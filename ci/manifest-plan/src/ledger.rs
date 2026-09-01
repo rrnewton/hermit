@@ -1,6 +1,7 @@
 //! Validation ledger schema emitted by Hermit's validation driver and consumed
 //! by ci-hub.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
@@ -177,6 +178,32 @@ impl HistoryRow {
             .as_u64()
             .map(Some)
             .ok_or("malformed HistoryRow retry_rounds: expected a nonnegative integer")
+    }
+
+    /// Decode cell-results evidence only after the enclosing schema version is
+    /// known. Schema 6 and 7 retain their historical type; schema 8 is parsed
+    /// from the forward-compatible JSON arm into its exact versioned shape.
+    /// Newer schemas remain readable but receive no typed evidence authority.
+    pub fn cell_results_evidence(&self) -> Option<Cow<'_, CellResultsEvidence>> {
+        let value = self.cell_results.as_ref()?;
+        match self.schema_version? {
+            6 | 7 => value.typed().map(Cow::Borrowed),
+            8 => value
+                .schema8()
+                .map(|evidence| Cow::Owned(evidence.into_evidence())),
+            _ => None,
+        }
+    }
+
+    /// Return the recorded validation path only for an exact schema-8 row.
+    pub fn cell_results_validate_path(&self) -> Option<ValidatePath> {
+        if self.schema_version != Some(8) {
+            return None;
+        }
+        self.cell_results
+            .as_ref()?
+            .schema8()
+            .map(|evidence| evidence.path)
     }
 
     /// Return the number of nodes for which at least one child execution
@@ -497,7 +524,7 @@ impl ValidatePath {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CellResultsEvidenceV8 {
     pub path: ValidatePath,
@@ -513,6 +540,201 @@ pub struct CellResultsEvidenceV8 {
     pub cells: Vec<CellResult>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComparisonSpecV8 {
+    strictness: ComparisonStrictness,
+    display_name: RequiredNullable<String>,
+    compare_logs: bool,
+    compare_io_buffers: RequiredNullable<bool>,
+    record_envelope: RequiredNullable<String>,
+    virtualize_time: RequiredNullable<bool>,
+    log_scope: ComparedLogScope,
+    strip_lines: bool,
+    canonicalize_addresses: bool,
+    full_trace: bool,
+    exact_remainder: bool,
+    stripped_prefixes: Vec<String>,
+    canonicalizations: Vec<String>,
+    ignore_lines: bool,
+    skip_commit: bool,
+    skip_detlog: bool,
+}
+
+fn required_nullable_into_option<T>(value: RequiredNullable<T>) -> Option<T> {
+    match value {
+        RequiredNullable::Null => None,
+        RequiredNullable::Value(value) => Some(value),
+    }
+}
+
+impl From<ComparisonSpecV8> for ComparisonSpec {
+    fn from(value: ComparisonSpecV8) -> Self {
+        Self {
+            strictness: value.strictness,
+            display_name: required_nullable_into_option(value.display_name),
+            compare_logs: value.compare_logs,
+            compare_io_buffers: required_nullable_into_option(value.compare_io_buffers),
+            record_envelope: required_nullable_into_option(value.record_envelope),
+            virtualize_time: required_nullable_into_option(value.virtualize_time),
+            log_scope: value.log_scope,
+            strip_lines: value.strip_lines,
+            canonicalize_addresses: value.canonicalize_addresses,
+            full_trace: value.full_trace,
+            exact_remainder: value.exact_remainder,
+            stripped_prefixes: value.stripped_prefixes,
+            canonicalizations: value.canonicalizations,
+            ignore_lines: value.ignore_lines,
+            skip_commit: value.skip_commit,
+            skip_detlog: value.skip_detlog,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+enum CellVerdictV8 {
+    ComparedAndMatched {
+        comparison_tier: ComparisonTier,
+        comparison: ComparisonSpecV8,
+        bitwise_parity: bool,
+        compared_log_messages: RequiredNullable<ComparedLogCounts>,
+    },
+    ComparedAndDiverged {
+        comparison_tier: ComparisonTier,
+        comparison: ComparisonSpecV8,
+        bitwise_parity: bool,
+        compared_log_messages: RequiredNullable<ComparedLogCounts>,
+    },
+    PerformsNoComparisonByDesign {
+        comparison_tier: ComparisonTier,
+        reason: String,
+    },
+    UnavailableWithReason {
+        comparison_tier: ComparisonTier,
+        reason: String,
+    },
+}
+
+impl From<CellVerdictV8> for CellVerdict {
+    fn from(value: CellVerdictV8) -> Self {
+        match value {
+            CellVerdictV8::ComparedAndMatched {
+                comparison_tier,
+                comparison,
+                bitwise_parity,
+                compared_log_messages,
+            } => Self::ComparedAndMatched {
+                comparison_tier,
+                comparison: comparison.into(),
+                bitwise_parity,
+                compared_log_messages,
+            },
+            CellVerdictV8::ComparedAndDiverged {
+                comparison_tier,
+                comparison,
+                bitwise_parity,
+                compared_log_messages,
+            } => Self::ComparedAndDiverged {
+                comparison_tier,
+                comparison: comparison.into(),
+                bitwise_parity,
+                compared_log_messages,
+            },
+            CellVerdictV8::PerformsNoComparisonByDesign {
+                comparison_tier,
+                reason,
+            } => Self::PerformsNoComparisonByDesign {
+                comparison_tier,
+                reason,
+            },
+            CellVerdictV8::UnavailableWithReason {
+                comparison_tier,
+                reason,
+            } => Self::UnavailableWithReason {
+                comparison_tier,
+                reason,
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CellResultV8 {
+    lane: String,
+    category: String,
+    test: String,
+    mode: String,
+    backend: String,
+    cell_verdict: CellVerdictV8,
+}
+
+impl From<CellResultV8> for CellResult {
+    fn from(value: CellResultV8) -> Self {
+        Self {
+            lane: value.lane,
+            category: value.category,
+            test: value.test,
+            mode: value.mode,
+            backend: value.backend,
+            cell_verdict: value.cell_verdict.into(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CellResultsEvidenceV8Wire {
+    path: ValidatePath,
+    run_id: String,
+    hermit_sha: String,
+    source_tree_dirty: bool,
+    selected_count: u64,
+    recorded_count: u64,
+    population_sha256: String,
+    artifact: CellResultsArtifact,
+    selected: Vec<CellIdentity>,
+    cells: Vec<CellResultV8>,
+}
+
+impl<'de> Deserialize<'de> for CellResultsEvidenceV8 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = CellResultsEvidenceV8Wire::deserialize(deserializer)?;
+        Ok(Self {
+            path: value.path,
+            run_id: value.run_id,
+            hermit_sha: value.hermit_sha,
+            source_tree_dirty: value.source_tree_dirty,
+            selected_count: value.selected_count,
+            recorded_count: value.recorded_count,
+            population_sha256: value.population_sha256,
+            artifact: value.artifact,
+            selected: value.selected,
+            cells: value.cells.into_iter().map(CellResult::from).collect(),
+        })
+    }
+}
+
+impl CellResultsEvidenceV8 {
+    fn into_evidence(self) -> CellResultsEvidence {
+        CellResultsEvidence {
+            run_id: self.run_id,
+            hermit_sha: self.hermit_sha,
+            source_tree_dirty: self.source_tree_dirty,
+            selected_count: self.selected_count,
+            recorded_count: self.recorded_count,
+            population_sha256: self.population_sha256,
+            artifact: self.artifact,
+            selected: self.selected,
+            cells: self.cells,
+        }
+    }
+}
+
 /// A supported cell-results shape, or the exact JSON from a newer shape that
 /// this reader does not understand yet. Exact versioned shapes precede the raw
 /// fallback so supported rows retain typed access while unknown extensions stay
@@ -520,7 +742,6 @@ pub struct CellResultsEvidenceV8 {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum CellResultsValue {
-    Schema8(CellResultsEvidenceV8),
     Typed(CellResultsEvidence),
     Other(Value),
 }
@@ -529,7 +750,7 @@ impl CellResultsValue {
     pub fn typed(&self) -> Option<&CellResultsEvidence> {
         match self {
             Self::Typed(evidence) => Some(evidence),
-            Self::Schema8(_) | Self::Other(_) => None,
+            Self::Other(_) => None,
         }
     }
 
@@ -537,91 +758,14 @@ impl CellResultsValue {
         match self {
             Self::Typed(evidence) => Some(evidence),
             Self::Other(_) => None,
-            Self::Schema8(_) => None,
         }
     }
 
-    pub fn schema8(&self) -> Option<&CellResultsEvidenceV8> {
+    fn schema8(&self) -> Option<CellResultsEvidenceV8> {
         match self {
-            Self::Schema8(evidence) => Some(evidence),
-            Self::Typed(_) | Self::Other(_) => None,
+            Self::Other(value) => serde_json::from_value(value.clone()).ok(),
+            Self::Typed(_) => None,
         }
-    }
-
-    pub fn run_id(&self) -> Option<&str> {
-        match self {
-            Self::Typed(evidence) => Some(&evidence.run_id),
-            Self::Schema8(evidence) => Some(&evidence.run_id),
-            Self::Other(_) => None,
-        }
-    }
-
-    pub fn hermit_sha(&self) -> Option<&str> {
-        match self {
-            Self::Typed(evidence) => Some(&evidence.hermit_sha),
-            Self::Schema8(evidence) => Some(&evidence.hermit_sha),
-            Self::Other(_) => None,
-        }
-    }
-
-    pub fn source_tree_dirty(&self) -> Option<bool> {
-        match self {
-            Self::Typed(evidence) => Some(evidence.source_tree_dirty),
-            Self::Schema8(evidence) => Some(evidence.source_tree_dirty),
-            Self::Other(_) => None,
-        }
-    }
-
-    pub fn selected_count(&self) -> Option<u64> {
-        match self {
-            Self::Typed(evidence) => Some(evidence.selected_count),
-            Self::Schema8(evidence) => Some(evidence.selected_count),
-            Self::Other(_) => None,
-        }
-    }
-
-    pub fn recorded_count(&self) -> Option<u64> {
-        match self {
-            Self::Typed(evidence) => Some(evidence.recorded_count),
-            Self::Schema8(evidence) => Some(evidence.recorded_count),
-            Self::Other(_) => None,
-        }
-    }
-
-    pub fn population_sha256(&self) -> Option<&str> {
-        match self {
-            Self::Typed(evidence) => Some(&evidence.population_sha256),
-            Self::Schema8(evidence) => Some(&evidence.population_sha256),
-            Self::Other(_) => None,
-        }
-    }
-
-    pub fn artifact(&self) -> Option<&CellResultsArtifact> {
-        match self {
-            Self::Typed(evidence) => Some(&evidence.artifact),
-            Self::Schema8(evidence) => Some(&evidence.artifact),
-            Self::Other(_) => None,
-        }
-    }
-
-    pub fn selected(&self) -> Option<&[CellIdentity]> {
-        match self {
-            Self::Typed(evidence) => Some(&evidence.selected),
-            Self::Schema8(evidence) => Some(&evidence.selected),
-            Self::Other(_) => None,
-        }
-    }
-
-    pub fn cells(&self) -> Option<&[CellResult]> {
-        match self {
-            Self::Typed(evidence) => Some(&evidence.cells),
-            Self::Schema8(evidence) => Some(&evidence.cells),
-            Self::Other(_) => None,
-        }
-    }
-
-    pub fn validate_path(&self) -> Option<ValidatePath> {
-        self.schema8().map(|evidence| evidence.path)
     }
 }
 
@@ -992,21 +1136,116 @@ mod tests {
         let evidence: CellResultsEvidenceV8 = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(evidence.path, ValidatePath::Quick);
         let value: CellResultsValue = serde_json::from_value(json.clone()).unwrap();
-        assert!(matches!(value, CellResultsValue::Schema8(_)));
+        assert!(matches!(value, CellResultsValue::Other(_)));
         assert_eq!(serde_json::to_value(value).unwrap(), json);
 
-        let mut wrong_path = json.clone();
-        wrong_path["path"] = serde_json::json!("selective");
-        assert!(matches!(
-            serde_json::from_value::<CellResultsValue>(wrong_path).unwrap(),
-            CellResultsValue::Other(_)
-        ));
+        let row: HistoryRow = serde_json::from_value(serde_json::json!({
+            "schema_version": 8,
+            "cell_results": json,
+        }))
+        .unwrap();
+        assert_eq!(row.cell_results_validate_path(), Some(ValidatePath::Quick));
+        assert_eq!(row.cell_results_evidence().unwrap().selected_count, 0);
 
-        let mut extension = json;
-        extension["future_field"] = serde_json::json!(true);
-        assert!(matches!(
-            serde_json::from_value::<CellResultsValue>(extension).unwrap(),
-            CellResultsValue::Other(_)
-        ));
+        let mut wrong_outer_version = serde_json::to_value(&row).unwrap();
+        wrong_outer_version["schema_version"] = serde_json::json!(7);
+        let wrong_outer_version: HistoryRow = serde_json::from_value(wrong_outer_version).unwrap();
+        assert!(wrong_outer_version.cell_results_evidence().is_none());
+
+        let mut future_outer_version = serde_json::to_value(&row).unwrap();
+        future_outer_version["schema_version"] = serde_json::json!(9);
+        let future_outer_version: HistoryRow =
+            serde_json::from_value(future_outer_version).unwrap();
+        assert!(future_outer_version.cell_results_evidence().is_none());
+
+        let mut wrong_path = serde_json::to_value(&row).unwrap();
+        wrong_path["schema_version"] = serde_json::json!(8);
+        wrong_path["cell_results"]["path"] = serde_json::json!("selective");
+        let wrong_path: HistoryRow = serde_json::from_value(wrong_path).unwrap();
+        assert!(wrong_path.cell_results_evidence().is_none());
+
+        let mut extension = serde_json::to_value(&row).unwrap();
+        extension["cell_results"]["future_field"] = serde_json::json!(true);
+        let extension: HistoryRow = serde_json::from_value(extension).unwrap();
+        assert!(extension.cell_results_evidence().is_none());
+    }
+
+    #[test]
+    fn schema8_compared_verdict_requires_every_current_comparison_key() {
+        let comparison = serde_json::json!({
+            "strictness": "canonical",
+            "display_name": "BitwiseInfoV1",
+            "compare_logs": true,
+            "compare_io_buffers": true,
+            "record_envelope": "all_records_v1",
+            "virtualize_time": true,
+            "log_scope": "info",
+            "strip_lines": false,
+            "canonicalize_addresses": true,
+            "full_trace": true,
+            "exact_remainder": true,
+            "stripped_prefixes": ["real-wall-clock-prefix/v1"],
+            "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
+            "ignore_lines": false,
+            "skip_commit": false,
+            "skip_detlog": false
+        });
+        let identity = serde_json::json!({
+            "lane": "portable",
+            "category": "c-programs",
+            "test": "example",
+            "mode": "verify",
+            "backend": "ptrace"
+        });
+        let mut json = serde_json::json!({
+            "path": "full",
+            "run_id": "run-8",
+            "hermit_sha": "a".repeat(40),
+            "source_tree_dirty": false,
+            "selected_count": 1,
+            "recorded_count": 1,
+            "population_sha256": "b".repeat(64),
+            "artifact": {
+                "path": "ignored/validate/artifacts/run-8/cell-results.jsonl",
+                "sha256": "c".repeat(64),
+                "row_count": 1
+            },
+            "selected": [identity.clone()],
+            "cells": [{
+                "lane": "portable",
+                "category": "c-programs",
+                "test": "example",
+                "mode": "verify",
+                "backend": "ptrace",
+                "cell_verdict": {
+                    "state": "compared-and-matched",
+                    "comparison_tier": "canonical-bitwise",
+                    "comparison": comparison,
+                    "bitwise_parity": true,
+                    "compared_log_messages": {"left": 1, "right": 1}
+                }
+            }]
+        });
+        assert!(serde_json::from_value::<CellResultsEvidenceV8>(json.clone()).is_ok());
+
+        for required in [
+            "display_name",
+            "compare_io_buffers",
+            "record_envelope",
+            "virtualize_time",
+        ] {
+            let mut missing = json.clone();
+            missing["cells"][0]["cell_verdict"]["comparison"]
+                .as_object_mut()
+                .unwrap()
+                .remove(required);
+            assert!(
+                serde_json::from_value::<CellResultsEvidenceV8>(missing).is_err(),
+                "schema 8 must require comparison.{required}"
+            );
+        }
+
+        json["cells"][0]["cell_verdict"]["comparison"]["display_name"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<CellResultsEvidenceV8>(json).is_ok());
     }
 }
