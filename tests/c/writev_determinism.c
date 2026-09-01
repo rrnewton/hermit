@@ -848,7 +848,7 @@ static void *run_blocked_pipe_writer(void *opaque) {
   return NULL;
 }
 
-static int check_two_blocked_pipe_writers(void) {
+static int check_two_blocked_pipe_writers(int wait_for_release) {
   int pipe_fds[2];
   if (pipe(pipe_fds) != 0) {
     perror("two-writer pipe");
@@ -915,8 +915,18 @@ static int check_two_blocked_pipe_writers(void) {
   while (atomic_load_explicit(&entered, memory_order_acquire) != 2) {
     sched_yield();
   }
-  for (int attempt = 0; attempt < 64; attempt++) {
-    sched_yield();
+  if (wait_for_release) {
+    char release = 0;
+    ssize_t release_count = read(STDIN_FILENO, &release, 1);
+    if (release_count != 1) {
+      fprintf(stderr, "two-writer release returned %zd with errno %d\n",
+              release_count, errno);
+      return -1;
+    }
+  } else {
+    for (int attempt = 0; attempt < 64; attempt++) {
+      sched_yield();
+    }
   }
   if (atomic_load_explicit(&finished, memory_order_acquire) != 0) {
     fprintf(stderr, "a writer completed while the pipe was still full\n");
@@ -1233,7 +1243,7 @@ int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "record-pipe") == 0) {
     if (check_atomic_full_pipe() != 0 || check_large_iovec_snapshot() != 0 ||
         check_large_blocking_pipe() != 0 || check_large_blocking_write() != 0 ||
-        check_two_blocked_pipe_writers() != 0) {
+        check_two_blocked_pipe_writers(0) != 0) {
       return 1;
     }
     puts("writev-determinism-ok");
@@ -1289,6 +1299,13 @@ int main(int argc, char **argv) {
     puts("pipe-fd-replacement-refused-without-redirection");
     return 0;
   }
+  if (argc > 1 && strcmp(argv[1], "two-blocked-writers") == 0) {
+    if (check_two_blocked_pipe_writers(1) != 0) {
+      return 1;
+    }
+    puts("two-blocked-pipe-writers-ok");
+    return 0;
+  }
 
   int pipe_fds[2];
   if (pipe(pipe_fds) != 0) {
@@ -1317,7 +1334,7 @@ int main(int argc, char **argv) {
   if (check_atomic_full_pipe() != 0 || check_readonly_iovec() != 0 ||
       check_large_iovec_snapshot() != 0 || check_large_blocking_pipe() != 0 ||
       check_large_blocking_write() != 0 ||
-      check_two_blocked_pipe_writers() != 0 ||
+      check_two_blocked_pipe_writers(0) != 0 ||
       check_failed_write_preserves_metadata() != 0 ||
       check_signal_interrupts_full_pipe_writev(0) != 0 ||
       check_signal_interrupts_full_pipe_writev(1) != 0 ||

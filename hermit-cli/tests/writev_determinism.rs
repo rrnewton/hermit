@@ -10,9 +10,19 @@
 mod hermit_test;
 
 use std::fs;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Read;
+use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 use std::process::Output;
+use std::process::Stdio;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
@@ -27,6 +37,127 @@ fn command_output(mut command: Command, label: &str) -> Output {
         String::from_utf8_lossy(&output.stderr),
     );
     output
+}
+
+fn kill_process_group(child: &mut std::process::Child) {
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+fn run_two_blocked_writers(guest: &Path) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args([
+            "--log=trace",
+            "run",
+            "--strict",
+            "--panic-on-unsupported-syscalls",
+            "--base-env=minimal",
+            "--",
+        ])
+        .arg(guest)
+        .arg("two-blocked-writers")
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let rendered = format!("{command:?}");
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to spawn two-writer probe: {rendered}: {error}"));
+    let mut child_stdin = Some(child.stdin.take().expect("stdin was piped"));
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let (send, receive) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            if send.send(line.map_err(|error| error.to_string())).is_err() {
+                return;
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let mut scalar_retried = false;
+    let mut vectored_retried = false;
+    let mut diagnostics = Vec::new();
+    let mut failure = None;
+    let status = loop {
+        match receive.recv_timeout(Duration::from_millis(10)) {
+            Ok(Ok(line)) => {
+                scalar_retried |= line.contains("Retry #1 for blocking pipe write:");
+                vectored_retried |=
+                    line.contains("Retry #1 for blocking pipe writev after EAGAIN:");
+                if diagnostics.len() < 2_000 {
+                    diagnostics.push(line);
+                }
+            }
+            Ok(Err(error)) => {
+                failure = Some(format!("failed while draining Hermit stderr: {error}"))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+
+        if scalar_retried
+            && vectored_retried
+            && let Some(mut stdin) = child_stdin.take()
+            && let Err(error) = stdin.write_all(b"x")
+        {
+            failure = Some(format!("failed to release the two-writer guest: {error}"));
+        }
+
+        if let Some(reason) = failure.as_ref() {
+            kill_process_group(&mut child);
+            break child.wait().unwrap_or_else(|error| {
+                panic!("failed to reap two-writer probe after {reason}: {error}")
+            });
+        }
+        if let Some(status) = child.try_wait().expect("failed to poll two-writer probe") {
+            break status;
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            failure = Some(format!(
+                "two-writer probe timed out: scalar_retried={scalar_retried}, \
+                 vectored_retried={vectored_retried}"
+            ));
+        }
+    };
+    reader.join().expect("stderr reader panicked");
+    while let Ok(line) = receive.try_recv() {
+        match line {
+            Ok(line) if diagnostics.len() < 2_000 => diagnostics.push(line),
+            Ok(_) => {}
+            Err(error) => panic!("failed while draining Hermit stderr: {error}"),
+        }
+    }
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout was piped")
+        .read_to_string(&mut stdout)
+        .expect("failed to read two-writer stdout");
+    let stderr = diagnostics.join("\n");
+    if let Some(reason) = failure {
+        panic!("{reason}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    }
+    assert!(
+        status.success(),
+        "two-writer probe failed: {rendered}\nstatus: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        scalar_retried && vectored_retried,
+        "reader was not released until both retries, but the retained evidence is incomplete: \
+         scalar_retried={scalar_retried}, vectored_retried={vectored_retried}\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        stdout.contains("two-blocked-pipe-writers-ok"),
+        "two-writer guest omitted its success marker\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
 }
 
 fn compile_writev_guest(build_name: &str) -> std::path::PathBuf {
@@ -106,6 +237,11 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         "write/writev did not reach typed dispatch and internal-fd scheduling\n\
          stdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
     );
+
+    // Keep the reader stopped until the host-side harness has observed both
+    // writer threads retrying against the full pipe. This proves both writes
+    // blocked; an entered counter before each syscall cannot establish that.
+    run_two_blocked_writers(&guest);
 
     for (label, strict, extra_arg) in [
         ("strict writev verification", true, None),
