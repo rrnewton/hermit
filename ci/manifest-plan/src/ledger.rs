@@ -479,12 +479,48 @@ pub struct CellResultsEvidence {
     pub cells: Vec<CellResult>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ValidatePath {
+    Quick,
+    Full,
+    Super,
+}
+
+impl ValidatePath {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Full => "full",
+            Self::Super => "super",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CellResultsEvidenceV8 {
+    pub path: ValidatePath,
+    pub run_id: String,
+    pub hermit_sha: String,
+    pub source_tree_dirty: bool,
+    pub selected_count: u64,
+    pub recorded_count: u64,
+    /// SHA-256 over canonical JSON of the sorted `selected` identities.
+    pub population_sha256: String,
+    pub artifact: CellResultsArtifact,
+    pub selected: Vec<CellIdentity>,
+    pub cells: Vec<CellResult>,
+}
+
 /// A supported cell-results shape, or the exact JSON from a newer shape that
-/// this reader does not understand yet. The typed arm is deliberately first:
-/// supported rows must keep their established serialization and receipt digest.
+/// this reader does not understand yet. Exact versioned shapes precede the raw
+/// fallback so supported rows retain typed access while unknown extensions stay
+/// readable.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum CellResultsValue {
+    Schema8(CellResultsEvidenceV8),
     Typed(CellResultsEvidence),
     Other(Value),
 }
@@ -493,7 +529,7 @@ impl CellResultsValue {
     pub fn typed(&self) -> Option<&CellResultsEvidence> {
         match self {
             Self::Typed(evidence) => Some(evidence),
-            Self::Other(_) => None,
+            Self::Schema8(_) | Self::Other(_) => None,
         }
     }
 
@@ -501,7 +537,91 @@ impl CellResultsValue {
         match self {
             Self::Typed(evidence) => Some(evidence),
             Self::Other(_) => None,
+            Self::Schema8(_) => None,
         }
+    }
+
+    pub fn schema8(&self) -> Option<&CellResultsEvidenceV8> {
+        match self {
+            Self::Schema8(evidence) => Some(evidence),
+            Self::Typed(_) | Self::Other(_) => None,
+        }
+    }
+
+    pub fn run_id(&self) -> Option<&str> {
+        match self {
+            Self::Typed(evidence) => Some(&evidence.run_id),
+            Self::Schema8(evidence) => Some(&evidence.run_id),
+            Self::Other(_) => None,
+        }
+    }
+
+    pub fn hermit_sha(&self) -> Option<&str> {
+        match self {
+            Self::Typed(evidence) => Some(&evidence.hermit_sha),
+            Self::Schema8(evidence) => Some(&evidence.hermit_sha),
+            Self::Other(_) => None,
+        }
+    }
+
+    pub fn source_tree_dirty(&self) -> Option<bool> {
+        match self {
+            Self::Typed(evidence) => Some(evidence.source_tree_dirty),
+            Self::Schema8(evidence) => Some(evidence.source_tree_dirty),
+            Self::Other(_) => None,
+        }
+    }
+
+    pub fn selected_count(&self) -> Option<u64> {
+        match self {
+            Self::Typed(evidence) => Some(evidence.selected_count),
+            Self::Schema8(evidence) => Some(evidence.selected_count),
+            Self::Other(_) => None,
+        }
+    }
+
+    pub fn recorded_count(&self) -> Option<u64> {
+        match self {
+            Self::Typed(evidence) => Some(evidence.recorded_count),
+            Self::Schema8(evidence) => Some(evidence.recorded_count),
+            Self::Other(_) => None,
+        }
+    }
+
+    pub fn population_sha256(&self) -> Option<&str> {
+        match self {
+            Self::Typed(evidence) => Some(&evidence.population_sha256),
+            Self::Schema8(evidence) => Some(&evidence.population_sha256),
+            Self::Other(_) => None,
+        }
+    }
+
+    pub fn artifact(&self) -> Option<&CellResultsArtifact> {
+        match self {
+            Self::Typed(evidence) => Some(&evidence.artifact),
+            Self::Schema8(evidence) => Some(&evidence.artifact),
+            Self::Other(_) => None,
+        }
+    }
+
+    pub fn selected(&self) -> Option<&[CellIdentity]> {
+        match self {
+            Self::Typed(evidence) => Some(&evidence.selected),
+            Self::Schema8(evidence) => Some(&evidence.selected),
+            Self::Other(_) => None,
+        }
+    }
+
+    pub fn cells(&self) -> Option<&[CellResult]> {
+        match self {
+            Self::Typed(evidence) => Some(&evidence.cells),
+            Self::Schema8(evidence) => Some(&evidence.cells),
+            Self::Other(_) => None,
+        }
+    }
+
+    pub fn validate_path(&self) -> Option<ValidatePath> {
+        self.schema8().map(|evidence| evidence.path)
     }
 }
 
@@ -849,5 +969,44 @@ mod tests {
         let value: CellResultsValue = serde_json::from_value(newer.clone()).unwrap();
         assert!(matches!(value, CellResultsValue::Other(_)));
         assert_eq!(serde_json::to_value(value).unwrap(), newer);
+    }
+
+    #[test]
+    fn schema8_cell_results_has_an_exact_validate_path_shape() {
+        let json = serde_json::json!({
+            "path": "quick",
+            "run_id": "run-8",
+            "hermit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source_tree_dirty": false,
+            "selected_count": 0,
+            "recorded_count": 0,
+            "population_sha256": "b".repeat(64),
+            "artifact": {
+                "path": "ignored/validate/artifacts/run-8/cell-results.jsonl",
+                "sha256": "c".repeat(64),
+                "row_count": 0
+            },
+            "selected": [],
+            "cells": []
+        });
+        let evidence: CellResultsEvidenceV8 = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(evidence.path, ValidatePath::Quick);
+        let value: CellResultsValue = serde_json::from_value(json.clone()).unwrap();
+        assert!(matches!(value, CellResultsValue::Schema8(_)));
+        assert_eq!(serde_json::to_value(value).unwrap(), json);
+
+        let mut wrong_path = json.clone();
+        wrong_path["path"] = serde_json::json!("selective");
+        assert!(matches!(
+            serde_json::from_value::<CellResultsValue>(wrong_path).unwrap(),
+            CellResultsValue::Other(_)
+        ));
+
+        let mut extension = json;
+        extension["future_field"] = serde_json::json!(true);
+        assert!(matches!(
+            serde_json::from_value::<CellResultsValue>(extension).unwrap(),
+            CellResultsValue::Other(_)
+        ));
     }
 }
