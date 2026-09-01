@@ -147,13 +147,22 @@ the suite at an exact Hermit commit, preserves per-demo logs, and stays failed
 on every demo red.
 
 Demo 8 seed calibration writes `ignored/demo08-run/calibration.tsv` plus one
-retained output per attempted seed. Each row records the seed, whether the
-`print_copied_inodes` progress-thread path engaged, whether ASAN reported the
-planted heap use-after-free, the exit status, and the output path. The summary
-always states `engagement=N/M` and `uaf_hits=H/M`. A cached crash seed is
-replayed and must supply 1/1 engagement evidence; it is never trusted merely
-because the cache file exists. Zero engagement is a refused `NO-RESULT`, not a
-clean sweep.
+retained output per attempted seed. Each row records the seed, whether it came
+from the cache or a cold sweep, whether the `print_copied_inodes`
+progress-thread path engaged, whether ASAN reported the use-after-free, the exit
+status, and the output path. The summary states `engagement=N/M` and
+`uaf_hits=H/M`; zero engagement is a refused `NO-RESULT: path engagement 0/M`,
+which is a statement about this machine rather than a clean sweep.
+
+A cached crash seed is **replayed and required to reproduce** before it is used;
+it is never trusted merely because the cache file exists. The seed is recorded as
+`<seed> <fixture-sha256> <hermit-sha256>`, but those hashes are a *hint that
+explains the reason*, not the gate — which seeds crash depends on more than the
+fixture, and it has not been established which input decides it (see
+`demos/08-btrfs-convert-uaf.md`, "Results"). A cached seed that no longer
+reproduces is reported as `STALE CACHED SEED`, explicitly not as a regression,
+and re-derived. `demos/clean.sh` removes the recorded seed, so `make clean` gives
+a genuinely cold calibration.
 
 Run each demo individually so its output and result remain easy to inspect:
 

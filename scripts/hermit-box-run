@@ -98,8 +98,15 @@ diag_log=""
 
 die() { echo "hermit-box-run: $*" >&2; exit 2; }
 
+# Runner lookup. agent-utils publishes dagrun under common/bin and rs/bin; it has no
+# top-level bin/. Searching only the top-level path made this script unusable in Hermit:
+# at submodule pin 0cdc8867 every invocation died with exit 2 before running anything,
+# which took the whole Demo 8 seed calibration with it. The top-level names are kept
+# last so a checkout that does publish them is still honoured.
 RUNNER=""
 for candidate in \
+  "$ROOT/agent-utils/common/bin/dagrun" \
+  "$ROOT/agent-utils/rs/bin/dagrun" \
   "$ROOT/agent-utils/bin/dagrun" \
   "$ROOT/agent-utils/bin/safe-ci-dag-runner"; do
   if [ -x "$candidate" ]; then
@@ -107,7 +114,14 @@ for candidate in \
     break
   fi
 done
-[ -n "$RUNNER" ] || die "agent-utils contains neither bin/dagrun nor bin/safe-ci-dag-runner"
+# Exit 3, not 2: "no runner here" is the same fact for a caller as "this host cannot box"
+# -- boxing is unavailable and nothing ran. Callers already branch on 3 to degrade to an
+# announced unboxed run; exit 2 (bad usage) sent them down no branch at all.
+if [ -z "$RUNNER" ]; then
+  echo "hermit-box-run: no dagrun found under agent-utils (looked in common/bin, rs/bin," \
+    "bin); cgroup boxing unavailable (exit 3)" >&2
+  exit 3
+fi
 
 while [ $# -gt 0 ]; do
   case "$1" in

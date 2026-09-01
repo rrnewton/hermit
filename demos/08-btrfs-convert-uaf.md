@@ -64,8 +64,14 @@ thread frees it — is the genuine, unmodified 73e211a7 bug.
 
 ## Results
 
-From `demos/fixtures/demo08/` (btrfs-progs
-v7.1, hermit primary checkout `103657d…`, `pop-tiny.img` ≈100 files):
+**Which seeds crash is a property of the inputs, not of this document.** Two
+sweeps of the same 0–31 range, against a byte-identical `buggy/btrfs-convert`,
+disagree about which seeds reproduce. Read the numbers below as two dated
+measurements, and derive your own seed with
+`scripts/prepare-demo08-assets.sh` rather than copying one from here.
+
+First sweep — btrfs-progs v7.1, hermit primary checkout `103657d…`,
+`pop-tiny.img` ≈100 files:
 
 | Execution | Runs | UAF crashes | Notes |
 |---|---|---|---|
@@ -79,6 +85,37 @@ hit the per-run timeout in **both** variants; they are a hermit-chaos artifact,
 not the bug. Buggy seed 15 replayed 3× produced a **byte-identical** guest ASAN
 report (same faulting heap address, PC, stack, and shadow bytes); only hermit's
 own host-side log lines vary.
+
+Second sweep — 2026-08-31, the **same** fixture
+(`buggy/btrfs-convert` sha256 `6e660b87…`), hermit release built at
+`00ed139b` (sha256 `7d559e36…`), devbig014, AMD EPYC 9D85:
+
+| Execution | Runs | UAF crashes | Notes |
+|---|---|---|---|
+| chaos buggy, seeds 0–31 | 32 | **4** (seeds **3**, **6**, **10**, **13**) | 15 and 19 are clean here |
+| chaos fixed, seeds 3/6/10/13 | 4 | **0** | progress-thread path engaged on all four |
+
+Seeds 16 and 25 hit the 150 s per-run timeout without reaching the progress
+thread. Seeds 3 and 13 report the UAF on a thread whose **process still exits
+0**, and ASAN does not finish writing frames before the process goes — which is
+why both this demo and the calibrator detect on the report text rather than the
+exit status, and why the calibrator prefers a seed whose report reached its
+`SUMMARY` line.
+
+**The seed set is per-input down to the image path.** Seed 3 reproduces the
+truncated report at the image path that sweep used, twice, with a byte-identical
+error line — and does *not* reproduce at a different image path. That is not
+flakiness: hermit's determinism is per-input, and the path length shifts the
+initial heap layout, which is the same reason Step 4 replays over the *same*
+image path rather than a fresh one. Treat a crashing seed as belonging to the
+whole input set it was derived from.
+
+What the pair of sweeps establishes is narrow and worth stating exactly: **the
+fixture alone does not determine which seeds crash.** It does *not* establish
+which other input does. No older hermit was built to isolate the variable, and
+host, kernel and toolchain differed too. That is why the recorded seed is
+verified by replaying it rather than by comparing hashes — see
+`scripts/prepare-demo08-assets.sh`.
 
 The crash is the textbook 73e211a7 UAF:
 
@@ -99,9 +136,19 @@ The script runs native buggy (clean), chaos buggy on the crashing seed
 (reproduces the UAF), chaos fixed on the same seed (clean — the differential),
 then replays the crashing seed and confirms the guest ASAN report is identical.
 
+The seed comes from `<asset-dir>/.crash-seed`, written by
+`scripts/prepare-demo08-assets.sh`. **There is no built-in default seed**: as the
+two sweeps above show, a hardcoded one is wrong on most hosts, and the previous
+default of 15 does not reproduce at `00ed139b`. When the recorded seed no longer
+reproduces, the demo says `STALE SEED RECORD`, names the recorded and present
+identities, re-derives a seed through the calibrator, and retries. It reports a
+regression only when a seed **derived from the inputs actually present** fails to
+reproduce.
+
 It **skips cleanly (exit 0)** when the prebuilt assets are absent, so it is safe
-in `make all`. Provide them under `ignored/demo08-btrfs/` (or point
-`DEMO08_DIR` elsewhere):
+in `make all` — though `demos/run-all.sh` records that as `SKIP`, not `PASS`,
+because a gated-out demo demonstrated nothing. Provide the assets under
+`ignored/demo08-btrfs/` (or point `DEMO08_DIR` elsewhere):
 
 ```
 ignored/demo08-btrfs/buggy/btrfs-convert
@@ -109,8 +156,9 @@ ignored/demo08-btrfs/fixed/btrfs-convert
 ignored/demo08-btrfs/pop-tiny.img
 ```
 
-Overrides: `DEMO08_DIR`, `DEMO08_ARTIFACTS`, `DEMO08_CRASH_SEED` (default 15),
-`DEMO08_TIMEOUT` (default 90), `HERMIT_RELEASE`.
+Overrides: `DEMO08_DIR`, `DEMO08_ARTIFACTS`, `DEMO08_TIMEOUT` (defaults to the calibrator budget, 150),
+`HERMIT_RELEASE`, and `DEMO08_CRASH_SEED` to drive one seed by hand (which also
+turns off re-derivation, so a miss is reported rather than repaired).
 
 ## Build recipe
 
@@ -143,8 +191,47 @@ mkfs.ext4 -F -q -b 4096 -N 200 -d <some-populated-dir> pop-tiny.img   # 256 MiB
 The validated hermit invocation the demo uses is:
 
 ```bash
-hermit run --chaos --sched-seed <S> --no-virtualize-cpuid -- <variant>/btrfs-convert <fresh-image-copy>
+hermit run --chaos --sched-seed <S> --no-virtualize-cpuid --strict -- <variant>/btrfs-convert <fresh-image-copy>
 ```
 
-(`--no-virtualize-cpuid` because CPUID faulting is unavailable on the demo
-hosts; each run converts a fresh reflink copy of the image.)
+Backend `ptrace`; log level `error`; the single relaxation is
+`--no-virtualize-cpuid`, because CPUID faulting is unavailable on the demo
+hosts. Each run converts a fresh reflink copy of the image, and
+`scripts/prepare-demo08-assets.sh` uses this identical flag set — a seed derived
+under one flag set is not evidence about another.
+
+**`--strict` is load-bearing, and running without it was a real defect.**
+`btrfs-convert` generates a random UUID for the target filesystem. Without
+`--strict`, hermit does not virtualize that: measured 2026-08-31, three
+non-strict runs of seed 6 produced two different target UUIDs, and within a
+single demo run the seed reproduced the UAF at Step 2 and *missed* at Step 4,
+the two transcripts differing at the UUID line. Four `--strict` runs produced
+target UUID `10708a9d-7517-44b2-8a5b-dc05ab4ae2fd` every time and reproduced the
+UAF 4/4, at roughly 9 s each against roughly 7 s without. A demo whose headline
+claim is bit-for-bit replay must not run in the mode that does not guarantee it.
+
+Step 4 therefore compares the **entire guest transcript**, rather than the
+four-line filtered ASAN extract it used to compare. That extract does not contain
+the UUID line, so it would have reported "byte-identical" across two runs that
+genuinely differed.
+
+Exactly three things are compared, and between them they cover every line of the
+captured output:
+
+| compared | how |
+|---|---|
+| the guest's own output, safehermit's accounting lines and hermit's log lines removed | in order, byte for byte |
+| hermit's own log records | wall-clock prefix removed, remainder compared exactly, unordered |
+| the guest exit status | equality; safehermit reports it on an accounting line |
+
+The middle row is the repository's retained-log rule — remove the real wall-clock
+prefix, compare the whole remainder exactly — and it is there because dropping
+those lines whole hid the terminating signal, the thread and process it reached,
+and the core-dump flag. Their **order** is the one thing treated as host-side:
+measured 2026-08-31 over 12 `--strict` runs of seed 6 with byte-identical inputs,
+all 12 emitted the same two records and 3 of the 12 emitted them in the opposite
+order while their guest output stayed byte-identical.
+
+What is not compared is safehermit's accounting: a per-run identifier, absolute
+host paths, the applied bounds, an elapsed wall-clock time, and a byte count of
+output that is itself compared above.

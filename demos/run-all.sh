@@ -48,6 +48,7 @@ printf 'demo\tstatus\texit\tduration_seconds\tlog\n' >>"$SUMMARY"
 export DEMO_TMP="${DEMO_TMP:-$(mktemp -d -t hermit-demo.XXXXXX)}"
 
 failures=0
+skipped=0
 for demo in "${demos[@]}"; do
   log="$LOG_DIR/$demo.log"
   started=$SECONDS
@@ -59,8 +60,19 @@ for demo in "${demos[@]}"; do
   duration=$((SECONDS - started))
 
   if [ "$rc" -eq 0 ]; then
-    status=PASS
-    printf '=== %s: PASS (%ss) ===\n' "$demo" "$duration"
+    # A demo that gated itself out on a missing input exited 0 without demonstrating
+    # anything, and recording that as PASS is a did-not-run reading as a pass. It stays
+    # exit 0 and still does not fail the sweep -- that gating is deliberate -- but the
+    # summary must not claim it demonstrated something.
+    if grep -qa "^=== Demo .*: SKIPPED" "$log"; then
+      status=SKIP
+      printf '=== %s: SKIPPED (%ss) — gated out, demonstrated nothing ===\n' \
+        "$demo" "$duration"
+      skipped=$((skipped + 1))
+    else
+      status=PASS
+      printf '=== %s: PASS (%ss) ===\n' "$demo" "$duration"
+    fi
     # Demos 2-4 consume the same already-built Hermit binaries as demo 1.
     [ "$demo" != demo1 ] || export DEMO_SKIP_BUILD=1
   else
@@ -102,5 +114,12 @@ if [ "$failures" -ne 0 ]; then
   exit 1
 fi
 
-printf '\n=== Demo suite: SUCCESS — all %s requested demos passed ===\n' \
-  "${#demos[@]}"
+# Report the skipped count in the success line too. "All 8 passed" over a sweep where one
+# demo gated itself out is the same overstatement in prose that status=PASS was in the TSV.
+if [ "$skipped" -ne 0 ]; then
+  printf '\n=== Demo suite: SUCCESS — %s of %s demos passed, %s SKIPPED (demonstrated nothing) ===\n' \
+    "$(( ${#demos[@]} - skipped ))" "${#demos[@]}" "$skipped"
+else
+  printf '\n=== Demo suite: SUCCESS — all %s requested demos passed ===\n' \
+    "${#demos[@]}"
+fi

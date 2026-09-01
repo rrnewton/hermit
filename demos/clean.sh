@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Wipe stale computed results from the QEMU/Linux demo suite (demos 5 and 6).
+# Wipe stale computed results from the QEMU/Linux demos (5 and 6) and Demo 8.
 #
 # The Python demos (05-qemu-boot.py, 06-qemu-resume.py) persist a first-run
 # "anchor" (demo 5: the boot-anchor/ directory; demo 6: resume-metadata/) and
@@ -8,10 +8,13 @@
 # script gives a one-command fresh start.
 #
 #   ./clean.sh              wipe COMPUTED RESULTS only (anchors, run history,
-#                           snapshots, runtime cruft). Keeps the kernel/rootfs
-#                           blobs so the next run does not re-download/rebuild.
+#                           snapshots, runtime cruft, and Demo 8's recorded crash
+#                           seed and scratch). Keeps the kernel/rootfs blobs and
+#                           Demo 8's ASAN fixtures so the next run does not
+#                           re-download or rebuild them.
 #   ./clean.sh --distclean  additionally wipe the provisioned kernel download
-#                           and BusyBox initramfs (bzImage, initramfs.cpio.gz).
+#                           and BusyBox initramfs (bzImage, initramfs.cpio.gz)
+#                           and Demo 8's ASAN fixtures and ext4 image.
 #   ./clean.sh --dry-run    print what would be removed without deleting.
 #
 # The demo asset directory defaults to <repo>/ignored/qemu-linux, or to a host-visible
@@ -100,32 +103,59 @@ remove_path() {
   fi
 }
 
-if [ ! -d "$ASSETS" ]; then
-  printf 'Nothing to clean: %s does not exist.\n' "${ASSETS#"$ROOT"/}"
-  exit 0
-fi
-
 if [ "$dry_run" -eq 1 ]; then
   printf 'Dry run (no files will be deleted).\n'
 fi
-printf 'Cleaning computed demo results under %s\n' "${ASSETS#"$ROOT"/}"
 
-for name in "${computed[@]}"; do
-  remove_path "$ASSETS/$name"
-done
+# A missing QEMU asset directory used to exit the whole script, which meant Demo 8's trees
+# below were never reached on a host that had only ever run Demo 8. Skip the section, not
+# the script.
+if [ ! -d "$ASSETS" ]; then
+  printf 'Nothing to clean for demos 5-6: %s does not exist.\n' "${ASSETS#"$ROOT"/}"
+else
+  printf 'Cleaning computed demo results under %s\n' "${ASSETS#"$ROOT"/}"
 
-shopt -s nullglob
-for glob in "${transient_globs[@]}"; do
-  for path in "$ASSETS"/$glob; do
-    remove_path "$path"
-  done
-done
-shopt -u nullglob
-
-if [ "$distclean" -eq 1 ]; then
-  printf 'Removing provisioned kernel download and initramfs (--distclean)\n'
-  for name in "${provisioned[@]}"; do
+  for name in "${computed[@]}"; do
     remove_path "$ASSETS/$name"
+  done
+
+  shopt -s nullglob
+  for glob in "${transient_globs[@]}"; do
+    for path in "$ASSETS"/$glob; do
+      remove_path "$path"
+    done
+  done
+  shopt -u nullglob
+
+  if [ "$distclean" -eq 1 ]; then
+    printf 'Removing provisioned kernel download and initramfs (--distclean)\n'
+    for name in "${provisioned[@]}"; do
+      remove_path "$ASSETS/$name"
+    done
+  fi
+fi
+
+# --- Demo 8 (btrfs-convert UAF) ----------------------------------------------
+# Demo 8 keeps its own asset and scratch trees, and this script used to skip them
+# entirely. That left the one file whose staleness manufactures a false regression --
+# the recorded crash seed -- surviving every `make clean` and `make distclean`.
+#
+# The seed is a COMPUTED RESULT: scripts/prepare-demo08-assets.sh re-derives it, and it
+# is only valid for the exact inputs it was derived from. The fixtures and the 256 MiB
+# image are PROVISIONED (a clone plus two ASAN compiles), so they go only on --distclean.
+DEMO08_ASSETS="${DEMO08_DIR:-$ROOT/ignored/demo08-btrfs}"
+DEMO08_ARTIFACTS_DIR="${DEMO08_ARTIFACTS:-$ROOT/ignored/demo08-run}"
+if [ -n "$DEMO08_ASSETS" ] && [ "$DEMO08_ASSETS" != "/" ] && [ -d "$DEMO08_ASSETS" ]; then
+  printf 'Cleaning Demo 8 computed results under %s\n' "${DEMO08_ASSETS#"$ROOT"/}"
+  remove_path "$DEMO08_ASSETS/.crash-seed"
+fi
+if [ -d "$DEMO08_ARTIFACTS_DIR" ]; then
+  remove_path "$DEMO08_ARTIFACTS_DIR"
+fi
+if [ "$distclean" -eq 1 ] && [ -d "$DEMO08_ASSETS" ]; then
+  printf 'Removing provisioned Demo 8 ASAN fixtures and image (--distclean)\n'
+  for name in buggy fixed pop-tiny.img .nightly-prep-version; do
+    remove_path "$DEMO08_ASSETS/$name"
   done
 fi
 
