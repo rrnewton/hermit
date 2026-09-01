@@ -349,7 +349,9 @@ random target-filesystem UUID, and without `--strict` hermit does not virtualize
 it: measured 2026-08-31, a single demo run reproduced the UAF at Step 2 and
 missed at Step 4, the two transcripts differing at the UUID line. Step 4 now
 compares the whole guest transcript rather than a four-line ASAN extract that
-did not contain the UUID.
+did not contain the UUID, plus hermit's own log records (wall-clock prefix
+removed) and the guest exit status, which the transcript cannot carry. See
+`demos/08-btrfs-convert-uaf.md` for exactly what each of the three covers.
 
 
 Re-running the crashing seed with the identical image path (hermit determinism

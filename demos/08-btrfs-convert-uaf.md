@@ -210,8 +210,28 @@ target UUID `10708a9d-7517-44b2-8a5b-dc05ab4ae2fd` every time and reproduced the
 UAF 4/4, at roughly 9 s each against roughly 7 s without. A demo whose headline
 claim is bit-for-bit replay must not run in the mode that does not guarantee it.
 
-Step 4 therefore compares the **entire guest transcript**, with only
-safehermit's host-side accounting lines removed, rather than the four-line
-filtered ASAN extract it used to compare. That extract does not contain the UUID
-line, so it would have reported "byte-identical" across two runs that genuinely
-differed.
+Step 4 therefore compares the **entire guest transcript**, rather than the
+four-line filtered ASAN extract it used to compare. That extract does not contain
+the UUID line, so it would have reported "byte-identical" across two runs that
+genuinely differed.
+
+Exactly three things are compared, and between them they cover every line of the
+captured output:
+
+| compared | how |
+|---|---|
+| the guest's own output, safehermit's accounting lines and hermit's log lines removed | in order, byte for byte |
+| hermit's own log records | wall-clock prefix removed, remainder compared exactly, unordered |
+| the guest exit status | equality; safehermit reports it on an accounting line |
+
+The middle row is the repository's retained-log rule — remove the real wall-clock
+prefix, compare the whole remainder exactly — and it is there because dropping
+those lines whole hid the terminating signal, the thread and process it reached,
+and the core-dump flag. Their **order** is the one thing treated as host-side:
+measured 2026-08-31 over 12 `--strict` runs of seed 6 with byte-identical inputs,
+all 12 emitted the same two records and 3 of the 12 emitted them in the opposite
+order while their guest output stayed byte-identical.
+
+What is not compared is safehermit's accounting: a per-run identifier, absolute
+host paths, the applied bounds, an elapsed wall-clock time, and a byte count of
+output that is itself compared above.

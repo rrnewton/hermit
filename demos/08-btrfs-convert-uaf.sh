@@ -215,19 +215,45 @@ chaos_convert() {
 
 # The guest's own output, with the two host-side sources removed:
 #
-#   * safehermit's accounting lines, which carry a wall-clock elapsed time; and
+#   * safehermit's accounting lines, which carry a wall-clock elapsed time, a per-run
+#     identifier and absolute host paths; and
 #   * hermit's own log lines, which begin with a real UTC wall-clock timestamp
 #     (`2026-08-31T23:01:42.881384Z ERROR reverie_ptrace::lifecycle: ...`).
 #
-# This is the same principle the repository's comparison policy already applies to retained
-# logs: remove the real wall-clock prefix and compare the whole remainder exactly. Nothing
-# the guest itself writes begins with an ISO-8601 UTC timestamp, so the filter cannot
+# Nothing the guest itself writes begins with an ISO-8601 UTC timestamp, so this cannot
 # swallow guest output. Measured 2026-08-31: with these two sources removed, two --strict
 # runs of seed 6 are byte-identical across the entire transcript, UUID and full ASAN report
 # included.
+#
+# This drops hermit's log lines WHOLE, so it is not on its own the rule the repository's
+# comparison policy applies to retained logs. hermit_log_records() below compares what it
+# drops; the two together are that rule.
 guest_transcript() {
   grep -av -e '^safehermit: ' \
     -e '^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9:.]*Z ' "$1" || true
+}
+
+# Hermit's own log records with only the real wall-clock prefix removed, which is what the
+# repository's comparison policy does to a retained log: the timestamp is the part that
+# cannot be compared, so everything after it is kept and compared exactly.
+#
+# THIS EXISTS BECAUSE DROPPING THE WHOLE LINE HID A REAL FACT. The remainder carries the
+# terminating signal, the thread and process it reached, and whether a core was dumped
+# (`guest terminated by signal tid=5 pid=3 signal=SIGABRT core_dumped=true`) -- none of
+# which the guest's own output states. With the line dropped entirely, two runs differing
+# in the signal, the thread, or the core-dump flag compared as byte-identical.
+#
+# The records are compared UNORDERED, and only their order is treated that way. Measured
+# 2026-08-31 over 12 --strict runs of seed 6 with byte-identical inputs: all 12 emitted
+# exactly the same two records, and 3 of the 12 emitted them in the opposite order while
+# their guest output stayed byte-identical. So the emission order of these host-side
+# records is not a fact about the guest, and comparing them in order would report a
+# difference that says nothing.
+#
+# LC_ALL=C on both stages for the same reason the greps above pass -a: the capture is guest
+# output and must be treated as bytes, not as text in the ambient locale.
+hermit_log_records() {
+  LC_ALL=C sed -n 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9:.]*Z //p' "$1" | LC_ALL=C sort
 }
 
 echo "=== Demo 08: schedule-dependent btrfs-convert progress-thread UAF ==="
@@ -339,6 +365,9 @@ if ! uaf_reported "$ARTIFACTS/chaos-buggy.out"; then
 fi
 
 asan_core "$ARTIFACTS/chaos-buggy.out" | tee "$ARTIFACTS/asan-report.txt"
+# The guest exit status of the run Step 4 replays. safehermit reports it on a host-side
+# accounting line, so it is not in the transcript compared below and has to be carried here.
+BUGGY_RC_STEP2="$BUGGY_RC"
 echo "chaos buggy: reproduced the use-after-free on seed $CRASH_SEED (from $SEED_SOURCE)"
 echo
 
@@ -400,15 +429,40 @@ if ! cmp -s "$ARTIFACTS/guest-transcript.txt" "$ARTIFACTS/guest-transcript-repla
   exit 1
 fi
 
+# What the transcript above cannot carry: hermit's own log records, and the guest exit
+# status. Both were dropped before, and a run differing only in one of them compared as
+# byte-identical. Widening the transcript to the UUID fixed the case that was measured;
+# these two are the same class of gap left inside that fix.
+hermit_log_records "$ARTIFACTS/chaos-buggy.out" >"$ARTIFACTS/hermit-log-records.txt"
+hermit_log_records "$ARTIFACTS/chaos-buggy-replay.out" >"$ARTIFACTS/hermit-log-records-replay.txt"
+if ! cmp -s "$ARTIFACTS/hermit-log-records.txt" "$ARTIFACTS/hermit-log-records-replay.txt"; then
+  echo "replay: hermit's own log records differ between two runs of seed $CRASH_SEED over" >&2
+  echo "byte-identical inputs. These carry the terminating signal, the thread and process it" >&2
+  echo "reached, and whether a core was dumped. The wall-clock prefix is removed and the" >&2
+  echo "records are compared unordered, so this is a difference in WHAT happened, not in when" >&2
+  echo "hermit logged it or in what order." >&2
+  diff "$ARTIFACTS/hermit-log-records.txt" "$ARTIFACTS/hermit-log-records-replay.txt" >&2 || true
+  exit 1
+fi
+
+if [ "$BUGGY_RC" -ne "$BUGGY_RC_STEP2" ]; then
+  echo "replay: the guest exited $BUGGY_RC on the replay and $BUGGY_RC_STEP2 at Step 2, over" >&2
+  echo "byte-identical inputs. safehermit reports the exit status on a host-side accounting" >&2
+  echo "line, which is not part of the transcript compared above, so it is compared here." >&2
+  exit 1
+fi
+
 if cmp -s "$ARTIFACTS/asan-report.txt" "$ARTIFACTS/asan-report-replay.txt"; then
   # Say what was actually compared. A report that ASAN did not finish writing carries the
   # faulting address and PC but no frames, and claiming frames were compared would overstate
   # what this file holds.
   if grep -qa 'SUMMARY: AddressSanitizer' "$ARTIFACTS/asan-report.txt"; then
     echo "replay: entire guest transcript byte-identical, ASAN report included"
-    echo "        (same heap address, PC, frames, and filesystem UUID)"
+    echo "        (same heap address, PC, frames, and filesystem UUID); hermit's own log"
+    echo "        records and the guest exit status ($BUGGY_RC) match too"
   else
-    echo "replay: entire guest transcript byte-identical; the ASAN report is truncated, so"
+    echo "replay: entire guest transcript byte-identical, and hermit's own log records and"
+    echo "        the guest exit status ($BUGGY_RC) match; the ASAN report is truncated, so"
     echo "        it carries the heap address and PC but no frames to compare"
   fi
 else
