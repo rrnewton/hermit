@@ -170511,12 +170511,12 @@
       },
       "green_removal_reason": "RUN1598 reclassified 65 newly selected cells: 44 DBT infrastructure refusals and 21 KVM/SaBRe no-result executions; zero product divergences",
       "last_tested": {
-        "hermit_sha": "cd976f804de7568e34dc731b859dd7a5a1c1c0b9",
-        "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
+        "hermit_sha": "8515b4b9cc0f40bb65acda0b76d738b1a76528a5",
+        "detcore_tree": "cc4f7a5498e168ca7dd0a680e2b277a4074dce43",
         "depth": {
           "hermit": {
-            "commits": 2592,
-            "first_parent": 2517
+            "commits": 2622,
+            "first_parent": 2547
           },
           "reverie": {
             "commits": 999,
@@ -170835,6 +170835,146 @@
                   },
                   "cwd": "/repo",
                   "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/results/runs/validate-dagrun-cap-solo-current/c-programs-madvise-determinism-verify-kvm-attempt-2/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=8 HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-madvise-determinism-verify-kvm-attempt-2/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-madvise-determinism-verify-kvm-attempt-2/xdg-config /repo/target/ci/hermit-e2e-artifacts/f23cf64b0da6d2fc3e7547663f9f42a4975adf06cd08efce99a90fc7c8ea777b/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /results/runs/validate-dagrun-cap-solo-current/c-programs-madvise-determinism-verify-kvm-attempt-2/verify-1.json --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-madvise-determinism-verify-kvm-attempt-2/home --env XDG_CONFIG_HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-madvise-determinism-verify-kvm-attempt-2/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/results/runs/validate-dagrun-cap-solo-current/c-programs-madvise-determinism-verify-kvm-attempt-2/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=8 -- /results/runs/validate-dagrun-cap-solo-current/c-programs-madvise-determinism-verify-kvm-attempt-2/fixtures/program --kvm"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "detcore_tree": "cc4f7a5498e168ca7dd0a680e2b277a4074dce43",
+          "provenance": "pressure-test",
+          "depth": {
+            "hermit": {
+              "commits": 2622,
+              "first_parent": 2547
+            },
+            "reverie": {
+              "commits": 999,
+              "first_parent": 984
+            }
+          },
+          "hermit_shas": [
+            "8515b4b9cc0f40bb65acda0b76d738b1a76528a5"
+          ],
+          "results": [
+            "pass"
+          ],
+          "invocations": [
+            {
+              "hermit_sha": "8515b4b9cc0f40bb65acda0b76d738b1a76528a5",
+              "run_id": "portable-c-programs-c-programs-madvise-determinism-verify-kvm",
+              "result": "pass",
+              "argv": [
+                "/repo/target/release/hermit",
+                "--log",
+                "info",
+                "run",
+                "--base-env=minimal",
+                "--backend",
+                "kvm",
+                "--strict",
+                "--verify-strict",
+                "--verify",
+                "--verify-json",
+                "/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/verify-1.json",
+                "--keep-logs",
+                "--verify-log-dir",
+                "/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/verify-logs/verify-1",
+                "--mount=type=tmpfs,target=/test",
+                "--workdir",
+                "/test",
+                "--env",
+                "LC_ALL=C",
+                "--env",
+                "TZ=UTC",
+                "--env",
+                "HOME=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/home",
+                "--env",
+                "XDG_CONFIG_HOME=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/xdg-config",
+                "--env",
+                "E2E_TMPDIR=/test",
+                "--env",
+                "E2E_FIXTURE_DIR=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/fixtures",
+                "--env",
+                "HERMIT_E2E_SCHEDULED_JOBS=1",
+                "--",
+                "/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/fixtures/program",
+                "--kvm"
+              ],
+              "guest_argv": [
+                "/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/fixtures/program",
+                "--kvm"
+              ],
+              "env": {
+                "E2E_FIXTURE_DIR": "/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/fixtures",
+                "E2E_TMPDIR": "/tmp/hermit-e2e",
+                "HERMIT_E2E_SCHEDULED_JOBS": "1",
+                "HOME": "/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/home",
+                "LC_ALL": "C",
+                "TZ": "UTC",
+                "XDG_CONFIG_HOME": "/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/xdg-config"
+              },
+              "cwd": "/repo",
+              "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=1 HOME=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/verify-1.json --keep-logs --verify-log-dir /repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/verify-logs/verify-1 --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/home --env XDG_CONFIG_HOME=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=1 -- /repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/fixtures/program --kvm",
+              "attempts": [
+                {
+                  "index": "1",
+                  "outcome": "PASS",
+                  "status": 0,
+                  "signal": null,
+                  "timed_out": false,
+                  "argv": [
+                    "/repo/target/release/hermit",
+                    "--log",
+                    "info",
+                    "run",
+                    "--base-env=minimal",
+                    "--backend",
+                    "kvm",
+                    "--strict",
+                    "--verify-strict",
+                    "--verify",
+                    "--verify-json",
+                    "/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/verify-1.json",
+                    "--keep-logs",
+                    "--verify-log-dir",
+                    "/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/verify-logs/verify-1",
+                    "--mount=type=tmpfs,target=/test",
+                    "--workdir",
+                    "/test",
+                    "--env",
+                    "LC_ALL=C",
+                    "--env",
+                    "TZ=UTC",
+                    "--env",
+                    "HOME=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/home",
+                    "--env",
+                    "XDG_CONFIG_HOME=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/xdg-config",
+                    "--env",
+                    "E2E_TMPDIR=/test",
+                    "--env",
+                    "E2E_FIXTURE_DIR=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/fixtures",
+                    "--env",
+                    "HERMIT_E2E_SCHEDULED_JOBS=1",
+                    "--",
+                    "/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/fixtures/program",
+                    "--kvm"
+                  ],
+                  "guest_argv": [
+                    "/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/fixtures/program",
+                    "--kvm"
+                  ],
+                  "env": {
+                    "E2E_FIXTURE_DIR": "/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/fixtures",
+                    "E2E_TMPDIR": "/tmp/hermit-e2e",
+                    "HERMIT_E2E_SCHEDULED_JOBS": "1",
+                    "HOME": "/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/home",
+                    "LC_ALL": "C",
+                    "TZ": "UTC",
+                    "XDG_CONFIG_HOME": "/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/xdg-config"
+                  },
+                  "cwd": "/repo",
+                  "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=1 HOME=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/verify-1.json --keep-logs --verify-log-dir /repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/verify-logs/verify-1 --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/home --env XDG_CONFIG_HOME=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=1 -- /repo/ignored/kvm5/madvise-determinism/runs/portable-c-programs-c-programs-madvise-determinism-verify-kvm/c-programs-madvise-determinism-verify-kvm/fixtures/program --kvm"
                 }
               ]
             }
@@ -179840,12 +179980,12 @@
       },
       "green_removal_reason": "RUN1598 reclassified 65 newly selected cells: 44 DBT infrastructure refusals and 21 KVM/SaBRe no-result executions; zero product divergences",
       "last_tested": {
-        "hermit_sha": "cd976f804de7568e34dc731b859dd7a5a1c1c0b9",
-        "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
+        "hermit_sha": "f4501eec783927e321411e2c8ea00f106b2a1270",
+        "detcore_tree": "cc4f7a5498e168ca7dd0a680e2b277a4074dce43",
         "depth": {
           "hermit": {
-            "commits": 2592,
-            "first_parent": 2517
+            "commits": 2623,
+            "first_parent": 2548
           },
           "reverie": {
             "commits": 999,
@@ -180164,6 +180304,146 @@
                   },
                   "cwd": "/repo",
                   "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/results/runs/validate-dagrun-cap-solo-current/c-programs-mmap-determinism-verify-kvm-attempt-2/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=8 HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-mmap-determinism-verify-kvm-attempt-2/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-mmap-determinism-verify-kvm-attempt-2/xdg-config /repo/target/ci/hermit-e2e-artifacts/f23cf64b0da6d2fc3e7547663f9f42a4975adf06cd08efce99a90fc7c8ea777b/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /results/runs/validate-dagrun-cap-solo-current/c-programs-mmap-determinism-verify-kvm-attempt-2/verify-1.json --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-mmap-determinism-verify-kvm-attempt-2/home --env XDG_CONFIG_HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-mmap-determinism-verify-kvm-attempt-2/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/results/runs/validate-dagrun-cap-solo-current/c-programs-mmap-determinism-verify-kvm-attempt-2/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=8 -- /results/runs/validate-dagrun-cap-solo-current/c-programs-mmap-determinism-verify-kvm-attempt-2/fixtures/program multiple"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "detcore_tree": "cc4f7a5498e168ca7dd0a680e2b277a4074dce43",
+          "provenance": "pressure-test",
+          "depth": {
+            "hermit": {
+              "commits": 2623,
+              "first_parent": 2548
+            },
+            "reverie": {
+              "commits": 999,
+              "first_parent": 984
+            }
+          },
+          "hermit_shas": [
+            "f4501eec783927e321411e2c8ea00f106b2a1270"
+          ],
+          "results": [
+            "pass"
+          ],
+          "invocations": [
+            {
+              "hermit_sha": "f4501eec783927e321411e2c8ea00f106b2a1270",
+              "run_id": "portable-c-programs-c-programs-mmap-determinism-verify-kvm",
+              "result": "pass",
+              "argv": [
+                "/repo/target/release/hermit",
+                "--log",
+                "info",
+                "run",
+                "--base-env=minimal",
+                "--backend",
+                "kvm",
+                "--strict",
+                "--verify-strict",
+                "--verify",
+                "--verify-json",
+                "/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/verify-1.json",
+                "--keep-logs",
+                "--verify-log-dir",
+                "/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/verify-logs/verify-1",
+                "--mount=type=tmpfs,target=/test",
+                "--workdir",
+                "/test",
+                "--env",
+                "LC_ALL=C",
+                "--env",
+                "TZ=UTC",
+                "--env",
+                "HOME=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/home",
+                "--env",
+                "XDG_CONFIG_HOME=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/xdg-config",
+                "--env",
+                "E2E_TMPDIR=/test",
+                "--env",
+                "E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/fixtures",
+                "--env",
+                "HERMIT_E2E_SCHEDULED_JOBS=1",
+                "--",
+                "/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/fixtures/program",
+                "multiple"
+              ],
+              "guest_argv": [
+                "/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/fixtures/program",
+                "multiple"
+              ],
+              "env": {
+                "E2E_FIXTURE_DIR": "/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/fixtures",
+                "E2E_TMPDIR": "/tmp/hermit-e2e",
+                "HERMIT_E2E_SCHEDULED_JOBS": "1",
+                "HOME": "/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/home",
+                "LC_ALL": "C",
+                "TZ": "UTC",
+                "XDG_CONFIG_HOME": "/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/xdg-config"
+              },
+              "cwd": "/repo",
+              "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=1 HOME=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/verify-1.json --keep-logs --verify-log-dir /repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/verify-logs/verify-1 --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/home --env XDG_CONFIG_HOME=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=1 -- /repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/fixtures/program multiple",
+              "attempts": [
+                {
+                  "index": "1",
+                  "outcome": "PASS",
+                  "status": 0,
+                  "signal": null,
+                  "timed_out": false,
+                  "argv": [
+                    "/repo/target/release/hermit",
+                    "--log",
+                    "info",
+                    "run",
+                    "--base-env=minimal",
+                    "--backend",
+                    "kvm",
+                    "--strict",
+                    "--verify-strict",
+                    "--verify",
+                    "--verify-json",
+                    "/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/verify-1.json",
+                    "--keep-logs",
+                    "--verify-log-dir",
+                    "/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/verify-logs/verify-1",
+                    "--mount=type=tmpfs,target=/test",
+                    "--workdir",
+                    "/test",
+                    "--env",
+                    "LC_ALL=C",
+                    "--env",
+                    "TZ=UTC",
+                    "--env",
+                    "HOME=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/home",
+                    "--env",
+                    "XDG_CONFIG_HOME=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/xdg-config",
+                    "--env",
+                    "E2E_TMPDIR=/test",
+                    "--env",
+                    "E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/fixtures",
+                    "--env",
+                    "HERMIT_E2E_SCHEDULED_JOBS=1",
+                    "--",
+                    "/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/fixtures/program",
+                    "multiple"
+                  ],
+                  "guest_argv": [
+                    "/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/fixtures/program",
+                    "multiple"
+                  ],
+                  "env": {
+                    "E2E_FIXTURE_DIR": "/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/fixtures",
+                    "E2E_TMPDIR": "/tmp/hermit-e2e",
+                    "HERMIT_E2E_SCHEDULED_JOBS": "1",
+                    "HOME": "/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/home",
+                    "LC_ALL": "C",
+                    "TZ": "UTC",
+                    "XDG_CONFIG_HOME": "/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/xdg-config"
+                  },
+                  "cwd": "/repo",
+                  "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=1 HOME=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/verify-1.json --keep-logs --verify-log-dir /repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/verify-logs/verify-1 --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/home --env XDG_CONFIG_HOME=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=1 -- /repo/ignored/kvm5/re-mmap-determinism/runs/portable-c-programs-c-programs-mmap-determinism-verify-kvm/c-programs-mmap-determinism-verify-kvm/fixtures/program multiple"
                 }
               ]
             }
@@ -189738,12 +190018,12 @@
       },
       "green_removal_reason": "RUN1598 reclassified 65 newly selected cells: 44 DBT infrastructure refusals and 21 KVM/SaBRe no-result executions; zero product divergences",
       "last_tested": {
-        "hermit_sha": "cd976f804de7568e34dc731b859dd7a5a1c1c0b9",
-        "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
+        "hermit_sha": "ca2430d69c624b76d79d91abb08452e9a8c8b8bd",
+        "detcore_tree": "cc4f7a5498e168ca7dd0a680e2b277a4074dce43",
         "depth": {
           "hermit": {
-            "commits": 2592,
-            "first_parent": 2517
+            "commits": 2624,
+            "first_parent": 2549
           },
           "reverie": {
             "commits": 999,
@@ -190054,6 +190334,142 @@
                   },
                   "cwd": "/repo",
                   "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-generic-verify-kvm-attempt-2/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=8 HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-generic-verify-kvm-attempt-2/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-generic-verify-kvm-attempt-2/xdg-config /repo/target/ci/hermit-e2e-artifacts/f23cf64b0da6d2fc3e7547663f9f42a4975adf06cd08efce99a90fc7c8ea777b/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-generic-verify-kvm-attempt-2/verify-1.json --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-generic-verify-kvm-attempt-2/home --env XDG_CONFIG_HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-generic-verify-kvm-attempt-2/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-generic-verify-kvm-attempt-2/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=8 -- /results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-generic-verify-kvm-attempt-2/fixtures/program"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "detcore_tree": "cc4f7a5498e168ca7dd0a680e2b277a4074dce43",
+          "provenance": "pressure-test",
+          "depth": {
+            "hermit": {
+              "commits": 2624,
+              "first_parent": 2549
+            },
+            "reverie": {
+              "commits": 999,
+              "first_parent": 984
+            }
+          },
+          "hermit_shas": [
+            "ca2430d69c624b76d79d91abb08452e9a8c8b8bd"
+          ],
+          "results": [
+            "pass"
+          ],
+          "invocations": [
+            {
+              "hermit_sha": "ca2430d69c624b76d79d91abb08452e9a8c8b8bd",
+              "run_id": "portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm",
+              "result": "pass",
+              "argv": [
+                "/repo/target/release/hermit",
+                "--log",
+                "info",
+                "run",
+                "--base-env=minimal",
+                "--backend",
+                "kvm",
+                "--strict",
+                "--verify-strict",
+                "--verify",
+                "--verify-json",
+                "/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/verify-1.json",
+                "--keep-logs",
+                "--verify-log-dir",
+                "/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/verify-logs/verify-1",
+                "--mount=type=tmpfs,target=/test",
+                "--workdir",
+                "/test",
+                "--env",
+                "LC_ALL=C",
+                "--env",
+                "TZ=UTC",
+                "--env",
+                "HOME=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/home",
+                "--env",
+                "XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/xdg-config",
+                "--env",
+                "E2E_TMPDIR=/test",
+                "--env",
+                "E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/fixtures",
+                "--env",
+                "HERMIT_E2E_SCHEDULED_JOBS=1",
+                "--",
+                "/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/fixtures/program"
+              ],
+              "guest_argv": [
+                "/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/fixtures/program"
+              ],
+              "env": {
+                "E2E_FIXTURE_DIR": "/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/fixtures",
+                "E2E_TMPDIR": "/tmp/hermit-e2e",
+                "HERMIT_E2E_SCHEDULED_JOBS": "1",
+                "HOME": "/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/home",
+                "LC_ALL": "C",
+                "TZ": "UTC",
+                "XDG_CONFIG_HOME": "/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/xdg-config"
+              },
+              "cwd": "/repo",
+              "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=1 HOME=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/verify-1.json --keep-logs --verify-log-dir /repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/verify-logs/verify-1 --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/home --env XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=1 -- /repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/fixtures/program",
+              "attempts": [
+                {
+                  "index": "1",
+                  "outcome": "PASS",
+                  "status": 0,
+                  "signal": null,
+                  "timed_out": false,
+                  "argv": [
+                    "/repo/target/release/hermit",
+                    "--log",
+                    "info",
+                    "run",
+                    "--base-env=minimal",
+                    "--backend",
+                    "kvm",
+                    "--strict",
+                    "--verify-strict",
+                    "--verify",
+                    "--verify-json",
+                    "/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/verify-1.json",
+                    "--keep-logs",
+                    "--verify-log-dir",
+                    "/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/verify-logs/verify-1",
+                    "--mount=type=tmpfs,target=/test",
+                    "--workdir",
+                    "/test",
+                    "--env",
+                    "LC_ALL=C",
+                    "--env",
+                    "TZ=UTC",
+                    "--env",
+                    "HOME=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/home",
+                    "--env",
+                    "XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/xdg-config",
+                    "--env",
+                    "E2E_TMPDIR=/test",
+                    "--env",
+                    "E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/fixtures",
+                    "--env",
+                    "HERMIT_E2E_SCHEDULED_JOBS=1",
+                    "--",
+                    "/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/fixtures/program"
+                  ],
+                  "guest_argv": [
+                    "/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/fixtures/program"
+                  ],
+                  "env": {
+                    "E2E_FIXTURE_DIR": "/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/fixtures",
+                    "E2E_TMPDIR": "/tmp/hermit-e2e",
+                    "HERMIT_E2E_SCHEDULED_JOBS": "1",
+                    "HOME": "/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/home",
+                    "LC_ALL": "C",
+                    "TZ": "UTC",
+                    "XDG_CONFIG_HOME": "/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/xdg-config"
+                  },
+                  "cwd": "/repo",
+                  "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=1 HOME=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/verify-1.json --keep-logs --verify-log-dir /repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/verify-logs/verify-1 --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/home --env XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=1 -- /repo/ignored/kvm5/re-netlink-autobind-generic/runs/portable-c-programs-c-programs-netlink-autobind-generic-verify-kvm/c-programs-netlink-autobind-generic-verify-kvm/fixtures/program"
                 }
               ]
             }
@@ -190464,12 +190880,12 @@
       },
       "green_removal_reason": "RUN1598 reclassified 65 newly selected cells: 44 DBT infrastructure refusals and 21 KVM/SaBRe no-result executions; zero product divergences",
       "last_tested": {
-        "hermit_sha": "cd976f804de7568e34dc731b859dd7a5a1c1c0b9",
-        "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
+        "hermit_sha": "a6129d9cce415b338ae279870c54700d54d9020f",
+        "detcore_tree": "cc4f7a5498e168ca7dd0a680e2b277a4074dce43",
         "depth": {
           "hermit": {
-            "commits": 2592,
-            "first_parent": 2517
+            "commits": 2625,
+            "first_parent": 2550
           },
           "reverie": {
             "commits": 999,
@@ -190780,6 +191196,142 @@
                   },
                   "cwd": "/repo",
                   "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-route-verify-kvm-attempt-2/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=8 HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-route-verify-kvm-attempt-2/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-route-verify-kvm-attempt-2/xdg-config /repo/target/ci/hermit-e2e-artifacts/f23cf64b0da6d2fc3e7547663f9f42a4975adf06cd08efce99a90fc7c8ea777b/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-route-verify-kvm-attempt-2/verify-1.json --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-route-verify-kvm-attempt-2/home --env XDG_CONFIG_HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-route-verify-kvm-attempt-2/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-route-verify-kvm-attempt-2/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=8 -- /results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-route-verify-kvm-attempt-2/fixtures/program"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "detcore_tree": "cc4f7a5498e168ca7dd0a680e2b277a4074dce43",
+          "provenance": "pressure-test",
+          "depth": {
+            "hermit": {
+              "commits": 2625,
+              "first_parent": 2550
+            },
+            "reverie": {
+              "commits": 999,
+              "first_parent": 984
+            }
+          },
+          "hermit_shas": [
+            "a6129d9cce415b338ae279870c54700d54d9020f"
+          ],
+          "results": [
+            "pass"
+          ],
+          "invocations": [
+            {
+              "hermit_sha": "a6129d9cce415b338ae279870c54700d54d9020f",
+              "run_id": "portable-c-programs-c-programs-netlink-autobind-route-verify-kvm",
+              "result": "pass",
+              "argv": [
+                "/repo/target/release/hermit",
+                "--log",
+                "info",
+                "run",
+                "--base-env=minimal",
+                "--backend",
+                "kvm",
+                "--strict",
+                "--verify-strict",
+                "--verify",
+                "--verify-json",
+                "/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/verify-1.json",
+                "--keep-logs",
+                "--verify-log-dir",
+                "/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/verify-logs/verify-1",
+                "--mount=type=tmpfs,target=/test",
+                "--workdir",
+                "/test",
+                "--env",
+                "LC_ALL=C",
+                "--env",
+                "TZ=UTC",
+                "--env",
+                "HOME=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/home",
+                "--env",
+                "XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/xdg-config",
+                "--env",
+                "E2E_TMPDIR=/test",
+                "--env",
+                "E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/fixtures",
+                "--env",
+                "HERMIT_E2E_SCHEDULED_JOBS=1",
+                "--",
+                "/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/fixtures/program"
+              ],
+              "guest_argv": [
+                "/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/fixtures/program"
+              ],
+              "env": {
+                "E2E_FIXTURE_DIR": "/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/fixtures",
+                "E2E_TMPDIR": "/tmp/hermit-e2e",
+                "HERMIT_E2E_SCHEDULED_JOBS": "1",
+                "HOME": "/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/home",
+                "LC_ALL": "C",
+                "TZ": "UTC",
+                "XDG_CONFIG_HOME": "/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/xdg-config"
+              },
+              "cwd": "/repo",
+              "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=1 HOME=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/verify-1.json --keep-logs --verify-log-dir /repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/verify-logs/verify-1 --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/home --env XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=1 -- /repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/fixtures/program",
+              "attempts": [
+                {
+                  "index": "1",
+                  "outcome": "PASS",
+                  "status": 0,
+                  "signal": null,
+                  "timed_out": false,
+                  "argv": [
+                    "/repo/target/release/hermit",
+                    "--log",
+                    "info",
+                    "run",
+                    "--base-env=minimal",
+                    "--backend",
+                    "kvm",
+                    "--strict",
+                    "--verify-strict",
+                    "--verify",
+                    "--verify-json",
+                    "/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/verify-1.json",
+                    "--keep-logs",
+                    "--verify-log-dir",
+                    "/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/verify-logs/verify-1",
+                    "--mount=type=tmpfs,target=/test",
+                    "--workdir",
+                    "/test",
+                    "--env",
+                    "LC_ALL=C",
+                    "--env",
+                    "TZ=UTC",
+                    "--env",
+                    "HOME=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/home",
+                    "--env",
+                    "XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/xdg-config",
+                    "--env",
+                    "E2E_TMPDIR=/test",
+                    "--env",
+                    "E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/fixtures",
+                    "--env",
+                    "HERMIT_E2E_SCHEDULED_JOBS=1",
+                    "--",
+                    "/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/fixtures/program"
+                  ],
+                  "guest_argv": [
+                    "/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/fixtures/program"
+                  ],
+                  "env": {
+                    "E2E_FIXTURE_DIR": "/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/fixtures",
+                    "E2E_TMPDIR": "/tmp/hermit-e2e",
+                    "HERMIT_E2E_SCHEDULED_JOBS": "1",
+                    "HOME": "/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/home",
+                    "LC_ALL": "C",
+                    "TZ": "UTC",
+                    "XDG_CONFIG_HOME": "/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/xdg-config"
+                  },
+                  "cwd": "/repo",
+                  "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=1 HOME=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/verify-1.json --keep-logs --verify-log-dir /repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/verify-logs/verify-1 --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/home --env XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=1 -- /repo/ignored/kvm5/re-netlink-autobind-route/runs/portable-c-programs-c-programs-netlink-autobind-route-verify-kvm/c-programs-netlink-autobind-route-verify-kvm/fixtures/program"
                 }
               ]
             }
@@ -191190,12 +191742,12 @@
       },
       "green_removal_reason": "RUN1598 reclassified 65 newly selected cells: 44 DBT infrastructure refusals and 21 KVM/SaBRe no-result executions; zero product divergences",
       "last_tested": {
-        "hermit_sha": "cd976f804de7568e34dc731b859dd7a5a1c1c0b9",
-        "detcore_tree": "077a5d847f6541daa5ef145536a7065868e9d3ab",
+        "hermit_sha": "5b78147a624d0546dcc1a841e2ffc90c8fff198c",
+        "detcore_tree": "cc4f7a5498e168ca7dd0a680e2b277a4074dce43",
         "depth": {
           "hermit": {
-            "commits": 2592,
-            "first_parent": 2517
+            "commits": 2626,
+            "first_parent": 2551
           },
           "reverie": {
             "commits": 999,
@@ -191506,6 +192058,142 @@
                   },
                   "cwd": "/repo",
                   "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-usersock-verify-kvm-attempt-2/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=8 HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-usersock-verify-kvm-attempt-2/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-usersock-verify-kvm-attempt-2/xdg-config /repo/target/ci/hermit-e2e-artifacts/f23cf64b0da6d2fc3e7547663f9f42a4975adf06cd08efce99a90fc7c8ea777b/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-usersock-verify-kvm-attempt-2/verify-1.json --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-usersock-verify-kvm-attempt-2/home --env XDG_CONFIG_HOME=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-usersock-verify-kvm-attempt-2/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-usersock-verify-kvm-attempt-2/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=8 -- /results/runs/validate-dagrun-cap-solo-current/c-programs-netlink-autobind-usersock-verify-kvm-attempt-2/fixtures/program"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "detcore_tree": "cc4f7a5498e168ca7dd0a680e2b277a4074dce43",
+          "provenance": "pressure-test",
+          "depth": {
+            "hermit": {
+              "commits": 2626,
+              "first_parent": 2551
+            },
+            "reverie": {
+              "commits": 999,
+              "first_parent": 984
+            }
+          },
+          "hermit_shas": [
+            "5b78147a624d0546dcc1a841e2ffc90c8fff198c"
+          ],
+          "results": [
+            "pass"
+          ],
+          "invocations": [
+            {
+              "hermit_sha": "5b78147a624d0546dcc1a841e2ffc90c8fff198c",
+              "run_id": "portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm",
+              "result": "pass",
+              "argv": [
+                "/repo/target/release/hermit",
+                "--log",
+                "info",
+                "run",
+                "--base-env=minimal",
+                "--backend",
+                "kvm",
+                "--strict",
+                "--verify-strict",
+                "--verify",
+                "--verify-json",
+                "/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/verify-1.json",
+                "--keep-logs",
+                "--verify-log-dir",
+                "/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/verify-logs/verify-1",
+                "--mount=type=tmpfs,target=/test",
+                "--workdir",
+                "/test",
+                "--env",
+                "LC_ALL=C",
+                "--env",
+                "TZ=UTC",
+                "--env",
+                "HOME=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/home",
+                "--env",
+                "XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/xdg-config",
+                "--env",
+                "E2E_TMPDIR=/test",
+                "--env",
+                "E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/fixtures",
+                "--env",
+                "HERMIT_E2E_SCHEDULED_JOBS=1",
+                "--",
+                "/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/fixtures/program"
+              ],
+              "guest_argv": [
+                "/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/fixtures/program"
+              ],
+              "env": {
+                "E2E_FIXTURE_DIR": "/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/fixtures",
+                "E2E_TMPDIR": "/tmp/hermit-e2e",
+                "HERMIT_E2E_SCHEDULED_JOBS": "1",
+                "HOME": "/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/home",
+                "LC_ALL": "C",
+                "TZ": "UTC",
+                "XDG_CONFIG_HOME": "/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/xdg-config"
+              },
+              "cwd": "/repo",
+              "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=1 HOME=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/verify-1.json --keep-logs --verify-log-dir /repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/verify-logs/verify-1 --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/home --env XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=1 -- /repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/fixtures/program",
+              "attempts": [
+                {
+                  "index": "1",
+                  "outcome": "PASS",
+                  "status": 0,
+                  "signal": null,
+                  "timed_out": false,
+                  "argv": [
+                    "/repo/target/release/hermit",
+                    "--log",
+                    "info",
+                    "run",
+                    "--base-env=minimal",
+                    "--backend",
+                    "kvm",
+                    "--strict",
+                    "--verify-strict",
+                    "--verify",
+                    "--verify-json",
+                    "/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/verify-1.json",
+                    "--keep-logs",
+                    "--verify-log-dir",
+                    "/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/verify-logs/verify-1",
+                    "--mount=type=tmpfs,target=/test",
+                    "--workdir",
+                    "/test",
+                    "--env",
+                    "LC_ALL=C",
+                    "--env",
+                    "TZ=UTC",
+                    "--env",
+                    "HOME=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/home",
+                    "--env",
+                    "XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/xdg-config",
+                    "--env",
+                    "E2E_TMPDIR=/test",
+                    "--env",
+                    "E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/fixtures",
+                    "--env",
+                    "HERMIT_E2E_SCHEDULED_JOBS=1",
+                    "--",
+                    "/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/fixtures/program"
+                  ],
+                  "guest_argv": [
+                    "/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/fixtures/program"
+                  ],
+                  "env": {
+                    "E2E_FIXTURE_DIR": "/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/fixtures",
+                    "E2E_TMPDIR": "/tmp/hermit-e2e",
+                    "HERMIT_E2E_SCHEDULED_JOBS": "1",
+                    "HOME": "/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/home",
+                    "LC_ALL": "C",
+                    "TZ": "UTC",
+                    "XDG_CONFIG_HOME": "/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/xdg-config"
+                  },
+                  "cwd": "/repo",
+                  "shell_command": "cd /repo && env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/fixtures E2E_TMPDIR=/tmp/hermit-e2e HERMIT_E2E_SCHEDULED_JOBS=1 HOME=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/home LC_ALL=C TZ=UTC XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/xdg-config /repo/target/release/hermit --log info run --base-env=minimal --backend kvm --strict --verify-strict --verify --verify-json /repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/verify-1.json --keep-logs --verify-log-dir /repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/verify-logs/verify-1 --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C --env TZ=UTC --env HOME=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/home --env XDG_CONFIG_HOME=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/xdg-config --env E2E_TMPDIR=/test --env E2E_FIXTURE_DIR=/repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/fixtures --env HERMIT_E2E_SCHEDULED_JOBS=1 -- /repo/ignored/kvm5/re-netlink-autobind-usersock/runs/portable-c-programs-c-programs-netlink-autobind-usersock-verify-kvm/c-programs-netlink-autobind-usersock-verify-kvm/fixtures/program"
                 }
               ]
             }
