@@ -2338,6 +2338,11 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     config.backend_dispatches_thread_tools = true;
     config.backend_tracks_process_children = backend != Backend::Dbt;
     config.backend_requires_thread_directed_process_signals = backend == Backend::Dbt;
+    // E9patch preprocesses the guest and then uses the ptrace builder. LiteInst,
+    // DBT, KVM, and SaBRe re-invoke the Tool callback on ERESTARTSYS instead of
+    // resuming through the kernel's ptrace syscall-restart frame.
+    config.backend_supports_parked_write_signal_interruption =
+        matches!(backend, Backend::Ptrace | Backend::E9patch);
     config.backend_virtualizes_capability_prctls = backend == Backend::Kvm;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child
@@ -4005,6 +4010,24 @@ mod tests {
         assert!(!config.backend_tracks_process_children);
         assert!(config.backend_requires_thread_directed_process_signals);
         assert!(!config.backend_defers_vfork_child_registration);
+    }
+
+    #[test]
+    fn backend_write_signal_contract_is_explicit() {
+        for (backend, supports_interruption) in [
+            (Backend::Ptrace, true),
+            (Backend::Dbt, false),
+            (Backend::Kvm, false),
+            (Backend::Sabre, false),
+            (Backend::Liteinst, false),
+            (Backend::E9patch, true),
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            assert_eq!(
+                config.backend_supports_parked_write_signal_interruption, supports_interruption,
+                "unexpected parked-write signal support for {backend:?}"
+            );
+        }
     }
 
     #[test]

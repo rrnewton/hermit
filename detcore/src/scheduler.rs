@@ -41,6 +41,7 @@ use rand::SeedableRng;
 use rand::seq::IndexedRandom;
 use rand::seq::SliceRandom;
 use rand_pcg::Pcg64Mcg;
+use reverie::Errno;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 pub use runqueue::DEFAULT_PRIORITY;
@@ -579,8 +580,9 @@ pub struct Scheduler {
     pending_run_queue_removals: BTreeMap<DetTid, RemovalDisposition>,
 
     /// Cross-task signals physically queued while their sole target was parked
-    /// in waitid polling. Applied at step2, where run-queue mutation is safe.
-    pending_waitid_signals: BTreeMap<DetTid, Vec<SigWrapper>>,
+    /// in waitid or restartable internal IO polling. Applied at step2, where
+    /// run-queue mutation is safe.
+    pending_cross_task_signals: BTreeMap<DetTid, Vec<SigWrapper>>,
 
     /// Child-TID futexes whose kernel clear may still be racing a guest join.
     cleared_child_tids: HashMap<FutexID, DetTid>,
@@ -602,6 +604,10 @@ pub struct Scheduler {
     /// Whether scheduler identities must be resolved through a host thread
     /// pidfd before sending process-directed signals.
     backend_requires_thread_directed_process_signals: bool,
+
+    /// Whether this backend can preserve Linux signal semantics when a
+    /// scheduler-managed pipe write is woken by a cross-task signal.
+    backend_supports_parked_write_signal_interruption: bool,
 
     /// Raw TIDs removed by logical teardown. Tombstones are permanent for the life of this
     /// scheduler: accepting Linux TID reuse would let delayed backend RPCs bind to a new thread.
@@ -1425,12 +1431,14 @@ impl Scheduler {
             vfork_barriers: Default::default(),
             pending_run_queue_admissions: Default::default(),
             pending_run_queue_removals: Default::default(),
-            pending_waitid_signals: Default::default(),
+            pending_cross_task_signals: Default::default(),
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
             cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
             backend_requires_thread_directed_process_signals: cfg
                 .backend_requires_thread_directed_process_signals,
+            backend_supports_parked_write_signal_interruption: cfg
+                .backend_supports_parked_write_signal_interruption,
             logically_killed_threads: Default::default(),
             exec_incarnations: Default::default(),
             deregistration_accounted: Default::default(),
@@ -2265,7 +2273,7 @@ impl Scheduler {
         // drain before admissions so a thread killed while an admission was
         // still buffered is not re-enqueued.
         self.drain_pending_run_queue_removals();
-        self.drain_pending_waitid_signals();
+        self.drain_pending_cross_task_signals();
         self.drain_pending_run_queue_admissions();
         if self
             .blocked
@@ -2809,23 +2817,12 @@ impl Scheduler {
         if legacy_polling || waiting_on_child {
             return Some(WaitidSignalRequest::Parked);
         }
-        // Signals already materialized on this request by an earlier drain.
-        //
-        // Deliberately matches `WaitidSignals` ONLY. An earlier revision also
-        // matched `InboundSignal`, intending to make the observed set
-        // independent of which path delivered first. That was wrong and it
-        // crashed: the drain then produced a request holding BOTH resources,
-        // and `step4_resource_block` / `blocking_request_is_ready` assert a
-        // request carries exactly one resource, so the scheduler daemon
-        // panicked and the container hung. It reproduced on a guest with no
-        // `waitid` in it at all -- two sibling threads `pthread_kill`ing a
-        // third is enough, because `{InboundSignal}` with `poll_attempt: 0` is
-        // exactly what `signal_guest` installs.
-        //
-        // Merging the two would require either teaching both assertions to
-        // accept the pair, or folding the signal into `WaitidSignals` and
-        // dropping the `InboundSignal` key -- which discards the SIGCHLD
-        // deferral its grant path performs. Neither belongs in this change.
+        // Signals already materialized on this waitid request by an earlier
+        // drain. A marked `WaitidSignals` resource instead belongs to an
+        // interrupted InternalIOPolling request and is classified below.
+        if resources.signal_interrupt_errno().is_some() {
+            return None;
+        }
         resources
             .resources
             .keys()
@@ -2837,12 +2834,37 @@ impl Scheduler {
             })
     }
 
+    fn restartable_internal_io_signals(&self, dettid: DetTid) -> Option<Vec<SigWrapper>> {
+        if !self.backend_supports_parked_write_signal_interruption {
+            return None;
+        }
+        self.next_turns
+            .get(&dettid)
+            .and_then(|next_turn| next_turn.req.try_read())
+            .and_then(Result::ok)
+            .and_then(|resources| {
+                if resources.resources.len() != 1
+                    || resources.signal_interrupt_errno() != Some(Errno::ERESTARTSYS.into_raw())
+                {
+                    return None;
+                }
+                match resources.resources.keys().next() {
+                    Some(ResourceID::InternalIOPolling) => Some(Vec::new()),
+                    Some(ResourceID::WaitidSignals(signals)) => Some(signals.clone()),
+                    _ => None,
+                }
+            })
+    }
+
     /// Record an unambiguous cross-task signal that was physically queued while
-    /// its target was parked in waitid. The request rewrite is deferred to step2
-    /// so an asynchronous backend cannot mutate beneath a tentative selection.
+    /// its target was parked in waitid or restartable internal IO polling. The
+    /// request rewrite is deferred to step2 so an asynchronous backend cannot
+    /// mutate beneath a tentative selection.
     pub(crate) fn notify_signal_pending(&mut self, dettid: DetTid, signal: SigWrapper) {
-        if self.waitid_signal_request(dettid).is_some() {
-            let signals = self.pending_waitid_signals.entry(dettid).or_default();
+        if self.waitid_signal_request(dettid).is_some()
+            || self.restartable_internal_io_signals(dettid).is_some()
+        {
+            let signals = self.pending_cross_task_signals.entry(dettid).or_default();
             if !signals.contains(&signal) {
                 signals.push(signal);
             }
@@ -3599,7 +3621,13 @@ impl Scheduler {
                 0 => Ok(()),
                 1 => {
                     let (rid, perm) = rs.resources.iter().next().unwrap();
-                    self.block_for_one_resource(dettid, rid, perm, resp)
+                    self.block_for_one_resource(
+                        dettid,
+                        rid,
+                        perm,
+                        rs.signal_interrupt_errno(),
+                        resp,
+                    )
                 }
                 _ => {
                     panic!(
@@ -3639,6 +3667,7 @@ impl Scheduler {
         dettid: DetTid,
         rid: &ResourceID,
         _perm: &Permission,
+        signal_interrupt_errno: Option<i32>,
         resp: &Ivar<SchedResponse>,
     ) -> Result<(), SkipTurn> {
         match rid {
@@ -3831,6 +3860,7 @@ impl Scheduler {
                 // grant it now rather than deferring it a second time.
                 let already_readmitted = self.blocked.sigchld_ready.remove(&dettid);
                 if sig.signal() == Some(Signal::SIGCHLD)
+                    && signal_interrupt_errno.is_none()
                     && !already_readmitted
                     && self.run_queue.has_runnable_besides(dettid)
                 {
@@ -4453,11 +4483,11 @@ impl Scheduler {
             .insert(dtid, RemovalDisposition::Retire);
     }
 
-    /// Apply queued waitid-signal notifications at the deterministic run-queue
-    /// mutation point. Re-check the request because a target may have exited or
-    /// completed its wait before this drain.
-    fn drain_pending_waitid_signals(&mut self) {
-        let pending = std::mem::take(&mut self.pending_waitid_signals);
+    /// Apply queued cross-task signal notifications at the deterministic
+    /// run-queue mutation point. Re-check the request because a target may have
+    /// exited or completed its wait before this drain.
+    fn drain_pending_cross_task_signals(&mut self) {
+        let pending = std::mem::take(&mut self.pending_cross_task_signals);
         for (dettid, mut signals) in pending {
             match self.waitid_signal_request(dettid) {
                 Some(WaitidSignalRequest::Parked) => {
@@ -4502,7 +4532,37 @@ impl Scheduler {
                     };
                     next_turn.req = Ivar::full(Ok(resources));
                 }
-                None => {}
+                None => {
+                    let Some(existing) = self.restartable_internal_io_signals(dettid) else {
+                        continue;
+                    };
+                    // ERESTARTSYS is the existing contract by which the kernel
+                    // decides whether this physically pending signal is
+                    // blocked, ignored, restarts the syscall, or interrupts it
+                    // for a handler. Replace the polling request rather than
+                    // adding a second resource; step4 accepts exactly one.
+                    if self.run_queue.contains_tid(dettid) {
+                        let removed = self.run_queue.remove_tid(dettid);
+                        debug_assert!(
+                            removed,
+                            "run_queue.contains_tid disagreed with remove_tid for {dettid}"
+                        );
+                    }
+                    signals.extend(existing);
+                    signals.sort_by_key(SigWrapper::raw);
+                    signals.dedup();
+                    if signals.is_empty() {
+                        continue;
+                    }
+                    let mut resources = Resources::new(dettid);
+                    // `WaitidSignals` is already the scheduler's one-resource
+                    // representation for a complete signal identity set. The
+                    // ERESTARTSYS marker distinguishes this write wakeup from a
+                    // waitid request and survives later notification batches.
+                    resources.insert(ResourceID::WaitidSignals(signals), Permission::W);
+                    resources.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+                    self.force_unblock_thread(dettid, resources);
+                }
             }
         }
     }
@@ -6284,15 +6344,226 @@ mod test {
         register_known_thread(&mut scheduler, target);
         let mut polling = Resources::new(target);
         polling.insert(ResourceID::InternalIOPolling, Permission::W);
+        polling.set_signal_interrupt_errno(Errno::EINTR);
         polling.fyi("poll");
         scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(polling));
         scheduler.runqueue_push_back(target);
 
         scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
 
-        assert!(scheduler.pending_waitid_signals.is_empty());
+        assert!(scheduler.pending_cross_task_signals.is_empty());
         assert!(scheduler.run_queue.contains_tid(target));
         assert!(scheduler.inbound_signals(target).is_empty());
+
+        scheduler.drain_pending_cross_task_signals();
+
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert!(scheduler.inbound_signals(target).is_empty());
+        let resources = scheduler
+            .next_turns
+            .get(&target)
+            .and_then(|next_turn| next_turn.req.try_read())
+            .and_then(Result::ok)
+            .expect("the target should hold its signal interruption request");
+        assert_eq!(resources.resources.len(), 1);
+        assert!(
+            resources
+                .resources
+                .contains_key(&ResourceID::InternalIOPolling)
+        );
+    }
+
+    #[test]
+    fn pending_signal_does_not_rewrite_an_unmarked_internal_poller() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        register_known_thread(&mut scheduler, target);
+        let mut polling = Resources::new(target);
+        polling.insert(ResourceID::InternalIOPolling, Permission::W);
+        polling.fyi("write");
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(polling));
+        scheduler.runqueue_push_back(target);
+
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
+        scheduler.drain_pending_cross_task_signals();
+
+        assert!(scheduler.pending_cross_task_signals.is_empty());
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert!(scheduler.inbound_signals(target).is_empty());
+        let resources = scheduler
+            .next_turns
+            .get(&target)
+            .and_then(|next_turn| next_turn.req.try_read())
+            .and_then(Result::ok)
+            .expect("the target should retain its polling request");
+        assert_eq!(resources.resources.len(), 1);
+        assert!(
+            resources
+                .resources
+                .contains_key(&ResourceID::InternalIOPolling)
+        );
+        assert_eq!(resources.signal_interrupt_errno(), None);
+    }
+
+    #[test]
+    fn unsupported_backend_does_not_rewrite_a_marked_internal_poller() {
+        let config = Config {
+            backend_supports_parked_write_signal_interruption: false,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let target = DetTid::from_raw(100);
+        register_known_thread(&mut scheduler, target);
+        let mut polling = Resources::new(target);
+        polling.insert(ResourceID::InternalIOPolling, Permission::W);
+        polling.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(polling));
+        scheduler.runqueue_push_back(target);
+
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
+        scheduler.drain_pending_cross_task_signals();
+
+        assert!(scheduler.pending_cross_task_signals.is_empty());
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert!(scheduler.inbound_signals(target).is_empty());
+        assert!(scheduler.take_terminal_deadlock().is_none());
+        let resources = scheduler
+            .next_turns
+            .get(&target)
+            .and_then(|next_turn| next_turn.req.try_read())
+            .and_then(Result::ok)
+            .expect("the target should retain its polling request");
+        assert!(
+            resources
+                .resources
+                .contains_key(&ResourceID::InternalIOPolling)
+        );
+        assert_eq!(
+            resources.signal_interrupt_errno(),
+            Some(Errno::ERESTARTSYS.into_raw())
+        );
+    }
+
+    #[test]
+    fn pending_signals_preserve_a_restartable_internal_write_pollers_signal_set() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        register_known_thread(&mut scheduler, target);
+        let mut polling = Resources::new(target);
+        polling.insert(ResourceID::InternalIOPolling, Permission::W);
+        polling.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+        polling.fyi("writev");
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(polling));
+        scheduler.runqueue_push_back(target);
+
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR2));
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
+        scheduler.drain_pending_cross_task_signals();
+
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![
+                SigWrapper::from(Signal::SIGUSR1),
+                SigWrapper::from(Signal::SIGUSR2)
+            ]
+        );
+        let resources = scheduler
+            .next_turns
+            .get(&target)
+            .and_then(|next_turn| next_turn.req.try_read())
+            .and_then(Result::ok)
+            .expect("the target should hold its signal interruption request");
+        assert_eq!(resources.resources.len(), 1);
+        assert!(
+            resources
+                .resources
+                .contains_key(&ResourceID::WaitidSignals(vec![
+                    SigWrapper::from(Signal::SIGUSR1),
+                    SigWrapper::from(Signal::SIGUSR2)
+                ]))
+        );
+        assert_eq!(
+            resources.signal_interrupt_errno(),
+            Some(Errno::ERESTARTSYS.into_raw())
+        );
+
+        // A signal arriving after the request was rewritten must remain part
+        // of the same one-resource response rather than being dropped.
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGTERM));
+        scheduler.drain_pending_cross_task_signals();
+        assert_eq!(
+            scheduler.inbound_signals(target),
+            vec![
+                SigWrapper::from(Signal::SIGUSR1),
+                SigWrapper::from(Signal::SIGUSR2),
+                SigWrapper::from(Signal::SIGTERM),
+            ]
+        );
+
+        let response = scheduler.next_turns[&target].resp.clone();
+        let (selected, _, selected_response) = scheduler.step3_peek().unwrap();
+        assert_eq!(selected, target);
+        assert!(
+            scheduler
+                .step4_resource_block(target, &resources, &selected_response)
+                .is_ok()
+        );
+        assert!(
+            scheduler
+                .step5_guest_unblock(target, &resources, &selected_response)
+                .is_ok()
+        );
+        assert!(matches!(
+            response.try_read(),
+            Some(SchedResponse::Signaled(Some(signals)))
+                if signals == vec![
+                    SigWrapper::from(Signal::SIGUSR1),
+                    SigWrapper::from(Signal::SIGUSR2),
+                    SigWrapper::from(Signal::SIGTERM),
+                ]
+        ));
+    }
+
+    #[test]
+    fn restartable_io_sigchld_bypasses_host_async_signal_deferral() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let target = DetTid::from_raw(100);
+        let sibling = DetTid::from_raw(101);
+        register_known_thread(&mut scheduler, target);
+        register_known_thread(&mut scheduler, sibling);
+        let mut polling = Resources::new(target);
+        polling.insert(ResourceID::InternalIOPolling, Permission::W);
+        polling.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+        scheduler.next_turns.get_mut(&target).unwrap().req = Ivar::full(Ok(polling));
+        scheduler.runqueue_push_back(target);
+        scheduler.runqueue_push_back(sibling);
+
+        scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGCHLD));
+        scheduler.drain_pending_cross_task_signals();
+
+        let resources = scheduler.next_turns[&target]
+            .req
+            .try_read()
+            .and_then(Result::ok)
+            .expect("the target should hold its signal interruption request");
+        assert_eq!(
+            resources.signal_interrupt_errno(),
+            Some(Errno::ERESTARTSYS.into_raw())
+        );
+        assert_eq!(scheduler.run_queue.tentative_pop_tid(target), Some(target));
+        assert!(
+            scheduler
+                .block_for_one_resource(
+                    target,
+                    resources.resources.keys().next().unwrap(),
+                    &Permission::W,
+                    resources.signal_interrupt_errno(),
+                    &Ivar::new(),
+                )
+                .is_ok()
+        );
+        assert!(scheduler.blocked.sigchld_deferred.is_empty());
     }
 
     /// `step4_resource_block` and `blocking_request_is_ready` both assert that a
@@ -6319,7 +6590,7 @@ mod test {
         scheduler.runqueue_push_back(target);
 
         scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR2));
-        scheduler.drain_pending_waitid_signals();
+        scheduler.drain_pending_cross_task_signals();
 
         let resources = scheduler
             .next_turns
@@ -6368,7 +6639,7 @@ mod test {
         assert!(!scheduler.blocked.child_waiters.contains_key(&target));
 
         scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
-        scheduler.drain_pending_waitid_signals();
+        scheduler.drain_pending_cross_task_signals();
 
         let occurrences = scheduler
             .run_queue
@@ -6409,9 +6680,9 @@ mod test {
         assert!(!scheduler.run_queue.contains_tid(target));
 
         scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
-        assert_eq!(scheduler.pending_waitid_signals[&target].len(), 1);
+        assert_eq!(scheduler.pending_cross_task_signals[&target].len(), 1);
 
-        scheduler.drain_pending_waitid_signals();
+        scheduler.drain_pending_cross_task_signals();
 
         assert!(
             scheduler.run_queue.contains_tid(target),
@@ -6441,8 +6712,8 @@ mod test {
 
         scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR2));
 
-        assert_eq!(scheduler.pending_waitid_signals[&target].len(), 1);
-        scheduler.drain_pending_waitid_signals();
+        assert_eq!(scheduler.pending_cross_task_signals[&target].len(), 1);
+        scheduler.drain_pending_cross_task_signals();
         assert!(scheduler.run_queue.contains_tid(target));
         assert_eq!(
             scheduler.inbound_signals(target),
@@ -6451,8 +6722,8 @@ mod test {
 
         // A later signal must merge into the already-materialized waitid wakeup.
         scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
-        assert_eq!(scheduler.pending_waitid_signals[&target].len(), 1);
-        scheduler.drain_pending_waitid_signals();
+        assert_eq!(scheduler.pending_cross_task_signals[&target].len(), 1);
+        scheduler.drain_pending_cross_task_signals();
         assert_eq!(
             scheduler.inbound_signals(target),
             vec![
@@ -6696,6 +6967,7 @@ mod test {
                     waiter,
                     &ResourceID::WaitPhysicalChild(child),
                     &Permission::W,
+                    None,
                     &Ivar::new(),
                 )
                 .is_err()

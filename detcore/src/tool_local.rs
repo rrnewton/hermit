@@ -2143,6 +2143,7 @@ impl<T> ThreadState<T> {
             resources,
             poll_attempt: 0,
             fyi: String::new(),
+            signal_interrupt_errno: None,
         }
     }
 

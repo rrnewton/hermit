@@ -667,7 +667,6 @@
     "c-programs/wait-on-child::naked",
     "c-programs/wait-on-child::replay",
     "c-programs/writev-determinism::chaos",
-    "c-programs/writev-determinism::custom",
     "c-programs/writev-determinism::naked",
     "c-programs/writev-determinism::replay",
     "chaos-c/lock-granularity::custom",

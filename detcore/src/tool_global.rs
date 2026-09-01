@@ -1684,6 +1684,7 @@ impl GlobalState {
                     resources: s,
                     poll_attempt: 0,
                     fyi: String::new(),
+                    signal_interrupt_errno: None,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {

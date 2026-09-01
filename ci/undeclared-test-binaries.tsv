@@ -91,4 +91,3 @@ verify_claim_names_its_limit	measured-green-pending-registration	Measured 2026-0
 version_provenance	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 vmstat_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 waitid_signal_interrupt	measured-green-pending-registration	Measured 2026-08-26 on hermit@a787a547ea: 11 tests, 11 pass, 0.5s. Green; belongs in the DAG pending a memory sample for its hint block.
-writev_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.

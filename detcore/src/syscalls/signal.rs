@@ -543,8 +543,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // realtime signals. The notification was skipped silently, so a target
         // parked on `ResourceID::WaitChild` was never woken and the wait hung.
         // `SigWrapper` now carries the raw number, so every deliverable signal
-        // can be represented and none is dropped for being unnameable.
-        if target != guest.thread_state().dettid {
+        // can be represented and none is dropped for being unnameable. Signal
+        // zero is only an existence/permission probe and queues no signal.
+        if should_notify_cross_task_signal(guest.thread_state().dettid, target, raw_signal) {
             notify_signal_pending(guest, target, SigWrapper(raw_signal), target_process).await;
         }
     }
@@ -624,6 +625,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         Ok(self.record_or_replay(guest, call).await?)
     }
+}
+
+fn should_notify_cross_task_signal(sender: DetTid, target: DetTid, raw_signal: i32) -> bool {
+    raw_signal != 0 && target != sender
 }
 
 #[cfg(test)]
@@ -715,6 +720,23 @@ mod tests {
         assert!(!can_forward_process_group_signal(0, libc::SIGKILL, false));
         assert!(!can_forward_process_group_signal(-1, libc::SIGKILL, false));
         assert!(!can_forward_process_group_signal(-42, libc::SIGKILL, true));
+    }
+
+    #[test]
+    fn signal_zero_never_notifies_a_target() {
+        let sender = DetTid::from_raw(42);
+        let target = DetTid::from_raw(43);
+        assert!(!should_notify_cross_task_signal(sender, target, 0));
+        assert!(should_notify_cross_task_signal(
+            sender,
+            target,
+            libc::SIGUSR1
+        ));
+        assert!(!should_notify_cross_task_signal(
+            sender,
+            sender,
+            libc::SIGUSR1
+        ));
     }
 }
 

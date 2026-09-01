@@ -31,12 +31,19 @@ use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::syscalls::threads::KernelSigaction;
+use crate::syscalls::threads::WaitSignalDisposition;
+use crate::syscalls::threads::block_signals_for_disposition;
+use crate::syscalls::threads::blocked_signal_mask;
+use crate::syscalls::threads::restore_signals_after_disposition;
+use crate::syscalls::threads::wait_signal_disposition;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_global::trace_schedevent;
 use crate::tool_local::Detcore;
 use crate::tool_local::finish_partial_record_or_replay_write;
+use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::SchedEvent;
 use crate::types::SyscallPhase;
@@ -284,6 +291,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         const MAX_RW_COUNT: usize = 0x7fff_f000;
         // Linux guarantees pipe writes through this size are atomic.
         const PIPE_BUF: usize = 4096;
+        // Every backend provides at least 512 bytes of tool scratch. Linux's
+        // own fast-iovec path is smaller; this covers common vectors.
+        const STACK_IOVECS: usize = 32;
 
         let Some(iov_addr) = call.iov() else {
             return self.execute_nonblockable_fd_syscall(guest, call).await;
@@ -322,29 +332,62 @@ impl<T: RecordOrReplay> Detcore<T> {
         tracing::trace!(
             "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev"
         );
-        let mut resources = Resources::new(guest.thread_state().dettid);
-        resources.insert(ResourceID::InternalIOPolling, Permission::W);
-        resources.fyi(call.name());
+        let mut resources = pipe_writev_resources(guest.thread_state().dettid, call);
         let subtool = self.cfg.recordreplay_modes.then_some(self);
         let mut current = Syscall::Writev(call);
         let mut written_total = 0usize;
 
-        loop {
-            if resources.poll_attempt > 0
-                && matches!(
-                    resource_request(guest, resources.clone()).await,
-                    ResumeStatus::Signaled(_)
-                )
+        // Keep ordinary signals pending while the scheduler and the target-side
+        // disposition check decide whether a wakeup interrupts this write. The
+        // ptrace-owned backends need the explicit mask while inspecting the
+        // target's current disposition.
+        let blocked_mask = blocked_signal_mask();
+        let mut stack = guest.stack().await;
+        let atomic_scratch_iov = if atomic_pipe_write && iovecs.len() <= STACK_IOVECS {
+            let mut raw_iovecs = [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; STACK_IOVECS];
+            for (raw, (base, length)) in raw_iovecs.iter_mut().zip(&iovecs) {
+                raw.iov_base = *base as *mut libc::c_void;
+                raw.iov_len = *length;
+            }
+            let scratch_iov: Addr<libc::iovec> = stack.push(raw_iovecs).cast();
+            Some(scratch_iov.as_raw())
+        } else {
+            None
+        };
+        let blocked_mask_addr = stack.push(blocked_mask);
+        let old_mask_addr = stack.reserve::<libc::sigset_t>();
+        let action_addr = stack.reserve::<KernelSigaction>();
+        let _mask_guard = stack.commit()?;
+        let guest_signal_mask =
+            block_signals_for_disposition(guest, blocked_mask_addr, old_mask_addr).await?;
+
+        let result: Result<i64, Error> = loop {
+            // A cross-task signal can replace the initial scheduler request,
+            // before the first physical attempt, as well as a later retry.
+            let status = resource_request(guest, resources.clone()).await;
+            let disposition = match wait_signal_disposition(
+                guest,
+                status.clone(),
+                &guest_signal_mask,
+                action_addr,
+                true,
+            )
+            .await
             {
-                break if written_total > 0 {
-                    Ok(written_total as i64)
-                } else {
-                    Err(call.signal_interrupt_errno().into())
-                };
+                Ok(disposition) => disposition,
+                Err(error) => break Err(error),
+            };
+            if matches!(status, ResumeStatus::Signaled(_))
+                && let Some(result) = interrupted_write_result(&call, written_total, disposition)
+            {
+                break result;
             }
 
             let result = if atomic_pipe_write {
-                self.execute_atomic_pipe_writev_attempt(guest, call, &iovecs)
+                self.execute_atomic_pipe_writev_attempt(guest, call, &iovecs, atomic_scratch_iov)
                     .await
             } else {
                 match subtool {
@@ -358,8 +401,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             match result {
                 Ok(written) if written > 0 => {
-                    let written = usize::try_from(written).map_err(|_| Errno::EIO)?;
-                    written_total = written_total.checked_add(written).ok_or(Errno::EIO)?;
+                    let written = match usize::try_from(written) {
+                        Ok(written) => written,
+                        Err(_) => break Err(Errno::EIO.into()),
+                    };
+                    written_total = match written_total.checked_add(written) {
+                        Some(written_total) => written_total,
+                        None => break Err(Errno::EIO.into()),
+                    };
                     if written_total >= target {
                         break Ok(written_total as i64);
                     }
@@ -401,7 +450,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.display(&guest.memory())
             );
             record_retry_event(guest, call).await;
-        }
+        };
+
+        restore_signals_after_disposition(guest, old_mask_addr).await?;
+        result
     }
 
     async fn execute_atomic_pipe_writev_attempt<G: Guest<Self>>(
@@ -409,28 +461,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Writev,
         iovecs: &[(usize, usize)],
+        stack_iov: Option<usize>,
     ) -> Result<i64, Error> {
-        // Every backend provides at least 512 bytes of tool scratch. Linux's own fast-iovec
-        // path is smaller; this covers common vectors without consuming guest VM mappings.
-        const STACK_IOVECS: usize = 32;
-        if iovecs.len() <= STACK_IOVECS {
-            let mut stack = guest.stack().await;
-            let scratch_array = {
-                let mut raw_iovecs = [libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                }; STACK_IOVECS];
-                for (raw, (base, length)) in raw_iovecs.iter_mut().zip(iovecs) {
-                    raw.iov_base = *base as *mut libc::c_void;
-                    raw.iov_len = *length;
-                }
-                stack.push(raw_iovecs)
-            };
-            let scratch_iov: Addr<libc::iovec> = scratch_array.cast();
-            let _guard = stack
-                .commit()
-                .unwrap_or_else(|error| panic!("failed to commit atomic writev scratch: {error}"));
-            let scratch_call = call.with_iov(Some(scratch_iov));
+        if let Some(stack_iov) = stack_iov {
+            let scratch_call = call.with_iov(Addr::from_raw(stack_iov));
             return if self.cfg.recordreplay_modes {
                 self.record_or_replay_preserving_tool_errors(guest, scratch_call)
                     .await
@@ -792,6 +826,26 @@ pub trait NonblockableSyscall: SyscallInfo {
 pub trait TimeoutableSyscall: SyscallInfo {
     /// What would the syscall return IF it timed out?
     fn timeout_return_val(&self) -> Result<i64, Errno>;
+}
+
+fn interrupted_write_result<C: NonblockableSyscall>(
+    call: &C,
+    written_total: usize,
+    disposition: Option<WaitSignalDisposition>,
+) -> Option<Result<i64, Error>> {
+    match disposition {
+        None => None,
+        Some(_) if written_total > 0 => Some(Ok(written_total as i64)),
+        Some(_) => Some(Err(call.signal_interrupt_errno().into())),
+    }
+}
+
+fn pipe_writev_resources(dettid: DetTid, call: reverie::syscalls::Writev) -> Resources {
+    let mut resources = Resources::new(dettid);
+    resources.insert(ResourceID::InternalIOPolling, Permission::W);
+    resources.fyi(call.name());
+    resources.set_signal_interrupt_errno(call.signal_interrupt_errno());
+    resources
 }
 
 #[async_trait]
@@ -1503,9 +1557,48 @@ mod tests {
             reverie::syscalls::Read::new().signal_interrupt_errno(),
             Errno::ERESTARTSYS
         );
+        // A zero-progress writev interruption returns this internal errno on
+        // ptrace so Linux applies the handler's SA_RESTART policy.
+        assert_eq!(
+            reverie::syscalls::Writev::new().signal_interrupt_errno(),
+            Errno::ERESTARTSYS
+        );
         assert_eq!(
             reverie::syscalls::Futex::new().signal_interrupt_errno(),
             Errno::ERESTARTSYS
         );
+    }
+
+    #[test]
+    fn writev_signal_result_uses_disposition_and_progress() {
+        let call = reverie::syscalls::Writev::new();
+        for disposition in [
+            WaitSignalDisposition::Interrupt,
+            WaitSignalDisposition::Restart,
+        ] {
+            assert!(matches!(
+                interrupted_write_result(&call, 0, Some(disposition)),
+                Some(Err(Error::Errno(Errno::ERESTARTSYS)))
+            ));
+            assert!(matches!(
+                interrupted_write_result(&call, 17, Some(disposition)),
+                Some(Ok(17))
+            ));
+        }
+        assert!(interrupted_write_result(&call, 0, None).is_none());
+        assert!(interrupted_write_result(&call, 17, None).is_none());
+    }
+
+    #[test]
+    fn pipe_writev_requests_signal_disposition() {
+        let dettid = DetTid::from_raw(42);
+        let call = reverie::syscalls::Writev::new();
+        let request = pipe_writev_resources(dettid, call);
+
+        assert_eq!(
+            request.signal_interrupt_errno(),
+            Some(Errno::ERESTARTSYS.into_raw())
+        );
+        assert_eq!(request.resources.len(), 1);
     }
 }

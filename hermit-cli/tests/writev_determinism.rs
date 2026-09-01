@@ -26,12 +26,11 @@ fn command_output(mut command: Command, label: &str) -> Output {
     output
 }
 
-#[test]
-fn writev_uses_fd_aware_scheduling_and_verifies() {
+fn compile_writev_guest(build_name: &str) -> std::path::PathBuf {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("writev-determinism");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(build_name);
     fs::create_dir_all(&build_root).expect("failed to create writev guest build directory");
     let guest = build_root.join("writev_determinism");
 
@@ -42,6 +41,13 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         .arg("-o")
         .arg(&guest);
     command_output(compile, "writev guest compilation");
+    guest
+}
+
+#[test]
+fn writev_uses_fd_aware_scheduling_and_verifies() {
+    let guest = compile_writev_guest("writev-determinism");
+    let build_root = guest.parent().expect("writev guest should have a parent");
 
     let mut trace = Command::new("timeout");
     trace
@@ -64,11 +70,32 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         "writev guest omitted its success marker\nstdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
     );
     assert!(
+        trace_stdout.contains("writev-signal-interrupt-ok"),
+        "a sibling pthread_kill did not interrupt full-pipe writev with EINTR\n\
+         stdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
+    );
+    assert!(
+        trace_stdout.contains("writev-signal-restart-ok"),
+        "SA_RESTART did not resume full-pipe writev after the pipe was drained\n\
+         stdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
+    );
+    for marker in [
+        "writev-partial-caught-ok",
+        "writev-partial-blocked-ok",
+        "writev-partial-ignored-ok",
+        "writev-partial-mixed-ok",
+    ] {
+        assert!(
+            trace_stdout.contains(marker),
+            "writev guest omitted {marker}\nstdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
+        );
+    }
+    assert!(
         trace_stderr.contains("inbound syscall: writev")
             && trace_stderr.contains(
                 "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev",
             )
-            && trace_stderr.contains("Retry #1 for atomic blocking pipe writev after Err(EAGAIN)"),
+            && trace_stderr.contains("Retry #1 for atomic blocking pipe writev after EAGAIN"),
         "writev did not reach typed dispatch and internal-fd scheduling\n\
          stdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
     );
