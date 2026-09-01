@@ -567,6 +567,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut resources = Resources::new(guest.thread_state().dettid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.fyi("pselect6");
+        // Keep the request metadata accurate, but do not make it eligible for
+        // the scheduler's ERESTARTSYS wakeup. A cross-task signal must first be
+        // checked against pselect6's snapshotted temporary mask and disposition.
+        resources.set_signal_interrupt_errno(Errno::EINTR);
 
         loop {
             if matches!(
@@ -752,6 +756,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut resources = Resources::new(guest.thread_state().dettid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.fyi("select");
+        // EINTR records select's interruption result. The scheduler only wakes
+        // ERESTARTSYS requests: blocked and ignored signals still need a target-
+        // side disposition check before this Signaled path can be used.
+        resources.set_signal_interrupt_errno(Errno::EINTR);
 
         loop {
             if matches!(

@@ -10668,10 +10668,20 @@ test:
           liteinst: Chaos scheduling is unsupported by LiteInst
       custom:
         ci: false
-        backends_enabled: []
+        ci_disabled_reason: 'NOT-EXERCISED: the portable hermit integration node owns the ptrace success case; DBT, KVM, SaBRe, and LiteInst do not support interrupting scheduler-managed pipe writes.'
+        args:
+          - --strict
+          - --panic-on-unsupported-syscalls
+        guest_args:
+          ptrace:
+            - signal-interrupt
+        assert:
+          runs: 3
+          repeat_identical: true
+        backends_enabled:
+          - ptrace
         backends_disabled:
-          ptrace: No custom edge-case arguments have been calibrated for this C guest
-          dbt: No custom edge-case arguments have been calibrated for this C guest
-          kvm: No custom edge-case arguments have been calibrated for this C guest
-          sabre: No custom edge-case arguments have been calibrated for this C guest
-          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          dbt: DBT does not support interrupting scheduler-managed pipe writes while preserving signal restart semantics
+          kvm: KVM does not support interrupting scheduler-managed pipe writes while preserving signal restart semantics
+          sabre: SaBRe does not support interrupting scheduler-managed pipe writes while preserving signal restart semantics
+          liteinst: LiteInst does not support interrupting scheduler-managed pipe writes while preserving signal restart semantics

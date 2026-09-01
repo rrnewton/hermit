@@ -10,8 +10,10 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::fmt;
 use std::path::PathBuf;
 
+use reverie::Errno;
 use reverie::syscalls::Syscall;
 use serde::Deserialize;
 use serde::Serialize;
@@ -296,7 +298,8 @@ pub enum ResourceID {
     InboundSignal(SigWrapper),
 
     /// A scheduler notification that one or more guest-generated signals are
-    /// physically pending for a thread parked in waitid polling. Kept as one
+    /// physically pending. An unmarked request wakes waitid polling; a request
+    /// carrying `signal_interrupt_errno` wakes internal IO polling. Kept as one
     /// resource because scheduler requests currently admit one resource only.
     WaitidSignals(Vec<SigWrapper>),
 
@@ -343,7 +346,7 @@ pub enum Device {
 /// `Resources` is a request to lock zero or more resources so that the thread can perform an action.
 ///
 /// There can only be one outstanding request at a time for a given TID.
-#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct Resources {
     /// The thread ID requesting the resources.
     pub tid: DetTid,
@@ -357,6 +360,28 @@ pub struct Resources {
     /// A bit of metadata (just for debugging), about what the thread is trying to do with the
     /// resources.
     pub fyi: String,
+    /// Errno returned when an established signal interruption happens before a
+    /// syscall makes progress. Its presence also asks the caller to classify a
+    /// signal wake after partial progress, when Linux returns the byte count
+    /// instead. `None` does not make an `InternalIOPolling` request eligible
+    /// for the scheduler's cross-task signal wakeup.
+    #[serde(default)]
+    pub(crate) signal_interrupt_errno: Option<i32>,
+}
+
+impl fmt::Debug for Resources {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_struct("Resources");
+        debug
+            .field("tid", &self.tid)
+            .field("resources", &self.resources)
+            .field("poll_attempt", &self.poll_attempt)
+            .field("fyi", &self.fyi);
+        if let Some(errno) = self.signal_interrupt_errno {
+            debug.field("signal_interrupt_errno", &errno);
+        }
+        debug.finish()
+    }
 }
 
 impl Resources {
@@ -367,6 +392,7 @@ impl Resources {
             resources: HashMap::new(),
             poll_attempt: 0,
             fyi: String::new(),
+            signal_interrupt_errno: None,
         }
     }
 
@@ -386,6 +412,19 @@ impl Resources {
                 }
             }
         }
+        match (self.signal_interrupt_errno, other.signal_interrupt_errno) {
+            (None, interrupt) => self.signal_interrupt_errno = interrupt,
+            (Some(left), Some(right)) => assert_eq!(left, right),
+            (Some(_), None) => {}
+        }
+    }
+
+    pub fn set_signal_interrupt_errno(&mut self, errno: Errno) {
+        self.signal_interrupt_errno = Some(errno.into_raw());
+    }
+
+    pub fn signal_interrupt_errno(&self) -> Option<i32> {
+        self.signal_interrupt_errno
     }
 
     /// Insert a new individual resource into a set of resources.

@@ -379,6 +379,7 @@ fn load_dbt_config() -> (Config, ConfigSource) {
     };
     config.max_timeslice = None;
     config.sequentialize_threads = true;
+    config.backend_supports_parked_write_signal_interruption = false;
     (config, source)
 }
 

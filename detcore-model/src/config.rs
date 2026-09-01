@@ -155,6 +155,12 @@ pub struct Config {
     #[clap(skip)]
     pub backend_requires_thread_directed_process_signals: bool,
 
+    /// The backend can wake a scheduler-managed pipe write for a cross-task signal while
+    /// preserving Linux signal-mask, disposition, and syscall-restart behavior.
+    #[serde(default = "default_true")]
+    #[clap(skip = true)]
+    pub backend_supports_parked_write_signal_interruption: bool,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1125): Review backend-owned capability-control prctls.
     /// The execution backend virtualizes capability bounding-set and ambient-capability state.
@@ -1378,6 +1384,7 @@ mod tests {
         assert!(config.backend_dispatches_thread_tools);
         assert!(config.backend_tracks_process_children);
         assert!(!config.backend_requires_thread_directed_process_signals);
+        assert!(config.backend_supports_parked_write_signal_interruption);
         assert!(!config.backend_virtualizes_capability_prctls);
         assert!(!config.backend_defers_vfork_child_registration);
     }

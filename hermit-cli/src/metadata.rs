@@ -360,6 +360,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         backend_dispatches_thread_tools: true,
         backend_tracks_process_children: true,
         backend_requires_thread_directed_process_signals: false,
+        backend_supports_parked_write_signal_interruption: true,
         backend_virtualizes_capability_prctls: false,
         backend_defers_vfork_child_registration: false,
         has_uts_namespace: true,

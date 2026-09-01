@@ -533,7 +533,7 @@ fn signal_is_blocked(mask: &libc::sigset_t, signal: SigWrapper) -> bool {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct KernelSigaction {
+pub(super) struct KernelSigaction {
     handler: u64,
     flags: u64,
     restorer: u64,
@@ -541,7 +541,7 @@ struct KernelSigaction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WaitSignalDisposition {
+pub(super) enum WaitSignalDisposition {
     Interrupt,
     Restart,
 }
@@ -553,11 +553,16 @@ fn signal_default_disposition_does_not_interrupt_child_wait(signal: SigWrapper) 
     )
 }
 
-async fn wait_signal_disposition<G, T>(
+fn signal_has_uncatchable_default_disposition(signal: SigWrapper) -> bool {
+    matches!(signal.raw(), libc::SIGKILL | libc::SIGSTOP)
+}
+
+pub(super) async fn wait_signal_disposition<G, T>(
     guest: &mut G,
     status: ResumeStatus,
     guest_signal_mask: &libc::sigset_t,
     action_addr: AddrMut<'_, KernelSigaction>,
+    inspect_action: bool,
 ) -> Result<Option<WaitSignalDisposition>, Error>
 where
     G: Guest<Detcore<T>>,
@@ -569,13 +574,13 @@ where
     let Some(mut signals) = signals else {
         return Ok(Some(WaitSignalDisposition::Interrupt));
     };
-    let inspect_action = guest
-        .config()
-        .backend_requires_thread_directed_process_signals;
     signals.sort_by_key(|signal| signal.raw());
     for signal in signals {
         if signal_is_blocked(guest_signal_mask, signal) {
             continue;
+        }
+        if signal_has_uncatchable_default_disposition(signal) {
+            return Ok(Some(WaitSignalDisposition::Interrupt));
         }
         if !inspect_action {
             return Ok(Some(WaitSignalDisposition::Interrupt));
@@ -603,6 +608,60 @@ where
         ));
     }
     Ok(None)
+}
+
+pub(super) fn blocked_signal_mask() -> libc::sigset_t {
+    let mut blocked_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigfillset(&mut blocked_mask);
+        libc::sigdelset(&mut blocked_mask, reverie::PERF_EVENT_SIGNAL as i32);
+    }
+    blocked_mask
+}
+
+pub(super) async fn block_signals_for_disposition<G, T>(
+    guest: &mut G,
+    blocked_mask_addr: Addr<'_, libc::sigset_t>,
+    old_mask_addr: AddrMut<'_, libc::sigset_t>,
+) -> Result<libc::sigset_t, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let block_signals = syscalls::RtSigprocmask::new()
+        .with_how(libc::SIG_SETMASK)
+        .with_set(
+            (!guest
+                .config()
+                .backend_requires_thread_directed_process_signals)
+                .then_some(blocked_mask_addr),
+        )
+        .with_oldset(Some(old_mask_addr))
+        .with_sigsetsize(std::mem::size_of::<u64>());
+    guest.inject_with_retry(block_signals).await?;
+    Ok(guest.memory().read_value(old_mask_addr)?)
+}
+
+pub(super) async fn restore_signals_after_disposition<G, T>(
+    guest: &mut G,
+    old_mask_addr: AddrMut<'_, libc::sigset_t>,
+) -> Result<(), Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !guest
+        .config()
+        .backend_requires_thread_directed_process_signals
+    {
+        let restore_signals = syscalls::RtSigprocmask::new()
+            .with_how(libc::SIG_SETMASK)
+            .with_set(Some(old_mask_addr.into()))
+            .with_oldset(None)
+            .with_sigsetsize(std::mem::size_of::<u64>());
+        guest.inject_with_retry(restore_signals).await?;
+    }
+    Ok(())
 }
 
 async fn interrupted_child_wait_result<G, T, S>(
@@ -1393,37 +1452,31 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // delivery while this callback is active, and replacing its
                 // application mask here also hides those signals from
                 // rt_sigpending. Read that mask without changing it instead.
-                let mut blocked_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
-                unsafe {
-                    libc::sigfillset(&mut blocked_mask);
-                    libc::sigdelset(&mut blocked_mask, reverie::PERF_EVENT_SIGNAL as i32);
-                }
+                let blocked_mask = blocked_signal_mask();
                 let mut stack = guest.stack().await;
                 let blocked_mask_addr = stack.push(blocked_mask);
                 let old_mask_addr = stack.reserve::<libc::sigset_t>();
                 let action_addr = stack.reserve::<KernelSigaction>();
                 let _mask_guard = stack.commit()?;
-                let block_signals = syscalls::RtSigprocmask::new()
-                    .with_how(libc::SIG_SETMASK)
-                    .with_set(
-                        (!guest
-                            .config()
-                            .backend_requires_thread_directed_process_signals)
-                            .then_some(blocked_mask_addr),
-                    )
-                    .with_oldset(Some(old_mask_addr))
-                    .with_sigsetsize(std::mem::size_of::<u64>());
-                guest.inject_with_retry(block_signals).await?;
-                let guest_signal_mask: libc::sigset_t = guest.memory().read_value(old_mask_addr)?;
+                let guest_signal_mask =
+                    block_signals_for_disposition(guest, blocked_mask_addr, old_mask_addr).await?;
+                let inspect_signal_action = guest
+                    .config()
+                    .backend_requires_thread_directed_process_signals;
 
                 let poll_call = call.with_options(call.options() | WaitPidFlag::WNOHANG);
                 let mut pending_signal = None;
                 let result: Result<i64, Error> = loop {
                     let status = wait_for_child_lifecycle(guest, spec).await;
                     if pending_signal.is_none() {
-                        pending_signal =
-                            wait_signal_disposition(guest, status, &guest_signal_mask, action_addr)
-                                .await?;
+                        pending_signal = wait_signal_disposition(
+                            guest,
+                            status,
+                            &guest_signal_mask,
+                            action_addr,
+                            inspect_signal_action,
+                        )
+                        .await?;
                     }
                     let (ready, has_child) = ready_child_wait(guest, spec).await;
                     if let Some(child) = ready {
@@ -1469,17 +1522,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 };
 
-                if !guest
-                    .config()
-                    .backend_requires_thread_directed_process_signals
-                {
-                    let restore_signals = syscalls::RtSigprocmask::new()
-                        .with_how(libc::SIG_SETMASK)
-                        .with_set(Some(old_mask_addr.into()))
-                        .with_oldset(None)
-                        .with_sigsetsize(std::mem::size_of::<u64>());
-                    guest.inject_with_retry(restore_signals).await?;
-                }
+                restore_signals_after_disposition(guest, old_mask_addr).await?;
                 result?
             }
         } else {
@@ -1689,28 +1732,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             // mask before returning. DBT reads the mask without replacing it because
             // DynamoRIO already delays application delivery while this callback runs.
             // The tracer's private preemption signal must remain unblocked.
-            let mut blocked_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
-            unsafe {
-                libc::sigfillset(&mut blocked_mask);
-                libc::sigdelset(&mut blocked_mask, reverie::PERF_EVENT_SIGNAL as i32);
-            }
+            let blocked_mask = blocked_signal_mask();
             let mut stack = guest.stack().await;
             let blocked_mask_addr = stack.push(blocked_mask);
             let old_mask_addr = stack.reserve::<libc::sigset_t>();
             let action_addr = stack.reserve::<KernelSigaction>();
             let _mask_guard = stack.commit()?;
-            let block_signals = syscalls::RtSigprocmask::new()
-                .with_how(libc::SIG_SETMASK)
-                .with_set(
-                    (!guest
-                        .config()
-                        .backend_requires_thread_directed_process_signals)
-                        .then_some(blocked_mask_addr),
-                )
-                .with_oldset(Some(old_mask_addr))
-                .with_sigsetsize(std::mem::size_of::<u64>());
-            guest.inject_with_retry(block_signals).await?;
-            let guest_signal_mask: libc::sigset_t = guest.memory().read_value(old_mask_addr)?;
+            let guest_signal_mask =
+                block_signals_for_disposition(guest, blocked_mask_addr, old_mask_addr).await?;
+            let inspect_signal_action = guest
+                .config()
+                .backend_requires_thread_directed_process_signals;
 
             let poll_call = call.with_options(call.options() | libc::WNOHANG);
             let mut pending_signal = None;
@@ -1735,9 +1767,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     resource_request(guest, rsrc.clone()).await
                 };
                 if pending_signal.is_none() {
-                    pending_signal =
-                        wait_signal_disposition(guest, status, &guest_signal_mask, action_addr)
-                            .await?;
+                    pending_signal = wait_signal_disposition(
+                        guest,
+                        status,
+                        &guest_signal_mask,
+                        action_addr,
+                        inspect_signal_action,
+                    )
+                    .await?;
                 }
                 let (ready, has_child) = if let Some(spec) = managed_spec {
                     ready_child_wait(guest, spec).await
@@ -1839,17 +1876,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             };
 
-            if !guest
-                .config()
-                .backend_requires_thread_directed_process_signals
-            {
-                let restore_signals = syscalls::RtSigprocmask::new()
-                    .with_how(libc::SIG_SETMASK)
-                    .with_set(Some(old_mask_addr.into()))
-                    .with_oldset(None)
-                    .with_sigsetsize(std::mem::size_of::<u64>());
-                guest.inject_with_retry(restore_signals).await?;
-            }
+            restore_signals_after_disposition(guest, old_mask_addr).await?;
             if result.is_ok() && call.options() & libc::WNOWAIT == 0 {
                 let info_value: libc::siginfo_t = guest.memory().read_value(info)?;
                 let child_pid = unsafe { info_value.si_pid() };
@@ -2248,6 +2275,19 @@ mod tests {
                 SigWrapper(signal)
             ));
         }
+    }
+
+    #[test]
+    fn uncatchable_signals_do_not_require_a_sigaction_query() {
+        assert!(signal_has_uncatchable_default_disposition(SigWrapper(
+            libc::SIGKILL
+        )));
+        assert!(signal_has_uncatchable_default_disposition(SigWrapper(
+            libc::SIGSTOP
+        )));
+        assert!(!signal_has_uncatchable_default_disposition(SigWrapper(
+            libc::SIGUSR1
+        )));
     }
 
     #[test]
