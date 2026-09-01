@@ -72,7 +72,7 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
                 "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev",
             )
             && trace_stderr.contains("Retry #1 for blocking pipe write")
-            && trace_stderr.contains("Retry #1 for atomic blocking pipe writev after Err(EAGAIN)"),
+            && trace_stderr.contains("Retry #1 for atomic blocking pipe writev after EAGAIN"),
         "write/writev did not reach typed dispatch and internal-fd scheduling\n\
          stdout:\n{trace_stdout}\nstderr:\n{trace_stderr}",
     );
@@ -164,10 +164,15 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
     replacement
         .args(["--kill-after", "5s", "30s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
+        // NO `--strict` HERE, and the CLI is why: it refuses `--strict` together
+        // with `--allow-unsupported-syscalls`, and this case cannot drop the
+        // latter -- observing the EOPNOTSUPP refusal IS the case. Written with
+        // both, this invocation exited 2 on the argument conflict and so had
+        // never run. The canonical comparison is retained through
+        // `--verify-strict` and the JSON report below.
         .args([
             "--log=info",
             "run",
-            "--strict",
             "--verify",
             "--verify-strict",
             "--allow-unsupported-syscalls",
