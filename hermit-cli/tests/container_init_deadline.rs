@@ -23,6 +23,9 @@
 //! the supervisor returning promptly -- looks identical whether or not the run
 //! was actually killed. So these tests assert on process liveness directly.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::io;
 use std::os::unix::process::CommandExt;
@@ -183,7 +186,9 @@ fn spawn_in_new_session(argv: &[&str]) -> io::Result<Child> {
 }
 
 fn hermit_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_hermit")
+    hermit_test::hermit_binary()
+        .to_str()
+        .expect("Hermit test binary path is not valid UTF-8")
 }
 
 /// Start a hung run and wait until its container init exists, so that any

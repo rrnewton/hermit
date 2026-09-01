@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -50,7 +53,7 @@ fn futex2_feature_probes_receive_deterministic_enosys() {
 
         let trace = Command::new("timeout")
             .args(["--kill-after", "5s", "60s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args([
                 "--log=trace",
                 "run",
@@ -83,7 +86,7 @@ fn futex2_feature_probes_receive_deterministic_enosys() {
 
         let output = Command::new("timeout")
             .args(["--kill-after", "5s", "60s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args([
                 "--log=debug",
                 "run",

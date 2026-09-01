@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -92,7 +95,7 @@ fn run_native(iteration: usize) -> Vec<u8> {
 }
 
 fn run_strict(iteration: usize) -> Vec<u8> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_test::hermit_binary());
     command.args([
         "run",
         "--strict",

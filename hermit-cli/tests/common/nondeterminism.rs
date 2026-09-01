@@ -10,6 +10,8 @@ use std::path::Path;
 use std::process::Command;
 use std::process::Output;
 
+use super::hermit_binary;
+
 const DEFAULT_NONDETERMINISM_RETRIES: usize = 10;
 const NONDETERMINISM_MARKER: &str = "Failure: nondeterministic.";
 const DETERMINISM_MARKER: &str = "Success: deterministic. Determinism verified.";
@@ -136,7 +138,7 @@ impl<'a> NondeterminismCase<'a> {
     }
 
     fn run_hermit(&self, mode_args: &[&str]) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        let mut command = Command::new(hermit_binary::hermit_binary());
         command.args(mode_args).arg(self.program).args(self.args);
         run_command(command, self.source, "Hermit verification")
     }
@@ -149,7 +151,7 @@ impl<'a> NondeterminismCase<'a> {
     /// Otherwise a passed-through syscall (e.g. `clock_gettime`) aborts before
     /// the assertion can observe the guest's nondeterminism.
     fn run_noop_passthrough(&self, mode_args: &[&str]) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        let mut command = Command::new(hermit_binary::hermit_binary());
         command.args(mode_args).arg(self.program).args(self.args);
         run_command(command, self.source, "Hermit verification")
     }

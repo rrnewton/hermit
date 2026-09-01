@@ -15,6 +15,9 @@
 //! positioned read observes the sanitized snapshot and that a procfs `sendfile`
 //! input is refused, and Hermit's own `--verify` proves both are deterministic.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -46,7 +49,7 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
     // actually executed rather than being skipped.
     let run = Command::new("timeout")
         .args(["--kill-after", "5s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "--log=off",
             "run",
@@ -80,7 +83,7 @@ fn procfs_positioned_reads_are_mediated_and_deterministic() {
     // live kernel bytes).
     let verify = Command::new("timeout")
         .args(["--kill-after", "5s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "--log=info",
             "run",

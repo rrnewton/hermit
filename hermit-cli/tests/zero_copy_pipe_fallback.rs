@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -53,7 +56,7 @@ fn zero_copy_pipe_syscalls_fail_closed_by_default_and_allow_compatibility_opt_ou
         let mut default = Command::new("timeout");
         default
             .args(["--kill-after", "5s", "90s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args([
                 "--log=info",
                 "run",
@@ -81,7 +84,7 @@ fn zero_copy_pipe_syscalls_fail_closed_by_default_and_allow_compatibility_opt_ou
         let mut compatibility = Command::new("timeout");
         compatibility
             .args(["--kill-after", "5s", "90s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args([
                 "--log=off",
                 "run",

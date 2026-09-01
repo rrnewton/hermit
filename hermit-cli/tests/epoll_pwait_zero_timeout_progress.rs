@@ -21,6 +21,9 @@
 //! passes happily while the producer starves. The failure signal is `timeout`
 //! killing the run (exit 124).
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -85,7 +88,7 @@ fn run_guest(extra: &[&str], guest_args: &[&str], marker: &str) {
     command
         .arg("--kill-after=2s")
         .arg(format!("{TIMEOUT_SECONDS}s"))
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "run",
             "--base-env=minimal",

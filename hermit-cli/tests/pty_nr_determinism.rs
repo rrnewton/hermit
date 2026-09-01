@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -69,7 +72,7 @@ fn pty_nr_consumers_verify() {
     );
     let probe_output = Command::new("timeout")
         .args(["--kill-after", "5s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "--log=off",
             "run",
@@ -113,7 +116,7 @@ fn pty_nr_consumers_verify() {
         let mut verify = Command::new("timeout");
         verify
             .args(["--kill-after", "5s", "90s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args([
                 "--log=info",
                 "run",

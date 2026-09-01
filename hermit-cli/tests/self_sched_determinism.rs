@@ -8,6 +8,9 @@
 
 //! End-to-end coverage for host scheduler accounting in /proc/self/sched.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
@@ -45,7 +48,7 @@ fn assert_l2(case: &ProgramCase) {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "10s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "--log",
             "DEBUG",
@@ -81,7 +84,7 @@ fn assert_l2(case: &ProgramCase) {
 }
 
 fn read_self_sched() -> String {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_test::hermit_binary());
     command.args([
         "--log",
         "ERROR",
