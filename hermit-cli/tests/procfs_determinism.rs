@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
@@ -93,7 +96,7 @@ fn read_procfs_with(
     epoch: Option<&str>,
     configure: impl FnOnce(&mut Command),
 ) -> Vec<u8> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_test::hermit_binary());
     command.args([
         "--log=error",
         "run",
@@ -572,7 +575,7 @@ fn proc_rtc_tracks_custom_epoch_and_virtual_time() {
     assert!(initial.contains("rtc_date\t: 2000-12-31\n"));
     assert!(initial.contains("alarm_IRQ\t: no\n"));
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_test::hermit_binary());
     command.args([
         "--log=error",
         "run",
@@ -676,7 +679,7 @@ fn mountinfo_and_stat_proc_device(no_virtualize_metadata: bool, stat_first: bool
     } else {
         "cat /proc/self/mountinfo; /usr/bin/stat -c '__STAT__ %d' /proc"
     };
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_test::hermit_binary());
     command.args([
         "--log=error",
         "run",
@@ -931,7 +934,7 @@ fn ordered_var_then_nscd_mount_keeps_the_run_nscd_hardening_mount() {
     );
 
     let run = || {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        let mut command = Command::new(hermit_test::hermit_binary());
         command
             .args([
                 "--log=error",
@@ -1098,7 +1101,7 @@ fn fdinfo_and_mountinfo_ids() -> (u64, u64, u64, u64) {
                   printf '__ROOT_FD__ '; sed -n 's/^mnt_id:[[:space:]]*//p' /proc/self/fdinfo/3; \
                   printf '__PROC_FD__ '; sed -n 's/^mnt_id:[[:space:]]*//p' /proc/self/fdinfo/4; \
                   cat /proc/self/mountinfo";
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_test::hermit_binary());
     command.args([
         "--log=error",
         "run",
@@ -1295,7 +1298,7 @@ fn redirected_regular_stdio_fdinfo() -> Vec<u8> {
     writeln!(input, "unused input").expect("populate redirected stdin");
     let output = tempfile::NamedTempFile::new().expect("redirected stdout file");
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_test::hermit_binary());
     command
         .args([
             "--log=error",
@@ -1358,7 +1361,7 @@ fn compile_fdinfo_mount_classes_guest() -> PathBuf {
 }
 
 fn fdinfo_mount_classes_with_stdio(guest: &PathBuf, regular_stdin_and_stderr: bool) -> Vec<u8> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_test::hermit_binary());
     command.args([
         "--log=error",
         "run",
@@ -1450,7 +1453,7 @@ fn guest_pipe_socket_and_anon_fdinfo_ignore_hermit_stdio_shape() {
 }
 
 fn mount_namespace_fdinfo(no_namespace: bool) -> Vec<u8> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_test::hermit_binary());
     command.args([
         "--log=error",
         "run",
@@ -1501,7 +1504,7 @@ fn mount_namespace_fdinfo_is_stable_with_and_without_namespace_setup() {
 fn no_namespace_mountinfo_and_fdinfo_share_one_mount_identity_map() {
     let _guard = hermit_run_lock();
     let run = || {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        let mut command = Command::new(hermit_test::hermit_binary());
         command.args([
             "--log=error",
             "run",

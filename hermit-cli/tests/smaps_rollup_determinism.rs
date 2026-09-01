@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -26,7 +29,7 @@ fn required_program(case: &ProgramCase) -> PathBuf {
 fn assert_l2(case: &ProgramCase) {
     let output = Command::new("timeout")
         .args(["--kill-after", "5s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "--log",
             "DEBUG",
@@ -76,7 +79,7 @@ fn smaps_rollup_consumers_are_deterministic_under_strict_verify() {
         candidates: &["/usr/bin/cat", "/bin/cat"],
         args: &["/proc/self/smaps_rollup"],
     };
-    let snapshot = Command::new(env!("CARGO_BIN_EXE_hermit"))
+    let snapshot = Command::new(hermit_test::hermit_binary())
         .args([
             "--log=ERROR",
             "run",

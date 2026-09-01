@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::io::Read;
 use std::io::Seek;
@@ -181,7 +184,7 @@ fn run_signal_scenario_on_backend(
     let mut baseline = None;
 
     for iteration in 0..runs {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        let mut command = Command::new(hermit_test::hermit_binary());
         command.arg("run");
         if let Some(backend) = backend {
             command.arg(format!("--backend={backend}"));
@@ -313,7 +316,7 @@ fn sigsuspend_without_signal_reports_terminal_deadlock() {
     let mut baseline_stderr = None;
 
     for iteration in 0..DEADLOCK_RUNS {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        let mut command = Command::new(hermit_test::hermit_binary());
         command.args([
             "--log=off",
             "run",

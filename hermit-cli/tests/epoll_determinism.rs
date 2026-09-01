@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -74,7 +77,7 @@ fn epoll_guest() -> &'static Path {
 }
 
 fn run_scenario(scenario: &str, run: usize) -> Vec<u8> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_test::hermit_binary());
     command
         .args([
             "run",
@@ -117,7 +120,7 @@ fn assert_scenario_reaches_l2(scenario: &str) {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "10s", "60s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "--log=info",
             "run",

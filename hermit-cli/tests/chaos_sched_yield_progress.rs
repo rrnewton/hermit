@@ -18,6 +18,9 @@
 //! turns `sched_yield` into a chaos reprioritization point, so every seed now
 //! makes progress and exits cleanly.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -74,7 +77,7 @@ fn run_seed(seed: u64) {
     command
         .arg("--kill-after=2s")
         .arg(format!("{TIMEOUT_SECONDS}s"))
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "run",
             "--base-env=minimal",
@@ -125,7 +128,7 @@ fn run_strict_guest(args: &[&str]) {
     command
         .arg("--kill-after=2s")
         .arg(format!("{TIMEOUT_SECONDS}s"))
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "run",
             "--strict",
@@ -185,7 +188,7 @@ fn preemption_replay_preserves_vfork_sched_yield_progress() {
         command
             .arg("--kill-after=2s")
             .arg(format!("{TIMEOUT_SECONDS}s"))
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args([
                 "run",
                 "--strict",

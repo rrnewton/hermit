@@ -19,6 +19,9 @@
 //! this is a normal test. Meta's `fbpython` build is deliberately skipped (see
 //! `find_python3`).
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -96,7 +99,7 @@ fn run_native(python: &Path, script: &Path) -> String {
 
 /// Run the workload under `hermit run --strict`.
 fn run_hermit_strict(python: &Path, script: &Path) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+    let output = Command::new(hermit_test::hermit_binary())
         .args([
             "run",
             "--strict",

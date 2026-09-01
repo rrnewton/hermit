@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -52,7 +55,7 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
     let mut trace = Command::new("timeout");
     trace
         .args(["--kill-after", "5s", "30s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "--log=trace",
             "run",
@@ -111,7 +114,7 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
         let mut verify = Command::new("timeout");
         verify
             .args(["--kill-after", "5s", "30s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args(["--log=info", "run", "--verify", "--base-env=minimal"]);
         if strict {
             verify.args(["--strict", "--panic-on-unsupported-syscalls"]);
@@ -147,7 +150,7 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
     let mut pipe_record = Command::new("timeout");
     pipe_record
         .args(["--kill-after", "5s", "60s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args(["--log=off", "record", "start", "--record-timeout=30"])
         .arg("--data-dir")
         .arg(&pipe_recording)
@@ -169,7 +172,7 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
     let mut record = Command::new("timeout");
     record
         .args(["--kill-after", "5s", "60s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "--log=info",
             "record",

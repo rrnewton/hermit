@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -56,7 +59,7 @@ fn kernel_keyring_is_deterministically_unavailable() {
         let mut verify = Command::new("timeout");
         verify
             .args(["--kill-after", "5s", "90s"])
-            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg(hermit_test::hermit_binary())
             .args([
                 "--log=info",
                 "run",
@@ -128,7 +131,7 @@ fn kernel_keyring_passes_through_with_compatibility_opt_out() {
     let mut hermit = Command::new("timeout");
     hermit
         .args(["--kill-after", "5s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "--log=off",
             "run",

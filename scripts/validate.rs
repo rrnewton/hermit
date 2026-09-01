@@ -153,6 +153,8 @@ const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 /// and the fail-closed assertion that requires it cannot drift apart.
 const PIN_GATE_TAG: &str = "pre.reverie_pin";
 const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
+const INTEGRATION_ARTIFACT_WRAPPER: &str =
+    "./ci/run-with-hermit-e2e-artifact.sh --require-install ";
 const STRICT_COMPAT_PLACEHOLDER_TAG: &str = "test.strict_compat";
 const STRICT_COMPAT_PLACEHOLDER_COMMAND: &str =
     "echo 'test.strict_compat is expanded by scripts/validate.rs into direct compat.* nodes; run this lane through validate or ci/run-node.sh' >&2; exit 125";
@@ -165,6 +167,14 @@ const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ];
 const DETCORE_MISC_TEST_PREBUILD_COMMAND: &str = r#"mkdir -p target/ci; tests_misc_json="target/ci/tests-misc.cargo.jsonl.tmp.$$"; tests_misc_pointer_tmp="target/ci/tests-misc.path.tmp.$$"; if ! CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run --message-format=json > "$tests_misc_json"; then exit 1; fi; mapfile -t tests_misc_bins < <(jq -er 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "tests_misc" and .executable != null) | .executable' "$tests_misc_json" | sort -u); if ((${#tests_misc_bins[@]} != 1)); then printf 'privileged build: expected one Cargo-reported tests_misc executable, found %d\n' "${#tests_misc_bins[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_bins[0]}"; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi; printf '%s\n' "$tests_misc" > "$tests_misc_pointer_tmp"; mv -f "$tests_misc_pointer_tmp" target/ci/tests-misc.path; mv -f "$tests_misc_json" target/ci/tests-misc.cargo.jsonl"#;
 const HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND: &str = "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run";
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"if [ ! -s target/ci/tests-misc.path ]; then printf 'privileged build: Cargo-reported tests_misc path is missing\n' >&2; exit 1; fi; mapfile -t tests_misc_paths < target/ci/tests-misc.path; if ((${#tests_misc_paths[@]} != 1)); then printf 'privileged build: Cargo-reported tests_misc path must contain exactly one line, found %d\n' "${#tests_misc_paths[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_paths[0]}"; case "$tests_misc" in "$PWD"/target/*) ;; *) printf 'privileged build: Cargo-reported tests_misc path is outside this target directory: %s\n' "$tests_misc" >&2; exit 1 ;; esac; case "${tests_misc##*/}" in tests_misc-*) ;; *) printf 'privileged build: Cargo-reported path does not name tests_misc: %s\n' "$tests_misc" >&2; exit 1 ;; esac; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi"#;
+
+fn hermit_integration_uses_published_artifact(step: &Step) -> bool {
+    step.cmd.starts_with(INTEGRATION_ARTIFACT_WRAPPER)
+        && step
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact")
+}
 
 fn fused_privileged_test_build_command() -> String {
     format!(
@@ -2609,6 +2619,40 @@ cleared-caps refusal names {} starved step(s)",
         {
             return Err(
                 "full-plan bracket: E2E publisher is not a complete binary+resource barrier"
+                    .into(),
+            );
+        }
+        let integration = full
+            .cfg
+            .steps
+            .iter()
+            .find(|s| s.tag() == "test.hermit_integration")
+            .ok_or("full-plan bracket: Hermit integration node disappeared")?;
+        if !hermit_integration_uses_published_artifact(integration) {
+            return Err(format!(
+                "full-plan bracket: Hermit integration tests can consume a mutable Hermit binary: cmd={} deps={:?}",
+                integration.cmd, integration.deps
+            ));
+        }
+        let mut missing_wrapper = integration.clone();
+        missing_wrapper.cmd = missing_wrapper
+            .cmd
+            .strip_prefix(INTEGRATION_ARTIFACT_WRAPPER)
+            .ok_or("full-plan bracket: cannot plant missing integration artifact wrapper")?
+            .to_owned();
+        if hermit_integration_uses_published_artifact(&missing_wrapper) {
+            return Err(
+                "full-plan bracket: removing the integration artifact wrapper was accepted"
+                    .into(),
+            );
+        }
+        let mut missing_dependency = integration.clone();
+        missing_dependency
+            .deps
+            .retain(|dependency| dependency != "build.e2e_artifact");
+        if hermit_integration_uses_published_artifact(&missing_dependency) {
+            return Err(
+                "full-plan bracket: removing the integration artifact dependency was accepted"
                     .into(),
             );
         }

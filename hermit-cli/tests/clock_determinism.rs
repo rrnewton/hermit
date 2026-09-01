@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::OnceLock;
 
+use common::hermit_binary;
 use common::nondeterminism::NondeterminismCase;
 
 const DETERMINISM_RUNS: usize = 5;
@@ -77,7 +78,7 @@ fn clock_guest() -> &'static Path {
 }
 
 fn run_clock_matrix(iteration: usize) -> Vec<u8> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let mut command = Command::new(hermit_binary::hermit_binary());
     command.args([
         "run",
         "--base-env=minimal",

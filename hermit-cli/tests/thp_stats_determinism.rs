@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -36,7 +39,7 @@ fn assert_l2(case: &ProgramCase) {
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "10s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "--log",
             "DEBUG",

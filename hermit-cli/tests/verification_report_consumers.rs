@@ -1,7 +1,22 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Output;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -96,6 +111,204 @@ fn temporary_directory() -> PathBuf {
     ));
     fs::create_dir(&path).expect("create temporary directory");
     path
+}
+
+const ARTIFACT_CONSUMER_CHILD: &str = "HERMIT_ARTIFACT_CONSUMER_CHILD";
+const ARTIFACT_CONSUMER_ENTRY_MARKER: &str = "HERMIT_ARTIFACT_CONSUMER_ENTRY_MARKER";
+const ARTIFACT_CONSUMER_MODE: &str = "artifact";
+const STANDALONE_CARGO_MODE: &str = "standalone-cargo";
+
+fn write_executable(path: &Path, contents: &str) {
+    fs::write(path, contents).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|error| panic!("make {} executable: {error}", path.display()));
+}
+
+fn run_artifact_consumer(root: &Path, pointer: &Path, marker: &Path) -> Output {
+    Command::new(root.join("ci/run-with-hermit-e2e-artifact.sh"))
+        .env("HERMIT_E2E_ARTIFACT_POINTER", pointer)
+        .env(ARTIFACT_CONSUMER_CHILD, ARTIFACT_CONSUMER_MODE)
+        .env(ARTIFACT_CONSUMER_ENTRY_MARKER, marker)
+        .arg(std::env::current_exe().expect("locate the running integration-test binary"))
+        .args([
+            "--exact",
+            "immutable_artifact_controls_a_real_integration_consumer",
+            "--nocapture",
+        ])
+        .output()
+        .expect("run the integration-test consumer through the artifact wrapper")
+}
+
+fn copy_binary_only_bundle(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination)
+        .unwrap_or_else(|error| panic!("create {}: {error}", destination.display()));
+    for name in ["hermit", "hermit.sha256", "kind"] {
+        fs::copy(source.join(name), destination.join(name)).unwrap_or_else(|error| {
+            panic!("copy {} into {}: {error}", name, destination.display())
+        });
+    }
+}
+
+#[test]
+fn immutable_artifact_controls_a_real_integration_consumer() {
+    match std::env::var(ARTIFACT_CONSUMER_CHILD).as_deref() {
+        Ok(ARTIFACT_CONSUMER_MODE) => {
+            let marker = std::env::var_os(ARTIFACT_CONSUMER_ENTRY_MARKER)
+                .map(PathBuf::from)
+                .expect("child invocation lacks its entry marker");
+            fs::write(&marker, b"entered\n")
+                .unwrap_or_else(|error| panic!("write {}: {error}", marker.display()));
+            let output = Command::new(hermit_test::hermit_binary())
+                .output()
+                .expect("execute the Hermit binary selected by the shared test resolver");
+            assert!(
+                output.status.success(),
+                "selected Hermit failed: {output:?}"
+            );
+            assert_eq!(output.stdout, b"expected-identity\n");
+            return;
+        }
+        Ok(STANDALONE_CARGO_MODE) => {
+            assert!(
+                std::env::var_os("HERMIT_BIN").is_none(),
+                "standalone Cargo child unexpectedly inherited HERMIT_BIN"
+            );
+            assert_eq!(
+                hermit_test::hermit_binary(),
+                Path::new(env!("CARGO_BIN_EXE_hermit")),
+                "standalone Cargo did not select its compile-time Hermit binary"
+            );
+            let output = Command::new(hermit_test::hermit_binary())
+                .arg("--version")
+                .output()
+                .expect("execute standalone Cargo's compiled Hermit binary");
+            assert!(
+                output.status.success(),
+                "standalone Cargo's compiled Hermit --version failed: {output:?}"
+            );
+            return;
+        }
+        Ok(mode) => panic!("unknown artifact consumer child mode {mode:?}"),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("artifact consumer child mode is not valid UTF-8")
+        }
+        Err(std::env::VarError::NotPresent) => {}
+    }
+
+    let root = root();
+    if std::env::var_os("HERMIT_BIN").is_none_or(|path| path.is_empty()) {
+        let standalone = Command::new(
+            std::env::current_exe().expect("locate the running standalone integration-test binary"),
+        )
+        .env_remove("HERMIT_BIN")
+        .env(ARTIFACT_CONSUMER_CHILD, STANDALONE_CARGO_MODE)
+        .args([
+            "--exact",
+            "immutable_artifact_controls_a_real_integration_consumer",
+            "--nocapture",
+        ])
+        .output()
+        .expect("self-spawn the standalone Cargo integration-test consumer");
+        assert!(
+            standalone.status.success(),
+            "standalone Cargo integration consumer failed:\n{}",
+            String::from_utf8_lossy(&standalone.stderr)
+        );
+    }
+
+    let temporary = temporary_directory();
+    let mutable = temporary.join("target/debug/hermit");
+    let bundles = temporary.join("target/ci/hermit-e2e-artifacts");
+    let pointer = temporary.join("target/ci/hermit-e2e-artifact.path");
+    fs::create_dir_all(mutable.parent().expect("mutable binary has a parent"))
+        .expect("create mutable target directory");
+    write_executable(&mutable, "#!/bin/sh\nprintf 'expected-identity\\n'\n");
+
+    let published = Command::new(root.join("ci/publish-hermit-e2e-artifact.sh"))
+        .args([mutable.as_path(), bundles.as_path(), pointer.as_path()])
+        .output()
+        .expect("publish the fixture Hermit artifact");
+    assert!(
+        published.status.success(),
+        "fixture artifact publication failed:\n{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    let bundle = PathBuf::from(
+        fs::read_to_string(&pointer)
+            .expect("read fixture artifact pointer")
+            .trim(),
+    );
+
+    let replacement = mutable.with_extension("next");
+    write_executable(&replacement, "#!/bin/sh\nprintf 'wrong-relinked\\n'\n");
+    fs::rename(&replacement, &mutable).expect("atomically relink mutable Hermit source");
+    let relink_marker = temporary.join("relink-consumer-entered");
+    let relink = run_artifact_consumer(&root, &pointer, &relink_marker);
+    assert!(
+        relink.status.success(),
+        "real integration consumer followed the relinked mutable path:\n{}",
+        String::from_utf8_lossy(&relink.stderr)
+    );
+    assert!(
+        relink_marker.is_file(),
+        "real integration consumer was never entered for the valid immutable artifact"
+    );
+
+    for (state, expected_reason) in [
+        (
+            "absent",
+            "published Hermit is missing, empty, or non-executable",
+        ),
+        (
+            "nonexec",
+            "published Hermit is missing, empty, or non-executable",
+        ),
+        ("wrong-hash", "published Hermit hash mismatch"),
+    ] {
+        let fake_bundle = temporary.join(state).join(
+            bundle
+                .file_name()
+                .expect("published bundle has an identity"),
+        );
+        copy_binary_only_bundle(&bundle, &fake_bundle);
+        match state {
+            "absent" => fs::remove_file(fake_bundle.join("hermit"))
+                .expect("remove the fake artifact binary"),
+            "nonexec" => fs::set_permissions(
+                fake_bundle.join("hermit"),
+                fs::Permissions::from_mode(0o644),
+            )
+            .expect("make the fake artifact binary non-executable"),
+            "wrong-hash" => OpenOptions::new()
+                .append(true)
+                .open(fake_bundle.join("hermit"))
+                .and_then(|mut file| file.write_all(b"corruption"))
+                .expect("corrupt the fake artifact binary"),
+            _ => unreachable!(),
+        }
+        let fake_pointer = temporary.join(format!("{state}.path"));
+        fs::write(&fake_pointer, format!("{}\n", fake_bundle.display()))
+            .expect("write fake artifact pointer");
+        let marker = temporary.join(format!("{state}-consumer-entered"));
+        let refused = run_artifact_consumer(&root, &fake_pointer, &marker);
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "{state} artifact returned the wrong status:\n{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains(expected_reason),
+            "{state} artifact refusal did not name {expected_reason:?}:\n{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert!(
+            !marker.exists(),
+            "{state} artifact entered the protected integration consumer"
+        );
+    }
+
+    fs::remove_dir_all(temporary).expect("remove artifact-contract temporary directory");
 }
 
 fn measured_match() -> Value {

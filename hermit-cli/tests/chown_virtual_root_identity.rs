@@ -39,6 +39,9 @@
 //! default configuration adds `--strict`; `run_guest` documents why the
 //! `--no-namespace` case cannot.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -115,7 +118,7 @@ fn run_guest(tag: &str, strict: bool, extra: &[&str]) {
     command
         .arg("--kill-after=2s")
         .arg(format!("{TIMEOUT_SECONDS}s"))
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args([
             "run",
             "--base-env=minimal",
