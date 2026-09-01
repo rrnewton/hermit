@@ -213,8 +213,14 @@ pub struct VerificationReport {
     /// read both run summaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<VerificationRuntime>,
+    /// The guest's exit code when an exited status was available to the
+    /// producer. `None` means either that `guest_signal` records a signal
+    /// disposition, or that execution did not return a guest status at all;
+    /// current producers must not leave this null for `ExitStatus::Exited`.
     #[serde(default)]
     pub guest_exit_code: Option<i32>,
+    /// The guest's signal when a signaled status was available to the producer.
+    /// When both disposition fields are null, the writer had no guest status.
     #[serde(default)]
     pub guest_signal: Option<i32>,
     /// WHERE the divergence began, in scheduler-turn units. `None` when the

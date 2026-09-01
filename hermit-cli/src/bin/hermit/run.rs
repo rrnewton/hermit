@@ -69,6 +69,7 @@ use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
 use super::verify::NoResultReason;
 use super::verify::VerificationReport;
+use super::verify::VerificationRuntime;
 use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
 use super::verify::retain_verification_logs;
@@ -105,6 +106,23 @@ fn read_verify_summary(path: &Path) -> Option<RunSummary> {
             None
         }
     }
+}
+
+fn first_run_rejected_report(
+    output: &Output,
+    runtime: Option<VerificationRuntime>,
+) -> VerificationReport {
+    let mut report = VerificationReport::no_result();
+    report.no_result_reason = Some(NoResultReason::FirstRunRejected {
+        exit_code: output.status.code(),
+        signal: output.status.signal(),
+        stdout_bytes: u64::try_from(output.stdout.len()).expect("guest stdout length fits u64"),
+        stderr_bytes: u64::try_from(output.stderr.len()).expect("guest stderr length fits u64"),
+    });
+    report.guest_exit_code = output.status.code();
+    report.guest_signal = output.status.signal();
+    report.runtime = runtime;
+    report
 }
 
 fn private_verify_summary() -> Result<tempfile::NamedTempFile, Error> {
@@ -3808,6 +3826,8 @@ impl RunOpts {
                         path,
                         overshoot.count(),
                         verification_runtime_from_summaries(summary1.as_ref(), None),
+                        // `run_verify` returned only an Error, so this site has
+                        // no guest ExitStatus to record.
                         None,
                     ) {
                         eprintln!(
@@ -3884,19 +3904,11 @@ impl RunOpts {
             // result. A best-effort write: an unwritable artifact must not
             // convert a rejected first run into a different error.
             if let Some(path) = &self.verify_json {
-                let mut report = VerificationReport::no_result();
-                report.no_result_reason = Some(NoResultReason::FirstRunRejected {
-                    exit_code: out1.status.code(),
-                    signal: out1.status.signal(),
-                    stdout_bytes: u64::try_from(out1.stdout.len())
-                        .expect("guest stdout length fits u64"),
-                    stderr_bytes: u64::try_from(out1.stderr.len())
-                        .expect("guest stderr length fits u64"),
-                });
-                report.guest_exit_code = out1.status.code();
-                report.guest_signal = out1.status.signal();
                 let summary1 = read_verify_summary(summary1_file.path());
-                report.runtime = verification_runtime_from_summaries(summary1.as_ref(), None);
+                let report = first_run_rejected_report(
+                    &out1,
+                    verification_runtime_from_summaries(summary1.as_ref(), None),
+                );
                 if let Err(error) = write_report_json(path, &report) {
                     eprintln!(
                         "WARNING: could not record the rejected first run in {}: {}",
@@ -4584,6 +4596,36 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn first_run_rejected_report_keeps_available_guest_exit_code() {
+        let output = Output {
+            status: ExitStatus::Exited(23),
+            stdout: b"out".to_vec(),
+            stderr: b"error".to_vec(),
+        };
+
+        let report = first_run_rejected_report(&output, None);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verification.json");
+        write_report_json(&path, &report).unwrap();
+        let persisted = VerificationReport::from_current_json_value(
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(persisted.guest_exit_code, Some(23));
+        assert_eq!(persisted.guest_signal, None);
+        assert_eq!(
+            persisted.no_result_reason,
+            Some(NoResultReason::FirstRunRejected {
+                exit_code: Some(23),
+                signal: None,
+                stdout_bytes: 3,
+                stderr_bytes: 5,
+            })
+        );
+    }
 
     #[test]
     fn run_one_summary_is_empty_again_before_run_two() -> Result<(), Error> {
