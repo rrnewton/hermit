@@ -257,6 +257,14 @@ for source in "${entrypoints[@]}"; do
         cat "$output" >&2
         exit 2
     fi
+    # validate deliberately keeps TMPDIR under target/validation so its cleanup
+    # owns every temporary file. Cargo then walks upward from this generated
+    # manifest, finds the repository workspace, and refuses the package because
+    # it is not a workspace member. Make the generated package its own workspace;
+    # rust-script does not emit this table itself.
+    if ! grep -qE '^\[workspace([.]|])' "$package_dir/Cargo.toml"; then
+        printf '\n[workspace]\n' >>"$package_dir/Cargo.toml"
+    fi
     if ! package_name=$(cargo metadata --format-version 1 --no-deps \
         --manifest-path "$package_dir/Cargo.toml" 2>"$output" | jq -er '.packages | if length == 1 then .[0].targets[] | select(.kind == ["bin"]) | .name else empty end'); then
         printf 'prepare-rust-scripts: cannot identify generated binary target for %s\n' "$source" >&2
