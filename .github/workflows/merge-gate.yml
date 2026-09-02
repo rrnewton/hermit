@@ -325,6 +325,10 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      # A pull request's APPROVED-AT bindings live in its ISSUE comments, read
+      # through /issues/{n}/comments, so this job needs issues:read alongside
+      # pull-requests:read. Both stay read-only: the gate never writes.
+      issues: read
       pull-requests: read
     steps:
       - name: Check out the review-protocol linter
@@ -334,7 +338,8 @@ jobs:
           # self-hosted runner, so checking out PR-controlled code and executing
           # scripts/core-review-protocol-lint.sh from it would run arbitrary PR
           # code on our infrastructure. The linter reads only environment inputs
-          # (PR_LABELS/PR_BODY/PR_IS_KVM/PR_NUMBER), so main's copy is the correct
+          # (PR_LABELS/PR_BODY/PR_IS_KVM/PR_NUMBER/PR_HEAD_SHA and
+          # PR_COMMENTS_FILE or PR_COMMENTS_JSON), so main's copy is the correct
           # and safe version to run — and a PR cannot weaken its own gate by
           # editing the lint script.
           ref: main
@@ -411,22 +416,63 @@ jobs:
             labels="$(jq -r '.labels[].name' <<< "$pr_json")"
             body="$(jq -r '.body // ""' <<< "$pr_json")"
 
+            # The exact head the reviews must bind, read from the PR itself
+            # rather than from the event payload, so a merge_group entry and a
+            # pull_request event resolve it the same way.
+            pr_head="$(jq -r '.head.sha' <<< "$pr_json")"
+
+            # Issue comments carry the APPROVED-AT bindings. `--paginate
+            # --slurp` returns one array PER PAGE, so `add` flattens them into
+            # the single oldest-first array the linter expects; `// []` covers a
+            # PR with no comments at all. A failed fetch aborts the step under
+            # `set -e` rather than degrading into an empty list, because an
+            # empty list would read as "nobody approved" for the wrong reason.
+            #
+            # Written to a FILE, never passed inline: one environment variable
+            # is capped at 128 KiB and PR #2176's comment array is already
+            # 154,666 bytes, which fails exec with E2BIG. Comment volume grows
+            # with review activity, so the inline form would break first on the
+            # PRs this gate matters most for.
+            pr_comments_file="$(mktemp)"
+            gh api "repos/${REPO}/issues/${pr_number}/comments?per_page=100" \
+              --paginate --slurp | jq -c 'add // []' > "$pr_comments_file"
+
             # A PR "touches KVM" when a changed file path or a label mentions kvm.
             files="$(gh api "repos/${REPO}/pulls/${pr_number}/files" \
-              --paginate --jq '.[].filename' || true)"
-            if grep -qiE 'kvm' <<< "$files" || grep -Fixq kvm <<< "$labels"; then
+              --paginate --jq '.[].filename')"
+            files_kvm_status=0
+            grep -qiE 'kvm' <<< "$files" || files_kvm_status=$?
+            labels_kvm_status=0
+            grep -Fixq kvm <<< "$labels" || labels_kvm_status=$?
+            case "$files_kvm_status" in
+              0 | 1) ;;
+              *)
+                echo "::error::KVM changed-file lookup could not decide (grep exit ${files_kvm_status})."
+                exit 2
+                ;;
+            esac
+            case "$labels_kvm_status" in
+              0 | 1) ;;
+              *)
+                echo "::error::KVM label lookup could not decide (grep exit ${labels_kvm_status})."
+                exit 2
+                ;;
+            esac
+            if [ "$files_kvm_status" -eq 0 ] || [ "$labels_kvm_status" -eq 0 ]; then
               is_kvm=true
             else
               is_kvm=false
             fi
 
             if PR_LABELS="$labels" PR_BODY="$body" PR_IS_KVM="$is_kvm" \
-               PR_NUMBER="$pr_number" \
+               PR_NUMBER="$pr_number" PR_HEAD_SHA="$pr_head" \
+               PR_COMMENTS_FILE="$pr_comments_file" \
                bash scripts/core-review-protocol-lint.sh; then
               :
             else
               failed=1
             fi
+            rm -f "$pr_comments_file"
           done <<< "$pr_numbers"
 
           exit "$failed"
