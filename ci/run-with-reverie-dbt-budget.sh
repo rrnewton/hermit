@@ -173,7 +173,15 @@ fi
 # The changed Reverie files are confined to reverie-ptrace timer recovery and
 # tests. They are build-relevant to Hermit, so this pin still requires fresh
 # validation; only the measured DBT build budget carries unchanged.
-expected_pin=bc106a195dfe7ba8e00c358a7bab11256202a1e6
+# CARRY TO c2e2c8fb (2026-09-02): both repository inputs to the DynamoRIO
+# content-key miss are byte-identical to bc106a19 by git object id:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+# The five intervening commits change validation evidence, exhaustive internal
+# enum dispatch, and the common Backend output API, but no native DBT recipe
+# input. The measured native-build budget therefore carries unchanged; the Rust
+# API change still requires a fresh Hermit build and validation.
+expected_pin=c2e2c8fbe52c2e5e8c65a56c2a547785f76c731e
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

@@ -186,8 +186,15 @@ fi
 # The changed Reverie files are confined to reverie-ptrace timer recovery and
 # tests. They require fresh Hermit validation but cannot change this measured
 # native-build budget. Carry, not recalibration.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bc106a195dfe7ba8e00c358a7bab11256202a1e6 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie bc106a195dfe7ba8e00c358a7bab11256202a1e6 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO c2e2c8fb (2026-09-02): both repository inputs to the DynamoRIO
+# content-key miss are byte-identical to bc106a19 by git object id:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+# The five intervening commits do not touch a native DBT recipe input. The
+# measured native-build budget carries unchanged; fresh Rust build and validate
+# evidence is still required for the Backend API change.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c2e2c8fbe52c2e5e8c65a56c2a547785f76c731e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c2e2c8fbe52c2e5e8c65a56c2a547785f76c731e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
