@@ -257,6 +257,15 @@ for source in "${entrypoints[@]}"; do
         cat "$output" >&2
         exit 2
     fi
+    # TMPDIR is deliberately scoped to each validation run and therefore may
+    # live below this checkout.  Cargo then discovers the repository workspace
+    # above rust-script's generated package and rejects the package as an
+    # unlisted member.  The generated package is independently locked and
+    # built into the one shared rust-script target, so make that boundary
+    # explicit wherever the temporary directory happens to be placed.
+    if ! grep -qE '^\[workspace\]([[:space:]]*#.*)?$' "$package_dir/Cargo.toml"; then
+        printf '\n[workspace]\n' >>"$package_dir/Cargo.toml"
+    fi
     if ! package_name=$(cargo metadata --format-version 1 --no-deps \
         --manifest-path "$package_dir/Cargo.toml" 2>"$output" | jq -er '.packages | if length == 1 then .[0].targets[] | select(.kind == ["bin"]) | .name else empty end'); then
         printf 'prepare-rust-scripts: cannot identify generated binary target for %s\n' "$source" >&2

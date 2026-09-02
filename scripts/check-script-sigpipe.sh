@@ -94,7 +94,12 @@ echo "check-script-sigpipe.sh: OK — $consumers tracked rust-script entrypoint(
 if [[ ${HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED:-} == 1 ]]; then
     ./ci/prepare-rust-scripts.sh --check
 else
-    ./ci/prepare-rust-scripts.sh
+    # Validation places TMPDIR below target/validation.  Exercise that exact
+    # placement so generated packages cannot accidentally inherit the root
+    # Cargo workspace and fail before any script is compiled.
+    producer_tmp="$ROOT_DIR/target/ci/rust-script-producer-tmp"
+    mkdir -p "$producer_tmp"
+    TMPDIR="$producer_tmp" ./ci/prepare-rust-scripts.sh
 fi
 echo "check-script-sigpipe.sh: OK — producer manifest covers all $consumers rust-script entrypoint(s)"
 
