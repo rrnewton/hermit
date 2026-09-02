@@ -305,6 +305,7 @@ pub fn node(
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
+        labels: Vec::new(),
         deps,
         env: BTreeMap::new(),
         hint: ResourceHint {
