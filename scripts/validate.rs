@@ -20337,7 +20337,10 @@ fn stop_test_seam(
         host,
         toolchain: sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into()),
         slot: slot_name(root, parent),
-        cwd: root.to_string_lossy().into(),
+        // This is a synthetic stop-path event, not evidence about the checkout
+        // that happens to host the test. Keep it path-neutral so the canonical
+        // adapter's owner-path guard can judge the event rather than its fixture.
+        cwd: ".".into(),
         profile: profile.to_string(),
         selection_mode: "full".into(),
         cache_state: cache_state(root).into(),
