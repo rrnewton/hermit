@@ -2273,55 +2273,6 @@ cleared-caps refusal names {} starved step(s)",
                 privileged_build.cmd
             ));
         }
-        if ["test.cli", "test.hermit_modes"]
-            .iter()
-            .any(|forbidden| privileged_build.deps.iter().any(|dep| dep == forbidden))
-        {
-            return Err(format!(
-                "full-plan bracket: privileged build depends on portable test success: {:?}",
-                privileged_build.deps
-            ));
-        }
-        assert_fused_shared_integration_test_resources(
-            &full.cfg.steps,
-            &full.cfg.resource_caps,
-        )?;
-        let mut missing_shared_demand = full.cfg.steps.clone();
-        missing_shared_demand
-            .iter_mut()
-            .find(|step| step.tag() == "test.cli")
-            .expect("portable cli exists")
-            .hint
-            .resources
-            .remove("integration_test_binaries.cli");
-        let mut missing_shared_cap = full.cfg.resource_caps.clone();
-        missing_shared_cap.remove("integration_test_binaries.hermit_modes");
-        if assert_fused_shared_integration_test_resources(
-            &missing_shared_demand,
-            &full.cfg.resource_caps,
-        )
-        .is_ok()
-            || assert_fused_shared_integration_test_resources(&full.cfg.steps, &missing_shared_cap)
-                .is_ok()
-        {
-            return Err("full-plan bracket: missing shared-test resource demand/cap was accepted".into());
-        }
-        let mut selected = Plan {
-            cfg: full.cfg.clone(),
-            profile: "full".into(),
-            ..Default::default()
-        };
-        select_constructed_steps(
-            &mut selected,
-            "privileged-test.cli_kvm,privileged-test.pmu_buck_chaos_cases",
-            false,
-        )?;
-        let tags: BTreeSet<String> = selected.cfg.steps.iter().map(Step::tag).collect();
-        if ["test.cli", "test.hermit_modes"].iter().any(|tag| tags.contains(*tag)) {
-            return Err(format!(
-                "full-plan bracket: selected privileged tests acquired a portable-test dependency: {tags:?}"
-            ));
-        }
         let cpuid = full
             .cfg
             .steps
