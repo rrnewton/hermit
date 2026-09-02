@@ -2741,8 +2741,9 @@ run and a required status check for this lint. Skipping the hand-run lint is not
 reported by the current repository settings.
 
 ⚠️ **DO NOT CHANGE THAT POLICY UNILATERALLY.** Adding a `pull_request` trigger
-would contradict the standing directive that CI does not run automatically.
-Requiring the existing manually dispatched check instead would make every pull
-request wait for a deliberate dispatch. Either policy changes repository-wide
-landing behavior and therefore needs an owner decision; the present partial
-lint remains a hand-run check until then.
+would contradict the standing directive that Actions run automatically only
+for the integration branch. That portable run is supplemental evidence and
+does not gate. Requiring the existing manually dispatched check instead would
+make every pull request wait for a deliberate dispatch. Either policy changes
+repository-wide landing behavior and therefore needs an owner decision; the
+present partial lint remains a hand-run check until then.

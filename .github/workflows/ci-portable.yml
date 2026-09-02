@@ -1,8 +1,9 @@
 name: CI (GitHub-managed portable)
 
-# Manually dispatched diagnostic fan-out of the constructed portable plan.
-# Local full validation remains the landing authority; this workflow reports
-# additional evidence and a hosted red does not block a qualifying local green.
+# Diagnostic fan-out of the constructed portable plan. It runs automatically
+# only after a commit reaches the integration branch, and may also be dispatched
+# manually. Local exact-head full validation remains the landing authority; this
+# workflow reports additional evidence and a hosted red never gates a landing.
 #
 # WHY: the former serial `regular` job ran the entire 46-node
 # portable DAG on ONE ubuntu-latest runner with outer concurrency 1 (serial
@@ -32,10 +33,12 @@ name: CI (GitHub-managed portable)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [integration]
 
 concurrency:
-  # Manual runs for one ref share a group. cancel-in-progress:false lets the
-  # running diagnostic finish while GitHub supersedes only an older pending run.
+  # Runs for one ref share a group. cancel-in-progress:false lets the running
+  # diagnostic finish while GitHub supersedes only an older pending run.
   group: portable-${{ github.event.merge_group.head_sha || github.ref }}
   cancel-in-progress: false
 
@@ -76,9 +79,9 @@ env:
 jobs:
   # -------------------------------------------------- affected-test selection
   # Consume ci/select-tests.rs (#1500) to shrink the matrix for a limited-
-  # footprint pull request. FAIL-SAFE by construction: only a pull_request with a
-  # resolvable base and the kill-switch off is eligible for a reduced suite.
-  # merge_group, push-to-main, workflow_dispatch, a disabled kill-switch, an
+  # footprint pull request. That selection path is dormant under the current
+  # trigger policy: the integration push and workflow_dispatch events always
+  # select the full suite. A disabled kill-switch, an
   # unresolvable base, ANY tool error, or an unrecognized decision all fall
   # through to the full matrix — the exact behavior before this job existed. The
   # `skip`/`selective` decisions themselves are the tool's audited, proof-of-inert

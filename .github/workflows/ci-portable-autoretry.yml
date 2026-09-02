@@ -1,5 +1,10 @@
 name: Portable auto-retry on cancellation
 
+# CURRENT TRIGGER POLICY: this workflow has no workflow_run trigger, so the
+# historical cancellation-retry implementation below cannot run automatically.
+# A manual dispatch carries no workflow_run payload and skips the job. The
+# original design is retained intact for old-run interpretation.
+#
 # Companion to "CI (GitHub-managed portable)". When a PR's portable run is
 # CANCELLED — concurrency supersede (ci-portable.yml `cancel-in-progress` on a
 # new pull_request event) or a hosted-runner queue eviction under load — the

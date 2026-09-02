@@ -133,12 +133,13 @@ owner wires `ci-portable.yml` against.
 ## Two delta contexts
 
 Selection is a delta **against a green baseline** — it runs the tests the delta
-can affect and trusts the baseline for everything else. The delta is defined
-differently in the two places CI runs:
+can affect and trusts the baseline for everything else. The selector supports
+two contexts, but only the local one is active in the current automation: the
+integration-branch and manual portable workflow events select the full suite.
 
 | Context | Delta | Invocation |
 | --- | --- | --- |
-| **GitHub PR** | the PR's own contribution vs the target branch | `ci/select-tests.rs --base origin/main` (uses `origin/main...HEAD`, the merge-base) |
+| **Historical GitHub PR path (not automatically triggered)** | the PR's own contribution vs the target branch | `ci/select-tests.rs --base origin/main` (uses `origin/main...HEAD`, the merge-base) |
 | **Local `scripts/validate.rs`** | dirty working copy + commits since the last known-green commit | `ci/select-tests.rs --since-green --baseline <sha>` |
 
 `--since-green` computes `committed-since-baseline ∪ staged ∪ unstaged ∪
@@ -159,18 +160,16 @@ consequences:
    commit whose validate run was green; a `scripts/validate.rs` wrapper reads that SHA
    and passes it in. See "Integration contract" below.
 
-> **Known blocker.** A robustly-green baseline does not yet exist on developer
-> hosts: full `scripts/validate.rs` cannot exit 0 on a devserver (host-sensitive detcore
-> tests — futex-absolute-timeout, RDRAND/RDSEED — plus the DynamoRIO
-> cold-checkout failure). Until that is resolved the *local* baseline is
-> untrustworthy and `--since-green` correctly falls back to full. The GitHub
-> context is unaffected: `origin/main` gated by required checks is the green
-> baseline there.
+Do not infer a green baseline from a branch name or hosted result. The local
+context receives its qualifying exact-head baseline from the validation ledger;
+without one, `--since-green` falls back to full. The integration-branch and
+manual portable workflow events also run the full selection and do not treat
+`main` or a required hosted check as a green baseline.
 
 ## Usage
 
 ```bash
-# GitHub PR context: what does this PR's diff require?
+# Historical/manual PR analysis: what does this PR's diff require?
 ci/select-tests.rs --base origin/main
 
 # Local context: what changed since my last green validate run?

@@ -5,15 +5,12 @@ name: Linux boot (QEMU) — dedicated lane
 # Booting a Linux kernel under Hermit is the heaviest thing in the demo suite:
 # it needs QEMU, a pinned kernel, a BusyBox initramfs, and — because it runs
 # under `--strict` — PMU retired-branch preemption, so it can only run on the
-# self-hosted `pmu` lane. Today that boot rides inside `demo-hot-path.yml`,
-# which runs `scripts/super-validate.sh --demos-only` (the whole parent demo
-# suite) on every hot-path push with `timeout-minutes: 360`. Anything that slow
-# in a push-triggered lane is a queue hazard on a single PMU runner.
+# self-hosted `pmu` lane. The broader `demo-hot-path.yml` diagnostic also runs
+# this boot as part of `scripts/super-validate.sh --demos-only`.
 #
 # This lane does one thing: boot Linux under Hermit and assert it reached
-# userspace deterministically. It is scheduled and manually dispatchable rather
-# than push-triggered, so it catches a demo5 regression without adding latency
-# to the hot path. It also uses Hermit's OWN self-contained demo
+# userspace deterministically. It is manually dispatched and never runs on a
+# pull request, `main`, or a schedule. It also uses Hermit's OWN self-contained demo
 # (`demos/05-qemu-busybox.sh`) rather than the parent's demo harness, so the
 # check lives in the repository whose commits can break it.
 #
@@ -23,21 +20,7 @@ name: Linux boot (QEMU) — dedicated lane
 # That is why this lane calls the in-repo demo directly.
 
 on:
-  schedule:
-    # Nightly, off the hour to avoid the busy scheduling slots other lanes use.
-    - cron: "41 04 * * *"
   workflow_dispatch:
-  push:
-    branches: [main]
-    # Deliberately NARROW. A full determinism regression is caught by the
-    # nightly run and by demo-hot-path; a push-trigger here is only for changes
-    # that can break the boot harness itself, where a 20-minute feedback loop is
-    # worth a PMU slot.
-    paths:
-      - ".github/workflows/linux-boot.yml"
-      - "demos/05-qemu-busybox.sh"
-      - "demos/boot_qemu.sh"
-      - "demos/qemu-busybox/**"
 
 # One boot at a time. There is a single PMU runner; queuing two of these behind
 # each other starves every other lane that needs it.

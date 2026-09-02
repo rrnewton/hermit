@@ -39,18 +39,17 @@ manifest validation, and KVM E2E cells so the manual self-hosted smoke stays
 within its 270-second workflow bound. Each sequential build/KVM segment is
 capped at 120 seconds, yielding a 240-second maximum DAG timeout path; the
 manifest audit recomputes and enforces that bound. The 139-program
-record/replay ratchet is preserved as a separate step in the long merge-group
-validation job.
+record/replay ratchet is preserved as a separate step in the manually dispatched
+full validation job.
 
 The `mem_race` family and three nonblocking post-DAG diagnostics run in the
-scheduled `super` tier so a known host-sensitive hang cannot consume the
-serialized capability lane.
+manually dispatched `super` tier so a known host-sensitive hang cannot consume
+the serialized capability lane unexpectedly.
 
-The `Validation Levels` workflow no longer launches a second copy of
-`--portable-only` for every pull request. Its quick lane remains available by
-manual dispatch, while merge-group privileged and scheduled super validation are
-unchanged. The manual [`ci-dag.yml`](../../.github/workflows/ci-dag.yml)
-workflow runs either DAG on demand.
+The `Validation Levels` workflow does not launch for pull requests, `main`, or a
+schedule. Its quick, privileged, and super levels remain available by manual
+dispatch. The manual [`ci-dag.yml`](../../.github/workflows/ci-dag.yml) workflow
+runs either DAG on demand.
 
 ### Runner dependency
 
@@ -71,7 +70,7 @@ A successful PR run on 2026-07-26 provided the baseline:
 - `Validation Levels` independently repeated the same 14-minute portable suite,
   consuming another GitHub-managed portable runner.
 
-The diagnostics now run in the scheduled `super` tier. The portable plan uses a 14 GiB memory budget, which the current model
+The diagnostics are available in the manually dispatched `super` tier. The portable plan uses a 14 GiB memory budget, which the current model
 maps to `-j 2` on the 16 GiB portable runner. Compile, lint, documentation, unit,
 contract, and Hermit guest nodes may overlap when dependencies and memory allow.
 Per-node performance reports are uploaded from every run so estimates can be

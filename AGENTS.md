@@ -454,10 +454,12 @@ Pass an explicit empty string to mean "genuinely none". Supplying only
 than the absence of complaints.
 
 ⚠️ **DO NOT "FIX" THIS BY ARMING THE GATE.** Adding a `pull_request` trigger
-contradicts the standing directive that CI does not run automatically, and a
-trigger without a `required_status_checks` rule — or a rule without a trigger —
-yields either a check that gates nothing or a requirement nothing can satisfy.
-Both layers or neither, and that pairing is an owner decision.
+contradicts the standing directive that Actions never run automatically for
+pull requests or `main`. The portable workflow's automatic integration-branch
+run is supplemental evidence only. A trigger without a `required_status_checks`
+rule — or a rule without a trigger — yields either a check that gates nothing or
+a requirement nothing can satisfy. Both layers or neither, and that pairing is
+an owner decision.
 
 **What actually holds this line today is agents choosing to hold it.**
 

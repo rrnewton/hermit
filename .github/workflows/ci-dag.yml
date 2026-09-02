@@ -1,8 +1,8 @@
 name: CI (DAG runner, manual)
 
 # Manual entrypoint for comparing or debugging the portable and privileged DAGs.
-# The required GitHub-managed portable lane uses the same portable DAG directly from
-# ci-portable.yml; this workflow adds no per-PR load.
+# The integration-branch GitHub-managed portable signal uses the same portable
+# DAG directly from ci-portable.yml; this workflow adds no automatic load.
 on:
   workflow_dispatch:
     inputs:

@@ -104,8 +104,8 @@ validate-timeout-layers-test: ## Live bracket for step/scope timeouts (requires 
 check-skill-discovery: ## Verify Claude and stock Codex discover the same product skills
 	./scripts/check-skill-discovery.rs
 
-# `make lint` mirrors the lint gate CI's merge-gate enforces, so a developer can
-# reproduce every lint failure locally before pushing. Cheap checks run first for
+# `make lint` mirrors the lint portion of canonical local validation, so a
+# developer can reproduce every lint failure locally before pushing. Cheap checks run first for
 # fast feedback; the compile-heavy clippy pass and the networked Reverie-pin
 # ancestry/monotonicity policy run last. The exact clippy/rustfmt invocations match
 # ci/dag/portable.json (lint.clippy / lint.rustfmt).
@@ -124,7 +124,7 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # everything else and IS scheduled, as the single node check.lint_checks.
 #
 # ADD NEW CHECKERS TO lint-checks, NOT HERE. That is the whole point of the split:
-# a checker added to lint-checks is gated by CI automatically, whereas the previous
+# a checker added to lint-checks is exercised by local validation automatically, whereas the previous
 # arrangement required someone to also hand-write a DAG node and six of the ten
 # checkers in this target had no such node (measured 2026-08-25 at a5fef7ff7623).
 lint: lint-checks lint-cargo ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, Reverie pin policy, nested lockfiles, record-version floor)
@@ -138,6 +138,7 @@ lint: lint-checks lint-cargo ## Run the full lint suite matching CI (rustfmt, sh
 # the recipe, silently dropping every line after it.
 lint-checks: ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
 	./scripts/check-skill-discovery.rs
+	./scripts/check-github-actions-triggers.rs
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh
 	bash ./tests/compat/real_compat_workload.sh --self-test-localhost-port

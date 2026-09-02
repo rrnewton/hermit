@@ -15,10 +15,12 @@ Hermit CI is partitioned by host capability, not by test duration:
 | Portable | `ci-portable.yml`, `ubuntu-latest` | `./scripts/validate.rs portable-only --no-label-pr` | No PMU counters, CPUID faulting, or KVM |
 | Privileged | `ci-privileged.yml`, `[Linux, X64, hermit, pmu]` | `./scripts/validate.rs --privileged-only --no-label-pr` | PMU overflow delivery, CPUID faulting, and read/write `/dev/kvm` |
 
-The portable workflow is the required broad product gate. The privileged
-workflow is a focused capability sentinel and must finish in less than five
-minutes. Long PMU stress, debugger, language-runtime, and application matrices
-do not belong in the scarce privileged lane.
+Local exact-head validation is the required broad product evidence. The
+portable workflow supplies a second, non-gating signal after integration-branch
+pushes or manual dispatches. The privileged workflow is a manually dispatched
+capability sentinel and must finish in less than five minutes. Long PMU stress,
+debugger, language-runtime, and application matrices do not belong in the
+scarce privileged lane.
 
 ## Multi-mode E2E harness
 
@@ -87,8 +89,8 @@ documentation, and unit-test nodes retain their existing dependencies.
 - the KVM E2E shell/environment sentinel.
 
 The 139-program record/replay compatibility ratchet runs as a separate step in
-the long merge-group job. It is intentionally outside the five-minute
-privileged smoke DAG, whose workflow enforces a 270-second outer bound.
+the manually dispatched full-validation job. It is intentionally outside the
+five-minute privileged smoke DAG, whose workflow enforces a 270-second outer bound.
 The DAG's longest configured timeout path is 240 seconds (120-second build plus
 120-second KVM E2E), and the manifest audit fails if later edits exceed the
 outer bound.

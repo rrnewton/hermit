@@ -50,15 +50,16 @@ decision surface:
 Two consumers are intentionally not generic admission classifiers.
 `ci-portable.yml` accepts a skipped internal shard only after affected-test
 selection proves that shard deselected; a cancelled selected shard still fails
-the aggregate. `ci-portable-autoretry.yml` consumes cancellation as a trigger
-to create a new result and never treats it as pass or failure.
+the aggregate. `ci-portable-autoretry.yml` retains its historical cancellation
+consumer, but its only current trigger is manual and a dispatch has no
+workflow-run payload, so it creates no automatic retry or admission result.
 
-The workflow removes `locally-validated` whenever the pull request head
-changes. It also re-runs the gate after CI completes and on label changes, so a
-premature pending-CI failure converges without closing and reopening the pull
-request. Every strip records a durable evidence comment (see
-"Validation-evidence trail" below) so the record of what was validated is never
-lost.
+The merge-gate workflow retains historical jobs for removing
+`locally-validated` after a pull-request head change and re-running after CI or
+label changes. Those events are not active triggers; the workflow is manual and
+advisory. Manual tooling that strips the label must record a durable evidence
+comment (see "Validation-evidence trail" below) so the record of what was
+validated is never lost.
 
 The job first verifies that its workflow file has the exact Git blob registered
 in the server-side `MERGE_GATE_V4_BLOB` variable. This rejects accidental drift
@@ -124,26 +125,22 @@ validated. Two symmetric comments preserve it:
   add-time evidence comment. It is best-effort and always exits 0, so it can
   never fail a gate job or block landing.
 
-Known strip paths — all must leave the trail:
+The live strip path must leave the trail; the automated paths below are retained
+only as historical workflow logic:
 
-1. **Automated on-push strip.** The `invalidate-local-validation` job in
-   `.github/workflows/merge-gate.yml` deletes the label on
-   `pull_request: synchronize` and then calls `label-strip-evidence.sh`.
-2. **Manual agent/tooling strip.** A human or agent removing the label
+1. **Historical on-push strip.** The `invalidate-local-validation` job in
+   `.github/workflows/merge-gate.yml` contains handling for
+   `pull_request: synchronize`, but no pull-request trigger invokes it.
+2. **Live manual agent/tooling strip.** A human or agent removing the label
    (`gh pr edit --remove-label locally-validated`, `gh api DELETE
    .../labels/locally-validated`, or a remove+add re-fire toggle) must run
    `scripts/label-strip-evidence.sh --pr <n> --validated-sha <sha> [--remove]`
    so the evidence is preserved. The `--remove` flag also strips the label.
-3. **Evidence mutation.** Editing or deleting a PR comment revalidates the
-   current exact-head receipt. If no dereferenceable receipt remains, the
-   workflow publishes failing `merge-gate-v4` and retired `merge-gate-v3`
-   checks at the exact head, then removes `locally-validated`. The checks keep
-   advisory history truthful but are not branch-protection requirements.
-   Same-repository branches explicitly dispatch a new exact-head gate because
-   label changes made with `GITHUB_TOKEN` do not recursively trigger another
-   workflow. Fork heads cannot be used as base-repository workflow-dispatch
-   refs; their advisory checks remain until a new receipt and label re-fire the
-   pull-request gate.
+3. **Historical evidence-mutation handling.** The workflow contains logic to
+   revalidate edited or deleted receipt comments, publish advisory checks, and
+   remove `locally-validated`, but no issue-comment trigger invokes it. A manual
+   dispatch does not carry that event payload. The retained code documents the
+   old behavior; it is not current enforcement.
 
 The receipt is remotely readable from every gate runner and immutable at its
 referenced commit, unlike a devbig014-local ledger path. The local applier reads

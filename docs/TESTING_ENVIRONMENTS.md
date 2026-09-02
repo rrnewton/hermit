@@ -27,7 +27,7 @@ it runs `full` for backward compatibility.
 | Level | Typical estimate | Coverage |
 | --- | --- | --- |
 | `quick` | About 3 minutes | Builds the workspace, runs Detcore's core unit tests, and exercises ptrace run, repeat-output, verify, record, and replay smoke tests. It does not execute DBT or KVM or build the optimized binary. |
-| `portable-only` | About 8 minutes | Constructs the portable plan also selected by the manually dispatched GitHub-managed portable workflow: build, portable workspace tests, Hermit and Detcore library/binary tests, docs, Clippy, and rustfmt. It does not require PMU or guest namespaces. |
+| `portable-only` | About 8 minutes | Constructs the portable plan also selected by the integration-branch and manually dispatched GitHub-managed portable workflow: build, portable workspace tests, Hermit and Detcore library/binary tests, docs, Clippy, and rustfmt. It does not require PMU or guest namespaces. |
 | `full` (default) | About 20-70 minutes | Constructs the portable and privileged plan from the committed validation data. This includes the portable product gates plus the focused CPUID, PMU, KVM, and record/replay capability partition. |
 | `super` | About 30-90 minutes | Builds Hermit and repeats each bounded determinism probe 20 times by default. It reports `passed/total` for every probe and fails if any iteration fails. Available KVM and DBT verify probes join the ptrace strict-verify, pipeline, and record/replay probes. |
 
@@ -152,14 +152,16 @@ Notes:
 
 ## CI tiers: what runs where
 
-Local `scripts/validate.rs` is the primary validation path. The portable and
-privileged workflows are manually dispatched diagnostics for comparing an
-ordinary GitHub Actions runner with a capability-bearing runner:
+Local exact-head `scripts/validate.rs` is the canonical validation and landing
+path. The portable workflow also runs automatically after pushes to
+`integration`; that run is a second signal and never gates a pull request or a
+landing. Portable and privileged workflows remain manually dispatchable for
+comparing an ordinary GitHub Actions runner with a capability-bearing runner:
 
 ### `regular` — GitHub-managed portable (`ubuntu-latest`)
 
-Runs only by `workflow_dispatch`. It asks `scripts/validate.rs` for selected
-step tags from the constructed portable plan and covers the
+Runs after a push to `integration` or by `workflow_dispatch`. It asks
+`scripts/validate.rs` for selected step tags from the constructed portable plan and covers the
 **environment-independent subset**:
 
 - `cargo build --workspace`
@@ -178,7 +180,7 @@ Runs only by `workflow_dispatch`.
 Requires PMU access, CPUID faulting, and read/write `/dev/kvm`. It is a focused
 sub-five-minute sentinel: one CPUID test, one direct PMU overflow/skid probe,
 and one KVM multi-mode E2E cell. Broad product and stress coverage remains in
-portable or scheduled validation.
+portable or local validation.
 
 ## Named measurement hosts
 

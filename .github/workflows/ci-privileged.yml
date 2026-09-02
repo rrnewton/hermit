@@ -3,9 +3,8 @@ name: CI (privileged)
 on:
   workflow_dispatch:
 
-# QUEUE-DEPTH-1 on main: all main pushes share one group (github.ref); with
-# cancel-in-progress:false GitHub lets the running job finish and supersedes only
-# the older PENDING run in the group.
+# The event-specific job condition and per-ref concurrency behavior are retained
+# for interpreting old runs. The current workflow trigger is manual only.
 concurrency:
   group: privileged-${{ github.ref }}
   cancel-in-progress: false
@@ -26,7 +25,7 @@ jobs:
   #   * strict guest execution through /dev/kvm.
   # Full workspace builds, lint, portable tests, record/replay matrices,
   # language runtimes, debugger tests, and heavyweight QEMU boots belong on
-  # portable or scheduled CI.
+  # portable or local validation.
   privileged:
     name: Privileged capability and E2E tests
     if: >-

@@ -23,9 +23,10 @@
 //!      scripts/check-detcore-backend-abstraction.sh:264 names
 //!      check-detcore-backend-abstraction-test.sh in a comment, and a plain grep
 //!      reports it as scheduled. Comments are stripped before matching.
-//!   2. A reference in .github/workflows/ is not evidence of anything. All ten
-//!      workflows are workflow_dispatch-only except linux-boot.yml, so they gate
-//!      no PR. Workflows are NOT a reachability source here, by design.
+//!   2. A reference in .github/workflows/ is not evidence of a local gate. The
+//!      portable workflow's integration-branch run is supplemental evidence;
+//!      every other workflow is manual, and none gate a PR. Workflows are NOT a
+//!      reachability source here, by design.
 //!
 //! Reachability is a fixpoint, not one hop: check-git-pin-uniformity.rs has no DAG
 //! node but ci/run-reverie-pin-check.sh calls it and that has two, so it IS
@@ -206,8 +207,9 @@ fn main() {
         println!(
             "check-checker-scheduling: refuse a tracked checker entrypoint that no DAG\n\
              node and no `make lint-checks` recipe line can reach, directly or\n\
-             transitively. Workflows are not a reachability source: they are\n\
-             workflow_dispatch-only and gate nothing. Deliberate exceptions live in\n\
+             transitively. Workflows are not a reachability source: the integration-\n\
+             branch portable run is supplemental and the others are manual.\n\
+             Deliberate exceptions live in\n\
              ALLOWLIST with a reason each."
         );
         return;
