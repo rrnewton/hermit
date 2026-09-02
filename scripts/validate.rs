@@ -3108,16 +3108,21 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
         .expect("exactly one producer exists");
+    let rust_scripts = full_nodes
+        .iter()
+        .find(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
+        .ok_or("selective bracket: full/no-baseline fallback lost build.rust_scripts")?;
     let gate = full_nodes
         .iter()
         .find(|step| step.tag() == "gate.manifest")
         .ok_or("selective bracket: full/no-baseline fallback lost gate.manifest")?;
-    if producer.deps != [PIN_GATE_TAG.to_string()]
+    if rust_scripts.deps != [PIN_GATE_TAG.to_string()]
+        || producer.deps != [RUST_SCRIPT_PRODUCER_TAG.to_string()]
         || gate.deps != [validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string()]
     {
         return Err(format!(
-            "selective bracket: full/no-baseline producer ordering is wrong: producer={:?} gate={:?}",
-            producer.deps, gate.deps
+            "selective bracket: full/no-baseline producer ordering is wrong: rust_scripts={:?} producer={:?} gate={:?}",
+            rust_scripts.deps, producer.deps, gate.deps
         ));
     }
     let tags: BTreeSet<String> = full_nodes.iter().map(|step| step.tag()).collect();
