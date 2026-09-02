@@ -1245,16 +1245,99 @@ jobs:
         if: always()
         env:
           RESULTS: ${{ toJSON(needs) }}
+          DECISION: ${{ needs.select.outputs.decision }}
+          BUILD_DEBUG: ${{ needs.select.outputs.build_debug }}
+          BUILD_RELEASE: ${{ needs.select.outputs.build_release }}
+          RUN_DEBUG_SHARDS: ${{ needs.select.outputs.run_debug_shards }}
+          RUN_RELEASE_SHARDS: ${{ needs.select.outputs.run_release_shards }}
+          RUN_STRICT_COMPAT: ${{ needs.select.outputs.run_strict_compat }}
+          RUN_E2E: ${{ needs.select.outputs.run_e2e }}
         run: |
           set -euo pipefail
           jq . <<< "$RESULTS"
-          # A job is acceptable only if it SUCCEEDED or was intentionally
-          # deselected (skipped) by affected-test selection. A `failure` or
-          # `cancelled` in ANY selected job still fails closed — selection can
-          # remove a job from the run, never mask a real failure. `select` itself
-          # is in this set: if it dies it reports `failure`, not `skipped`, so a
-          # broken selection job reds the diagnostic instead of silently skipping tests.
-          jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<< "$RESULTS"
+
+          # Match every job to the same selection output used by its job-level
+          # `if`. A selected job can still be reported as `skipped` when one of
+          # its dependencies fails; that is a blocked selected job, not an
+          # intentional deselection, and must red this summary.
+          SELECTED=$(jq -cn \
+            --arg decision "$DECISION" \
+            --arg build_debug "$BUILD_DEBUG" \
+            --arg build_release "$BUILD_RELEASE" \
+            --arg run_debug "$RUN_DEBUG_SHARDS" \
+            --arg run_release "$RUN_RELEASE_SHARDS" \
+            --arg run_strict "$RUN_STRICT_COMPAT" \
+            --arg run_e2e "$RUN_E2E" \
+            '{
+              select: true,
+              plan: true,
+              preflight: ($decision != "skip"),
+              checks: ($decision != "skip"),
+              "build-debug": ($build_debug != "false"),
+              "build-release": ($build_release != "false"),
+              "build-complete": ($build_release != "false"),
+              "test-debug": ($run_debug != "false"),
+              "strict-compat": ($run_strict != "false"),
+              "test-release": ($run_release != "false"),
+              e2e: ($run_e2e != "false")
+            }')
+
+          classify_non_successes() {
+            jq -c --argjson selected "$2" '
+              [to_entries[] |
+                .key as $job |
+                .value.result as $result |
+                ($selected | has($job)) as $known |
+                if ($known | not) then
+                  {job: $job, result: $result, classification: "missing-selection-rule"}
+                elif $result == "success" then
+                  empty
+                elif $result == "skipped" and ($selected[$job] | not) then
+                  empty
+                elif $result == "skipped" then
+                  {job: $job, result: $result, classification: "blocked"}
+                else
+                  {job: $job, result: $result, classification: "failed"}
+                end
+              ]' <<< "$1"
+          }
+
+          require_selected_results() {
+            local non_successes
+            non_successes=$(classify_non_successes "$1" "$2") || return
+            if [[ "$non_successes" == "[]" ]]; then
+              return 0
+            fi
+            jq -r '.[] |
+              if .classification == "blocked" then
+                "::error::blocked selected job \(.job): GitHub reported skipped; inspect its dependencies"
+              elif .classification == "missing-selection-rule" then
+                "::error::job \(.job) has no aggregate selection rule (result=\(.result))"
+              else
+                "::error::job \(.job) finished with \(.result)"
+              end' <<< "$non_successes" >&2
+            return 1
+          }
+
+          # Two-sided bracket: a skipped deselected job is accepted, while the
+          # identical result for a selected job is refused as dependency-blocked.
+          skipped_fixture='{"select":{"result":"success"},"test-debug":{"result":"skipped"}}'
+          require_selected_results "$skipped_fixture" \
+            '{"select":true,"test-debug":false}' >/dev/null 2>&1 || {
+              echo "::error::aggregate self-test rejected an intentionally deselected job" >&2
+              exit 1
+            }
+          if require_selected_results "$skipped_fixture" \
+            '{"select":true,"test-debug":true}' >/dev/null 2>&1; then
+            echo "::error::aggregate self-test accepted a blocked selected job" >&2
+            exit 1
+          fi
+
+          jq -r --argjson selected "$SELECTED" '
+            to_entries[] |
+            select(.value.result == "skipped" and ($selected[.key] == false)) |
+            "::notice::intentionally deselected job \(.key)"' <<< "$RESULTS"
+          require_selected_results "$RESULTS" "$SELECTED"
 
   # ------------------------------------------------------------- cleanup
   cleanup:

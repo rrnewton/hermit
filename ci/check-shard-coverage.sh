@@ -132,6 +132,124 @@ workflow_step_body() {
     ' <<<"$workflow_text"
 }
 
+workflow_job_body() {
+    local job=$1 workflow_text=$2
+    awk -v marker="  $job:" '
+        $0 == marker { in_job = 1; found = 1; next }
+        in_job && /^  [A-Za-z0-9_-]+:$/ { exit }
+        in_job { print }
+        END { if (!found) exit 1 }
+    ' <<<"$workflow_text"
+}
+
+workflow_job_needs() {
+    local job=$1 workflow_text=$2 body
+    body=$(workflow_job_body "$job" "$workflow_text") || return 1
+    awk '
+        /^    needs: \[/ {
+            line = $0
+            sub(/^    needs: \[/, "", line)
+            sub(/\][[:space:]]*$/, "", line)
+            count = split(line, values, /,[[:space:]]*/)
+            for (i = 1; i <= count; i++) print values[i]
+            found = 1
+            next
+        }
+        /^    needs: [A-Za-z0-9_-]+[[:space:]]*$/ {
+            line = $0
+            sub(/^    needs: /, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            print line
+            found = 1
+            next
+        }
+        /^    needs:[[:space:]]*$/ { in_needs = 1; found = 1; next }
+        in_needs && /^      - [A-Za-z0-9_-]+[[:space:]]*$/ {
+            line = $0
+            sub(/^      - /, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            print line
+            next
+        }
+        in_needs { in_needs = 0 }
+        END { if (!found) exit 1 }
+    ' <<<"$body"
+}
+
+workflow_job_action_values() {
+    local job=$1 direction=$2 field=$3 workflow_text=$4 body
+    body=$(workflow_job_body "$job" "$workflow_text") || return 1
+    awk -v wanted_action="actions/${direction}-artifact@" -v wanted_field="$field" '
+        /^      - / { action = "" }
+        index($0, "uses: " wanted_action) { action = wanted_action; next }
+        action == wanted_action && $0 ~ ("^          " wanted_field ":[[:space:]]") {
+            line = $0
+            sub("^          " wanted_field ":[[:space:]]*", "", line)
+            print line
+            action = ""
+        }
+    ' <<<"$body"
+}
+
+workflow_job_needs_exactly() {
+    local job=$1 expected_csv=$2 workflow_text=$3 actual expected
+    actual=$(workflow_job_needs "$job" "$workflow_text" | sort) || return 1
+    expected=$(tr ',' '\n' <<<"$expected_csv" | sed '/^$/d' | sort)
+    [[ $actual == "$expected" ]]
+}
+
+workflow_artifact_edge() {
+    local producer=$1 upload_field=$2 upload_value=$3
+    local consumer=$4 download_field=$5 download_value=$6 workflow_text=$7
+    workflow_job_action_values "$producer" upload "$upload_field" "$workflow_text" |
+        grep -Fqx -- "$upload_value" &&
+        workflow_job_action_values "$consumer" download "$download_field" "$workflow_text" |
+            grep -Fqx -- "$download_value"
+}
+
+workflow_wiring_contract() {
+    local workflow_text=$1
+
+    # Keep these exact. The dependency checks below treat predecessor groups as
+    # supplied only because this job graph orders them and these artifact edges
+    # move the build products across runner boundaries.
+    workflow_job_needs_exactly preflight 'select' "$workflow_text" &&
+        workflow_job_needs_exactly checks 'select,preflight' "$workflow_text" &&
+        workflow_job_needs_exactly build-debug 'select,preflight' "$workflow_text" &&
+        workflow_job_needs_exactly build-release 'select,preflight' "$workflow_text" &&
+        workflow_job_needs_exactly build-complete 'select,build-debug,build-release' "$workflow_text" &&
+        workflow_job_needs_exactly test-debug 'select,build-debug,build-release,build-complete' "$workflow_text" &&
+        workflow_job_needs_exactly strict-compat 'select,build-debug,build-complete,test-debug' "$workflow_text" &&
+        workflow_job_needs_exactly test-release 'select,build-complete' "$workflow_text" &&
+        workflow_job_needs_exactly e2e 'select,build-debug,build-complete' "$workflow_text" &&
+        workflow_job_needs_exactly regular \
+            'select,plan,preflight,checks,build-debug,build-release,build-complete,test-debug,strict-compat,test-release,e2e' \
+            "$workflow_text" &&
+        workflow_artifact_edge preflight name '${{ env.MANIFEST_PLAN_ARTIFACT }}' \
+            build-debug name '${{ env.MANIFEST_PLAN_ARTIFACT }}' "$workflow_text" &&
+        workflow_artifact_edge build-debug name '${{ env.DEBUG_ARTIFACT }}' \
+            build-complete name '${{ env.DEBUG_ARTIFACT }}' "$workflow_text" &&
+        workflow_artifact_edge build-release name '${{ env.RELEASE_DBT_ARTIFACT }}' \
+            build-complete name '${{ env.RELEASE_DBT_ARTIFACT }}' "$workflow_text" &&
+        workflow_artifact_edge build-debug name '${{ env.DEBUG_ARTIFACT }}' \
+            test-debug name '${{ env.DEBUG_ARTIFACT }}' "$workflow_text" &&
+        workflow_artifact_edge build-complete name '${{ env.RELEASE_ARTIFACT }}' \
+            test-debug name '${{ env.RELEASE_ARTIFACT }}' "$workflow_text" &&
+        workflow_artifact_edge build-debug name '${{ env.DEBUG_ARTIFACT }}' \
+            strict-compat name '${{ env.DEBUG_ARTIFACT }}' "$workflow_text" &&
+        workflow_artifact_edge build-complete name '${{ env.RELEASE_ARTIFACT }}' \
+            strict-compat name '${{ env.RELEASE_ARTIFACT }}' "$workflow_text" &&
+        workflow_artifact_edge build-complete name '${{ env.RELEASE_ARTIFACT }}' \
+            test-release name '${{ env.RELEASE_ARTIFACT }}' "$workflow_text" &&
+        workflow_artifact_edge build-debug name '${{ env.DEBUG_ARTIFACT }}' \
+            e2e name '${{ env.DEBUG_ARTIFACT }}' "$workflow_text" &&
+        workflow_artifact_edge build-complete name '${{ env.RELEASE_ARTIFACT }}' \
+            e2e name '${{ env.RELEASE_ARTIFACT }}' "$workflow_text" &&
+        workflow_artifact_edge e2e name \
+            'parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-portable-${{ matrix.slug }}' \
+            regular pattern 'parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-*' "$workflow_text"
+}
+
 debug_artifact_contract() {
     local workflow_text=$1 pack_step unpack_step
     local archive_member='            target/debug/verification-report \'
@@ -148,6 +266,33 @@ debug_artifact_contract() {
 # The mutation bracket proves the guard rejects the original omission instead
 # of passing merely because the binary is mentioned somewhere in the workflow.
 workflow_text=$(<"$workflow")
+if ! workflow_wiring_contract "$workflow_text"; then
+    echo "check-shard-coverage.sh: FAIL — workflow job needs/artifact transfers do not match the constructed dependency supply contract" >&2
+    status=1
+fi
+
+# Mutation brackets prove the workflow contract is reading the checked-in job
+# graph and artifact actions rather than accepting the shard-map-derived sets by
+# themselves. Remove one real needs edge and one real download independently;
+# each broken workflow must be refused.
+missing_need=${workflow_text/$'    needs: [select, build-complete]\n'/$'    needs: [select]\n'}
+if [[ $missing_need == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — needs-edge mutation did not change the workflow fixture" >&2
+    status=1
+elif workflow_wiring_contract "$missing_need"; then
+    echo "check-shard-coverage.sh: FAIL — workflow guard accepted a planted missing needs edge" >&2
+    status=1
+fi
+release_download=$'      - name: Download full release prebuilt tree\n        uses: actions/download-artifact@v4\n        with:\n          name: ${{ env.RELEASE_ARTIFACT }}'
+missing_artifact=${workflow_text/"$release_download"/${release_download%$'\n'*}}
+if [[ $missing_artifact == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — artifact-edge mutation did not change the workflow fixture" >&2
+    status=1
+elif workflow_wiring_contract "$missing_artifact"; then
+    echo "check-shard-coverage.sh: FAIL — workflow guard accepted a planted missing artifact download" >&2
+    status=1
+fi
+
 if ! debug_artifact_contract "$workflow_text"; then
     echo "check-shard-coverage.sh: FAIL — debug artifact must transport executable target/debug/verification-report" >&2
     status=1
