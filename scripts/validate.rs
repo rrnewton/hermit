@@ -74,6 +74,9 @@ mod validate_history;
 #[path = "lib/validate_cell_results.rs"]
 mod validate_cell_results;
 
+#[path = "lib/validate_test_results.rs"]
+mod validate_test_results;
+
 #[path = "lib/validate_plan.rs"]
 mod validate_plan;
 
@@ -1188,9 +1191,11 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     for relative in [
         "Makefile",
         "ci/dag/portable.json",
+        "ci/manifest-plan/src/ledger.rs",
         "ci/verify-submodules.sh",
         "scripts/validate.rs",
         "scripts/lib/validate_plan.rs",
+        "scripts/lib/validate_test_results.rs",
     ] {
         std::fs::copy(root.join(relative), checkout.join(relative)).map_err(|error| {
             format!("submodule service result: cannot copy {relative} into fixture: {error}")
@@ -1203,9 +1208,11 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "--",
                 "Makefile",
                 "ci/dag/portable.json",
+                "ci/manifest-plan/src/ledger.rs",
                 "ci/verify-submodules.sh",
                 "scripts/validate.rs",
                 "scripts/lib/validate_plan.rs",
+                "scripts/lib/validate_test_results.rs",
             ])
             .current_dir(&checkout),
         "stage the fixture sources",
@@ -2334,6 +2341,7 @@ fn self_test() -> Result<(), String> {
         validate_history::self_test()?,
         validate_receipt::self_test()?,
         validate_runtime::self_test()?,
+        validate_test_results::self_test()?,
         prebuilt_rust_script_plan_bracket()?,
         pinned_root_plan_bracket()?,
     ] {
@@ -2352,6 +2360,7 @@ fn self_test() -> Result<(), String> {
     host_capability_bracket(&root)?;
     coverage_schema_bracket()?;
     cell_results_schema_bracket()?;
+    test_results_schema_bracket()?;
     test_node_coverage_bracket()?;
     typed_libtest_count_bracket()?;
     ledger_gate_origin_bracket()?;
@@ -3241,10 +3250,16 @@ fn ledger_schema_and_coverage(
 fn ledger_schema_version(
     coverage_schema: i64,
     cell_results: Option<&validate_cell_results::RetainedCellResults>,
+    test_results: Option<&validate_test_results::RetainedTestResults>,
 ) -> i64 {
-    cell_results
-        .map(|results| results.schema_version)
-        .unwrap_or(coverage_schema)
+    [
+        coverage_schema,
+        cell_results.map_or(coverage_schema, |results| results.schema_version),
+        test_results.map_or(coverage_schema, |results| results.schema_version),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(coverage_schema)
 }
 
 /// Two-sided producer bracket for [`ledger_schema_and_coverage`]. Inert: it
@@ -3290,18 +3305,46 @@ fn cell_results_schema_bracket() -> Result<(), String> {
         run_id: "schema-bracket".into(),
         evidence: serde_json::json!({}),
     };
-    let current = ledger_schema_version(COVERAGE_LEDGER_SCHEMA_VERSION, Some(&retained));
+    let current = ledger_schema_version(COVERAGE_LEDGER_SCHEMA_VERSION, Some(&retained), None);
     if current != 7 {
         return Err(format!(
             "cell-results schema: current payload must emit schema 7, got {current}"
         ));
     }
-    if ledger_schema_version(COVERAGE_LEDGER_SCHEMA_VERSION, None)
+    if ledger_schema_version(COVERAGE_LEDGER_SCHEMA_VERSION, None, None)
         != COVERAGE_LEDGER_SCHEMA_VERSION
     {
         return Err("cell-results schema: a row without cell results changed schema".into());
     }
     println!("  cell-results schema: current payload -> schema 7; absent payload -> schema 5");
+    Ok(())
+}
+
+fn test_results_schema_bracket() -> Result<(), String> {
+    let retained = validate_test_results::RetainedTestResults {
+        schema_version: validate_test_results::TEST_RESULTS_LEDGER_SCHEMA_VERSION,
+        evidence: hermit_manifest_plan::ledger::TestResultsEvidence {
+            run_id: "schema-bracket".into(),
+            hermit_sha: "0".repeat(40),
+            source_tree_dirty: false,
+            node_count: 0,
+            recorded_count: 0,
+            executed_tests: 0,
+            passed_tests: 0,
+            filtered_tests: 0,
+            artifact: hermit_manifest_plan::ledger::TestResultsArtifact {
+                path: "ignored/validate/artifacts/schema-bracket/test-results.json".into(),
+                sha256: "0".repeat(64),
+            },
+        },
+    };
+    let current = ledger_schema_version(COVERAGE_LEDGER_SCHEMA_VERSION, None, Some(&retained));
+    if current != 8 {
+        return Err(format!(
+            "test-results schema: current payload must emit schema 8, got {current}"
+        ));
+    }
+    println!("  test-results schema: retained payload -> schema 8");
     Ok(())
 }
 
@@ -14849,6 +14892,92 @@ fn run_test_counts(
     Ok((executed, passed, filtered))
 }
 
+fn retained_test_results_inputs(
+    outcomes: &[StepOutcome],
+    attempts: &[NodeAttempt],
+    compat: Option<CompatMode>,
+) -> Result<
+    (
+        Vec<hermit_manifest_plan::ledger::NodeTestResultsRecord>,
+        Option<hermit_manifest_plan::ledger::TestResultsRecord>,
+    ),
+    String,
+> {
+    use hermit_manifest_plan::ledger::NodeTestResultsRecord;
+
+    let mut nodes = Vec::new();
+    for outcome in outcomes
+        .iter()
+        .filter(|outcome| !outcome.tag.starts_with("compat."))
+    {
+        let count_bearing = outcome.executed_tests.is_some()
+            || outcome.filtered_tests.is_some()
+            || outcome.test_results.is_some();
+        if !count_bearing {
+            continue;
+        }
+        let latest = terminal_attempt(outcome, attempts).ok_or_else(|| {
+            format!(
+                "count-bearing node {} has no recorded terminal attempt",
+                outcome.tag
+            )
+        })?;
+        if !latest.reported || latest.execution != AttemptExecution::Completed {
+            return Err(format!(
+                "count-bearing node {} latest attempt {} has no completed report",
+                outcome.tag, latest.attempt
+            ));
+        }
+        let executed_tests = outcome.executed_tests.ok_or_else(|| {
+            format!("count-bearing node {} has no executed_tests", outcome.tag)
+        })?;
+        let filtered_tests = outcome.filtered_tests.ok_or_else(|| {
+            format!("count-bearing node {} has no filtered_tests", outcome.tag)
+        })?;
+        let results = latest.test_results.as_ref().ok_or_else(|| {
+            format!(
+                "count-bearing node {} latest attempt {} has no producer-owned test results",
+                outcome.tag, latest.attempt
+            )
+        })?;
+        let test_results = dagrun::TestResults::current(
+            executed_tests,
+            filtered_tests,
+            results.clone(),
+        )?;
+        nodes.push(NodeTestResultsRecord {
+            node: outcome.tag.clone(),
+            outer_attempt: u64::try_from(latest.attempt).map_err(|_| {
+                format!("node {} outer attempt does not fit u64", outcome.tag)
+            })?,
+            test_results: validate_test_results::results_record(&test_results)?,
+        });
+    }
+    let compatibility = compat
+        .map(|_| compat_test_results(outcomes, attempts))
+        .transpose()?
+        .as_ref()
+        .map(validate_test_results::results_record)
+        .transpose()?;
+    Ok((nodes, compatibility))
+}
+
+fn exact_test_totals(
+    executed_tests: Option<i64>,
+    passed_tests: Option<i64>,
+    filtered_tests: Option<i64>,
+) -> Result<validate_test_results::TestTotals, String> {
+    let convert = |name: &str, value: Option<i64>| {
+        u64::try_from(value.ok_or_else(|| format!("{name} is unknown"))?)
+            .map_err(|_| format!("{name} is negative"))
+    };
+    Ok(validate_test_results::TestTotals {
+        executed_tests: convert("executed_tests", executed_tests)?,
+        passed_tests: convert("passed_tests", passed_tests)?,
+        filtered_tests: convert("filtered_tests", filtered_tests)?,
+    })
+}
+
 /// Derive the per-node coverage obligation from dagrun's structured test counts.
 ///
 /// A terminal node with no structured count file has no executed-test evidence.
@@ -15094,8 +15223,76 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
             "typed libtest counts: stale retained failure was not refused by latest attempt: {stale_error}"
         ));
     }
+
+    let mut first = outcome("test.terminal", false, Some(1), Some(0));
+    first.test_results = Some(vec![TestResult::new("case".into(), false, 1)?]);
+    let mut terminal = outcome("test.terminal", true, Some(1), Some(0));
+    terminal.test_results = Some(vec![TestResult::new("case".into(), true, 1)?]);
+    let terminal_attempts = vec![reported_attempt(&first, 1), reported_attempt(&terminal, 2)];
+    let (retained_nodes, retained_compatibility) = retained_test_results_inputs(
+        std::slice::from_ref(&terminal),
+        &terminal_attempts,
+        None,
+    )?;
+    if retained_compatibility.is_some()
+        || retained_nodes.len() != 1
+        || retained_nodes[0].outer_attempt != 2
+        || retained_nodes[0].test_results.results.len() != 1
+        || retained_nodes[0].test_results.results[0].result
+            != hermit_manifest_plan::ledger::TestResultVerdict::Pass
+    {
+        return Err(
+            "retained test results: final attempt did not supersede the older result".into(),
+        );
+    }
+
+    let missing = outcome("test.missing-results", true, Some(1), Some(0));
+    let missing_attempts = vec![reported_attempt(&missing, 1)];
+    let missing_error = retained_test_results_inputs(
+        std::slice::from_ref(&missing),
+        &missing_attempts,
+        None,
+    )
+    .expect_err("count-bearing node without producer-owned results must refuse");
+    if !missing_error.contains("no producer-owned test results") {
+        return Err(format!(
+            "retained test results: missing evidence refused unclearly: {missing_error}"
+        ));
+    }
+
+    let unreported_attempts = vec![
+        reported_attempt(&terminal, 1),
+        unreported_attempt(terminal.tag.clone(), 2),
+    ];
+    let unreported_error = retained_test_results_inputs(
+        std::slice::from_ref(&terminal),
+        &unreported_attempts,
+        None,
+    )
+    .expect_err("an older result followed by an unreported attempt must refuse");
+    if !unreported_error.contains("latest attempt 2")
+        || !unreported_error.contains("no completed report")
+    {
+        return Err(format!(
+            "retained test results: unreported terminal attempt refused unclearly: {unreported_error}"
+        ));
+    }
+
+    let mut compat_no_result = outcome("compat.no-result", false, None, None);
+    compat_no_result.returncode = Some(NO_RESULT_EXIT_CODE);
+    let no_result_attempts = vec![reported_attempt(&compat_no_result, 1)];
+    let no_result_error = compat_test_results(
+        std::slice::from_ref(&compat_no_result),
+        &no_result_attempts,
+    )
+    .expect_err("compatibility no-result must not become a retained test verdict");
+    if !no_result_error.contains("no pass/fail verdict") {
+        return Err(format!(
+            "typed libtest counts: compatibility no-result refused unclearly: {no_result_error}"
+        ));
+    }
     println!(
-        "  typed libtest counts: exact 873/873/350 pass; retained count-only failure stayed unknown; mixed typed failure aggregated exactly; typed mutation moved 1 -> 2; direct compatibility rows joined the outer denominator without hiding an unknown pass count; compatibility rows carried terminal verdicts and latest attempt ordinals; fail-then-unreported refused; 0/0/0 preserved"
+        "  typed libtest counts: exact 873/873/350 pass; retained count-only failure stayed unknown; mixed typed failure aggregated exactly; typed mutation moved 1 -> 2; direct compatibility rows joined the outer denominator without hiding an unknown pass count; compatibility rows carried terminal verdicts and latest attempt ordinals; missing/no-result evidence and fail-then-unreported refused; retained results select only the terminal attempt; 0/0/0 preserved"
     );
     Ok(())
 }
@@ -16462,9 +16659,10 @@ fn write_ledger(
     suite_complete: bool,
     coverage: serde_json::Value,
     cell_results: Option<&validate_cell_results::RetainedCellResults>,
+    test_results: Option<&validate_test_results::RetainedTestResults>,
 ) {
     let (coverage_schema, coverage) = ledger_schema_and_coverage(coverage);
-    let ledger_schema = ledger_schema_version(coverage_schema, cell_results);
+    let ledger_schema = ledger_schema_version(coverage_schema, cell_results, test_results);
     // `gate_records` counts typed scheduler outcomes, including an explicit
     // UNKNOWN record for a spawn/supervisor failure. `executed_nodes` counts
     // only terminal attempts with a collected child exit status. The two must
@@ -16670,6 +16868,10 @@ fn write_ledger(
         "cell_results": cell_results.map(|results| &results.evidence),
         "gates": gates,
     });
+    let mut record = record;
+    if let Some(test_results) = test_results {
+        record["test_results"] = serde_json::json!(&test_results.evidence);
+    }
     let typed = match serde_json::from_value::<HistoryRow>(record.clone()) {
         Ok(typed) => typed,
         Err(error) => {
@@ -19411,6 +19613,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
                 false,
                 coverage.clone(),
                 None,
+                None,
             );
         }
         // This is below the interrupted run's ledger write. Keep the checkout
@@ -19677,6 +19880,51 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     } else {
         None
     };
+    let retained_test_results = if plan.suite_complete
+        && !nesting.nested
+        && !args.allow_local_off_the_record_run
+        && execution_complete
+    {
+        let run_id = retained_cell_results
+            .as_ref()
+            .map(|results| results.run_id.clone())
+            .or_else(|| {
+                std::env::var("E2E_RUN_ID")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .ok_or("E2E_RUN_ID is missing after the validate run".to_string());
+        let retained = run_id.and_then(|run_id| {
+            let expected = exact_test_totals(executed_tests, passed_tests, filtered_tests)?;
+            let (nodes, compatibility) =
+                retained_test_results_inputs(&outcomes, &attempts, plan.compat)?;
+            validate_test_results::retain(
+                parent.as_deref().unwrap_or(&root),
+                &run_id,
+                &commit,
+                attribution_tree_dirty,
+                nodes,
+                compatibility,
+                expected,
+            )
+        });
+        match retained {
+            Ok(results) => {
+                println!("Test-results artifact: {}", results.evidence.artifact.path);
+                Some(results)
+            }
+            Err(error) => {
+                eprintln!(
+                    "validate: ERROR: cannot retain complete producer-owned test results: \
+                     {error}; refusing a schema-8 receipt"
+                );
+                exit_code = 1;
+                None
+            }
+        }
+    } else {
+        None
+    };
     let retained_coverage = if plan.suite_complete
         && !nesting.nested
         && !args.allow_local_off_the_record_run
@@ -19782,6 +20030,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             plan.suite_complete && execution_complete,
             coverage,
             retained_cell_results.as_ref(),
+            retained_test_results.as_ref(),
         );
     }
 
@@ -20139,6 +20388,7 @@ fn stop_test_seam(
             "",
             false,
             serde_json::json!({}),
+            None,
             None,
         );
     }
