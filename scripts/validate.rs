@@ -3177,15 +3177,22 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
     let lane = "portable";
     let all = validate_plan::lane_nodes(root, lane, "", "gate.manifest")?;
     let all_tags: BTreeSet<String> = all.iter().map(|step| step.tag()).collect();
+    let preflight_tags = validate_plan::preflight_nodes(root)?
+        .iter()
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
     let (child, parent) = all
         .iter()
+        .filter(|step| !preflight_tags.contains(&step.tag()))
         .find_map(|step| {
             step.deps
                 .iter()
-                .find(|dependency| all_tags.contains(*dependency))
+                .find(|dependency| {
+                    all_tags.contains(*dependency) && !preflight_tags.contains(*dependency)
+                })
                 .map(|dependency| (step.clone(), dependency.clone()))
         })
-        .ok_or("only bracket: portable lane has no intra-lane dependency")?;
+        .ok_or("only bracket: portable lane has no non-preflight dependency pair")?;
     let parent_step = all
         .iter()
         .find(|step| step.tag() == parent)
@@ -3213,11 +3220,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
     if actual_tags.len() != tags.len() {
         return Err(format!("only bracket: plan contains duplicate tags: {tags:?}"));
     }
-    let mut expected_tags: BTreeSet<String> =
-        validate_plan::preflight_nodes(root)?
-            .iter()
-            .map(|step| step.tag())
-            .collect();
+    let mut expected_tags = preflight_tags;
     expected_tags.extend(selected_tags.iter().cloned());
     if actual_tags != expected_tags {
         return Err(format!(
