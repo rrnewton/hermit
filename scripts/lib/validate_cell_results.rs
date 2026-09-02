@@ -20,6 +20,7 @@ use hermit_manifest_plan::ledger::ComparedLogCounts;
 use hermit_manifest_plan::ledger::ComparisonSpec;
 use hermit_manifest_plan::ledger::ComparisonTier;
 use hermit_manifest_plan::ledger::RequiredNullable;
+use hermit_manifest_plan::runner::CELL_WALL_CPU_BACKSTOP_FACTOR;
 use hermit_manifest_plan::runner::outcome_after_retries;
 use serde_json::Value;
 use sha2::Digest;
@@ -132,6 +133,27 @@ fn identity_value(identity: &CellIdentity) -> Result<Value, String> {
         .map_err(|error| format!("cannot encode selected cell identity: {error}"))
 }
 
+fn require_current_timeout_policy(row: &Value) -> Result<(), String> {
+    let timeout = row
+        .get("timeout_seconds")
+        .and_then(Value::as_u64)
+        .ok_or("current cell result has no timeout_seconds")?;
+    let cpu = row
+        .get("execution_cpu_timeout_seconds")
+        .and_then(Value::as_u64)
+        .ok_or("current cell result omitted execution_cpu_timeout_seconds")?;
+    let wall = row
+        .get("execution_wall_timeout_seconds")
+        .and_then(Value::as_u64)
+        .ok_or("current cell result omitted execution_wall_timeout_seconds")?;
+    if cpu != timeout || wall != cpu.saturating_mul(CELL_WALL_CPU_BACKSTOP_FACTOR) {
+        return Err(format!(
+            "current cell result timeout policy disagrees: timeout_seconds={timeout} execution_cpu_timeout_seconds={cpu} execution_wall_timeout_seconds={wall}"
+        ));
+    }
+    Ok(())
+}
+
 fn canonical_report(
     value: Value,
 ) -> Result<Option<(VerificationReport, ComparisonSpec, ComparedLogCounts)>, String> {
@@ -141,9 +163,9 @@ fn canonical_report(
     let report = VerificationReport::from_current_json_value(value.clone())?;
     if report.verdict == VerificationVerdict::InfrastructureError {
         return Err(match report.infrastructure_error.as_ref() {
-            Some(InfrastructureError::SkidOvershoot { count }) => format!(
-                "recorded infrastructure_error: {count} HERMIT_SKID_OVERSHOOT report(s)"
-            ),
+            Some(InfrastructureError::SkidOvershoot { count }) => {
+                format!("recorded infrastructure_error: {count} HERMIT_SKID_OVERSHOOT report(s)")
+            }
             None => unreachable!("typed report parser requires an infrastructure error"),
         });
     }
@@ -313,7 +335,13 @@ fn enabled_cell_scope(cell: &Value) -> Result<Value, String> {
         .as_object()
         .cloned()
         .ok_or("cell identity was not an object")?;
-    for key in ["status", "measurement", "reason", "last_tested", "observations"] {
+    for key in [
+        "status",
+        "measurement",
+        "reason",
+        "last_tested",
+        "observations",
+    ] {
         if let Some(value) = cell.get(key) {
             scoped.insert(key.into(), value.clone());
         }
@@ -367,7 +395,10 @@ fn coverage_document(
             Ok((id, enabled_cell_scope(cell)?))
         })
         .collect::<Result<_, String>>()?;
-    let selected_and_enabled = selected.keys().filter(|key| enabled.contains_key(*key)).count();
+    let selected_and_enabled = selected
+        .keys()
+        .filter(|key| enabled.contains_key(*key))
+        .count();
     let enabled_not_selected: Vec<Value> = enabled
         .iter()
         .filter(|(key, _)| !selected.contains_key(*key))
@@ -472,7 +503,10 @@ pub fn retain_coverage_evidence(
         return Err(format!(
             "{} --json exited {}; {}",
             audit.display(),
-            output.status.code().map_or_else(|| "by signal".into(), |code| code.to_string()),
+            output
+                .status
+                .code()
+                .map_or_else(|| "by signal".into(), |code| code.to_string()),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
@@ -488,9 +522,16 @@ pub fn retain_coverage_evidence(
         &cells_document,
         &registration,
     )?;
-    let artifact_dir = parent.join("ignored").join("validate").join("artifacts").join(run_id);
+    let artifact_dir = parent
+        .join("ignored")
+        .join("validate")
+        .join("artifacts")
+        .join(run_id);
     fs::create_dir_all(&artifact_dir).map_err(|error| {
-        format!("cannot create retained coverage directory {}: {error}", artifact_dir.display())
+        format!(
+            "cannot create retained coverage directory {}: {error}",
+            artifact_dir.display()
+        )
     })?;
     let artifact = artifact_dir.join("coverage.json");
     let mut bytes = serde_json::to_vec_pretty(&document)
@@ -543,7 +584,9 @@ pub fn retain_coverage_evidence(
             "sha256": hex_digest(&bytes),
         }),
     );
-    Ok(RetainedCoverageEvidence { evidence: Value::Object(evidence) })
+    Ok(RetainedCoverageEvidence {
+        evidence: Value::Object(evidence),
+    })
 }
 
 /// Transform all result rows for one validate invocation into the closed
@@ -560,38 +603,40 @@ pub fn retain(
     let mut observations = BTreeSet::new();
     let mut attempt_rows: BTreeMap<CellIdentity, Vec<(u64, Value)>> = BTreeMap::new();
     for (file, line_number, row) in read_result_rows(result_root)? {
-            if row.get("schema").and_then(Value::as_u64) != Some(4)
-                || string(&row, "hermit_sha")? != commit
-                || row.get("source_tree_dirty").and_then(Value::as_bool) != Some(false)
-            {
+        if row.get("schema").and_then(Value::as_u64) != Some(4)
+            || string(&row, "hermit_sha")? != commit
+            || row.get("source_tree_dirty").and_then(Value::as_bool) != Some(false)
+        {
+            return Err(format!(
+                "{}:{line_number} is not an exact clean schema-4 cell result for {commit}",
+                file.display()
+            ));
+        }
+        require_current_timeout_policy(&row)
+            .map_err(|error| format!("{}:{line_number} {error}", file.display()))?;
+        let row_run_id = string(&row, "run_id")?;
+        match run_id.as_deref() {
+            None => run_id = Some(row_run_id.into()),
+            Some(existing) if existing == row_run_id => {}
+            Some(existing) => {
                 return Err(format!(
-                    "{}:{line_number} is not an exact clean schema-4 cell result for {commit}",
-                    file.display()
+                    "per-cell results mix run_id {existing} with {row_run_id}"
                 ));
             }
-            let row_run_id = string(&row, "run_id")?;
-            match run_id.as_deref() {
-                None => run_id = Some(row_run_id.into()),
-                Some(existing) if existing == row_run_id => {}
-                Some(existing) => {
-                    return Err(format!(
-                        "per-cell results mix run_id {existing} with {row_run_id}"
-                    ));
-                }
-            }
-            let id = identity(&row)?;
-            let key = id.clone();
-            let attempt = row.get("attempt").and_then(Value::as_u64).unwrap_or(1);
-            if attempt == 0 {
-                return Err("per-cell result attempt must be positive".into());
-            }
-            if !observations.insert((key.clone(), attempt)) {
-                return Err("per-cell results contain a duplicate identity and attempt".into());
-            }
-            if identities.insert(key.clone()) {
-                selected.push(id);
-            }
-            attempt_rows.entry(key).or_default().push((attempt, row));
+        }
+        let id = identity(&row)?;
+        let key = id.clone();
+        let attempt = row.get("attempt").and_then(Value::as_u64).unwrap_or(1);
+        if attempt == 0 {
+            return Err("per-cell result attempt must be positive".into());
+        }
+        if !observations.insert((key.clone(), attempt)) {
+            return Err("per-cell results contain a duplicate identity and attempt".into());
+        }
+        if identities.insert(key.clone()) {
+            selected.push(id);
+        }
+        attempt_rows.entry(key).or_default().push((attempt, row));
     }
     let mut cells = attempt_rows
         .into_iter()
@@ -791,6 +836,9 @@ mod tests {
             "backend": "ptrace",
             "outcome": "PASS",
             "reason": null,
+            "timeout_seconds": 15,
+            "execution_cpu_timeout_seconds": 15,
+            "execution_wall_timeout_seconds": 45,
             "attempts": [attempt(&matched)]
         })
     }
@@ -807,6 +855,48 @@ mod tests {
             format!("{}\n", serde_json::to_string(row).unwrap()),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn current_timeout_policy_is_required_without_breaking_legacy_row_reads() {
+        let commit = "1515151515151515151515151515151515151515";
+        for (label, mutate, expected_error) in [
+            ("missing", 0_u8, "omitted execution_cpu_timeout_seconds"),
+            (
+                "half-present",
+                1_u8,
+                "omitted execution_wall_timeout_seconds",
+            ),
+            ("wrong-value", 2_u8, "timeout policy disagrees"),
+        ] {
+            let root = fixture_root();
+            let results = root.join("results");
+            let mut row = result_row(&format!("validate-{label}"), commit);
+            let object = row.as_object_mut().unwrap();
+            match mutate {
+                0 => {
+                    object.remove("execution_cpu_timeout_seconds");
+                    object.remove("execution_wall_timeout_seconds");
+                }
+                1 => {
+                    object.remove("execution_wall_timeout_seconds");
+                }
+                2 => {
+                    object.insert("execution_wall_timeout_seconds".into(), Value::from(44));
+                }
+                _ => unreachable!(),
+            }
+            write_result(&results, &row);
+            assert_eq!(
+                all_result_rows(&results).unwrap().len(),
+                1,
+                "legacy raw-row reading must preserve schema-4 rows before the additive fields"
+            );
+            let error = retain(&root, &results, commit, &expected(&row))
+                .expect_err("a malformed current timeout policy reached the ledger");
+            assert!(error.contains(expected_error), "{label}: {error}");
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -846,10 +936,8 @@ mod tests {
             "none_recorded":["unknown"],
             "undeclared":[]
         });
-        let planned_nodes = BTreeSet::from([
-            "check.example".to_string(),
-            "test.example".to_string(),
-        ]);
+        let planned_nodes =
+            BTreeSet::from(["check.example".to_string(), "test.example".to_string()]);
         let planned_test_nodes = BTreeSet::from(["test.example".to_string()]);
         let test_node_coverage = serde_json::json!({
             "planned_test_nodes": 1,
@@ -880,14 +968,26 @@ mod tests {
         assert_eq!(scope["e2e"]["selected_and_enabled_count"], 1);
         assert_eq!(scope["e2e"]["enabled_not_selected_count"], 1);
         assert_eq!(scope["e2e"]["selected_not_enabled_count"], 1);
-        assert_eq!(scope["e2e"]["enabled_not_selected"][0]["observed_pass_count"], 1);
-        assert_eq!(scope["e2e"]["enabled_not_selected"][0]["observed_fail_count"], 2);
+        assert_eq!(
+            scope["e2e"]["enabled_not_selected"][0]["observed_pass_count"],
+            1
+        );
+        assert_eq!(
+            scope["e2e"]["enabled_not_selected"][0]["observed_fail_count"],
+            2
+        );
         assert_eq!(
             scope["e2e"]["enabled_not_selected"][0]["reason"],
             "excluded after the recorded observations"
         );
-        assert_eq!(scope["integration_test_binaries"]["ci_registered"][0], "covered");
-        assert_eq!(scope["integration_test_binaries"]["none_recorded"][0], "unknown");
+        assert_eq!(
+            scope["integration_test_binaries"]["ci_registered"][0],
+            "covered"
+        );
+        assert_eq!(
+            scope["integration_test_binaries"]["none_recorded"][0],
+            "unknown"
+        );
     }
 
     fn append_result_row(root: &Path, row: &Value) {
@@ -923,9 +1023,9 @@ mod tests {
             retained.evidence["cells"][0]["cell_verdict"]["state"],
             "compared-and-matched"
         );
-        let expected_comparison: Value =
-            serde_json::from_str::<Value>(&report("matched", "info")).unwrap()["comparison"]
-                .clone();
+        let expected_comparison: Value = serde_json::from_str::<Value>(&report("matched", "info"))
+            .unwrap()["comparison"]
+            .clone();
         assert_eq!(
             retained.evidence["cells"][0]["cell_verdict"]["comparison"],
             expected_comparison
@@ -953,7 +1053,10 @@ mod tests {
         });
         let mut expected_bytes = serde_json::to_vec(&artifact_row).unwrap();
         expected_bytes.push(b'\n');
-        assert_eq!(bytes, expected_bytes, "the shared type must preserve artifact bytes");
+        assert_eq!(
+            bytes, expected_bytes,
+            "the shared type must preserve artifact bytes"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -986,17 +1089,22 @@ mod tests {
         let commit = "1515151515151515151515151515151515151515";
         let mut row = result_row("validate-missing-report-field", commit);
         let mut report: Value = serde_json::from_str(&report("matched", "info")).unwrap();
-        report.as_object_mut().unwrap().remove("first_divergent_record");
+        report
+            .as_object_mut()
+            .unwrap()
+            .remove("first_divergent_record");
         replace_report(&mut row, &report);
         write_result(&results, &row);
 
         let retained = retain(&root, &results, commit, &expected(&row)).unwrap();
         let verdict = &retained.evidence["cells"][0]["cell_verdict"];
         assert_eq!(verdict["state"], "unavailable-with-reason");
-        assert!(verdict["reason"]
-            .as_str()
-            .unwrap()
-            .contains("missing current producer field `first_divergent_record`"));
+        assert!(
+            verdict["reason"]
+                .as_str()
+                .unwrap()
+                .contains("missing current producer field `first_divergent_record`")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1150,9 +1258,8 @@ mod tests {
                 "3434343434343434343434343434343434343434",
             );
             row["outcome"] = Value::String("ERROR".into());
-            row["reason"] = Value::String(
-                "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)".into(),
-            );
+            row["reason"] =
+                Value::String("verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)".into());
             let mut infrastructure: Value =
                 serde_json::from_str(&report("matched", "info")).unwrap();
             infrastructure["verified"] = Value::Bool(false);

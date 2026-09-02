@@ -152,36 +152,15 @@ const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 /// The Reverie-pin preflight node's tag. Named once so the plan that creates it
 /// and the fail-closed assertion that requires it cannot drift apart.
 const PIN_GATE_TAG: &str = "pre.reverie_pin";
-const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
 const INTEGRATION_ARTIFACT_WRAPPER: &str =
     "./ci/run-with-hermit-e2e-artifact.sh --require-install ";
 const STRICT_COMPAT_PLACEHOLDER_TAG: &str = "test.strict_compat";
-const STRICT_COMPAT_PLACEHOLDER_COMMAND: &str =
-    "echo 'test.strict_compat is expanded by scripts/validate.rs into direct compat.* nodes; run this lane through validate or ci/run-node.sh' >&2; exit 125";
 const REQUALIFICATION_PLACEHOLDER_TAG: &str = "requalify.cell";
 const REQUALIFICATION_RESULT_ROOT_PLACEHOLDER: &str = "validate-requalification-results";
 const REQUALIFICATION_RUN_ID_PLACEHOLDER: &str = "validate-requalification-run-id";
 const QUICK_E2E_VERIFY_TIMEOUT_S: i64 = 1800;
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
-const DETCORE_MISC_TEST_PREBUILD_COMMAND: &str = r#"mkdir -p target/ci; tests_misc_json="target/ci/tests-misc.cargo.jsonl.tmp.$$"; tests_misc_pointer_tmp="target/ci/tests-misc.path.tmp.$$"; if ! CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run --message-format=json > "$tests_misc_json"; then exit 1; fi; mapfile -t tests_misc_bins < <(jq -er 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "tests_misc" and .executable != null) | .executable' "$tests_misc_json" | sort -u); if ((${#tests_misc_bins[@]} != 1)); then printf 'privileged build: expected one Cargo-reported tests_misc executable, found %d\n' "${#tests_misc_bins[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_bins[0]}"; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi; printf '%s\n' "$tests_misc" > "$tests_misc_pointer_tmp"; mv -f "$tests_misc_pointer_tmp" target/ci/tests-misc.path; mv -f "$tests_misc_json" target/ci/tests-misc.cargo.jsonl"#;
-const HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND: &str = "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run";
-const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"if [ ! -s target/ci/tests-misc.path ]; then printf 'privileged build: Cargo-reported tests_misc path is missing\n' >&2; exit 1; fi; mapfile -t tests_misc_paths < target/ci/tests-misc.path; if ((${#tests_misc_paths[@]} != 1)); then printf 'privileged build: Cargo-reported tests_misc path must contain exactly one line, found %d\n' "${#tests_misc_paths[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_paths[0]}"; case "$tests_misc" in "$PWD"/target/*) ;; *) printf 'privileged build: Cargo-reported tests_misc path is outside this target directory: %s\n' "$tests_misc" >&2; exit 1 ;; esac; case "${tests_misc##*/}" in tests_misc-*) ;; *) printf 'privileged build: Cargo-reported path does not name tests_misc: %s\n' "$tests_misc" >&2; exit 1 ;; esac; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi"#;
-
-fn hermit_integration_uses_published_artifact(step: &Step) -> bool {
-    step.cmd.starts_with(INTEGRATION_ARTIFACT_WRAPPER)
-        && step
-            .deps
-            .iter()
-            .any(|dependency| dependency == "build.e2e_artifact")
-}
-
-fn fused_privileged_test_build_command() -> String {
-    format!(
-        "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; {DETCORE_MISC_TEST_PREBUILD_COMMAND}; {HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND} || exit 1; {TESTS_MISC_EXECUTABLE_READ_COMMAND}"
-    )
-}
-
 const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     "CARGO_BUILD_JOBS",
     STEP_STARTED_MONOTONIC_NS_ENV,
@@ -455,8 +434,7 @@ fn usage() -> &'static str {
      \x20                  systemd-scope backstop. Env: HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS.\n\
      \x20 -k, --keep-going Do not eager-exit on the first failure.\n\
      \x20 --allow-cgroup-failure  Downgrade to an UNBOXED run instead of failing closed.\n\
-     \x20 --merge-lanes    Fuse the portable and privileged lanes (the full default).\n\
-     \x20 --sequential-lanes  Diagnostic fallback: run full lanes back to back.\n\
+     \x20 --merge-lanes    Accepted compatibility spelling for the one committed full graph.\n\
      \x20 --show-plan      Print the outer boxed DAG nodes, caps, and dependencies and exit.\n\
      \x20                  It does not enumerate Rust test IDs or E2E cells.\n\
      \x20 --show-plan-json Print the constructed plan before environment wrapping as JSON.\n\
@@ -701,7 +679,13 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 };
             }
             "--merge-lanes" => args.merge_lanes = true,
-            "--sequential-lanes" => args.merge_lanes = false,
+            "--sequential-lanes" => {
+                eprintln!(
+                    "validate: --sequential-lanes was removed when validation moved to one labelled DAG; \
+                     select the committed full graph instead"
+                );
+                return Err(2);
+            }
             "--self-test" => args.self_test = true,
             "-k" | "--keep-going" => args.keep_going = true,
             "--allow-cgroup-failure" => args.allow_cgroup_failure = true,
@@ -850,7 +834,7 @@ fn nested_scope_probe_step(
 ) -> dagrun::model::Step {
     let mut step = step_with_caps(
         "safe_ci_scope_self_test", job, "Exercise nested per-step cgroup containment",
-        cmd, Vec::new(), timeout_s, timeout_s, 512 * 1024 * 1024,
+        cmd, Vec::new(), timeout_s, 1, 512 * 1024 * 1024,
     );
     if let Some(mode) = mode {
         step.env.insert(NESTED_SCOPE_SELF_TEST_ENV.into(), mode.into());
@@ -1187,10 +1171,11 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     // changed the clone. The real child therefore still runs from a clean SHA.
     for relative in [
         "Makefile",
-        "ci/dag/portable.json",
+        "ci/dag/validate.json",
         "ci/verify-submodules.sh",
         "scripts/validate.rs",
         "scripts/lib/validate_plan.rs",
+        "scripts/lib/validate_super.rs",
     ] {
         std::fs::copy(root.join(relative), checkout.join(relative)).map_err(|error| {
             format!("submodule service result: cannot copy {relative} into fixture: {error}")
@@ -1202,10 +1187,11 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "add",
                 "--",
                 "Makefile",
-                "ci/dag/portable.json",
+                "ci/dag/validate.json",
                 "ci/verify-submodules.sh",
                 "scripts/validate.rs",
                 "scripts/lib/validate_plan.rs",
+                "scripts/lib/validate_super.rs",
             ])
             .current_dir(&checkout),
         "stage the fixture sources",
@@ -1261,6 +1247,47 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             .arg(root.join("agent-utils"))
             .arg(checkout.join("agent-utils")),
         "populate only agent-utils",
+    )?;
+    let agent_utils_output = Command::new("git")
+        .arg("-C")
+        .arg(root.join("agent-utils"))
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|error| {
+            format!("submodule service result: cannot resolve tested agent-utils: {error}")
+        })?;
+    if !agent_utils_output.status.success() {
+        return Err("submodule service result: cannot resolve the tested agent-utils revision".into());
+    }
+    let agent_utils_sha = String::from_utf8_lossy(&agent_utils_output.stdout)
+        .trim()
+        .to_string();
+    checked_command(
+        Command::new("git")
+            .args(["checkout", "--quiet", "--detach", &agent_utils_sha])
+            .current_dir(checkout.join("agent-utils")),
+        "check out the tested agent-utils revision",
+    )?;
+    checked_command(
+        Command::new("git")
+            .args(["add", "--", "agent-utils"])
+            .current_dir(&checkout),
+        "stage the tested agent-utils gitlink",
+    )?;
+    checked_command(
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=validate fixture",
+                "-c",
+                "user.email=validate-fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "validate service-result fixture agent-utils",
+            ])
+            .current_dir(&checkout),
+        "commit the tested agent-utils gitlink",
     )?;
     let expected_agent_utils = Command::new("git")
         .args(["ls-tree", "HEAD", "agent-utils"])
@@ -1323,12 +1350,12 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
 /// warm-cache scheduling estimate; it is not the hard safety ceiling.
 fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
     const MIB: i64 = 1024 * 1024;
-    const EXPECTED: (&str, i64, Option<i64>, Option<i64>) =
-        ("./ci/check-shard-coverage.sh", 600, Some(64 * MIB), Some(1024 * MIB));
-    fn policy(step: &Step) -> (&str, i64, Option<i64>, Option<i64>) {
+    const EXPECTED: (i64, i64, Option<i64>, Option<i64>) =
+        (1800, 600, Some(64 * MIB), Some(1024 * MIB));
+    fn policy(step: &Step) -> (i64, i64, Option<i64>, Option<i64>) {
         (
-            step.cmd.as_str(),
-            step.timeout,
+            dagrun::resolved_wall_timeout(step, 0, 1.0),
+            step.cpu_timeout,
             step.hint.rss_baseline_bytes,
             step.hint.hard_mem_max_bytes,
         )
@@ -1341,10 +1368,11 @@ fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
     if matches.next().is_some() {
         return Err("shard-coverage resource policy: duplicate check.shard_coverage nodes".into());
     }
-    if policy(shipped) != EXPECTED {
+    if !shipped.cmd.ends_with("./ci/check-shard-coverage.sh") || policy(shipped) != EXPECTED {
         return Err(format!(
-            "shard-coverage resource policy changed: got {:?}, expected {EXPECTED:?}",
-            policy(shipped)
+            "shard-coverage resource policy changed: got cmd={:?} policy={:?}, expected a command ending in ./ci/check-shard-coverage.sh and {EXPECTED:?}",
+            shipped.cmd,
+            policy(shipped),
         ));
     }
 
@@ -1359,7 +1387,7 @@ fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
     }
 
     println!(
-        "  shard coverage: old 60s/512 MiB bounds refused; 600s/1 GiB hard bounds retain the 64 MiB warm estimate"
+        "  shard coverage: old 60s wall/512 MiB bounds refused; 600s CPU with a derived 1800s wall backstop and 1 GiB hard memory retain the 64 MiB warm estimate"
     );
     Ok(())
 }
@@ -1374,8 +1402,6 @@ fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
 fn self_test() -> Result<(), String> {
     inner_freshness_skip_cli_bracket()?;
     run_owned_cache_bracket()?;
-    println!("  {}", portable_strict_compat_outer_dag_bracket(&repo_root())?);
-    println!("  {}", raw_run_dag_strict_compat_bracket(&repo_root())?);
     shard_coverage_resource_policy_bracket(&repo_root())?;
     println!(
         "  {}",
@@ -2034,6 +2060,38 @@ fn self_test() -> Result<(), String> {
                 .into(),
         );
     }
+    let wall_fixture = || Plan {
+        cfg: validate_plan::config_from(
+            vec![step_with_caps(
+                "fixture",
+                "derived_wall",
+                "derived wall clamp fixture",
+                "true".into(),
+                vec![],
+                0,
+                30,
+                1024 * 1024,
+            )],
+            "derived wall clamp fixture",
+        ),
+        ..Default::default()
+    };
+    let mut above = wall_fixture();
+    clamp_wall(&mut above, 2000);
+    if above.cfg.steps[0].timeout != 0 {
+        return Err("a wall cap above the derived backstop replaced the committed derivation".into());
+    }
+    let mut lowered = wall_fixture();
+    clamp_wall(&mut lowered, 60);
+    if lowered.cfg.steps[0].timeout != 60 || !validate_plan::undeclared_nodes(&lowered.cfg).is_empty()
+    {
+        return Err("a wall cap below the derived backstop did not become an explicit valid ceiling".into());
+    }
+    let mut inverted = wall_fixture();
+    clamp_wall(&mut inverted, 30);
+    if validate_plan::undeclared_nodes(&inverted.cfg) != ["fixture.derived_wall"] {
+        return Err("a wall override at or below the CPU budget did not fail closed".into());
+    }
     let cold_compat = build_release_hermit_node("gate.manifest", "/tmp/target/release/hermit");
     if cold_compat.hint.preferred_inner_jobs != Some(8)
         || cold_compat.hint.classification != dagrun::model::StepClass::CpuBound
@@ -2329,13 +2387,15 @@ fn self_test() -> Result<(), String> {
         scheduler_accounting_bracket()?,
         budget_reason_bracket()?,
         summary_listing_bracket()?,
-        validate_super::self_test(&root)?,
         validate_envelope::self_test()?,
         validate_history::self_test()?,
         validate_receipt::self_test()?,
         validate_runtime::self_test()?,
+        validate_super::self_test()?,
         prebuilt_rust_script_plan_bracket()?,
         pinned_root_plan_bracket()?,
+        committed_validation_dag_bracket(&root)?,
+        committed_validation_execution_bracket(&root)?,
     ] {
         println!("  {line}");
     }
@@ -2343,7 +2403,6 @@ fn self_test() -> Result<(), String> {
     // and the progress-rubric skill, so it is asserted rather than assumed.
     envelope_cli_bracket()?;
     verbosity_cli_bracket(&root)?;
-    super_plan_bracket()?;
     // Completeness is what a self-certifying driver is least able to check about
     // itself, so its refusal predicate is bracketed here rather than assumed.
     verdict_refusal_bracket()?;
@@ -2450,557 +2509,38 @@ cleared-caps refusal names {} starved step(s)",
                      base.resource_caps.len(), base.default_step_timeout, cleared_cap_starvation);
         }
     }
-    // The full hot path is one fused DAG and pays the exact-tree manifest audit
-    // once. Bracket the positive shape and both diagnostic escape hatches: a
-    // sequential plan still exists, while the nested audit reuse is accepted
-    // only for the no-label portable-strict payload.
+    // The full profile is one label selection over the committed graph. The
+    // removed two-lane fallback must remain an explicit refusal, not an inert
+    // option that silently selects a different execution shape.
     {
         let root = repo_root();
         let tmp = std::env::temp_dir().join(format!("validate-plan-selftest-{}", std::process::id()));
         let full_args = parse_argv(&["full".into(), "--no-label-pr".into()])
             .map_err(|rc| format!("full-plan bracket: parser refused positive form rc={rc}"))?;
         let full = build_plan(&root, &full_args, &tmp)?;
-        let inherited_timeout_violations = steps_violating_run_timeout(&full.cfg, 1619);
-        if !inherited_timeout_violations
-            .iter()
-            .any(|(tag, timeout)| tag == "check.lint_checks" && *timeout == 2400)
-        {
-            return Err(format!(
-                "full-plan bracket: the inherited-timeout fixture no longer contains the raw \
-                 check.lint_checks 2400s declaration: {inherited_timeout_violations:?}"
-            ));
-        }
-        if steps_violating_run_timeout(&full.cfg, 1).is_empty() {
-            return Err(
-                "full-plan bracket: an impossible real execution timeout no longer refuses"
-                    .into(),
-            );
-        }
-        if full.second.is_some() {
-            return Err("full-plan bracket: default full plan is still sequential".into());
-        }
-        let manifest_nodes: Vec<String> = full
-            .cfg
-            .steps
-            .iter()
-            .filter(|s| validation_step_identity(s) == ValidationStepIdentity::ManifestAudit)
-            .map(|s| s.tag())
-            .collect();
-        if manifest_nodes != vec!["gate.manifest"] {
-            return Err(format!(
-                "full-plan bracket: exact-tree manifest audit was not deduped to gate.manifest: {manifest_nodes:?}"
-            ));
-        }
-        // The surviving audit must run AFTER the node that builds the binary it
-        // invokes, and that builder must not wait on the audit. Losing this edge
-        // in `dedupe_identical` made every cold full run die at
-        // `exit 127: target/debug/test-harness: No such file or directory` with
-        // 56 of 59 nodes skipped, and made every warm run audit the tree with a
-        // stale binary. Asserted on the real full plan, not a fixture.
-        let builder = "setup.manifest_plan";
-        let find_deps = |tag: &str| {
-            full.cfg
-                .steps
-                .iter()
-                .find(|s| s.tag() == tag)
-                .map(|s| s.deps.clone())
-        };
-        let audit_deps = find_deps("gate.manifest")
-            .ok_or_else(|| "full-plan bracket: gate.manifest disappeared".to_string())?;
-        let builder_deps = find_deps(builder)
-            .ok_or_else(|| format!("full-plan bracket: {builder} disappeared"))?;
-        if !audit_deps.iter().any(|d| d == builder) {
-            return Err(format!(
-                "full-plan bracket: gate.manifest does not depend on {builder}, so a cold run cannot build the binary it invokes: deps={audit_deps:?}"
-            ));
-        }
-        if builder_deps.iter().any(|d| d == "gate.manifest") {
-            return Err(format!(
-                "full-plan bracket: {builder} still waits on gate.manifest, which is the cycle the dependency union must break: deps={builder_deps:?}"
-            ));
-        }
-        let manifest_audit = full
-            .cfg
-            .steps
-            .iter()
-            .find(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestAudit)
-            .expect("manifest audit exists")
-            .clone();
-        let manifest_producer = full
-            .cfg
-            .steps
-            .iter()
-            .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
-            .ok_or("full-plan bracket: manifest-plan producer disappeared")?;
-        if manifest_producer.cmd != validate_plan::MANIFEST_PLAN_BUILD_COMMAND
-            || manifest_producer.deps != [PIN_GATE_TAG.to_string()]
-            || manifest_producer.deps.iter().any(|dependency| dependency == "gate.manifest")
-        {
-            return Err(format!(
-                "full-plan bracket: manifest-plan producer is not directly after the pin gate: cmd={} deps={:?}",
-                manifest_producer.cmd, manifest_producer.deps
-            ));
-        }
-        if manifest_audit.deps
-            != [validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string()]
-        {
-            return Err(format!(
-                "full-plan bracket: manifest audit can run without its binary producer: deps={:?}",
-                manifest_audit.deps
-            ));
-        }
-        println!("  {}", manifest_producer_edge_bracket(&full.cfg)?);
-        let mut wrong_invocation = vec![manifest_audit];
-        wrong_invocation[0].cmd = "target/debug/test-harness validate --unexpected".into();
-        if validation_step_identity(&wrong_invocation[0]) != ValidationStepIdentity::ManifestAudit
-            || dedupe_identical(&mut wrong_invocation, "gate.manifest").is_ok()
-        {
-            return Err(
-                "full-plan bracket: manifest-audit identity depended on command text or accepted an unexpected invocation"
-                    .into(),
-            );
-        }
-        let pin_nodes: Vec<String> = full
-            .cfg
-            .steps
-            .iter()
-            .filter(|s| s.cmd.contains("ci/run-reverie-pin-check.sh"))
-            .map(|s| s.tag())
-            .collect();
-        if pin_nodes != vec![PIN_GATE_TAG] {
-            return Err(format!(
-                "full-plan bracket: pin authority was not deduped to the observed preflight: {pin_nodes:?}"
-            ));
-        }
-        for required in ["compat.echo", "privileged-cpuid.faulting"] {
-            if !full.cfg.steps.iter().any(|s| s.tag() == required) {
-                return Err(format!("full-plan bracket: fused plan lost {required}"));
-            }
-        }
-        if full.cfg.steps.iter().any(|step| {
-            step.cmd.contains("scripts/validate.rs --portable-strict-compat-only")
-                || step.cmd.contains("pressure-test.rs")
-                || step.cmd.contains("dagrun run")
-                || step.cmd.contains("run_dag_boxed")
-        }) {
-            return Err(
-                "full-plan bracket: a direct strict-compat node still starts another scheduler"
-                    .into(),
-            );
-        }
-        if full.compat != Some(CompatMode::PortableStrict) {
-            return Err(
-                "full-plan bracket: flattened portable compatibility lost its typed verdict"
-                    .into(),
-            );
-        }
-        let portable_build = full
-            .cfg
-            .steps
-            .iter()
-            .find(|s| s.tag() == "build.workspace")
-            .ok_or("full-plan bracket: portable fat build disappeared")?;
-        if !portable_build.cmd.contains("cargo build --workspace --all-targets")
-            || !portable_build.cmd.contains("cargo build -p hermit")
-            || !portable_build.cmd.contains("--bin hermit")
-        {
-            return Err("full-plan bracket: fat build does not finish the debug Hermit producer".into());
-        }
-        let artifact = full
-            .cfg
-            .steps
-            .iter()
-            .find(|s| s.tag() == "build.e2e_artifact")
-            .ok_or("full-plan bracket: verified E2E artifact publisher disappeared")?;
-        if !artifact.cmd.contains("ci/publish-hermit-e2e-artifact.sh")
-            || !artifact.cmd.ends_with(" target/install_pkg")
-            || !["build.workspace", "build.runtime_release"]
-                .iter()
-                .all(|dep| artifact.deps.iter().any(|actual| actual == dep))
-        {
-            return Err(
-                "full-plan bracket: E2E publisher is not a complete binary+resource barrier"
-                    .into(),
-            );
-        }
-        let integration = full
-            .cfg
-            .steps
-            .iter()
-            .find(|s| s.tag() == "test.hermit_integration")
-            .ok_or("full-plan bracket: Hermit integration node disappeared")?;
-        if !hermit_integration_uses_published_artifact(integration) {
-            return Err(format!(
-                "full-plan bracket: Hermit integration tests can consume a mutable Hermit binary: cmd={} deps={:?}",
-                integration.cmd, integration.deps
-            ));
-        }
-        let mut missing_wrapper = integration.clone();
-        missing_wrapper.cmd = missing_wrapper
-            .cmd
-            .strip_prefix(INTEGRATION_ARTIFACT_WRAPPER)
-            .ok_or("full-plan bracket: cannot plant missing integration artifact wrapper")?
-            .to_owned();
-        if hermit_integration_uses_published_artifact(&missing_wrapper) {
-            return Err(
-                "full-plan bracket: removing the integration artifact wrapper was accepted"
-                    .into(),
-            );
-        }
-        let mut missing_dependency = integration.clone();
-        missing_dependency
-            .deps
-            .retain(|dependency| dependency != "build.e2e_artifact");
-        if hermit_integration_uses_published_artifact(&missing_dependency) {
-            return Err(
-                "full-plan bracket: removing the integration artifact dependency was accepted"
-                    .into(),
-            );
-        }
-        let manifest_consumers: Vec<_> = full
-            .cfg
-            .steps
-            .iter()
-            .filter(|s| validation_step_identity(s) == ValidationStepIdentity::ManifestRun)
-            .collect();
-        if manifest_consumers.is_empty() {
-            return Err("full-plan bracket: no manifest consumers were inspected".into());
-        }
-        let manifest_tags = manifest_consumers
-            .iter()
-            .map(|step| step.tag())
-            .collect::<BTreeSet<_>>();
-        let scorecard_deps = full
-            .cfg
-            .steps
-            .iter()
-            .find(|step| step.tag() == "scorecard.compatibility")
-            .ok_or("full-plan bracket: compatibility scorecard disappeared")?
-            .deps
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if scorecard_deps != manifest_tags {
-            return Err(format!(
-                "full-plan bracket: compatibility scorecard does not depend on every manifest result node: expected={manifest_tags:?}, actual={scorecard_deps:?}"
-            ));
-        }
-        let mut results_paths = BTreeSet::new();
-        let mut junit_paths = BTreeSet::new();
-        let mut spelling_probe = (*manifest_consumers[0]).clone();
-        spelling_probe.cmd = "changed invocation text".into();
-        if validation_step_identity(&spelling_probe) != ValidationStepIdentity::ManifestRun {
-            return Err(
-                "full-plan bracket: manifest-run identity still depends on command text".into(),
-            );
-        }
-        for consumer in manifest_consumers {
-            let DagManifest { lane, category: _ } = consumer.manifest.as_ref().ok_or_else(|| {
-                format!(
-                    "full-plan bracket: {} manifest consumer lacks typed manifest selection",
-                    consumer.tag()
-                )
-            })?;
-            let result_path = format!(
-                "\"$E2E_RESULT_ROOT/{lane}/{}/results.jsonl\"",
-                consumer.job
-            );
-            let junit_path = format!(
-                "\"$E2E_RESULT_ROOT/{lane}/{}/junit.xml\"",
-                consumer.job
-            );
-            if consumer.cmd.matches("--results").count() != 1
-                || !consumer.cmd.contains(&format!("--results {result_path}"))
-                || !results_paths.insert(result_path)
-            {
-                return Err(format!(
-                    "full-plan bracket: {} does not have one unique result path: {}",
-                    consumer.tag(), consumer.cmd
-                ));
-            }
-            if consumer.env.contains_key("E2E_ATTEMPT") {
-                return Err(format!(
-                    "full-plan bracket: {} still receives the outer E2E_ATTEMPT variable: {:?}",
-                    consumer.tag(), consumer.env
-                ));
-            }
-            if consumer.cmd.matches("--junit").count() != 1
-                || !consumer.cmd.contains(&format!("--junit {junit_path}"))
-                || !junit_paths.insert(junit_path)
-            {
-                return Err(format!(
-                    "full-plan bracket: {} does not have one unique JUnit path: {}",
-                    consumer.tag(), consumer.cmd
-                ));
-            }
-            if !consumer.cmd.starts_with("./ci/run-with-hermit-e2e-artifact.sh ") {
-                return Err(format!(
-                    "full-plan bracket: {} still consumes a mutable Hermit path: {}",
-                    consumer.tag(), consumer.cmd
-                ));
-            }
-            let producer = if lane == "portable" {
-                if !consumer.cmd.contains("--require-install") {
-                    return Err(format!(
-                        "full-plan bracket: portable consumer {} did not require the backend-resource bundle",
-                        consumer.tag()
-                    ));
-                }
-                "build.e2e_artifact"
-            } else {
-                "privileged-build.privileged_tests"
-            };
-            if !consumer.deps.iter().any(|d| d == producer) {
-                return Err(format!(
-                    "full-plan bracket: {} does not declare immutable artifact producer {producer}",
-                    consumer.tag()
-                ));
-            }
-        }
-        let privileged_build = full
-            .cfg
-            .steps
-            .iter()
-            .find(|s| s.tag() == "privileged-build.privileged_tests")
-            .ok_or("full-plan bracket: privileged focused build disappeared")?;
-        for required in ["build.e2e_artifact", "build.liteinst_runtime_release"] {
-            if !privileged_build.deps.iter().any(|dependency| dependency == required) {
-                return Err(format!(
-                    "full-plan bracket: privileged build can start before required build barrier {required}"
-                ));
-            }
-        }
-        if !privileged_build
-            .cmd
-            .contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
-            || !privileged_build
-                .cmd
-                .contains(DETCORE_MISC_TEST_PREBUILD_COMMAND)
-            || !privileged_build
-                .cmd
-                .contains(HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND)
-            || !privileged_build
-                .cmd
-                .contains(TESTS_MISC_EXECUTABLE_READ_COMMAND)
-        {
-            return Err(
-                "full-plan bracket: privileged build did not assert the artifact and prebuild the exact downstream test binaries".into(),
-            );
-        }
-        let detcore_prebuild_at = privileged_build
-            .cmd
-            .find(DETCORE_MISC_TEST_PREBUILD_COMMAND)
-            .expect("presence checked above");
-        let hermit_prebuild_at = privileged_build
-            .cmd
-            .find(HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND)
-            .expect("presence checked above");
-        let artifact_scan_at = privileged_build
-            .cmd
-            .find(TESTS_MISC_EXECUTABLE_READ_COMMAND)
-            .expect("presence checked above");
-        if !(detcore_prebuild_at < hermit_prebuild_at && hermit_prebuild_at < artifact_scan_at) {
-            return Err(format!(
-                "full-plan bracket: privileged build does not create tests_misc before later prebuilds and the artifact check: {}",
-                privileged_build.cmd
-            ));
-        }
-        if ["test.cli", "test.hermit_modes"]
-            .iter()
-            .any(|forbidden| privileged_build.deps.iter().any(|dep| dep == forbidden))
-        {
-            return Err(format!(
-                "full-plan bracket: privileged build depends on portable test success: {:?}",
-                privileged_build.deps
-            ));
+        let committed = validate_plan::lane_config(&root, "full")?;
+        if full.second.is_some() || dag_to_json(&full.cfg) != dag_to_json(&committed) {
+            return Err("full-plan bracket: constructed full plan differs from the committed full label".into());
         }
         assert_fused_shared_integration_test_resources(
             &full.cfg.steps,
             &full.cfg.resource_caps,
         )?;
-        let mut missing_shared_demand = full.cfg.steps.clone();
-        missing_shared_demand
-            .iter_mut()
-            .find(|step| step.tag() == "test.cli")
-            .expect("portable cli exists")
-            .hint
-            .resources
-            .remove("integration_test_binaries.cli");
-        let mut missing_shared_cap = full.cfg.resource_caps.clone();
-        missing_shared_cap.remove("integration_test_binaries.hermit_modes");
-        if assert_fused_shared_integration_test_resources(
-            &missing_shared_demand,
-            &full.cfg.resource_caps,
-        )
-        .is_ok()
-            || assert_fused_shared_integration_test_resources(&full.cfg.steps, &missing_shared_cap)
-                .is_ok()
-        {
-            return Err("full-plan bracket: missing shared-test resource demand/cap was accepted".into());
-        }
-        let mut selected = Plan {
-            cfg: full.cfg.clone(),
-            profile: "full".into(),
-            ..Default::default()
-        };
-        select_constructed_steps(
-            &mut selected,
-            "privileged-test.cli_kvm,privileged-test.pmu_buck_chaos_cases",
-            false,
-        )?;
-        let tags: BTreeSet<String> = selected.cfg.steps.iter().map(Step::tag).collect();
-        if ["test.cli", "test.hermit_modes"].iter().any(|tag| tags.contains(*tag)) {
-            return Err(format!(
-                "full-plan bracket: selected privileged tests acquired a portable-test dependency: {tags:?}"
-            ));
-        }
-        let cpuid = full
-            .cfg
-            .steps
-            .iter()
-            .find(|s| s.tag() == "privileged-cpuid.faulting")
-            .ok_or("full-plan bracket: privileged CPUID node disappeared")?;
-        if cpuid.cmd.contains("cargo ") || !cpuid.cmd.contains("rdrand_rdseed_is_masked") {
-            return Err(
-                "full-plan bracket: CPUID test does not directly execute the prebuilt binary"
-                    .into(),
-            );
-        }
-        if !cpuid
-            .deps
-            .iter()
-            .any(|dependency| dependency == "privileged-build.privileged_tests")
-        {
-            return Err(
-                "full-plan bracket: CPUID consumer can run before tests_misc is built".into(),
-            );
-        }
-        // Exercise the actual full plan after lane fusion, then apply the
-        // pinned-root transformation. A synthetic producer graph cannot catch
-        // the dependency that fusion rewrites through gate.manifest.
-        let mut pinned_full = build_plan(&root, &full_args, &tmp)?;
-        apply_pinned_root(&mut pinned_full, &root, false)?;
-        let deps_of = |tag: &str| {
-            pinned_full
-                .cfg
-                .steps
-                .iter()
-                .find(|step| step.tag() == tag)
-                .map(|step| step.deps.clone())
-        };
-        for tag in [
-            "build.manifest_guests_in_pinned_root",
-            "privileged-build.manifest_guests_in_pinned_root",
-        ] {
-            let deps = deps_of(tag).ok_or_else(|| {
-                format!("full-plan bracket: post-fusion pinned-root producer {tag} disappeared")
-            })?;
-            if !deps
-                .iter()
-                .any(|dependency| dependency == "setup.manifest_plan_in_pinned_root")
-            {
-                return Err(format!(
-                    "full-plan bracket: post-fusion {tag} can run before \
-                     setup.manifest_plan_in_pinned_root builds the test harness: deps={deps:?}"
-                ));
-            }
-        }
-        for step in pinned_full.cfg.steps.iter().filter(|step| {
-            step.tag().ends_with("_in_pinned_root")
-                || validation_step_identity(step) == ValidationStepIdentity::ManifestRun
-        }) {
-            if !step
-                .cmd
-                .contains("/src/ci/hermetic/assert-build-dependencies.sh")
-            {
-                return Err(format!(
-                    "full-plan bracket: pinned-root node {} can start without the build-dependency assertion: {}",
-                    step.tag(), step.cmd
-                ));
-            }
-        }
-        for tag in [
-            "privileged-e2e.manifest_applications",
-            "privileged-e2e.manifest_backend_parity_c",
-        ] {
-            let deps = deps_of(tag)
-                .ok_or_else(|| format!("full-plan bracket: pinned-root cell {tag} disappeared"))?;
-            for required in [
-                "build.e2e_artifact_in_pinned_root",
-                "privileged-build.manifest_guests_in_pinned_root",
-            ] {
-                if !deps.iter().any(|dependency| dependency == required) {
-                    return Err(format!(
-                        "full-plan bracket: {tag} does not wait for pinned-root producer \
-                         {required}: deps={deps:?}"
-                    ));
-                }
-            }
-        }
-        let sequential_args = parse_argv(&[
+        let sequential = parse_argv(&[
             "full".into(),
             "--sequential-lanes".into(),
             "--no-label-pr".into(),
-        ])
-        .map_err(|rc| format!("full-plan bracket: sequential diagnostic refused rc={rc}"))?;
-        let sequential = build_plan(&root, &sequential_args, &tmp)?;
-        if sequential.second.is_none() {
-            return Err("full-plan bracket: --sequential-lanes did not preserve the fallback".into());
-        }
-        let sequential_has_shared_resource = std::iter::once(&sequential.cfg)
-            .chain(sequential.second.iter())
-            .any(|cfg| {
-                cfg.resource_caps
-                    .keys()
-                    .chain(cfg.steps.iter().flat_map(|step| step.hint.resources.keys()))
-                    .any(|resource| resource.starts_with(FUSED_INTEGRATION_TEST_RESOURCE_PREFIX))
-            });
-        if sequential_has_shared_resource {
-            return Err("full-plan bracket: fused shared-test resources leaked into the sequential plan".into());
-        }
-        let mut portable_tests = test_nodes_of(&validate_plan::lane_config(&root, "portable")?);
-        portable_tests.remove(STRICT_COMPAT_PLACEHOLDER_TAG);
-        let privileged_tests = test_nodes_of(&validate_plan::lane_config(&root, "privileged")?);
-        let mut sequential_expected = portable_tests.clone();
-        sequential_expected.extend(
-            privileged_tests
-                .iter()
-                .map(|tag| format!("privileged-{tag}")),
-        );
-        let mut fused_expected = portable_tests;
-        fused_expected.extend(
-            privileged_tests
-                .into_iter()
-                .map(|tag| format!("privileged-{tag}")),
-        );
-        if full.planned_test_nodes != fused_expected
-            || sequential.planned_test_nodes != sequential_expected
-        {
-            return Err(format!(
-                "full-plan bracket: fused/sequential planned-test sets differ from their lane configs: fused={:?} sequential={:?}",
-                full.planned_test_nodes, sequential.planned_test_nodes,
-            ));
-        }
-        let sequential_tags: Vec<String> = std::iter::once(&sequential.cfg)
-            .chain(sequential.second.iter())
-            .flat_map(|cfg| cfg.steps.iter().map(|step| step.tag()))
-            .collect();
-        let sequential_unique: BTreeSet<&str> =
-            sequential_tags.iter().map(String::as_str).collect();
-        if sequential_tags.len() != sequential_unique.len() {
-            return Err(format!(
-                "full-plan bracket: sequential lanes contain duplicate node identities, so \
-                 planned_node_count would collapse {} executions to {} names: {sequential_tags:?}",
-                sequential_tags.len(),
-                sequential_unique.len()
-            ));
+        ]);
+        if !matches!(sequential, Err(2)) {
+            return Err(
+                "full-plan bracket: removed --sequential-lanes was not explicitly refused".into(),
+            );
         }
         println!(
-            "  full plan: {} fused node(s), 1 manifest-plan producer -> 1 exact-tree manifest audit + 1 pin authority; sequential fallback bracketed",
+            "  full plan: {} committed labelled node(s); removed sequential-lanes spelling refused",
             full.cfg.steps.len()
         );
     }
-
     Ok(())
 }
 
@@ -3060,171 +2600,6 @@ fn inner_freshness_skip_cli_bracket() -> Result<(), String> {
 /// Execute the production manifest producer/audit dependency spine in both
 /// directions. The positive case starts with no output and requires the
 /// producer to create it before the audit runs. The negative case makes the
-/// producer fail and requires the scheduler to dependency-skip the audit.
-fn manifest_producer_edge_bracket(cfg: &DagConfig) -> Result<String, String> {
-    let tmp = std::env::temp_dir().join(format!(
-        "validate-manifest-producer-edge-{}-{}",
-        std::process::id(),
-        epoch_now()
-    ));
-    std::fs::create_dir(&tmp)
-        .map_err(|error| format!("manifest producer bracket: cannot create {}: {error}", tmp.display()))?;
-
-    let result = (|| -> Result<(), String> {
-        let required = [
-            "pre.submodules",
-            PIN_GATE_TAG,
-            validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
-            "gate.manifest",
-        ];
-        let fixture = |producer_cmd: String, gate_cmd: String| -> Result<DagConfig, String> {
-            let mut steps = Vec::new();
-            for tag in required {
-                let source = cfg
-                    .steps
-                    .iter()
-                    .find(|step| step.tag() == tag)
-                    .ok_or_else(|| format!("manifest producer bracket: production plan lost {tag}"))?;
-                let mut step = step_with_caps(
-                    &source.group,
-                    &source.job,
-                    "manifest producer dependency fixture",
-                    match tag {
-                        "pre.submodules" | PIN_GATE_TAG => "true".to_string(),
-                        validate_plan::MANIFEST_PLAN_PRODUCER_TAG => producer_cmd.clone(),
-                        "gate.manifest" => gate_cmd.clone(),
-                        _ => unreachable!(),
-                    },
-                    source.deps.clone(),
-                    30,
-                    30,
-                    64 * 1024 * 1024,
-                );
-                step.deps.retain(|dependency| required.contains(&dependency.as_str()));
-                steps.push(step);
-            }
-            Ok(validate_plan::config_from(
-                steps,
-                "manifest producer dependency fixture",
-            ))
-        };
-
-        let output = tmp.join("target/debug/test-harness");
-        let gate_ran = tmp.join("gate-ran");
-        let output_parent = output
-            .parent()
-            .ok_or_else(|| format!("manifest producer bracket: {} has no parent", output.display()))?;
-        let positive = fixture(
-            format!(
-                "mkdir -p {parent} && printf '#!/bin/sh\\nexit 0\\n' > {output} && chmod +x {output}",
-                parent = validate_plan::shell_quote(&output_parent.to_string_lossy()),
-                output = validate_plan::shell_quote(&output.to_string_lossy()),
-            ),
-            format!(
-                "test -x {output} && {output} && : > {gate_ran}",
-                output = validate_plan::shell_quote(&output.to_string_lossy()),
-                gate_ran = validate_plan::shell_quote(&gate_ran.to_string_lossy()),
-            ),
-        )?;
-        let positive_result = run_lane_once(
-            &positive,
-            2,
-            true,
-            0,
-            None,
-            &tmp.join("positive.log"),
-            None,
-            false,
-        );
-        if !positive_result.complete
-            || !positive_result.ok
-            || positive_result.outcomes.len() != required.len()
-            || !positive_result.skipped.is_empty()
-            || !output.is_file()
-            || !gate_ran.is_file()
-        {
-            return Err(format!(
-                "manifest producer bracket: absent output was not produced before the gate: complete={} ok={} outcomes={:?} skipped={:?} output={} gate_ran={}",
-                positive_result.complete,
-                positive_result.ok,
-                positive_result
-                    .outcomes
-                    .iter()
-                    .map(|outcome| (outcome.tag.as_str(), outcome.ok))
-                    .collect::<Vec<_>>(),
-                positive_result.skipped,
-                output.is_file(),
-                gate_ran.is_file()
-            ));
-        }
-
-        std::fs::remove_file(&output)
-            .map_err(|error| format!("manifest producer bracket: cannot remove {}: {error}", output.display()))?;
-        std::fs::remove_file(&gate_ran)
-            .map_err(|error| format!("manifest producer bracket: cannot remove {}: {error}", gate_ran.display()))?;
-        let negative = fixture(
-            "exit 23".to_string(),
-            format!(
-                ": > {}",
-                validate_plan::shell_quote(&gate_ran.to_string_lossy())
-            ),
-        )?;
-        let negative_result = run_lane_once(
-            &negative,
-            2,
-            true,
-            0,
-            None,
-            &tmp.join("negative.log"),
-            None,
-            false,
-        );
-        let producer_failed = negative_result.outcomes.iter().any(|outcome| {
-            outcome.tag == validate_plan::MANIFEST_PLAN_PRODUCER_TAG
-                && !outcome.ok
-                && outcome.returncode == Some(23)
-        });
-        if negative_result.complete
-            || negative_result.ok
-            || !producer_failed
-            || negative_result.skipped != ["gate.manifest".to_string()]
-            || gate_ran.exists()
-        {
-            return Err(format!(
-                "manifest producer bracket: failed producer did not block the gate: complete={} ok={} producer_failed={producer_failed} outcomes={:?} skipped={:?} gate_ran={}",
-                negative_result.complete,
-                negative_result.ok,
-                negative_result
-                    .outcomes
-                    .iter()
-                    .map(|outcome| (outcome.tag.as_str(), outcome.ok, outcome.returncode))
-                    .collect::<Vec<_>>(),
-                negative_result.skipped,
-                gate_ran.exists()
-            ));
-        }
-        Ok(())
-    })();
-
-    let cleanup = std::fs::remove_dir_all(&tmp)
-        .map_err(|error| format!("manifest producer bracket: cannot remove {}: {error}", tmp.display()));
-    match (result, cleanup) {
-        (Ok(()), Ok(())) => Ok(
-            "manifest producer edge: absent output built before gate; producer failure dependency-skips gate"
-                .into(),
-        ),
-        (Err(problem), Ok(())) => Err(problem),
-        (Ok(()), Err(cleanup_problem)) => Err(cleanup_problem),
-        (Err(problem), Err(cleanup_problem)) => Err(format!(
-            "{problem}; cleanup also failed: {cleanup_problem}"
-        )),
-    }
-}
-
-/// Bind the current schema to the evidence the row actually carries.
-///
-/// A missing or malformed coverage judgement stays explicit `null`. It must not
-/// cause a new row to masquerade as a grandfathered schema-4 receipt.
 fn ledger_schema_and_coverage(
     coverage: serde_json::Value,
 ) -> (i64, serde_json::Value) {
@@ -3339,7 +2714,7 @@ fn self_output_bracket() -> Result<(), String> {
         ("scripts/lib/validate_plan.rs", "bare path, real source"),
         ("R  detcore/src/a.rs -> ci/validate-ledger/a.rs", "a source file MOVED into the ledger dir"),
         ("R  ci/validate-ledger/a.jsonl -> detcore/src/a.rs", "a ledger file moved OUT into source"),
-        (" M ci/dag/portable.json", "a lane change under ci/, but not the ledger"),
+        (" M ci/dag/validate.json", "a lane change under ci/, but not the ledger"),
         (" M ci/validate-ledger-notes.md", "a sibling whose name merely starts the same way"),
     ];
     for (line, why) in foreign {
@@ -3562,7 +2937,7 @@ fn checkout_attribution_bracket() -> Result<(), String> {
 ///
 /// The dangerous failure here is silent under-running: a subset that drops a
 /// node the selector asked for, or keeps a dangling dependency that makes the
-/// runner skip a selected node. Both are checked against `ci/dag/portable.json`
+/// runner skip a selected node. Both are checked against `ci/dag/validate.json`
 /// itself rather than a fixture, because a fixture would not notice the lane
 /// file changing shape underneath the selector.
 fn selective_subset_bracket(root: &Path) -> Result<(), String> {
@@ -3576,7 +2951,7 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         .find_map(|s| {
             s.deps.iter().find(|d| all_tags.contains(*d)).map(|d| (s.tag(), d.clone()))
         })
-        .ok_or("selective bracket: ci/dag/portable.json has no intra-lane dependency to test")?;
+        .ok_or("selective bracket: ci/dag/validate.json has no intra-lane dependency to test")?;
     let keep: BTreeSet<String> = [child.clone(), parent.clone()].into_iter().collect();
     let sel = validate_plan::select_lane_nodes(all.clone(), &keep);
     // Positive: exactly the two named nodes survive, the kept edge survives, and
@@ -3695,7 +3070,7 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         full_total,
         SelectDecision::Full("no trustworthy green baseline (self-test)".into()),
     )?;
-    let mut full_nodes = validate_plan::preflight_nodes(root, false);
+    let mut full_nodes = validate_plan::preflight_nodes(root)?;
     full_nodes.extend(full_steps);
     let submodules = full_nodes
         .iter()
@@ -3817,7 +3192,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         return Err(format!("only bracket: plan contains duplicate tags: {tags:?}"));
     }
     let mut expected_tags: BTreeSet<String> =
-        validate_plan::preflight_nodes(root, has_cmd("with-proxy"))
+        validate_plan::preflight_nodes(root)?
             .iter()
             .map(|step| step.tag())
             .collect();
@@ -3906,7 +3281,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .map(|step| step.tag())
         .collect();
-    let canonical_preflight = validate_plan::preflight_nodes(root, has_cmd("with-proxy"));
+    let canonical_preflight = validate_plan::preflight_nodes(root)?;
     let preflight_tags: BTreeSet<String> = canonical_preflight
         .iter()
         .map(|step| step.tag())
@@ -4089,85 +3464,6 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
 /// The caps audit is the driver's own load-bearing guard: it is what makes
 /// "boxing ACTIVE" true for every node rather than for the ones someone
 /// remembered. A guard that never fires is indistinguishable from no guard, so
-/// this brackets it on both sides with an inert synthetic node.
-fn super_plan_bracket() -> Result<(), String> {
-    let root = repo_root();
-    let tmp = std::env::temp_dir().join(format!("validate-super-plan-{}", std::process::id()));
-    let args = parse_argv(&["super".to_string()])
-        .map_err(|c| format!("super plan: the `super` level was REFUSED with exit {c}"))?;
-    let plan = build_plan(&root, &args, &tmp)
-        .map_err(|e| format!("super plan: could not build a plan: {e}"))?;
-    // Positive: the audit must ACCEPT a real, fully-declared super plan.
-    let undeclared = validate_plan::undeclared_nodes(&plan.cfg);
-    if !undeclared.is_empty() {
-        return Err(format!(
-            "super plan: {} node(s) lack declared caps: {}",
-            undeclared.len(),
-            undeclared.join(", ")
-        ));
-    }
-    let tags: BTreeSet<String> = plan.cfg.steps.iter().map(|s| s.tag()).collect();
-    // One representative of each expansion the table names, so a lost synthetic
-    // is caught here and not at 2am in the weekly run.
-    for want in [
-        "super.build_workspace",
-        "super.build_release_hermit",
-        "super.sqlite_veryquick_strict_determinism",
-        "super.pmu_analyze_hello_race_stress_calibrated_skid",
-        "superstress.ptrace_strict_verify_01",
-        "superstress.kvm_available",
-        "compatprep.fixtures",
-        "compat.rustc",
-    ] {
-        if !tags.contains(want) {
-            return Err(format!("super plan: node {want} is missing"));
-        }
-    }
-    if !plan.super_mode {
-        return Err("super plan: super_mode must be set so the stress table is printed".into());
-    }
-    // Negative: one node with no caps must be REFUSED by the same audit.
-    let mut broken = validate_plan::config_from(
-        vec![dagrun::model::Step {
-            group: "bracket".into(),
-            job: "uncapped".into(),
-            desc: "inert fixture: declares no caps".into(),
-            description: String::new(),
-            cmd: "true".into(),
-            cmdtype: CmdType::Unknown,
-            manifest: None,
-            integration_test_binaries: None,
-            deps: vec![],
-            env: BTreeMap::new(),
-            hint: Default::default(),
-            networkonly: false,
-            engine_only: false,
-            timeout: 0,
-            cpu_timeout: 0,
-            jobs_flag: None,
-            jobs_env: None,
-            skip_reason: None,
-            write_domains: None,
-            write_domain_guarantee: None,
-            explains: Vec::new(),
-            fail_fast_family: None,
-        }],
-        "caps-audit negative bracket",
-    );
-    broken.default_step_cpu_timeout = 0;
-    let refused = validate_plan::undeclared_nodes(&broken);
-    if refused != vec!["bracket.uncapped".to_string()] {
-        return Err(format!(
-            "caps audit: an uncapped node MUST be refused; the audit returned {refused:?}"
-        ));
-    }
-    println!(
-        "  super plan: {} boxed node(s), all capped; caps audit bracketed 1 accept / 1 refusal",
-        plan.cfg.steps.len()
-    );
-    Ok(())
-}
-
 fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
     let level = |args: &[&str]| -> Result<i64, String> {
         parse_argv(&args.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
@@ -5243,14 +4539,6 @@ fn utc_now() -> String {
 
 fn epoch_now() -> i64 {
     sh("date", &["+%s"]).and_then(|s| s.parse().ok()).unwrap_or(0)
-}
-
-fn has_cmd(name: &str) -> bool {
-    Command::new("sh")
-        .args(["-c", &format!("command -v {name} >/dev/null 2>&1")])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 /// Locate the dev-hermit parent by walking up for a `.gitmodules` whose `hermit`
@@ -6402,8 +5690,8 @@ fn rust_script_producer_step() -> Step {
         "Build every tracked rust-script before graph consumers run",
         "./ci/prepare-rust-scripts.sh".into(),
         Vec::new(),
+        0,
         300,
-        900,
         2 * 1024 * 1024 * 1024,
     );
     step.description = "Discovers every tracked rust-script entrypoint, runs the existing clippy contract, and publishes release executables plus test harnesses. It runs after checkout and pin verification; every compiling consumer resolves rust-script through the read-only manifest, so compilation cost cannot migrate according to scheduler order.".into();
@@ -6416,7 +5704,7 @@ fn rust_script_producer_step() -> Step {
 
 /// Put rust-script compilation at one explicit point in each scheduled DAG.
 ///
-/// The checked-in lane files carry this node for direct `ci/run-dag.sh` users.
+/// The one committed DAG carries this node for direct `ci/run-dag.sh` users.
 /// Synthetic validation profiles do not, so the driver adds the same node when
 /// absent. The producer follows checkout verification and precedes the manifest
 /// build; plans with no preflight put it before every prior root. A source
@@ -6436,11 +5724,28 @@ fn configure_prebuilt_rust_scripts(
         let producer_tags: Vec<String> = cfg
             .steps
             .iter()
-            .filter(|step| {
-                step.job == "rust_scripts" && step.cmd == "./ci/prepare-rust-scripts.sh"
-            })
+            .filter(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
             .map(Step::tag)
             .collect();
+        if producer_tags.len() == 1
+            && cfg
+                .steps
+                .iter()
+                .all(|step| step.cmd.starts_with(RUST_SCRIPT_COMMAND_PREFIX))
+        {
+            let producer = cfg
+                .steps
+                .iter()
+                .find(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
+                .expect("counted exactly once");
+            if !producer.cmd.ends_with("./ci/prepare-rust-scripts.sh") {
+                return Err(format!(
+                    "committed rust-script producer command drifted: {}",
+                    producer.cmd
+                ));
+            }
+            continue;
+        }
         let producer_tag = match producer_tags.as_slice() {
             [] => {
                 if require_external_output {
@@ -6450,7 +5755,22 @@ fn configure_prebuilt_rust_scripts(
                     RUST_SCRIPT_PRODUCER_TAG.to_string()
                 }
             }
-            [tag] => tag.clone(),
+            [tag] => {
+                let producer = cfg
+                    .steps
+                    .iter()
+                    .find(|step| step.tag() == *tag)
+                    .expect("counted exactly once");
+                if producer.cmd != "./ci/prepare-rust-scripts.sh"
+                    && !producer.cmd.ends_with("./ci/prepare-rust-scripts.sh")
+                {
+                    return Err(format!(
+                        "rust-script producer command drifted: {}",
+                        producer.cmd
+                    ));
+                }
+                tag.clone()
+            }
             tags => {
                 return Err(format!(
                     "execution plan contains {} rust-script producer nodes ({}); exactly one may publish the script binaries",
@@ -6503,7 +5823,7 @@ fn configure_prebuilt_rust_scripts(
 
 fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
     let step = |job: &str, deps: Vec<String>| {
-        step_with_caps("fixture", job, "fixture", "true".into(), deps, 30, 30, 1024 * 1024)
+        step_with_caps("fixture", job, "fixture", "true".into(), deps, 0, 30, 1024 * 1024)
     };
     let mut plan = Plan {
         cfg: validate_plan::config_from(
@@ -6578,7 +5898,7 @@ fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
     }
     let mut preflight = Plan {
         cfg: validate_plan::config_from(
-            validate_plan::preflight_nodes(Path::new("/repo"), false),
+            validate_plan::preflight_nodes(&repo_root())?,
             "rust-script preflight bracket",
         ),
         ..Default::default()
@@ -6704,6 +6024,730 @@ fn select_constructed_steps(
         }
     );
     Ok(())
+}
+
+fn committed_graph_invariants(
+    root: &Path,
+    committed: &DagConfig,
+    portable: &DagConfig,
+    privileged: &DagConfig,
+) -> Result<(), String> {
+    let full = dagrun::select_steps_by_labels(committed, &["full".into()])?;
+    let find = |tag: &str| {
+        full.steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("committed DAG bracket: required full step {tag} is absent"))
+    };
+
+    let audits = full
+        .steps
+        .iter()
+        .filter(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestAudit)
+        .collect::<Vec<_>>();
+    if audits.len() != 1 || audits[0].tag() != "gate.manifest" {
+        return Err(format!(
+            "committed DAG bracket: full selection must contain one typed manifest audit, got {:?}",
+            audits.iter().map(|step| step.tag()).collect::<Vec<_>>()
+        ));
+    }
+    let pin = find(PIN_GATE_TAG)?;
+    let rust_scripts = find(RUST_SCRIPT_PRODUCER_TAG)?;
+    let producer = find(validate_plan::MANIFEST_PLAN_PRODUCER_TAG)?;
+    let audit = audits[0];
+    if !pin.cmd.contains("ci/run-reverie-pin-check.sh")
+        || full
+            .steps
+            .iter()
+            .filter(|step| step.cmd.contains("ci/run-reverie-pin-check.sh"))
+            .count()
+            != 1
+        || rust_scripts.deps != [PIN_GATE_TAG.to_string()]
+        || !producer.cmd.ends_with(validate_plan::MANIFEST_PLAN_BUILD_COMMAND)
+        || producer
+            .cmd
+            .matches(validate_plan::MANIFEST_PLAN_BUILD_COMMAND)
+            .count()
+            != 1
+        || producer.deps != [RUST_SCRIPT_PRODUCER_TAG.to_string()]
+        || audit.deps != [validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string()]
+    {
+        return Err(format!(
+            "committed DAG bracket: pin/rust-script/manifest producer/audit spine changed: pin={} rust_deps={:?} producer=({}, {:?}) audit_deps={:?}",
+            pin.tag(), rust_scripts.deps, producer.cmd, producer.deps, audit.deps
+        ));
+    }
+
+    let workspace = find("build.workspace")?;
+    if !workspace.cmd.contains("cargo build --workspace --all-targets")
+        || !workspace.cmd.contains("cargo build -p hermit")
+        || !workspace.cmd.contains("--bin hermit")
+    {
+        return Err("committed DAG bracket: build.workspace no longer produces the debug Hermit binary".into());
+    }
+    let artifact = find("build.e2e_artifact")?;
+    if !artifact.cmd.contains("ci/publish-hermit-e2e-artifact.sh")
+        || !artifact.cmd.ends_with(" target/install_pkg")
+        || ["build.workspace", "build.runtime_release"]
+            .iter()
+            .any(|required| !artifact.deps.iter().any(|dep| dep == required))
+    {
+        return Err("committed DAG bracket: build.e2e_artifact is not the complete immutable binary/resource barrier".into());
+    }
+    let integration = find("test.hermit_integration")?;
+    let integration_is_immutable = |step: &Step| {
+        step.cmd.contains(INTEGRATION_ARTIFACT_WRAPPER)
+            && step.deps.iter().any(|dep| dep == "build.e2e_artifact")
+    };
+    if !integration_is_immutable(integration) {
+        return Err("committed DAG bracket: test.hermit_integration can consume a mutable Hermit binary".into());
+    }
+    let mut missing_wrapper = integration.clone();
+    missing_wrapper.cmd = missing_wrapper.cmd.replace(INTEGRATION_ARTIFACT_WRAPPER, "");
+    let mut missing_edge = integration.clone();
+    missing_edge.deps.retain(|dep| dep != "build.e2e_artifact");
+    if integration_is_immutable(&missing_wrapper) || integration_is_immutable(&missing_edge) {
+        return Err("committed DAG bracket: immutable E2E wrapper/producer negative controls were accepted".into());
+    }
+
+    let manifest_consumers = full
+        .steps
+        .iter()
+        .filter(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestRun)
+        .collect::<Vec<_>>();
+    if manifest_consumers.is_empty() {
+        return Err("committed DAG bracket: full selection contains no typed manifest consumers".into());
+    }
+    let manifest_tags = manifest_consumers
+        .iter()
+        .map(|step| step.tag())
+        .collect::<BTreeSet<_>>();
+    let scorecard_deps = find("full-scorecard.compatibility")?
+        .deps
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if scorecard_deps != manifest_tags {
+        return Err(format!(
+            "committed DAG bracket: full scorecard does not depend on every manifest result: expected={manifest_tags:?} actual={scorecard_deps:?}"
+        ));
+    }
+    let mut result_paths = BTreeSet::new();
+    let mut junit_paths = BTreeSet::new();
+    let mut spelling_probe = (*manifest_consumers[0]).clone();
+    spelling_probe.cmd = "changed invocation text".into();
+    if validation_step_identity(&spelling_probe) != ValidationStepIdentity::ManifestRun {
+        return Err("committed DAG bracket: manifest-run identity depends on command spelling".into());
+    }
+    for consumer in manifest_consumers {
+        let DagManifest { lane, category: _ } = consumer.manifest.as_ref().ok_or_else(|| {
+            format!("committed DAG bracket: {} lacks typed manifest selection", consumer.tag())
+        })?;
+        let result = format!("\"$E2E_RESULT_ROOT/{lane}/{}/results.jsonl\"", consumer.job);
+        let junit = format!("\"$E2E_RESULT_ROOT/{lane}/{}/junit.xml\"", consumer.job);
+        let producer = if lane == "portable" {
+            "build.e2e_artifact"
+        } else {
+            "privileged-build.privileged_tests"
+        };
+        if consumer.cmd.matches("--results").count() != 1
+            || !consumer.cmd.contains(&format!("--results {result}"))
+            || !result_paths.insert(result)
+            || consumer.cmd.matches("--junit").count() != 1
+            || !consumer.cmd.contains(&format!("--junit {junit}"))
+            || !junit_paths.insert(junit)
+            || consumer.env.contains_key("E2E_ATTEMPT")
+            || !consumer.cmd.contains("./ci/run-with-hermit-e2e-artifact.sh ")
+            || !consumer.deps.iter().any(|dep| dep == producer)
+            || (lane == "portable" && !consumer.cmd.contains("--require-install"))
+        {
+            return Err(format!(
+                "committed DAG bracket: {} lost its typed, unique, immutable result contract",
+                consumer.tag()
+            ));
+        }
+    }
+
+    let privileged_build = find("privileged-build.privileged_tests")?;
+    if privileged_build.deps != ["gate.manifest".to_string()]
+        || !privileged_build.cmd.contains("publish-hermit-e2e-artifact.sh")
+        || !privileged_build.cmd.contains("cargo test -p hermit-detcore --test tests_misc --no-run")
+        || !privileged_build
+            .cmd
+            .contains("cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run")
+    {
+        return Err("committed DAG bracket: privileged build no longer publishes its artifact and prebuilds every privileged test binary after the manifest gate".into());
+    }
+    for (tag, producer) in [
+        ("privileged-cpuid.faulting", "privileged-build.privileged_tests"),
+        ("privileged-pmu.preemption", "privileged-build.privileged_tests"),
+        ("privileged-test.cli_kvm", "privileged-build.privileged_tests"),
+        ("privileged-test.pmu_buck_chaos_cases", "privileged-pmu.preemption"),
+    ] {
+        let step = privileged
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("committed DAG bracket: privileged consumer {tag} is absent"))?;
+        if !step.deps.iter().any(|dep| dep == producer) {
+            return Err(format!(
+                "committed DAG bracket: {tag} can run before producer {producer}"
+            ));
+        }
+    }
+    let cpuid = privileged
+        .steps
+        .iter()
+        .find(|step| step.tag() == "privileged-cpuid.faulting")
+        .expect("presence checked above");
+    if !cpuid.cmd.contains("cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact")
+        || cpuid.cmd.contains("--no-run")
+    {
+        return Err("committed DAG bracket: privileged CPUID node no longer executes the one prebuilt exact test".into());
+    }
+    assert_fused_shared_integration_test_resources(&full.steps, &full.resource_caps)?;
+    let mut missing_demand = full.steps.clone();
+    missing_demand
+        .iter_mut()
+        .find(|step| step.tag() == "test.cli")
+        .ok_or("committed DAG bracket: test.cli is absent")?
+        .hint
+        .resources
+        .remove("integration_test_binaries.cli");
+    let mut missing_cap = full.resource_caps.clone();
+    missing_cap.remove("integration_test_binaries.hermit_modes");
+    if assert_fused_shared_integration_test_resources(&missing_demand, &full.resource_caps).is_ok()
+        || assert_fused_shared_integration_test_resources(&full.steps, &missing_cap).is_ok()
+    {
+        return Err("committed DAG bracket: shared integration-test cap/demand negative control was accepted".into());
+    }
+
+    let compat = portable
+        .steps
+        .iter()
+        .filter(|step| step.group == "compat")
+        .collect::<Vec<_>>();
+    let expected_compat = validate_corpus::STRICT_COMPAT_TOTAL
+        - validate_corpus::portable_super_only().len();
+    if compat.len() != expected_compat
+        || portable.resource_caps.contains_key("hermit_guest")
+        || portable
+            .steps
+            .iter()
+            .any(|step| step.hint.resources.contains_key("hermit_guest"))
+        || compat.iter().any(|step| {
+            step.deps != ["compatprep.fixtures".to_string()]
+                || !step.labels.iter().any(|label| label == "portable")
+                || !step.cmd.contains(" run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- ")
+                || step.cmd.contains("scripts/validate.rs")
+                || step.cmd.contains("pressure-test.rs")
+                || step.cmd.contains("dagrun run")
+        })
+    {
+        return Err(format!(
+            "committed DAG bracket: portable strict compatibility shape changed ({} probes; expected {expected_compat})",
+            compat.len()
+        ));
+    }
+    let compat_tags = compat.iter().map(|step| step.tag()).collect::<BTreeSet<_>>();
+    if compat_tags.len() != compat.len() {
+        return Err("committed DAG bracket: portable strict compatibility has duplicate typed step identities".into());
+    }
+    let corpus_paths = validate_corpus::CorpusPaths {
+        root_dir: "$PWD",
+        real_compat_fixtures: "$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures",
+        validation_tmp_dir: "$VALIDATE_RUN_STATE/strict-compat",
+        shell_build_dir: "$VALIDATE_RUN_STATE/strict-compat/shell-build",
+    };
+    let corpus_tags = validate_plan::compat_nodes(
+        root,
+        CompatMode::PortableStrict,
+        "$PWD/target/ci/hermit-strict",
+        "",
+        &corpus_paths,
+        Some("compatprep.fixtures"),
+    )?
+    .into_iter()
+    .map(|step| step.tag())
+    .collect::<BTreeSet<_>>();
+    if compat_tags != corpus_tags {
+        return Err(format!(
+            "committed DAG bracket: committed portable strict identities differ from the corpus: committed-only={:?} corpus-only={:?}",
+            compat_tags.difference(&corpus_tags).collect::<Vec<_>>(),
+            corpus_tags.difference(&compat_tags).collect::<Vec<_>>()
+        ));
+    }
+    for (tag, required_path) in [
+        ("compat.seq", "$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures"),
+        ("compat.shell-build", "$VALIDATE_RUN_STATE/strict-compat/shell-build"),
+        ("compat.top", "$VALIDATE_RUN_STATE/strict-compat/top-home"),
+    ] {
+        let step = portable
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("committed DAG bracket: path-sensitive probe {tag} is absent"))?;
+        if !step.cmd.contains(required_path) {
+            return Err(format!("committed DAG bracket: {tag} does not use run-owned path {required_path}"));
+        }
+    }
+    for tag in ["compat.cargo", "compat.df"] {
+        let step = portable
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("committed DAG bracket: fixture-backed probe {tag} is absent"))?;
+        if !step.cmd.contains("tests/compat/real_compat_workload.sh")
+            || !step.cmd.contains("$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures")
+        {
+            return Err(format!("committed DAG bracket: {tag} lost its run-owned fixture contract"));
+        }
+    }
+
+    let full_args = parse_argv(&["full".into()])
+        .map_err(|code| format!("committed DAG bracket: full parser exited {code}"))?;
+    let mut pinned = build_plan(root, &full_args, &std::env::temp_dir().join("validate-pinned-full"))?;
+    apply_pinned_root(&mut pinned, root, false)?;
+    if pinned.cfg.resource_caps != full.resource_caps {
+        return Err(format!(
+            "committed DAG bracket: pinned-root execution rewrote resource caps: committed={:?} execution={:?}",
+            full.resource_caps, pinned.cfg.resource_caps
+        ));
+    }
+    let same_resource_policy = |committed: &Step, execution: &Step| {
+        committed.labels == execution.labels
+            && committed.timeout == execution.timeout
+            && committed.cpu_timeout == execution.cpu_timeout
+            && committed.hint.resources == execution.hint.resources
+            && committed.hint.est_duration_s.to_bits()
+                == execution.hint.est_duration_s.to_bits()
+            && committed.hint.rss_baseline_bytes == execution.hint.rss_baseline_bytes
+            && committed.hint.rss_baseline_inner_jobs == execution.hint.rss_baseline_inner_jobs
+            && committed.hint.hard_mem_max_bytes == execution.hint.hard_mem_max_bytes
+            && committed.hint.classification == execution.hint.classification
+            && committed.hint.preferred_inner_jobs == execution.hint.preferred_inner_jobs
+            && committed.hint.measured_effective_cores.map(f64::to_bits)
+                == execution.hint.measured_effective_cores.map(f64::to_bits)
+            && committed.hint.measured_cpu_utilization.map(f64::to_bits)
+                == execution.hint.measured_cpu_utilization.map(f64::to_bits)
+            && committed.jobs_flag == execution.jobs_flag
+            && committed.jobs_env == execution.jobs_env
+    };
+    for committed_step in &full.steps {
+        let execution_step = pinned
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == committed_step.tag())
+            .ok_or_else(|| {
+                format!(
+                    "committed DAG bracket: pinned-root execution lost committed step {}",
+                    committed_step.tag()
+                )
+            })?;
+        if !same_resource_policy(committed_step, execution_step) {
+            return Err(format!(
+                "committed DAG bracket: pinned-root execution rewrote committed resource policy for {}",
+                committed_step.tag()
+            ));
+        }
+    }
+    let deps_of = |tag: &str| {
+        pinned
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .map(|step| step.deps.clone())
+    };
+    for tag in [
+        "build.manifest_guests_in_pinned_root",
+        "privileged-build.manifest_guests_in_pinned_root",
+    ] {
+        let deps = deps_of(tag).ok_or_else(|| format!("committed DAG bracket: pinned producer {tag} is absent"))?;
+        if !deps.iter().any(|dep| dep == "setup.manifest_plan_in_pinned_root") {
+            return Err(format!("committed DAG bracket: {tag} can run before the pinned manifest producer: {deps:?}"));
+        }
+    }
+    for step in pinned.cfg.steps.iter().filter(|step| {
+        step.tag().ends_with("_in_pinned_root")
+            || validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+    }) {
+        if !step.cmd.contains("/src/ci/hermetic/assert-build-dependencies.sh") {
+            return Err(format!("committed DAG bracket: pinned node {} lacks the build-dependency assertion", step.tag()));
+        }
+    }
+    for tag in [
+        "privileged-e2e.manifest_applications",
+        "privileged-e2e.manifest_backend_parity_c",
+    ] {
+        let deps = deps_of(tag).ok_or_else(|| format!("committed DAG bracket: pinned consumer {tag} is absent"))?;
+        for required in [
+            "build.e2e_artifact_in_pinned_root",
+            "privileged-build.manifest_guests_in_pinned_root",
+        ] {
+            if !deps.iter().any(|dep| dep == required) {
+                return Err(format!("committed DAG bracket: pinned consumer {tag} does not wait for {required}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Prove that the checked-in validation DAG is canonical and that every public
+/// validation level is only a dagrun label selection over those committed bytes.
+fn committed_validation_dag_bracket(root: &Path) -> Result<String, String> {
+    let path = validate_plan::validation_dag_path(root);
+    let source = std::fs::read_to_string(&path)
+        .map_err(|error| format!("committed DAG bracket: cannot read {}: {error}", path.display()))?;
+    let committed = validate_plan::validation_config(root)?;
+    let serialized = format!("{}\n", dag_to_json(&committed));
+    if source != serialized {
+        return Err(format!(
+            "committed DAG bracket: {} differs from dagrun's serialization of the plan it loaded",
+            path.display()
+        ));
+    }
+    if committed.default_step_timeout != 0 {
+        return Err(format!(
+            "committed DAG bracket: document wall timeout must remain derived, got {}s",
+            committed.default_step_timeout
+        ));
+    }
+    for step in &committed.steps {
+        if step.cmd.contains("/home/") || step.cmd.contains("/tmp/run-state") {
+            return Err(format!(
+                "committed DAG bracket: {} contains a host-specific runtime path: {}",
+                step.tag(),
+                step.cmd
+            ));
+        }
+        if step.cmd.split("real-compat-fixtures-").skip(1).any(|suffix| {
+            suffix.chars().next().is_some_and(|character| character.is_ascii_digit())
+        }) {
+            return Err(format!(
+                "committed DAG bracket: {} contains a generator-process fixture path: {}",
+                step.tag(),
+                step.cmd
+            ));
+        }
+    }
+    let super_fixture_steps = committed
+        .steps
+        .iter()
+        .filter(|step| {
+            step.tag() == "super-compatprep.fixtures"
+                || step
+                    .cmd
+                    .contains("REAL_COMPAT_FIXTURES=$VALIDATE_RUN_STATE/super-compat-fixtures")
+        })
+        .collect::<Vec<_>>();
+    if super_fixture_steps.len() != 4
+        || super_fixture_steps
+            .iter()
+            .any(|step| !step.cmd.contains("$VALIDATE_RUN_STATE/super-compat-fixtures"))
+    {
+        return Err(format!(
+            "committed DAG bracket: super compatibility fixture producer/consumers must use one runtime-state path; got {:?}",
+            super_fixture_steps
+                .iter()
+                .map(|step| (step.tag(), step.cmd.as_str()))
+                .collect::<Vec<_>>()
+        ));
+    }
+
+    let expected_counts = [
+        ("quick", 13usize, vec!["quick"]),
+        ("portable", 251, vec!["portable-only"]),
+        ("full", 259, vec!["full"]),
+        ("super", 143, vec!["super"]),
+        ("privileged", 14, vec!["--privileged-only"]),
+    ];
+    for (label, expected, argv) in expected_counts {
+        let selected = dagrun::select_steps_by_labels(&committed, &[label.to_string()])
+            .map_err(|error| format!("committed DAG bracket: label {label}: {error}"))?;
+        if selected.steps.len() != expected {
+            return Err(format!(
+                "committed DAG bracket: label {label} selected {} steps, expected {expected}",
+                selected.steps.len()
+            ));
+        }
+        let selected_again = dagrun::select_steps_by_labels(&committed, &[label.to_string()])?;
+        if dag_to_json(&selected) != dag_to_json(&selected_again) {
+            return Err(format!(
+                "committed DAG bracket: repeated label {label} selection changed the serialized plan"
+            ));
+        }
+        let args = parse_argv(&argv.into_iter().map(str::to_string).collect::<Vec<_>>())
+            .map_err(|code| {
+                format!("committed DAG bracket: profile {label} parser exited {code}")
+            })?;
+        let constructed = build_plan(
+            root,
+            &args,
+            &std::env::temp_dir().join(format!("validate-committed-{label}")),
+        )?;
+        if constructed.second.is_some() || dag_to_json(&constructed.cfg) != dag_to_json(&selected)
+        {
+            return Err(format!(
+                "committed DAG bracket: constructed profile {label} differs from its committed label selection"
+            ));
+        }
+        let mut planted_rewrite = constructed.cfg.clone();
+        planted_rewrite.steps[0].cmd.push_str(" --planted-runtime-rewrite");
+        if dag_to_json(&planted_rewrite) == dag_to_json(&selected) {
+            return Err(format!(
+                "committed DAG bracket: planted runtime rewrite for {label} was accepted"
+            ));
+        }
+        for step in &selected.steps {
+            if step.cpu_timeout <= 0 {
+                return Err(format!(
+                    "committed DAG bracket: label {label} step {} has no CPU timeout",
+                    step.tag()
+                ));
+            }
+            let wall = dagrun::resolved_wall_timeout(
+                step,
+                selected.default_step_timeout,
+                selected.cpu_timeout_multiplier,
+            );
+            let effective_cpu = (step.cpu_timeout as f64 * selected.cpu_timeout_multiplier).round()
+                as i64;
+            if wall <= effective_cpu {
+                return Err(format!(
+                    "committed DAG bracket: label {label} step {} resolves wall={wall}s at or below effective CPU={effective_cpu}s",
+                    step.tag()
+                ));
+            }
+        }
+    }
+
+    let portable = dagrun::select_steps_by_labels(&committed, &["portable".into()])?;
+    if portable
+        .steps
+        .iter()
+        .any(|step| step.labels.iter().any(|label| label == "privileged"))
+    {
+        return Err(
+            "committed DAG bracket: portable selection admitted a privileged-labelled step".into(),
+        );
+    }
+    let privileged = dagrun::select_steps_by_labels(&committed, &["privileged".into()])?;
+    if !privileged
+        .steps
+        .iter()
+        .any(|step| step.tag() == "privileged-cpuid.faulting")
+    {
+        return Err(
+            "committed DAG bracket: privileged selection lost privileged-cpuid.faulting".into(),
+        );
+    }
+    if dagrun::select_steps_by_labels(&committed, &["test.cli".into()]).is_ok() {
+        return Err(
+            "committed DAG bracket: a group.job tag was accepted as a selection label".into(),
+        );
+    }
+    committed_graph_invariants(root, &committed, &portable, &privileged)?;
+
+    for mutation in ["resource cap", "dependency", "command", "label", "CPU timeout"] {
+        let mut changed = committed.clone();
+        match mutation {
+            "resource cap" => {
+                changed.resource_caps.insert("manifest_guest".into(), 7);
+            }
+            "dependency" => changed.steps[0].deps.push("missing.step".into()),
+            "command" => changed.steps[0].cmd.push_str(" --changed"),
+            "label" => changed.steps[0].labels.push("changed".into()),
+            "CPU timeout" => changed.steps[0].cpu_timeout += 1,
+            _ => unreachable!(),
+        }
+        if dag_to_json(&changed) == dag_to_json(&committed) {
+            return Err(format!(
+                "committed DAG bracket: {mutation} mutation did not change serialized output"
+            ));
+        }
+    }
+
+    let mut missing_cpu = committed.clone();
+    missing_cpu.steps[0].cpu_timeout = 0;
+    if missing_cpu.steps.iter().all(|step| step.cpu_timeout > 0) {
+        return Err("committed DAG bracket: planted missing CPU timeout was accepted".into());
+    }
+    let mut inverted = committed.clone();
+    inverted.steps[0].timeout = inverted.steps[0].cpu_timeout;
+    let inverted_tag = inverted.steps[0].tag();
+    if !validate_plan::undeclared_nodes(&inverted).contains(&inverted_tag) {
+        return Err(format!(
+            "committed DAG bracket: planted wall/CPU inversion for {inverted_tag} was accepted"
+        ));
+    }
+
+    Ok(format!(
+        "committed validation DAG: canonical {}-step superset; quick/portable/full/super/privileged labels select 13/251/259/143/14 steps with dependency closure",
+        committed.steps.len()
+    ))
+}
+
+/// Exercise the public labelled-DAG launcher and the outer scheduler without
+/// running the compatibility corpus.
+///
+/// The launcher arm captures the exact file and argv handed to dagrun. The
+/// scheduler arm replaces two committed compatibility commands and one ordinary
+/// command with a barrier, proving those steps can coexist under one scheduler
+/// after the historical `hermit_guest` exclusion was removed.
+fn committed_validation_execution_bracket(root: &Path) -> Result<String, String> {
+    let fixture = tempfile::Builder::new()
+        .prefix("validate-labelled-dag-")
+        .tempdir()
+        .map_err(|error| format!("labelled DAG execution: cannot create fixture: {error}"))?;
+    let captured = fixture.path().join("captured.json");
+    let runner = fixture.path().join("capture-runner");
+    std::fs::write(
+        &runner,
+        "#!/bin/sh\nset -eu\ntest \"$1\" = run\ntest \"$2\" = --dag\ncp -- \"$3\" \"$RUN_DAG_CAPTURE\"\ntest \"$4\" = --labels\ntest \"$5\" = portable\ntest \"$#\" -eq 5\n",
+    )
+    .map_err(|error| format!("labelled DAG execution: cannot write capture runner: {error}"))?;
+    std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
+        .map_err(|error| format!("labelled DAG execution: cannot chmod capture runner: {error}"))?;
+    let output = Command::new(root.join("ci/run-dag.sh"))
+        .arg("portable")
+        .current_dir(root)
+        .env("DAGRUN_BIN", &runner)
+        .env("RUN_DAG_CAPTURE", &captured)
+        .env_remove("RUN_DAG_FILE_OVERRIDE")
+        .output()
+        .map_err(|error| format!("labelled DAG execution: cannot launch run-dag.sh: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "labelled DAG execution: public launcher failed with {}: {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let committed = std::fs::read(validate_plan::validation_dag_path(root))
+        .map_err(|error| format!("labelled DAG execution: cannot read committed DAG: {error}"))?;
+    let launched = std::fs::read(&captured)
+        .map_err(|error| format!("labelled DAG execution: capture runner received no DAG: {error}"))?;
+    if launched != committed {
+        return Err("labelled DAG execution: public launcher did not hand dagrun the committed bytes".into());
+    }
+    let committed_cfg = dag_from_json(
+        std::str::from_utf8(&launched)
+            .map_err(|error| format!("labelled DAG execution: committed DAG is not UTF-8: {error}"))?,
+    )
+    .map_err(|error| format!("labelled DAG execution: dagrun rejected committed DAG: {error}"))?;
+    let portable = dagrun::select_steps_by_labels(&committed_cfg, &["portable".into()])?;
+    let prep = portable
+        .steps
+        .iter()
+        .find(|step| step.tag() == "compatprep.fixtures")
+        .cloned()
+        .ok_or("labelled DAG execution: portable selection lost compatprep.fixtures")?;
+    let ordinary = portable
+        .steps
+        .iter()
+        .find(|step| step.tag() == "test.hermit_modes")
+        .cloned()
+        .ok_or("labelled DAG execution: portable selection lost test.hermit_modes")?;
+    let probes = portable
+        .steps
+        .iter()
+        .filter(|step| step.group == "compat")
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>();
+    if probes.len() != 2 {
+        return Err("labelled DAG execution: portable selection has fewer than two compatibility steps".into());
+    }
+
+    let barrier = fixture.path().join("barrier");
+    std::fs::create_dir_all(&barrier)
+        .map_err(|error| format!("labelled DAG execution: cannot create barrier: {error}"))?;
+    let mut execution = validate_plan::config_from_base(
+        &portable,
+        Vec::new(),
+        "labelled validation one-scheduler execution bracket",
+    );
+    let mut execution_prep = prep;
+    execution_prep.deps.clear();
+    execution_prep.cmd = "true".into();
+    execution_prep.timeout = 10;
+    execution_prep.cpu_timeout = 1;
+    execution.steps.push(execution_prep);
+    let probe_tags = [probes[0].tag(), probes[1].tag()];
+    for (index, mut probe) in probes.into_iter().enumerate() {
+        let own = barrier.join(format!("{index}.ready"));
+        let peer = barrier.join(format!("{}.ready", 1 - index));
+        let ordinary_ready = barrier.join("ordinary.ready");
+        let observed = barrier.join(format!("{index}.observed"));
+        probe.cmd = format!(
+            "set -eu; test -n \"${{DAGRUN_STEP:-}}\"; touch {own}; i=0; while test ! -e {peer} || test ! -e {ordinary_ready}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; printf '%s\\n' \"$DAGRUN_STEP\" > {observed}",
+            own = validate_plan::shell_quote(&own.to_string_lossy()),
+            peer = validate_plan::shell_quote(&peer.to_string_lossy()),
+            ordinary_ready = validate_plan::shell_quote(&ordinary_ready.to_string_lossy()),
+            observed = validate_plan::shell_quote(&observed.to_string_lossy()),
+        );
+        probe.timeout = 10;
+        probe.cpu_timeout = 1;
+        execution.steps.push(probe);
+    }
+    let mut ordinary = ordinary;
+    ordinary.deps = vec!["compatprep.fixtures".into()];
+    let ordinary_observed = barrier.join("ordinary.observed");
+    ordinary.cmd = format!(
+        "set -eu; test -n \"${{DAGRUN_STEP:-}}\"; touch {ready}; i=0; while test ! -e {first} || test ! -e {second}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; printf '%s\\n' \"$DAGRUN_STEP\" > {observed}",
+        ready = validate_plan::shell_quote(&barrier.join("ordinary.ready").to_string_lossy()),
+        first = validate_plan::shell_quote(&barrier.join("0.ready").to_string_lossy()),
+        second = validate_plan::shell_quote(&barrier.join("1.ready").to_string_lossy()),
+        observed = validate_plan::shell_quote(&ordinary_observed.to_string_lossy()),
+    );
+    ordinary.timeout = 10;
+    ordinary.cpu_timeout = 1;
+    execution.steps.push(ordinary);
+    let result = run_lane_once(
+        &execution,
+        3,
+        true,
+        0,
+        None,
+        &fixture.path().join("outer.log"),
+        None,
+        false,
+    );
+    let mut observed = (0..2)
+        .map(|index| std::fs::read_to_string(barrier.join(format!("{index}.observed"))))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("labelled DAG execution: scheduler evidence missing: {error}"))?;
+    observed.push(
+        std::fs::read_to_string(&ordinary_observed)
+            .map_err(|error| format!("labelled DAG execution: ordinary evidence missing: {error}"))?,
+    );
+    let expected = probe_tags
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once("test.hermit_modes"))
+        .collect::<Vec<_>>();
+    let identities_match = observed
+        .iter()
+        .zip(&expected)
+        .all(|(value, tag)| value.trim().ends_with(&format!(":{tag}")));
+    if !result.ok
+        || !result.complete
+        || result.outcomes.len() != 4
+        || !result.skipped.is_empty()
+        || !identities_match
+    {
+        return Err(format!(
+            "labelled DAG execution: one outer scheduler did not run two compatibility steps and one ordinary step concurrently: ok={} complete={} outcomes={:?} skipped={:?} observed={observed:?}",
+            result.ok,
+            result.complete,
+            result.outcomes.iter().map(|outcome| outcome.tag.as_str()).collect::<Vec<_>>(),
+            result.skipped,
+        ));
+    }
+    Ok("labelled DAG execution: public launcher passed committed bytes plus portable label; one outer scheduler admitted two compatibility steps and one ordinary step concurrently".into())
 }
 
 /// Withhold every planned node this MACHINE provably cannot run, and say so.
@@ -7223,27 +7267,6 @@ fn assert_fused_shared_integration_test_consumers(steps: &[Step]) -> Result<(), 
     Ok(())
 }
 
-fn add_fused_shared_integration_test_resources(
-    steps: &mut [Step],
-) -> Result<BTreeMap<String, i64>, String> {
-    assert_fused_shared_integration_test_consumers(steps)?;
-    let mut caps = BTreeMap::new();
-    for (binary, portable, privileged) in EXPECTED_FUSED_SHARED_INTEGRATION_TESTS {
-        let resource = format!("{FUSED_INTEGRATION_TEST_RESOURCE_PREFIX}{binary}");
-        caps.insert(resource.clone(), 1);
-        for tag in [portable, privileged, FUSED_INTEGRATION_TEST_BUILDER] {
-            let step = steps
-                .iter_mut()
-                .find(|step| step.tag() == tag)
-                .ok_or_else(|| format!("fused shared-test resource lost {tag}"))?;
-            if step.hint.resources.insert(resource.clone(), 1).is_some() {
-                return Err(format!("fused shared-test resource already declared by {tag}"));
-            }
-        }
-    }
-    Ok(caps)
-}
-
 fn assert_fused_shared_integration_test_resources(
     steps: &[Step],
     caps: &BTreeMap<String, i64>,
@@ -7308,7 +7331,7 @@ fn attach_compatibility_scorecard(
             lanes.join(",")
         ),
         deps,
-        120,
+        0,
         120,
         1024 * 1024 * 1024,
     ));
@@ -7641,8 +7664,48 @@ fn materialize_requalification_plan(
 
 /// Build the execution plan for the selected level/mode.
 fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
-    let with_proxy = has_cmd("with-proxy");
-    let pre = validate_plan::preflight_nodes(root, with_proxy);
+    let committed_label = match (&args.focused, args.level) {
+        (Some(Focused::PrivilegedOnly), _) => Some("privileged"),
+        (None, Level::Quick) => Some("quick"),
+        (None, Level::PortableOnly) => Some("portable"),
+        (None, Level::Full) => Some("full"),
+        (None, Level::Super) => Some("super"),
+        _ => None,
+    };
+    if let Some(label) = committed_label {
+        let committed = validate_plan::validation_config(root)?;
+        let cfg = dagrun::select_steps_by_labels(&committed, &[label.to_string()])
+            .map_err(|error| format!("cannot select committed validation label {label}: {error}"))?;
+        let compat = matches!(label, "portable" | "full")
+            .then_some(CompatMode::PortableStrict);
+        let nonblocking = if label == "super" {
+            cfg.steps
+                .iter()
+                .filter(|step| {
+                    step.tag().starts_with("superstress.kvm_")
+                        || step.tag().starts_with("superstress.dbt_")
+                })
+                .map(Step::tag)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        return Ok(Plan {
+            planned_test_nodes: test_nodes_of(&cfg),
+            cfg,
+            second: None,
+            profile: label.to_string(),
+            selection_mode: "label",
+            compat,
+            suite_complete: label == "full",
+            super_mode: label == "super",
+            nonblocking,
+            cacheable: !matches!(label, "portable" | "full"),
+            ..Default::default()
+        });
+    }
+
+    let pre = validate_plan::preflight_nodes(root)?;
     let gate = "gate.manifest";
 
     // Focused compatibility matrices.
@@ -7737,7 +7800,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         // CARRY the lane's top-level config. `config_from` would substitute
         // DagConfig::default(), dropping resource_caps and default_step_timeout;
         // see config_from_base's note on the 14-minute 0%-CPU hang that caused.
-        let mut base = validate_plan::lane_config(root, lane)?;
+        let base = validate_plan::lane_config(root, lane)?;
         let mut requested: BTreeSet<String> = nodes
             .split(',')
             .map(str::trim)
@@ -7761,18 +7824,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             &mut lane_steps,
             &format!("--only lane {lane}"),
         )?;
-        let mut expanded = validate_plan::config_from_base(
-            &base,
-            lane_steps,
-            "selected lane before filtering",
-        );
-        let compat = if lane == "portable" && wants_compat {
-            expand_portable_strict_compat(root, tmp, &mut expanded)?
-        } else {
-            false
-        };
-        base.resource_caps = expanded.resource_caps.clone();
-        let lane_steps = expanded.steps;
+        let compat = lane == "portable" && wants_compat;
         let manifest_plan_consumers: BTreeSet<String> = base
             .steps
             .iter()
@@ -7827,8 +7879,11 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
                 known.join(", ")
             ));
         }
-        let selected: BTreeSet<String> =
-            requested.iter().filter(|t| available.contains(*t)).cloned().collect();
+        let selected: BTreeSet<String> = requested
+            .iter()
+            .filter(|t| available.contains(*t) && !preflight.contains(*t))
+            .cloned()
+            .collect();
         let mut dropped: BTreeSet<String> = BTreeSet::new();
         for mut step in lane_steps.into_iter().filter(|s| selected.contains(&s.tag())) {
             // Same selection semantics run-node.sh documented for `run --only`:
@@ -7929,7 +7984,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             "echo 'validate: internal error: requalification plan was not materialized' >&2; exit 125"
                 .into(),
             vec![PIN_GATE_TAG.into()],
-            30,
+            0,
             30,
             256 * 1024 * 1024,
         ));
@@ -7952,13 +8007,13 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         steps.push(nextest_setup_node(root, gate)?);
         steps.push(step_with_caps("liteinst", "hermit_release", "Release Hermit for LiteInst compatibility",
             "cargo build --release --locked -p hermit --features third-party-backends".into(),
-            vec![gate.to_string()], 1200, 3600, 16 * 1024 * 1024 * 1024));
+            vec![gate.to_string()], 0, 1200, 16 * 1024 * 1024 * 1024));
         steps.push(step_with_caps("liteinst", "runtime", "Release LiteInst runtime",
             "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build".into(),
-            vec!["liteinst.hermit_release".into()], 900, 1800, 8 * 1024 * 1024 * 1024));
+            vec!["liteinst.hermit_release".into()], 0, 900, 8 * 1024 * 1024 * 1024));
         steps.push(step_with_caps("liteinst", "strict", "Portable CI liteinst_strict",
             "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test liteinst_advanced -j 1".into(),
-            vec!["liteinst.runtime".into(), "setup.nextest".into()], 900, 1800, 8 * 1024 * 1024 * 1024));
+            vec!["liteinst.runtime".into(), "setup.nextest".into()], 0, 900, 8 * 1024 * 1024 * 1024));
         let cfg = validate_plan::config_from(steps, "liteinst compatibility");
         return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
             profile: args.focused.as_ref().unwrap().profile(), selection_mode: "full",
@@ -7970,49 +8025,14 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         let mut steps = pre;
         steps.push(step_with_caps("qemu", "hermit_release", "Release Hermit for QEMU L2",
             "cargo build --release -p hermit --features third-party-backends".into(),
-            vec![gate.to_string()], 3600, 7200, 16 * 1024 * 1024 * 1024));
+            vec![gate.to_string()], 0, 3600, 16 * 1024 * 1024 * 1024));
         steps.push(step_with_caps("qemu", "strict_l2_boot", "QEMU strict L2 boot (heavyweight)",
             "./tests/qemu-boot/strict_l2_test.sh".into(),
-            vec!["qemu.hermit_release".into()], 1500, 3000, 16 * 1024 * 1024 * 1024));
+            vec!["qemu.hermit_release".into()], 0, 1500, 16 * 1024 * 1024 * 1024));
         let cfg = validate_plan::config_from(steps, "QEMU L2 boot");
         return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
             profile: args.focused.as_ref().unwrap().profile(), selection_mode: "full",
             ..Default::default() });
-    }
-
-    // `quick` is NOT "the portable lane" — it is seven specific smoke gates
-    // (validate.sh:4583). Mapping it onto a lane would run a different, much
-    // larger thing under the same name.
-    if args.level == Level::Quick && args.focused.is_none() {
-        let hermit = "target/debug/hermit";
-        let marker = "hermit-validation-smoke";
-        let run_args = "run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled";
-        let mut steps = pre;
-        steps.push(nextest_setup_node(root, gate)?);
-        let mut add = |job: &str, desc: &str, cmd: String, deps: Vec<String>, t: i64, mem: i64| {
-            steps.push(step_with_caps("quick", job, desc, cmd, deps, t, t * 2, mem));
-        };
-        add("build", "Build workspace", "cargo build --workspace --features third-party-backends".into(), vec![gate.into()], 3600, 16 * 1024 * 1024 * 1024);
-        add("e2e_metadata", "Portable E2E metadata", "target/debug/test-harness validate".into(), vec!["quick.build".into()], 600, 4 * 1024 * 1024 * 1024);
-        add("e2e_verify", "Portable ptrace E2E verification", "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], QUICK_E2E_VERIFY_TIMEOUT_S, 8 * 1024 * 1024 * 1024);
-        add("detcore_unit", "Detcore core unit tests", "./ci/run-nextest-counted.sh -p hermit-detcore --lib".into(), vec!["quick.build".into(), "setup.nextest".into()], 1800, 8 * 1024 * 1024 * 1024);
-        add("run_smoke", "Hermit run smoke test",
-            format!("out=$(timeout 30s {hermit} {run_args} -- /bin/echo {marker}) && test \"$out\" = {marker}"),
-            vec!["quick.build".into()], 120, 4 * 1024 * 1024 * 1024);
-        add("verify_smoke", "Hermit verify-mode smoke test",
-            format!("timeout 30s {hermit} {run_args} --verify -- /bin/echo {marker}"),
-            vec!["quick.build".into()], 120, 4 * 1024 * 1024 * 1024);
-        add("record_replay_smoke", "Hermit record/replay smoke test",
-            format!("timeout 30s {hermit} record start --verify -- /bin/echo {marker}"),
-            vec!["quick.build".into()], 180, 4 * 1024 * 1024 * 1024);
-        let cfg = validate_plan::config_from(steps, "quick smoke suite");
-        return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
-            profile: "quick".into(), selection_mode: "full", ..Default::default() });
-    }
-
-    // The `super` stress/diagnostic suite (validate.sh:4702).
-    if args.level == Level::Super && args.focused.is_none() {
-        return super_plan(root, tmp, pre, gate);
     }
 
     // Working-envelope measurement (validate.sh:4173). A MEASUREMENT, not a
@@ -8044,361 +8064,11 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         return selective_plan(root, args, tmp, pre, gate, *shallow);
     }
 
-    // Lane-based profiles.
-    let lanes: Vec<&str> = match (&args.focused, args.level) {
-        (Some(Focused::PrivilegedOnly), _) => vec!["privileged"],
-        (None, Level::PortableOnly) => vec!["portable"],
-        (None, Level::Full) => vec!["portable", "privileged"],
-        (_, _) => {
-            return Err(format!(
-                "no plan is defined for level={:?} focused={:?}; refusing to substitute another profile",
-                args.level, args.focused
-            ))
-        }
-    };
-    let profile = match &args.focused {
-        Some(f) => f.profile(),
-        None => args.level.name().to_string(),
-    };
-    let selection_mode = match &args.focused {
-        Some(Focused::Selective { .. }) => "selective",
-        Some(Focused::Only { .. }) => "only",
-        _ => "full",
-    };
-
-    if lanes.len() == 2 && !args.merge_lanes {
-        // Faithful reproduction of run_full_suite: portable lane, then privileged.
-        let mut a = pre.clone();
-        a.extend(validate_plan::lane_nodes_reusing_manifest_producer(
-            root, lanes[0], "", gate,
-        )?);
-        // The second lane is a separate scheduler invocation, but its node
-        // identities still enter one ledger row and one coverage artifact.
-        // Use the same lane prefix as the fused plan so those serialized
-        // populations cannot collapse two executions into one set member.
-        let second_prefix = format!("{}-", lanes[1]);
-        let mut b = validate_plan::lane_nodes(root, lanes[1], &second_prefix, gate)?;
-        // The second run repeats preflight-free; its nodes hang off nothing.
-        for s in b.iter_mut() {
-            s.deps.retain(|d| d != gate);
-        }
-        attach_compatibility_scorecard(&mut a, &["portable"], "")?;
-        // The runs are sequential, so when this node runs the portable rows
-        // already exist. Emit the same whole-scorecard answer as the fused
-        // default rather than a second disconnected per-lane claim.
-        attach_compatibility_scorecard(
-            &mut b,
-            &["portable", "privileged"],
-            "privileged-",
-        )?;
-        // Each lane carries ITS OWN loaded config. They genuinely differ --
-        // portable default_step_timeout=600 vs privileged=120, and disjoint
-        // resource_caps -- so there is no correct single merged value; running
-        // them as two sequential DAGs lets each keep its own exactly.
-        let base_a = validate_plan::lane_config(root, lanes[0])?;
-        let base_b = validate_plan::lane_config(root, lanes[1])?;
-        let mut cfg_a = validate_plan::config_from_base(&base_a, a, "portable lane");
-        let cfg_b = validate_plan::config_from_base(&base_b, b, "privileged lane");
-        for (base, derived, lane) in [(&base_a, &cfg_a, lanes[0]), (&base_b, &cfg_b, lanes[1])] {
-            validate_plan::assert_config_carried(base, derived)
-                .map_err(|e| format!("lane {lane}: DAG config was not carried: {e}"))?;
-        }
-        let compat = expand_portable_strict_compat(root, tmp, &mut cfg_a)?;
-        let mut planned = test_nodes_of(&cfg_a);
-        planned.extend(test_nodes_of(&cfg_b));
-        return Ok(Plan {
-            cfg: cfg_a,
-            second: Some(cfg_b),
-            profile,
-            selection_mode,
-            planned_test_nodes: planned,
-            suite_complete: args.level == Level::Full && args.focused.is_none(),
-            // Validation is also the live compatibility measurement. Reusing
-            // an older tree-keyed receipt would print no fresh per-cell table.
-            cacheable: false,
-            compat: compat.then_some(CompatMode::PortableStrict),
-            ..Default::default()
-        });
-    }
-
-    let mut steps = pre;
-    for lane in &lanes {
-        // Keep the portable lane's shipped tags byte-identical: the
-        // main-reachable receipt finalizer derives its coverage denominator
-        // from those manifest tags. Prefix only the additional lane, which is
-        // sufficient to disambiguate every collision in the fused graph.
-        let prefix = if lanes.len() > 1 && *lane != "portable" {
-            format!("{lane}-")
-        } else {
-            String::new()
-        };
-        steps.extend(validate_plan::lane_nodes_reusing_manifest_producer(
-            root, lane, &prefix, gate,
-        )?);
-    }
-    // Fusing lanes can duplicate identical work. In particular, the always-on
-    // gate.manifest and both lane e2e.metadata nodes run the exact same
-    // `test-harness validate` tree audit. Drop later duplicates and repoint
-    // their dependents, so one full run pays that ~75 s audit exactly once. The
-    // dedup is keyed by typed manifest-audit identity; an unexpected command is
-    // refused explicitly instead of silently ceasing to match.
-    let removed = dedupe_identical(&mut steps, gate)?;
-    if !removed.is_empty() {
-        eprintln!("validate: fused lanes; deduped {} identical node(s): {}", removed.len(), removed.join(", "));
-    }
-    let mut shared_test_resource_caps = BTreeMap::new();
-    if lanes.len() == 2 {
-        // The artifact barrier waits for both initial Cargo producers, verifies
-        // binary and resource identities, then publishes a content-addressed
-        // bundle. Every later Cargo writer and manifest consumer runs only after
-        // that barrier, so no writer can mutate either source during publication
-        // and no consumer reads a mutable Cargo path afterward.
-        let producer = "build.e2e_artifact";
-        let debug_producer = "build.workspace";
-        let consumer = "privileged-build.privileged_tests";
-        let portable_build = steps
-            .iter()
-            .find(|s| s.tag() == debug_producer)
-            .ok_or_else(|| format!("fused debug producer disappeared: {debug_producer}"))?;
-        let expected_fat_build = "./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit";
-        if portable_build.cmd != expected_fat_build {
-            return Err(format!(
-                "fused debug producer command drifted; re-prove the artifact barrier: {}",
-                portable_build.cmd
-            ));
-        }
-        let artifact = steps
-            .iter()
-            .find(|s| s.tag() == producer)
-            .ok_or_else(|| format!("fused artifact producer disappeared: {producer}"))?;
-        let expected_artifact = "./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg";
-        if artifact.cmd != expected_artifact
-            || ![debug_producer, "build.runtime_release"]
-                .iter()
-                .all(|dep| artifact.deps.iter().any(|actual| actual == dep))
-        {
-            return Err(format!(
-                "fused artifact barrier drifted; re-prove binary+resource publication: {} deps={:?}",
-                artifact.cmd, artifact.deps
-            ));
-        }
-        shared_test_resource_caps = add_fused_shared_integration_test_resources(&mut steps)?;
-        let privileged_build = steps
-            .iter_mut()
-            .find(|s| s.tag() == consumer)
-            .ok_or_else(|| format!("fused artifact consumer disappeared: {consumer}"))?;
-        let expected_build = "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run && CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run";
-        if privileged_build.cmd != expected_build {
-            return Err(format!(
-                "fused privileged build command drifted; re-prove that build.workspace is a superset: {}",
-                privileged_build.cmd
-            ));
-        }
-        for dependency in [producer, "build.liteinst_runtime_release"] {
-            if !privileged_build.deps.iter().any(|d| d == dependency) {
-                privileged_build.deps.push(dependency.into());
-            }
-        }
-        privileged_build.deps.sort();
-        // Cargo owns the executable layout. Capture the exact compiler-artifact
-        // path from this build instead of reconstructing it from target/debug:
-        // current nightly Cargo places this generated test under
-        // build/hermit-detcore/<hash>/out, while older layouts used deps/.
-        // The pointer is overwritten by this producer and every consumer below
-        // validates that it names one regular executable in this checkout's
-        // target directory, so a stale or ambiguous artifact fails closed.
-        privileged_build.cmd = fused_privileged_test_build_command();
-        let cpuid = steps
-            .iter_mut()
-            .find(|s| s.tag() == "privileged-cpuid.faulting")
-            .ok_or("fused prebuilt CPUID consumer disappeared")?;
-        let expected_cpuid = "status=0; timeout --kill-after=5s 30s cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact || status=$?; if [ \"$status\" -eq 124 ] || [ \"$status\" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact Cargo timeout: exit %s)\\n' \"$status\" >&2; fi; exit \"$status\"";
-        if cpuid.cmd != expected_cpuid {
-            return Err(format!(
-                "fused CPUID command drifted; re-prove direct prebuilt invocation: {}",
-                cpuid.cmd
-            ));
-        }
-        cpuid.cmd = format!(
-            "{TESTS_MISC_EXECUTABLE_READ_COMMAND}; timeout 30 \"$tests_misc\" rdrand_rdseed_is_masked --exact"
-        );
-    }
-    attach_compatibility_scorecard(&mut steps, &lanes, "")?;
-    // Fusing lanes means one config for both. Their default wall timeouts differ,
-    // but every shipped/synthesized node has an explicit wall timeout and the
-    // fail-closed undeclared-node audit below enforces that invariant. Therefore
-    // the default is unreachable; retain the stricter value as defense in depth.
-    // Resource caps are disjoint and merge cleanly.
-    let bases: Vec<DagConfig> = lanes
-        .iter()
-        .map(|l| validate_plan::lane_config(root, l))
-        .collect::<Result<_, _>>()?;
-    let mut fused = bases[0].clone();
-    for b in bases.iter().skip(1) {
-        fused.default_step_timeout = fused.default_step_timeout.min(b.default_step_timeout);
-        for (r, n) in &b.resource_caps {
-            if let Some(prev) = fused.resource_caps.get(r) {
-                if prev != n {
-                    return Err(format!(
-                        "--merge-lanes refused: resource {r} capped at {prev} and {n} by different lanes"
-                    ));
-                }
-            }
-            fused.resource_caps.insert(r.clone(), *n);
-        }
-    }
-    for (resource, capacity) in shared_test_resource_caps {
-        if fused.resource_caps.insert(resource.clone(), capacity).is_some() {
-            return Err(format!("fused shared-test resource cap already exists: {resource}"));
-        }
-    }
-    if lanes.len() == 2 {
-        assert_fused_shared_integration_test_resources(&steps, &fused.resource_caps)?;
-    }
-    let mut cfg = validate_plan::config_from_base(&fused, steps, "fused lanes");
-    let compat = lanes.contains(&"portable")
-        && expand_portable_strict_compat(root, tmp, &mut cfg)?;
-    Ok(Plan {
-        planned_test_nodes: test_nodes_of(&cfg),
-        cfg,
-        second: None,
-        profile,
-        selection_mode,
-        suite_complete: args.level == Level::Full && args.focused.is_none(),
-        // Every ordinary lane validation must produce fresh per-cell results;
-        // a cache hit is valid landing evidence but is not a new measurement.
-        cacheable: false,
-        compat: compat.then_some(CompatMode::PortableStrict),
-        ..Default::default()
-    })
+    Err(format!(
+        "no plan is defined for level={:?} focused={:?}; refusing to substitute another profile",
+        args.level, args.focused
+    ))
 }
-
-/// Build the `super` plan from the mechanically extracted gate table.
-///
-/// Dependency policy — the bash ran all 32 rows strictly sequentially through
-/// `run_check`, so ANY edge set that preserves the real prerequisites is a
-/// faithful port and a strictly better schedule. The prerequisites are:
-///   * the two build rows gate everything that needs a binary;
-///   * `run_exact_detcore_cases` is FAIL-FAST within its group
-///     (validate.sh:4514), reproduced by chaining those rows so a failure SKIPS
-///     the rest instead of running them;
-///   * the LevelDB test needs its fixture built first.
-/// Everything else is independent and is allowed to overlap.
-fn super_plan(
-    root: &Path,
-    tmp: &Path,
-    pre: Vec<dagrun::model::Step>,
-    gate: &str,
-) -> Result<Plan, String> {
-    let gates = validate_super::load_gates(root)?;
-    let reps = validate_super::repetitions();
-    let build_ws = "super.build_workspace".to_string();
-    let build_rel = "super.build_release_hermit".to_string();
-    let debug_bin = root.join("target/debug/hermit").to_string_lossy().into_owned();
-    let release_bin = std::env::var("STRICT_COMPAT_HERMIT_BIN")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| root.join("target/release/hermit").to_string_lossy().into_owned());
-
-    let mut steps = pre;
-    steps.push(nextest_setup_node(root, gate)?);
-    let mut nonblocking: BTreeSet<String> = BTreeSet::new();
-    // `run_exact_detcore_cases` labels its rows "<group>: <case>"; consecutive
-    // rows sharing a group prefix are one fail-fast family. Deriving the chain
-    // from the label SHAPE keeps it correct if a case is added or removed.
-    let family = |label: &str| label.split_once(": ").map(|(g, _)| g.to_string());
-    let mut prev_family: Option<(String, String)> = None; // (family, previous tag)
-
-    for g in &gates {
-        let mut deps = match g.job.as_str() {
-            "build_workspace" | "build_release_hermit" => vec![gate.to_string()],
-            "full_leveldb_strict_determinism" => {
-                vec!["super.build_pinned_leveldb_super_fixture".to_string()]
-            }
-            _ => vec![build_ws.clone()],
-        };
-        if g.argv.windows(3).any(|w| w == ["cargo", "nextest", "run"]) {
-            deps.push("setup.nextest".to_string());
-        }
-        match g.synthetic.as_deref() {
-            Some("portable_slow_strict_diagnostics") => {
-                // The four PORTABLE_STRICT_SUPER_ONLY workloads, run with the
-                // portable-strict flags after the shared functional fixtures are
-                // prepared (validate.sh:4603).
-                let fixtures = root.join(format!("target/real-compat-fixtures-{}", std::process::id()));
-                steps.push(prepare_fixtures_node_dep("compatprep.fixtures", &fixtures, &build_rel));
-                let only: BTreeSet<String> =
-                    validate_corpus::portable_super_only().keys().map(|k| k.to_string()).collect();
-                let shell_build = tmp.join("shell-build");
-                let paths = validate_corpus::CorpusPaths {
-                    root_dir: &root.to_string_lossy(),
-                    real_compat_fixtures: &fixtures.to_string_lossy(),
-                    validation_tmp_dir: &tmp.to_string_lossy(),
-                    shell_build_dir: &shell_build.to_string_lossy(),
-                };
-                steps.extend(validate_plan::compat_nodes_for(
-                    root,
-                    CompatMode::PortableStrict,
-                    &release_bin,
-                    "",
-                    &paths,
-                    Some("compatprep.fixtures"),
-                    Some(&only),
-                    Some(g.wall()),
-                )?);
-            }
-            Some("super_stress_suite") => {
-                let stress =
-                    validate_super::stress_nodes(&release_bin, &debug_bin, tmp, reps, &build_rel, &build_ws);
-                steps.extend(stress);
-                nonblocking.extend(validate_super::nonblocking_tags(reps));
-            }
-            Some("calibrated_analyze_tests") => {
-                let mut deps = deps;
-                deps.push("setup.nextest".to_string());
-                steps.push(validate_super::calibrated_analyze_node(g, deps));
-            }
-            Some(other) => {
-                return Err(format!(
-                    "ci/super/gates.json row {} names an unknown synthetic expansion `{other}`; \
-                     refusing to skip it silently",
-                    g.job
-                ))
-            }
-            None => {
-                // Fail-fast chaining inside a `run_exact_detcore_cases` family. The edge
-                // preserves the established serial order; the explicit family also preserves
-                // eager cancellation if a later plan transformation makes two members runnable.
-                let mut deps = deps;
-                let declared_family = family(&g.label);
-                if let Some(f) = declared_family.as_ref() {
-                    if let Some((pf, ptag)) = &prev_family {
-                        if pf == f {
-                            deps = vec![ptag.clone()];
-                        }
-                    }
-                    prev_family = Some((f.clone(), format!("super.{}", g.job)));
-                } else {
-                    prev_family = None;
-                }
-                let mut step = validate_super::gate_node(g, deps);
-                step.fail_fast_family =
-                    declared_family.map(|family| format!("super.{family}"));
-                steps.push(step);
-            }
-        }
-    }
-    let cfg = validate_plan::config_from(steps, "super stress + diagnostic suite");
-    Ok(Plan {
-        planned_test_nodes: test_nodes_of(&cfg),
-        cfg,
-        profile: "super".into(),
-        super_mode: true,
-        nonblocking,
-        ..Default::default()
-    })
-}
-
 /// What `ci/select-tests.rs` decided, and what that means for the plan.
 enum SelectDecision {
     /// No CI-relevant change: run nothing beyond preflight.
@@ -8430,7 +8100,7 @@ fn apply_selective_decision(
             let sel = validate_plan::select_lane_nodes(all, &keep);
             if !sel.unknown_tags.is_empty() {
                 return Err(format!(
-                    "select-tests.rs named {} node(s) absent from ci/dag/portable.json ({}); the \
+                    "select-tests.rs named {} node(s) absent from ci/dag/validate.json ({}); the \
                      selector and the DAG disagree, so refusing to run a subset derived from a \
                      stale mapping",
                     sel.unknown_tags.len(),
@@ -8519,7 +8189,7 @@ fn ask_selector(root: &Path, baseline: Option<&str>) -> SelectDecision {
 fn selective_plan(
     root: &Path,
     args: &Args,
-    tmp: &Path,
+    _tmp: &Path,
     pre: Vec<dagrun::model::Step>,
     gate: &str,
     shallow: bool,
@@ -8563,10 +8233,10 @@ fn selective_plan(
     let steps = apply_selective_decision(all, total, decision)?;
     let mut nodes = pre;
     nodes.extend(steps);
-    let mut cfg = validate_plan::config_from_base(&base, nodes, "selective portable subset");
+    let cfg = validate_plan::config_from_base(&base, nodes, "selective portable subset");
     validate_plan::assert_config_carried(&base, &cfg)
         .map_err(|error| format!("selective portable DAG config was not carried: {error}"))?;
-    let compat = expand_portable_strict_compat(root, tmp, &mut cfg)?;
+    let compat = cfg.steps.iter().any(|step| step.group == "compat");
     Ok(Plan {
         planned_test_nodes: test_nodes_of(&cfg),
         cfg,
@@ -8577,158 +8247,6 @@ fn selective_plan(
     })
 }
 
-/// Remove later steps whose semantic work exactly matches an earlier step's,
-/// and repoint every dependency onto the survivor. Returns the removed tags.
-///
-/// Most nodes require both job and command to match. Deliberate exceptions are
-/// the manifest audit (different tags, byte-identical command/tree) and the
-/// Reverie-pin authority (preflight passes `--repo`, lane nodes rely on the same
-/// root cwd). The observed preflight node survives in both cases.
-/// `gate_dep` is the tag `validate_plan::lane_nodes` injects onto every
-/// dependency-less lane node to reproduce the fail-fast ordering. It is a
-/// scheduling artifact rather than a data dependency, so a removed duplicate
-/// never passes it on to its survivor: doing so would make `pre.reverie_pin`
-/// inherit an edge to `gate.manifest` from the deduped `check.reverie_pin` and
-/// invert the preflight.
-fn dedupe_identical(steps: &mut Vec<Step>, gate_dep: &str) -> Result<Vec<String>, String> {
-    let mut seen: BTreeMap<(String, String), String> = BTreeMap::new();
-    let mut remap: BTreeMap<String, String> = BTreeMap::new();
-    let mut keep = Vec::with_capacity(steps.len());
-    let mut removed = Vec::new();
-    // (survivor tag, the removed duplicate's own dependencies)
-    let mut inherited: Vec<(String, Vec<String>)> = Vec::new();
-    for s in steps.drain(..) {
-        let tag = s.tag();
-        let key = if validation_step_identity(&s) == ValidationStepIdentity::ManifestAudit {
-            if s.cmd != MANIFEST_AUDIT_COMMAND {
-                return Err(format!(
-                    "manifest-audit node {tag} has unexpected invocation: {}",
-                    s.cmd
-                ));
-            }
-            (
-                "exact-tree-manifest-audit".to_string(),
-                MANIFEST_AUDIT_COMMAND.to_string(),
-            )
-        } else if [
-            "pre.reverie_pin",
-            "check.reverie_pin",
-            "privileged-check.reverie_pin",
-        ]
-        .contains(&tag.as_str())
-            && s.cmd.contains("ci/run-reverie-pin-check.sh")
-        {
-            // The preflight spells the repository explicitly while lane nodes
-            // rely on the same root cwd. They invoke the same single pin
-            // authority; retaining the preflight observation also keeps
-            // `reverie_pin_current` evidence-derived.
-            (
-                "reverie-pin-authority".to_string(),
-                "current-repository-pin".to_string(),
-            )
-        } else {
-            (s.job.clone(), s.cmd.clone())
-        };
-        match seen.get(&key) {
-            Some(surv) => {
-                remap.insert(s.tag(), surv.clone());
-                // A duplicate's own dependencies are part of what made it
-                // correct; they are unioned into the survivor below, never
-                // dropped. See `inherited`.
-                inherited.push((surv.clone(), s.deps.clone()));
-                removed.push(s.tag());
-            }
-            None => {
-                seen.insert(key, s.tag());
-                keep.push(s);
-            }
-        }
-    }
-    // Repoint dependents of a removed node onto its survivor.
-    for s in keep.iter_mut() {
-        for d in s.deps.iter_mut() {
-            if let Some(t) = remap.get(d) {
-                *d = t.clone();
-            }
-        }
-    }
-
-    // Union each removed duplicate's OWN dependencies into its survivor.
-    //
-    // Discarding them is what made a cold `validate full` impossible. The
-    // preflight `gate.manifest` and each lane's `e2e.metadata` run the identical
-    // `test-harness validate` tree audit, but only the lane copy carries the edge
-    // to `setup.manifest_plan`, which BUILDS `target/debug/test-harness`. The
-    // preflight copy is pushed first so it always survived, its dependents were
-    // repointed, and the builder edge was silently deleted. Measured on a cold
-    // tree before this fix: `gate.manifest` died at node 3 of 59 with
-    // `exit 127: target/debug/test-harness: No such file or directory`, skipping
-    // the other 56, in 9.5 s. On a warm tree it did not fail -- it audited the
-    // tree with whatever STALE binary an earlier build had left behind, which is
-    // arguably worse, since the gate then vouches for a commit it never read.
-    let mut gained: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (survivor, deps) in inherited {
-        for dep in deps {
-            // An inherited dependency may itself name a removed duplicate.
-            let dep = remap.get(&dep).cloned().unwrap_or(dep);
-            if dep != survivor && dep != gate_dep {
-                gained.entry(survivor.clone()).or_default().insert(dep);
-            }
-        }
-    }
-    for s in keep.iter_mut() {
-        if let Some(extra) = gained.get(&s.tag()) {
-            s.deps.extend(extra.iter().cloned());
-        }
-    }
-
-    // Break the reverse edge the union would otherwise close into a cycle.
-    //
-    // `validate_plan::lane_nodes` hangs every dependency-less lane node off the
-    // manifest gate to reproduce the fail-fast ordering. That injection is wrong
-    // for the gate's OWN producer: `setup.manifest_plan` ships with no
-    // dependencies, so it acquires `gate.manifest`, and unioning the audit's
-    // builder edge back in would make the two depend on each other. A node the
-    // survivor now depends on cannot also depend on the survivor; the shipped
-    // lane files declare no such edge, so the only one dropped here is that
-    // injected fail-fast edge.
-    let mut drop_edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (survivor, extra) in &gained {
-        for dep in extra {
-            drop_edges
-                .entry(dep.clone())
-                .or_default()
-                .insert(survivor.clone());
-        }
-    }
-    for s in keep.iter_mut() {
-        if let Some(drop) = drop_edges.get(&s.tag()) {
-            s.deps.retain(|d| !drop.contains(d));
-        }
-        s.deps.sort();
-        s.deps.dedup();
-    }
-
-    // Fail closed on a cycle. Nothing downstream detects one: neither
-    // `scripts/validate.rs` nor `dagrun` topologically checks the
-    // graph, so a cycle would present as nodes that silently never run -- the
-    // same "56 skipped" shape this function just stopped producing, but with no
-    // failing node to name. Since unioning dependencies is precisely the
-    // operation that can close a cycle, the check belongs here.
-    if let Some(stuck) = first_dependency_cycle(&keep) {
-        return Err(format!(
-            "node deduplication produced a dependency cycle among: {}",
-            stuck.join(", ")
-        ));
-    }
-
-    *steps = keep;
-    Ok(removed)
-}
-
-/// Return the tags that cannot be topologically ordered, or `None` when the
-/// graph is a DAG. Dependencies naming absent nodes are ignored here; the
-/// runner reports those separately.
 fn first_dependency_cycle(steps: &[Step]) -> Option<Vec<String>> {
     let present: BTreeSet<String> = steps.iter().map(|s| s.tag()).collect();
     let mut pending: BTreeMap<String, BTreeSet<String>> = steps
@@ -8786,8 +8304,8 @@ fn build_release_hermit_node(gate: &str, bin: &str) -> dagrun::model::Step {
         "Release Hermit for compatibility",
         cmd,
         vec![gate.to_string()],
+        0,
         COMPAT_DIAGNOSTIC_WALL_S,
-        COMPAT_DIAGNOSTIC_WALL_S * 2,
         16 * 1024 * 1024 * 1024,
     );
     if default {
@@ -8804,545 +8322,6 @@ fn build_release_hermit_node(gate: &str, bin: &str) -> dagrun::model::Step {
 
 fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> dagrun::model::Step {
     prepare_fixtures_node_dep(_tag, fixtures, "compatprep.hermit_release")
-}
-
-/// Replace the portable lane's reviewed expansion marker with the actual
-/// strict-compatibility work in this run's ONE outer graph.
-///
-/// The corpus remains data in `ci/compat/corpus-strict.json`; committing 189
-/// copies of its rendered shell commands made the old flattening patch exceed
-/// five thousand lines and created a second source of truth.  Expanding at plan
-/// construction keeps the shipped lane small while still giving dagrun one
-/// typed, independently boxed `compat.*` step per probe.
-///
-/// Every host-visible scratch path is below `tmp`, which is already unique to
-/// this validate process (`target/validation/run-<pid>` in production).  The
-/// guest working directory is a fresh tmpfs at `/test`, selected by
-/// [`CompatMode::PortableStrict::run_args`], so neither concurrent validations
-/// nor the two runs inside `--verify` share mutable working-directory state.
-fn expand_portable_strict_compat(
-    root: &Path,
-    tmp: &Path,
-    cfg: &mut DagConfig,
-) -> Result<bool, String> {
-    let matches: Vec<usize> = cfg
-        .steps
-        .iter()
-        .enumerate()
-        .filter_map(|(index, step)| (step.tag() == STRICT_COMPAT_PLACEHOLDER_TAG).then_some(index))
-        .collect();
-    let Some(index) = matches.first().copied() else {
-        return Ok(false);
-    };
-    if matches.len() != 1 {
-        return Err(format!(
-            "portable strict compatibility has {} {STRICT_COMPAT_PLACEHOLDER_TAG} markers; expected exactly one",
-            matches.len()
-        ));
-    }
-    if cfg
-        .steps
-        .iter()
-        .any(|step| step.group == "compat" || step.tag() == "compatprep.fixtures")
-    {
-        return Err(
-            "portable strict compatibility marker coexists with already-expanded compat nodes"
-                .into(),
-        );
-    }
-
-    let placeholder = cfg.steps.remove(index);
-    if placeholder.cmd != STRICT_COMPAT_PLACEHOLDER_COMMAND {
-        return Err(format!(
-            "{STRICT_COMPAT_PLACEHOLDER_TAG} is not the reviewed expansion marker: {:?}",
-            placeholder.cmd
-        ));
-    }
-
-    let run_root = tmp.join("strict-compat");
-    let fixtures = run_root.join("real-compat-fixtures");
-    let shell_build = run_root.join("shell-build");
-    let hermit_bin = root.join("target/ci/hermit-strict");
-    let paths = validate_corpus::CorpusPaths {
-        root_dir: &root.to_string_lossy(),
-        real_compat_fixtures: &fixtures.to_string_lossy(),
-        validation_tmp_dir: &run_root.to_string_lossy(),
-        shell_build_dir: &shell_build.to_string_lossy(),
-    };
-
-    let mut prep = prepare_fixtures_node("compatprep.fixtures", &fixtures);
-    prep.deps = placeholder.deps;
-    prep.desc = "Functional compatibility fixtures for direct outer-DAG probes".into();
-    prep.description = format!(
-        "Generated for this validation under {}; the former nested scheduler is not invoked.",
-        run_root.display()
-    );
-
-    let probes = validate_plan::compat_nodes(
-        root,
-        CompatMode::PortableStrict,
-        &hermit_bin.to_string_lossy(),
-        "",
-        &paths,
-        Some("compatprep.fixtures"),
-    )?;
-    let expected = validate_corpus::STRICT_COMPAT_TOTAL
-        - validate_corpus::portable_super_only().len();
-    if probes.len() != expected {
-        return Err(format!(
-            "portable strict compatibility expanded {} probes, expected {expected}",
-            probes.len()
-        ));
-    }
-    if probes.iter().any(|probe| {
-        probe.cmd.contains("scripts/validate.rs")
-            || probe.cmd.contains("pressure-test.rs")
-            || probe.cmd.contains("dagrun run")
-            || probe.cmd.contains("run_dag_boxed")
-    }) {
-        return Err(
-            "portable strict compatibility expansion contains a nested validate, pressure, or dagrun invocation"
-                .into(),
-        );
-    }
-
-    cfg.steps.splice(index..index, std::iter::once(prep).chain(probes));
-    Ok(true)
-}
-
-/// Exercise the flattened strict-compatibility handoff through the real outer
-/// scheduler without running the 189-program corpus.
-///
-/// The production plan is inspected first. The execution half replaces two
-/// guest commands and one ordinary Hermit command with a barrier: all three
-/// must be admitted concurrently and must observe dagrun's one outer-step
-/// identity. A hidden serial/nested scheduler or restored guest-exclusion
-/// resource cannot satisfy that barrier.
-fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, String> {
-    let fixture = tempfile::Builder::new()
-        .prefix("validate-strict-compat-flat-")
-        .tempdir()
-        .map_err(|error| format!("strict-compat flatten: cannot create fixture: {error}"))?;
-    let run_a = fixture.path().join("run-a");
-    let run_b = fixture.path().join("run-b");
-
-    let mut coexistence = validate_plan::lane_config(root, "portable")?;
-    expand_portable_strict_compat(root, &run_a, &mut coexistence)?;
-    if coexistence.resource_caps.contains_key("hermit_guest")
-        || coexistence
-            .steps
-            .iter()
-            .any(|step| step.hint.resources.contains_key("hermit_guest"))
-    {
-        return Err(
-            "strict-compat flatten: constructed portable plan restored hermit_guest exclusion"
-                .into(),
-        );
-    }
-    let regular_crates = coexistence
-        .steps
-        .iter()
-        .find(|step| step.tag() == "test.regular_crates")
-        .ok_or("strict-compat flatten: constructed plan lost test.regular_crates")?;
-    if regular_crates.hint.preferred_inner_jobs != Some(8)
-        || regular_crates.jobs_flag.as_deref() != Some("-j")
-    {
-        return Err(format!(
-            "strict-compat flatten: test.regular_crates must couple nextest to its 8-core box: preferred_inner_jobs={:?} jobs_flag={:?}",
-            regular_crates.hint.preferred_inner_jobs, regular_crates.jobs_flag
-        ));
-    }
-    let ordinary = coexistence
-        .steps
-        .iter()
-        .find(|step| step.tag() == "test.hermit_modes")
-        .cloned()
-        .ok_or("strict-compat flatten: coexistence fixture lost test.hermit_modes")?;
-
-    let marker_config = || -> Result<DagConfig, String> {
-        let mut cfg = validate_plan::lane_config(root, "portable")?;
-        cfg.steps
-            .retain(|step| step.tag() == STRICT_COMPAT_PLACEHOLDER_TAG);
-        if cfg.steps.len() != 1 {
-            return Err(format!(
-                "strict-compat flatten: portable DAG has {} expansion markers",
-                cfg.steps.len()
-            ));
-        }
-        Ok(cfg)
-    };
-
-    let mut first = marker_config()?;
-    let original_deps = first.steps[0].deps.clone();
-    if !expand_portable_strict_compat(root, &run_a, &mut first)? {
-        return Err("strict-compat flatten: production marker was not expanded".into());
-    }
-    let expected = validate_corpus::STRICT_COMPAT_TOTAL
-        - validate_corpus::portable_super_only().len();
-    let probes: Vec<&Step> = first
-        .steps
-        .iter()
-        .filter(|step| step.group == "compat")
-        .collect();
-    let prep = first
-        .steps
-        .iter()
-        .find(|step| step.tag() == "compatprep.fixtures")
-        .ok_or("strict-compat flatten: fixture-preparation node is absent")?;
-    if probes.len() != expected
-        || prep.deps != original_deps
-        || first
-            .steps
-            .iter()
-            .any(|step| step.tag() == STRICT_COMPAT_PLACEHOLDER_TAG)
-    {
-        return Err(format!(
-            "strict-compat flatten: wrong direct shape probes={} expected={expected} prep_deps={:?} original_deps={original_deps:?}",
-            probes.len(), prep.deps
-        ));
-    }
-    if first.resource_caps.contains_key("hermit_guest")
-        || first
-            .steps
-            .iter()
-            .any(|step| step.hint.resources.contains_key("hermit_guest"))
-    {
-        return Err(
-            "strict-compat flatten: expansion injected a hermit_guest cap or demand".into(),
-        );
-    }
-    let required_prefix = " run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- ";
-    if probes.iter().any(|probe| !probe.cmd.contains(required_prefix)) {
-        return Err(
-            "strict-compat flatten: a portable probe lost minimal base environment or /test working-directory isolation"
-                .into(),
-        );
-    }
-    let fixture_readme = run_a.join("strict-compat/real-compat-fixtures/README.md");
-    let fixture_readme = fixture_readme.to_string_lossy();
-    let readme_labels = probes
-        .iter()
-        .filter(|probe| probe.cmd.contains("README.md"))
-        .map(|probe| probe.job.as_str())
-        .collect::<BTreeSet<_>>();
-    let expected_readme_labels = BTreeSet::from([
-        "b2sum",
-        "base32",
-        "base64",
-        "bzip2",
-        "cat",
-        "chown",
-        "cksum",
-        "du",
-        "gzip",
-        "head",
-        "install",
-        "ls",
-        "md5sum",
-        "pr",
-        "readlink",
-        "realpath",
-        "sha1sum",
-        "sha224sum",
-        "sha256sum",
-        "sha384sum",
-        "sha512sum",
-        "sum",
-        "wc",
-        "wc-lines",
-        "xz",
-        "zstd",
-    ]);
-    if readme_labels != expected_readme_labels
-        || probes
-            .iter()
-            .filter(|probe| probe.cmd.contains("README.md"))
-            .any(|probe| !probe.cmd.contains(&*fixture_readme))
-    {
-        return Err(format!(
-            "strict-compat flatten: README consumers are not bound to the run-owned fixture: labels={readme_labels:?} fixture={fixture_readme}"
-        ));
-    }
-    for (tag, workload) in [("compat.cargo", "cargo"), ("compat.df", "df")] {
-        let command = probes
-            .iter()
-            .find(|probe| probe.tag() == tag)
-            .ok_or_else(|| format!("strict-compat flatten: fixture-backed probe {tag} is absent"))?
-            .cmd
-            .as_str();
-        if !command.contains("tests/compat/real_compat_workload.sh")
-            || !command.contains(&format!(" {workload} </dev/null"))
-        {
-            return Err(format!(
-                "strict-compat flatten: {tag} does not use its explicit fixture/tool contract: {command}"
-            ));
-        }
-    }
-    if first.steps.iter().any(|step| {
-        step.cmd.contains("scripts/validate.rs")
-            || step.cmd.contains("pressure-test.rs")
-            || step.cmd.contains("dagrun run")
-            || step.cmd.contains("run_dag_boxed")
-    }) {
-        return Err(
-            "strict-compat flatten: the production expansion still contains a nested scheduler entrypoint"
-                .into(),
-        );
-    }
-
-    let run_a_text = run_a.to_string_lossy();
-    let path_cases = [
-        ("compat.seq", run_a.join("strict-compat/real-compat-fixtures")),
-        ("compat.shell-build", run_a.join("strict-compat/shell-build")),
-        ("compat.top", run_a.join("strict-compat/top-home")),
-    ];
-    for (tag, path) in &path_cases {
-        let command = first
-            .steps
-            .iter()
-            .find(|step| step.tag() == *tag)
-            .ok_or_else(|| format!("strict-compat flatten: path probe {tag} is absent"))?
-            .cmd
-            .as_str();
-        if !command.contains(&*path.to_string_lossy()) || !command.contains(&*run_a_text) {
-            return Err(format!(
-                "strict-compat flatten: {tag} does not use its run-owned path {}: {command}",
-                path.display()
-            ));
-        }
-    }
-    let mut second = marker_config()?;
-    expand_portable_strict_compat(root, &run_b, &mut second)?;
-    for tag in ["compat.seq", "compat.shell-build", "compat.top"] {
-        let a = first.steps.iter().find(|step| step.tag() == tag).unwrap();
-        let b = second.steps.iter().find(|step| step.tag() == tag).unwrap();
-        if a.cmd == b.cmd || b.cmd.contains(&*run_a_text) {
-            return Err(format!(
-                "strict-compat flatten: {tag} reused another validation's host-visible path"
-            ));
-        }
-    }
-
-    let barrier = fixture.path().join("barrier");
-    std::fs::create_dir_all(&barrier)
-        .map_err(|error| format!("strict-compat flatten: cannot create barrier: {error}"))?;
-    let mut execution = DagConfig {
-        description: "strict compatibility one-scheduler execution bracket".into(),
-        ..Default::default()
-    };
-    let mut execution_prep = prep.clone();
-    execution_prep.deps.clear();
-    execution_prep.cmd = "true".into();
-    execution_prep.timeout = 10;
-    execution_prep.cpu_timeout = 10;
-    execution.steps.push(execution_prep);
-    let selected: Vec<Step> = probes.into_iter().take(2).cloned().collect();
-    if selected.len() != 2 {
-        return Err("strict-compat flatten: fewer than two probes exist for execution".into());
-    }
-    let tags = [selected[0].tag(), selected[1].tag()];
-    for (index, mut probe) in selected.into_iter().enumerate() {
-        let own = barrier.join(format!("{index}.ready"));
-        let peer = barrier.join(format!("{}.ready", 1 - index));
-        let active = barrier.join(format!("{index}.active"));
-        let ordinary_active = barrier.join("ordinary.active");
-        let observed = barrier.join(format!("{index}.observed"));
-        probe.cmd = format!(
-            "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active} {own}; i=0; while test ! -e {peer} || test ! -e {ordinary_active}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}",
-            tag = validate_plan::shell_quote(&tags[index]),
-            active = validate_plan::shell_quote(&active.to_string_lossy()),
-            own = validate_plan::shell_quote(&own.to_string_lossy()),
-            peer = validate_plan::shell_quote(&peer.to_string_lossy()),
-            ordinary_active = validate_plan::shell_quote(&ordinary_active.to_string_lossy()),
-            observed = validate_plan::shell_quote(&observed.to_string_lossy()),
-        );
-        probe.timeout = 10;
-        probe.cpu_timeout = 10;
-        execution.steps.push(probe);
-    }
-    let mut ordinary = ordinary;
-    let ordinary_observed = barrier.join("ordinary.observed");
-    ordinary.deps = vec!["compatprep.fixtures".into()];
-    ordinary.cmd = format!(
-        "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active}; i=0; while test ! -e {first} || test ! -e {second}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}",
-        tag = validate_plan::shell_quote(&ordinary.tag()),
-        active = validate_plan::shell_quote(&barrier.join("ordinary.active").to_string_lossy()),
-        first = validate_plan::shell_quote(&barrier.join("0.active").to_string_lossy()),
-        second = validate_plan::shell_quote(&barrier.join("1.active").to_string_lossy()),
-        observed = validate_plan::shell_quote(&ordinary_observed.to_string_lossy()),
-    );
-    ordinary.timeout = 10;
-    ordinary.cpu_timeout = 10;
-    execution.steps.push(ordinary);
-    let result = run_lane_once(
-        &execution,
-        3,
-        true,
-        0,
-        None,
-        &fixture.path().join("outer.log"),
-        None,
-        false,
-    );
-    let mut observed = (0..2)
-        .map(|index| std::fs::read_to_string(barrier.join(format!("{index}.observed"))))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("strict-compat flatten: scheduler evidence missing: {error}"))?;
-    observed.push(
-        std::fs::read_to_string(&ordinary_observed).map_err(|error| {
-            format!("strict-compat flatten: ordinary scheduler evidence missing: {error}")
-        })?,
-    );
-    let expected_observed = tags
-        .iter()
-        .map(String::as_str)
-        .chain(std::iter::once("test.hermit_modes"))
-        .collect::<BTreeSet<_>>();
-    if !result.ok
-        || !result.complete
-        || result.outcomes.len() != 4
-        || !result.skipped.is_empty()
-        || observed
-            .iter()
-            .map(|value| value.trim())
-            .collect::<BTreeSet<_>>()
-            != expected_observed
-    {
-        return Err(format!(
-            "strict-compat flatten: one outer scheduler did not execute two probes and one ordinary Hermit node concurrently: ok={} complete={} outcomes={:?} skipped={:?} observed={observed:?}",
-            result.ok,
-            result.complete,
-            result.outcomes.iter().map(|outcome| outcome.tag.as_str()).collect::<Vec<_>>(),
-            result.skipped,
-        ));
-    }
-
-    Ok(format!(
-        "portable strict compatibility: {expected} direct outer nodes without hermit_guest exclusion, run-unique fixture/shell/top paths, one scheduler execution"
-    ))
-}
-
-/// Exercise the public raw-lane entrypoint used by `.github/workflows/ci-dag.yml`.
-///
-/// The first arm invokes its default `run` verb with a capture runner, proving
-/// the workflow path receives the constructed DAG rather than portable.json's
-/// exit-125 marker. The second uses the real pinned runner's `json` verb, proving
-/// that same generated document is accepted by dagrun. Neither arm runs a test
-/// workload or creates a second scheduler.
-fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
-    let fixture = tempfile::Builder::new()
-        .prefix("validate-run-dag-flat-")
-        .tempdir()
-        .map_err(|error| format!("raw run-dag: cannot create fixture: {error}"))?;
-    let captured = fixture.path().join("captured.json");
-    let runner = fixture.path().join("capture-runner");
-    std::fs::write(
-        &runner,
-        "#!/bin/sh\nset -eu\ntest \"$1\" = run\ntest \"$2\" = --dag\ntest \"$#\" -eq 3\ncp -- \"$3\" \"$RUN_DAG_CAPTURE\"\n",
-    )
-    .map_err(|error| format!("raw run-dag: cannot write capture runner: {error}"))?;
-    std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
-        .map_err(|error| format!("raw run-dag: cannot chmod capture runner: {error}"))?;
-
-    let output = Command::new(root.join("ci/run-dag.sh"))
-        .arg("portable")
-        .current_dir(root)
-        .env("DAGRUN_BIN", &runner)
-        .env("RUN_DAG_CAPTURE", &captured)
-        .env_remove("RUN_DAG_FILE_OVERRIDE")
-        .output()
-        .map_err(|error| format!("raw run-dag: cannot launch default entrypoint: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "raw run-dag: default portable entrypoint failed with {}: {}{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    let inspect = |label: &str, bytes: &[u8]| -> Result<(), String> {
-        let text = std::str::from_utf8(bytes)
-            .map_err(|error| format!("raw run-dag: {label} output is not UTF-8: {error}"))?;
-        let cfg = dag_from_json(text)
-            .map_err(|error| format!("raw run-dag: {label} is not a valid DAG: {error}"))?;
-        let compat = cfg
-            .steps
-            .iter()
-            .filter(|step| step.group == "compat")
-            .collect::<Vec<_>>();
-        let ordinary_present = cfg
-            .steps
-            .iter()
-            .any(|step| step.tag() == "test.hermit_modes");
-        let has_guest_exclusion = cfg.resource_caps.contains_key("hermit_guest")
-            || cfg
-                .steps
-                .iter()
-                .any(|step| step.hint.resources.contains_key("hermit_guest"));
-        let expected = validate_corpus::STRICT_COMPAT_TOTAL
-            - validate_corpus::portable_super_only().len();
-        if compat.len() != expected
-            || cfg
-                .steps
-                .iter()
-                .filter(|step| step.tag() == "compatprep.fixtures")
-                .count()
-                != 1
-            || cfg
-                .steps
-                .iter()
-                .any(|step| step.tag() == STRICT_COMPAT_PLACEHOLDER_TAG)
-            || cfg
-                .steps
-                .iter()
-                .any(|step| step.cmd == STRICT_COMPAT_PLACEHOLDER_COMMAND)
-            || has_guest_exclusion
-            || !ordinary_present
-        {
-            return Err(format!(
-                "raw run-dag: {label} did not receive the reviewed cap-free expansion: compat={} prep={} marker={} ordinary_present={} hermit_guest_present={has_guest_exclusion}",
-                compat.len(),
-                cfg.steps
-                    .iter()
-                    .filter(|step| step.tag() == "compatprep.fixtures")
-                    .count(),
-                cfg.steps
-                    .iter()
-                    .filter(|step| step.tag() == STRICT_COMPAT_PLACEHOLDER_TAG)
-                    .count(),
-                ordinary_present,
-            ));
-        }
-        Ok(())
-    };
-
-    let captured_bytes = std::fs::read(&captured)
-        .map_err(|error| format!("raw run-dag: capture runner received no DAG: {error}"))?;
-    inspect("default run input", &captured_bytes)?;
-
-    let output = Command::new(root.join("ci/run-dag.sh"))
-        .args(["portable", "json"])
-        .current_dir(root)
-        .env_remove("DAGRUN_BIN")
-        .env_remove("RUN_DAG_FILE_OVERRIDE")
-        .output()
-        .map_err(|error| format!("raw run-dag: cannot launch real json entrypoint: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "raw run-dag: real runner rejected constructed portable DAG with {}: {}{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    inspect("real runner json output", &output.stdout)?;
-
-    Ok(format!(
-        "raw run-dag: default workflow run and real json parser received {}/{} direct strict-compat nodes; marker exit 125 absent",
-        validate_corpus::STRICT_COMPAT_TOTAL - validate_corpus::portable_super_only().len(),
-        validate_corpus::STRICT_COMPAT_TOTAL - validate_corpus::portable_super_only().len() + 1,
-    ))
 }
 
 /// The functional-fixture prep node, with an explicit predecessor.
@@ -9363,7 +8342,7 @@ fn prepare_fixtures_node_dep(
             validate_plan::shell_quote(&fixtures.to_string_lossy())
         ),
         vec![dep.to_string()],
-        COMPAT_DIAGNOSTIC_WALL_S,
+        0,
         COMPAT_DIAGNOSTIC_WALL_S,
         4 * 1024 * 1024 * 1024,
     )
@@ -9412,11 +8391,16 @@ fn step_with_caps(
     cpu_timeout: i64,
     mem: i64,
 ) -> dagrun::model::Step {
+    assert!(
+        cpu_timeout > 0 && (timeout == 0 || timeout > cpu_timeout),
+        "{group}.{job}: explicit timeout policy must have CPU > 0 and wall = 0 (derived) or wall > CPU; wall={timeout} cpu={cpu_timeout}"
+    );
     dagrun::model::Step {
         group: group.into(),
         job: job.into(),
         desc: desc.into(),
         description: String::new(),
+        labels: Vec::new(),
         cmd,
         cmdtype: CmdType::Unknown,
         manifest: None,
@@ -10167,8 +9151,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     // the command is checked only to prove that execution selects the same
     // population. A command with any selection token this function does not
     // model must NOT be matched against the bucket accounting.
-    let mut transformed =
-        validate_plan::lane_nodes(root, "privileged", "privileged-", "gate.manifest")?;
+    let mut transformed = validate_plan::lane_nodes(root, "privileged", "", "gate.manifest")?;
     let withheld_tag = "privileged-e2e.manifest_backend_parity_c";
     let shipped = transformed
         .iter()
@@ -10285,13 +9268,17 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     if expected.remove(withheld_tag).is_none() {
         return Err("node vacuity: transformed plan lost the expected bucket".into());
     }
-    let scorecard_deps = expected
-        .get_mut(scorecard_tag)
-        .ok_or("node vacuity: transformed plan lost the compatibility scorecard")?;
-    let scorecard_deps_before = scorecard_deps.len();
-    scorecard_deps.retain(|dep| dep != withheld_tag);
-    if scorecard_deps.len() + 1 != scorecard_deps_before {
-        return Err("node vacuity: expected exactly one scorecard edge to the bucket".into());
+    for result_consumer in [scorecard_tag, "privileged-scorecard.compatibility"] {
+        let scorecard_deps = expected
+            .get_mut(result_consumer)
+            .ok_or_else(|| format!("node vacuity: transformed plan lost result consumer {result_consumer}"))?;
+        let scorecard_deps_before = scorecard_deps.len();
+        scorecard_deps.retain(|dep| dep != withheld_tag);
+        if scorecard_deps.len() + 1 != scorecard_deps_before {
+            return Err(format!(
+                "node vacuity: expected exactly one {result_consumer} edge to the bucket"
+            ));
+        }
     }
     let mut actual_plan = Plan {
         cfg: DagConfig {
@@ -10383,7 +9370,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         "  node vacuity: 2 withheld / 7 not-withheld (3 un-withholding, 3 nothing-withheld, \
          1 empty-bucket), 1 transformed command bound / 15 refused, accounting parser 1 good / \
          3 malformed, dependents 1 edge-dropped / 1 refusal / 1 inert, actual plan 1 bucket \
-         withheld / 1 scorecard edge dropped / 0 other changes"
+         withheld / 2 scorecard edges dropped / 0 other changes"
     );
     Ok(())
 }
@@ -10402,6 +9389,7 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
         job: job.into(),
         desc: String::new(),
         description: String::new(),
+        labels: Vec::new(),
         cmd: "true".into(),
         cmdtype: CmdType::Unknown,
         manifest: None,
@@ -10492,12 +9480,10 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
     // bracket is about, and every declaration in every lane parses. A bracket
     // that passed against an empty declaration set would prove nothing.
     let shipped = validate_plan::host_capability_requirements(root)?;
-    if shipped.get("privileged-cpuid.faulting") != Some(&HostCapability::CpuidFaulting)
-        || shipped.get("cpuid.faulting") != Some(&HostCapability::CpuidFaulting)
-    {
+    if shipped.get("privileged-cpuid.faulting") != Some(&HostCapability::CpuidFaulting) {
         return Err(format!(
-            "host capability: ci/dag/privileged.json must declare cpuid.faulting as requiring \
-             cpuid-faulting under both the bare and fused tag; got {shipped:?}"
+            "host capability: ci/dag/validate.json must label privileged-cpuid.faulting with \
+             cpuid-faulting; got {shipped:?}"
         ));
     }
 
@@ -10682,8 +9668,17 @@ fn env_positive(name: &str) -> Option<i64> {
 /// Lower every node's wall ceiling to at most `cap`.
 fn clamp_wall(plan: &mut Plan, cap: i64) {
     for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
+        let default_step_timeout = cfg.default_step_timeout;
+        let cpu_timeout_multiplier = cfg.cpu_timeout_multiplier;
         for s in cfg.steps.iter_mut() {
-            s.timeout = s.timeout.min(cap);
+            let resolved = dagrun::resolved_wall_timeout(
+                s,
+                default_step_timeout,
+                cpu_timeout_multiplier,
+            );
+            if resolved > cap {
+                s.timeout = cap;
+            }
         }
     }
 }
@@ -10861,7 +9856,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 "Fetch locked Cargo inputs before the network-disabled pinned-root commands",
                 PINNED_ROOT_FETCH_COMMAND.into(),
                 fetch_deps,
-                600,
+                0,
                 600,
                 1024 * 1024 * 1024,
             ));
@@ -10905,7 +9900,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 .iter()
                 .any(|producer| producer.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
         {
-            let manifest_plan = validate_plan::preflight_nodes(root, has_cmd("with-proxy"))
+            let manifest_plan = validate_plan::preflight_nodes(root)?
                 .into_iter()
                 .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
                 .ok_or("pinned-root plan lost its canonical manifest-plan producer")?;
@@ -11010,7 +10005,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
 
 fn pinned_root_plan_bracket() -> Result<String, String> {
     let step = |group: &str, job: &str, cmd: &str, deps: Vec<String>| {
-        step_with_caps(group, job, "fixture", cmd.into(), deps, 30, 30, 1024 * 1024)
+        step_with_caps(group, job, "fixture", cmd.into(), deps, 0, 30, 1024 * 1024)
     };
     let mut cell = step("e2e", "manifest_fixture", "echo cells", vec!["build.workspace".into()]);
     cell.manifest = Some(DagManifest {
@@ -11029,12 +10024,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
                 // the host. gate.manifest is named explicitly because it is the one
                 // measured to fail in the container.
                 step("gate", "manifest", "target/debug/test-harness validate", vec![]),
-                step(
-                    "test",
-                    "strict_compat",
-                    STRICT_COMPAT_PLACEHOLDER_COMMAND,
-                    vec![],
-                ),
+                step("compat", "echo", "echo compat", vec![]),
                 step("lint", "clippy", "cargo clippy --workspace", vec![]),
                 step("test", "hermit_integration", "./ci/run-nextest-counted.sh -p hermit", vec![]),
                 // A producer whose output the cells execute: wrapped by the rule.
@@ -11066,7 +10056,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
     // grown back past the scheduled cells and that failure returns with it.
     for tag in [
         "gate.manifest",
-        "test.strict_compat",
+        "compat.echo",
         "lint.clippy",
         "test.hermit_integration",
         "pre.submodules",
@@ -12184,7 +11174,15 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .collect::<Result<Vec<_>, _>>()?;
     let smallest_enclosing_deadline_s = lane_configs
         .iter()
-        .map(|(_, cfg)| cfg.default_step_timeout)
+        .flat_map(|(_, cfg)| {
+            cfg.steps.iter().map(|step| {
+                dagrun::resolved_wall_timeout(
+                    step,
+                    cfg.default_step_timeout,
+                    cfg.cpu_timeout_multiplier,
+                )
+            })
+        })
         .min()
         .ok_or("retry bounds: no enclosing lane deadline")?;
     let mut streamed_nextest_nodes = 0usize;
@@ -12204,8 +11202,8 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .map(|(_, cfg)| cfg)
         .ok_or("retry bounds: privileged lane is absent")?;
     for (tag, expected) in [
-        ("test.pmu_buck_chaos_cases", 6usize),
-        ("test.cli_kvm", 24usize),
+        ("privileged-test.pmu_buck_chaos_cases", 6usize),
+        ("privileged-test.cli_kvm", 24usize),
     ] {
         let step = privileged
             .steps
@@ -12293,7 +11291,11 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             }
             check_manifest_selection(
                 &format!("{lane}:{}", step.tag()),
-                step.timeout,
+                dagrun::resolved_wall_timeout(
+                    step,
+                    cfg.default_step_timeout,
+                    cfg.cpu_timeout_multiplier,
+                ),
                 Selection {
                     population: Some(Population::Required),
                     lane: Some((*lane).into()),
@@ -12380,7 +11382,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             "validate scheduler accounting fixture",
             cmd.to_string(),
             Vec::new(),
-            30,
+            0,
             30,
             64 * 1024 * 1024,
         )
@@ -18554,6 +17556,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         );
     }
     if !nesting.nested {
+        std::env::set_var("VALIDATE_RUN_STATE", &tmp);
         for (variable, name) in [
             ("TMPDIR", "tmp"),
             ("PYTHONPYCACHEPREFIX", "python-cache"),
@@ -18884,17 +17887,28 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             println!("\n--- DAG {} of {} ({}) : {} node(s)", i + 1, all.len(), cfg.description, cfg.steps.len());
             println!("{:<40} {:>7} {:>7} {:>8}  deps", "node", "wall_s", "cpu_s", "mem");
             for s in &cfg.steps {
-                let cpu = if s.cpu_timeout > 0 { s.cpu_timeout } else { cfg.default_step_cpu_timeout };
+                let cpu = ((if s.cpu_timeout > 0 {
+                    s.cpu_timeout
+                } else {
+                    cfg.default_step_cpu_timeout
+                }) as f64
+                    * cfg.cpu_timeout_multiplier)
+                    .round() as i64;
+                let wall = dagrun::resolved_wall_timeout(
+                    s,
+                    cfg.default_step_timeout,
+                    cfg.cpu_timeout_multiplier,
+                );
                 let mem = s.hint.hard_mem_max_bytes.or(s.hint.rss_baseline_bytes).unwrap_or(0);
                 println!(
                     "{:<40} {:>7} {:>7} {:>7}M  {}",
-                    s.tag(), s.timeout, cpu, mem / (1024 * 1024), s.deps.join(",")
+                    s.tag(), wall, cpu, mem / (1024 * 1024), s.deps.join(",")
                 );
             }
         }
         let total: usize = all.iter().map(|c| c.steps.len()).sum();
         println!(
-            "\ntotal outer boxed nodes: {total}; all have declared wall+cpu+memory caps (audited above)."
+            "\ntotal outer boxed nodes: {total}; all have declared CPU+memory caps and a wider resolved wall backstop (audited above)."
         );
         println!(
             "This output does not enumerate Rust test IDs or E2E cells inside those outer nodes."
@@ -18904,7 +17918,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             0,
             &plan.profile,
             vec![
-                format!("--show-plan: {total} outer boxed node(s) printed, all with declared wall+cpu+memory caps"),
+                format!("--show-plan: {total} outer boxed node(s) printed, all with declared CPU+memory caps and wider resolved wall backstops"),
                 "Rust test IDs and E2E cells inside those nodes were not enumerated".into(),
                 "nothing was executed and no ledger row was written".into(),
             ],
@@ -20229,165 +19243,6 @@ fn stop_test_seam(
 }
 
 #[cfg(test)]
-mod fused_privileged_build_tests {
-    use super::*;
-
-    fn write_executable(path: &Path, contents: &str) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, contents).unwrap();
-        let mut permissions = std::fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(path, permissions).unwrap();
-    }
-
-    fn cold_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let root = tempfile::tempdir().unwrap();
-        let cargo_log = root.path().join("cargo-calls");
-        write_executable(
-            &root.path().join("ci/verify-hermit-e2e-artifact.sh"),
-            "#!/bin/sh\nexit 0\n",
-        );
-        write_executable(
-            &root.path().join("bin/cargo"),
-            r#"#!/bin/sh
-set -eu
-printf '%s\n' "$*" >> "$CARGO_CALL_LOG"
-case "$*" in
-  "test -p hermit-detcore --test tests_misc --no-run --message-format=json")
-    case "${CARGO_ARTIFACT_MODE:-current}" in
-      current)
-        artifact="$PWD/target/debug/build/hermit-detcore/cold/out/tests_misc-cold-fixture"
-        mkdir -p "$(dirname "$artifact")"
-        : > "$artifact"
-        chmod 700 "$artifact"
-        ;;
-      missing)
-        artifact="$PWD/target/debug/build/hermit-detcore/cold/out/tests_misc-missing"
-        ;;
-      wrong)
-        artifact="$PWD/target/debug/hermit"
-        mkdir -p "$(dirname "$artifact")"
-        : > "$artifact"
-        chmod 700 "$artifact"
-        ;;
-      ambiguous)
-        artifact="$PWD/target/debug/build/hermit-detcore/one/out/tests_misc-one"
-        second="$PWD/target/debug/build/hermit-detcore/two/out/tests_misc-two"
-        mkdir -p "$(dirname "$artifact")" "$(dirname "$second")"
-        : > "$artifact"
-        : > "$second"
-        chmod 700 "$artifact" "$second"
-        printf '{"reason":"compiler-artifact","profile":{"test":true},"target":{"name":"tests_misc"},"executable":"%s"}\n' "$second"
-        ;;
-      *)
-        exit 65
-        ;;
-    esac
-    printf '{"reason":"compiler-artifact","profile":{"test":true},"target":{"name":"tests_misc"},"executable":"%s"}\n' "$artifact"
-    ;;
-  "test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run")
-    :
-    ;;
-  *)
-    exit 64
-    ;;
-esac
-"#,
-        );
-        let bin = root.path().join("bin");
-        (root, bin, cargo_log)
-    }
-
-    fn run_build(
-        command: &str,
-        root: &Path,
-        bin: &Path,
-        cargo_log: &Path,
-        artifact_mode: &str,
-    ) -> std::process::ExitStatus {
-        let mut path = vec![bin.to_path_buf()];
-        if let Some(existing) = std::env::var_os("PATH") {
-            path.extend(std::env::split_paths(&existing));
-        }
-        Command::new("bash")
-            .arg("-c")
-            .arg(command)
-            .current_dir(root)
-            .env("PATH", std::env::join_paths(path).unwrap())
-            .env("CARGO_CALL_LOG", cargo_log)
-            .env("CARGO_ARTIFACT_MODE", artifact_mode)
-            .status()
-            .unwrap()
-    }
-
-    #[test]
-    fn fused_privileged_build_creates_tests_misc_in_a_cold_target_before_consumers() {
-        let command = fused_privileged_test_build_command();
-        let missing_producer =
-            command.replacen(&format!("{DETCORE_MISC_TEST_PREBUILD_COMMAND}; "), "", 1);
-        assert_ne!(missing_producer, command);
-
-        let (old_root, old_bin, old_log) = cold_fixture();
-        assert!(
-            !run_build(
-                &missing_producer,
-                old_root.path(),
-                &old_bin,
-                &old_log,
-                "current",
-            )
-            .success(),
-            "the pre-fix command must fail from an empty target rather than consume a missing tests_misc binary"
-        );
-        assert!(!old_root
-            .path()
-            .join("target/ci/tests-misc.path")
-            .exists());
-
-        let (fixed_root, fixed_bin, fixed_log) = cold_fixture();
-        assert!(
-            run_build(
-                &command,
-                fixed_root.path(),
-                &fixed_bin,
-                &fixed_log,
-                "current",
-            )
-            .success()
-        );
-        assert!(fixed_root
-            .path()
-            .join("target/debug/build/hermit-detcore/cold/out/tests_misc-cold-fixture")
-            .is_file());
-        assert_eq!(
-            std::fs::read_to_string(fixed_root.path().join("target/ci/tests-misc.path"))
-                .unwrap(),
-            format!(
-                "{}/target/debug/build/hermit-detcore/cold/out/tests_misc-cold-fixture\n",
-                fixed_root.path().display()
-            )
-        );
-        assert_eq!(
-            std::fs::read_to_string(fixed_log).unwrap(),
-            format!(
-                "test -p hermit-detcore --test tests_misc --no-run --message-format=json\n{}\n",
-                HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND
-                    .strip_prefix("CARGO_BUILD_JOBS=8 cargo ")
-                    .unwrap()
-            )
-        );
-
-        for mode in ["missing", "wrong", "ambiguous"] {
-            let (root, bin, log) = cold_fixture();
-            assert!(
-                !run_build(&command, root.path(), &bin, &log, mode).success(),
-                "the fused build must refuse Cargo artifact mode {mode}"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
 mod e2e_attempt_tests {
     use super::*;
 
@@ -20398,7 +19253,7 @@ mod e2e_attempt_tests {
             "fixture",
             "target/debug/test-harness run --lane portable --ci-only".into(),
             Vec::new(),
-            30,
+            0,
             30,
             64 * 1024 * 1024,
         );
@@ -20421,7 +19276,7 @@ mod e2e_attempt_tests {
             "fixture",
             "cargo test".into(),
             Vec::new(),
-            30,
+            0,
             30,
             64 * 1024 * 1024,
         );

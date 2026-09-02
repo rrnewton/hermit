@@ -33,14 +33,13 @@
 //! `OOM-KILLED (hit inner MemoryMax; 3 oom_kill event(s))` at `peak≈256.0 MiB`
 //! and failed the run. Boxing works; it just has to be asked for.
 //!
-//! So: every node built here declares `timeout`, `cpu_timeout`, and a memory
-//! hint, and [`undeclared_nodes`] is the fail-closed audit that keeps it true.
+//! So: every node built here declares `cpu_timeout` and a memory hint, and its
+//! wall-clock hang backstop resolves wider than the CPU budget.
+//! [`undeclared_nodes`] is the fail-closed audit that keeps those properties true.
 //!
-//! Note also that `ci/dag/{portable,privileged}.json` declare memory hints on
-//! 47/47 and 8/8 nodes respectively, but `cpu_timeout` on **0/55** — so the
-//! per-step CPU-time guard is currently inert for every shipped lane node. This
-//! module supplies a profile-level `default_step_cpu_timeout` so those nodes get
-//! a load-immune budget without editing 55 JSON rows.
+//! The committed validation DAG declares both memory and CPU limits on every
+//! step. Synthetic focused profiles use the same default only while constructing
+//! nodes that have no committed representation.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -50,7 +49,6 @@ use dagrun::model::CmdType;
 use dagrun::model::DagConfig;
 use dagrun::model::ResourceHint;
 use dagrun::model::Step;
-use dagrun::model::StepClass;
 pub use hermit_manifest_plan::host_capability::HostCapability;
 pub use hermit_manifest_plan::host_capability::cpuid_faulting_absent;
 pub use hermit_manifest_plan::host_capability::kvm_absent;
@@ -59,42 +57,10 @@ pub use hermit_manifest_plan::host_capability::probe_host_capability;
 use crate::validate_corpus;
 use crate::validate_corpus::CorpusPaths;
 
-/// Wall budget for the preflight gates. Submodule init reaches the network
-/// through `with-proxy`, so it needs more than a trivial ceiling but must not
-/// inherit a lane-sized one.
-const PREFLIGHT_TIMEOUT_S: i64 = 900;
-/// CPU budget for the lightweight preflight checks. They are I/O-bound (clone,
-/// fetch, a small rustc); a tight CPU ceiling catches a spin without flaking
-/// under host load.
-const PREFLIGHT_CPU_TIMEOUT_S: i64 = 300;
-/// CPU budget for the manifest audit under an isolated operational cache.
-///
-/// Measured 2026-08-30 at Hermit 44668c4a: the exact single-job command used by
-/// `gate.manifest` completed in 443.93 CPU seconds / 479.84 wall seconds with a
-/// fresh `XDG_CACHE_HOME` (625196 KiB / 610.5 MiB peak RSS), versus 100.65 CPU
-/// seconds warm.
-/// Run 1577 killed that same cold path at the former 300-second CPU cap while
-/// rust-script was compiling `scripts/validate.rs --self-test`. Keep the wall
-/// and memory ceilings unchanged and widen only this CPU-heavy audit; the two
-/// lightweight preflight checks retain the tighter 300-second spin detector.
-const MANIFEST_AUDIT_CPU_TIMEOUT_S: i64 = 600;
-/// Memory ceiling for a preflight gate. `git submodule update --recursive` on
-/// this tree peaks well under a GiB; 2 GiB leaves headroom without being a
-/// non-cap.
-const PREFLIGHT_MEM_BYTES: i64 = 2 * 1024 * 1024 * 1024;
-
 /// The manifest audit is an executable consumer, so its producer is part of
 /// the always-on preflight spine rather than an incidental lane root.
 pub const MANIFEST_PLAN_PRODUCER_TAG: &str = "setup.manifest_plan";
 pub const MANIFEST_PLAN_BUILD_COMMAND: &str = "cargo build -p hermit-manifest-plan --bins";
-const MANIFEST_PLAN_BUILD_TIMEOUT_S: i64 = 180;
-const MANIFEST_PLAN_BUILD_MEM_BYTES: i64 = 2 * 1024 * 1024 * 1024;
-
-/// Per-lane-node CPU budget applied as the DAG-level default, closing the
-/// measured 0/55 `cpu_timeout` gap. Generous relative to the wall timeout because
-/// the build spine legitimately burns many CPU-minutes; it exists to stop an
-/// unbounded spin, not to police normal cost.
-const LANE_DEFAULT_CPU_TIMEOUT_S: i64 = 7200;
 
 /// Wall budget for one compatibility probe. Mirrors `STRICT_COMPAT_TIMEOUT=60`
 /// (validate.sh:1091).
@@ -104,9 +70,6 @@ const COMPAT_PORTABLE_DIAGNOSTIC_TIMEOUT_S: i64 = 20;
 /// Extended budget for the two large internal executables under e9patch
 /// (validate.sh:2991).
 const COMPAT_E9PATCH_LARGE_TIMEOUT_S: i64 = 180;
-/// CPU budget for a compatibility probe: these are short guest runs under Hermit,
-/// so a spin is the failure mode a CPU cap catches.
-const COMPAT_CPU_TIMEOUT_S: i64 = 120;
 /// Memory ceiling for a compatibility probe.
 const COMPAT_MEM_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 
@@ -296,11 +259,16 @@ pub fn node(
     cpu_timeout: i64,
     mem_bytes: i64,
 ) -> Step {
+    assert!(
+        cpu_timeout > 0 && (timeout == 0 || timeout > cpu_timeout),
+        "{group}.{job}: explicit timeout policy must have CPU > 0 and wall = 0 (derived) or wall > CPU; wall={timeout} cpu={cpu_timeout}"
+    );
     Step {
         group: group.to_string(),
         job: job.to_string(),
         desc: desc.to_string(),
         description: String::new(),
+        labels: Vec::new(),
         cmd,
         cmdtype: CmdType::Unknown,
         manifest: None,
@@ -364,138 +332,28 @@ pub fn shell_join<I: IntoIterator<Item = S>, S: AsRef<str>>(argv: I) -> String {
 /// or repairing a checkout before observing it would erase the exact drift this
 /// gate exists to detect. A caller with an uninitialized checkout must run
 /// `make checkout-all` explicitly, then retry validation.
-pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
-    let proxy = if with_proxy { "with-proxy " } else { "" };
-    // The Reverie-pin launcher is bound to THIS repository explicitly, never left
-    // to whatever directory the node happens to start in. `target/debug/test-harness`'s
-    // `assert_reverie_pin_enforcement` audits that binding, because "it will be
-    // the right repo because cwd is right" is an inference, not an observation —
-    // and the archival pin is not a testing exemption.
-    let root = shell_quote(&root.to_string_lossy());
-    let mut manifest_plan = node(
-        "setup",
-        "manifest_plan",
-        "Build the manifest-plan binaries the metadata validation runs",
-        MANIFEST_PLAN_BUILD_COMMAND.to_string(),
-        vec!["pre.reverie_pin".to_string()],
-        MANIFEST_PLAN_BUILD_TIMEOUT_S,
-        LANE_DEFAULT_CPU_TIMEOUT_S,
-        MANIFEST_PLAN_BUILD_MEM_BYTES,
-    );
-    manifest_plan.hint.est_duration_s = 60.0;
-    manifest_plan.hint.classification = StepClass::CpuBound;
-
-    vec![
-        node(
-            "pre",
-            "submodules",
-            "Verify repository submodules without initializing or repairing them",
-            "./ci/verify-submodules.sh --self-test && ./ci/verify-submodules.sh".to_string(),
-            vec![],
-            PREFLIGHT_TIMEOUT_S,
-            PREFLIGHT_CPU_TIMEOUT_S,
-            PREFLIGHT_MEM_BYTES,
-        ),
-        node(
-            // Tag must stay `pre.reverie_pin`: scripts/validate.rs asserts a
-            // passing node with exactly this tag before it will emit a PASS.
-            "pre",
-            "reverie_pin",
-            "Reverie pin consistency",
-            format!("{proxy}{root}/ci/run-reverie-pin-check.sh --repo {root}"),
-            vec!["pre.submodules".to_string()],
-            PREFLIGHT_TIMEOUT_S,
-            PREFLIGHT_CPU_TIMEOUT_S,
-            PREFLIGHT_MEM_BYTES,
-        ),
-        manifest_plan,
-        node(
-            "gate",
-            "manifest",
-            "Centralized test manifest and inventory",
-            "target/debug/test-harness validate".to_string(),
-            vec![MANIFEST_PLAN_PRODUCER_TAG.to_string()],
-            PREFLIGHT_TIMEOUT_S,
-            MANIFEST_AUDIT_CPU_TIMEOUT_S,
-            PREFLIGHT_MEM_BYTES,
-        ),
-    ]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn manifest_audit_uses_its_measured_cold_cache_cpu_budget_only() {
-        let nodes = preflight_nodes(Path::new("/repo"), false);
-        let expected = vec![
-            ("pre.submodules".to_string(), 900, 300, Some(2_147_483_648)),
-            ("pre.reverie_pin".to_string(), 900, 300, Some(2_147_483_648)),
-            ("setup.manifest_plan".to_string(), 180, 7200, Some(2_147_483_648)),
-            ("gate.manifest".to_string(), 900, 600, Some(2_147_483_648)),
-        ];
-        let check = |candidate: &[Step]| {
-            let observed = candidate
+pub fn preflight_nodes(root: &Path) -> Result<Vec<Step>, String> {
+    let committed = validation_config(root)?;
+    let tags = [
+        "pre.submodules",
+        "pre.reverie_pin",
+        "build.rust_scripts",
+        MANIFEST_PLAN_PRODUCER_TAG,
+        "gate.manifest",
+    ];
+    let mut out = Vec::with_capacity(tags.len());
+    for tag in tags {
+        out.push(
+            committed
+                .steps
                 .iter()
-                .map(|step| {
-                    (
-                        step.tag(),
-                        step.timeout,
-                        step.cpu_timeout,
-                        step.hint.hard_mem_max_bytes,
-                    )
-                })
-                .collect::<Vec<_>>();
-            (observed == expected).then_some(()).ok_or(observed)
-        };
-
-        assert_eq!(check(&nodes), Ok(()));
-
-        let mut lowered_gate = nodes.clone();
-        lowered_gate
-            .iter_mut()
-            .find(|step| step.tag() == "gate.manifest")
-            .expect("gate.manifest exists")
-            .cpu_timeout = 300;
-        assert!(
-            check(&lowered_gate).is_err(),
-            "restoring the measured audit's inadequate 300-second CPU cap must fail"
-        );
-
-        let mut widened_neighbor = nodes;
-        widened_neighbor
-            .iter_mut()
-            .find(|step| step.tag() == "pre.reverie_pin")
-            .expect("pre.reverie_pin exists")
-            .cpu_timeout = 600;
-        assert!(
-            check(&widened_neighbor).is_err(),
-            "widening a neighboring lightweight preflight cap must fail"
+                .find(|step| step.tag() == tag)
+                .cloned()
+                .ok_or_else(|| format!("committed validation DAG lost preflight node {tag}"))?,
         );
     }
+    Ok(out)
 }
-
-/// Remove a lane's duplicate manifest-plan producer and bind its consumers to
-/// the always-on preflight producer.
-///
-/// Lane JSON retains the producer because it is also executable independently.
-/// Once a lane is attached to validate's preflight, however, keeping that root
-/// would either duplicate the tag or recreate the old `gate -> producer -> gate`
-/// cycle. Refuse command drift before remapping the dependency.
-pub fn lane_nodes_reusing_manifest_producer(
-    root: &Path,
-    lane: &str,
-    prefix: &str,
-    gate_dep: &str,
-) -> Result<Vec<Step>, String> {
-    let mut steps = lane_nodes(root, lane, prefix, gate_dep)?;
-    if !reuse_preflight_manifest_producer(&mut steps, &format!("lane {lane}"))? {
-        return Err(format!("lane {lane} has no manifest-plan producer"));
-    }
-    Ok(steps)
-}
-
 /// Replace a selected lane's manifest-plan producer with the equivalent node
 /// already present in validate's preflight spine.
 ///
@@ -521,7 +379,9 @@ pub fn reuse_preflight_manifest_producer(
     let Some(index) = producer_indexes.first().copied() else {
         return Ok(false);
     };
-    if steps[index].cmd != MANIFEST_PLAN_BUILD_COMMAND {
+    if steps[index].cmd != MANIFEST_PLAN_BUILD_COMMAND
+        && !steps[index].cmd.ends_with(MANIFEST_PLAN_BUILD_COMMAND)
+    {
         return Err(format!(
             "{context} manifest-plan producer command drifted: {}",
             steps[index].cmd
@@ -541,68 +401,41 @@ pub fn reuse_preflight_manifest_producer(
     Ok(true)
 }
 
-/// THE one place a CI lane's file is resolved.
+/// THE one place the committed validation DAG is resolved.
 ///
 /// `target/debug/test-harness` audits that this expression appears EXACTLY ONCE in this
 /// file, so that a lane's node set can never be resolved from two places that
 /// could drift. Both `lane_nodes` (steps) and `lane_config` (top-level config)
 /// go through here; adding a second construction of the path is what the audit
 /// exists to catch, and it caught exactly that when `lane_config` was added.
-pub fn lane_dag_path(root: &Path, lane: &str) -> std::path::PathBuf {
-    root.join("ci").join("dag").join(format!("{lane}.json"))
+pub fn validation_dag_path(root: &Path) -> std::path::PathBuf {
+    root.join("ci").join("dag").join("validate.json")
 }
 
-/// Load one shipped CI lane (`ci/dag/<lane>.json`) and hang it off the preflight.
+/// Select one labelled subset from the committed validation DAG.
 ///
-/// `prefix` disambiguates tags when two lanes are fused into one DAG; it is empty
-/// for a single-lane run so tags stay byte-identical to the shipped file (which
-/// keeps `ci/run-node.sh`, the perf store, and the coverage predicate keyed the
-/// same way).
+/// `prefix` and `gate_dep` remain in the compatibility signature for focused
+/// callers, but only the canonical empty prefix and `gate.manifest` value are
+/// accepted. The committed graph already contains final tags and dependencies;
+/// accepting any other values would pretend a runtime rewrite still occurred.
 pub fn lane_nodes(
     root: &Path,
     lane: &str,
     prefix: &str,
     gate_dep: &str,
 ) -> Result<Vec<Step>, String> {
-    let path = lane_dag_path(root, lane);
+    if !prefix.is_empty() || gate_dep != "gate.manifest" {
+        return Err(format!(
+            "committed validation labels do not support runtime retagging or dependency injection: prefix={prefix:?} gate_dep={gate_dep:?}"
+        ));
+    }
+    let path = validation_dag_path(root);
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let cfg = dag_from_json(&text).map_err(|e| format!("invalid DAG {}: {e}", path.display()))?;
-    let retag = |g: &str| if prefix.is_empty() { g.to_string() } else { format!("{prefix}{g}") };
-    let mut out = Vec::with_capacity(cfg.steps.len());
-    for s in &cfg.steps {
-        let mut step = s.clone();
-        // All buckets in one validate share E2E_RUN_ID, so the harness defaults
-        // would make concurrent processes append unrelated bucket rows to one
-        // file. Keep one run identity while isolating storage by lane and bucket.
-        if s.group == "e2e" && s.job.starts_with("manifest_") {
-            step.cmd.push_str(&format!(
-                " --results \"$E2E_RESULT_ROOT/{lane}/{}/results.jsonl\" --junit \"$E2E_RESULT_ROOT/{lane}/{}/junit.xml\"",
-                s.job, s.job
-            ));
-        }
-        step.group = retag(&s.group);
-        step.deps = s
-            .deps
-            .iter()
-            .map(|d| match d.split_once('.') {
-                Some((g, j)) => format!("{}.{}", retag(g), j),
-                None => d.clone(),
-            })
-            .collect();
-        // Every lane node waits on the manifest gate, reproducing
-        // run_ci_manifest_lane's ordering (validate.sh:4344).
-        if step.deps.is_empty() && !(s.group == "build" && s.job == "rust_scripts") {
-            step.deps.push(gate_dep.to_string());
-        }
-        // Supply a memory cap for any lane node that shipped without one, so the
-        // "declared caps" audit below cannot be satisfied by an unboxed node.
-        if step.hint.rss_baseline_bytes.is_none() && step.hint.hard_mem_max_bytes.is_none() {
-            step.hint.hard_mem_max_bytes = Some(8 * 1024 * 1024 * 1024);
-        }
-        out.push(step);
-    }
-    Ok(out)
+    let cfg = dagrun::select_steps_by_labels(&cfg, &[lane.to_string()])
+        .map_err(|e| format!("cannot select label {lane} from {}: {e}", path.display()))?;
+    Ok(cfg.steps)
 }
 
 // ------------------------------------------------- host-capability requirements
@@ -657,54 +490,30 @@ pub struct HostInapplicableNode {
     pub evidence: String,
 }
 
-/// The `requires_host_capability` declarations in one lane, keyed by runner tag.
+/// Host-capability labels in one validation subset, keyed by runner tag.
 ///
-/// Reads the same file `lane_nodes` reads, through the same single path helper.
-/// `prefix` matches the retagging `lane_nodes` applies when lanes are fused.
-/// An unparseable capability name is an ERROR: refusing the whole run is the
-/// only safe response to a declaration nobody can evaluate.
+/// Reads the same committed validation DAG `lane_nodes` reads.
+/// Capability labels use the existing closed `HostCapability` vocabulary and
+/// remain independent of the profile label used to select the subset.
 pub fn lane_host_capability_requirements(
     root: &Path,
     lane: &str,
-    prefix: &str,
 ) -> Result<BTreeMap<String, HostCapability>, String> {
-    let path = lane_dag_path(root, lane);
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let raw: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("invalid DAG {}: {e}", path.display()))?;
-    let steps = raw
-        .get("steps")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| format!("invalid DAG {}: 'steps' must be a list", path.display()))?;
+    let cfg = validation_config(root)?;
     let mut out = BTreeMap::new();
-    for step in steps {
-        let Some(declared) = step.get("requires_host_capability") else {
+    for step in &cfg.steps {
+        if !step.labels.iter().any(|label| label == lane) {
             continue;
-        };
-        let name = declared.as_str().ok_or_else(|| {
-            format!(
-                "{}: requires_host_capability must be a string",
-                path.display()
-            )
-        })?;
-        let capability = HostCapability::from_value(name).ok_or_else(|| {
-            format!(
-                "{}: unknown requires_host_capability '{name}'; the capability vocabulary is \
-                 closed (hermit_manifest_plan::host_capability::HostCapability) and an unrecognized name \
-                 is refused rather than treated as a reason to omit a node",
-                path.display()
-            )
-        })?;
-        let group = step.get("group").and_then(serde_json::Value::as_str).unwrap_or_default();
-        let job = step.get("job").and_then(serde_json::Value::as_str).unwrap_or_default();
-        if group.is_empty() || job.is_empty() {
-            return Err(format!(
-                "{}: a step declaring requires_host_capability has no group.job identity",
-                path.display()
-            ));
         }
-        out.insert(format!("{prefix}{group}.{job}"), capability);
+        for capability in [HostCapability::CpuidFaulting, HostCapability::Kvm] {
+            if step
+                .labels
+                .iter()
+                .any(|label| label == capability.value())
+            {
+                out.insert(step.tag(), capability);
+            }
+        }
     }
     Ok(out)
 }
@@ -716,10 +525,8 @@ pub fn host_capability_requirements(
     root: &Path,
 ) -> Result<BTreeMap<String, HostCapability>, String> {
     let mut out = BTreeMap::new();
-    for lane in ["portable", "privileged"] {
-        for prefix in ["".to_string(), format!("{lane}-")] {
-            out.extend(lane_host_capability_requirements(root, lane, &prefix)?);
-        }
+    for lane in ["portable", "privileged", "full", "quick", "super"] {
+        out.extend(lane_host_capability_requirements(root, lane)?);
     }
     Ok(out)
 }
@@ -853,8 +660,8 @@ pub fn compat_nodes_for(
             &format!("{} compatibility: {}", mode.display_name(), row.label),
             format!("{} </dev/null", shell_join(&argv)),
             gate_dep.map(|d| vec![d.to_string()]).unwrap_or_default(),
+            0,
             wall,
-            COMPAT_CPU_TIMEOUT_S.max(wall),
             COMPAT_MEM_BYTES,
         ));
     }
@@ -916,7 +723,17 @@ pub fn sanitize_job(label: &str) -> String {
 /// top-level, and every one of them silently reverts to `DagConfig::default()` if
 /// the caller rebuilds the config instead of carrying it.
 pub fn lane_config(root: &Path, lane: &str) -> Result<DagConfig, String> {
-    let path = lane_dag_path(root, lane);
+    let path = validation_dag_path(root);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let cfg = dag_from_json(&text).map_err(|e| format!("invalid DAG {}: {e}", path.display()))?;
+    dagrun::select_steps_by_labels(&cfg, &[lane.to_string()])
+        .map_err(|e| format!("cannot select label {lane} from {}: {e}", path.display()))
+}
+
+/// Load the complete committed validation DAG without selecting a profile.
+pub fn validation_config(root: &Path) -> Result<DagConfig, String> {
+    let path = validation_dag_path(root);
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     dag_from_json(&text).map_err(|e| format!("invalid DAG {}: {e}", path.display()))
@@ -926,32 +743,16 @@ pub fn lane_config(root: &Path, lane: &str) -> Result<DagConfig, String> {
 ///
 /// # Why this takes a base at all
 ///
-/// It used to be `DagConfig { steps, ..Default::default() }`, which loaded a DAG
-/// file, kept its steps, and threw its configuration away. That is not a
-/// hypothetical: it hung a full validate for 14 minutes at 0% CPU.
-/// `ci/dag/portable.json` declares `resource_caps {manifest_guest: 8}`;
-/// dropping it leaves `res_free` evaluating `unwrap_or(0) >= 1` for the 13
-/// steps demanding `manifest_guest`, so none can be admitted. The scheduler's
-/// only exit is `running.is_empty() && done + skipped >= steps.len()`, so with
-/// work neither runnable nor accounted it slept at 50 ms forever -- no error, no
-/// exit, 21 of ~58 nodes done.
-///
-/// `resource_caps` failed LOUDLY (a visible hang). The quieter one matters more:
-/// `default_step_timeout` is 600 s in portable and 120 s in privileged, and
-/// reverted to `DEFAULT_STEP_TIMEOUT` (1800 s) -- every step's wall cap loosened
-/// 3x and 15x respectively, with nothing to see. `mem_cap_factor`,
-/// `mem_cap_floor_bytes` and `outer_mem_safety_factor` happen to equal their
-/// defaults today, so they would have broken the first time anyone tuned them.
-///
-/// Hence: carry the base wholesale, and let [`assert_config_carried`] prove it.
+/// Rebuilding a selected plan with `DagConfig::default()` silently discards
+/// document policy such as resource capacities, memory factors, job controls,
+/// and timeout derivation. A demand whose capacity disappeared cannot ever be
+/// admitted, while a missing default can change enforcement without changing a
+/// step. Carry the committed config wholesale and let [`assert_config_carried`]
+/// prove every top-level field remains intact.
 pub fn config_from_base(base: &DagConfig, steps: Vec<Step>, description: &str) -> DagConfig {
     let mut cfg = base.clone();
     cfg.steps = steps;
     cfg.description = description.to_string();
-    // The one DELIBERATE divergence: shipped lane nodes declare cpu_timeout on
-    // 0 of 55, so supply a load-immune default. A node's own cpu_timeout still
-    // wins via effective_cpu_timeout. Recorded here so the audit can exempt it.
-    cfg.default_step_cpu_timeout = LANE_DEFAULT_CPU_TIMEOUT_S;
     cfg
 }
 
@@ -965,8 +766,7 @@ pub fn config_from(steps: Vec<Step>, description: &str) -> DagConfig {
 /// Enumerated deliberately rather than derived from a `PartialEq`: a new
 /// `DagConfig` field must force a decision here instead of silently defaulting,
 /// which is the exact failure this function exists to prevent. `steps` and
-/// `description` are expected to differ; `default_step_cpu_timeout` is the one
-/// documented divergence above.
+/// `description` are expected to differ.
 pub fn assert_config_carried(base: &DagConfig, derived: &DagConfig) -> Result<(), String> {
     let mut bad: Vec<String> = Vec::new();
     if base.resource_caps != derived.resource_caps {
@@ -996,6 +796,12 @@ pub fn assert_config_carried(base: &DagConfig, derived: &DagConfig) -> Result<()
     if base.default_step_cpu_count != derived.default_step_cpu_count {
         bad.push(format!("default_step_cpu_count {:?} != {:?}", base.default_step_cpu_count, derived.default_step_cpu_count));
     }
+    if base.default_step_cpu_timeout != derived.default_step_cpu_timeout {
+        bad.push(format!(
+            "default_step_cpu_timeout {} != {}",
+            base.default_step_cpu_timeout, derived.default_step_cpu_timeout
+        ));
+    }
     if bad.is_empty() { Ok(()) } else { Err(bad.join("; ")) }
 }
 
@@ -1018,8 +824,8 @@ pub fn ungrantable_resources(cfg: &DagConfig) -> Vec<String> {
     bad
 }
 
-/// Fail-closed audit: every node in a plan must declare a wall timeout, a CPU
-/// budget (its own or the config default), and a memory cap.
+/// Fail-closed audit: every node in a plan must declare a CPU budget and a
+/// memory cap, and must resolve to a wider wall-clock hang backstop.
 ///
 /// This is the guard that keeps the module doc's claim true as nodes are added.
 /// Without it, a future node added without hints would run UNBOXED while the
@@ -1032,9 +838,15 @@ pub fn undeclared_nodes(cfg: &DagConfig) -> Vec<String> {
         .iter()
         .filter(|s| {
             let mem = s.hint.hard_mem_max_bytes.is_some() || s.hint.rss_baseline_bytes.is_some();
-            let cpu = s.cpu_timeout > 0 || cfg.default_step_cpu_timeout > 0;
-            let wall = s.timeout > 0;
-            !(mem && cpu && wall)
+            let cpu = s.cpu_timeout > 0;
+            let wall = dagrun::resolved_wall_timeout(
+                s,
+                cfg.default_step_timeout,
+                cfg.cpu_timeout_multiplier,
+            );
+            let effective_cpu =
+                (s.cpu_timeout as f64 * cfg.cpu_timeout_multiplier).round() as i64;
+            !(mem && cpu && wall > effective_cpu)
         })
         .map(|s| s.tag())
         .collect()

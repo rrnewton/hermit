@@ -201,6 +201,16 @@ pub struct SeriesNoVerdictEvidence {
     pub attempts: Vec<SeriesAttemptDisposition>,
 }
 
+fn is_prelaunch_timeout_disposition(disposition: &SeriesAttemptDisposition) -> bool {
+    disposition.timed_out
+        && disposition.status.is_none()
+        && disposition.signal.is_none()
+        && matches!(
+            disposition.error_kind.as_deref(),
+            Some("incomplete-verification-evidence" | "cpu-timeout" | "wall-timeout")
+        )
+}
+
 fn one_run() -> u64 {
     1
 }
@@ -552,11 +562,7 @@ impl SeriesRow {
                     } else {
                         SeriesOutcome::NoResult
                     };
-                    let no_process_timeout = disposition.timed_out
-                        && disposition.status.is_none()
-                        && disposition.signal.is_none()
-                        && disposition.error_kind.as_deref()
-                            == Some("incomplete-verification-evidence");
+                    let no_process_timeout = is_prelaunch_timeout_disposition(disposition);
                     if disposition.attempt_outcome != "ERROR"
                         || disposition.disposition != expected
                         || disposition
@@ -1187,7 +1193,18 @@ mod tests {
         disposition.status = None;
         disposition.signal = None;
         disposition.timed_out = true;
-        prelaunch_timeout.validate_for_write().unwrap();
+        for error_kind in [
+            "incomplete-verification-evidence",
+            "cpu-timeout",
+            "wall-timeout",
+        ] {
+            let mut typed = prelaunch_timeout.clone();
+            typed.series.no_verdict_evidence.as_mut().unwrap().attempts[0].error_kind =
+                Some(error_kind.into());
+            typed.validate_for_write().unwrap_or_else(|error| {
+                panic!("typed pre-launch timeout {error_kind} was refused: {error}")
+            });
+        }
 
         let mut wrong_prelaunch_kind = prelaunch_timeout;
         wrong_prelaunch_kind

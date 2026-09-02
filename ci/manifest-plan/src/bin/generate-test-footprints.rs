@@ -25,8 +25,17 @@ use serde_json::json;
 
 const POLICY: &str = "ci/test-footprints-policy.json";
 const OUTPUT: &str = "ci/test-footprints.json";
-const DAG: &str = "ci/dag/portable.json";
+const DAG: &str = "ci/dag/validate.json";
 const REGENERATE: &str = "cargo run -p hermit-manifest-plan --bin generate-test-footprints";
+const STRICT_COMPAT_SELECTION_ALIAS: &str = "test.strict_compat";
+
+fn known_selection_node(nodes: &BTreeSet<String>, node: &str) -> bool {
+    nodes.contains(node)
+        || (node == STRICT_COMPAT_SELECTION_ALIAS
+            && nodes
+                .iter()
+                .any(|candidate| candidate.starts_with("compat.")))
+}
 
 #[derive(Debug)]
 struct Package {
@@ -326,6 +335,14 @@ fn load_dag_targets(
     let mut all_nodes = BTreeSet::new();
     let mut targets = BTreeMap::new();
     for step in steps {
+        if !step["labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|label| label.as_str() == Some("portable"))
+        {
+            continue;
+        }
         let group = step["group"]
             .as_str()
             .unwrap_or_else(|| die(format!("{DAG}: step is missing `group`")));
@@ -362,7 +379,7 @@ fn load_rules(
         let location = format!("{POLICY}: package_rules[{index}]");
         let rule_nodes = strings(raw_rule, "nodes", &location);
         for node in &rule_nodes {
-            if !nodes.contains(node) {
+            if !known_selection_node(nodes, node) {
                 die(format!("{location}: unknown portable DAG node `{node}`"));
             }
         }
@@ -400,7 +417,7 @@ fn validate_path_footprints(policy: &Value, nodes: &BTreeSet<String>) {
         let location = format!("{POLICY}: path_footprints[{index}]");
         let _ = strings(footprint, "paths", &location);
         for node in strings(footprint, "nodes", &location) {
-            if !nodes.contains(&node) {
+            if !known_selection_node(nodes, &node) {
                 die(format!("{location}: unknown portable DAG node `{node}`"));
             }
         }

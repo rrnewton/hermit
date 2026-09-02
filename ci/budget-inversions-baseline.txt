@@ -10,30 +10,17 @@
 # inverts -- so the list can only shrink, and a fix must delete its line.
 #
 # HOW TO REMOVE A LINE, and this is a real decision rather than a formality:
-#   * lower the node's wall in ci/dag/<lane>.json so it fits inside the job, which
+#   * lower the node's wall in ci/dag/validate.json so it fits inside the job, which
 #     may make a node that has always silently overrun start failing visibly --
 #     that is newly EXPOSED, not newly broken; or
 #   * raise that job's timeout-minutes, which is a cap increase and needs the
 #     explicit approval that class of change requires.
 # Both are CI policy calls. The guard deliberately does not choose.
 #
-# Format: <node> <declared>s >= <bound>s (<what bounds it>)
-doc.doctests 900s >= 900s (job test-debug timeout-minutes)
-doc.rustdoc 900s >= 900s (job test-debug timeout-minutes)
-lint.clippy 1200s >= 900s (job test-debug timeout-minutes)
-test.app_strict_verify 900s >= 900s (job test-debug timeout-minutes)
-test.arbitrary_binaries 900s >= 900s (job test-debug timeout-minutes)
-test.cli 900s >= 900s (job test-debug timeout-minutes)
-test.command_strict_verify 900s >= 900s (job test-debug timeout-minutes)
-test.dbt_parity 900s >= 900s (job test-release timeout-minutes)
-test.detcore_unit 900s >= 900s (job test-debug timeout-minutes)
-test.envelope_levels 900s >= 900s (job test-debug timeout-minutes)
-test.hermit_integration 1200s >= 900s (job test-debug timeout-minutes)
-test.hermit_modes 900s >= 900s (job test-debug timeout-minutes)
-test.hermit_unit 900s >= 900s (job test-debug timeout-minutes)
-test.liteinst_strict 900s >= 900s (job test-release timeout-minutes)
-test.regular_crates 900s >= 900s (job test-debug timeout-minutes)
-test.sabre_examples 900s >= 900s (job test-release timeout-minutes)
+# Format: <node> <resolved-wall>s >= <bound>s (<what bounds it>)
+#
+# Empty as of 2026-09-02. The hosted job walls were moved outside the selected
+# graph's derived wall backstops when the committed DAG made CPU time primary.
 #
 # REMOVED 2026-08-10, and this is what a shrink looks like:
 #   test.strict_compat 1800s >= 900s (job test-debug timeout-minutes)

@@ -11,7 +11,7 @@
 //! selection frequency. This tool joins the two so rarely selected, relatively
 //! heavy nodes can be reviewed for moving off the per-commit critical path.
 //!
-//!   * WEIGHT  = `hint.est_duration_s` from `ci/dag/portable.json`. Despite the
+//!   * WEIGHT  = `hint.est_duration_s` from `ci/dag/validate.json`. Despite the
 //!               legacy field name, these values are UNMEASURED scheduling
 //!               hints (see ci/dag/README). This tool treats them as unitless,
 //!               ordinal weights and never presents them as elapsed seconds.
@@ -88,6 +88,14 @@ fn load_nodes(dag_path: &Path) -> BTreeMap<String, Node> {
         .unwrap_or_else(|e| fail(&format!("invalid JSON in {}: {e}", dag_path.display())));
     let mut nodes = BTreeMap::new();
     for s in v["steps"].as_array().unwrap_or(&vec![]) {
+        if !s["labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|label| label.as_str() == Some("portable"))
+        {
+            continue;
+        }
         let tag = format!(
             "{}.{}",
             s["group"].as_str().unwrap_or(""),
@@ -214,7 +222,7 @@ nightly', never 'safe to delete'.
     if !selector.exists() {
         fail(&format!("selector not found at {}", selector.display()));
     }
-    let mut nodes = load_nodes(&root.join("ci/dag/portable.json"));
+    let mut nodes = load_nodes(&root.join("ci/dag/validate.json"));
 
     let commits = sample_commits(&rev, sample);
     if commits.is_empty() {

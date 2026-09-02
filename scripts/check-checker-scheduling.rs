@@ -279,7 +279,7 @@ fn main() {
     // instrument must read the field that CAUSES execution, not the field that
     // discusses it.
     let mut seed = String::new();
-    for dag in ["ci/dag/portable.json", "ci/dag/privileged.json"] {
+    for dag in ["ci/dag/validate.json"] {
         if Path::new(dag).exists() {
             let raw = std::fs::read_to_string(dag).unwrap();
             let cmds = extract_cmds(&raw);
