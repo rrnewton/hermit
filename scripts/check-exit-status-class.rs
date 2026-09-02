@@ -746,9 +746,10 @@ mod tests {
 
     /// ⚠️ PINS THE `.code()` CLAUSE INDEPENDENTLY, and it is the mirror of the
     /// blind spot that `catches_a_site_whose_context_says_status_without_calling_code`
-    /// closed. Every other fixture spells the call `output.status.code()`, which
-    /// also contains `status` -- so that clause was never the reason a fixture
-    /// matched, and the `.code()` half could be deleted with all cases green.
+    /// closed. Every older fixture contained `status` somewhere in the matcher
+    /// window -- including the `o.status.code()` and standalone `status.code()`
+    /// spellings -- so that clause could match even with the `.code()` half
+    /// deleted.
     /// Closing one half of an `||` is what leaves the other half untested.
     #[test]
     fn catches_code_without_the_word_status_anywhere() {
@@ -764,9 +765,10 @@ mod tests {
         );
     }
 
-    /// The FORWARD half of the context window. Every other fixture puts the
-    /// status mention ABOVE the value, so `hi` could collapse from `i + 7` to
-    /// `i + 1` untouched. This is expected-first ordering, which is ordinary Rust.
+    /// The FORWARD half of the context window. No older fixture put the status
+    /// mention below the value; it appeared above or on the same line. Therefore
+    /// `hi` could collapse from `i + 7` to `i + 1` untouched. This is
+    /// expected-first ordering, which is ordinary Rust.
     #[test]
     fn catches_the_status_mention_below_the_value() {
         // ⚠️ THE STATUS MENTION IS SIX LINES BELOW THE VALUE, AND THE PADDING IS
