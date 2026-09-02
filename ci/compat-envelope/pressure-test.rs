@@ -1366,6 +1366,24 @@ fn run() -> Result<(), String> {
                 return Err("run refuses a dirty checkout; commit first so every row binds to reproducible source".into());
             }
             require_empty_result_dir(&results)?;
+            let results_preexisted = results.exists();
+            let output = results.join("dag.json");
+            let checked_scorecard = check_scorecard(&root)?;
+            let (scope_metadata, _) = construct_plan_after_scorecard_check(
+                &checked_scorecard,
+                &results,
+                &output,
+                &selection,
+                false,
+            )?;
+            require_empty_result_dir(&results)?;
+            if !results_preexisted && results.exists() {
+                return Err(format!(
+                    "side-effect-free pressure plan construction unexpectedly created {} before scope establishment",
+                    results.display()
+                ));
+            }
+            let cgroups = establish_pressure_cgroups(scope_metadata.run_timeout_seconds)?;
             let started = Instant::now();
             let sha = git_output(&root, &["rev-parse", "HEAD"])?;
             let fresh = if selection.allows_dirty_source() {
@@ -1382,10 +1400,14 @@ fn run() -> Result<(), String> {
                 .as_ref()
                 .map(|checkout| checkout.path.as_path())
                 .unwrap_or(root.as_path());
-            let output = results.join("dag.json");
             let run_result = (|| {
                 let (metadata, dag) = write_plan(execution_root, &results, &output, &selection)?;
-                let cgroups = establish_pressure_cgroups(metadata.run_timeout_seconds)?;
+                if metadata.run_timeout_seconds != scope_metadata.run_timeout_seconds {
+                    return Err(format!(
+                        "pressure plan changed its whole-run bound across scope establishment: {}s before, {}s after",
+                        scope_metadata.run_timeout_seconds, metadata.run_timeout_seconds
+                    ));
+                }
                 print_unavailable(&metadata);
                 print_sample(&metadata);
                 if exact_cell {
@@ -2592,6 +2614,16 @@ fn write_plan_after_scorecard_check(
     output: &Path,
     selection: &CellSelection,
 ) -> Result<(RunMetadata, DagConfig), String> {
+    construct_plan_after_scorecard_check(checked_scorecard, results, output, selection, true)
+}
+
+fn construct_plan_after_scorecard_check(
+    checked_scorecard: &CheckedScorecard<'_>,
+    results: &Path,
+    output: &Path,
+    selection: &CellSelection,
+    persist: bool,
+) -> Result<(RunMetadata, DagConfig), String> {
     let root = checked_scorecard.root;
     let PressureCells {
         selected: cells,
@@ -2632,10 +2664,13 @@ fn write_plan_after_scorecard_check(
             "--repetitions would generate {generated_nodes} nodes, above dagrun's {MAX_PRESSURE_GENERATED_NODES}-node safety bound"
         ));
     }
-    fs::create_dir_all(results).map_err(|e| format!("cannot create {}: {e}", results.display()))?;
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    if persist {
+        fs::create_dir_all(results)
+            .map_err(|e| format!("cannot create {}: {e}", results.display()))?;
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        }
     }
 
     let mut steps = Vec::new();
@@ -3062,14 +3097,16 @@ fn write_plan_after_scorecard_check(
         &cell_timeouts,
     )?;
     let retained_output = results.join("dag.json");
-    fs::write(&retained_output, &dag_text)
-        .map_err(|e| format!("cannot write {}: {e}", retained_output.display()))?;
     if output != retained_output {
         return Err(format!(
             "pressure plan must be retained and executed at {}; refusing alternate output {}",
             retained_output.display(),
             output.display()
         ));
+    }
+    if persist {
+        fs::write(&retained_output, &dag_text)
+            .map_err(|e| format!("cannot write {}: {e}", retained_output.display()))?;
     }
 
     let metadata = RunMetadata {
@@ -3101,8 +3138,10 @@ fn write_plan_after_scorecard_check(
     let mut metadata_text = serde_json::to_string_pretty(&metadata)
         .map_err(|e| format!("cannot serialize run metadata: {e}"))?;
     metadata_text.push('\n');
-    fs::write(results.join("run.json"), metadata_text)
-        .map_err(|e| format!("cannot write run metadata: {e}"))?;
+    if persist {
+        fs::write(results.join("run.json"), metadata_text)
+            .map_err(|e| format!("cannot write run metadata: {e}"))?;
+    }
     Ok((metadata, dag))
 }
 
@@ -6204,12 +6243,27 @@ fn self_test(root: &Path) -> Result<(), String> {
         ..CellSelection::default()
     };
     let exact_results = scratch.join("exact-plan");
-    let (exact_metadata, _) = write_plan_after_scorecard_check(
+    let (pre_scope_metadata, pre_scope_dag) = construct_plan_after_scorecard_check(
+        &checked_scorecard,
+        &exact_results,
+        &exact_results.join("dag.json"),
+        &exact_selection,
+        false,
+    )?;
+    if exact_results.exists() {
+        return Err("side-effect-free pre-scope plan construction wrote to RESULTS".into());
+    }
+    let (exact_metadata, exact_dag) = write_plan_after_scorecard_check(
         &checked_scorecard,
         &exact_results,
         &exact_results.join("dag.json"),
         &exact_selection,
     )?;
+    if pre_scope_metadata.run_timeout_seconds != exact_metadata.run_timeout_seconds
+        || dag_to_json(&pre_scope_dag) != dag_to_json(&exact_dag)
+    {
+        return Err("pre-scope plan derivation differs from the retained execution plan".into());
+    }
     if exact_metadata.cells != [exact_id.clone()] {
         return Err("generated exact-cell plan did not retain exactly its requested cell".into());
     }
