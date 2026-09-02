@@ -106,6 +106,7 @@ const PRESSURE_RUN_TIMEOUT_SECONDS: i64 = 6 * 60 * 60 + PRESSURE_RUN_BACKSTOP_MA
 // allocating a generated plan rather than relying on allocation failure.
 const MAX_PRESSURE_GENERATED_NODES: usize = 100_000;
 const PRESSURE_SCOPE_TIMEOUT_ENV: &str = "HERMIT_PRESSURE_SCOPE_TIMEOUT_SECONDS";
+const PRESSURE_SAMPLE_SEED_ENV: &str = "HERMIT_PRESSURE_SAMPLE_SEED";
 const HERMETIC_TEST_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
 
@@ -136,11 +137,34 @@ fn pressure_scope_grace_s(run_timeout_s: i64) -> i64 {
     60.max(run_timeout_s / 10)
 }
 
+fn inherited_pressure_scope_timeout(run_timeout_s: i64) -> Result<Option<i64>, String> {
+    let inherited = match env::var(PRESSURE_SCOPE_TIMEOUT_ENV) {
+        Ok(raw) => Some(raw.parse::<i64>().map_err(|_| {
+            format!("{PRESSURE_SCOPE_TIMEOUT_ENV}={raw:?} is not a valid positive timeout")
+        })?),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(format!("{PRESSURE_SCOPE_TIMEOUT_ENV} is not valid UTF-8"));
+        }
+    };
+    if let Some(inherited) = inherited {
+        if inherited <= 0 {
+            return Err(format!(
+                "{PRESSURE_SCOPE_TIMEOUT_ENV}={inherited} is not a valid positive timeout"
+            ));
+        }
+        if inherited != run_timeout_s {
+            return Err(format!(
+                "pressure plan derived a {run_timeout_s}s whole-run bound after re-exec, but the outer scope was created for {inherited}s"
+            ));
+        }
+    }
+    Ok(inherited)
+}
+
 fn establish_pressure_cgroups(run_timeout_s: i64) -> Result<BoxedCgroups, String> {
     let already_in_scope = dagrun::cgroup::is_in_scope();
-    let inherited_marker = env::var(PRESSURE_SCOPE_TIMEOUT_ENV)
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok());
+    let inherited_marker = inherited_pressure_scope_timeout(run_timeout_s)?;
     if !already_in_scope {
         env::set_var(PRESSURE_SCOPE_TIMEOUT_ENV, run_timeout_s.to_string());
     }
@@ -157,6 +181,30 @@ fn establish_pressure_cgroups(run_timeout_s: i64) -> Result<BoxedCgroups, String
         owns_runtime,
     ))
     .map_err(|code| format!("cgroup setup refused with exit {code}"))
+}
+
+fn retain_sample_seed(selection: &mut CellSelection) -> Result<(), String> {
+    if selection.sample.is_none() || selection.seed.is_some() {
+        return Ok(());
+    }
+    let seed = match env::var(PRESSURE_SAMPLE_SEED_ENV) {
+        Ok(raw) => raw.parse::<u64>().map_err(|_| {
+            format!("{PRESSURE_SAMPLE_SEED_ENV}={raw:?} is not an unsigned integer")
+        })?,
+        Err(env::VarError::NotPresent) => {
+            let generated = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| format!("system clock is before the Unix epoch: {e}"))?
+                .as_nanos() as u64;
+            env::set_var(PRESSURE_SAMPLE_SEED_ENV, generated.to_string());
+            generated
+        }
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(format!("{PRESSURE_SAMPLE_SEED_ENV} is not valid UTF-8"));
+        }
+    };
+    selection.seed = Some(seed);
+    Ok(())
 }
 
 const USAGE: &str = r#"Hermit compatibility pressure test
@@ -1701,14 +1749,7 @@ fn result_options(
     if selection.seed.is_some() && selection.sample.is_none() {
         return Err("--seed requires --sample".into());
     }
-    if selection.sample.is_some() && selection.seed.is_none() {
-        selection.seed = Some(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| format!("system clock is before the Unix epoch: {e}"))?
-                .as_nanos() as u64,
-        );
-    }
+    retain_sample_seed(&mut selection)?;
     let results = match (results, default_results) {
         (Some(path), _) => absolute_from(root, path),
         (None, true) => default_result_root(root)?,
@@ -5314,6 +5355,70 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("tracked cells are empty".into());
     }
     safe_ci_scope::self_test()?;
+    let saved_scope_timeout = env::var_os(PRESSURE_SCOPE_TIMEOUT_ENV);
+    env::remove_var(PRESSURE_SCOPE_TIMEOUT_ENV);
+    let scope_timeout_check = (|| {
+        if inherited_pressure_scope_timeout(41)? != None {
+            return Err("an absent inherited pressure bound became present".into());
+        }
+        env::set_var(PRESSURE_SCOPE_TIMEOUT_ENV, "41");
+        if inherited_pressure_scope_timeout(41)? != Some(41) {
+            return Err("a matching inherited pressure bound was not retained".into());
+        }
+        let mismatch = inherited_pressure_scope_timeout(42)
+            .err()
+            .ok_or("a mismatched inherited pressure bound was accepted")?;
+        if !mismatch.contains("outer scope was created for 41s") {
+            return Err(format!(
+                "inherited pressure-bound mismatch refused for the wrong reason: {mismatch}"
+            ));
+        }
+        env::set_var(PRESSURE_SCOPE_TIMEOUT_ENV, "not-a-timeout");
+        if inherited_pressure_scope_timeout(41).is_ok() {
+            return Err("an invalid inherited pressure bound was accepted".into());
+        }
+        Ok(())
+    })();
+    match saved_scope_timeout {
+        Some(value) => env::set_var(PRESSURE_SCOPE_TIMEOUT_ENV, value),
+        None => env::remove_var(PRESSURE_SCOPE_TIMEOUT_ENV),
+    }
+    scope_timeout_check?;
+
+    let saved_sample_seed = env::var_os(PRESSURE_SAMPLE_SEED_ENV);
+    env::remove_var(PRESSURE_SAMPLE_SEED_ENV);
+    let sample_seed_check: Result<(), String> = (|| {
+        let mut first = CellSelection {
+            sample: Some(1),
+            ..CellSelection::default()
+        };
+        retain_sample_seed(&mut first)?;
+        let generated = first
+            .seed
+            .ok_or("sample selection did not retain its generated seed")?;
+        let mut reentered = CellSelection {
+            sample: Some(1),
+            ..CellSelection::default()
+        };
+        retain_sample_seed(&mut reentered)?;
+        if reentered.seed != Some(generated) {
+            return Err("sample selection changed its seed across re-exec".into());
+        }
+        env::set_var(PRESSURE_SAMPLE_SEED_ENV, "not-a-seed");
+        let mut invalid = CellSelection {
+            sample: Some(1),
+            ..CellSelection::default()
+        };
+        if retain_sample_seed(&mut invalid).is_ok() {
+            return Err("an invalid inherited sample seed was accepted".into());
+        }
+        Ok(())
+    })();
+    match saved_sample_seed {
+        Some(value) => env::set_var(PRESSURE_SAMPLE_SEED_ENV, value),
+        None => env::remove_var(PRESSURE_SAMPLE_SEED_ENV),
+    }
+    sample_seed_check?;
     if series_run_index("a-cell-repetition-0004") != 4
         || series_run_index("a-cell-with-no-suffix") != 0
     {
