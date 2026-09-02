@@ -23,9 +23,10 @@
 //!      scripts/check-detcore-backend-abstraction.sh:264 names
 //!      check-detcore-backend-abstraction-test.sh in a comment, and a plain grep
 //!      reports it as scheduled. Comments are stripped before matching.
-//!   2. A reference in .github/workflows/ is not evidence of anything. All ten
-//!      workflows are workflow_dispatch-only except linux-boot.yml, so they gate
-//!      no PR. Workflows are NOT a reachability source here, by design.
+//!   2. A reference in an arbitrary .github/workflows/ file is not evidence of
+//!      anything. Most workflows are workflow_dispatch-only and gate no PR. The
+//!      explicitly scheduled demo hot-path workflow is a reachability source, but
+//!      only its `run:` commands count; step names and prose do not.
 //!
 //! Reachability is a fixpoint, not one hop: check-git-pin-uniformity.rs has no DAG
 //! node but ci/run-reverie-pin-check.sh calls it and that has two, so it IS
@@ -51,13 +52,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
          and wall limits, and a release binary that check.lint_checks does not \
          build. It is an on-demand acceptance bracket; scheduling it in the lint \
          node would make that node depend on an unrelated release build.",
-    ),
-    (
-        "scripts/test-prepare-demo08-calibration.sh",
-        "This acceptance bracket is owned by the separately assigned demo 08 \
-         task. The owner explicitly routed that work away from this agent, so \
-         this move preserves the checker without silently scheduling or claiming \
-         evidence from work that must be completed in that task.",
     ),
     (
         "scripts/check-default-build-warnings.sh",
@@ -147,6 +141,10 @@ const CHECKER_SUFFIXES: &[&str] = &["-test.sh"];
 /// This checker's own tracked path.
 const SELF_PATH: &str = "scripts/check-checker-scheduling.rs";
 
+/// Workflows that run without a person dispatching them. Only their `run:`
+/// commands seed reachability; names, comments, inputs, and other prose do not.
+const SCHEDULED_WORKFLOWS: &[&str] = &[".github/workflows/demo-hot-path.yml"];
+
 /// Whether a reached script's BODY may be read as a source of invocations.
 ///
 /// ⚠️ THIS FILE IS REACHED BUT IS NOT AN INVOCATION SOURCE, AND THE DISTINCTION IS
@@ -218,11 +216,9 @@ fn main() {
     rust_script_prelude::init();
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!(
-            "check-checker-scheduling: refuse a tracked checker entrypoint that no DAG\n\
-             node and no `make lint-checks` recipe line can reach, directly or\n\
-             transitively. Workflows are not a reachability source: they are\n\
-             workflow_dispatch-only and gate nothing. Deliberate exceptions live in\n\
-             ALLOWLIST with a reason each."
+            "check-checker-scheduling: refuse a tracked checker entrypoint that no DAG,\n\
+             scheduled workflow, or `make lint-checks` recipe line can reach, directly\n\
+             or transitively. Deliberate exceptions live in ALLOWLIST with a reason each."
         );
         return;
     }
@@ -311,6 +307,23 @@ fn main() {
     seed.push_str(&lint_checks_recipe(
         &std::fs::read_to_string("Makefile").expect("Makefile is unreadable"),
     ));
+    for workflow in SCHEDULED_WORKFLOWS {
+        let raw = std::fs::read_to_string(workflow)
+            .unwrap_or_else(|_| panic!("scheduled workflow is unreadable: {workflow}"));
+        assert!(
+            workflow_has_schedule(&raw),
+            "{workflow} no longer has a top-level `on.schedule` trigger; its \
+             checkers are not scheduled and must not seed reachability"
+        );
+        let commands = workflow_run_commands(&raw);
+        assert!(
+            !commands.trim().is_empty(),
+            "{workflow} yielded no `run:` commands; the workflow schema moved and \
+             this guard would otherwise report its checkers as orphans"
+        );
+        seed.push_str(&strip_comments(&commands, workflow));
+        seed.push('\n');
+    }
 
     // Fixpoint over EVERY tracked script, not only the checkers.
     //
@@ -384,7 +397,8 @@ fn main() {
             "  A checker nothing runs is indistinguishable from a checker that passes."
         );
         eprintln!("  Add it to the Makefile's `lint-checks` recipe (which check.lint_checks");
-        eprintln!("  runs, so no DAG edit is needed), or to a DAG node, or add it to");
+        eprintln!("  runs, so no DAG edit is needed), a DAG node, or an explicitly");
+        eprintln!("  scheduled workflow; otherwise add it to");
         eprintln!("  ALLOWLIST in this file WITH A REASON.");
         for c in &unscheduled {
             eprintln!("    {c}");
@@ -1109,6 +1123,67 @@ fn extract_cmds(raw: &str) -> Vec<String> {
     out
 }
 
+/// Extract executable `run:` values from a GitHub Actions workflow.
+///
+/// Reading the whole YAML would let a checker path in a step name, input
+/// description, or other prose masquerade as scheduling. This intentionally
+/// supports the two shapes used by Actions: an inline value and an indented
+/// block introduced by `|` or `>`.
+fn workflow_run_commands(raw: &str) -> String {
+    let mut out = String::new();
+    let mut block_indent = None;
+
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+
+        if let Some(run_indent) = block_indent {
+            if trimmed.is_empty() {
+                out.push('\n');
+                continue;
+            }
+            if indent > run_indent {
+                out.push_str(trimmed);
+                out.push('\n');
+                continue;
+            }
+            block_indent = None;
+        }
+
+        let value = trimmed
+            .strip_prefix("run:")
+            .or_else(|| trimmed.strip_prefix("- run:"));
+        let Some(value) = value else { continue };
+        let value = value.trim_start();
+        if value.starts_with('|') || value.starts_with('>') {
+            block_indent = Some(indent);
+        } else if !value.is_empty() {
+            out.push_str(value);
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+/// Require a block-form top-level `on.schedule` trigger before treating a
+/// workflow as a scheduling source. Unsupported YAML shapes fail closed.
+fn workflow_has_schedule(raw: &str) -> bool {
+    let mut inside_on = false;
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if indent == 0 {
+            inside_on = trimmed == "on:";
+            continue;
+        }
+        if inside_on && indent == 2 && trimmed == "schedule:" {
+            return true;
+        }
+    }
+    false
+}
+
 /// Extract just the `lint-checks` recipe. Using the whole Makefile would count a
 /// checker named anywhere in it -- including in `lint-cargo`, in a comment, or in
 /// an unrelated target -- as scheduled, which is the false-negative this guard
@@ -1150,6 +1225,39 @@ fn self_test() {
     assert_eq!(exit_code_for(0, 1), 1, "a stale allowlist entry must exit nonzero");
     assert_eq!(exit_code_for(3, 2), 1, "both together must exit nonzero");
     assert_eq!(exit_code_for(0, 0), 0, "a clean run must exit zero");
+
+    let workflow = r#"name: example
+on:
+  schedule:
+    - cron: "0 0 * * *"
+steps:
+  - name: scripts/check-name-only.sh
+    run: |
+      echo preparing
+      scripts/check-real.sh
+  - run: scripts/check-inline.sh
+"#;
+    assert!(
+        workflow_has_schedule(workflow),
+        "a top-level schedule trigger must be recognized"
+    );
+    assert!(
+        !workflow_has_schedule("on:\n  workflow_dispatch:\n"),
+        "a manual-only workflow must not seed scheduling"
+    );
+    let workflow_commands = workflow_run_commands(workflow);
+    assert!(
+        is_invoked(&workflow_commands, "scripts/check-real.sh"),
+        "a command in a workflow run block must seed reachability"
+    );
+    assert!(
+        is_invoked(&workflow_commands, "scripts/check-inline.sh"),
+        "an inline workflow command must seed reachability"
+    );
+    assert!(
+        !workflow_commands.contains("check-name-only.sh"),
+        "a checker mentioned only in a workflow step name is not scheduled"
+    );
 
     // ⚠️ THE SHARED CONTROL. Several matcher defects in one night shared a SIGNATURE and
     // not a cause: each inferred a semantic fact from an unverified syntactic position,
