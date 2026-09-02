@@ -93,7 +93,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 7200,
+      "cpu_timeout": 900,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {

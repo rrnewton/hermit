@@ -6460,11 +6460,13 @@ fn committed_validation_dag_bracket(root: &Path) -> Result<String, String> {
     // These representatives cover each source of the old constructed policy:
     // the lane-wide CPU default, explicit compatibility and super budgets, and
     // one producer shared by profiles that previously assigned different
-    // defaults. The committed superset must preserve the maximum effective
-    // value; copying the smaller wall field into cpu_timeout makes ordinary
-    // computation fail under load, which is the defect this migration removes.
+    // defaults. A shared node cannot retain both profile-specific values, so it
+    // must preserve the tighter effective value: selecting a broader profile
+    // must not silently relax quick or super. Copying the smaller wall field
+    // into cpu_timeout for unrelated ordinary computation is still the defect
+    // this migration removes.
     let expected_cpu = [
-        ("build.rust_scripts", 7200),
+        ("build.rust_scripts", 900),
         ("build.workspace", 7200),
         ("privileged-build.privileged_tests", 7200),
         ("test.app_strict_verify", 7200),
