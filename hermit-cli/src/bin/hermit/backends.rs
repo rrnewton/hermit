@@ -1058,6 +1058,8 @@ pub(super) fn run_dbt(
             // A backend-observed divergence needs the same retained evidence
             // as a divergence found by the ordinary comparator.
             keep_logs: keep_logs || branch_clock_diverged || summary_failure.is_some(),
+            failed_log_retention: (!keep_logs)
+                .then(super::verify::default_failed_verify_log_retention),
             // Every decoded evidence record is compared, which is what this
             // adapter already did before the envelope was disclosed. Naming it
             // changes no record selection; it states the selection in the

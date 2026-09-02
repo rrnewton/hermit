@@ -582,6 +582,7 @@ impl StartOpts {
                 // cannot describe a policy the run did not use.
                 virtualize_time: hermit::RECORD_REPLAY_VIRTUALIZES_TIME,
                 keep_logs: false,
+                failed_log_retention: Some(super::verify::default_failed_verify_log_retention()),
                 record_envelope: RecordEnvelope::all_records_v1(),
             },
         )?;

@@ -7,7 +7,13 @@
  */
 
 use std::collections::BTreeSet;
+use std::fs;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -41,6 +47,41 @@ use tracing::metadata::LevelFilter;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::record_envelope::RecordEnvelopePolicy;
+
+const FAILED_VERIFY_LOG_DIR_PREFIX: &str = "comparison-";
+const FAILED_VERIFY_LOG_PENDING_PREFIX: &str = ".pending-comparison-";
+const FAILED_VERIFY_LOG_RETIRING_PREFIX: &str = ".retiring-comparison-";
+const FAILED_VERIFY_LOG_LOCK: &str = ".retention.lock";
+const FAILED_VERIFY_LOG_ROOT_LOCK: &str = ".retirement.lock";
+// Cell-aware validation stores its logs in per-attempt artifact directories.
+// This population exists for recent ad-hoc failures whose caller supplied no
+// durable destination and, consequently, no cell identity. Sixty-four complete
+// comparisons preserve a useful recent debugging window without pretending a
+// per-cell policy can be recovered from identity-free files.
+const FAILED_VERIFY_LOG_COMPARISONS_TO_KEEP: usize = 64;
+
+#[derive(Clone, Debug)]
+pub(crate) struct FailedVerifyLogRetention {
+    root: PathBuf,
+    keep: usize,
+}
+
+impl FailedVerifyLogRetention {
+    #[cfg(test)]
+    fn new(root: PathBuf, keep: usize) -> Self {
+        Self { root, keep }
+    }
+}
+
+pub(crate) fn default_failed_verify_log_retention() -> FailedVerifyLogRetention {
+    let root = dirs::state_dir()
+        .map(|path| path.join("hermit").join("verify-failures"))
+        .unwrap_or_else(|| std::env::temp_dir().join("hermit-verify-failures"));
+    FailedVerifyLogRetention {
+        root,
+        keep: FAILED_VERIFY_LOG_COMPARISONS_TO_KEEP,
+    }
+}
 
 pub(crate) struct ComparedRun<'a> {
     pub output: &'a Output,
@@ -79,6 +120,10 @@ pub(crate) struct ComparisonOptions {
     /// Keep both captured logs at their selected paths after comparison,
     /// whether the runs match or diverge.
     pub keep_logs: bool,
+    /// Where an implicitly retained failed comparison is stored and bounded.
+    /// This is absent when the caller explicitly requested `--keep-logs`; an
+    /// explicit evidence directory remains entirely caller-owned.
+    pub failed_log_retention: Option<FailedVerifyLogRetention>,
     /// Typed, versioned record envelope applied before selecting messages.
     /// Its policy identity is serialized beside the verdict.
     pub record_envelope: RecordEnvelope,
@@ -830,6 +875,225 @@ pub(crate) fn retain_verification_logs<const N: usize>(
     Ok(retained)
 }
 
+fn flock(file: &File, operation: i32) -> io::Result<()> {
+    // SAFETY: flock only reads the supplied descriptor and operation. `file`
+    // keeps the descriptor open for at least the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn open_retention_lock(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+}
+
+fn persist_log(log: TempPath, destination: &Path) -> io::Result<()> {
+    match log.persist_noclobber(destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.error.raw_os_error() == Some(libc::EXDEV) => {
+            fs::copy(&*error.path, destination)?;
+            drop(error.path);
+            Ok(())
+        }
+        Err(error) => Err(error.error),
+    }
+}
+
+fn retained_comparison_dirs(root: &Path) -> io::Result<Vec<(PathBuf, std::time::SystemTime)>> {
+    let mut directories = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(FAILED_VERIFY_LOG_DIR_PREFIX) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            continue;
+        }
+        directories.push((entry.path(), metadata.modified()?));
+    }
+    directories.sort_by(|(left_path, left_time), (right_path, right_time)| {
+        right_time
+            .cmp(left_time)
+            .then_with(|| right_path.cmp(left_path))
+    });
+    Ok(directories)
+}
+
+fn finish_interrupted_retirements(root: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(FAILED_VERIFY_LOG_RETIRING_PREFIX)
+            && !name.starts_with(FAILED_VERIFY_LOG_PENDING_PREFIX)
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_dir() && metadata.uid() == unsafe { libc::geteuid() } {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn retire_failed_verification_logs(root: &Path, current: &Path, keep: usize) -> io::Result<usize> {
+    let directories = retained_comparison_dirs(root)?;
+    let mut kept = BTreeSet::from([current.to_path_buf()]);
+    for (path, _) in &directories {
+        if kept.len() >= keep.max(1) {
+            break;
+        }
+        kept.insert(path.clone());
+    }
+
+    let mut retired = 0;
+    for (path, _) in directories {
+        if kept.contains(&path) {
+            continue;
+        }
+        let lock = match open_retention_lock(&path.join(FAILED_VERIFY_LOG_LOCK)) {
+            Ok(lock) => lock,
+            Err(error) => {
+                eprintln!(
+                    "WARNING: could not inspect retained verification logs {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        match flock(&lock, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) => {
+                eprintln!(
+                    "WARNING: could not lock retained verification logs {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| io::Error::other("retained verification directory has no name"))?;
+        let retiring = tempfile::Builder::new()
+            .prefix(&format!("{FAILED_VERIFY_LOG_RETIRING_PREFIX}{name}-"))
+            .rand_bytes(12)
+            .tempdir_in(root)?
+            .keep();
+        fs::remove_dir(&retiring)?;
+        fs::rename(&path, &retiring)?;
+        fs::remove_dir_all(&retiring)?;
+        retired += 1;
+    }
+    Ok(retired)
+}
+
+fn retain_failed_verification_logs(
+    logs: [(&str, TempPath); 2],
+    retention: &FailedVerifyLogRetention,
+) -> Result<Vec<PathBuf>, Error> {
+    fs::create_dir_all(&retention.root).with_context(|| {
+        format!(
+            "could not create failed verification log directory {}",
+            retention.root.display()
+        )
+    })?;
+    let root = fs::canonicalize(&retention.root).with_context(|| {
+        format!(
+            "could not resolve failed verification log directory {}",
+            retention.root.display()
+        )
+    })?;
+    let root_lock = open_retention_lock(&root.join(FAILED_VERIFY_LOG_ROOT_LOCK))?;
+    flock(&root_lock, libc::LOCK_EX)?;
+    finish_interrupted_retirements(&root)?;
+
+    let pending = tempfile::Builder::new()
+        .prefix(FAILED_VERIFY_LOG_PENDING_PREFIX)
+        .rand_bytes(12)
+        .tempdir_in(&root)?
+        .keep();
+    let pending_name = pending
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("failed verification directory has no name"))?;
+    let final_name = pending_name
+        .strip_prefix(FAILED_VERIFY_LOG_PENDING_PREFIX)
+        .ok_or_else(|| io::Error::other("failed verification directory has an invalid name"))?;
+    let completed = root.join(format!("{FAILED_VERIFY_LOG_DIR_PREFIX}{final_name}"));
+    let pair_lock = open_retention_lock(&pending.join(FAILED_VERIFY_LOG_LOCK))?;
+    flock(&pair_lock, libc::LOCK_EX)?;
+
+    let mut retained = Vec::with_capacity(logs.len());
+    for (index, (label, log)) in logs.into_iter().enumerate() {
+        let original_name = log
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(if index == 0 { "run1.log" } else { "run2.log" });
+        let destination = pending.join(original_name);
+        persist_log(log, &destination)?;
+        retained.push((label, destination));
+    }
+    fs::rename(&pending, &completed)?;
+    for (label, path) in &mut retained {
+        *path = completed.join(path.file_name().expect("retained log has a name"));
+        eprintln!("::   {label}: {}", path.display());
+    }
+    drop(pair_lock);
+
+    let retired = retire_failed_verification_logs(&root, &completed, retention.keep)?;
+    if retired > 0 {
+        eprintln!(
+            ":: Retired {retired} older failed verification comparison(s); kept at most {}",
+            retention.keep.max(1)
+        );
+    }
+    Ok(retained.into_iter().map(|(_, path)| path).collect())
+}
+
+pub(crate) fn lock_failed_verification_logs_for_read(
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> io::Result<Vec<File>> {
+    let mut directories = BTreeSet::new();
+    for path in paths {
+        let Some(directory) = path.parent() else {
+            continue;
+        };
+        let Some(name) = directory.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with(FAILED_VERIFY_LOG_DIR_PREFIX)
+            && directory.join(FAILED_VERIFY_LOG_LOCK).is_file()
+        {
+            directories.insert(directory.to_path_buf());
+        }
+    }
+    let mut locks = Vec::with_capacity(directories.len());
+    for directory in directories {
+        let lock = open_retention_lock(&directory.join(FAILED_VERIFY_LOG_LOCK))?;
+        flock(&lock, libc::LOCK_SH)?;
+        locks.push(lock);
+    }
+    Ok(locks)
+}
+
 pub fn compare_two_runs(
     first: ComparedRun<'_>,
     second: ComparedRun<'_>,
@@ -1028,7 +1292,12 @@ fn compare_two_runs_with_unsupported_scan(
 
     if let Err(error) = log_processing_result {
         if options.keep_logs || failed {
-            retain_verification_logs([(label1, log1), (label2, log2)])?;
+            if let Some(retention) = &options.failed_log_retention {
+                eprintln!(":: Verification logs retained:");
+                retain_failed_verification_logs([(label1, log1), (label2, log2)], retention)?;
+            } else {
+                retain_verification_logs([(label1, log1), (label2, log2)])?;
+            }
         }
         return Err(error);
     }
@@ -1037,7 +1306,12 @@ fn compare_two_runs_with_unsupported_scan(
     // that behavior to successful comparisons instead of changing the failure
     // path.
     if options.keep_logs || failed {
-        retain_verification_logs([(label1, log1), (label2, log2)])?;
+        if let Some(retention) = &options.failed_log_retention {
+            eprintln!(":: Verification logs retained:");
+            retain_failed_verification_logs([(label1, log1), (label2, log2)], retention)?;
+        } else {
+            retain_verification_logs([(label1, log1), (label2, log2)])?;
+        }
     }
 
     if failed {
@@ -1357,6 +1631,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: true,
                 keep_logs: false,
+                failed_log_retention: None,
                 record_envelope,
                 virtualize_time: true,
             },
@@ -1611,6 +1886,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: false,
+                failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
             },
@@ -1824,6 +2100,7 @@ mod tests {
                 diagnostic_full_trace: true,
                 compare_io_buffers: false,
                 keep_logs: false,
+                failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
             },
@@ -1924,6 +2201,7 @@ mod tests {
                     diagnostic_full_trace: false,
                     compare_io_buffers: false,
                     keep_logs,
+                    failed_log_retention: None,
                     record_envelope: RecordEnvelope::all_records_v1(),
                     virtualize_time: true,
                 },
@@ -1937,6 +2215,97 @@ mod tests {
                 fs::remove_file(right_path).unwrap();
             }
         }
+    }
+
+    fn run_failed_comparison(source: &Path, retention: FailedVerifyLogRetention, value: u64) {
+        let output = output(0, b"same output\n", b"");
+        let (left, right) = temp_log_files_in("run1", "run2", Some(source)).unwrap();
+        fs::write(left.path(), detlog_with_value(value)).unwrap();
+        fs::write(right.path(), detlog_with_value(value + 1)).unwrap();
+        let outcome = compare_two_runs(
+            ComparedRun {
+                output: &output,
+                log: left.into_temp_path(),
+                label: "run 1",
+            },
+            ComparedRun {
+                output: &output,
+                log: right.into_temp_path(),
+                label: "run 2",
+            },
+            ComparisonOptions {
+                verbose: false,
+                strictness: LogCompareStrictness::Canonical,
+                compare_logs: true,
+                diagnostic_full_trace: false,
+                compare_io_buffers: true,
+                keep_logs: false,
+                failed_log_retention: Some(retention),
+                record_envelope: RecordEnvelope::all_records_v1(),
+                virtualize_time: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.verdict, Verdict::Diverged);
+    }
+
+    #[test]
+    fn failed_comparison_materialization_holds_the_retained_count_at_the_bound() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let root = temporary.path().join("verify-failures");
+        fs::create_dir(&source).unwrap();
+        let retention = FailedVerifyLogRetention::new(root.clone(), 2);
+
+        for value in 0..3 {
+            run_failed_comparison(&source, retention.clone(), value);
+        }
+
+        let directories = retained_comparison_dirs(&root).unwrap();
+        assert_eq!(
+            directories.len(),
+            2,
+            "the third failure must retire the oldest"
+        );
+        for (directory, _) in directories {
+            let logs = fs::read_dir(directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name() != FAILED_VERIFY_LOG_LOCK)
+                .collect::<Vec<_>>();
+            assert_eq!(logs.len(), 2, "each retained failure keeps both logs");
+        }
+    }
+
+    #[test]
+    fn failed_comparison_retirement_refuses_a_log_diff_reader() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let root = temporary.path().join("verify-failures");
+        fs::create_dir(&source).unwrap();
+        let retention = FailedVerifyLogRetention::new(root.clone(), 2);
+        run_failed_comparison(&source, retention.clone(), 0);
+        run_failed_comparison(&source, retention.clone(), 2);
+
+        let oldest = retained_comparison_dirs(&root).unwrap().pop().unwrap().0;
+        let protected_log = fs::read_dir(&oldest)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name() != FAILED_VERIFY_LOG_LOCK)
+            .unwrap()
+            .path();
+        let read_locks = lock_failed_verification_logs_for_read([protected_log]).unwrap();
+        run_failed_comparison(&source, retention.clone(), 4);
+        assert!(oldest.is_dir(), "an active reader must prevent retirement");
+        assert_eq!(retained_comparison_dirs(&root).unwrap().len(), 3);
+
+        drop(read_locks);
+        run_failed_comparison(&source, retention, 6);
+        assert!(
+            !oldest.exists(),
+            "the unlocked old evidence is retired later"
+        );
+        assert_eq!(retained_comparison_dirs(&root).unwrap().len(), 2);
     }
 
     #[test]
@@ -1967,6 +2336,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: true,
+                failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
             },
@@ -2029,6 +2399,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: true,
+                failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
             },
