@@ -1129,6 +1129,8 @@ pub(super) fn run_dbt(
             keep_logs: keep_logs
                 || branch_clock_diverged
                 || summary_comparison.requires_log_retention(),
+            failed_log_retention: (!keep_logs)
+                .then(super::verify::default_failed_verify_log_retention),
             // Reverie's authenticated decoder represents each process-image
             // initialization record by a count instead of preserving its
             // host-arrival position in the comparable stream. The counts are
