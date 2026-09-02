@@ -1380,6 +1380,9 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             .env_remove(validate_runtime::ACTIVE_ENV)
             .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_PID")
             .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE")
+            // The fixture deliberately runs one focused preflight node. Do not
+            // inherit the outer canonical run's full-profile admission guard.
+            .env_remove("VALIDATE_FORCE_FULL")
             // This fixture deliberately exercises the pre-driver bootstrap in
             // an independent checkout. It must compile that copied driver with
             // the real rust-script so a missing path dependency remains visible
@@ -1636,6 +1639,10 @@ fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
 /// on every invocation (validate.sh:308); here they are a `--self-test` subcommand
 /// so the cost is not paid on the hot path.
 fn self_test() -> Result<(), String> {
+    // The outer invocation has already passed admission. The brackets below
+    // intentionally parse and launch focused forms, so an inherited full-run
+    // requirement would test the caller's environment instead of those forms.
+    std::env::remove_var("VALIDATE_FORCE_FULL");
     inner_freshness_skip_cli_bracket()?;
     run_owned_cache_bracket()?;
     run_state_path_bracket()?;
@@ -9047,6 +9054,7 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
         .env_remove("VALIDATE_RUN_STATE")
         .env_remove("E2E_RESULT_ROOT")
         .env_remove("E2E_BUILD_ROOT")
+        .env_remove("VALIDATE_FORCE_FULL")
         .output()
         .map_err(|error| format!("raw run-dag: cannot launch allowed controls: {error}"))?;
     if !allowed.status.success() {
@@ -9079,6 +9087,7 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
         .env("RUN_DAG_INVOKED", &invoked)
         .env("RUN_DAG_EXPECTED_LABEL", "hosted-portable")
         .env("RUN_DAG_FILE_OVERRIDE", &alternate)
+        .env_remove("VALIDATE_FORCE_FULL")
         .output()
         .map_err(|error| format!("raw run-dag: cannot launch override refusal: {error}"))?;
     let refusal_stderr = String::from_utf8_lossy(&refused.stderr);

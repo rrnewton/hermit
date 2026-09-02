@@ -336,7 +336,7 @@ field note.run_record "$reg_state"
 # takes the script down silently. It keeps draining and stops writing.
 capper() {
     # STREAMING, CONSTANT MEMORY. A reviewer found that the evidence cap in
-    # safe-ci-dag-runner bounds the FILE while still holding complete stdout and
+    # dagrun bounds the FILE while still holding complete stdout and
     # stderr in memory -- trading a full disk for an OOM is not a fix. This reads
     # and writes in 64 KiB chunks and accumulates nothing, so peak memory is the
     # chunk, not the stream.

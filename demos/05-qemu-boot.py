@@ -54,8 +54,9 @@ TIMEOUT = int(os.environ.get("QEMU_TIMEOUT", "600"))
 # tripped the disk headroom alarm twice; start_new_session below reaps the tree the
 # demo knows about, but nothing bounded the bytes.
 SAFEHERMIT = ROOT / "bin/safehermit"
-# MEASURED ON THIS DEMO, NOT GUESSED. Four healthy full boots on devbig014 (hermit
-# 0.2.0 g770b95c505fa, QEMU 10.1.2) wrote 253,386,127 / 253,585,587 / 253,643,026 /
+# MEASURED ON THIS DEMO, NOT GUESSED. Four healthy full boots on the Demo 5 QEMU
+# measurement host recorded in docs/TESTING_ENVIRONMENTS.md under "Named measurement
+# hosts" (hermit 0.2.0 g770b95c505fa, QEMU 10.1.2) wrote 253,386,127 / 253,585,587 / 253,643,026 /
 # 253,643,032 bytes of hermit-info.log in 50-54s of wall -- about 5.4 MiB/s, and a
 # spread of 0.1%, so unlike demo 6 this figure is stable across runs. The cap is
 # 3.17x the largest of them.
