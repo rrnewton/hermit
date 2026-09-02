@@ -81,8 +81,21 @@ shift
 
 [[ -f $MANIFEST ]] || die "missing producer output $MANIFEST; require build.rust_scripts before this node"
 source_abs=$(realpath -- "$source") || die "cannot resolve script path $source"
+source_root=$(git -C "$(dirname -- "$source_abs")" rev-parse --show-toplevel 2>/dev/null || true)
+if [[ -n $source_root ]]; then
+    source_root=$(realpath -- "$source_root") || die "cannot resolve source repository $source_root"
+fi
 case $source_abs in
-    "$ROOT_DIR"/*) source_rel=${source_abs#"$ROOT_DIR"/} ;;
+    "$ROOT_DIR"/*)
+        if [[ $source_root != "$ROOT_DIR" ]]; then
+            # Validation fixtures may create a separate checkout below the
+            # outer checkout's ignored target directory. Path containment does
+            # not make that checkout's scripts members of this repository.
+            real_rust_script=$(find_real_rust_script)
+            exec "$real_rust_script" "${original_args[@]}"
+        fi
+        source_rel=${source_abs#"$ROOT_DIR"/}
+        ;;
     *)
         # The validation environment also launches rust-script programs owned
         # by its external operational tooling. This repository cannot prepare
