@@ -118,15 +118,41 @@ class NoParentAdapter(RuntimeError):
 
 
 def find_parent_adapter() -> Path | None:
-    """The nearest ancestor carrying the parent ledger adapter, or None.
+    """The configured tool root or nearest ancestor carrying the adapter.
 
     Returns rather than raises so the caller decides what absence means. The
     previous spelling put that decision inside `next()`, which can only raise.
     """
+    configured = os.environ.get("DEV_HERMIT_TOOL_ROOT")
+    if configured is not None:
+        candidate = Path(configured)
+        if not candidate.is_absolute():
+            return None
+        candidate = candidate.resolve()
+        adapter = candidate / "ci-hub" / "ledger" / "validate_rows.py"
+        return candidate if adapter.is_file() else None
     for candidate in ROOT.parents:
         if (candidate / "ci-hub" / "ledger" / "validate_rows.py").is_file():
             return candidate
     return None
+
+
+def check_parent_adapter_selection() -> None:
+    """A configured missing or relative tool root must not fall back silently."""
+    saved = os.environ.get("DEV_HERMIT_TOOL_ROOT")
+    try:
+        with tempfile.TemporaryDirectory(prefix="validate-missing-tool-root-") as tmp:
+            os.environ["DEV_HERMIT_TOOL_ROOT"] = str(Path(tmp) / "missing")
+            assert find_parent_adapter() is None
+        os.environ["DEV_HERMIT_TOOL_ROOT"] = "relative-tool-root"
+        assert find_parent_adapter() is None
+    finally:
+        if saved is None:
+            os.environ.pop("DEV_HERMIT_TOOL_ROOT", None)
+        else:
+            os.environ["DEV_HERMIT_TOOL_ROOT"] = saved
+
+
 VALIDATE = ROOT / "scripts" / "validate.rs"
 TEST_ROOTS: list[Path] = []
 OUTER_VALIDATE_ENV = (
@@ -664,11 +690,17 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
             # contract without appending the machine's authoritative ledger.
             parent = find_parent_adapter()
             if parent is None:
+                configured = os.environ.get("DEV_HERMIT_TOOL_ROOT")
+                location = (
+                    f"at configured DEV_HERMIT_TOOL_ROOT {configured}"
+                    if configured is not None
+                    else f"on any ancestor of {ROOT}"
+                )
                 raise NoParentAdapter(
                     "the dev-hermit parent adapter "
                     "(ci-hub/ledger/validate_rows.py, in the dev-hermit PARENT "
-                    "repository -- this repository has no ci-hub/ directory) is "
-                    f"not on any ancestor of {ROOT}"
+                    "repository -- this repository has no ci-hub/ directory) was not found "
+                    f"{location}"
                 )
         raw_shadow = parent / "ignored" / "validate-run-ledger.jsonl"
         raw_before = raw_shadow.read_bytes() if raw_shadow.exists() else None
@@ -852,6 +884,7 @@ def main(argv: list[str] | None = None) -> None:
     # run's marker would prevent the fixture from observing any stop path.
     os.environ.pop("HERMIT_VALIDATE_ACTIVE", None)
 
+    check_parent_adapter_selection()
     run_final_validate_status_contract()
     check_stop_test_env_does_not_inherit_outer_validate()
     check_signal_refusal_does_not_skip_incomplete_exit()
