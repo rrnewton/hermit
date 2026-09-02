@@ -99,7 +99,9 @@ const PREPARATION_FAILED_STATUS: i32 = 126;
 // The pressure wrapper must outlive any selected step; two extra minutes retain
 // the existing control-step margin. Production also derives this floor from
 // the selected plan below, so a later DAG change cannot silently invert it.
-const PRESSURE_RUN_TIMEOUT_SECONDS: i64 = 6 * 60 * 60 + 2 * 60;
+const PRESSURE_RUN_BACKSTOP_MARGIN_SECONDS: i64 = 2 * 60;
+const PRESSURE_RUN_TIMEOUT_SECONDS: i64 =
+    6 * 60 * 60 + PRESSURE_RUN_BACKSTOP_MARGIN_SECONDS;
 const PRESSURE_SCOPE_TIMEOUT_ENV: &str = "HERMIT_PRESSURE_SCOPE_TIMEOUT_SECONDS";
 const HERMETIC_TEST_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
@@ -3010,9 +3012,9 @@ fn write_plan_after_scorecard_check(
             )
         })
         .max()
-        .unwrap_or(CONTROL_STEP_TIMEOUT_SECONDS);
+        .unwrap_or(PRESSURE_RUN_BACKSTOP_MARGIN_SECONDS);
     let derived_run_timeout = largest_step_wall
-        .checked_add(CONTROL_STEP_TIMEOUT_SECONDS)
+        .checked_add(PRESSURE_RUN_BACKSTOP_MARGIN_SECONDS)
         .ok_or("selected pressure DAG wall backstop exceeds the supported integer range")?;
     let run_timeout_seconds = selection
         .run_timeout_seconds
