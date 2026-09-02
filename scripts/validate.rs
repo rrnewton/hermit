@@ -1274,21 +1274,30 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             .current_dir(&checkout),
         "stage the tested agent-utils gitlink",
     )?;
-    checked_command(
-        Command::new("git")
-            .args([
-                "-c",
-                "user.name=validate fixture",
-                "-c",
-                "user.email=validate-fixture@example.invalid",
-                "commit",
-                "--quiet",
-                "-m",
-                "validate service-result fixture agent-utils",
-            ])
-            .current_dir(&checkout),
-        "commit the tested agent-utils gitlink",
-    )?;
+    let staged = Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(&checkout)
+        .status()
+        .map_err(|error| {
+            format!("submodule service result: cannot inspect staged agent-utils pin: {error}")
+        })?;
+    if !staged.success() {
+        checked_command(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=validate fixture",
+                    "-c",
+                    "user.email=validate-fixture@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "validate service-result fixture agent-utils",
+                ])
+                .current_dir(&checkout),
+            "commit the tested agent-utils gitlink",
+        )?;
+    }
     let expected_agent_utils = Command::new("git")
         .args(["ls-tree", "HEAD", "agent-utils"])
         .current_dir(&checkout)
