@@ -82,6 +82,15 @@ const MANIFEST_AUDIT_CPU_TIMEOUT_S: i64 = 600;
 /// this tree peaks well under a GiB; 2 GiB leaves headroom without being a
 /// non-cap.
 const PREFLIGHT_MEM_BYTES: i64 = 2 * 1024 * 1024 * 1024;
+/// Memory ceiling for the manifest audit after the pinned agent-utils tests
+/// became part of its validation command.
+///
+/// Measured 2026-09-02 at Hermit c707c9e85, the exact uncapped command peaked
+/// at 4,039,316 KiB and passed. The same command at unmodified main 34ae512aa
+/// peaked at 869,664 KiB. The former shared 2 GiB preflight ceiling therefore
+/// killed this branch rather than detecting a leak; 5 GiB keeps a measured
+/// bound while leaving the lightweight preflight checks at 2 GiB.
+const MANIFEST_AUDIT_MEM_BYTES: i64 = 5 * 1024 * 1024 * 1024;
 
 /// The manifest audit is an executable consumer, so its producer is part of
 /// the always-on preflight spine rather than an incidental lane root.
@@ -418,7 +427,7 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
             vec![MANIFEST_PLAN_PRODUCER_TAG.to_string()],
             PREFLIGHT_TIMEOUT_S,
             MANIFEST_AUDIT_CPU_TIMEOUT_S,
-            PREFLIGHT_MEM_BYTES,
+            MANIFEST_AUDIT_MEM_BYTES,
         ),
     ]
 }
@@ -434,7 +443,7 @@ mod tests {
             ("pre.submodules".to_string(), 900, 300, Some(2_147_483_648)),
             ("pre.reverie_pin".to_string(), 900, 300, Some(2_147_483_648)),
             ("setup.manifest_plan".to_string(), 180, 7200, Some(2_147_483_648)),
-            ("gate.manifest".to_string(), 900, 600, Some(2_147_483_648)),
+            ("gate.manifest".to_string(), 900, 600, Some(5_368_709_120)),
         ];
         let check = |candidate: &[Step]| {
             let observed = candidate
