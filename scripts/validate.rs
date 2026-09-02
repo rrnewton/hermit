@@ -3085,8 +3085,9 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|step| step.tag() == "pre.submodules")
         .ok_or("selective bracket: full/no-baseline fallback lost pre.submodules")?;
-    if submodules.cmd
-        != "./ci/verify-submodules.sh --self-test && ./ci/verify-submodules.sh"
+    let submodule_check = "./ci/verify-submodules.sh --self-test && ./ci/verify-submodules.sh";
+    if !submodules.cmd.ends_with(submodule_check)
+        || submodules.cmd.matches(submodule_check).count() != 1
         || submodules.cmd.contains("submodule update")
         || !submodules.deps.is_empty()
     {
