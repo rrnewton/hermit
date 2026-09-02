@@ -92,16 +92,19 @@ const INCOMPLETE_ATTEMPT_STATUS: i32 = 125;
 /// Written when a cell is not invoked because its serialized fixture
 /// preparation did not complete successfully.
 const PREPARATION_FAILED_STATUS: i32 = 126;
-/// The prior 432-cell measurement completed in nine minutes on this host. Two
-/// hours is an operational stop for the periodic experiment, not a pass
-/// threshold: breach makes the run incomplete and publishes no promotion.
-// The committed lane's largest derived wall backstop is 6h (7200s CPU x 3).
-// The pressure wrapper must outlive any selected step; two extra minutes retain
-// the existing control-step margin. Production also derives this floor from
-// the selected plan below, so a later DAG change cannot silently invert it.
+/// The prior 432-cell measurement completed in nine minutes on this host. This
+/// operational stop is not a pass threshold: breach makes the run incomplete
+/// and publishes no promotion.
+// The committed lane's current largest derived wall backstop is 6h (7200s CPU
+// x 3). The pressure wrapper must outlive any selected step; two extra minutes
+// retain the existing control-step margin. Production derives the effective
+// value from the selected plan before establishing its outer scope, so a later
+// DAG change cannot silently invert it.
 const PRESSURE_RUN_BACKSTOP_MARGIN_SECONDS: i64 = 2 * 60;
-const PRESSURE_RUN_TIMEOUT_SECONDS: i64 =
-    6 * 60 * 60 + PRESSURE_RUN_BACKSTOP_MARGIN_SECONDS;
+const PRESSURE_RUN_TIMEOUT_SECONDS: i64 = 6 * 60 * 60 + PRESSURE_RUN_BACKSTOP_MARGIN_SECONDS;
+// Match dagrun's existing stress-expansion safety bound. Refuse before
+// allocating a generated plan rather than relying on allocation failure.
+const MAX_PRESSURE_GENERATED_NODES: usize = 100_000;
 const PRESSURE_SCOPE_TIMEOUT_ENV: &str = "HERMIT_PRESSURE_SCOPE_TIMEOUT_SECONDS";
 const HERMETIC_TEST_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
@@ -235,8 +238,10 @@ Selection and bounded-batch options (run and plan):
                            not a full-population result.
   --seed SEED              Reproduce one sample. If omitted, a generated seed
                            and every selected identity are retained in run.json.
-  --run-timeout SECONDS    Whole-run WALL-CLOCK bound (default 7200). This is
-                           not a CPU budget and never weakens per-cell limits.
+  --run-timeout SECONDS    Whole-run WALL-CLOCK bound (default: selected plan's
+                           largest wall backstop plus 120s, at least 21720s).
+                           This is not a CPU budget and never weakens per-cell
+                           limits.
   --jobs COUNT             Fixed safe-ci scheduler pool (default 4). Named
                            resource caps still limit manifest guests to four.
 
@@ -1360,10 +1365,6 @@ fn run() -> Result<(), String> {
             if !selection.allows_dirty_source() && worktree_dirty(&root)? {
                 return Err("run refuses a dirty checkout; commit first so every row binds to reproducible source".into());
             }
-            let run_timeout_seconds = selection
-                .run_timeout_seconds
-                .unwrap_or(PRESSURE_RUN_TIMEOUT_SECONDS);
-            let cgroups = establish_pressure_cgroups(run_timeout_seconds)?;
             require_empty_result_dir(&results)?;
             let started = Instant::now();
             let sha = git_output(&root, &["rev-parse", "HEAD"])?;
@@ -1384,6 +1385,7 @@ fn run() -> Result<(), String> {
             let output = results.join("dag.json");
             let run_result = (|| {
                 let (metadata, dag) = write_plan(execution_root, &results, &output, &selection)?;
+                let cgroups = establish_pressure_cgroups(metadata.run_timeout_seconds)?;
                 print_unavailable(&metadata);
                 print_sample(&metadata);
                 if exact_cell {
@@ -2603,12 +2605,6 @@ fn write_plan_after_scorecard_check(
         BTreeMap::new()
     };
     let budgets = load_budgets(root)?;
-    fs::create_dir_all(results).map_err(|e| format!("cannot create {}: {e}", results.display()))?;
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-    }
-
     let canonical_text = fs::read_to_string(root.join(PORTABLE_DAG))
         .map_err(|e| format!("cannot read {PORTABLE_DAG}: {e}"))?;
     let canonical =
@@ -2624,6 +2620,24 @@ fn write_plan_after_scorecard_check(
         )
     });
     let required_builds = required_build_tags(exact_cell, includes_liteinst);
+    let generated_nodes = cells
+        .len()
+        .checked_mul(selection.run_count())
+        .and_then(|count| count.checked_add(preparation_by_test.len()))
+        .and_then(|count| count.checked_add(required_builds.len()))
+        .and_then(|count| count.checked_add(1))
+        .ok_or("--repetitions produces an unrepresentable generated-node count")?;
+    if generated_nodes > MAX_PRESSURE_GENERATED_NODES {
+        return Err(format!(
+            "--repetitions would generate {generated_nodes} nodes, above dagrun's {MAX_PRESSURE_GENERATED_NODES}-node safety bound"
+        ));
+    }
+    fs::create_dir_all(results).map_err(|e| format!("cannot create {}: {e}", results.display()))?;
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+
     let mut steps = Vec::new();
     for mut step in canonical.steps.iter().cloned() {
         let tag = step.tag();
