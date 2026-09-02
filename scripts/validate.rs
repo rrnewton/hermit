@@ -2352,6 +2352,7 @@ fn self_test() -> Result<(), String> {
     host_capability_bracket(&root)?;
     coverage_schema_bracket()?;
     cell_results_schema_bracket()?;
+    rebase_freshness_message_bracket()?;
     test_node_coverage_bracket()?;
     typed_libtest_count_bracket()?;
     ledger_gate_origin_bracket()?;
@@ -6228,10 +6229,11 @@ fn cache_state(root: &Path) -> &'static str {
 /// Refuse to validate a head that is behind its upstream.
 ///
 /// Owner directive: "ALWAYS rebase before validate; admission control should
-/// ERROR if the base is out of date." The reason is not tidiness — a receipt is
-/// keyed to a SHA, and while a stale head waits, `main` advances and the receipt
-/// stops describing anything landable. Validating a stale base spends the
-/// box-exclusive validate slot producing evidence that is already invalid.
+/// ERROR if the base is out of date." The reason is not tidiness: validation
+/// records exact-commit evidence, and admission requires that commit to include
+/// every `origin/main` change available when the run starts. Whether that exact
+/// evidence later authorizes a hard-green or soft-green landing is a separate
+/// decision at the landing boundary.
 ///
 /// Only ERRORS when the local `origin/main` ref genuinely contains commits this
 /// head lacks. It does NOT fetch (that would make an offline run fail for a
@@ -6246,13 +6248,18 @@ fn rebase_freshness(force: bool) -> Result<String, String> {
     let mut it = counts.split_whitespace();
     let behind: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
     let ahead: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    rebase_freshness_from_counts(behind, ahead, force)
+}
+
+fn rebase_freshness_from_counts(behind: i64, ahead: i64, force: bool) -> Result<String, String> {
     if behind == 0 {
         return Ok(format!("base: up to date with origin/main (ahead {ahead}, behind 0)"));
     }
     let msg = format!(
         "HEAD is {behind} commit(s) BEHIND origin/main (ahead {ahead}).\n  \
-         A receipt minted here is keyed to a SHA that main has already moved past, so it cannot \
-         authorize a landing and will have to be rebuilt after the rebase it is missing.\n  \
+         Validation records exact-commit evidence. Admission requires HEAD to include every \
+         origin/main change available when the run starts; hard-green or soft-green landing \
+         authorization is decided separately at the landing boundary.\n  \
          Rebase first:  git rebase origin/main\n  \
          To skip only scripts/validate.rs's dirty-working-tree and rebase-freshness checks, pass \
          --skip-inner-dirty-working-tree-and-rebase-freshness-checks. This does not bypass \
@@ -6263,6 +6270,40 @@ fn rebase_freshness(force: bool) -> Result<String, String> {
     } else {
         Err(msg)
     }
+}
+
+fn rebase_freshness_message_bracket() -> Result<(), String> {
+    let refusal = rebase_freshness_from_counts(1, 2, false)
+        .expect_err("a stale base must still be refused at admission");
+    for required in [
+        "HEAD is 1 commit(s) BEHIND origin/main (ahead 2)",
+        "Validation records exact-commit evidence",
+        "hard-green or soft-green landing authorization is decided separately",
+        "Rebase first",
+    ] {
+        if !refusal.contains(required) {
+            return Err(format!(
+                "rebase freshness: stale-base refusal omitted {required:?}: {refusal}"
+            ));
+        }
+    }
+    for false_claim in ["cannot authorize a landing", "will have to be rebuilt"] {
+        if refusal.contains(false_claim) {
+            return Err(format!(
+                "rebase freshness: stale-base refusal retained false landing claim {false_claim:?}"
+            ));
+        }
+    }
+    let forced = rebase_freshness_from_counts(1, 2, true)?;
+    if !forced.contains("base: STALE, 1 behind origin/main") {
+        return Err(format!(
+            "rebase freshness: explicit force did not retain its stale-base warning: {forced}"
+        ));
+    }
+    println!(
+        "  rebase freshness: stale admission still refuses; exact-commit evidence is separate from hard-green or soft-green landing authorization"
+    );
+    Ok(())
 }
 
 // --------------------------------------------------------------------------- plan
