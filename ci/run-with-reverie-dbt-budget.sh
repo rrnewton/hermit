@@ -160,13 +160,17 @@ fi
 #     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
 #     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
 #     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
-# The intervening Reverie commits are the LiteInst task-creation change (#447),
-# which touches only reverie-ptrace/src/{task,tracer,error}.rs,
-# reverie-liteinst/src/backend.rs, reverie-liteinst/tests/hybrid.rs and six C
-# fixtures, and a documentation commit (#511). Neither can affect the elapsed
-# time of a DynamoRIO content-key miss, so the measured key and conservative
-# threshold carry unchanged and this is NOT a recalibration.
-expected_pin=af42d9cf7ae604777cd88c5cca5b319460c986e8
+# CARRY TO c2e2c8fb (2026-09-02): both repository inputs to source_recipe_key
+# are byte-identical to af42d9cf by git object id:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+# The broader third-party tree is also unchanged:
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# The intervening Reverie commits change validation evidence, exhaustive enum
+# dispatch, and the common Backend output API, but no native DBT recipe input.
+# The measured key and conservative threshold therefore carry unchanged; this
+# is not a recalibration and the Rust API change still requires fresh validation.
+expected_pin=c2e2c8fbe52c2e5e8c65a56c2a547785f76c731e
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

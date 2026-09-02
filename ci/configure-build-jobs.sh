@@ -176,11 +176,17 @@ fi
 #     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
 #     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
 #     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
-# The intervening Reverie commits are the LiteInst task-creation change (#447)
-# and a documentation commit (#511); neither can affect the elapsed time of a
-# DynamoRIO content-key miss. Carry, not recalibration.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != af42d9cf7ae604777cd88c5cca5b319460c986e8 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie af42d9cf7ae604777cd88c5cca5b319460c986e8 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO c2e2c8fb (2026-09-02): both repository inputs to source_recipe_key
+# are byte-identical to af42d9cf by git object id:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+# The broader third-party tree is also unchanged:
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# The intervening Reverie commits do not touch a native DBT recipe input. The
+# measured native-build budget carries unchanged; fresh Rust build and validate
+# evidence is still required for the Backend API change.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c2e2c8fbe52c2e5e8c65a56c2a547785f76c731e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c2e2c8fbe52c2e5e8c65a56c2a547785f76c731e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
