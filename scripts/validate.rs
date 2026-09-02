@@ -1144,6 +1144,9 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             .env_remove(validate_runtime::ACTIVE_ENV)
             .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_PID")
             .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE")
+            // The fixture deliberately runs one focused preflight node. Do not
+            // inherit the outer canonical run's full-profile admission guard.
+            .env_remove("VALIDATE_FORCE_FULL")
             // This fixture deliberately exercises the pre-driver bootstrap in
             // an independent checkout. It must compile that copied driver with
             // the real rust-script so a missing path dependency remains visible
@@ -1372,6 +1375,10 @@ fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
 /// on every invocation (validate.sh:308); here they are a `--self-test` subcommand
 /// so the cost is not paid on the hot path.
 fn self_test() -> Result<(), String> {
+    // The outer invocation has already passed admission. The brackets below
+    // intentionally parse and launch focused forms, so an inherited full-run
+    // requirement would test the caller's environment instead of those forms.
+    std::env::remove_var("VALIDATE_FORCE_FULL");
     inner_freshness_skip_cli_bracket()?;
     run_owned_cache_bracket()?;
     println!("  {}", portable_strict_compat_outer_dag_bracket(&repo_root())?);
@@ -9250,6 +9257,10 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
         .current_dir(root)
         .env("DAGRUN_BIN", &runner)
         .env("RUN_DAG_CAPTURE", &captured)
+        // The outer canonical full run exports this admission guard. This
+        // nested bracket deliberately constructs one portable lane and must
+        // test that entry point under its normal environment.
+        .env_remove("VALIDATE_FORCE_FULL")
         .env_remove("RUN_DAG_FILE_OVERRIDE")
         .output()
         .map_err(|error| format!("raw run-dag: cannot launch default entrypoint: {error}"))?;
@@ -9326,6 +9337,7 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
         .args(["portable", "json"])
         .current_dir(root)
         .env_remove("DAGRUN_BIN")
+        .env_remove("VALIDATE_FORCE_FULL")
         .env_remove("RUN_DAG_FILE_OVERRIDE")
         .output()
         .map_err(|error| format!("raw run-dag: cannot launch real json entrypoint: {error}"))?;

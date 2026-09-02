@@ -18,7 +18,7 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules verify-submodules check-skill-discovery validate validate-plan \
-	validate-self-test validate-timeout-layers-test lint \
+	validate-self-test validate-timeout-layers-test lint demo-review \
 	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch \
 	check-demo-deps demo1 demo2 demo3 demo4 demo5 demo6 demo7 demo8 demos
 
@@ -173,7 +173,11 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	$(MAKE) -C demos --no-print-directory test
 	./scripts/test-prepare-demo08-calibration.sh
 	./scripts/test-check-demo-review.sh
-	./scripts/check-demo-review.sh --range HEAD..HEAD
+	@base="$$(git merge-base HEAD origin/main)" || { \
+		echo "demo-review: cannot find the merge base of HEAD and origin/main" >&2; \
+		exit 2; \
+	}; \
+	./scripts/check-demo-review.sh --range "$$base..HEAD"
 	./scripts/check-skill-discovery.rs
 	./scripts/check-github-actions-triggers.rs
 	./scripts/test-required-check-outcomes.sh
@@ -211,6 +215,13 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	./scripts/core-review-protocol-lint-test.sh
 	python3 ./ci/test_audit_test_binary_registration.py
 	./ci/run-with-reverie-dbt-budget-test.sh
+
+demo-review: ## Check every runnable demo changed on this branch for a current green attestation
+	@base="$$(git merge-base HEAD origin/main)" || { \
+		echo "demo-review: cannot find the merge base of HEAD and origin/main" >&2; \
+		exit 2; \
+	}; \
+	./scripts/check-demo-review.sh --range "$$base..HEAD"
 
 lint-cargo: ## The two compile-heavy lint passes; CI runs these as lint.rustfmt and lint.clippy
 	$(CARGO) fmt --all -- --check

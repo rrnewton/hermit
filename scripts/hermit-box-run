@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hermit-box-run — run ONE ad-hoc command inside the safe-ci-dag-runner box so it can
+# hermit-box-run — run ONE ad-hoc command inside the dagrun box so it can
 # never orphan a setsid/double-fork inner child or leak a burned core / held namespace.
 #
 # WHY THIS EXISTS
@@ -9,10 +9,10 @@
 # its OWN process group that burns a core / holds a PID namespace and reparents to
 # ppid=1. A launcher `kill -- -<PGID>` (what an agent recycle or a tool wall-cap does)
 # reaches only the OUTER and ORPHANS the inner — the exact reason ad-hoc runs leak while
-# cgroup-scoped safe-ci-dag-runner nodes do not.
+# cgroup-scoped dagrun nodes do not.
 #
 # This wrapper closes that gap WITHOUT new engine code: it emits a ONE-step DAG (with a
-# CPU-TIME budget) and drives it through the canonical safe-ci-dag-runner, reusing verbatim
+# CPU-TIME budget) and drives it through dagrun, reusing verbatim
 #   * boxing ON by default + exit 3 when cgroup-v2/systemd --user scope is unavailable,
 #   * the per-step CPU-time budget kill in scheduler._monitor (reads cgroup cpu.stat
 #     usage_usec — immune to wall-clock slowdown under load), and
@@ -62,7 +62,7 @@
 #                      exit 3 (fail-closed) if cgroup boxing is unavailable. Use this whenever
 #                      the caller consumes the guest's stdout/stderr (determinism fingerprints,
 #                      ASAN/QEMU/verify grep evidence). The DEFAULT (capture) mode drives
-#                      safe-ci-dag-runner and is a PASS/FAIL harness that swallows guest output.
+#                      dagrun and is a PASS/FAIL harness that swallows guest output.
 #   --diag-fd N        (passthrough only) write box diagnostics (scope id, CPU-TIMEOUT notices,
 #                      resource CSV) to already-open fd N instead of a temp log. NEVER onto the
 #                      consumed fd1/fd2. Use `--diag-fd 2` only when stderr is not consumed.
@@ -70,7 +70,7 @@
 #                      Default: a temp file (path announced only on the diag stream, never fd1/fd2).
 #
 # EXIT CODES
-#   default (capture) mode — passthrough from safe-ci-dag-runner:
+#   default (capture) mode — passthrough from dagrun:
 #     0  command succeeded within all limits
 #     1  command failed OR was reaped for exceeding a limit — grep the step line to
 #        distinguish: "CPU-TIMEOUT" (--cpu-budget), "TIMEOUT"/wall (--wall), or an OOM kill
@@ -98,16 +98,28 @@ diag_log=""
 
 die() { echo "hermit-box-run: $*" >&2; exit 2; }
 
-RUNNER=""
-for candidate in \
-  "$ROOT/agent-utils/bin/dagrun" \
-  "$ROOT/agent-utils/bin/safe-ci-dag-runner"; do
-  if [ -x "$candidate" ]; then
-    RUNNER="$candidate"
-    break
+find_runner() {
+  if [ -n "${DAGRUN_BIN:-}" ]; then
+    printf '%s\n' "$DAGRUN_BIN"
+    return 0
   fi
-done
-[ -n "$RUNNER" ] || die "agent-utils contains neither bin/dagrun nor bin/safe-ci-dag-runner"
+  local base="$ROOT/agent-utils"
+  if [ -x "$base/common/bin/dagrun" ]; then
+    printf '%s\n' "$base/common/bin/dagrun"
+    return 0
+  fi
+  if [ -x "$base/py/bin/dagrun" ]; then
+    printf '%s\n' "$base/py/bin/dagrun"
+    return 0
+  fi
+  if command -v dagrun >/dev/null 2>&1; then
+    command -v dagrun
+    return 0
+  fi
+  return 1
+}
+
+RUNNER="$(find_runner)" || die "dagrun not found; initialize agent-utils or set DAGRUN_BIN"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -177,7 +189,7 @@ fi
 # ---------------------------------------------------------------------------
 # TRANSPARENT-PASSTHROUGH mode.
 #
-# The default (capture) path below drives safe-ci-dag-runner, a PASS/FAIL harness that
+# The default (capture) path below drives dagrun, a PASS/FAIL harness that
 # swallows guest stdout/stderr (only a `[box.<tag>]` tail survives) and injects a
 # nondeterministic `safe-ci-<pid>.scope` id into consumed output — fatal for any caller that
 # hashes/greps the guest streams. Passthrough instead runs the command in a transient

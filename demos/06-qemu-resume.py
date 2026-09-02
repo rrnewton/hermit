@@ -60,8 +60,9 @@ TIMEOUT = int(os.environ.get("QEMU_TIMEOUT", "120"))
 # never byte-bounded while it lived.
 SAFEHERMIT = ROOT / "bin/safehermit"
 # MEASURED ON THIS DEMO, NOT GUESSED -- and measured MORE THAN ONCE, which is the
-# only reason this number is right. On devbig014 (hermit 0.2.0 g770b95c505fa, QEMU
-# 10.1.2) a healthy resume wrote:
+# only reason this number is right. On the Demo 6 QEMU measurement host recorded in
+# docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts" (hermit 0.2.0
+# g770b95c505fa, QEMU 10.1.2), a healthy resume wrote:
 #     80,133,297 bytes in 10s   -- resuming one snapshot state
 #    153,236,739 bytes in 18-26s -- resuming another, twice, byte-identical
 # The same demo, healthy both times, differing by 1.9x depending on the snapshot it
