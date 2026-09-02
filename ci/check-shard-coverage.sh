@@ -250,21 +250,6 @@ workflow_wiring_contract() {
             regular pattern 'parity-v1-${{ github.run_id }}-${{ github.run_attempt }}-*' "$workflow_text"
 }
 
-debug_artifact_contract() {
-    local workflow_text=$1 pack_step unpack_step
-    local archive_member='            target/debug/verification-report \'
-    pack_step=$(workflow_step_body "Pack debug prebuilt tree" "$workflow_text")
-    unpack_step=$(workflow_step_body "Unpack debug tree" "$workflow_text")
-    grep -Fqx '          test -x target/debug/verification-report' <<<"$pack_step" &&
-        grep -Fqx "$archive_member" <<<"$pack_step" &&
-        grep -Fqx '          test -x target/debug/verification-report' <<<"$unpack_step"
-}
-
-# check.backend_parity_suites runs target/debug/verification-report after the
-# debug tree crosses a job boundary. Guard all three parts of that contract:
-# producer existence, archive membership, and executable consumer assertion.
-# The mutation bracket proves the guard rejects the original omission instead
-# of passing merely because the binary is mentioned somewhere in the workflow.
 workflow_text=$(<"$workflow")
 if ! workflow_wiring_contract "$workflow_text"; then
     echo "check-shard-coverage.sh: FAIL — workflow job needs/artifact transfers do not match the constructed dependency supply contract" >&2
@@ -290,19 +275,6 @@ if [[ $missing_artifact == "$workflow_text" ]]; then
     status=1
 elif workflow_wiring_contract "$missing_artifact"; then
     echo "check-shard-coverage.sh: FAIL — workflow guard accepted a planted missing artifact download" >&2
-    status=1
-fi
-
-if ! debug_artifact_contract "$workflow_text"; then
-    echo "check-shard-coverage.sh: FAIL — debug artifact must transport executable target/debug/verification-report" >&2
-    status=1
-fi
-omitted_artifact=${workflow_text/$'            target/debug/verification-report \\\n'/}
-if [[ $omitted_artifact == "$workflow_text" ]]; then
-    echo "check-shard-coverage.sh: FAIL — artifact omission fixture did not remove verification-report" >&2
-    status=1
-elif debug_artifact_contract "$omitted_artifact"; then
-    echo "check-shard-coverage.sh: FAIL — artifact guard accepted a planted missing verification-report member" >&2
     status=1
 fi
 

@@ -25,6 +25,7 @@
     "check.shard_coverage",
     "check.backend_abstraction",
     "check.backend_parity_mutation",
+    "check.backend_parity_suites",
     "check.portability_paths",
     "check.dagrun_naming",
     "check.run_node_args",
@@ -86,7 +87,6 @@
     {
       "slug": "integration",
       "nodes": [
-        "check.backend_parity_suites",
         "test.hermit_integration",
         "test.cli",
         "test.arbitrary_binaries",
