@@ -502,12 +502,28 @@ jobs:
           # empty dir so the pack is robust — e2e cells run with --allow-empty and
           # simply find no prebuilt fixtures, exactly as an unstaged tree intends.
           mkdir -p ignored/e2e/build
+          for required in \
+            "target/debug/deps/libdetcore_dbt.so" \
+            "target/debug/hermit" \
+            "target/debug/test-harness" \
+            "target/debug/hermit-manifest-plan" \
+            "target/debug/verification-report" \
+            "target/ci/bin/cargo-nextest"; do
+            if [[ ! -e "$required" ]]; then
+              echo "::error::debug artifact producer did not create required path: $required" >&2
+            elif [[ "$required" != target/debug/deps/libdetcore_dbt.so && ! -x "$required" ]]; then
+              echo "::error::debug artifact producer created a non-executable file: $required" >&2
+            fi
+          done
           test -f target/debug/deps/libdetcore_dbt.so
           # Cargo test shards may rewrite target/debug/deps. Keep the DBT runtime
           # in Hermit's normal install-resource location so later CLI nodes do
           # not depend on that mutable Cargo output directory.
           install -Dm755 target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so
+          test -x target/debug/hermit
+          test -x target/debug/test-harness
+          test -x target/debug/hermit-manifest-plan
           test -x target/debug/verification-report
           test -x target/ci/bin/cargo-nextest
           tar --zstd -cf "$DEBUG_TARBALL" \
