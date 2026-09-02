@@ -8,9 +8,9 @@ on:
     inputs:
       sha:
         description: >-
-          Exact Hermit SHA to test on demand. Use this to attribute a failure
-          to a specific commit (git-bisect style). Empty = the dispatched ref's
-          tip.
+          Exact Hermit SHA to test on demand. It must be the commit at the
+          dispatched ref, so the run's GitHub head identity and tested checkout
+          cannot disagree. Empty = the dispatched ref's tip.
         required: false
         type: string
       force_cold_calibration:
@@ -70,8 +70,10 @@ jobs:
         run: |
           set -euo pipefail
           actual="$(git rev-parse HEAD)"
-          expected="$(git rev-parse "$TARGET_SHA^{commit}")"
-          test "$actual" = "$expected"
+          requested="$(git rev-parse "$TARGET_SHA^{commit}")"
+          dispatched="$(git rev-parse "$GITHUB_SHA^{commit}")"
+          test "$actual" = "$requested"
+          test "$actual" = "$dispatched"
           echo "Demo suite Hermit SHA: $actual"
 
       - name: Ensure the repository Rust toolchain
@@ -193,7 +195,7 @@ jobs:
         shell: bash
         env:
           CACHE_HIT: ${{ steps.demo08-cache.outputs.cache-hit }}
-          FORCE_COLD: ${{ github.event_name == 'schedule' || inputs.force_cold_calibration }}
+          FORCE_COLD: ${{ inputs.force_cold_calibration }}
         run: |
           set -euo pipefail
           seed_file="$GITHUB_WORKSPACE/ignored/demo08-btrfs/.crash-seed"
@@ -213,29 +215,28 @@ jobs:
         id: demo-sweep
         run: |
           set -euo pipefail
-          scripts/prepare-demo08-assets.sh
+          log="$GITHUB_WORKSPACE/demo-sweep-validation.log"
+          : >"$log"
+          scripts/prepare-demo08-assets.sh 2>&1 | tee -a "$log"
           command=(demos/run-all.sh --all)
           if command -v with-proxy >/dev/null 2>&1; then
             command=(with-proxy "${command[@]}")
           fi
           timeout --foreground --kill-after=60s 21000s \
-            "${command[@]}" 2>&1 | tee demo-sweep-validation.log
+            "${command[@]}" 2>&1 | tee -a "$log"
 
       - name: Verify the selected Demo 8 calibration path
         if: always()
         shell: bash
         env:
           DEMO_SWEEP_OUTCOME: ${{ steps.demo-sweep.outcome }}
-          FORCE_COLD: ${{ github.event_name == 'schedule' || inputs.force_cold_calibration }}
+          FORCE_COLD: ${{ inputs.force_cold_calibration }}
         run: |
           set -euo pipefail
           log="$GITHUB_WORKSPACE/demo-sweep-validation.log"
-          actual=no-evidence
-          if [[ -r "$log" ]] && grep -q 'Demo 8 crash seed calibrated:' "$log"; then
-            actual=cold-calibration
-          elif [[ -r "$log" ]] && grep -q 'Demo 8 crash seed ready (cached seed' "$log"; then
-            actual=cached-seed-shortcut
-          fi
+          classifier_rc=0
+          actual="$(scripts/demo08-calibration-path.sh \
+            --log "$log" --force-cold "${FORCE_COLD:-false}")" || classifier_rc=$?
           {
             echo "## Demo 8 calibration path"
             echo
@@ -243,9 +244,9 @@ jobs:
             echo "- observed path: $actual"
             echo "- demo sweep outcome: ${DEMO_SWEEP_OUTCOME:-unknown}"
           } >>"$GITHUB_STEP_SUMMARY"
-          if [[ "$FORCE_COLD" == true && "$actual" != cold-calibration ]]; then
-            echo "::error title=Demo 8 cold calibration NO-RESULT::forced cold run did not publish the calibration-success marker"
-            exit 1
+          if [[ $classifier_rc -ne 0 ]]; then
+            echo "::error title=Demo 8 calibration evidence refused::$actual"
+            exit "$classifier_rc"
           fi
 
       - name: Upload per-demo diagnostics
@@ -261,6 +262,7 @@ jobs:
             ignored/demo07-drgn/
             ignored/demo08-run/*.txt
             ignored/demo08-run/*.out
+            ignored/demo08-run/calibration.tsv
           if-no-files-found: warn
           retention-days: 14
 

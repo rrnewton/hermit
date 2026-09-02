@@ -8,9 +8,10 @@
  */
 //! Enforce the repository's GitHub Actions trigger policy.
 //!
-//! Local exact-head validation is the landing authority. The portable workflow
-//! is supplemental evidence and may run automatically only after a commit is
-//! pushed to `integration`; every workflow may remain manually dispatchable.
+//! Local exact-head validation is the landing authority. The portable and demo
+//! review workflows are supplemental evidence and may run automatically only
+//! after a commit is pushed to `integration`; every workflow may remain manually
+//! dispatchable.
 //! This checker deliberately accepts only the small YAML shape used here. An
 //! unfamiliar or ambiguous trigger block is an error, never a silent pass.
 
@@ -24,6 +25,8 @@ use std::path::PathBuf;
 
 const WORKFLOW_DIR: &str = ".github/workflows";
 const PORTABLE: &str = "ci-portable.yml";
+const DEMO_REVIEW: &str = "demo-review-gate.yml";
+const INTEGRATION_PUSH_WORKFLOWS: [&str; 2] = [PORTABLE, DEMO_REVIEW];
 
 #[derive(Debug, PartialEq, Eq)]
 struct Triggers {
@@ -62,12 +65,32 @@ fn key(line: &str) -> Option<&str> {
 fn inline_list(value: &str) -> Option<Vec<String>> {
     let value = value.trim();
     let inner = value.strip_prefix('[')?.strip_suffix(']')?;
-    let entries = inner
-        .split(',')
-        .map(|entry| entry.trim().trim_matches(['\'', '"']).to_string())
-        .collect::<Vec<_>>();
-    if entries.is_empty() || entries.iter().any(String::is_empty) {
-        return None;
+    let mut entries = Vec::new();
+    for raw in inner.split(',') {
+        let raw = raw.trim();
+        let token = if let Some(quoted) = raw
+            .strip_prefix('\'')
+            .and_then(|value| value.strip_suffix('\''))
+        {
+            quoted
+        } else if let Some(quoted) = raw
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        {
+            quoted
+        } else if raw.starts_with(['\'', '"']) || raw.ends_with(['\'', '"']) {
+            return None;
+        } else {
+            raw
+        };
+        if token.is_empty()
+            || !token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return None;
+        }
+        entries.push(token.to_string());
     }
     Some(entries)
 }
@@ -197,15 +220,24 @@ fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
         errors.push("found `push.branches` without a `push` trigger".to_string());
     }
 
-    if name == PORTABLE {
+    if INTEGRATION_PUSH_WORKFLOWS.contains(&name) {
         if triggers.events != allowed {
-            errors.push(
-                "ci-portable.yml must have exactly `workflow_dispatch` and `push` triggers"
-                    .to_string(),
-            );
+            errors.push(format!(
+                "{name} must have exactly `workflow_dispatch` and `push` triggers"
+            ));
         }
         if triggers.push_branches.as_deref() != Some(&["integration".to_string()]) {
-            errors.push("ci-portable.yml must push-trigger exactly on `integration`".to_string());
+            errors.push(format!("{name} must push-trigger exactly on `integration`"));
+        }
+    } else {
+        let manual_only = BTreeSet::from(["workflow_dispatch".to_string()]);
+        if triggers.events != manual_only {
+            errors.push(format!(
+                "{name} must have exactly the `workflow_dispatch` trigger"
+            ));
+        }
+        if triggers.push_branches.is_some() {
+            errors.push(format!("{name} must not configure `push.branches`"));
         }
     }
     errors
@@ -236,13 +268,15 @@ fn workflow_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
 fn run(dir: &Path) -> Result<usize, Vec<String>> {
     let files = workflow_files(dir).map_err(|error| vec![error])?;
     let mut errors = Vec::new();
-    let mut saw_portable = false;
+    let mut seen_integration_push_workflows = BTreeSet::new();
     for path in &files {
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        saw_portable |= name == PORTABLE;
+        if INTEGRATION_PUSH_WORKFLOWS.contains(&name) {
+            seen_integration_push_workflows.insert(name);
+        }
         let source = match fs::read_to_string(path) {
             Ok(source) => source,
             Err(error) => {
@@ -261,8 +295,10 @@ fn run(dir: &Path) -> Result<usize, Vec<String>> {
             Err(error) => errors.push(format!("{}: {error}", path.display())),
         }
     }
-    if !saw_portable {
-        errors.push(format!("{PORTABLE} is missing"));
+    for required in INTEGRATION_PUSH_WORKFLOWS {
+        if !seen_integration_push_workflows.contains(required) {
+            errors.push(format!("{required} is missing"));
+        }
     }
     if errors.is_empty() {
         Ok(files.len())
@@ -295,11 +331,18 @@ mod tests {
     }
 
     #[test]
-    fn portable_policy_accepts_integration_and_manual_only() {
-        let triggers = parsed(
-            "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration]\njobs:\n",
-        );
-        assert!(validate(PORTABLE, &triggers).is_empty());
+    fn integration_push_workflows_accept_integration_and_manual_dispatch() {
+        for name in INTEGRATION_PUSH_WORKFLOWS {
+            for branch in ["integration", "'integration'", "\"integration\""] {
+                let triggers = parsed(&format!(
+                    "name: workflow\non:\n  workflow_dispatch:\n  push:\n    branches: [{branch}]\njobs:\n"
+                ));
+                assert!(
+                    validate(name, &triggers).is_empty(),
+                    "{name} rejected matched quoting: {branch}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -309,26 +352,58 @@ mod tests {
     }
 
     #[test]
-    fn pull_request_and_schedule_are_rejected() {
+    fn wrong_workflow_integration_push_is_rejected() {
+        let triggers =
+            parsed("on:\n  workflow_dispatch:\n  push:\n    branches: [integration]\njobs:\n");
+        let errors = validate("demo-hot-path.yml", &triggers);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must have exactly the `workflow_dispatch` trigger")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn pull_request_and_schedule_are_rejected_for_every_workflow_class() {
         for event in [
             "pull_request",
             "pull_request_target",
             "schedule",
             "workflow_run",
         ] {
-            let triggers = parsed(&format!("on:\n  workflow_dispatch:\n  {event}:\njobs:\n"));
-            assert!(
-                !validate("other.yml", &triggers).is_empty(),
-                "{event} unexpectedly passed"
-            );
+            for name in [PORTABLE, DEMO_REVIEW, "other.yml"] {
+                let push = INTEGRATION_PUSH_WORKFLOWS
+                    .contains(&name)
+                    .then_some("  push:\n    branches: [integration]\n")
+                    .unwrap_or("");
+                let triggers = parsed(&format!(
+                    "on:\n  workflow_dispatch:\n{push}  {event}:\njobs:\n"
+                ));
+                let errors = validate(name, &triggers);
+                assert!(
+                    errors
+                        .iter()
+                        .any(|error| error.contains(&format!("automatic `{event}`"))),
+                    "{event} unexpectedly passed for {name}: {errors:?}"
+                );
+            }
         }
     }
 
     #[test]
-    fn main_and_unbounded_pushes_are_rejected() {
-        for push in ["  push:\n    branches: [main]\n", "  push:\n"] {
-            let triggers = parsed(&format!("on:\n  workflow_dispatch:\n{push}jobs:\n"));
-            assert!(!validate("other.yml", &triggers).is_empty());
+    fn main_and_unbounded_pushes_are_rejected_for_allowed_workflows() {
+        for name in INTEGRATION_PUSH_WORKFLOWS {
+            for push in ["  push:\n    branches: [main]\n", "  push:\n"] {
+                let triggers = parsed(&format!("on:\n  workflow_dispatch:\n{push}jobs:\n"));
+                let errors = validate(name, &triggers);
+                assert!(
+                    errors.iter().any(|error| {
+                        error.contains("must push-trigger exactly on `integration`")
+                    }),
+                    "{name} unexpectedly accepted {push:?}: {errors:?}"
+                );
+            }
         }
     }
 
@@ -340,6 +415,18 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_branch_quotes_are_rejected() {
+        for branch in ["'integration\"'", "\"integration'\""] {
+            let source =
+                format!("on:\n  workflow_dispatch:\n  push:\n    branches: [{branch}]\njobs:\n");
+            assert!(
+                parse_triggers(&source).is_err(),
+                "mismatched branch quotes unexpectedly parsed: {branch}"
+            );
+        }
+    }
+
+    #[test]
     fn deeper_push_structures_are_rejected() {
         let source = "on:\n  workflow_dispatch:\n  push:\n    branches: [integration]\n      unexpected: value\njobs:\n";
         let error = parse_triggers(source).expect_err("deeper push structure unexpectedly parsed");
@@ -347,9 +434,11 @@ mod tests {
     }
 
     #[test]
-    fn portable_requires_both_allowed_events() {
+    fn integration_push_workflows_require_both_allowed_events() {
         let triggers = parsed("on:\n  workflow_dispatch:\njobs:\n");
-        assert!(!validate(PORTABLE, &triggers).is_empty());
+        for name in INTEGRATION_PUSH_WORKFLOWS {
+            assert!(!validate(name, &triggers).is_empty());
+        }
     }
 
     #[test]
@@ -357,6 +446,8 @@ mod tests {
         for source in [
             "on: [push, workflow_dispatch]\njobs:\n",
             "on:\n  workflow_dispatch: {}\njobs:\n",
+            "on:\n  \"repository_dispatch\":\njobs:\n",
+            "on:\n  'repository_dispatch':\njobs:\n",
             "on:\n  push:\n    branches:\n      - integration\njobs:\n",
         ] {
             assert!(
@@ -373,6 +464,8 @@ mod tests {
             "on : [pull_request]",
             "\"on\": [pull_request]",
             "'on': [pull_request]",
+            "\"on\":\n  repository_dispatch:",
+            "\"o\\x6e\":\n  repository_dispatch:",
             "!!str on: [pull_request]",
             "? on\n: [pull_request]",
         ] {

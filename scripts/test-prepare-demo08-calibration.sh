@@ -5,6 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREP="$ROOT/scripts/prepare-demo08-assets.sh"
+CLASSIFIER="$ROOT/scripts/demo08-calibration-path.sh"
 TMP="$(mktemp -d -t demo08-calibration-test.XXXXXX)"
 trap 'rm -rf -- "$TMP"' EXIT
 
@@ -99,6 +100,20 @@ case "${DEMO08_TEST_MODE:?mode required}" in
       echo 'Conversion complete'
     fi
     ;;
+  uaf-no-engagement)
+    ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 \
+      "${DEMO08_TEST_UAF_BIN:?UAF binary required}"
+    ;;
+  runner-failure)
+    echo 'fixture runner failed before guest execution' >&2
+    exit 127
+    ;;
+  runner-failure-with-signatures)
+    printf 'Copy inodes [o] [         0/         1]\r\n'
+    ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 \
+      "${DEMO08_TEST_UAF_BIN:?UAF binary required}" || true
+    exit 127
+    ;;
   *)
     echo "unknown test mode: $DEMO08_TEST_MODE" >&2
     exit 2
@@ -116,9 +131,39 @@ run_prepare() {
     DEMO08_CALIBRATION_SEEDS="$seeds" \
     DEMO08_CALIBRATION_TIMEOUT=1 \
     DEMO08_CALIBRATION_RUNNER="$TMP/runner.sh" \
+    DEMO08_CALIBRATION_FIXTURE_MODE=1 \
+    DEMO08_CALIBRATION_FIXTURE_ROOT="$TMP" \
     HERMIT_RELEASE="$TMP/not-used-hermit" \
     "$PREP"
 }
+
+# An ambient runner variable cannot bypass the normal safehermit path. Fixture
+# mode must be explicit, and the runner must be contained by its supplied root.
+assets="$TMP/assets-runner-guard"
+artifacts="$TMP/artifacts-runner-guard"
+make_assets "$assets"
+set +e
+runner_guard_output="$(DEMO08_TEST_MODE=no-engagement env \
+  DEMO08_DIR="$assets" DEMO08_ARTIFACTS="$artifacts" \
+  DEMO08_CALIBRATION_RUNNER="$TMP/runner.sh" \
+  HERMIT_RELEASE="$TMP/not-used-hermit" "$PREP" 2>&1)"
+runner_guard_rc=$?
+set -e
+[ "$runner_guard_rc" -ne 0 ]
+grep -q 'requires DEMO08_CALIBRATION_FIXTURE_MODE=1' <<<"$runner_guard_output"
+
+mkdir -p "$TMP/other-fixture-root"
+set +e
+runner_guard_output="$(DEMO08_TEST_MODE=no-engagement env \
+  DEMO08_DIR="$assets" DEMO08_ARTIFACTS="$artifacts" \
+  DEMO08_CALIBRATION_RUNNER="$TMP/runner.sh" \
+  DEMO08_CALIBRATION_FIXTURE_MODE=1 \
+  DEMO08_CALIBRATION_FIXTURE_ROOT="$TMP/other-fixture-root" \
+  HERMIT_RELEASE="$TMP/not-used-hermit" "$PREP" 2>&1)"
+runner_guard_rc=$?
+set -e
+[ "$runner_guard_rc" -ne 0 ]
+grep -q 'is outside the fixture root' <<<"$runner_guard_output"
 
 # Negative bracket: two attempted seeds, no path engagement. This must be a
 # refused NO-RESULT, with both per-seed outputs and rows retained.
@@ -160,22 +205,130 @@ uaf_output="$(DEMO08_TEST_MODE=planted-uaf \
   DEMO08_TEST_UAF_SEED=1 DEMO08_TEST_UAF_BIN="$TMP/planted-uaf" \
   run_prepare "$assets" "$artifacts" 3 2>&1)"
 grep -q 'engagement=2/2 uaf_hits=1/2' <<<"$uaf_output"
-[ "$(cat "$assets/.crash-seed")" = 1 ]
+grep -q 'Demo 8 crash seed calibrated: 1' <<<"$uaf_output"
+! grep -q 'Demo 8 crash seed replayed:' <<<"$uaf_output"
+printf '%s\n' "$uaf_output" >"$TMP/cold.log"
+[ "$("$CLASSIFIER" --log "$TMP/cold.log" --force-cold false)" = cold-calibration ]
+[ "$("$CLASSIFIER" --log "$TMP/cold.log" --force-cold true)" = cold-calibration ]
+fixture=$(sha256sum "$assets/buggy/btrfs-convert" | cut -d' ' -f1)
+[ "$(cat "$assets/.crash-seed")" = "1 $fixture" ]
 grep -q $'^1\tcold\treached\thit\t' "$artifacts/calibration.tsv"
 grep -q 'AddressSanitizer: heap-use-after-free' \
   "$artifacts/calibration-cold-seed-1.out"
 
-# Cached seeds are replayed, not trusted as a proxy. The evidence denominator
-# is therefore 1/1 rather than an unmeasured cache hit.
+# A UAF signature without the progress-thread witness does not qualify a seed.
+assets="$TMP/assets-unbound-uaf"
+artifacts="$TMP/artifacts-unbound-uaf"
+make_assets "$assets"
+set +e
+unbound_output="$(DEMO08_TEST_MODE=uaf-no-engagement \
+  DEMO08_TEST_UAF_BIN="$TMP/planted-uaf" \
+  run_prepare "$assets" "$artifacts" 1 2>&1)"
+unbound_rc=$?
+set -e
+[ "$unbound_rc" -ne 0 ]
+grep -q 'NO-RESULT: path engagement 0/1' <<<"$unbound_output"
+grep -q 'engagement=0/1 uaf_hits=1/1' <<<"$unbound_output"
+[ ! -e "$assets/.crash-seed" ]
+
+# A runner failure is an environment error, not evidence that the path ran
+# without finding the UAF.
+assets="$TMP/assets-runner-failure"
+artifacts="$TMP/artifacts-runner-failure"
+make_assets "$assets"
+set +e
+runner_failure_output="$(DEMO08_TEST_MODE=runner-failure \
+  run_prepare "$assets" "$artifacts" 1 2>&1)"
+runner_failure_rc=$?
+set -e
+[ "$runner_failure_rc" -ne 0 ]
+grep -q 'never executed the guest: 0 of 1 seeds' <<<"$runner_failure_output"
+! grep -q 'no ASAN UAF found' <<<"$runner_failure_output"
+
+# Output text cannot turn a wrapper failure into a qualifying guest run, even
+# when that output happens to contain both required signatures.
+assets="$TMP/assets-runner-failure-with-signatures"
+artifacts="$TMP/artifacts-runner-failure-with-signatures"
+make_assets "$assets"
+set +e
+runner_failure_output="$(DEMO08_TEST_MODE=runner-failure-with-signatures \
+  DEMO08_TEST_UAF_BIN="$TMP/planted-uaf" \
+  run_prepare "$assets" "$artifacts" 1 2>&1)"
+runner_failure_rc=$?
+set -e
+[ "$runner_failure_rc" -ne 0 ]
+grep -q 'never executed the guest: 0 of 1 seeds' <<<"$runner_failure_output"
+[ ! -e "$assets/.crash-seed" ]
+
+# A fixture-bound cache is a selection hint, not evidence. Replay must produce
+# the same qualifying execution, path engagement, and ASAN diagnostic.
 assets="$TMP/assets-cached"
 artifacts="$TMP/artifacts-cached"
 make_assets "$assets"
-printf '1\n' >"$assets/.crash-seed"
+fixture=$(sha256sum "$assets/buggy/btrfs-convert" | cut -d' ' -f1)
+printf '1 %s\n' "$fixture" >"$assets/.crash-seed"
 cached_output="$(DEMO08_TEST_MODE=planted-uaf \
   DEMO08_TEST_UAF_SEED=1 DEMO08_TEST_UAF_BIN="$TMP/planted-uaf" \
   run_prepare "$assets" "$artifacts" 3 2>&1)"
-grep -q 'engagement=1/1 uaf_hits=1/1' <<<"$cached_output"
+grep -q 'engagement=1/1 uaf_hits=1/1 executed=1/1' <<<"$cached_output"
+grep -q 'Demo 8 crash seed replayed: cached seed 1' <<<"$cached_output"
+! grep -q 'Demo 8 crash seed calibrated:' <<<"$cached_output"
+printf '%s\n' "$cached_output" >"$TMP/cached.log"
+[ "$("$CLASSIFIER" --log "$TMP/cached.log" --force-cold false)" = cached-seed-replay ]
+set +e
+forced_cached="$("$CLASSIFIER" --log "$TMP/cached.log" --force-cold true 2>/dev/null)"
+forced_cached_rc=$?
+set -e
+[ "$forced_cached_rc" -ne 0 ]
+[ "$forced_cached" = cached-seed-replay ]
+[ "$(cat "$assets/.crash-seed")" = "1 $fixture" ]
 grep -q $'^1\tcached\treached\thit\t' "$artifacts/calibration.tsv"
 [ "$(wc -l <"$artifacts/calibration.tsv")" -eq 2 ]
+grep -q 'AddressSanitizer: heap-use-after-free' \
+  "$artifacts/calibration-cached-seed-1.out"
+
+# A fixture-bound cached seed whose replay never executes is refused rather
+# than trusted as evidence from an earlier run.
+assets="$TMP/assets-cached-refused"
+artifacts="$TMP/artifacts-cached-refused"
+make_assets "$assets"
+fixture=$(sha256sum "$assets/buggy/btrfs-convert" | cut -d' ' -f1)
+printf '1 %s\n' "$fixture" >"$assets/.crash-seed"
+set +e
+cached_refused_output="$(DEMO08_TEST_MODE=runner-failure \
+  run_prepare "$assets" "$artifacts" 1 2>&1)"
+cached_refused_rc=$?
+set -e
+[ "$cached_refused_rc" -ne 0 ]
+grep -q 'never executed the guest: 0 of 2 seeds' <<<"$cached_refused_output"
+grep -q $'^1\tcached\tdid-not-reach\tnone\t127\t' "$artifacts/calibration.tsv"
+[ "$(wc -l <"$artifacts/calibration.tsv")" -eq 3 ]
+
+# Missing and conflicting retained evidence are both refused by the exact
+# classifier invoked from the workflow.
+printf 'preparation completed without a marker\n' >"$TMP/no-evidence.log"
+set +e
+no_evidence="$("$CLASSIFIER" --log "$TMP/no-evidence.log" --force-cold false 2>/dev/null)"
+no_evidence_rc=$?
+set -e
+[ "$no_evidence_rc" -ne 0 ]
+[ "$no_evidence" = no-evidence ]
+
+printf '%s\n%s\n' \
+  'Demo 8 crash seed calibrated: 1' \
+  'Demo 8 crash seed replayed: cached seed 1' >"$TMP/conflicting.log"
+set +e
+conflicting="$("$CLASSIFIER" --log "$TMP/conflicting.log" --force-cold false 2>/dev/null)"
+conflicting_rc=$?
+set -e
+[ "$conflicting_rc" -ne 0 ]
+[ "$conflicting" = conflicting-evidence ]
+
+# Keep the workflow consumer on the tested helper, and retain preparation plus
+# sweep output in the same append-only log under pipefail.
+workflow="$ROOT/.github/workflows/demo-hot-path.yml"
+grep -Fq 'scripts/prepare-demo08-assets.sh 2>&1 | tee -a "$log"' "$workflow"
+grep -Fq '"${command[@]}" 2>&1 | tee -a "$log"' "$workflow"
+grep -Fq 'actual="$(scripts/demo08-calibration-path.sh \' "$workflow"
 
 echo 'PASS: Demo 8 calibration records engagement and detects a planted ASAN UAF'

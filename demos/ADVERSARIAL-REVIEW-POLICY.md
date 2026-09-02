@@ -38,9 +38,10 @@ Demo-Green-Review: reviewer=<agent-id> demo=<demos/path|all> result=GREEN eviden
    `scripts/check-demo-review.sh --range <base>..<head>` (exit 0 required) before
    merging a demo-touching PR, in addition to the normal gates.
 
-The manual-only `.github/workflows/demo-review-gate.yml` runs the same range
-check when an investigator dispatches it. It is evidence, not an automatic PR
-trigger or a required GitHub check.
+`.github/workflows/demo-review-gate.yml` runs the same range check automatically
+only for pushes to `integration`, or when an investigator dispatches it. It is
+supplemental evidence, not an automatic pull-request or `main` trigger and not a
+required GitHub check.
 
 ## Scope
 
