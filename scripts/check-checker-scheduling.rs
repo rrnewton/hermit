@@ -54,13 +54,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
          node would make that node depend on an unrelated release build.",
     ),
     (
-        "scripts/test-prepare-demo08-calibration.sh",
-        "This acceptance bracket is owned by the separately assigned demo 08 \
-         task. The owner explicitly routed that work away from this agent, so \
-         this move preserves the checker without silently scheduling or claiming \
-         evidence from work that must be completed in that task.",
-    ),
-    (
         "scripts/check-default-build-warnings.sh",
         "Builds the workspace; its findings were never counted, so wiring it \
          untriaged could convert a silent gap into a standing red. Only \
@@ -313,7 +306,6 @@ fn main() {
     seed.push_str(&lint_checks_recipe(
         &std::fs::read_to_string("Makefile").expect("Makefile is unreadable"),
     ));
-
     // Fixpoint over EVERY tracked script, not only the checkers.
     //
     // ⚠️ Expanding only checkers is wrong and the first version of this guard did
@@ -386,7 +378,8 @@ fn main() {
             "  A checker nothing runs is indistinguishable from a checker that passes."
         );
         eprintln!("  Add it to the Makefile's `lint-checks` recipe (which check.lint_checks");
-        eprintln!("  runs, so no DAG edit is needed), or to a DAG node, or add it to");
+        eprintln!("  runs, so no DAG edit is needed), a DAG node, or an explicitly");
+        eprintln!("  scheduled workflow; otherwise add it to");
         eprintln!("  ALLOWLIST in this file WITH A REASON.");
         for c in &unscheduled {
             eprintln!("    {c}");

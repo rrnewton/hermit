@@ -171,6 +171,7 @@ lint: lint-checks lint-cargo ## Run the full lint suite matching CI (rustfmt, sh
 # the recipe, silently dropping every line after it.
 lint-checks: ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
 	$(MAKE) -C demos --no-print-directory test
+	./scripts/test-prepare-demo08-calibration.sh
 	./scripts/test-check-demo-review.sh
 	./scripts/check-demo-review.sh --range HEAD..HEAD
 	./scripts/check-skill-discovery.rs
