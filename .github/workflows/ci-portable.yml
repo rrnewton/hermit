@@ -165,7 +165,7 @@ jobs:
           run_dbg=$(jq -e '.include|length>0' <<<"$dbg" >/dev/null 2>&1 && echo true || echo false)
           run_rel=$(jq -e '.include|length>0' <<<"$rel" >/dev/null 2>&1 && echo true || echo false)
           run_strict=$(jq -r \
-            'if (.nodes | index("test.strict_compat")) == null then "false" else "true" end' \
+            'if any(.nodes[]; startswith("compat.")) then "true" else "false" end' \
             <<<"$sel_json")
           if [[ "$run_strict" == "true" ]]; then
             dbg=$(jq -c '{include: [ .debug_shards[] | {slug, nodes: (.nodes|join(","))} ]}' ci/portable-shards.json)
@@ -238,7 +238,7 @@ jobs:
     # proof-of-inert `skip` (e.g. docs-only) drops it.
     if: needs.select.outputs.decision != 'skip'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 166
     steps:
       - uses: actions/checkout@v4
         with:
@@ -332,7 +332,7 @@ jobs:
     needs: [select, preflight]
     if: needs.select.outputs.decision != 'skip'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 136
     steps:
       - uses: actions/checkout@v4
         with:
@@ -388,10 +388,9 @@ jobs:
     needs: [select, preflight]
     if: needs.select.outputs.build_debug != 'false'
     runs-on: ubuntu-latest
-    # The selected debug DAG has a 1560s critical path after e2e.metadata's
-    # measured budget rose from 60s to 180s. Keep the hosted job
-    # outside that path plus at least 300s for setup and artifact overhead.
-    timeout-minutes: 35
+    # The selected DAG's wall limits are derived hang backstops. Keep the hosted
+    # job outside that path plus 15 minutes for setup and artifact overhead.
+    timeout-minutes: 76
     outputs:
       e2e_matrix: ${{ steps.cells.outputs.matrix }}
       e2e_count: ${{ steps.cells.outputs.count }}
@@ -552,7 +551,7 @@ jobs:
     needs: [select, preflight]
     if: needs.select.outputs.build_release != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 76
     steps:
       - uses: actions/checkout@v4
       - name: Initialize dagrun submodule
@@ -628,7 +627,7 @@ jobs:
     needs: [select, build-debug, build-release]
     if: needs.select.outputs.build_release != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 91
     steps:
       - uses: actions/checkout@v4
       - name: Initialize dagrun submodule
@@ -718,7 +717,7 @@ jobs:
       && needs.build-release.result == 'success'
       && needs.build-complete.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 76
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select.outputs.debug_matrix) }}
@@ -845,7 +844,7 @@ jobs:
     needs: [select, build-debug, build-complete, test-debug]
     if: needs.select.outputs.run_strict_compat != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 46
     steps:
       - uses: actions/checkout@v4
       - name: Initialize submodules
@@ -905,7 +904,7 @@ jobs:
     needs: [select, build-complete]
     if: needs.select.outputs.run_release_shards != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 91
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select.outputs.release_matrix) }}
@@ -985,7 +984,7 @@ jobs:
     needs: [select, build-debug, build-complete]
     if: needs.select.outputs.run_e2e != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 46
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.build-debug.outputs.e2e_matrix) }}
@@ -1180,9 +1179,9 @@ jobs:
       - e2e
     if: always()
     runs-on: ubuntu-latest
-    # 10m absorbs the folded-in e2e parity reduction (former reduce-e2e job,
-    # itself 5m-capped) plus the gate jq.
-    timeout-minutes: 10
+    # The selected DAG's derived wall backstop plus 15 minutes for the folded-in
+    # e2e parity reduction and gate setup.
+    timeout-minutes: 46
     steps:
       - uses: actions/checkout@v4
       - name: Initialize dagrun submodule

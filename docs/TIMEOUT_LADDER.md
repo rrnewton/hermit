@@ -7,7 +7,7 @@ them.
 
 **If a run was killed rather than failing, this is the page for it.** The same
 number means different things at different rungs, so two rungs carrying "15" are
-not agreeing with each other. Five rungs exit **124**, which is why the exit code
+not agreeing with each other. Four rungs exit **124**, which is why the exit code
 cannot say which one fired and the stderr class line is the discriminator
 instead. And a bound at an inner rung that is not strictly smaller than its outer
 rung can never fire: it is dead configuration that reads as protection, and it
@@ -34,15 +34,23 @@ agreeing with each other.
 | hermit's unwind fallback | the same invocation, `N + 10s` | `RUN_TIMEOUT_UNWIND_GRACE` in `hermit-cli/src/lib.rs` | `_exit(124)` from a `SIGALRM` handler; no destructors | exit 124, `HERMIT_RUN_TIMEOUT_FALLBACK` |
 | `hermit record --record-timeout N` | one recording | the caller's argument | `_exit(124)` from a `SIGALRM` handler | exit 124 |
 | nextest `slow-timeout` | **one cargo test process**, which may invoke hermit zero or many times | `.config/nextest.toml`: 15s default, two named 30s overrides | `SIGTERM` to the test binary, 2s grace, then `SIGKILL` | wrapper exit 100, test named by nextest |
-| manifest cell `timeout_seconds` | **one manifest cell** | `tests/e2e/manifests/*.yaml`, per cell | `timeout --kill-after=10s Ns` around the cell command | exit 124 |
-| dagrun step `timeout` | **one DAG node**, i.e. a whole batch of cells or tests | `ci/dag/{portable,privileged}.json` | dagrun stops the step | node failure |
+| manifest fixture `timeout_seconds` | fixture preparation for **one manifest cell** | `tests/e2e/manifests/*.yaml`, per cell | the harness stops the preparation process group after the wall deadline | preparation error |
+| manifest cell CPU budget | all post-preparation attempts or seeds for **one manifest cell** | the same resolved `timeout_seconds` value | the harness stops the current process group after aggregate live CPU reaches the budget | timeout with `error_kind=cpu-timeout` |
+| manifest cell wall backstop | the same post-preparation population when it stops consuming CPU | three times the resolved cell CPU budget | the harness stops the current process group | timeout with `error_kind=wall-timeout` |
+| dagrun step `timeout` | **one DAG node**, i.e. a whole batch of cells or tests | `ci/dag/validate.json` | dagrun stops the step | node failure |
 | validate run budget | the whole outer validate graph | `HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS` or `--run-timeout` | dagrun stops admitting work and records unfinished nodes | incomplete validation, with named unfinished nodes |
 | validate systemd scope | the same outer run plus teardown grace | validate's safe-ci scope | systemd stops the whole process tree | outer-scope timeout |
 | `safehermit --sh-deadline` | **the whole wrapped process tree** | `bin/safehermit`, default 3600s | `systemd-run --user RuntimeMaxSec`, a **cgroup kill** | exit 124, `safehermit: bound.wall=` |
 
 Distribution of the values actually deployed today:
 
-- manifest `timeout_seconds`: 90s ×310, 60s ×25, 120s ×22, 600s ×1.
+- manifest `timeout_seconds`: the resolved number is a preparation wall bound and
+  a post-preparation CPU bound; replay receives that original number as its
+  inner `--record-timeout`, while the execution wall backstop is three times it.
+  Schema-4 result rows retain the historical `timeout_seconds` wall-bound
+  meaning and add `execution_cpu_timeout_seconds` and
+  `execution_wall_timeout_seconds`; older rows with neither additive field stay
+  readable, while a half-present or inconsistent pair is refused.
 - dagrun step `timeout`: 600s ×15, 900s ×15, 120s ×11, 180s ×6, 60s ×6, 720s ×5,
   1200s ×4, 300s ×3, 2400s ×1, 40s ×1, 30s ×1.
 
@@ -77,10 +85,10 @@ evidence, not processes.
 
 ## Which rung fired: read the class line, not `$?`
 
-⚠️ **THE EXIT CODE CANNOT ANSWER THIS AND MUST NOT BE ASKED.** Five different
+⚠️ **THE EXIT CODE CANNOT ANSWER THIS AND MUST NOT BE ASKED.** Four different
 rungs exit **124** — hermit's own bound, hermit's fallback, `hermit record`'s
-bound, the manifest cell's `timeout(1)`, and `safehermit`'s wall deadline. GNU
-`timeout` uses 124 for the same event. A consumer that branches on `$?` alone is
+bound, and `safehermit`'s wall deadline. GNU `timeout` also uses 124 for that
+event. A consumer that branches on `$?` alone is
 guessing which mechanism stopped the run, and will attribute a slow guest to the
 wrong layer.
 
@@ -93,12 +101,14 @@ greppable marker, and that marker — not the status — is what a caller keys o
 | `HERMIT_RUN_TIMEOUT_FALLBACK` | the bound expired and **the unwind itself did not finish** within the grace. This is a hermit defect, not a slow guest. | investigate the wedged teardown |
 | `safehermit: bound.wall=APPLIED` … then a kill | the outermost cgroup deadline reaped the tree | the run escaped every inner bound |
 | a nextest-named test with wrapper exit 100 | the test **process** exceeded its per-test cap | `.config/nextest.toml` |
-| exit 124 with **no marker at all** | something outside hermit killed it — `timeout(1)` on the cell, or a harness | the cell's `timeout_seconds`, or a missing inner bound |
+| `error_kind=cpu-timeout` | the manifest cell consumed its aggregate post-preparation CPU budget | the cell's measured CPU need |
+| `error_kind=wall-timeout` | the manifest process stopped making enough CPU progress to reach its CPU budget | the wedged process or a missing inner bound |
+| exit 124 with **no marker at all** | something outside hermit killed it without typed harness evidence | the missing inner bound |
 
-That last row is the useful one. **A cell that times out with no class line means
-no inner bound fired**, which is either a missing `--timeout` or an inner bound
-set larger than the outer one. Both are configuration errors, and the marker's
-absence is what distinguishes them from a genuinely slow guest.
+That last row is the useful one. **A cell process that exits 124 with neither a
+Hermit class line nor the harness's typed timeout kind has lost its attribution.**
+That is either a missing inner bound or a consumer that discarded the harness
+result, and it must not be inferred from elapsed time.
 
 ## `--timeout` is qualified per backend, and refuses elsewhere
 
@@ -187,9 +197,8 @@ the owner named is a third, separate thing and does not resolve the ambiguity.
 `hermit-cli/tests/container_init_deadline.rs` — which defends `PR_SET_PDEATHSIG`
 and the container-init stop handlers, i.e. the guarantee that an external
 deadline can end a hung run at all — **is in no DAG node**. Enumerating every
-`--test <target>` across `ci/dag/portable.json` and `ci/dag/privileged.json`
-yields 50 targets and that file is not among them, so those cells never run in
-validation. The regression cells for `hermit run --timeout` are in
+`--test <target>` in `ci/dag/validate.json` does not include that file, so those
+cells never run in validation. The regression cells for `hermit run --timeout` are in
 `hermit-cli/tests/cli.rs` for that reason.
 
 If that file is ever wired in, note that it declares a 15-second deadline, a

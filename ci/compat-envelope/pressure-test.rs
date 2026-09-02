@@ -21,16 +21,18 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
-use std::io::Write as _;
 use std::process::Command;
-use std::process::Stdio;
 use std::process::ExitCode;
+use std::process::Stdio;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use dagrun::cgroup::aggregate_slice_max_cpus;
+use dagrun::container_core_budget;
 use dagrun::io::dag_from_json;
 use dagrun::io::dag_to_json;
 use dagrun::model::CmdType;
@@ -43,31 +45,31 @@ use dagrun::model::StepClass;
 use dagrun::model::StepOutcome;
 use dagrun::model::effective_cpu_count;
 use dagrun::model::effective_cpu_timeout;
-use dagrun::cgroup::aggregate_slice_max_cpus;
-use dagrun::container_core_budget;
 use dagrun::scheduler::BoxedCgroups;
 use dagrun::scheduler::run_dag_boxed_deadline;
 use hermit_manifest_plan::canonical_verdict::RuntimeStats;
+use hermit_manifest_plan::canonical_verdict::Verdict;
 use hermit_manifest_plan::canonical_verdict::VerificationReport;
 use hermit_manifest_plan::canonical_verdict::VerificationRuntime;
-use hermit_manifest_plan::canonical_verdict::Verdict;
 use hermit_manifest_plan::host_capability::CapabilityVerdict;
 use hermit_manifest_plan::host_capability::HostCapability;
 use hermit_manifest_plan::runner::AttemptResult;
 use hermit_manifest_plan::runner::CELL_RESULT_SCHEMA;
+use hermit_manifest_plan::runner::CELL_WALL_CPU_BACKSTOP_FACTOR;
 use hermit_manifest_plan::runner::CellResult;
-use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
-use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::E2E_RUN_INDEX_ENV;
 use hermit_manifest_plan::runner::FailureClass;
+use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::ObservedResult;
+use hermit_manifest_plan::runner::cell_result_after_retries;
+use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 
 const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
-const PORTABLE_DAG: &str = "ci/dag/portable.json";
+const PORTABLE_DAG: &str = "ci/dag/validate.json";
 /// ⚠️ COUPLED TO `SCHEMA` IN ci/compat-envelope/scorecard.rs. Both tools read
 /// cells.json and both pin its version, so a bump in one WITHOUT the other
 /// leaves this tool refusing every tracked file with "unsupported tracked cell
@@ -90,11 +92,6 @@ const INCOMPLETE_ATTEMPT_STATUS: i32 = 125;
 /// Written when a cell is not invoked because its serialized fixture
 /// preparation did not complete successfully.
 const PREPARATION_FAILED_STATUS: i32 = 126;
-/// The shipped portable DAG gives a whole manifest bucket 600 seconds. A red
-/// cell gets that complete existing allowance to itself; cells whose repeated
-/// mode could theoretically consume longer remain red when this pressure
-/// boundary cuts them. This bounds a known-bad cell without redefining green.
-const PRESSURE_CELL_TIMEOUT_SECONDS: i64 = 600;
 /// The prior 432-cell measurement completed in nine minutes on this host. Two
 /// hours is an operational stop for the periodic experiment, not a pass
 /// threshold: breach makes the run incomplete and publishes no promotion.
@@ -205,8 +202,10 @@ Exact-cell options (run and plan):
                            applications/example-timed-progress-bar
   --mode MODE              verify, replay, chaos, or naked
   --backend BACKEND        ptrace, dbt, kvm, sabre, liteinst, or native
-  --cell-timeout SECONDS   Tighter cap for each selected cell; requires either
-                           an exact cell, --sample, or a repeated batch
+  --cell-timeout SECONDS   Maximum accepted derived cell wrapper bound; a
+                           smaller value refuses rather than truncating typed
+                           runner evidence. Requires either an exact cell,
+                           --sample, or a repeated batch
   --repetitions COUNT      Repeat each selected red cell in independent boxed
                            jobs, or selected green cells with --green. COUNT must
                            be positive. Plan and run
@@ -236,26 +235,26 @@ Selection and bounded-batch options (run and plan):
                            resource caps still limit manifest guests to four.
 
 Examples:
-  # Probe one currently red ptrace/verify cell with a 60-second boxed wall cap.
+  # Probe one currently red ptrace/verify cell with a 170-second boxed wall cap.
   ./ci/compat-envelope/pressure-test.rs run \
     --test applications/example-timed-progress-bar \
-    --mode verify --backend ptrace --cell-timeout 60
+    --mode verify --backend ptrace --cell-timeout 170
 
-  # Reproducibly sample ten red verify/replay/chaos cells, sixty seconds each.
+  # Reproducibly sample ten red verify/replay/chaos cells.
   ./ci/compat-envelope/pressure-test.rs run \
-    --sample 10 --seed 42 --cell-timeout 60
+    --sample 10 --seed 42
 
   # Repeat every executable red verify cell twice with one shared build.
   ./ci/compat-envelope/pressure-test.rs plan \
     --results ignored/compat-envelope/repeated-red-verify \
-    --mode verify --repetitions 2 --cell-timeout 60
+    --mode verify --repetitions 2
 
   # Check one committed green cell 100 times under the same boxed limits.
   # The DAG admits at most four manifest guests at once.
   ./ci/compat-envelope/pressure-test.rs run \
     --test backend-parity-c/fork-exec-pipeline \
     --mode verify --backend ptrace --green \
-    --repetitions 100 --cell-timeout 120
+    --repetitions 100 --cell-timeout 170
 
   # Check every enabled green cell once with one shared build.
   ./ci/compat-envelope/pressure-test.rs run \
@@ -264,7 +263,7 @@ Examples:
   # Inspect the bounded plan without executing it.
   ./ci/compat-envelope/pressure-test.rs plan \
     --results ignored/compat-envelope/pressure-review \
-    --mode verify --sample 10 --seed 42 --cell-timeout 60
+    --mode verify --sample 10 --seed 42
 
 Other options:
   --results DIR            Retained ignored/ result directory
@@ -273,7 +272,7 @@ Other options:
 How it runs:
   Plan generation first checks the tracked scorecard and reads selection and
   budgets from the typed manifest tool. The in-memory graph then reuses the
-  canonical Hermit/resource build commands from ci/dag/portable.json without
+  canonical Hermit/resource build commands from ci/dag/validate.json without
   recursively running the full validation metadata audit. Fixture preparation
   is serialized. Every selected-cell repetition then runs in its own safe-ci
   cgroup. Existing resource caps admit
@@ -868,8 +867,8 @@ struct ManifestBudgetRow {
 }
 
 fn read_result_rows(path: &Path) -> Result<Vec<CellResult>, String> {
-    let text = fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let text =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let mut rows: Vec<CellResult> = Vec::new();
     let mut attempts = BTreeSet::new();
     let mut artifact_dirs = BTreeSet::new();
@@ -880,6 +879,13 @@ fn read_result_rows(path: &Path) -> Result<Vec<CellResult>, String> {
         }
         let row: CellResult = serde_json::from_str(line)
             .map_err(|e| format!("invalid {}:{}: {e}", path.display(), index + 1))?;
+        row.require_current_timeout_policy().map_err(|error| {
+            format!(
+                "invalid {}:{} result timeout policy: {error}",
+                path.display(),
+                index + 1
+            )
+        })?;
         row.validate_recorded_classification().map_err(|error| {
             format!(
                 "invalid {}:{} result classification: {error}",
@@ -1088,13 +1094,15 @@ fn execute_typed_dag(
         }
 
         passes += 1;
-        // This graph clones the canonical build steps out of ci/dag/portable.json,
+        // This graph clones the canonical build steps out of ci/dag/validate.json,
         // including the two that bake a 32-wide cargo invocation into the command and
         // therefore carry an empty jobs_flag. The runner refuses before any node
         // starts if the CPU budget is narrower than such a step's declared width, and
         // the budget defaults to `jobs`, so it must be passed explicitly here for the
         // same reason as in scripts/validate.rs::scheduler_cpu_budget.
-        let cpu_budget = container_core_budget().min(aggregate_slice_max_cpus()).max(1);
+        let cpu_budget = container_core_budget()
+            .min(aggregate_slice_max_cpus())
+            .max(1);
         let result: RunResult = run_dag_boxed_deadline(
             &pass,
             jobs,
@@ -1704,7 +1712,7 @@ fn print_exact_manifest_command(
             )
         })?;
     println!(
-        "Boxed cell wall cap: {}s (the manifest's per-cell timeout remains nested and cannot extend this cap)",
+        "Boxed cell wall cap: {}s (two framework attempts of preparation + execution wall backstop + teardown, then reporting grace)",
         pressure_timeout(budget, selection.cell_timeout_seconds)?
     );
     println!("Manifest command inside that boxed cell:");
@@ -1775,11 +1783,19 @@ fn series_run_index(dir_name: &str) -> u64 {
 /// coordinates, source depth, ancestry and compression have one implementation.
 /// The writer refuses the batch whole if any result cannot be represented.
 fn collect_series_result_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = fs::read_dir(path)
-        .map_err(|e| format!("cannot read pressure result directory {}: {e}", path.display()))?;
+    let entries = fs::read_dir(path).map_err(|e| {
+        format!(
+            "cannot read pressure result directory {}: {e}",
+            path.display()
+        )
+    })?;
     for entry in entries {
-        let entry = entry
-            .map_err(|e| format!("cannot read pressure result entry under {}: {e}", path.display()))?;
+        let entry = entry.map_err(|e| {
+            format!(
+                "cannot read pressure result entry under {}: {e}",
+                path.display()
+            )
+        })?;
         let file_type = entry
             .file_type()
             .map_err(|e| format!("cannot classify {}: {e}", entry.path().display()))?;
@@ -1825,10 +1841,7 @@ fn collect_series_rows(results: &Path) -> Result<Vec<(String, CellResult)>, Stri
             collected.push((key, row));
         }
     }
-    collected.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.attempt.cmp(&b.1.attempt))
-    });
+    collected.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.attempt.cmp(&b.1.attempt)));
     Ok(collected)
 }
 
@@ -2295,27 +2308,64 @@ fn decode_budgets(
     Ok(out)
 }
 
-/// The harness gives preparation and every invocation one shared manifest
-/// timeout. The extra 10 seconds admits its documented TERM/KILL grace; the
-/// final 30 seconds is the existing nextest/reporting grace used by this
-/// repository, not an invocation multiplier or a guessed speed ratio.
+/// The cell wrapper must outlive every bound whose typed evidence it publishes:
+/// one preparation wall bound, the post-preparation wall backstop, and ten
+/// seconds for the runner's TERM/KILL grace for EACH possible framework
+/// attempt, followed by the existing thirty-second reporting grace. If the
+/// wrapper expires first, it converts a typed runner timeout into an
+/// unexplained missing result.
 fn outer_timeout(budget: &CellBudget) -> Result<i64, String> {
     budget.attempts.ok_or(
         "cannot derive a wall cap for a cell whose manifest has no executable attempt recipe",
     )?;
-    Ok(budget.timeout_seconds + 10 + 30)
+    let execution_wall = budget
+        .timeout_seconds
+        .checked_mul(CELL_WALL_CPU_BACKSTOP_FACTOR as i64)
+        .ok_or("manifest execution wall backstop exceeds the supported integer range")?;
+    let one_attempt = budget
+        .timeout_seconds
+        .checked_add(execution_wall)
+        .and_then(|seconds| seconds.checked_add(10))
+        .ok_or("one manifest cell attempt exceeds the supported integer range")?;
+    one_attempt
+        .checked_mul(MAX_ATTEMPTS_PER_CELL as i64)
+        .and_then(|seconds| seconds.checked_add(30))
+        .ok_or_else(|| "manifest cell wrapper timeout exceeds the supported integer range".into())
 }
 
 fn pressure_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> Result<i64, String> {
-    Ok(outer_timeout(budget)?.min(
-        selected_cap
-            .unwrap_or(PRESSURE_CELL_TIMEOUT_SECONDS)
-            .min(PRESSURE_CELL_TIMEOUT_SECONDS),
-    ))
+    let required = outer_timeout(budget)?;
+    if let Some(cap) = selected_cap {
+        if cap < required {
+            return Err(format!(
+                "cell requires a {required}s wrapper to preserve its preparation, execution, teardown, and reporting evidence, but the selected pressure cap is {cap}s"
+            ));
+        }
+    }
+    Ok(required)
+}
+
+fn preparation_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> Result<i64, String> {
+    let preparation = budget
+        .timeout_seconds
+        .checked_add(10 + 30)
+        .ok_or("fixture preparation timeout exceeds the supported integer range")?;
+    if let Some(selected_cap) = selected_cap {
+        if selected_cap < preparation {
+            return Err(format!(
+                "fixture preparation requires a {preparation}s wrapper, but the selected pressure cap is {selected_cap}s"
+            ));
+        }
+    }
+    Ok(preparation)
 }
 
 fn preparation_node_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> Result<i64, String> {
-    Ok(pressure_timeout(budget, selected_cap)? + 20)
+    preparation_timeout(budget, selected_cap)?
+        .checked_add(20)
+        .ok_or_else(|| {
+            "fixture preparation node timeout exceeds the supported integer range".into()
+        })
 }
 
 fn require_cell_occupancy_fits(
@@ -2474,7 +2524,7 @@ fn retain_required_build_dependencies(
         // commands that are not present in this generated plan. Pressure plan
         // generation performs its scorecard and typed-manifest checks before
         // execution instead.
-        if dependency == "e2e.metadata"
+        if matches!(dependency.as_str(), "e2e.metadata" | "gate.manifest")
             && matches!(tag.as_str(), "build.workspace" | "build.runtime_release")
         {
             continue;
@@ -2583,6 +2633,16 @@ fn write_plan_after_scorecard_check(
     for mut step in canonical.steps.iter().cloned() {
         let tag = step.tag();
         if required_builds.contains(tag.as_str()) {
+            // The committed graph may intentionally inherit its wall backstop
+            // from document defaults. This generated graph is serialized as a
+            // standalone artifact, so materialize the resolved value; otherwise
+            // parsing the omitted zero changes the typed graph during its own
+            // round-trip check.
+            step.timeout = dagrun::resolved_wall_timeout(
+                &step,
+                canonical.default_step_timeout,
+                canonical.cpu_timeout_multiplier,
+            );
             let marker = build_marker(results, &tag);
             let direct_backend_build = tag == "build.runtime_release"
                 && exact_cell.is_some()
@@ -2649,7 +2709,7 @@ fn write_plan_after_scorecard_check(
         } else {
             format!(" --backend {}", shell_quote(&cell.backend))
         };
-        let pressure_seconds = pressure_timeout(budget, selection.cell_timeout_seconds)?;
+        let pressure_seconds = preparation_timeout(budget, selection.cell_timeout_seconds)?;
         let cmd = format!(
             "mkdir -p {status_dir}; if test -f {status}; then exit 0; fi; \
              printf '{incomplete}\\n' > {status}; status=0; \
@@ -2678,11 +2738,11 @@ fn write_plan_after_scorecard_check(
             job,
             desc: format!("Prepare selected-cell fixture {test}"),
             description: String::new(),
+            labels: Vec::new(),
             cmd,
             cmdtype: CmdType::Unknown,
             manifest: None,
             integration_test_binaries: None,
-            labels: Vec::new(),
             deps: preparation_deps,
             env: BTreeMap::new(),
             // `None` preserves the existing GLOBAL eager-exit behaviour, which is what
@@ -2728,11 +2788,8 @@ fn write_plan_after_scorecard_check(
             })?;
         for repetition in repetition_numbers(selection.repetitions) {
             let slug = cell_run_slug(cell, repetition);
-            let evidence_run_id = cell_evidence_run_id(
-                cell,
-                repetition,
-                selection.run_id_prefix.as_deref(),
-            );
+            let evidence_run_id =
+                cell_evidence_run_id(cell, repetition, selection.run_id_prefix.as_deref());
             let tag = format!("cell.{slug}");
             let cell_dir = results.join("cells").join(&slug);
             let result_file = cell_dir.join("results.jsonl");
@@ -2863,11 +2920,11 @@ fn write_plan_after_scorecard_check(
                     )
                 },
                 description: String::new(),
+                labels: Vec::new(),
                 cmd,
                 cmdtype: CmdType::Unknown,
                 manifest: None,
                 integration_test_binaries: None,
-                labels: Vec::new(),
                 deps,
                 // Requalification evidence must exercise the same hermetic
                 // guest workdir contract as canonical validation. Otherwise a
@@ -2915,11 +2972,11 @@ fn write_plan_after_scorecard_check(
             "Wait for every red-cell attempt before reading retained runner evidence".into()
         },
         description: String::new(),
+        labels: Vec::new(),
         cmd: "true".into(),
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        labels: Vec::new(),
         deps: cell_tags,
         env: BTreeMap::new(),
         // `None` preserves the existing GLOBAL eager-exit behaviour, which is what
@@ -2946,8 +3003,7 @@ fn write_plan_after_scorecard_check(
 
     let max_timeout = steps.iter().map(|step| step.timeout).max().unwrap_or(120);
     let mut dag = canonical;
-    dag.resource_caps =
-        BTreeMap::from([("cargo_writer".into(), 1), ("manifest_guest".into(), 4)]);
+    dag.resource_caps = BTreeMap::from([("cargo_writer".into(), 1), ("manifest_guest".into(), 4)]);
     dag.default_step_timeout = max_timeout;
     dag.default_step_cpu_timeout = max_timeout * 2;
     dag.steps = steps;
@@ -3024,7 +3080,11 @@ fn audit_dag(
         if !tags.insert(tag.clone()) {
             return Err(format!("generated DAG has duplicate tag {tag}"));
         }
-        let timeout = step.timeout;
+        let timeout = dagrun::resolved_wall_timeout(
+            step,
+            dag.default_step_timeout,
+            dag.cpu_timeout_multiplier,
+        );
         let cpu_timeout = step.cpu_timeout;
         if timeout <= 0 || cpu_timeout <= 0 || timeout >= run_timeout {
             return Err(format!(
@@ -3456,9 +3516,7 @@ fn is_proven_oom_attempt(runner: RunnerEvidence, harness_status: Option<i32>) ->
         && !runner.ok
         && runner.oom
         && !runner.timed_out
-        && harness_status.is_some_and(|status| {
-            !matches!(status, 0 | PREPARATION_FAILED_STATUS)
-        })
+        && harness_status.is_some_and(|status| !matches!(status, 0 | PREPARATION_FAILED_STATUS))
 }
 
 fn runner_observed_terminal_attempt(runner: RunnerEvidence, harness_status: Option<i32>) -> bool {
@@ -3469,8 +3527,7 @@ fn runner_observed_terminal_attempt(runner: RunnerEvidence, harness_status: Opti
             !matches!(
                 status,
                 INCOMPLETE_ATTEMPT_STATUS | PREPARATION_FAILED_STATUS
-            )
-                && runner.ok == (status == 0)
+            ) && runner.ok == (status == 0)
         })
 }
 
@@ -3756,9 +3813,7 @@ fn repeated_run_has_unacceptable_product_result(
     retried: usize,
     total: usize,
 ) -> bool {
-    repetitions.is_some()
-        && !repeated_red
-        && (total == 0 || clean_passes != total || retried > 0)
+    repetitions.is_some() && !repeated_red && (total == 0 || clean_passes != total || retried > 0)
 }
 
 fn repeated_cell_summary(
@@ -3801,9 +3856,7 @@ fn verify_repetition_summary_json(
     for cell in repeated_cells {
         let terminal_passes = cell.get("passes").and_then(JsonValue::as_u64);
         let clean_passes = cell.get("clean_passes").and_then(JsonValue::as_u64);
-        let retried = cell
-            .get("retried_repetitions")
-            .and_then(JsonValue::as_u64);
+        let retried = cell.get("retried_repetitions").and_then(JsonValue::as_u64);
         let total = cell.get("total").and_then(JsonValue::as_u64);
         if terminal_passes.is_none()
             || clean_passes.is_none()
@@ -3892,10 +3945,7 @@ fn verification_report_path(artifact_dir: &Path) -> PathBuf {
     artifact_dir.join("verify-1.json")
 }
 
-fn retained_verification_logs(
-    cell: &CellId,
-    artifact_dir: &Path,
-) -> Result<Vec<String>, String> {
+fn retained_verification_logs(cell: &CellId, artifact_dir: &Path) -> Result<Vec<String>, String> {
     if cell.mode != "verify" {
         return Ok(Vec::new());
     }
@@ -3964,10 +4014,7 @@ fn retained_verification_logs(
     Ok(run1.into_iter().chain(run2).collect())
 }
 
-fn normalized_ptrace_golden(
-    cell: &CellId,
-    artifact_dir: &Path,
-) -> Result<Option<String>, String> {
+fn normalized_ptrace_golden(cell: &CellId, artifact_dir: &Path) -> Result<Option<String>, String> {
     if cell.mode != "verify" || cell.backend != "ptrace" {
         return Ok(None);
     }
@@ -4033,8 +4080,12 @@ fn read_verification_report(
         .map_err(|e| format!("cannot read verification report {}: {e}", path.display()))?;
     let report: JsonValue = serde_json::from_str(&text)
         .map_err(|e| format!("invalid verification report {}: {e}", path.display()))?;
-    let canonical = VerificationReport::from_current_json_value(report.clone())
-        .map_err(|e| format!("incomplete canonical verification report {}: {e}", path.display()))?;
+    let canonical = VerificationReport::from_current_json_value(report.clone()).map_err(|e| {
+        format!(
+            "incomplete canonical verification report {}: {e}",
+            path.display()
+        )
+    })?;
     match (canonical.verdict, canonical.verified) {
         (Verdict::Matched, true)
         | (Verdict::Diverged | Verdict::NoResult | Verdict::InfrastructureError, false) => {}
@@ -4077,8 +4128,7 @@ fn read_verification_report(
             )
         })?;
     }
-    if canonical.verdict == Verdict::InfrastructureError
-        && canonical.infrastructure_error.is_none()
+    if canonical.verdict == Verdict::InfrastructureError && canonical.infrastructure_error.is_none()
     {
         return Err(format!(
             "verification report {} names infrastructure_error without its cause",
@@ -4088,13 +4138,12 @@ fn read_verification_report(
     if !matches!(
         canonical.verdict,
         Verdict::Diverged | Verdict::InfrastructureError
-    )
-        && (canonical.first_divergent_scheduler_turn.is_some()
-            || canonical.first_divergent_virtual_nanoseconds.is_some()
-            || canonical.first_divergent_record.is_some()
-            || canonical.first_divergent_syscall.is_some()
-            || canonical.first_divergent_left_message.is_some()
-            || canonical.first_divergent_right_message.is_some())
+    ) && (canonical.first_divergent_scheduler_turn.is_some()
+        || canonical.first_divergent_virtual_nanoseconds.is_some()
+        || canonical.first_divergent_record.is_some()
+        || canonical.first_divergent_syscall.is_some()
+        || canonical.first_divergent_left_message.is_some()
+        || canonical.first_divergent_right_message.is_some())
     {
         return Err(format!(
             "verification report {} records divergence evidence without a divergent verdict",
@@ -4291,19 +4340,17 @@ fn summarize(
                                     && (proven_oom || runner_completed) =>
                             {
                                 match result_row_invocation(row) {
-                                    Ok(invocation) => {
-                                        (
-                                            row.outcome.clone(),
-                                            true,
-                                            row.reason.clone(),
-                                            row.error_kind.clone(),
-                                            row.result,
-                                            row.failure_class,
-                                            row.attempt,
-                                            Some(invocation),
-                                            Some(result_artifact_dir(results, row)?),
-                                        )
-                                    }
+                                    Ok(invocation) => (
+                                        row.outcome.clone(),
+                                        true,
+                                        row.reason.clone(),
+                                        row.error_kind.clone(),
+                                        row.result,
+                                        row.failure_class,
+                                        row.attempt,
+                                        Some(invocation),
+                                        Some(result_artifact_dir(results, row)?),
+                                    ),
                                     Err(error) => {
                                         evidence_errors.push(format!(
                                             "{} does not carry complete literal attempt invocations: {error}",
@@ -4556,10 +4603,9 @@ fn summarize(
             // writer and the scorecard enforces that boundary.
             if row_valid {
                 if let Some(terminal) = result_rows_for_history.last() {
-                    for earlier_row in earlier_attempts_that_located(
-                        &result_rows_for_history,
-                        terminal.attempt,
-                    ) {
+                    for earlier_row in
+                        earlier_attempts_that_located(&result_rows_for_history, terminal.attempt)
+                    {
                         if earlier_row.attempt == attempt {
                             continue;
                         }
@@ -4912,11 +4958,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn literal_shell_command(
-    cwd: &str,
-    env: &BTreeMap<String, String>,
-    argv: &[String],
-) -> String {
+fn literal_shell_command(cwd: &str, env: &BTreeMap<String, String>, argv: &[String]) -> String {
     let mut words = vec![
         "cd".into(),
         recorded_shell_quote(cwd),
@@ -5034,16 +5076,9 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
     // fixture's current 50 ms commands.
     let declared_critical_path_seconds = CONTROL_STEP_TIMEOUT_SECONDS * 2
         + CELL_WALL_TIMEOUT_SECONDS * i64::try_from(cell_waves).unwrap();
-    let run_timeout_seconds =
-        declared_critical_path_seconds + CONTROL_STEP_TIMEOUT_SECONDS;
+    let run_timeout_seconds = declared_critical_path_seconds + CONTROL_STEP_TIMEOUT_SECONDS;
     let execution = with_execution_root(scratch, || {
-        execute_typed_dag(
-            &dag,
-            jobs,
-            None,
-            Instant::now(),
-            run_timeout_seconds,
-        )
+        execute_typed_dag(&dag, jobs, None, Instant::now(), run_timeout_seconds)
     })?;
     let cell_outcomes: Vec<_> = execution
         .outcomes
@@ -5202,7 +5237,9 @@ fn self_test(root: &Path) -> Result<(), String> {
     if series_run_index("a-cell-repetition-0004") != 4
         || series_run_index("a-cell-with-no-suffix") != 0
     {
-        return Err("pressure repetition ordinals no longer match retained result directories".into());
+        return Err(
+            "pressure repetition ordinals no longer match retained result directories".into(),
+        );
     }
     // A divergence located by an earlier attempt remains an observation even
     // when the terminal retry passes. An attempt that located nothing does not
@@ -5212,8 +5249,8 @@ fn self_test(root: &Path) -> Result<(), String> {
             "pressure-divergence-history-{}",
             std::process::id()
         ));
-        let diverged = r#"{"schema":4,"attempt":1,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","first_divergent_record":93,"first_divergent_syscall":37,"first_divergent_scheduler_turn":68,"first_divergent_virtual_nanoseconds":7,"first_divergent_left_message":"INFO detcore: left event","first_divergent_right_message":"INFO detcore: right event","timeout_seconds":15,"duration_ms":100,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace"}"#;
-        let passed = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"first_divergent_left_message":null,"first_divergent_right_message":null,"timeout_seconds":15,"duration_ms":200,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace-attempt-2"}"#;
+        let diverged = r#"{"schema":4,"attempt":1,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"FAIL","first_divergent_record":93,"first_divergent_syscall":37,"first_divergent_scheduler_turn":68,"first_divergent_virtual_nanoseconds":7,"first_divergent_left_message":"INFO detcore: left event","first_divergent_right_message":"INFO detcore: right event","timeout_seconds":15,"execution_cpu_timeout_seconds":15,"execution_wall_timeout_seconds":45,"duration_ms":100,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace"}"#;
+        let passed = r#"{"schema":4,"attempt":2,"run_id":"r","hermit_sha":"s","source_tree_dirty":false,"test":"t","category":"c","lane":"l","mode":"verify","backend":"ptrace","classification":"required","outcome":"PASS","first_divergent_record":null,"first_divergent_syscall":null,"first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,"first_divergent_left_message":null,"first_divergent_right_message":null,"timeout_seconds":15,"execution_cpu_timeout_seconds":15,"execution_wall_timeout_seconds":45,"duration_ms":200,"argv":["a"],"guest_argv":["g"],"env":{},"cwd":"/","shell_command":"x","attempts":[],"reason":null,"error_kind":null,"artifact_dir":"/retained/runs/r/t-verify-ptrace-attempt-2"}"#;
         fs::write(&path, format!("{diverged}\n{passed}\n"))
             .map_err(|e| format!("cannot write divergence history fixture: {e}"))?;
         let all = read_result_rows(&path)?;
@@ -5299,18 +5336,10 @@ fn self_test(root: &Path) -> Result<(), String> {
     )?;
     if backend_specific.len() != 2
         || backend_specific
-            .get(&(
-                "fixture/test".into(),
-                "verify".into(),
-                "ptrace".into(),
-            ))
+            .get(&("fixture/test".into(), "verify".into(), "ptrace".into()))
             .is_none_or(|budget| budget.timeout_seconds != 30)
         || backend_specific
-            .get(&(
-                "fixture/test".into(),
-                "verify".into(),
-                "liteinst".into(),
-            ))
+            .get(&("fixture/test".into(), "verify".into(), "liteinst".into()))
             .is_none_or(|budget| budget.timeout_seconds != 15)
     {
         return Err("backend-specific cell timeouts were collapsed together".into());
@@ -5342,6 +5371,29 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
 
     let manifest_budgets = load_budgets(root)?;
+    let ninety_second_budget = CellBudget {
+        timeout_seconds: 90,
+        attempts: Some(1),
+    };
+    if outer_timeout(&ninety_second_budget)? != 770
+        || pressure_timeout(&ninety_second_budget, None)? != 770
+    {
+        return Err(
+            "the default pressure timeout does not cover both attempts of a 90-second manifest cell"
+                .into(),
+        );
+    }
+    for budget in manifest_budgets
+        .values()
+        .filter(|budget| budget.attempts.is_some())
+    {
+        if pressure_timeout(budget, None)? != outer_timeout(budget)? {
+            return Err(
+                "the default pressure timeout does not cover a current executable manifest cell"
+                    .into(),
+            );
+        }
+    }
     let omitted_naked_runs = manifest_budgets
         .get(&(
             "applications/timed-progress-bar".into(),
@@ -5386,31 +5438,32 @@ fn self_test(root: &Path) -> Result<(), String> {
         timeout_seconds: 7,
         attempts: Some(3),
     };
-    if outer_timeout(&budget)? != 47 {
+    if outer_timeout(&budget)? != 106 {
         return Err(format!(
-            "timeout derivation changed: expected 47, got {}",
+            "two-attempt timeout derivation changed: expected 106, got {}",
             outer_timeout(&budget)?
         ));
     }
-    if pressure_timeout(
-        &CellBudget {
-            timeout_seconds: 1800,
-            attempts: Some(32),
-        },
-        None,
-    )? != PRESSURE_CELL_TIMEOUT_SECONDS
-    {
-        return Err("pressure timeout did not cap a long repeated red cell".into());
+    if preparation_timeout(&budget, None)? != 47 || preparation_node_timeout(&budget, None)? != 67 {
+        return Err("fixture preparation lost its independent wall bound and node grace".into());
     }
-    if pressure_timeout(
-        &CellBudget {
-            timeout_seconds: 1800,
-            attempts: Some(32),
-        },
-        Some(37),
-    )? != 37
-    {
-        return Err("exact-cell pressure timeout did not apply the requested tighter cap".into());
+    let maximum_budget = CellBudget {
+        timeout_seconds: 1800,
+        attempts: Some(32),
+    };
+    if pressure_timeout(&maximum_budget, None)? != 14_450 {
+        return Err("default pressure timeout truncated the derived cell lifecycle".into());
+    }
+    if pressure_timeout(&maximum_budget, Some(14_449)).is_ok() {
+        return Err(
+            "pressure timeout accepted an explicit cap that can erase typed runner evidence".into(),
+        );
+    }
+    if pressure_timeout(&budget, Some(105)).is_ok() {
+        return Err("exact-cell pressure timeout accepted a too-short wrapper cap".into());
+    }
+    if pressure_timeout(&budget, Some(106))? != 106 {
+        return Err("a sufficient selected cap changed the derived wrapper timeout".into());
     }
     let repeated_selection_contract = CellSelection {
         test: Some("fixture/test".into()),
@@ -5444,7 +5497,9 @@ fn self_test(root: &Path) -> Result<(), String> {
     validate_repetition_selection(&exact_green_repetitions)
         .map_err(|e| format!("explicit exact green repetition was refused: {e}"))?;
     if CellSelection::default().scheduler_jobs() != default_jobs() {
-        return Err("pressure scheduler default diverged from the host-adaptive validate policy".into());
+        return Err(
+            "pressure scheduler default diverged from the host-adaptive validate policy".into(),
+        );
     }
     let mut jobs_args = vec![
         "--results".to_string(),
@@ -5538,9 +5593,15 @@ fn self_test(root: &Path) -> Result<(), String> {
         || selected_cell_dependencies(true, false, "naked", "native", None)
             != ["setup.manifest_plan".to_string()]
         || selected_cell_dependencies(true, false, "verify", "ptrace", None)
-            != ["setup.manifest_plan".to_string(), "build.runtime_release".to_string()]
+            != [
+                "setup.manifest_plan".to_string(),
+                "build.runtime_release".to_string(),
+            ]
         || selected_cell_dependencies(true, false, "verify", "liteinst", None)
-            != ["setup.manifest_plan".to_string(), "build.liteinst_runtime_release".to_string()]
+            != [
+                "setup.manifest_plan".to_string(),
+                "build.liteinst_runtime_release".to_string(),
+            ]
     {
         return Err(
             "selected-cell dependencies lost the LiteInst positive/negative build bracket".into(),
@@ -6209,23 +6270,21 @@ fn self_test(root: &Path) -> Result<(), String> {
     )
     .map_err(|e| format!("cannot parse second-invocation DAG: {e}"))?;
     let first_run_ids: BTreeSet<_> = (1..=3)
-        .map(|number| {
-            cell_evidence_run_id(&exact_id, Some(number), Some("validate-one-pid100"))
-        })
+        .map(|number| cell_evidence_run_id(&exact_id, Some(number), Some("validate-one-pid100")))
         .collect();
     let second_run_ids: BTreeSet<_> = (1..=3)
-        .map(|number| {
-            cell_evidence_run_id(&exact_id, Some(number), Some("validate-two-pid200"))
-        })
+        .map(|number| cell_evidence_run_id(&exact_id, Some(number), Some("validate-two-pid200")))
         .collect();
     if !first_run_ids.is_disjoint(&second_run_ids)
-        || second_invocation_dag.steps.iter().filter(|step| step.group == "cell").any(
-            |step| {
+        || second_invocation_dag
+            .steps
+            .iter()
+            .filter(|step| step.group == "cell")
+            .any(|step| {
                 !step
                     .cmd
                     .contains(&format!("E2E_RUN_ID='validate-two-pid200--{}'", step.job))
-            },
-        )
+            })
     {
         return Err("independent repeated-cell invocations reused an evidence run ID".into());
     }
@@ -6272,6 +6331,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .collect();
     let recursive_metadata_tags = [
         "e2e.metadata",
+        "gate.manifest",
         "build.workspace",
         "build.e2e_artifact",
     ];
@@ -6311,7 +6371,10 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     let preparation_tag = preparation_steps[0].tag();
     if preparation_steps[0].deps
-        != ["setup.manifest_plan".to_string(), "build.runtime_release".to_string()]
+        != [
+            "setup.manifest_plan".to_string(),
+            "build.runtime_release".to_string(),
+        ]
     {
         return Err("repeated exact preparation does not depend on its direct Hermit build".into());
     }
@@ -6577,8 +6640,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     red_batch_result_metadata.green = false;
     if !repeated_metadata.is_exact()
         || green_batch_metadata.is_exact()
-        || top_level_repeated_result_description(&repeated_metadata, 1, 1, 0, 0, 2)
-            != "flaky"
+        || top_level_repeated_result_description(&repeated_metadata, 1, 1, 0, 0, 2) != "flaky"
         || top_level_repeated_result_description(&red_batch_result_metadata, 1, 1, 0, 0, 2)
             != "one or more repeated checks failed or required a retry"
     {
@@ -6589,24 +6651,19 @@ fn self_test(root: &Path) -> Result<(), String> {
     let exact_red_heading = summary_heading(&repeated_metadata);
     let exact_red_result = repeated_summary_line(&repeated_metadata, 1, 1, 0, 0, 2);
     let retried_exact_red_result = repeated_summary_line(&repeated_metadata, 2, 1, 0, 1, 2);
-    let all_recovered_exact_red_result =
-        repeated_summary_line(&repeated_metadata, 2, 0, 0, 2, 2);
-    let all_failed_exact_red_result =
-        repeated_summary_line(&repeated_metadata, 0, 0, 0, 2, 2);
+    let all_recovered_exact_red_result = repeated_summary_line(&repeated_metadata, 2, 0, 0, 2, 2);
+    let all_failed_exact_red_result = repeated_summary_line(&repeated_metadata, 0, 0, 0, 2, 2);
     let red_batch_heading = summary_heading(&red_batch_result_metadata);
-    let red_batch_result =
-        repeated_summary_line(&red_batch_result_metadata, 1, 1, 0, 0, 2);
+    let red_batch_result = repeated_summary_line(&red_batch_result_metadata, 1, 1, 0, 0, 2);
     let one_recovered_red_batch_result =
         repeated_summary_line(&red_batch_result_metadata, 2, 1, 0, 1, 2);
     let recovered_red_batch_result =
         repeated_summary_line(&red_batch_result_metadata, 2, 0, 0, 2, 2);
-    let failed_red_batch_result =
-        repeated_summary_line(&red_batch_result_metadata, 0, 0, 0, 2, 2);
+    let failed_red_batch_result = repeated_summary_line(&red_batch_result_metadata, 0, 0, 0, 2, 2);
     let green_batch_heading = summary_heading(&green_batch_metadata);
     let green_batch_result = repeated_summary_line(&green_batch_metadata, 1, 1, 0, 0, 2);
     if exact_red_heading != "# Repeated red-cell results"
-        || exact_red_result
-            != "Repeated result: 1/2 terminally passed; 1/2 passed cleanly; flaky."
+        || exact_red_result != "Repeated result: 1/2 terminally passed; 1/2 passed cleanly; flaky."
         || retried_exact_red_result
             != "Repeated result: 2/2 terminally passed; 1/2 passed cleanly; flaky."
         || all_recovered_exact_red_result
@@ -6655,7 +6712,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         || green_batch_dag
             .steps
             .iter()
-            .any(|step| step.tag() == "e2e.metadata")
+            .any(|step| matches!(step.tag().as_str(), "e2e.metadata" | "gate.manifest"))
     {
         return Err(format!(
             "green batch build set changed or reintroduced the recursive metadata audit: expected={expected_green_build_tags:?} actual={actual_green_build_tags:?}"
@@ -6670,9 +6727,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         let tag = step.tag();
         let expected: BTreeSet<&str> = match tag.as_str() {
             "build.workspace" | "build.runtime_release" => BTreeSet::new(),
-            "build.e2e_artifact" => {
-                BTreeSet::from(["build.workspace", "build.runtime_release"])
-            }
+            "build.e2e_artifact" => BTreeSet::from(["build.workspace", "build.runtime_release"]),
             "build.liteinst_runtime_release" => BTreeSet::from(["build.e2e_artifact"]),
             other => return Err(format!("unexpected green-batch build node {other}")),
         };
@@ -6682,8 +6737,7 @@ fn self_test(root: &Path) -> Result<(), String> {
                 tag
             ));
         }
-        if tag == "build.e2e_artifact"
-            && !step.cmd.contains("./ci/publish-hermit-e2e-artifact.sh")
+        if tag == "build.e2e_artifact" && !step.cmd.contains("./ci/publish-hermit-e2e-artifact.sh")
         {
             return Err("green batch replaced the canonical prebuilt artifact publisher".into());
         }
@@ -6712,7 +6766,10 @@ fn self_test(root: &Path) -> Result<(), String> {
             .filter(|step| step.group == "prepare")
             .any(|step| {
                 step.deps
-                    != ["setup.manifest_plan".to_string(), "build.e2e_artifact".to_string()]
+                    != [
+                        "setup.manifest_plan".to_string(),
+                        "build.e2e_artifact".to_string(),
+                    ]
             })
         || green_batch_dag
             .steps
@@ -6721,9 +6778,9 @@ fn self_test(root: &Path) -> Result<(), String> {
             .any(|step| {
                 !step.deps.contains(&"build.e2e_artifact".to_string())
                     || !step.deps.contains(&"setup.manifest_plan".to_string())
-                    || !step.cmd.contains(
-                        "./ci/run-with-hermit-e2e-artifact.sh --require-install",
-                    )
+                    || !step
+                        .cmd
+                        .contains("./ci/run-with-hermit-e2e-artifact.sh --require-install")
             })
     {
         return Err(
@@ -7312,6 +7369,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         failure_class: Some(FailureClass::ProductFailure),
         error_kind: None,
         timeout_seconds: 20,
+        execution_cpu_timeout_seconds: Some(20),
+        execution_wall_timeout_seconds: Some(60),
         duration_ms: Some(19_000),
         cpu_usage_usec: Some(1_000),
         runtime: None,
@@ -7376,10 +7435,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         || appended[0].duration_ms != Some(19_000)
         || appended[0].timeout_seconds != 20
         || appended[0].first_divergent_syscall != Some(37)
-        || appended[0].first_divergent_left_message.as_deref()
-            != Some("INFO detcore: left event")
-        || appended[0].first_divergent_right_message.as_deref()
-            != Some("INFO detcore: right event")
+        || appended[0].first_divergent_left_message.as_deref() != Some("INFO detcore: left event")
+        || appended[0].first_divergent_right_message.as_deref() != Some("INFO detcore: right event")
         || appended[1].attempt != 2
         || appended[1].result != Some(ObservedResult::Pass)
         || appended[1].failure_class.is_some()
@@ -7465,9 +7522,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             Some(0),
         )? != 2
     {
-        return Err(
-            "a retry without divergence coordinates was mistaken for one execution".into(),
-        );
+        return Err("a retry without divergence coordinates was mistaken for one execution".into());
     }
     if repetition_passed_cleanly("pass", &appended) {
         return Err(
@@ -7575,10 +7630,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         ),
     )
     .map_err(|e| format!("cannot write summarize retry results: {e}"))?;
-    let summarize_runner = BTreeMap::from([(
-        format!("cell.{summarize_retry_slug}"),
-        runner_ok,
-    )]);
+    let summarize_runner = BTreeMap::from([(format!("cell.{summarize_retry_slug}"), runner_ok)]);
     summarize(
         root,
         &summarize_retry_results,
@@ -7731,9 +7783,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         || batch_failed_json["repeated_cells"][0]["clean_passes"] != 0
         || batch_failed_json["repeated_cells"][0]["result"] != "failed every repetition"
     {
-        return Err(
-            "exact or batch JSON confused recovered retries with terminal failures".into(),
-        );
+        return Err("exact or batch JSON confused recovered retries with terminal failures".into());
     }
     verify_repetition_summary_json(&exact_recovered_json, 2, 1)?;
     verify_repetition_summary_json(&exact_all_recovered_json, 4, 2)?;
@@ -7840,7 +7890,10 @@ fn self_test(root: &Path) -> Result<(), String> {
     )
     .map_err(|e| format!("cannot write mismatched nested series fixture: {e}"))?;
     if collect_series_rows(&nested_results).is_ok() {
-        return Err("a framework result whose run_index disagreed with its pressure directory was accepted".into());
+        return Err(
+            "a framework result whose run_index disagreed with its pressure directory was accepted"
+                .into(),
+        );
     }
     let mut reused_artifact = second_row.clone();
     reused_artifact.artifact_dir = first_row.artifact_dir.clone();
@@ -7899,7 +7952,9 @@ fn self_test(root: &Path) -> Result<(), String> {
         true,
         Some(INCOMPLETE_ATTEMPT_STATUS),
     ) {
-        return Err("a result row whose shell command does not encode argv/env was accepted".into());
+        return Err(
+            "a result row whose shell command does not encode argv/env was accepted".into(),
+        );
     }
     result_row.shell_command = "cd /repo && env LC_ALL=C hermit run".into();
     result_row.attempts[0].shell_command = "cd /repo && env LC_ALL=C hermit run".into();
@@ -7960,6 +8015,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         failure_class: None,
         error_kind: None,
         timeout_seconds: 20,
+        execution_cpu_timeout_seconds: Some(20),
+        execution_wall_timeout_seconds: Some(60),
         duration_ms: Some(1_000),
         cpu_usage_usec: Some(1_000),
         runtime: None,

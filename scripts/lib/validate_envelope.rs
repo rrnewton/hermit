@@ -19,7 +19,7 @@
 //!
 //! `ENVELOPE_PROBES` is three rows, dumped mechanically from the real bash with
 //! `declare -p ENVELOPE_PROBES` in the same instrumented copy that produced
-//! `ci/super/gates.json`:
+//! `ci/dag/validate.json`:
 //!
 //! ```text
 //! declare -ar ENVELOPE_PROBES=([0]="true|/bin/true" [1]="echo|/bin/echo hermit-envelope"
@@ -115,8 +115,8 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
             &format!("envelope {}: L1 hermit run --strict", p.label),
             level_command(hermit_bin, &["--strict"], p.argv),
             vec![build_dep.to_string()],
+            0,
             SMOKE_TIMEOUT_S,
-            SMOKE_TIMEOUT_S * 2,
             PROBE_MEM_BYTES,
         ));
         out.push(node(
@@ -125,8 +125,8 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
             &format!("envelope {}: L2 --strict --verify", p.label),
             level_command(hermit_bin, &["--strict", "--verify"], p.argv),
             vec![build_dep.to_string()],
+            0,
             SMOKE_TIMEOUT_S,
-            SMOKE_TIMEOUT_S * 2,
             PROBE_MEM_BYTES,
         ));
         out.push(node(
@@ -139,8 +139,8 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
                 p.argv,
             ),
             vec![build_dep.to_string()],
+            0,
             SMOKE_TIMEOUT_S,
-            SMOKE_TIMEOUT_S * 2,
             PROBE_MEM_BYTES,
         ));
         // L4 depends on L2: the bash only counted L4 when L2 passed, and a
@@ -157,8 +157,8 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
                  i=$((i+1)); done"
             ),
             vec![format!("envelope.{}", job("l2"))],
+            0,
             SMOKE_TIMEOUT_S * reps + 60,
-            SMOKE_TIMEOUT_S * reps * 2,
             PROBE_MEM_BYTES,
         ));
         // `record start --verify` records, replays non-interactively, diffs the
@@ -177,8 +177,8 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
             &format!("envelope {}: rr record/replay end-to-end", p.label),
             format!("{} </dev/null", shell_join(&rr)),
             vec![build_dep.to_string()],
+            0,
             rr_timeout,
-            rr_timeout * 2,
             PROBE_MEM_BYTES,
         ));
     }
@@ -193,8 +193,8 @@ pub fn build_node(gate_dep: &str) -> Step {
         "Build workspace for envelope measurement",
         "cargo build --workspace --features third-party-backends".to_string(),
         vec![gate_dep.to_string()],
+        0,
         3600,
-        7200,
         16 * 1024 * 1024 * 1024,
     )
 }
@@ -340,7 +340,11 @@ pub fn self_test() -> Result<String, String> {
         return Err(format!("envelope built {} nodes, expected {want}", steps.len()));
     }
     for s in &steps {
-        if s.timeout <= 0 || s.cpu_timeout <= 0 || s.hint.hard_mem_max_bytes.is_none() {
+        let wall = dagrun::resolved_wall_timeout(s, 0, 1.0);
+        if s.cpu_timeout <= 0
+            || wall <= s.cpu_timeout
+            || s.hint.hard_mem_max_bytes.is_none()
+        {
             return Err(format!("envelope node {} is not fully capped", s.tag()));
         }
     }

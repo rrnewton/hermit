@@ -740,9 +740,12 @@ fn command_jobs(command: &str) -> Result<Option<i64>, String> {
 }
 
 fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), String> {
+    let committed_path = root.join("ci/dag/validate.json");
+    let committed = read_dag(&committed_path)?;
     for lane in ["portable", "privileged"] {
-        let path = root.join(format!("ci/dag/{lane}.json"));
-        let dag = read_dag(&path)?;
+        let path = &committed_path;
+        let dag = dagrun::select_steps_by_labels(&committed, &[lane.to_string()])
+            .map_err(|error| format!("{}: cannot select label {lane}: {error}", path.display()))?;
         if dag
             .steps
             .iter()
@@ -775,7 +778,7 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
         if dag
             .steps
             .iter()
-            .filter(|step| step.cmd == "target/debug/test-harness validate")
+            .filter(|step| step.cmd.ends_with("target/debug/test-harness validate"))
             .count()
             != 1
         {
@@ -786,7 +789,13 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
         }
         let build =
             format!("target/debug/test-harness build --lane {lane} --ci-only --allow-empty");
-        if dag.steps.iter().filter(|step| step.cmd == build).count() != 1 {
+        if dag
+            .steps
+            .iter()
+            .filter(|step| step.cmd.ends_with(&build))
+            .count()
+            != 1
+        {
             return Err(format!(
                 "{} must contain exactly one Rust manifest build node",
                 path.display()
@@ -799,11 +808,11 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
             .map(|document| document.bucket.clone())
             .collect::<BTreeSet<_>>();
         let mut actual = BTreeSet::new();
-        for step in dag
-            .steps
-            .iter()
-            .filter(|step| step.group == "e2e" && step.job.starts_with("manifest_"))
-        {
+        for step in dag.steps.iter().filter(|step| {
+            step.manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.lane == lane)
+        }) {
             let manifest = step.manifest.as_ref().ok_or_else(|| {
                 format!("{}.{} lacks typed manifest identity", step.group, step.job)
             })?;
@@ -869,13 +878,28 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
 }
 
 fn audit_budget_ordering(root: &Path) -> Result<(), String> {
-    let portable = read_dag(&root.join("ci/dag/portable.json"))?;
-    let privileged = read_dag(&root.join("ci/dag/privileged.json"))?;
+    let committed = read_dag(&root.join("ci/dag/validate.json"))?;
+    let portable = dagrun::select_steps_by_labels(&committed, &["portable".into()])
+        .map_err(|error| format!("cannot select portable DAG steps: {error}"))?;
+    let privileged = dagrun::select_steps_by_labels(&committed, &["privileged".into()])
+        .map_err(|error| format!("cannot select privileged DAG steps: {error}"))?;
     for (lane, dag) in [("portable", &portable), ("privileged", &privileged)] {
         for step in &dag.steps {
-            if step.timeout <= 0 {
+            if step.cpu_timeout <= 0 {
                 return Err(format!(
-                    "{lane} node {}.{} has no derivable wall budget",
+                    "{lane} node {}.{} has no CPU budget",
+                    step.group, step.job
+                ));
+            }
+            let wall = dagrun::resolved_wall_timeout(
+                step,
+                dag.default_step_timeout,
+                dag.cpu_timeout_multiplier,
+            );
+            let cpu = (step.cpu_timeout as f64 * dag.cpu_timeout_multiplier).round() as i64;
+            if wall <= cpu {
+                return Err(format!(
+                    "{lane} node {}.{} resolves wall={wall}s at or below effective CPU={cpu}s",
                     step.group, step.job
                 ));
             }
@@ -910,6 +934,58 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
         &fs::read(root.join("ci/portable-shards.json")).map_err(|e| e.to_string())?,
     )
     .map_err(|e| format!("invalid portable shard map: {e}"))?;
+    const PORTABLE_JOB_SETUP_HEADROOM_S: u64 = 15 * 60;
+    let string_array = |value: &JsonValue, location: &str| -> Result<BTreeSet<String>, String> {
+        value
+            .as_array()
+            .ok_or_else(|| format!("{location} must be an array"))?
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("{location} contains a non-string node"))
+            })
+            .collect()
+    };
+    let compat_nodes = portable
+        .steps
+        .iter()
+        .map(dagrun::Step::tag)
+        .filter(|tag| tag.starts_with("compat."))
+        .collect::<BTreeSet<_>>();
+    let mut job_selections = Vec::<(&str, BTreeSet<String>)>::new();
+    for (job, key) in [
+        ("preflight", "preflight_nodes"),
+        ("checks", "check_nodes"),
+        ("build-debug", "build_debug_nodes"),
+        ("build-release", "build_dbt_nodes"),
+        ("build-complete", "build_aux_nodes"),
+        ("e2e", "e2e_nodes"),
+        ("regular", "final_nodes"),
+    ] {
+        job_selections.push((job, string_array(&shards[key], key)?));
+    }
+    job_selections.push(("strict-compat", compat_nodes));
+    for (job, key) in [
+        ("test-debug", "debug_shards"),
+        ("test-release", "release_shards"),
+    ] {
+        for shard in shards[key]
+            .as_array()
+            .ok_or_else(|| format!("{key} must be an array"))?
+        {
+            job_selections.push((job, string_array(&shard["nodes"], key)?));
+        }
+    }
+    for (job, selected) in &job_selections {
+        let critical_path = dag_selected_critical_path(&portable, selected)?;
+        let job_bound = workflow_job_timeout(&portable_workflow, job)? * 60;
+        if job_bound <= critical_path + PORTABLE_JOB_SETUP_HEADROOM_S {
+            return Err(format!(
+                "portable job {job} {job_bound}s must exceed selected DAG critical path {critical_path}s plus {PORTABLE_JOB_SETUP_HEADROOM_S}s setup headroom"
+            ));
+        }
+    }
     let portable_steps = portable
         .steps
         .iter()
@@ -932,9 +1008,12 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
             let step = portable_steps
                 .get(node)
                 .ok_or_else(|| format!("portable shard names missing DAG node {node}"))?;
-            let timeout = u64::try_from(step.timeout).map_err(|_| {
-                format!("portable node {node} has invalid timeout {}", step.timeout)
-            })?;
+            let timeout = u64::try_from(dagrun::resolved_wall_timeout(
+                step,
+                portable.default_step_timeout,
+                portable.cpu_timeout_multiplier,
+            ))
+            .map_err(|_| format!("portable node {node} has invalid resolved wall timeout"))?;
             if timeout >= bound {
                 current.insert(format!(
                     "{node} {timeout}s >= {bound}s (job {job} timeout-minutes)"
@@ -983,10 +1062,15 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
         ));
     }
     for step in &privileged.steps {
-        let timeout = u64::try_from(step.timeout).map_err(|_| {
+        let timeout = u64::try_from(dagrun::resolved_wall_timeout(
+            step,
+            privileged.default_step_timeout,
+            privileged.cpu_timeout_multiplier,
+        ))
+        .map_err(|_| {
             format!(
-                "privileged node {}.{} has invalid timeout {}",
-                step.group, step.job, step.timeout
+                "privileged node {}.{} has invalid resolved wall timeout",
+                step.group, step.job
             )
         })?;
         if timeout >= launcher_bound {
@@ -1066,6 +1150,14 @@ fn audit_privileged_unboxed_guard(workflow: &str) -> Result<(), String> {
 }
 
 fn dag_critical_path(dag: &dagrun::DagConfig) -> Result<u64, String> {
+    let selected = dag.steps.iter().map(dagrun::Step::tag).collect();
+    dag_selected_critical_path(dag, &selected)
+}
+
+fn dag_selected_critical_path(
+    dag: &dagrun::DagConfig,
+    selected: &BTreeSet<String>,
+) -> Result<u64, String> {
     let steps = dag
         .steps
         .iter()
@@ -1076,6 +1168,9 @@ fn dag_critical_path(dag: &dagrun::DagConfig) -> Result<u64, String> {
         steps: &std::collections::BTreeMap<String, &dagrun::Step>,
         active: &mut BTreeSet<String>,
         memo: &mut std::collections::BTreeMap<String, u64>,
+        default_step_timeout: i64,
+        cpu_timeout_multiplier: f64,
+        selected: &BTreeSet<String>,
     ) -> Result<u64, String> {
         if let Some(value) = memo.get(id) {
             return Ok(*value);
@@ -1089,14 +1184,29 @@ fn dag_critical_path(dag: &dagrun::DagConfig) -> Result<u64, String> {
         let predecessor = step
             .deps
             .iter()
-            .map(|dependency| visit(dependency, steps, active, memo))
+            .filter(|dependency| selected.contains(*dependency))
+            .map(|dependency| {
+                visit(
+                    dependency,
+                    steps,
+                    active,
+                    memo,
+                    default_step_timeout,
+                    cpu_timeout_multiplier,
+                    selected,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .max()
             .unwrap_or(0);
         active.remove(id);
-        let timeout = u64::try_from(step.timeout)
-            .map_err(|_| format!("DAG node {id} has invalid timeout {}", step.timeout))?;
+        let timeout = u64::try_from(dagrun::resolved_wall_timeout(
+            step,
+            default_step_timeout,
+            cpu_timeout_multiplier,
+        ))
+        .map_err(|_| format!("DAG node {id} has invalid resolved wall timeout"))?;
         let value = predecessor
             .checked_add(timeout)
             .ok_or_else(|| format!("DAG critical path overflows at {id}"))?;
@@ -1105,8 +1215,21 @@ fn dag_critical_path(dag: &dagrun::DagConfig) -> Result<u64, String> {
     }
     let mut memo = std::collections::BTreeMap::new();
     let mut maximum = 0;
-    for id in steps.keys() {
-        maximum = maximum.max(visit(id, &steps, &mut BTreeSet::new(), &mut memo)?);
+    for id in selected {
+        if !steps.contains_key(id) {
+            return Err(format!(
+                "selected DAG critical path references missing node {id}"
+            ));
+        }
+        maximum = maximum.max(visit(
+            id,
+            &steps,
+            &mut BTreeSet::new(),
+            &mut memo,
+            dag.default_step_timeout,
+            dag.cpu_timeout_multiplier,
+            selected,
+        )?);
     }
     Ok(maximum)
 }

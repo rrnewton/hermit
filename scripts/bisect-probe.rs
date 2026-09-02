@@ -1101,7 +1101,7 @@ fn main() {
     let mut lane = "portable".to_string();
     // ⚠️ THE DEFAULT IS 1 BECAUSE THE NODES RUN AT 1, AND A BISECT MUST REPRODUCE THE
     // INVOCATION THAT OBSERVED THE FAILURE. Measured 2026-08-26 against
-    // ci/dag/portable.json: of the thirteen `e2e.manifest_*` nodes, ELEVEN pass no
+    // ci/dag/validate.json: of the thirteen `e2e.manifest_*` nodes, ELEVEN pass no
     // `--jobs` at all -- and `test-harness` itself defaults to 1
     // (test-harness.rs, `ScheduledWorkerCapacity::new(args.jobs.unwrap_or(1))`) --
     // `e2e.manifest_system_utils` pins `--jobs 1` explicitly, and only

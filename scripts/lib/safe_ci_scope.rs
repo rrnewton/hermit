@@ -198,7 +198,11 @@ fn outer_scope_limit_readback_matches(scope: &Path, expected_memory_max: i64) ->
     eprintln!(
         "[safe-ci]{} outer cgroup audit at {}: memory.max={} ({}), memory.swap.max={} ({}), \
          memory.oom.group={} ({})",
-        if EXPECTED_REFUSAL.load(Ordering::Relaxed) { " expected-refusal:" } else { "" },
+        if EXPECTED_REFUSAL.load(Ordering::Relaxed) {
+            " expected-refusal:"
+        } else {
+            ""
+        },
         scope.display(),
         memory_max.as_deref().unwrap_or("UNREADABLE"),
         if memory_ok { "bound" } else { "MISMATCH" },

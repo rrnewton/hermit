@@ -2391,8 +2391,8 @@
     {
       "disposition": "special-driver",
       "path": "tests/e2e/lib/applications/run_all.sh",
-      "runner": "ci/dag/portable.json test.applications_e2e",
-      "why": "tests/e2e/lib/applications/run_all.sh is owned by ci/dag/portable.json test.applications_e2e: The `run_all.sh` executable is the applications suite aggregator: it enumerates multiple sibling scenarios, supplies their shared lifecycle, and combines their assertions. It remains a suite driver because flattening it into one program cell would hide its internal test denominator and multi-program setup."
+      "runner": "ci/dag/validate.json test.applications_e2e",
+      "why": "tests/e2e/lib/applications/run_all.sh is owned by ci/dag/validate.json test.applications_e2e: The `run_all.sh` executable is the applications suite aggregator: it enumerates multiple sibling scenarios, supplies their shared lifecycle, and combines their assertions. It remains a suite driver because flattening it into one program cell would hide its internal test denominator and multi-program setup."
     },
     {
       "disposition": "suite-helper",
@@ -3435,8 +3435,8 @@
     {
       "disposition": "suite-helper",
       "path": "tests/backend-parity/parity_mutation.py",
-      "runner": "ci/dag/portable.json e2e.parity_mutation",
-      "why": "tests/backend-parity/parity_mutation.py is owned by ci/dag/portable.json e2e.parity_mutation: This is the shared mutation harness for the backend-parity identity family: it proves each declared field is load-bearing and compares every candidate backend against the golden ptrace reference at a recorded strictness tier. It is a driver invoked directly by CI, not a guest, and the generic manifest must not schedule it as one."
+      "runner": "ci/dag/validate.json e2e.parity_mutation",
+      "why": "tests/backend-parity/parity_mutation.py is owned by ci/dag/validate.json e2e.parity_mutation: This is the shared mutation harness for the backend-parity identity family: it proves each declared field is load-bearing and compares every candidate backend against the golden ptrace reference at a recorded strictness tier. It is a driver invoked directly by CI, not a guest, and the generic manifest must not schedule it as one."
     },
     {
       "disposition": "guest-fixture",
