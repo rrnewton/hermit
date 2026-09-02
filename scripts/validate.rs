@@ -7810,6 +7810,10 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             .iter()
             .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
             .cloned();
+        let rust_script_producer = pre
+            .iter()
+            .find(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
+            .cloned();
         let mut steps = pre;
         let selected_gate = if args.allow_local_off_the_record_run {
             // Iteration must not be blocked by an unrelated red manifest audit:
@@ -7880,6 +7884,9 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
                     || manifest_plan_consumers.contains(tag)
             });
         if needs_manifest_plan {
+            steps.push(rust_script_producer.ok_or(
+                "--only: canonical preflight lost build.rust_scripts",
+            )?);
             steps.push(manifest_plan_producer.ok_or(
                 "--only: canonical preflight lost setup.manifest_plan",
             )?);
