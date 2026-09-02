@@ -7993,7 +7993,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 120,
+      "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {

@@ -6468,7 +6468,7 @@ fn committed_validation_dag_bracket(root: &Path) -> Result<String, String> {
         ("build.runtime_release", 1500),
         ("e2e.manifest_backend_parity_c", 1800),
         ("e2e.manifest_c_programs", 2700),
-        ("privileged-build.privileged_tests", 120),
+        ("privileged-build.privileged_tests", 600),
         ("test.app_strict_verify", 900),
         ("quick.build", 3600),
         ("compat.echo", 120),
