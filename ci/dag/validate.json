@@ -12619,6 +12619,9 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -u\niters=${ANALYZE_SKID_CALIBRATION_ITERATIONS:-64}\nperiod=${ANALYZE_SKID_CALIBRATION_PERIOD:-1000000}\nfloor=${ANALYZE_SKID_MINIMUM_MARGIN:-20000}\ncal_timeout=${ANALYZE_SKID_CALIBRATION_TIMEOUT:-30}\nfor name in iters period floor cal_timeout; do\n    eval \"v=\\$$name\"\n    case \"$v\" in\n        ''|*[!0-9]*|0*) echo \"Analyze PMU calibration error: $name must be a positive integer, got $v\" >&2; exit 2 ;;\n    esac\ndone\nbin=$PWD/target/ci-pmu-skid\nmkdir -p \"$(dirname \"$bin\")\" || exit 1\ncc -O2 -Wall -Wextra -Werror -std=gnu11 tests/util/pmu_skid.c -o \"$bin\" || {\n    echo \"Analyze PMU calibration error: failed to build tests/util/pmu_skid.c\" >&2; exit 1; }\nout=$(timeout \"$cal_timeout\" \"$bin\" --iterations \"$iters\" --period \"$period\" 2>&1) || {\n    status=$?; printf 'Analyze PMU calibration failed (exit %s):\\n%s\\n' \"$status\" \"$out\" >&2; exit \"$status\"; }\nprintf '%s\\n' \"$out\"\nrec=$(printf '%s\\n' \"$out\" | sed -n 's/^Recommended margin: \\([0-9][0-9]*\\) RCB.*/\\1/p')\ncase \"$rec\" in\n    ''|*[!0-9]*|0*) echo \"Analyze PMU calibration error: output omitted a valid recommended margin\" >&2; exit 1 ;;\nesac\nmargin=$rec\nif [ \"$margin\" -lt \"$floor\" ]; then margin=$floor; fi\nprintf 'Analyze PMU skid margin: calibrated=%s RCB, conservative floor=%s RCB, using=%s RCB\\n' \\\n    \"$rec\" \"$floor\" \"$margin\"\nHERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test analyze -j 1 analyze_hello_race -- --exact --ignored",
+      "integration_test_binaries": [
+        "analyze"
+      ],
       "deps": [
         "setup.nextest",
         "super.build_workspace"
