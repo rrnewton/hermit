@@ -34,7 +34,7 @@ staging, or standalone scripts, so those semantic edges remain explicit in
 `ci/test-footprints-policy.json`.
 
 `target/debug/test-harness validate` runs the generator in `--check` mode and fails the
-`e2e.metadata` gate if the committed artifact differs byte-for-byte. A focused
+`gate.manifest` gate if the committed artifact differs byte-for-byte. A focused
 check is also available:
 
 ```bash

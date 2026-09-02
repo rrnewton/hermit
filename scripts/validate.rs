@@ -2996,7 +2996,7 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
     }
 
     // Exercise the real selector, not a hand-written keep set. A flaky-tests
-    // change reaches the chaos manifest cell through e2e.metadata and the
+    // change reaches the chaos manifest cell through gate.manifest and the
     // shipped setup.manifest_plan producer. The producer is valid selector
     // vocabulary even though plan composition satisfies it from preflight.
     let selector = Command::new(root.join("ci").join("select-tests.rs"))
@@ -3019,7 +3019,7 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         .collect();
     for required in [
         validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
-        "e2e.metadata",
+        "gate.manifest",
         "e2e.manifest_chaos_c",
     ] {
         if !selected.contains(required) {
@@ -3055,15 +3055,15 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
     let metadata = real
         .steps
         .iter()
-        .find(|step| step.tag() == "e2e.metadata")
-        .ok_or("selective bracket: real selector lost e2e.metadata")?;
+        .find(|step| step.tag() == "gate.manifest")
+        .ok_or("selective bracket: real selector lost gate.manifest")?;
     if !metadata
         .deps
         .iter()
         .any(|dependency| dependency == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
     {
         return Err(
-            "selective bracket: e2e.metadata was not bound to the preflight manifest producer"
+            "selective bracket: gate.manifest was not bound to the preflight manifest producer"
             .into(),
         );
     }
@@ -9784,16 +9784,11 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.manifest_guests",
 ];
 
-// ⚠️ e2e.metadata IS DELIBERATELY ABSENT FROM THAT LIST, AND THE REASON CORRECTS MY OWN
+// ⚠️ gate.manifest IS DELIBERATELY ABSENT FROM THAT LIST, AND THE REASON CORRECTS MY OWN
 // FIRST DRAFT. I had listed it because it RUNS test-harness, but running a tool is not
-// the criterion -- PRODUCING SOMETHING THE CELLS EXECUTE is. `e2e.metadata` runs
+// the criterion -- PRODUCING SOMETHING THE CELLS EXECUTE is. `gate.manifest` runs
 // `target/debug/test-harness validate`, which validates the manifest and emits no
 // binary the cells go on to run, so a second in-image copy would buy nothing.
-// Separately, and only visible in a real plan: its command is identical to
-// gate.manifest's, so lane fusion deduplicates the two and `e2e.metadata` does not
-// survive as its own node at all -- "deduped 4 identical node(s): check.reverie_pin,
-// e2e.metadata, ...". A list that names it is describing a node the fused plan does
-// not contain.
 
 
 

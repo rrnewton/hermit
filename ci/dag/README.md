@@ -125,7 +125,7 @@ Each node's tag is `group.job` (e.g. `build.workspace`, `lint.clippy`).
 
 The centralized manifests use an explicit build barrier before execution:
 
-1. `e2e.metadata` validates schema, inventory, generated test-footprint freshness,
+1. `gate.manifest` validates schema, inventory, generated test-footprint freshness,
    and CI correspondence.
 2. `build.e2e_artifact` waits for both initial Cargo producers, verifies and
    hash-binds the debug Hermit plus the dereferenced `install_pkg` resource
