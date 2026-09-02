@@ -95,7 +95,11 @@ const PREPARATION_FAILED_STATUS: i32 = 126;
 /// The prior 432-cell measurement completed in nine minutes on this host. Two
 /// hours is an operational stop for the periodic experiment, not a pass
 /// threshold: breach makes the run incomplete and publishes no promotion.
-const PRESSURE_RUN_TIMEOUT_SECONDS: i64 = 2 * 60 * 60;
+// The committed lane's largest derived wall backstop is 6h (7200s CPU x 3).
+// The pressure wrapper must outlive any selected step; two extra minutes retain
+// the existing control-step margin. Production also derives this floor from
+// the selected plan below, so a later DAG change cannot silently invert it.
+const PRESSURE_RUN_TIMEOUT_SECONDS: i64 = 6 * 60 * 60 + 2 * 60;
 const PRESSURE_SCOPE_TIMEOUT_ENV: &str = "HERMIT_PRESSURE_SCOPE_TIMEOUT_SECONDS";
 const HERMETIC_TEST_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
@@ -2597,17 +2601,6 @@ fn write_plan_after_scorecard_check(
         BTreeMap::new()
     };
     let budgets = load_budgets(root)?;
-    let run_timeout_seconds = selection
-        .run_timeout_seconds
-        .unwrap_or(PRESSURE_RUN_TIMEOUT_SECONDS);
-    require_cell_occupancy_fits(
-        &cells,
-        &budgets,
-        selection.cell_timeout_seconds,
-        run_timeout_seconds,
-        selection.run_count(),
-        selection.scheduler_jobs(),
-    )?;
     fs::create_dir_all(results).map_err(|e| format!("cannot create {}: {e}", results.display()))?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)
@@ -3000,6 +2993,38 @@ fn write_plan_after_scorecard_check(
         write_domain_guarantee: None,
         explains: Vec::new(),
     });
+
+    // The committed validation DAG now carries the effective CPU budgets that
+    // its old constructor supplied (up to 7200s). Their derived wall backstops
+    // can therefore exceed the historical two-hour pressure default. Derive a
+    // default that is later than every selected step; an explicitly requested
+    // bound remains authoritative and is refused below by audit_dag when it
+    // cannot contain the selected work.
+    let largest_step_wall = steps
+        .iter()
+        .map(|step| {
+            dagrun::resolved_wall_timeout(
+                step,
+                canonical.default_step_timeout,
+                canonical.cpu_timeout_multiplier,
+            )
+        })
+        .max()
+        .unwrap_or(CONTROL_STEP_TIMEOUT_SECONDS);
+    let derived_run_timeout = largest_step_wall
+        .checked_add(CONTROL_STEP_TIMEOUT_SECONDS)
+        .ok_or("selected pressure DAG wall backstop exceeds the supported integer range")?;
+    let run_timeout_seconds = selection
+        .run_timeout_seconds
+        .unwrap_or(PRESSURE_RUN_TIMEOUT_SECONDS.max(derived_run_timeout));
+    require_cell_occupancy_fits(
+        &cells,
+        &budgets,
+        selection.cell_timeout_seconds,
+        run_timeout_seconds,
+        selection.run_count(),
+        selection.scheduler_jobs(),
+    )?;
 
     let max_timeout = steps.iter().map(|step| step.timeout).max().unwrap_or(120);
     let mut dag = canonical;
