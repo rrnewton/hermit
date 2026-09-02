@@ -206,6 +206,9 @@ jobs:
           echo "DEMO08_SELECTED_PATH=$selected" >>"$GITHUB_ENV"
           echo "::notice title=Demo 8 calibration path::$selected; cache_hit=${CACHE_HIT:-false}"
 
+      - name: Test Demo 8 calibration preparation
+        run: scripts/test-prepare-demo08-calibration.sh
+
       - name: Run demos 1-8 at the exact Hermit SHA
         id: demo-sweep
         run: |

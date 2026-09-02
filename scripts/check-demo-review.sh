@@ -9,7 +9,7 @@
 # The attestation is a commit-message trailer produced by an adversarial reviewer
 # who actually ran the demo:
 #
-#   Demo-Green-Review: reviewer=<agent-id> demo=<demos/path|all> result=GREEN evidence=<url|path|sha>
+#   Demo-Green-Review: reviewer=<agent-id> demo=<demos/path[,demos/path...]|all> result=GREEN evidence=<url|path|sha>
 #
 # result must be GREEN; reviewer and evidence must be non-empty. The reviewer
 # should be a DIFFERENT agent than the implementer (independence) -- see policy.
@@ -38,8 +38,8 @@ USAGE:
   scripts/check-demo-review.sh --commit <SHA>                  a single commit
   scripts/check-demo-review.sh -h|--help                       show this help and exit (no side effects)
 
-Passes (exit 0) when no runnable demo is touched, or a valid trailer is present:
-  Demo-Green-Review: reviewer=<agent> demo=<demos/path|all> result=GREEN evidence=<url|path|sha>
+Passes (exit 0) when no runnable demo is touched, or valid trailers cover every path:
+  Demo-Green-Review: reviewer=<agent> demo=<demos/path[,demos/path...]|all> result=GREEN evidence=<url|path|sha>
 HERMIT_DEMO_REVIEW_OVERRIDE=1 allows a LOCAL commit (never --range). Policy: demos/ADVERSARIAL-REVIEW-POLICY.md.
 EOF
     exit 0
@@ -67,7 +67,10 @@ any_demo_touched() {  # stdin: NUL- or newline-separated paths
     return $hit
 }
 
-has_attestation() {  # $1 = text blob to search for a valid trailer
+# Emit every demo path named by a valid trailer, one per line. A trailer may
+# cover several exact paths with a comma-separated demo= value; `all` and
+# directory coverage retain their documented meanings.
+attested_demos() {  # $1 = text blob
     local line
     while IFS= read -r line; do
         printf '%s\n' "$line" | grep -qE '^[[:space:]]*Demo-Green-Review:' || continue
@@ -75,8 +78,24 @@ has_attestation() {  # $1 = text blob to search for a valid trailer
         printf '%s\n' "$line" | grep -qE '(^|[[:space:]])demo=(all|demos/[^[:space:]]+)([[:space:]]|$)' || continue
         printf '%s\n' "$line" | grep -qE '(^|[[:space:]])result=GREEN([[:space:]]|$)' || continue
         printf '%s\n' "$line" | grep -qE '(^|[[:space:]])evidence=[^[:space:]]+([[:space:]]|$)' || continue
-        return 0
+        printf '%s\n' "$line" \
+            | grep -oE '(^|[[:space:]])demo=[^[:space:]]+' \
+            | sed -E 's/^[[:space:]]*demo=//' \
+            | tr ',' '\n'
     done <<<"$1"
+}
+
+# Does one attested demo= value cover a touched path?
+#   all                        -> covers everything
+#   demos/05-qemu-boot.py      -> covers exactly that file
+#   demos/qemu-busybox         -> covers files beneath that directory
+# A bare filename is deliberately not accepted: the trailer must name the path
+# as it appears in the diff.
+demo_value_covers() {  # $1 = demo= value, $2 = touched path
+    local value="${1%/}" path="$2"
+    [ "$value" = all ] && return 0
+    [ "$value" = "$path" ] && return 0
+    case "$path" in "$value"/*) return 0 ;; esac
     return 1
 }
 
@@ -101,24 +120,6 @@ case "$mode" in
     range)
         changed=$(git diff --name-only "$range" 2>/dev/null) || git_refused "range $range"
         commits=$(git rev-list "$range" 2>/dev/null) || git_refused "range $range"
-        messages=""
-        latest_demo_commit=""
-        for revision in $commits; do
-            paths=$(git diff-tree --no-commit-id --name-only -r "$revision" 2>/dev/null) \
-                || git_refused "commit $revision"
-            if printf '%s\n' "$paths" | any_demo_touched >/dev/null; then
-                latest_demo_commit="$revision"
-                break
-            fi
-        done
-        if [ -n "$latest_demo_commit" ]; then
-            for revision in $commits; do
-                message=$(git log -1 --format='%B' "$revision" 2>/dev/null) \
-                    || git_refused "commit $revision"
-                messages="${messages}${message}"$'\n'
-                [ "$revision" = "$latest_demo_commit" ] && break
-            done
-        fi
         where="range $range" ;;
     staged)
         changed=$(git diff --cached --name-only 2>/dev/null) || git_refused "staged change"
@@ -138,22 +139,90 @@ touched=$(printf '%s\n' "$changed" | any_demo_touched) || {
     exit 0
 }
 
-if has_attestation "$messages"; then
-    echo "demo-review gate: green-demo attestation present for $where -- OK."
+# A review applies only to the paths it names, and it must be at or after the
+# last change to each path. One old `demo=all` trailer must not bless later
+# edits, and a trailer for demos 1-7 must not bless Demo 8.
+uncovered=""
+stale=""
+
+if [ "$mode" = range ]; then
+    for path in $touched; do
+        last_change=$(git log --format='%H' -1 "$range" -- "$path" 2>/dev/null) \
+            || git_refused "last change to $path in range $range"
+        if [ -z "$last_change" ]; then
+            uncovered="$uncovered $path"
+            continue
+        fi
+        covered=0
+        stale_only=0
+        for candidate in $commits; do
+            candidate_msg=$(git log -1 --format='%B' "$candidate" 2>/dev/null) \
+                || git_refused "commit $candidate"
+            value_covers=0
+            for value in $(attested_demos "$candidate_msg"); do
+                if demo_value_covers "$value" "$path"; then
+                    value_covers=1
+                    break
+                fi
+            done
+            [ "$value_covers" = 1 ] || continue
+            if git merge-base --is-ancestor "$last_change" "$candidate" 2>/dev/null; then
+                covered=1
+                break
+            fi
+            stale_only=1
+        done
+        if [ "$covered" = 1 ]; then
+            continue
+        elif [ "$stale_only" = 1 ]; then
+            stale="$stale $path"
+        else
+            uncovered="$uncovered $path"
+        fi
+    done
+else
+    for path in $touched; do
+        covered=0
+        for value in $(attested_demos "$messages"); do
+            if demo_value_covers "$value" "$path"; then
+                covered=1
+                break
+            fi
+        done
+        [ "$covered" = 1 ] || uncovered="$uncovered $path"
+    done
+fi
+
+if [ -z "$uncovered" ] && [ -z "$stale" ]; then
+    echo "demo-review gate: green-demo attestation covers every touched demo in $where -- OK."
     echo "  touched:"; printf '    %s\n' $touched
     exit 0
 fi
 
 {
     echo "----------------------------------------------------------------------"
-    echo "DEMO-REVIEW GATE: $where touches a runnable demo but has NO adversarial"
-    echo "green-demo attestation:"
+    echo "DEMO-REVIEW GATE: $where touches runnable demos that are not covered by"
+    echo "a valid adversarial green-demo attestation."
+    echo
+    if [ -n "$uncovered" ]; then
+        echo "  NO attestation names these touched demos:"
+        printf '    %s\n' $uncovered
+        echo
+    fi
+    if [ -n "$stale" ]; then
+        echo "  An attestation names these, but it was recorded BEFORE the last"
+        echo "  commit that changed them, so it attests to superseded content."
+        echo "  Re-run the demo at the current head and record a new trailer:"
+        printf '    %s\n' $stale
+        echo
+    fi
+    echo "  all touched demo files:"
     printf '    %s\n' $touched
     echo
     echo "Any demos/** change must be verified GREEN by an adversarial reviewer who"
     echo "actually ran the demo, then recorded a commit-message trailer:"
     echo
-    echo "  Demo-Green-Review: reviewer=<agent> demo=<demos/path|all> result=GREEN evidence=<url|path|sha>"
+    echo "  Demo-Green-Review: reviewer=<agent> demo=<demos/path[,demos/path...]|all> result=GREEN evidence=<url|path|sha>"
     echo
     echo "Policy: ${POLICY}"
 } >&2
