@@ -236,9 +236,12 @@ jobs:
     # Selective runs still execute preflight (fmt + abstraction + portability):
     # select-tests always pins these as always-on PREFLIGHT nodes. Only a
     # proof-of-inert `skip` (e.g. docs-only) drops it.
+    # The selected DAG critical path is 9900s; 181 minutes leaves the required
+    # 900s setup headroom plus 60s. The manifest-plan self-test recomputes this
+    # ordering from the committed DAG and workflow.
     if: needs.select.outputs.decision != 'skip'
     runs-on: ubuntu-latest
-    timeout-minutes: 166
+    timeout-minutes: 181
     steps:
       - uses: actions/checkout@v4
         with:
@@ -551,7 +554,9 @@ jobs:
     needs: [select, preflight]
     if: needs.select.outputs.build_release != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 76
+    # build.runtime_release has a measured 1500s CPU budget, which resolves to
+    # 4500s wall. 91 minutes leaves the required 900s setup headroom plus 60s.
+    timeout-minutes: 91
     steps:
       - uses: actions/checkout@v4
       - name: Initialize dagrun submodule
@@ -984,7 +989,10 @@ jobs:
     needs: [select, build-debug, build-complete]
     if: needs.select.outputs.run_e2e != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 46
+    # Each matrix job runs one selected E2E node. The largest explicit cap,
+    # e2e.manifest_c_programs, is 2700s CPU / 8100s resolved wall; 151 minutes
+    # leaves the required 900s setup headroom plus 60s.
+    timeout-minutes: 151
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.build-debug.outputs.e2e_matrix) }}

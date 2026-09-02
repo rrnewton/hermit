@@ -47,16 +47,14 @@ jobs:
     # This is a WALL, not an expected duration: a green run of this job measured
     # 126s end to end on 2026-08-08 (run 31282467953). The wall must still cover
     # the case where every budgeted step spends its whole allowance, which is
-    # 14500s (DAG launcher) + 330s (30s locks + 60s submodule init + 30s hardware
-    # capabilities + 210s occasional KVM probes) + an allowance for the steps
-    # that carry no `timeout` of their own (job setup, checkout, and the two
-    # artifact uploads measured 7s warm, but a cold checkout and a large
-    # artifact upload are far slower). target/debug/test-harness reads the
-    # privileged launcher and DAG budgets from their deployed files and fails
-    # closed on their ordering drift, so
-    # raise the step budgets and rerun `target/debug/test-harness validate` rather
-    # than guessing here.
-    timeout-minutes: 250
+    # 15400s (DAG launcher) + 450s (30s locks + 60s submodule init + 30s hardware
+    # capabilities + 120s boxing probe + 210s occasional KVM probes) + 50s for
+    # the steps that carry no `timeout` of their own (job setup, checkout, and
+    # the two artifact uploads measured 7s warm). target/debug/test-harness
+    # reads the privileged launcher and DAG budgets from their deployed files
+    # and fails closed on their ordering drift, so raise the step budgets and
+    # rerun `target/debug/test-harness validate` rather than guessing here.
+    timeout-minutes: 265
     env:
       DETCORE_TEST_RUST_LOG: "off"
 
@@ -117,8 +115,9 @@ jobs:
       # execution only in that exact context. A copied/local invocation, or any
       # boxing failure outside Actions, must fail closed instead of silently
       # downgrading through --allow-cgroup-failure.
-      # 14500s exceeds the selected graph's derived 14400s critical path. The
-      # individual wall limits are hang backstops derived from committed CPU
+      # 15400s exceeds the selected graph's derived 15300s critical path plus
+      # 30s of runner overhead. The individual wall limits are hang backstops
+      # derived from committed CPU
       # budgets, not expected durations. A warm exact-tree build measured 77s;
       # the first canonical cold-cache run exceeded 180s before completing.
       # This number is the SINGLE AUTHOR
@@ -132,7 +131,7 @@ jobs:
           echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2
           exit 2
         fi
-        timeout --foreground --kill-after=10s 14500s env DAGRUN_BIN=agent-utils/py/bin/dagrun ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+        timeout --foreground --kill-after=10s 15400s env DAGRUN_BIN=agent-utils/py/bin/dagrun ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
     - name: Run non-gating occasional KVM probes
       id: kvm_occasional
       continue-on-error: true
