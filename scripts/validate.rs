@@ -391,10 +391,7 @@ const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_ENV: &str =
 const ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION: &str = "--allow-local-off-the-record-run";
 const OUT_OF_PLACE_CONCURRENCY_EXPERIMENT_OPTION: &str =
     "--out-of-place-concurrency-experiment";
-const OUT_OF_PLACE_CONCURRENCY_RESOURCES: [&str; 2] = [
-    validate_plan::PORTABLE_STRICT_COMPAT_RESOURCE,
-    "manifest_guest",
-];
+const OUT_OF_PLACE_CONCURRENCY_RESOURCES: [&str; 1] = ["manifest_guest"];
 
 fn usage() -> &'static str {
     "Usage: ./scripts/validate.rs [LEVEL] [OPTIONS]\n\
@@ -439,7 +436,7 @@ fn usage() -> &'static str {
      \x20                  and cannot be cited as validation evidence.\n\
      \x20 --out-of-place-concurrency-experiment\n\
      \x20                  INTERNAL EXPERIMENT: force the complete full plan, ignore cached\n\
-     \x20                  validation, publish no label, and remove hermit_guest/manifest_guest\n\
+     \x20                  validation, publish no label, and remove the remaining manifest_guest\n\
      \x20                  caps and demands after plan construction. Requires an explicit\n\
      \x20                  HERMIT_VALIDATE_LEDGER for a non-plan run.\n\
      \x20 --verbose        Verbosity level 2: stream tagged per-step output.\n\
@@ -6553,7 +6550,9 @@ fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
         ));
     }
     Ok("rust-script build: one producer follows checkout verification and precedes graph consumers; prepared binaries are read-only and duplicate producers refuse".into())
-/// Remove only the two guest-concurrency resources whose box-wide exclusion is
+}
+
+/// Remove the remaining guest-concurrency resource whose box-wide exclusion is
 /// under test. This runs after every plan constructor/expander so newly-created
 /// strict-compat and manifest nodes cannot retain a hidden demand. All other
 /// resource accounting remains intact.
@@ -6789,7 +6788,7 @@ fn out_of_place_concurrency_experiment_bracket(root: &Path) -> Result<String, St
         return Err("concurrency experiment: serialized DAG lost an unrelated resource cap".into());
     }
     Ok(format!(
-        "out-of-place concurrency experiment: removed hermit_guest/manifest_guest from {} steps and serialized round-trip preserved {} other cap(s)",
+        "out-of-place concurrency experiment: removed manifest_guest from {} steps and serialized round-trip preserved {} other cap(s)",
         decoded.steps.len(),
         decoded.resource_caps.len()
     ))
