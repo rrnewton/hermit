@@ -7,11 +7,11 @@
 #
 # check-shard-coverage.sh — fail-closed correspondence guard for the parallel
 # portable fan-out. Asserts that ci/portable-shards.json assigns EVERY step in
-# validate's constructed portable-only plan to exactly one job, with no overlap
+# validate's committed portable label selection to exactly one job, with no overlap
 # and no unknown step names:
 #
 #   union(preflight, builds, test shards, e2e, final)
-#     == { steps returned by scripts/validate.rs portable-only --show-plan-json }
+#     == { steps selected by the portable label from ci/dag/validate.json }
 #
 # The immutable E2E artifact and the LiteInst producer are deliberately assigned
 # to one completed-build job after the debug and release producers. Keeping that
@@ -39,9 +39,9 @@ trap 'rm -f "$plan_out"' EXIT
 ./scripts/validate.rs portable-only --show-plan-json \
     --skip-inner-dirty-working-tree-and-rebase-freshness-checks >"$plan_out"
 plan_json=$(sed -n '1p' "$plan_out")
-jq -e '.profile == "portable-only" and .selection_mode == "full"' \
+jq -e '.profile == "portable" and .selection_mode == "label"' \
     <<<"$plan_json" >/dev/null || {
-    echo "check-shard-coverage.sh: validate did not return the full portable-only plan" >&2
+    echo "check-shard-coverage.sh: validate did not return the committed portable label selection" >&2
     exit 2
 }
 mapfile -t expected < <(jq -r '.dags[].steps[].tag' <<<"$plan_json" | sort -u)
@@ -106,7 +106,7 @@ if [[ -n $missing ]]; then
     status=1
 fi
 if [[ -n $extra ]]; then
-    echo "check-shard-coverage.sh: FAIL — shard map names steps absent from the constructed portable-only plan:" >&2
+    echo "check-shard-coverage.sh: FAIL — shard map names steps absent from the committed portable label selection:" >&2
     printf '  %s\n' $extra >&2
     status=1
 fi

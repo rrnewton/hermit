@@ -9807,8 +9807,6 @@ fn propagate_verbosity(plan: &mut Plan, verbosity: i64) {
 /// `ci/publish-hermit-e2e-artifact.sh` copies that whole tree into the artifact the
 /// cells unpack and run. A list assembled from memory would have stopped at five.
 const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
-    // builds the rust-script executables that source-based cell helpers invoke
-    "build.rust_scripts",
     // builds target/debug/test-harness, which the cell command invokes directly
     "setup.manifest_plan",
     // builds target/debug/hermit, which the cells run as the guest tracer
@@ -9947,6 +9945,10 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 .ok_or("pinned-root plan lost its canonical manifest-plan producer")?;
             producers.push(manifest_plan);
         }
+        let has_rust_script_producer = cfg
+            .steps
+            .iter()
+            .any(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG);
         let producer_tags: BTreeSet<String> =
             producers.iter().map(|producer| producer.tag()).collect();
         let mut twins = Vec::new();
@@ -9962,12 +9964,6 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 .filter(|dep| producer_tags.contains(*dep))
                 .map(|dep| pinned_root_producer_twin_tag(dep))
                 .collect();
-            if producer.tag() != RUST_SCRIPT_PRODUCER_TAG
-                && producer_tags.contains(RUST_SCRIPT_PRODUCER_TAG)
-            {
-                twin.deps
-                    .push(pinned_root_producer_twin_tag(RUST_SCRIPT_PRODUCER_TAG));
-            }
             // Fusion replaces e2e.metadata with the host gate.manifest node.
             // That host node is deliberately not copied into the pinned root,
             // so preserve the actual build prerequisite explicitly: this
@@ -10025,14 +10021,17 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 step.deps
                     .push("build.e2e_artifact_in_pinned_root".into());
             }
-            if producer_tags.contains(RUST_SCRIPT_PRODUCER_TAG)
+            // The one host producer publishes immutable binaries. The pinned
+            // root mounts that directory read-only over its separate target
+            // tree, so cells wait for the producer rather than compiling a
+            // second copy without network access.
+            if has_rust_script_producer
                 && !step
                     .deps
                     .iter()
-                    .any(|dep| dep == "build.rust_scripts_in_pinned_root")
+                    .any(|dep| dep == RUST_SCRIPT_PRODUCER_TAG)
             {
-                step.deps
-                    .push("build.rust_scripts_in_pinned_root".into());
+                step.deps.push(RUST_SCRIPT_PRODUCER_TAG.into());
             }
             step.cmd = pinned_root_command(root, &out, step);
             if index == 0 && !step.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG) {
@@ -10045,6 +10044,16 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
 }
 
 fn pinned_root_plan_bracket() -> Result<String, String> {
+    const RUST_SCRIPT_MOUNT: &str = "type=bind,source=$src/target/ci/rust-scripts,destination=/src/target/ci/rust-scripts,ro=true";
+    let wrapper = std::fs::read_to_string(repo_root().join("ci/hermetic/run-in-pinned-root.sh"))
+        .map_err(|error| format!("pinned-root bracket: cannot read wrapper: {error}"))?;
+    if !wrapper.contains(RUST_SCRIPT_MOUNT) {
+        return Err("pinned-root bracket: wrapper does not mount the one host rust-script producer's output read-only in the pinned target".into());
+    }
+    let writable_mount = wrapper.replacen(RUST_SCRIPT_MOUNT, &RUST_SCRIPT_MOUNT.replace(",ro=true", ""), 1);
+    if writable_mount.contains(RUST_SCRIPT_MOUNT) {
+        return Err("pinned-root bracket: planted writable rust-script artifact mount was accepted".into());
+    }
     let step = |group: &str, job: &str, cmd: &str, deps: Vec<String>| {
         step_with_caps(group, job, "fixture", cmd.into(), deps, 0, 30, 1024 * 1024)
     };
@@ -10139,13 +10148,9 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
         .ok_or("pinned-root bracket: the in-image copy of build.workspace was not added; the cells would get host-built binaries the image cannot load")?;
     if !twin.cmd.contains("run-in-pinned-root.sh")
         || twin.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
-        || !twin
-            .deps
-            .iter()
-            .any(|dep| dep == "build.rust_scripts_in_pinned_root")
     {
         return Err(format!(
-            "pinned-root bracket: the in-image copy of build.workspace is not actually in the image or can contend with the rust-script producer: cmd={:?} env={:?} deps={:?}",
+            "pinned-root bracket: the in-image copy of build.workspace is not actually in the image: cmd={:?} env={:?} deps={:?}",
             twin.cmd, twin.env, twin.deps
         ));
     }
@@ -10197,17 +10202,14 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
             wrapped.deps
         ));
     }
-    let rust_script_twin = by_tag
-        .get("build.rust_scripts_in_pinned_root")
-        .ok_or("pinned-root bracket: the in-image rust-script producer was not added")?;
-    if !rust_script_twin.cmd.contains("run-in-pinned-root.sh")
+    if by_tag.contains_key("build.rust_scripts_in_pinned_root")
         || !wrapped
             .deps
             .iter()
-            .any(|dep| dep == "build.rust_scripts_in_pinned_root")
+            .any(|dep| dep == RUST_SCRIPT_PRODUCER_TAG)
     {
         return Err(format!(
-            "pinned-root bracket: the scheduled cell does not consume the in-image rust-script producer: producer={rust_script_twin:?} cell={wrapped:?}"
+            "pinned-root bracket: the scheduled cell must consume the one host rust-script producer through the pinned root's read-only artifact mount: cell={wrapped:?}"
         ));
     }
 
@@ -10276,7 +10278,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
             "pinned-root bracket: sequential lanes must fetch once then reuse the cache: first_fetches={first_fetches} second_fetches={second_fetches} second={second_step:?}"
         ));
     }
-    Ok("pinned root: scheduled manifest cells wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; 6 non-producer steps verified still on the host; 1 locked fetch added".into())
+    Ok("pinned root: scheduled manifest cells consume the one host rust-script producer through a read-only mount and use in-image copies of toolchain-dependent producers; host copies remain untouched; 6 non-producer steps stay on the host; 1 locked fetch added".into())
 }
 
 // --------------------------------------------------------------------------- interruption
