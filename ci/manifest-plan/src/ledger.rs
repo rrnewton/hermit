@@ -3,11 +3,14 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
 
 use crate::runner::FailureClass;
 
@@ -131,6 +134,12 @@ pub struct HistoryRow {
     /// typed shape applies; supported schemas still require a complete value.
     #[serde(default)]
     pub cell_results: Option<CellResultsValue>,
+    /// Schema-9 producer-owned terminal test results. Keep the raw value until
+    /// the enclosing row version is known so schemas 6, 7, 8, and future rows
+    /// retain their established serialization and receive no accidental
+    /// authority from a shape that happens to parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_results: Option<TestResultsValue>,
     #[serde(default)]
     pub gates: Vec<GateHistoryRow>,
     /// `tree` deliberately remains in this map even though it has a shared
@@ -181,29 +190,50 @@ impl HistoryRow {
     }
 
     /// Decode cell-results evidence only after the enclosing schema version is
-    /// known. Schema 6 and 7 retain their historical type; schema 8 is parsed
-    /// from the forward-compatible JSON arm into its exact versioned shape.
-    /// Newer schemas remain readable but receive no typed evidence authority.
+    /// known. Schema 6 and 7 retain their historical type; schema 8 introduced
+    /// the exact versioned shape that schema 9 carries forward unchanged while
+    /// adding separate test-results evidence. Newer schemas remain readable but
+    /// receive no typed evidence authority.
     pub fn cell_results_evidence(&self) -> Option<Cow<'_, CellResultsEvidence>> {
         let value = self.cell_results.as_ref()?;
         match self.schema_version? {
             6 | 7 => value.typed().map(Cow::Borrowed),
-            8 => value
+            8 | 9 => value
                 .schema8()
                 .map(|evidence| Cow::Owned(evidence.into_evidence())),
             _ => None,
         }
     }
 
-    /// Return the recorded validation path only for an exact schema-8 row.
+    /// Return the recorded validation path for schema 8 or its schema-9
+    /// extension, both of which use the same cell-results shape.
     pub fn cell_results_validate_path(&self) -> Option<ValidatePath> {
-        if self.schema_version != Some(8) {
+        if !matches!(self.schema_version, Some(8) | Some(9)) {
             return None;
         }
         self.cell_results
             .as_ref()?
             .schema8()
             .map(|evidence| evidence.path)
+    }
+
+    /// Decode and validate producer-owned per-test evidence only for schema 9.
+    ///
+    /// Artifact bytes are verified by the receipt consumer. This reader proves
+    /// everything available from the ledger row itself: exact row identity,
+    /// validation path, selected producer population, canonical summaries,
+    /// checked totals, and the content-addressed artifact reference.
+    pub fn test_results_evidence(&self) -> Result<Option<TestResultsEvidenceV9>, String> {
+        if self.schema_version != Some(9) {
+            return Ok(None);
+        }
+        let value = self
+            .test_results
+            .as_ref()
+            .ok_or_else(|| "schema 9 row omitted test_results".to_string())?;
+        let evidence = value.schema9()?;
+        evidence.validate_for_row(self)?;
+        Ok(Some(evidence))
     }
 
     /// Return the number of nodes for which at least one child execution
@@ -769,6 +799,333 @@ impl CellResultsValue {
     }
 }
 
+/// Raw test-results evidence. The enclosing [`HistoryRow::schema_version`]
+/// decides whether these bytes have a supported typed interpretation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(transparent)]
+pub struct TestResultsValue(Value);
+
+impl TestResultsValue {
+    fn schema9(&self) -> Result<TestResultsEvidenceV9, String> {
+        serde_json::from_value(self.0.clone())
+            .map_err(|error| format!("schema 9 test_results is malformed: {error}"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TestResultVerdict {
+    Pass,
+    Fail,
+}
+
+/// One producer-owned terminal test row in the retained JSONL artifact.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestResultArtifactRow {
+    pub run_id: String,
+    pub hermit_sha: String,
+    pub path: ValidatePath,
+    pub producer: TestResultProducer,
+    pub id: String,
+    pub result: TestResultVerdict,
+    pub attempts: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestResultArtifactRowWire {
+    run_id: String,
+    hermit_sha: String,
+    path: ValidatePath,
+    producer: TestResultProducer,
+    id: String,
+    result: TestResultVerdict,
+    attempts: u64,
+}
+
+impl<'de> Deserialize<'de> for TestResultArtifactRow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        let value = TestResultArtifactRowWire::deserialize(deserializer)?;
+        if !nonblank_component(&value.run_id)
+            || !is_lower_hex(&value.hermit_sha, 40)
+            || value.id.is_empty()
+            || value.id.trim() != value.id
+            || value.attempts == 0
+        {
+            return Err(D::Error::custom(
+                "schema 9 test-result artifact row has malformed identity or attempts",
+            ));
+        }
+        if let TestResultProducer::Node {
+            node,
+            outer_attempt,
+        } = &value.producer
+        {
+            if !nonblank_component(node) || *outer_attempt == 0 {
+                return Err(D::Error::custom(
+                    "schema 9 test-result artifact row has malformed node or outer_attempt",
+                ));
+            }
+        }
+        Ok(Self {
+            run_id: value.run_id,
+            hermit_sha: value.hermit_sha,
+            path: value.path,
+            producer: value.producer,
+            id: value.id,
+            result: value.result,
+            attempts: value.attempts,
+        })
+    }
+}
+
+/// The existing two sources of structured test results remain distinct.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TestResultProducer {
+    Node { node: String, outer_attempt: u64 },
+    Compatibility,
+}
+
+/// Exact count-bearing population selected before outcomes are observed.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestResultsSelectedPopulation {
+    pub nodes: Vec<String>,
+    pub compatibility: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestResultTotals {
+    pub executed_tests: u64,
+    pub passed_tests: u64,
+    pub failed_tests: u64,
+    pub filtered_tests: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NodeTestResultSummary {
+    pub node: String,
+    pub outer_attempt: u64,
+    pub totals: TestResultTotals,
+    pub row_count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompatibilityTestResultSummary {
+    pub totals: TestResultTotals,
+    pub row_count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestResultsArtifact {
+    /// Parent-root-relative producer path. Receipt publication replaces this
+    /// local location with an immutable receipt-repository artifact binding.
+    pub path: String,
+    pub sha256: String,
+    pub row_count: u64,
+}
+
+/// Schema-9 reader contract. This PR deliberately has no writer.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestResultsEvidenceV9 {
+    pub path: ValidatePath,
+    pub run_id: String,
+    pub hermit_sha: String,
+    pub source_tree_dirty: bool,
+    pub selected_count: u64,
+    pub recorded_count: u64,
+    pub population_sha256: String,
+    pub selected: TestResultsSelectedPopulation,
+    pub nodes: Vec<NodeTestResultSummary>,
+    pub compatibility: Option<CompatibilityTestResultSummary>,
+    pub totals: TestResultTotals,
+    pub artifact: TestResultsArtifact,
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn nonblank_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && value != "."
+        && value != ".."
+        && !value.contains('/')
+        && !value.contains('\\')
+}
+
+fn checked_summary(summary: &TestResultTotals, row_count: u64) -> Result<(), String> {
+    if summary
+        .passed_tests
+        .checked_add(summary.failed_tests)
+        .ok_or_else(|| "test-results pass/fail total overflowed u64".to_string())?
+        != summary.executed_tests
+    {
+        return Err("test-results pass/fail total differs from executed_tests".into());
+    }
+    if row_count != summary.executed_tests {
+        return Err("test-results row_count differs from executed_tests".into());
+    }
+    Ok(())
+}
+
+impl TestResultsEvidenceV9 {
+    fn validate_for_row(&self, row: &HistoryRow) -> Result<(), String> {
+        if row.profile.as_deref() != Some(self.path.as_str()) {
+            return Err("schema 9 test_results path differs from row profile".into());
+        }
+        if !nonblank_component(&self.run_id) || row.run_id.as_deref() != Some(self.run_id.as_str())
+        {
+            return Err("schema 9 test_results run_id differs from row run_id".into());
+        }
+        if !is_lower_hex(&self.hermit_sha, 40)
+            || row.commit.as_deref() != Some(self.hermit_sha.as_str())
+        {
+            return Err("schema 9 test_results hermit_sha differs from row commit".into());
+        }
+        if self.source_tree_dirty || row.tree_dirty != Some(false) {
+            return Err("schema 9 test_results source is not the exact clean row tree".into());
+        }
+        if !self
+            .selected
+            .nodes
+            .iter()
+            .all(|node| nonblank_component(node))
+            || !self.selected.nodes.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return Err(
+                "schema 9 test_results selected nodes are empty, untrimmed, duplicate, or unsorted"
+                    .into(),
+            );
+        }
+        let selected_count = u64::try_from(self.selected.nodes.len())
+            .map_err(|_| "schema 9 selected node count does not fit u64")?
+            .checked_add(u64::from(self.selected.compatibility))
+            .ok_or("schema 9 selected producer count overflowed u64")?;
+        if self.selected_count != selected_count {
+            return Err("schema 9 test_results selected_count mismatch".into());
+        }
+        let selected_nodes = self
+            .selected
+            .nodes
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let summary_nodes = self
+            .nodes
+            .iter()
+            .map(|summary| summary.node.as_str())
+            .collect::<BTreeSet<_>>();
+        if self.nodes.len() != summary_nodes.len()
+            || !self
+                .nodes
+                .windows(2)
+                .all(|pair| pair[0].node < pair[1].node)
+            || selected_nodes != summary_nodes
+        {
+            return Err("schema 9 test_results node summaries differ from selected nodes".into());
+        }
+        if self.selected.compatibility != self.compatibility.is_some() {
+            return Err(
+                "schema 9 test_results compatibility summary differs from selection".into(),
+            );
+        }
+
+        let mut totals = TestResultTotals {
+            executed_tests: 0,
+            passed_tests: 0,
+            failed_tests: 0,
+            filtered_tests: 0,
+        };
+        let mut recorded_count = 0u64;
+        let mut add = |summary: &TestResultTotals, row_count: u64| -> Result<(), String> {
+            checked_summary(summary, row_count)?;
+            totals.executed_tests = totals
+                .executed_tests
+                .checked_add(summary.executed_tests)
+                .ok_or("schema 9 executed_tests overflowed u64")?;
+            totals.passed_tests = totals
+                .passed_tests
+                .checked_add(summary.passed_tests)
+                .ok_or("schema 9 passed_tests overflowed u64")?;
+            totals.failed_tests = totals
+                .failed_tests
+                .checked_add(summary.failed_tests)
+                .ok_or("schema 9 failed_tests overflowed u64")?;
+            totals.filtered_tests = totals
+                .filtered_tests
+                .checked_add(summary.filtered_tests)
+                .ok_or("schema 9 filtered_tests overflowed u64")?;
+            recorded_count = recorded_count
+                .checked_add(row_count)
+                .ok_or("schema 9 recorded_count overflowed u64")?;
+            Ok(())
+        };
+        for summary in &self.nodes {
+            if summary.outer_attempt == 0 {
+                return Err(format!(
+                    "schema 9 test_results node {} has zero outer_attempt",
+                    summary.node
+                ));
+            }
+            add(&summary.totals, summary.row_count)?;
+        }
+        if let Some(summary) = &self.compatibility {
+            add(&summary.totals, summary.row_count)?;
+        }
+        if totals != self.totals
+            || self.recorded_count != recorded_count
+            || self.artifact.row_count != recorded_count
+        {
+            return Err("schema 9 test_results checked totals or row counts mismatch".into());
+        }
+        let executed = i64::try_from(totals.executed_tests)
+            .map_err(|_| "schema 9 executed_tests does not fit ledger i64")?;
+        let passed = i64::try_from(totals.passed_tests)
+            .map_err(|_| "schema 9 passed_tests does not fit ledger i64")?;
+        let filtered = i64::try_from(totals.filtered_tests)
+            .map_err(|_| "schema 9 filtered_tests does not fit ledger i64")?;
+        if row.executed_tests != Some(executed)
+            || row.passed_tests != Some(passed)
+            || row.filtered_tests != Some(filtered)
+        {
+            return Err("schema 9 test_results totals differ from HistoryRow totals".into());
+        }
+
+        let population_bytes = serde_json::to_vec(&self.selected)
+            .map_err(|error| format!("cannot encode schema 9 selected population: {error}"))?;
+        let population_sha256 = format!("{:x}", Sha256::digest(population_bytes));
+        if !is_lower_hex(&self.population_sha256, 64) || self.population_sha256 != population_sha256
+        {
+            return Err("schema 9 test_results population_sha256 mismatch".into());
+        }
+        let expected_path = format!(
+            "ignored/validate/artifacts/{}/test-results.jsonl",
+            self.run_id
+        );
+        if self.artifact.path != expected_path || !is_lower_hex(&self.artifact.sha256, 64) {
+            return Err("schema 9 test_results artifact binding is malformed".into());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sha2::Digest;
@@ -1152,8 +1509,18 @@ mod tests {
         let wrong_outer_version: HistoryRow = serde_json::from_value(wrong_outer_version).unwrap();
         assert!(wrong_outer_version.cell_results_evidence().is_none());
 
+        let mut schema9_outer_version = serde_json::to_value(&row).unwrap();
+        schema9_outer_version["schema_version"] = serde_json::json!(9);
+        let schema9_outer_version: HistoryRow =
+            serde_json::from_value(schema9_outer_version).unwrap();
+        assert_eq!(
+            schema9_outer_version.cell_results_validate_path(),
+            Some(ValidatePath::Quick)
+        );
+        assert!(schema9_outer_version.cell_results_evidence().is_some());
+
         let mut future_outer_version = serde_json::to_value(&row).unwrap();
-        future_outer_version["schema_version"] = serde_json::json!(9);
+        future_outer_version["schema_version"] = serde_json::json!(10);
         let future_outer_version: HistoryRow =
             serde_json::from_value(future_outer_version).unwrap();
         assert!(future_outer_version.cell_results_evidence().is_none());
@@ -1247,5 +1614,286 @@ mod tests {
 
         json["cells"][0]["cell_verdict"]["comparison"]["display_name"] = serde_json::Value::Null;
         assert!(serde_json::from_value::<CellResultsEvidenceV8>(json).is_ok());
+    }
+
+    fn schema9_row() -> Value {
+        let selected = TestResultsSelectedPopulation {
+            nodes: vec!["test.alpha".into(), "test.beta".into()],
+            compatibility: true,
+        };
+        let population_sha256 = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&selected).unwrap())
+        );
+        serde_json::json!({
+            "schema_version": 9,
+            "run_id": "run-9",
+            "profile": "full",
+            "commit": "a".repeat(40),
+            "tree_dirty": false,
+            "executed_tests": 4,
+            "passed_tests": 3,
+            "filtered_tests": 7,
+            "test_results": {
+                "path": "full",
+                "run_id": "run-9",
+                "hermit_sha": "a".repeat(40),
+                "source_tree_dirty": false,
+                "selected_count": 3,
+                "recorded_count": 4,
+                "population_sha256": population_sha256,
+                "selected": {
+                    "nodes": ["test.alpha", "test.beta"],
+                    "compatibility": true
+                },
+                "nodes": [{
+                    "node": "test.alpha",
+                    "outer_attempt": 2,
+                    "totals": {
+                        "executed_tests": 2,
+                        "passed_tests": 1,
+                        "failed_tests": 1,
+                        "filtered_tests": 3
+                    },
+                    "row_count": 2
+                }, {
+                    "node": "test.beta",
+                    "outer_attempt": 1,
+                    "totals": {
+                        "executed_tests": 1,
+                        "passed_tests": 1,
+                        "failed_tests": 0,
+                        "filtered_tests": 4
+                    },
+                    "row_count": 1
+                }],
+                "compatibility": {
+                    "totals": {
+                        "executed_tests": 1,
+                        "passed_tests": 1,
+                        "failed_tests": 0,
+                        "filtered_tests": 0
+                    },
+                    "row_count": 1
+                },
+                "totals": {
+                    "executed_tests": 4,
+                    "passed_tests": 3,
+                    "failed_tests": 1,
+                    "filtered_tests": 7
+                },
+                "artifact": {
+                    "path": "ignored/validate/artifacts/run-9/test-results.jsonl",
+                    "sha256": "b".repeat(64),
+                    "row_count": 4
+                }
+            }
+        })
+    }
+
+    fn assert_schema9_refused(value: Value, expected: &str) {
+        let row: HistoryRow = serde_json::from_value(value).unwrap();
+        let error = row
+            .test_results_evidence()
+            .expect_err("mutated schema 9 evidence must refuse");
+        assert!(
+            error.contains(expected),
+            "schema 9 refusal {error:?} did not name {expected:?}"
+        );
+    }
+
+    #[test]
+    fn schema9_test_results_accept_exact_identity_population_path_and_totals() {
+        let value = schema9_row();
+        let row: HistoryRow = serde_json::from_value(value.clone()).unwrap();
+        let evidence = row
+            .test_results_evidence()
+            .unwrap()
+            .expect("schema 9 should expose typed evidence");
+        assert_eq!(evidence.path, ValidatePath::Full);
+        assert_eq!(evidence.selected_count, 3);
+        assert_eq!(evidence.recorded_count, 4);
+        assert_eq!(evidence.totals.executed_tests, 4);
+        assert_eq!(evidence.totals.passed_tests, 3);
+        assert_eq!(
+            serde_json::to_value(&row).unwrap()["test_results"],
+            value["test_results"]
+        );
+    }
+
+    #[test]
+    fn schema9_test_results_authority_is_version_first_and_old_bytes_omit_the_new_field() {
+        for schema in [6, 7, 8] {
+            let row: HistoryRow = serde_json::from_value(serde_json::json!({
+                "schema_version": schema,
+                "commit": "a".repeat(40)
+            }))
+            .unwrap();
+            let bytes = serde_json::to_vec(&row).unwrap();
+            assert!(
+                !bytes
+                    .windows(b"test_results".len())
+                    .any(|window| window == b"test_results")
+            );
+            assert!(row.test_results_evidence().unwrap().is_none());
+        }
+
+        let mut older = schema9_row();
+        older["schema_version"] = serde_json::json!(8);
+        let older: HistoryRow = serde_json::from_value(older.clone()).unwrap();
+        assert!(older.test_results_evidence().unwrap().is_none());
+        assert!(serde_json::to_value(older).unwrap()["test_results"].is_object());
+
+        let mut future = schema9_row();
+        future["schema_version"] = serde_json::json!(10);
+        future["test_results"]["future_field"] = serde_json::json!(true);
+        let expected_test_results = future["test_results"].clone();
+        let future: HistoryRow = serde_json::from_value(future).unwrap();
+        assert!(future.test_results_evidence().unwrap().is_none());
+        assert_eq!(
+            serde_json::to_value(future).unwrap()["test_results"],
+            expected_test_results
+        );
+
+        let mut missing = schema9_row();
+        missing.as_object_mut().unwrap().remove("test_results");
+        assert_schema9_refused(missing, "omitted test_results");
+    }
+
+    #[test]
+    fn schema9_test_results_refuse_identity_population_and_path_mutations() {
+        let mut wrong_path = schema9_row();
+        wrong_path["test_results"]["path"] = serde_json::json!("quick");
+        assert_schema9_refused(wrong_path, "path differs");
+
+        let mut wrong_run = schema9_row();
+        wrong_run["test_results"]["run_id"] = serde_json::json!("other-run");
+        assert_schema9_refused(wrong_run, "run_id differs");
+
+        let mut wrong_sha = schema9_row();
+        wrong_sha["test_results"]["hermit_sha"] = serde_json::json!("c".repeat(40));
+        assert_schema9_refused(wrong_sha, "hermit_sha differs");
+
+        let mut dirty = schema9_row();
+        dirty["test_results"]["source_tree_dirty"] = serde_json::json!(true);
+        assert_schema9_refused(dirty, "exact clean row tree");
+
+        let mut selected_count = schema9_row();
+        selected_count["test_results"]["selected_count"] = serde_json::json!(2);
+        assert_schema9_refused(selected_count, "selected_count mismatch");
+
+        let mut unsorted = schema9_row();
+        unsorted["test_results"]["selected"]["nodes"] =
+            serde_json::json!(["test.beta", "test.alpha"]);
+        assert_schema9_refused(unsorted, "duplicate, or unsorted");
+
+        let mut missing_summary = schema9_row();
+        missing_summary["test_results"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert_schema9_refused(missing_summary, "summaries differ");
+
+        let mut compatibility = schema9_row();
+        compatibility["test_results"]["selected"]["compatibility"] = serde_json::json!(false);
+        compatibility["test_results"]["selected_count"] = serde_json::json!(2);
+        assert_schema9_refused(compatibility, "compatibility summary differs");
+
+        let mut population = schema9_row();
+        population["test_results"]["population_sha256"] = serde_json::json!("d".repeat(64));
+        assert_schema9_refused(population, "population_sha256 mismatch");
+
+        let mut traversal = schema9_row();
+        traversal["test_results"]["artifact"]["path"] =
+            serde_json::json!("ignored/validate/artifacts/../test-results.jsonl");
+        assert_schema9_refused(traversal, "artifact binding is malformed");
+
+        let mut digest = schema9_row();
+        digest["test_results"]["artifact"]["sha256"] = serde_json::json!("NOT-A-DIGEST");
+        assert_schema9_refused(digest, "artifact binding is malformed");
+    }
+
+    #[test]
+    fn schema9_test_results_refuse_attempt_count_and_total_mutations() {
+        let mut attempt = schema9_row();
+        attempt["test_results"]["nodes"][0]["outer_attempt"] = serde_json::json!(0);
+        assert_schema9_refused(attempt, "zero outer_attempt");
+
+        let mut summary = schema9_row();
+        summary["test_results"]["nodes"][0]["totals"]["passed_tests"] = serde_json::json!(2);
+        assert_schema9_refused(summary, "pass/fail total differs");
+
+        let mut row_count = schema9_row();
+        row_count["test_results"]["nodes"][0]["row_count"] = serde_json::json!(3);
+        assert_schema9_refused(row_count, "row_count differs");
+
+        let mut aggregate = schema9_row();
+        aggregate["test_results"]["totals"]["filtered_tests"] = serde_json::json!(8);
+        assert_schema9_refused(aggregate, "checked totals");
+
+        let mut recorded = schema9_row();
+        recorded["test_results"]["recorded_count"] = serde_json::json!(5);
+        assert_schema9_refused(recorded, "checked totals");
+
+        let mut artifact_count = schema9_row();
+        artifact_count["test_results"]["artifact"]["row_count"] = serde_json::json!(5);
+        assert_schema9_refused(artifact_count, "checked totals");
+
+        let mut row_total = schema9_row();
+        row_total["passed_tests"] = serde_json::json!(4);
+        assert_schema9_refused(row_total, "HistoryRow totals");
+
+        let mut overflow = schema9_row();
+        overflow["test_results"]["nodes"][0]["totals"] = serde_json::json!({
+            "executed_tests": u64::MAX,
+            "passed_tests": u64::MAX,
+            "failed_tests": 0,
+            "filtered_tests": 3
+        });
+        overflow["test_results"]["nodes"][0]["row_count"] = serde_json::json!(u64::MAX);
+        assert_schema9_refused(overflow, "executed_tests overflowed");
+    }
+
+    #[test]
+    fn schema9_exact_shapes_refuse_missing_unknown_and_invalid_artifact_rows() {
+        let mut unknown = schema9_row();
+        unknown["test_results"]["unknown"] = serde_json::json!(true);
+        assert_schema9_refused(unknown, "unknown field");
+
+        let mut missing = schema9_row();
+        missing["test_results"]
+            .as_object_mut()
+            .unwrap()
+            .remove("totals");
+        assert_schema9_refused(missing, "missing field");
+
+        let row = serde_json::json!({
+            "run_id": "run-9",
+            "hermit_sha": "a".repeat(40),
+            "path": "full",
+            "producer": {
+                "source": "node",
+                "node": "test.alpha",
+                "outer_attempt": 2
+            },
+            "id": "suite$case",
+            "result": "pass",
+            "attempts": 1
+        });
+        assert!(serde_json::from_value::<TestResultArtifactRow>(row.clone()).is_ok());
+        for (field, value) in [
+            ("attempts", serde_json::json!(0)),
+            ("id", serde_json::json!("")),
+        ] {
+            let mut invalid = row.clone();
+            invalid[field] = value;
+            assert!(serde_json::from_value::<TestResultArtifactRow>(invalid).is_err());
+        }
+        let mut zero_outer = row.clone();
+        zero_outer["producer"]["outer_attempt"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<TestResultArtifactRow>(zero_outer).is_err());
+        let mut extra = row;
+        extra["extra"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<TestResultArtifactRow>(extra).is_err());
     }
 }
