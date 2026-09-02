@@ -25,7 +25,7 @@
 //! therefore only waste time, never hide a regression.
 //!
 //! The node universe, node dependencies, and node commands are read from
-//! `ci/dag/portable.json` (single source of truth); the path→node relation is
+//! `ci/dag/validate.json` (single source of truth); the path→node relation is
 //! read from `ci/test-footprints.json`.
 //!
 //! Usage:
@@ -210,6 +210,8 @@ struct Dag {
     deps: BTreeMap<String, Vec<String>>,
 }
 
+const STRICT_COMPAT_SELECTION_ALIAS: &str = "test.strict_compat";
+
 impl Dag {
     fn load(path: &Path) -> Dag {
         let raw = std::fs::read_to_string(path)
@@ -219,6 +221,9 @@ impl Dag {
         let mut all_nodes = BTreeSet::new();
         let mut deps = BTreeMap::new();
         for s in v["steps"].as_array().unwrap_or(&vec![]) {
+            if !str_vec(&s["labels"]).iter().any(|label| label == "portable") {
+                continue;
+            }
             let tag = format!(
                 "{}.{}",
                 s["group"].as_str().unwrap_or(""),
@@ -244,6 +249,20 @@ impl Dag {
             }
         }
         out
+    }
+
+    /// Resolve the stable strict-compat selection alias to the committed cells.
+    /// The alias remains useful in footprint policy and shard assignment, but it
+    /// is not an executable node in the committed DAG.
+    fn expand_selection_aliases(&self, nodes: &mut BTreeSet<String>) {
+        if nodes.remove(STRICT_COMPAT_SELECTION_ALIAS) {
+            nodes.extend(
+                self.all_nodes
+                    .iter()
+                    .filter(|node| node.starts_with("compat."))
+                    .cloned(),
+            );
+        }
     }
 }
 
@@ -451,6 +470,8 @@ fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
         return full(dag.all_nodes.clone(), reasons);
     }
 
+    dag.expand_selection_aliases(&mut matched);
+
     // Selective: add preflight, then close over build deps.
     for pf in PREFLIGHT {
         if dag.all_nodes.contains(*pf) {
@@ -462,7 +483,7 @@ fn select(fp: &Footprints, dag: &Dag, files: &[String]) -> Selection {
         matched.iter().filter(|n| !dag.all_nodes.contains(*n)).cloned().collect();
     if !unknown_nodes.is_empty() {
         reasons.push(format!(
-            "footprint referenced {} node(s) absent from portable.json ({}) → full suite (stale map)",
+            "footprint referenced {} node(s) absent from validate.json ({}) → full suite (stale map)",
             unknown_nodes.len(),
             unknown_nodes.join(", ")
         ));
@@ -748,7 +769,7 @@ fn main() {
 
     let root = repo_root();
     let fp = Footprints::load(&root.join("ci/test-footprints.json"));
-    let dag = Dag::load(&root.join("ci/dag/portable.json"));
+    let dag = Dag::load(&root.join("ci/dag/validate.json"));
     let shards = Shards::load(&root.join("ci/portable-shards.json"));
     let plan = Plan::load(&root.join("ci/expected-e2e-plan.json"));
 
@@ -994,7 +1015,7 @@ fn self_test() {
     // --- selection scenarios ---
     let root = repo_root();
     let fp = Footprints::load(&root.join("ci/test-footprints.json"));
-    let dag = Dag::load(&root.join("ci/dag/portable.json"));
+    let dag = Dag::load(&root.join("ci/dag/validate.json"));
     let shards = Shards::load(&root.join("ci/portable-shards.json"));
     let plan = Plan::load(&root.join("ci/expected-e2e-plan.json"));
 
@@ -1007,7 +1028,7 @@ fn self_test() {
     let toolchain = select(&fp, &dag, &["rust-toolchain.toml".into()]);
     check("toolchain ⇒ full", toolchain.decision == Decision::Full);
 
-    let ci = select(&fp, &dag, &["ci/dag/portable.json".into()]);
+    let ci = select(&fp, &dag, &["ci/dag/validate.json".into()]);
     check("ci/** ⇒ full", ci.decision == Decision::Full);
 
     let skill = select(&fp, &dag, &[".claude/skills/benchmark/SKILL.md".into()]);
@@ -1026,14 +1047,21 @@ fn self_test() {
     check("dbt-only runs dbt_parity", dbt.nodes.contains("test.dbt_parity"));
     check("dbt-only pulls build.runtime_release", dbt.nodes.contains("build.runtime_release"));
     check("dbt-only pulls build.workspace (dep)", dbt.nodes.contains("build.workspace"));
-    check("dbt-only skips strict_compat", !dbt.nodes.contains("test.strict_compat"));
+    check(
+        "dbt-only skips strict compat cells",
+        !dbt.nodes.iter().any(|node| node.starts_with("compat.")),
+    );
     check("dbt-only skips language_runtimes", !dbt.nodes.contains("e2e.manifest_language_runtimes"));
     check("dbt-only is a strict subset", dbt.nodes.len() < dag.all_nodes.len());
     check("dbt-only includes preflight", dbt.nodes.contains("lint.rustfmt"));
 
     let core = select(&fp, &dag, &["detcore/src/scheduler.rs".into()]);
     check("detcore core ⇒ selective", core.decision == Decision::Selective);
-    check("detcore core runs strict_compat", core.nodes.contains("test.strict_compat"));
+    check(
+        "detcore core expands the strict compat alias",
+        core.nodes.iter().any(|node| node.starts_with("compat."))
+            && !core.nodes.contains(STRICT_COMPAT_SELECTION_ALIAS),
+    );
     check("detcore core runs detcore_unit", core.nodes.contains("test.detcore_unit"));
 
     let unknown = select(&fp, &dag, &["some/brand/new/area/file.py".into()]);

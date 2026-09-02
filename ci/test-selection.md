@@ -10,7 +10,7 @@ and provably CI-irrelevant changes skip CI entirely.
 | `ci/select-tests.rs` | Given a change, which portable-DAG nodes can it affect? |
 | `ci/power-to-weight.rs` | Which relatively heavy nodes are selected least often? |
 
-Both read `ci/dag/portable.json` as the single source of truth for the node
+Both read `ci/dag/validate.json` as the single source of truth for the node
 universe, node commands, and build dependencies. `select-tests.rs` adds one
 thing the DAG does not encode: the **source-path → node** relation. The checked-in
 `ci/test-footprints.json` is generated from the real Cargo workspace graph, the
@@ -34,7 +34,7 @@ staging, or standalone scripts, so those semantic edges remain explicit in
 `ci/test-footprints-policy.json`.
 
 `target/debug/test-harness validate` runs the generator in `--check` mode and fails the
-`e2e.metadata` gate if the committed artifact differs byte-for-byte. A focused
+`gate.manifest` gate if the committed artifact differs byte-for-byte. A focused
 check is also available:
 
 ```bash

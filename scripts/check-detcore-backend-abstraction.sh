@@ -276,7 +276,8 @@ fi
 #
 # This node's cost is one self-invocation per negative control, and the control
 # list comes from BACKEND_CRATES, which is DERIVED from the workspace's Reverie
-# crates. The DAG declares a single constant wall timeout. On 2026-08-25 that
+# crates. The DAG declares a single constant CPU timeout. On 2026-08-25 the
+# corresponding wall timeout
 # constant was 120s and the node was killed at 120.030s with every assertion
 # passing -- not a correctness failure, a budget that had silently been outgrown.
 #
@@ -287,9 +288,9 @@ fi
 # cross the ceiling silently: it either still fits, or this fails in under a
 # second saying exactly which number to change and why.
 #
-# The runner's schema takes a literal integer for `timeout`, and agent-utils is
+# The runner's schema takes a literal integer for `cpu_timeout`, and agent-utils is
 # a separately pinned, main-only repository, so the declared value stays a
-# reviewable constant in ci/dag/portable.json. What is DERIVED is the
+# reviewable constant in ci/dag/validate.json. What is DERIVED is the
 # requirement that constant must satisfy.
 #
 # Per-unit costs are measured, not guessed (2026-08-25, this checkout):
@@ -302,7 +303,7 @@ BASE_BUDGET_S=30
 PER_CONTROL_BUDGET_S=3
 
 check_declared_budget() {
-    local dag="$REPO_ROOT/ci/dag/portable.json"
+    local dag="$REPO_ROOT/ci/dag/validate.json"
     # Only meaningful in a real checkout. Negative controls run against scratch
     # copies that contain detcore alone and execute no controls of their own.
     [[ -f $dag ]] || return 0
@@ -318,7 +319,7 @@ with open(sys.argv[1], encoding="utf-8") as handle:
     graph = json.load(handle)
 for step in graph.get("steps", []):
     if step.get("group") == "check" and step.get("job") == "backend_abstraction":
-        print(int(step.get("timeout", 0)))
+        print(int(step.get("cpu_timeout", 0)))
         break
 else:
     print(0)
@@ -326,20 +327,20 @@ PYBUDGET
 )" || return 1
 
     if ((declared <= 0)); then
-        err "check.backend_abstraction declares no wall timeout in ci/dag/portable.json"
+        err "check.backend_abstraction declares no CPU timeout in ci/dag/validate.json"
         return 1
     fi
     if ((declared < required)); then
         err "check.backend_abstraction is BUDGETED FOR LESS WORK THAN IT DERIVES."
         err "  the workspace derives $control_count negative control(s)"
         err "  requiring ${required}s = ${BASE_BUDGET_S}s base + ${control_count} x ${PER_CONTROL_BUDGET_S}s"
-        err "  but ci/dag/portable.json declares only ${declared}s"
+        err "  but ci/dag/validate.json declares only ${declared}s"
         err "  THIS IS NOT A TIMEOUT AND NOTHING RAN LONG. It is the declared"
         err "  budget failing to cover work the workspace now derives."
-        err "  Raise check.backend_abstraction \"timeout\" to at least ${required}, with evidence."
+        err "  Raise check.backend_abstraction \"cpu_timeout\" to at least ${required}, with evidence."
         return 1
     fi
-    info "budget: ${declared}s declared covers $control_count derived control(s) needing ~${required}s"
+    info "CPU budget: ${declared}s declared covers $control_count derived control(s) needing ~${required}s"
     return 0
 }
 

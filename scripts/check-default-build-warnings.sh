@@ -16,7 +16,7 @@
 # enabled -- the break only appears in the DEFAULT configuration.
 #
 # The command below is deliberately IDENTICAL to the `lint.clippy` node in
-# `ci/dag/portable.json`, minus that node's `CARGO_BUILD_JOBS=8` memory pin,
+# `ci/dag/validate.json`, minus that node's `CARGO_BUILD_JOBS=8` memory pin,
 # which exists for CI's cgroup cap and only makes a developer wait longer. Do not
 # substitute a narrower command: a gate that lints something other than what CI
 # lints can go green while CI goes red, which is the failure this closes.

@@ -287,11 +287,12 @@ target/debug/test-harness run --lane portable --category system-utils --ci-only 
 target/debug/test-harness run --mode naked --test system-utils/random-device
 ```
 
-Both GitHub workflows and `scripts/validate.rs` execute the same portable and
-privileged DAG files. Each DAG has a manifest guest-build barrier followed by
-one structured selector per bucket. `audit-ci` fails if either caller stops
-delegating to the shared plans, a bucket node disappears, a command diverges
-from its selector, or the aggregate selected cells differ from the ratchet.
+Both GitHub workflows and `scripts/validate.rs` select labels from the same
+committed `ci/dag/validate.json`. Each selected graph has a manifest guest-build
+barrier followed by one structured selector per bucket. `audit-ci` fails if a
+caller stops delegating to the committed plan, a bucket node disappears, a
+command diverges from its selector, or the aggregate selected cells differ from
+the ratchet.
 
 ## Adding a test
 

@@ -108,7 +108,7 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # reproduce every lint failure locally before pushing. Cheap checks run first for
 # fast feedback; the compile-heavy clippy pass and the networked Reverie-pin
 # ancestry/monotonicity policy run last. The exact clippy/rustfmt invocations match
-# ci/dag/portable.json (lint.clippy / lint.rustfmt).
+# ci/dag/validate.json (lint.clippy / lint.rustfmt).
 #
 # shellcheck runs at --severity=error: an enforceable floor that is clean on
 # current main (0/122 tracked scripts fail at error level) while 24 still carry
@@ -117,7 +117,7 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # SPLIT INTO TWO PREREQUISITES so that CI can schedule the checkers as one node.
 # `make lint` is unchanged for humans. The split exists because a single DAG node
 # running the whole target would re-run `cargo clippy` -- a measured 300s in
-# ci/dag/portable.json's lint.clippy hint -- a second time per validate, and would
+# ci/dag/validate.json's lint.clippy hint -- a second time per validate, and would
 # run it OUTSIDE ci/run-with-reverie-dbt-budget.sh, which that node wraps it in.
 # So lint-cargo holds exactly the two steps that already have byte-identical DAG
 # nodes (lint.rustfmt, lint.clippy) and stays unscheduled here; lint-checks holds

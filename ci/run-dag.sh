@@ -10,13 +10,13 @@
 # This entrypoint is the shared local/GitHub execution path for the centralized
 # portable and privileged CI plans. Each gate is an independently boxed node
 # with explicit dependencies and resource limits (see ci/dag/README.md).
-# Portable execution asks scripts/validate.rs for the constructed DAG so its
-# corpus-derived strict-compatibility expansion is shared by local, hosted, and
-# validate callers; privileged currently needs no generated expansion.
+# Every standard profile selects a labelled subset of the same committed DAG.
+# No profile rewrites commands, dependencies, or resource policy at launch.
 #
 # Usage:
-#   ci/run-dag.sh <lane> [runner-args...]
-#     <lane>            portable | privileged  (selects ci/dag/<lane>.json)
+#   ci/run-dag.sh <label> [runner-args...]
+#     <label>           quick | portable | full | super | privileged
+#                       (selects labelled steps from ci/dag/validate.json)
 #     runner-args       forwarded verbatim to `dagrun run`
 #                       (e.g. -j 8, --max-mem 32G, --perf-dir ./perf,
 #                        -k/--keep-going, -v, -q)
@@ -24,11 +24,11 @@
 # Examples:
 #   ci/run-dag.sh portable --max-mem 32G
 #   ci/run-dag.sh privileged -j 1 --perf-dir ./perf
-#   ci/run-dag.sh portable ascii   # any non-`run` verb also works
+#   agent-utils/py/bin/dagrun ascii --dag ci/dag/validate.json  # inspect the superset
 #
 # Environment:
 #   DAGRUN_BIN     override the runner executable to use.
-#   RUN_DAG_FILE_OVERRIDE  run this exact DAG file instead of ci/dag/<lane>.json.
+#   RUN_DAG_FILE_OVERRIDE  run this exact DAG file instead of ci/dag/validate.json.
 #                          Used by scripts/validate.rs --selective to feed a subset DAG
 #                          (a dependency-closed slice of the lane) while keeping
 #                          the lane argument for runner labeling. The override
@@ -43,7 +43,7 @@ cd "$ROOT_DIR" || exit 2
 source "$ROOT_DIR/ci/configure-build-jobs.sh" launcher || exit $?
 
 if (($# < 1)); then
-    echo "usage: ci/run-dag.sh <portable|privileged> [runner-args...]" >&2
+    echo "usage: ci/run-dag.sh <quick|portable|full|super|privileged> [runner-args...]" >&2
     exit 2
 fi
 
@@ -58,28 +58,10 @@ if [[ -n ${RUN_DAG_FILE_OVERRIDE:-} ]]; then
     fi
     echo "run-dag.sh: using DAG override for lane '$lane': $dag" >&2
 else
-    dag="$ROOT_DIR/ci/dag/${lane}.json"
-    if [[ ! -f $dag ]]; then
-        echo "run-dag.sh: unknown lane '$lane' (no such file: $dag)" >&2
-        echo "            known lanes: portable, privileged" >&2
-        exit 2
-    fi
-fi
-
-# Portable strict compatibility is generated from the canonical corpus during
-# validate plan construction. Raw portable execution must consume that same
-# constructed graph: executing portable.json directly would reach the
-# fail-closed test.strict_compat marker instead of the 189 compat.* steps.
-# This exports data only; the single dagrun invocation below remains the only
-# scheduler.
-generated_dir=
-if [[ -z ${RUN_DAG_FILE_OVERRIDE:-} && $lane == portable ]]; then
-    mkdir -p "$ROOT_DIR/target/validation" || exit 2
-    generated_dir=$(mktemp -d "$ROOT_DIR/target/validation/run-dag.XXXXXX") || exit 2
-    trap 'rm -rf -- "$generated_dir"' EXIT
-    dag="$generated_dir/portable.json"
-    if ! ./scripts/validate.rs portable-only --write-constructed-dag "$dag" >/dev/null; then
-        echo "run-dag.sh: validate could not construct the portable DAG" >&2
+    dag="$ROOT_DIR/ci/dag/validate.json"
+    if [[ ! $lane =~ ^(quick|portable|full|super|privileged)$ ]]; then
+        echo "run-dag.sh: unknown validation label '$lane'" >&2
+        echo "            known labels: quick, portable, full, super, privileged" >&2
         exit 2
     fi
 fi
@@ -137,6 +119,12 @@ if (($# > 0)) && [[ $1 == list || $1 == ascii || $1 == dot || $1 == json ]]; the
     shift
 fi
 
+if [[ $verb != run && -z ${RUN_DAG_FILE_OVERRIDE:-} ]]; then
+    echo "run-dag.sh: '$verb' cannot represent the '$lane' label selection." >&2
+    echo "            Inspect the committed superset directly: $runner $verb --dag $dag" >&2
+    exit 2
+fi
+
 echo "run-dag.sh: lane=$lane runner=$runner verb=$verb cargo-jobs=$CARGO_BUILD_JOBS reverie-dbt-budget=portable-build-child-only" >&2
 if [[ $verb == run ]]; then
     export HERMIT_REAL_RUST_SCRIPT
@@ -148,8 +136,9 @@ if [[ $verb == run ]]; then
     export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1
     export PATH="$ROOT_DIR/ci/rust-script-bin:$PATH"
 fi
-if [[ -n $generated_dir ]]; then
-    "$runner" "$verb" --dag "$dag" "$@"
-    exit $?
+if [[ $verb == run && -z ${RUN_DAG_FILE_OVERRIDE:-} ]]; then
+    export VALIDATE_RUN_STATE=${VALIDATE_RUN_STATE:-"$ROOT_DIR/target/validation/run-dag-${lane}-$$"}
+    mkdir -p "$VALIDATE_RUN_STATE" || exit 2
+    exec "$runner" "$verb" --dag "$dag" --labels "$lane" "$@"
 fi
 exec "$runner" "$verb" --dag "$dag" "$@"

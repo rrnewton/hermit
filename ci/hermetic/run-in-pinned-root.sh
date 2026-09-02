@@ -79,9 +79,15 @@ if ! podman image exists "$digest"; then
     exit 1
 fi
 
-mkdir -p "$out/target" "$out/home"
+mkdir -p "$out/target/ci" "$out/home"
 
 cargo_mount=(); cargo_home_in=/build/.cargo
+rust_script_mount=()
+if [[ -d "$src/target/ci/rust-scripts" ]]; then
+    rust_script_mount=(
+        --mount "type=bind,source=$src/target/ci/rust-scripts,destination=/src/target/ci/rust-scripts,ro=true"
+    )
+fi
 git_mounts=()
 if [[ -f "$src/.git" ]]; then
     git_common_dir=$(git -C "$src" rev-parse --path-format=absolute --git-common-dir)
@@ -167,6 +173,7 @@ exec podman run --rm \
     --tmpfs /test:rw,nosuid,nodev,mode=1777 \
     --mount "type=bind,source=$src,destination=/src,$src_mode" \
     --mount "type=bind,source=$out/target,destination=/src/target" \
+    "${rust_script_mount[@]}" \
     --mount "type=bind,source=$out/home,destination=/build" \
     "${cargo_mount[@]}" \
     "${git_mounts[@]}" \

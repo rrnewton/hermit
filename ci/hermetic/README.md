@@ -140,7 +140,7 @@ Two things worth knowing before touching this:
   The stable `test.strict_compat` selection alias has group `test`, expands to
   direct `compat.*` nodes, and runs after its other test-node predecessors in a
   separate hosted job; `setup.manifest_plan`,
-  `setup.nextest`, `e2e.metadata` and `e2e.audit_compile_backend_parity_c` are
+  `setup.nextest`, `gate.manifest` and `e2e.audit_compile_backend_parity_c` are
   not group `build` but execute before the remaining test side. Partitioning on
   `group` therefore does not reproduce the hosted grouping.
 - **GitHub's split is for wall clock, not for network.** Its shard jobs have

@@ -32,6 +32,7 @@ use std::time::Instant;
 
 use fs2::FileExt;
 use hermit_manifest_plan::canonical_verdict;
+use hermit_manifest_plan::runner::CELL_WALL_CPU_BACKSTOP_FACTOR;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::ObservedResult;
 use hermit_manifest_plan::stress_series::HostCapability;
@@ -880,6 +881,21 @@ struct PressureInvocation {
     attempts: Vec<ObservedAttemptInvocation>,
 }
 
+fn is_prelaunch_timeout_disposition(
+    timed_out: bool,
+    status: Option<i64>,
+    signal: Option<i64>,
+    error_kind: Option<&str>,
+) -> bool {
+    timed_out
+        && status.is_none()
+        && signal.is_none()
+        && matches!(
+            error_kind,
+            Some("incomplete-verification-evidence" | "cpu-timeout" | "wall-timeout")
+        )
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ResultRow {
     schema: u64,
@@ -905,6 +921,10 @@ struct ResultRow {
     error_kind: Option<String>,
     #[serde(default)]
     timeout_seconds: u64,
+    #[serde(default)]
+    execution_cpu_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    execution_wall_timeout_seconds: Option<u64>,
     log_level: Option<String>,
     effective_args: Vec<String>,
     argv: Vec<String>,
@@ -961,6 +981,35 @@ fn default_attempt() -> u64 {
 }
 
 impl ResultRow {
+    fn validate_timeout_policy(&self) -> Result<(), String> {
+        match (
+            self.execution_cpu_timeout_seconds,
+            self.execution_wall_timeout_seconds,
+        ) {
+            (None, None) => Ok(()),
+            (Some(cpu), Some(wall))
+                if cpu == self.timeout_seconds
+                    && wall == cpu.saturating_mul(CELL_WALL_CPU_BACKSTOP_FACTOR) =>
+            {
+                Ok(())
+            }
+            (cpu, wall) => Err(format!(
+                "timeout policy disagrees: timeout_seconds={} execution_cpu_timeout_seconds={cpu:?} execution_wall_timeout_seconds={wall:?}",
+                self.timeout_seconds
+            )),
+        }
+    }
+
+    fn require_current_timeout_policy(&self) -> Result<(), String> {
+        self.validate_timeout_policy()?;
+        if self.execution_cpu_timeout_seconds.is_none()
+            || self.execution_wall_timeout_seconds.is_none()
+        {
+            return Err("current result omitted explicit execution timeout bounds".into());
+        }
+        Ok(())
+    }
+
     fn id(&self) -> Option<CellId> {
         let backend = match self.backend.as_deref() {
             Some(backend) => backend.to_string(),
@@ -1791,11 +1840,12 @@ impl ResultRow {
                             })?;
                         let disposition = matches!((status, signal), (Some(status), None) if status != 0)
                             || matches!((status, signal), (None, Some(_)));
-                        let no_process_timeout = timed_out
-                            && status.is_none()
-                            && signal.is_none()
-                            && attempt.get("error_kind").and_then(JsonValue::as_str)
-                                == Some("incomplete-verification-evidence");
+                        let no_process_timeout = is_prelaunch_timeout_disposition(
+                            timed_out,
+                            status,
+                            signal,
+                            attempt.get("error_kind").and_then(JsonValue::as_str),
+                        );
                         if attempt.get("outcome").and_then(JsonValue::as_str) != Some("ERROR")
                             || attempt
                                 .get("error_kind")
@@ -3488,13 +3538,14 @@ fn observation_tree_counts(tracked: &TrackedCells, head_tree: &str) -> (usize, u
         .cells
         .iter()
         .flat_map(|cell| cell.observations.iter())
-        .fold((0, 0), |(different, unknown), observation| {
-            match observation.detcore_tree.as_deref() {
+        .fold(
+            (0, 0),
+            |(different, unknown), observation| match observation.detcore_tree.as_deref() {
                 Some(tree) if tree != head_tree => (different + 1, unknown),
                 None => (different, unknown + 1),
                 _ => (different, unknown),
-            }
-        })
+            },
+        )
 }
 
 fn render_evidence_coverage(root: &Path) -> Result<String, String> {
@@ -4099,8 +4150,7 @@ fn apply_validate_results(
                 .then(left.evidence_identity.cmp(&right.evidence_identity))
         });
         let mut distinct = Vec::with_capacity(classified.len());
-        let mut identities_by_attempt =
-            BTreeMap::<(String, u64), (String, Option<String>)>::new();
+        let mut identities_by_attempt = BTreeMap::<(String, u64), (String, Option<String>)>::new();
         for (candidate, evidence) in classified {
             let key = (candidate.row.run_id.clone(), candidate.row.attempt);
             let classification_identity = (candidate.row.result.is_some()
@@ -5040,7 +5090,9 @@ fn validate_observation_identity_namespace(cells: &TrackedCells) -> Result<(), S
             }
             for event_id in &observation.event_ids {
                 if event_id.trim().is_empty() || !seen_event_ids.insert(event_id) {
-                    return Err(format!("invalid or repeated projected event_id {event_id:?}"));
+                    return Err(format!(
+                        "invalid or repeated projected event_id {event_id:?}"
+                    ));
                 }
             }
             if observation.detcore_tree.is_none()
@@ -5280,12 +5332,7 @@ fn apply_series_rows(
     projection_source: Option<&str>,
 ) -> Result<ProjectObservationsOutcome, String> {
     let mut updated = tracked.clone();
-    let outcome = apply_series_rows_inner(
-        ambient_git_root,
-        &mut updated,
-        rows,
-        projection_source,
-    )?;
+    let outcome = apply_series_rows_inner(ambient_git_root, &mut updated, rows, projection_source)?;
     *tracked = updated;
     Ok(outcome)
 }
@@ -5994,6 +6041,13 @@ fn read_result_candidates(
             }
             let mut row: ResultRow = serde_json::from_str(line)
                 .map_err(|e| format!("invalid JSON at {}:{}: {e}", path.display(), index + 1))?;
+            row.require_current_timeout_policy().map_err(|error| {
+                format!(
+                    "invalid timeout policy at {}:{}: {error}",
+                    path.display(),
+                    index + 1
+                )
+            })?;
             // Before ANY use, including the provenance checks below, so every
             // downstream consumer and the tracked file agree on one spelling.
             normalise_recorded_root(&mut row);
@@ -6107,6 +6161,13 @@ fn read_retained_results(
             let mut row: ResultRow = serde_json::from_value(raw).map_err(|e| {
                 format!(
                     "invalid schema-{CELL_RESULT_SCHEMA} row at {}:{}: {e}",
+                    path.display(),
+                    index + 1
+                )
+            })?;
+            row.validate_timeout_policy().map_err(|error| {
+                format!(
+                    "invalid timeout policy at {}:{}: {error}",
                     path.display(),
                     index + 1
                 )
@@ -7118,6 +7179,30 @@ fn recorded_shell_quote(value: &str) -> String {
 }
 
 fn self_test() -> Result<(), String> {
+    for error_kind in [
+        "incomplete-verification-evidence",
+        "cpu-timeout",
+        "wall-timeout",
+    ] {
+        if !is_prelaunch_timeout_disposition(true, None, None, Some(error_kind)) {
+            return Err(format!(
+                "typed pre-launch timeout {error_kind} was not accepted"
+            ));
+        }
+    }
+    for (timed_out, status, signal, error_kind) in [
+        (false, None, None, Some("cpu-timeout")),
+        (true, Some(0), None, Some("cpu-timeout")),
+        (true, None, Some(15), Some("wall-timeout")),
+        (true, None, None, Some("infrastructure")),
+        (true, None, None, None),
+    ] {
+        if is_prelaunch_timeout_disposition(timed_out, status, signal, error_kind) {
+            return Err(format!(
+                "invalid pre-launch timeout disposition was accepted: timed_out={timed_out} status={status:?} signal={signal:?} error_kind={error_kind:?}"
+            ));
+        }
+    }
     let summary = fresh_result_summary(172, "fixture-sha", 170, 2, 2);
     let expected_summary = "Fresh result check: 172/172 selected cells passed at fixture-sha \
 (170 compatibility green, including 2 chaos; 2 custom outside the comparable denominator).";
@@ -7159,6 +7244,8 @@ fn self_test() -> Result<(), String> {
             failure_class: (outcome != "PASS").then_some(FailureClass::ProductFailure),
             error_kind: None,
             timeout_seconds: 15,
+            execution_cpu_timeout_seconds: Some(15),
+            execution_wall_timeout_seconds: Some(45),
             log_level: Some("info".into()),
             effective_args: vec!["run".into()],
             argv: vec!["hermit".into(), "run".into()],
@@ -7241,6 +7328,32 @@ fn self_test() -> Result<(), String> {
         }
     };
     let current_identity = candidate("PASS").row;
+    current_identity.validate_timeout_policy()?;
+    let mut retained_without_explicit_bounds = current_identity.clone();
+    retained_without_explicit_bounds.execution_cpu_timeout_seconds = None;
+    retained_without_explicit_bounds.execution_wall_timeout_seconds = None;
+    retained_without_explicit_bounds.validate_timeout_policy()?;
+    if retained_without_explicit_bounds
+        .require_current_timeout_policy()
+        .is_ok()
+    {
+        return Err("a current row without explicit execution bounds was accepted".into());
+    }
+    let mut half_present_timeout = current_identity.clone();
+    half_present_timeout.execution_wall_timeout_seconds = None;
+    if half_present_timeout.validate_timeout_policy().is_ok() {
+        return Err("a half-present additive timeout policy was accepted".into());
+    }
+    let mut wrong_cpu_timeout = current_identity.clone();
+    wrong_cpu_timeout.execution_cpu_timeout_seconds = Some(14);
+    if wrong_cpu_timeout.validate_timeout_policy().is_ok() {
+        return Err("an execution CPU bound disagreeing with timeout_seconds was accepted".into());
+    }
+    let mut wrong_wall_timeout = current_identity.clone();
+    wrong_wall_timeout.execution_wall_timeout_seconds = Some(44);
+    if wrong_wall_timeout.validate_timeout_policy().is_ok() {
+        return Err("an execution wall backstop that was not three times CPU was accepted".into());
+    }
     let mut legacy_identity = current_identity.clone();
     legacy_identity.result = None;
     legacy_identity.failure_class = None;
@@ -8073,6 +8186,8 @@ red/`measured-and-passed` count is **0**.",
         failure_class: Some(FailureClass::ProductFailure),
         error_kind: None,
         timeout_seconds: 15,
+        execution_cpu_timeout_seconds: Some(15),
+        execution_wall_timeout_seconds: Some(45),
         log_level: Some("info".into()),
         effective_args: vec!["run".into()],
         argv: vec!["hermit".into(), "run".into()],
@@ -8970,8 +9085,7 @@ red/`measured-and-passed` count is **0**.",
         "{:x}",
         Sha256::digest(prior_verify_report.as_bytes())
     ));
-    prior_verify_row.attempts[0]["verification_report"] =
-        JsonValue::String(prior_verify_report);
+    prior_verify_row.attempts[0]["verification_report"] = JsonValue::String(prior_verify_report);
     write_result_row(&prior_verify_row)?;
     let seeded = run_result_command("observe-results", None)?;
     if !seeded.status.success() {
@@ -9738,6 +9852,19 @@ red/`measured-and-passed` count is **0**.",
         }
     }
 
+    for error_kind in ["cpu-timeout", "wall-timeout"] {
+        let mut prelaunch = not_run_row.clone();
+        prelaunch.run_id = format!("fixture-prelaunch-{error_kind}");
+        prelaunch.error_kind = Some(error_kind.into());
+        prelaunch.attempts[0]["error_kind"] = JsonValue::String(error_kind.into());
+        prelaunch.attempts[0]["status"] = JsonValue::Null;
+        prelaunch.attempts[0]["signal"] = JsonValue::Null;
+        prelaunch.attempts[0]["timed_out"] = JsonValue::Bool(true);
+        fold_fixture_row(prelaunch).map_err(|error| {
+            format!("typed pre-launch {error_kind} result was refused: {error}")
+        })?;
+    }
+
     let (tracked, fold) = fold_fixture_rows(vec![not_run_pass.clone(), not_run_pass.clone()])?;
     if fold.passed != 1 || tracked.cells[0].observations.len() != 1 {
         return Err("identical duplicate outer-attempt evidence was counted twice".into());
@@ -9845,8 +9972,7 @@ red/`measured-and-passed` count is **0**.",
             || fold.reads_all_green()
             || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
             || tracked.cells[0].observations.len() != 1
-            || tracked.cells[0].observations[0].results
-                != BTreeSet::from([ObservedResult::Timeout])
+            || tracked.cells[0].observations[0].results != BTreeSet::from([ObservedResult::Timeout])
             || tracked.cells[0].last_tested.is_none()
         {
             return Err(format!(
@@ -10754,6 +10880,8 @@ red/`measured-and-passed` count is **0**.",
         failure_class: None,
         error_kind: None,
         timeout_seconds: 15,
+        execution_cpu_timeout_seconds: Some(15),
+        execution_wall_timeout_seconds: Some(45),
         log_level: None,
         effective_args: Vec::new(),
         argv: vec!["fixture".into()],
@@ -11652,19 +11780,17 @@ red/`measured-and-passed` count is **0**.",
     series_unavailable.series.run_index = 2;
     series_unavailable.series.attempt = Some(2);
     series_unavailable.series.no_verdict_evidence = Some(no_verdict_evidence(false));
-    let project_series_fixture = |rows: &[SeriesRow]| -> Result<
-        (TrackedCells, ProjectObservationsOutcome),
-        String,
-    > {
-        let mut tracked = TrackedCells {
-            schema: SCHEMA,
-            projection: None,
-            cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+    let project_series_fixture =
+        |rows: &[SeriesRow]| -> Result<(TrackedCells, ProjectObservationsOutcome), String> {
+            let mut tracked = TrackedCells {
+                schema: SCHEMA,
+                projection: None,
+                cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+            };
+            let outcome = apply_series_rows(&root, &mut tracked, rows, None)?;
+            refresh_measurement(&mut tracked);
+            Ok((tracked, outcome))
         };
-        let outcome = apply_series_rows(&root, &mut tracked, rows, None)?;
-        refresh_measurement(&mut tracked);
-        Ok((tracked, outcome))
-    };
     let (projected_timeout, _) = project_series_fixture(&[series_timeout.clone()])?;
     let (direct_timeout, _) = fold_fixture_row(not_run_row.clone())?;
     if projected_timeout.cells[0].measurement != direct_timeout.cells[0].measurement
@@ -11703,10 +11829,7 @@ red/`measured-and-passed` count is **0**.",
     disposition.status = Some(0);
     let (projected_noncanonical, _) = project_series_fixture(&[series_noncanonical])?;
     let mut direct_noncanonical_rows = coordinate_less_row(&unlocated_id, "PASS");
-    let direct_noncanonical = &mut direct_noncanonical_rows
-        .get_mut(&unlocated_id)
-        .unwrap()[0]
-        .row;
+    let direct_noncanonical = &mut direct_noncanonical_rows.get_mut(&unlocated_id).unwrap()[0].row;
     let mut report: JsonValue = serde_json::from_str(
         direct_noncanonical.attempts[0]["verification_report"]
             .as_str()
@@ -11735,9 +11858,7 @@ red/`measured-and-passed` count is **0**.",
         || projected_noncanonical.cells[0].observations[0].results
             != direct_noncanonical_tracked.cells[0].observations[0].results
     {
-        return Err(
-            "noncanonical comparison changed between direct and series paths".into(),
-        );
+        return Err("noncanonical comparison changed between direct and series paths".into());
     }
 
     let (projected_no_verdict, projected_no_verdict_outcome) =
@@ -11942,34 +12063,30 @@ red/`measured-and-passed` count is **0**.",
 
     let procfs_cell = "c-programs/procfs-positioned-probe/verify/ptrace";
     let legacy_row = |key: usize, outcome: SeriesOutcome, detcore_tree: Option<String>| {
-            let commit = ambient_commits.get(key).unwrap_or(&ambient_commits[0]);
-            let mut row = series_row(
-                procfs_cell,
-                outcome,
-                SeriesProducer::Validate,
-                1,
-                detcore_tree,
-                None,
-            );
-            row.schema = SeriesSchema::V2;
-            row.event_id = format!("ambient-event-{key}");
-            row.run_id = format!("ambient-run-{key}");
-            row.emitted_at = format!("2026-08-27T05:00:{key:02}Z");
-            row.series.tree = (*commit).into();
-            row.series.result = None;
-            row.series.failure_class = None;
-            row
-        };
+        let commit = ambient_commits.get(key).unwrap_or(&ambient_commits[0]);
+        let mut row = series_row(
+            procfs_cell,
+            outcome,
+            SeriesProducer::Validate,
+            1,
+            detcore_tree,
+            None,
+        );
+        row.schema = SeriesSchema::V2;
+        row.event_id = format!("ambient-event-{key}");
+        row.run_id = format!("ambient-run-{key}");
+        row.emitted_at = format!("2026-08-27T05:00:{key:02}Z");
+        row.series.tree = (*commit).into();
+        row.series.result = None;
+        row.series.failure_class = None;
+        row
+    };
     let mut ambient_rows = (0..ambient_commits.len())
         .map(|index| legacy_row(index, SeriesOutcome::Passed, None))
         .collect::<Vec<_>>();
     ambient_rows.extend([
         legacy_row(6, SeriesOutcome::Diverged, None),
-        legacy_row(
-            7,
-            SeriesOutcome::Passed,
-            Some(ambient_commits[0].into()),
-        ),
+        legacy_row(7, SeriesOutcome::Passed, Some(ambient_commits[0].into())),
     ]);
 
     let source_commit = "a".repeat(40);
@@ -12631,15 +12748,14 @@ red/`measured-and-passed` count is **0**.",
     let embedded_root = format!("--hermit={foreign_root}/target/debug/hermit");
     let path_root = format!("/usr/bin:{foreign_root}/bin");
     let interior_root = format!("prefix{foreign_root}/target/debug/hermit");
-    let foreign_env: BTreeMap<String, String> =
-        [
-            ("HOME".to_string(), format!("{foreign_root}/home")),
-            ("PATH".to_string(), path_root),
-            ("SIBLING".to_string(), sibling_root.clone()),
-            ("INTERIOR".to_string(), interior_root.clone()),
-        ]
-            .into_iter()
-            .collect();
+    let foreign_env: BTreeMap<String, String> = [
+        ("HOME".to_string(), format!("{foreign_root}/home")),
+        ("PATH".to_string(), path_root),
+        ("SIBLING".to_string(), sibling_root.clone()),
+        ("INTERIOR".to_string(), interior_root.clone()),
+    ]
+    .into_iter()
+    .collect();
     let mut fixture = ObservedInvocation {
         hermit_sha: "fixture-sha".into(),
         run_id: "fixture-run".into(),

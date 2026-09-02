@@ -11,7 +11,7 @@
 # WHY (single-engine invariant): the parallel GitHub fan-out (ci-portable.yml)
 # shards the portable lane across many small jobs. Each shard must execute an
 # exact subset of the plan against a prebuilt tree / restored cache produced by
-# an upstream build job. Historically this shim loaded ci/dag/<lane>.json itself,
+# an upstream build job. Historically this shim loaded ci/dag/validate.json itself,
 # missing validate's plan construction. It also RE-IMPLEMENTED node execution in
 # jq+bash (extract each node's `.cmd`, `bash -c` it) because the pinned runner
 # predated its `run --only` node selector. That made GitHub Actions a SECOND
@@ -29,7 +29,7 @@
 #
 # Usage:
 #   ci/run-node.sh <lane> <group.job>[,<group.job>...] [-- <extra args>]
-#     <lane>   portable | privileged  (selects ci/dag/<lane>.json)
+#     <lane>   portable | privileged  (selects ci/dag/validate.json)
 #     nodes    one or more "group.job" tags, comma-separated. Passed verbatim to
 #              `run --only`: the runner executes EXACTLY those steps (dependency
 #              edges to steps OUTSIDE the selection are dropped — their outputs
@@ -149,58 +149,22 @@ if ((${#append[@]} == 0)); then
     exec ./scripts/validate.rs "${profile[@]}" "${extra[@]}"
 fi
 
-dag="$ROOT_DIR/ci/dag/${lane}.json"
+dag="$ROOT_DIR/ci/dag/validate.json"
 if [[ ! -f $dag ]]; then
     echo "run-node.sh: unknown lane '$lane' (no such file: $dag)" >&2
     exit 2
 fi
 
-# ⚠️ CARRY THE LANE'S CPU BUDGET, WHICH THIS ENTRYPOINT WAS SILENTLY DROPPING.
-#
-# Shipped lane nodes declare `cpu_timeout` on 0 of 56 (portable) and 0 of 9
-# (privileged), so the budget comes entirely from the caller. scripts/validate.rs
-# supplies one — `scripts/lib/validate_plan.rs` sets the DAG-level default to
-# LANE_DEFAULT_CPU_TIMEOUT_S and calls it "the one DELIBERATE divergence". This
-# script never did, so the runner's own fallback applied instead:
-# DEFAULT_SMALL_CPU_TIMEOUT = 10 s (agent-utils/py/dagrun/model.py:47).
-#
-# The 10 s is a FALLBACK FOR A STEP THAT DECLARES NOTHING, not a limit anybody
-# chose for these nodes, and it only bites HERE:
-#   * `scripts/validate.rs --show-plan` prints cpu_s = 7200 for every lane node;
-#   * in CI this script passes --allow-cgroup-failure, and with no cgroup
-#     `cpu.stat` is unreadable so the CPU guard DOES NOT RUN AT ALL
-#     (agent-utils/py/dagrun/scheduler.py, cpu_guard docstring);
-#   * a local run boxes fail-closed, so the guard runs — against 10 s.
-# Measured 2026-08-25: `e2e.metadata` FAIL "12s, CPU-TIMEOUT >10s cpu" while
-# `target/debug/test-harness validate` alone exits 0 with "PASS: 13 YAML
-# manifests, 305 required cells"; `check.check_outcome_consumers` likewise at
-# 11.3 s CPU with both its scripts exiting 0. A targeted runner that reddens work
-# the lane passes is worse than no targeted runner.
-#
-# The DAG document format REFUSES `default_step_cpu_timeout` at the top level on
-# purpose (agent-utils/py/dagrun/io.py, UNCARRIED_CONFIG_KEYS: it is caller
-# policy, and a key the parser ignores reads exactly like one that took effect).
-# So apply it the way the format DOES carry — per step, on the steps that declare
-# nothing, leaving any declared budget alone, exactly as `effective_cpu_timeout`
-# would. The number is READ FROM validate_plan.rs rather than copied, so this
-# entrypoint cannot drift from the lane it is supposed to mirror; if that
-# constant is renamed or removed, this fails closed instead of using a stale one.
-lane_cpu_timeout=$(sed -n 's/^const LANE_DEFAULT_CPU_TIMEOUT_S: i64 = \([0-9]\{1,\}\);$/\1/p' \
-    "$ROOT_DIR/scripts/lib/validate_plan.rs")
-if [[ ! $lane_cpu_timeout =~ ^[0-9]+$ ]]; then
-    echo "run-node.sh: could not read LANE_DEFAULT_CPU_TIMEOUT_S from scripts/lib/validate_plan.rs." >&2
-    echo "            That constant is the lane's per-node CPU budget; without it this entrypoint" >&2
-    echo "            would silently fall back to the runner's 10 s default and redden nodes the" >&2
-    echo "            lane passes. Refusing rather than guessing." >&2
-    exit 2
-fi
+# Every step's CPU budget is committed in validate.json. This entrypoint may
+# edit one command for local iteration, but it must not invent or stamp resource
+# policy while doing so.
 
 # One test inside one node: run the node's own boxing and limits over an edited
 # command. Refused in CI, refused for a multi-node selection, and never silent.
 if ((${#append[@]} > 0)); then
     if [[ -n ${GITHUB_ACTIONS:-} || -n ${CI:-} ]]; then
         echo "run-node.sh: '--' node-command arguments are a local iteration aid and are refused in CI." >&2
-        echo "            CI must run the tracked command; edit ci/dag/${lane}.json instead." >&2
+        echo "            CI must run the tracked command; edit ci/dag/validate.json instead." >&2
         exit 2
     fi
     if [[ $sel == *,* ]]; then
@@ -250,26 +214,17 @@ scratch_name() {
         "$(printf '%s' "$sel" | sha1sum | cut -d' ' -f1 | cut -c1-16)"
 }
 scratch_dag="$scratch_dir/$(scratch_name "$lane" "$sel")"
-RUN_NODE_TAG="$sel" RUN_NODE_APPEND="$quoted" RUN_NODE_CPU_TIMEOUT="$lane_cpu_timeout" \
+RUN_NODE_TAG="$sel" RUN_NODE_APPEND="$quoted" \
     python3 -c '
 import json, os, sys
 
 source, destination = sys.argv[1], sys.argv[2]
 tag = os.environ["RUN_NODE_TAG"]
 extra = os.environ["RUN_NODE_APPEND"]
-budget = int(os.environ["RUN_NODE_CPU_TIMEOUT"])
 dag = json.load(open(source))
 
 def step_tag(step):
     return "{}.{}".format(step.get("group", ""), step.get("job", ""))
-
-# A step that declares its own cpu_timeout keeps it, exactly as
-# effective_cpu_timeout would; only the undeclared ones take the lane default.
-stamped = 0
-for step in dag["steps"]:
-    if not step.get("cpu_timeout"):
-        step["cpu_timeout"] = budget
-        stamped += 1
 
 edited = ""
 if extra:
@@ -280,13 +235,10 @@ if extra:
     edited = hits[0]["cmd"]
 
 json.dump(dag, open(destination, "w"), indent=2)
-print(stamped)
 print(edited)
 ' "$dag" "$scratch_dag" >"$scratch_dir/.state" || exit 2
 dag="$scratch_dag"
-stamped=$(sed -n 1p "$scratch_dir/.state")
-edited_cmd=$(sed -n 2p "$scratch_dir/.state")
-echo "run-node.sh: carried the lane CPU budget onto $stamped undeclared step(s): ${lane_cpu_timeout}s (LANE_DEFAULT_CPU_TIMEOUT_S)" >&2
+edited_cmd=$(sed -n 1p "$scratch_dir/.state")
 
 if [[ -n $quoted ]]; then
     echo "run-node.sh: ⚠️  EDITED NODE COMMAND — iteration evidence only, NOT the tracked node." >&2
@@ -339,6 +291,11 @@ mkdir -p "$perf_dir" || {
     echo "run-node.sh: could not create perf dir: $perf_dir" >&2
     exit 2
 }
+export VALIDATE_RUN_STATE=${VALIDATE_RUN_STATE:-"$ROOT_DIR/target/validation/run-node-${lane}-$$"}
+mkdir -p "$VALIDATE_RUN_STATE" || {
+    echo "run-node.sh: could not create validation run-state directory: $VALIDATE_RUN_STATE" >&2
+    exit 2
+}
 
 # Boxing policy. dagrun boxes fail-closed by default (two-level
 # cgroup-v2 + a systemd --user scope, or it exits 3). Inside GitHub Actions the
@@ -354,4 +311,5 @@ if [[ -n ${GITHUB_ACTIONS:-} || -n ${CI:-} ]]; then
 fi
 
 echo "run-node.sh: lane=$lane runner=$runner nodes=$sel -j$jobs cargo-jobs=$CARGO_BUILD_JOBS reverie-dbt-budget=portable-build-child-only perf-dir=$perf_dir${acf+ (unboxed: ephemeral CI VM)}" >&2
-exec "$runner" run --dag "$dag" --only "$sel" -j "$jobs" --perf-dir "$perf_dir" "${acf[@]}" -v
+exec "$runner" run --dag "$dag" --selected "$sel" --ignore-selected-deps \
+    -j "$jobs" --perf-dir "$perf_dir" "${acf[@]}" -v

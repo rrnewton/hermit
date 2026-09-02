@@ -7,40 +7,33 @@ with explicit dependencies and resource limits, so the scheduler can run
 independent gates concurrently. On hosts with delegated cgroup v2 support, it
 can also box each node for memory limits and full process-subtree teardown.
 
-- [`portable.json`](portable.json) — contributes committed data to the plan
-  constructed for `scripts/validate.rs`'s **`--portable-only`** lane and the
-  manually dispatched GitHub-managed portable `regular` diagnostic in
-  [`.github/workflows/ci-portable.yml`](../../.github/workflows/ci-portable.yml).
-  No PMU / CPUID interception required.
-- [`privileged.json`](privileged.json) — contributes the focused capability
-  contract selected by the manually dispatched privileged diagnostic in
-  [`.github/workflows/ci-privileged.yml`](../../.github/workflows/ci-privileged.yml).
-  Requires PMU + `/dev/kvm`.
+- [`validate.json`](validate.json) — the one committed superset. Steps declare
+  `quick`, `portable`, `full`, `super`, and `privileged` labels; dagrun keeps the
+  requested label and its dependency ancestry. The labels are independent of
+  the load-bearing `group.job` tags used by dependency edges.
 
 Run a lane with the wrapper:
 
 ```sh
 ci/run-dag.sh portable   --max-mem 32G          # memory-aware -j
 ci/run-dag.sh privileged -j 2                    # PMU lane, one gate at a time
-ci/run-dag.sh portable   ascii                   # visualize instead of run
+agent-utils/py/bin/dagrun ascii --dag ci/dag/validate.json  # inspect the superset
 ```
 
 ## Status: active local lanes and manual hosted diagnostics
 
-`scripts/validate.rs` constructs the plan from the committed validation data.
-The hosted workflows pass selected step tags back to that plan builder; they do
-not read a lane file as an executable plan or restate a step command. The
-constructed plan is therefore the source of truth for individual gate commands,
-dependencies, and resource declarations even when the hosted workflow groups
-those steps across separate jobs.
+`scripts/validate.rs` loads the committed DAG and selects its requested label.
+It does not merge lane files or synthesize resource caps. The self-test
+serializes the loaded superset with dagrun and requires byte-for-byte equality
+with the committed file before any host-specific withholding or execution
+wrapping is considered.
 
-The privileged DAG is limited to the focused build, CPUID faulting, PMU skid,
-manifest validation, and KVM E2E cells so the manual self-hosted smoke stays
-within its 270-second workflow bound. Each sequential build/KVM segment is
-capped at 120 seconds, yielding a 240-second maximum DAG timeout path; the
-manifest audit recomputes and enforces that bound. The 139-program
-record/replay ratchet is preserved as a separate step in the long merge-group
-validation job.
+The `privileged` label selects the focused build, CPUID faulting, PMU skid,
+manifest validation, and KVM E2E cells together with their dependency ancestry.
+Its workflow wall is derived from the selected graph's resolved critical path
+plus setup headroom; the manifest audit recomputes and enforces that relation.
+The 139-program record/replay ratchet remains a separate step in the long
+merge-group validation job.
 
 The `mem_race` family and three nonblocking post-DAG diagnostics run in the
 scheduled `super` tier so a known host-sensitive hang cannot consume the
@@ -50,7 +43,7 @@ The `Validation Levels` workflow no longer launches a second copy of
 `--portable-only` for every pull request. Its quick lane remains available by
 manual dispatch, while merge-group privileged and scheduled super validation are
 unchanged. The manual [`ci-dag.yml`](../../.github/workflows/ci-dag.yml)
-workflow runs either DAG on demand.
+workflow runs either labelled subset on demand.
 
 ### Runner dependency
 
@@ -80,17 +73,17 @@ replaced with measurements.
 ### Relationship to local validation
 
 For every step assigned by `ci/portable-shards.json`, the step command,
-dependencies inside its selected group, timeouts, CPU timeouts, and declared
-resource limits are the same values returned by the constructed local plan.
-`ci/check-shard-coverage.sh` refuses a hosted grouping unless every constructed
+dependencies inside its selected group, CPU timeout, derived wall backstop, and
+declared resource limits come from the same committed DAG used locally.
+`ci/check-shard-coverage.sh` refuses a hosted grouping unless every committed
 portable step is assigned exactly once and the preflight group contains the
-constructed dependencies it needs.
+dependencies it needs.
 
 The current relationships are:
 
-- **Same:** Clippy and rustdoc refuse warnings through the constructed step
+- **Same:** Clippy and rustdoc refuse warnings through the committed step
   commands, and the hosted environment also exports `-D warnings`. Every
-  constructed nextest step uses `ci/run-nextest-counted.sh`, so zero executed
+  committed nextest step uses `ci/run-nextest-counted.sh`, so zero executed
   tests are refused in both places.
 - **Same policy, different host capacity:** local full validation and hosted
   selected runs both use `validate`'s host-derived outer width (`host_cpus/8`,
@@ -101,7 +94,7 @@ The current relationships are:
 - **Deliberately different:** local validation fails closed unless it establishes
   its two-level cgroup-v2 boxing. GitHub-hosted runners do not provide the needed
   delegated systemd user scope, so selected diagnostic runs explicitly permit an
-  unboxed execution. The constructed limits remain declared and audited but are
+  unboxed execution. The committed limits remain declared and audited but are
   not enforced there.
 - **Deliberately different:** hosted selected runs are off the record. They do
   not write a local validation receipt, ledger row, scorecard, or pull-request
@@ -132,7 +125,7 @@ Each node's tag is `group.job` (e.g. `build.workspace`, `lint.clippy`).
 
 The centralized manifests use an explicit build barrier before execution:
 
-1. `e2e.metadata` validates schema, inventory, generated test-footprint freshness,
+1. `gate.manifest` validates schema, inventory, generated test-footprint freshness,
    and CI correspondence.
 2. `build.e2e_artifact` waits for both initial Cargo producers, verifies and
    hash-binds the debug Hermit plus the dereferenced `install_pkg` resource
@@ -161,17 +154,11 @@ runtime output.
 
 ### Command fidelity
 
-Node `cmd`s are the **verbatim** commands `scripts/validate.rs` runs, with three
-deliberate exceptions, chosen to avoid duplicating script logic that has many
-moving parts:
+Node `cmd`s are the **verbatim** commands `scripts/validate.rs` runs. Portable
+strict compatibility is committed as one fixture producer plus the direct
+`compat.*` steps. The stable `test.strict_compat` shard/selection alias expands
+only to those already-committed steps; it does not construct or rewrite them.
 
-- **Portable strict compatibility is a generated expansion.** The committed
-  `test.strict_compat` row is a fail-closed marker; `scripts/validate.rs`
-  replaces it with one run-unique fixture-preparation node and the corpus-derived
-  `compat.*` nodes before invoking dagrun. This keeps the corpus JSON as the one
-  source of argv while exposing every probe and its resource demand to the one
-  outer scheduler. The privileged `rr.compat_baseline` composite still reuses
-  `./scripts/validate.rs --rr-compat-only`.
 - **The DBT stderr-isolation CLI case is a separate 120-second node** so a
   backend hang fails quickly without consuming the aggregate CLI budget. The
   aggregate node skips that case, so the test set remains unchanged.
@@ -290,7 +277,7 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 
 **Outer** — how many gates may co-run:
 
-- `resource_caps` gates *scarce* resources. `portable.json` keeps only
+- `resource_caps` gates *scarce* resources. `validate.json` keeps
   `{"manifest_guest": 8}`. Ordinary manifest buckets use disjoint cell trees
   and request one slot after the shared build barrier. The two high-width
   buckets, `backend-parity-c` and `c-programs`, request all eight slots and pass
@@ -298,8 +285,7 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
   the measured worker width. Legacy Hermit guest gates and direct strict
   compatibility probes have no shared scarce-resource demand; they may overlap
   when dependencies, the outer scheduler width, and memory allow.
-  `privileged.json` declares no resource cap: `/dev/kvm` supports concurrent
-  guests, so its three consumers may overlap. The PMU is
+  `/dev/kvm` supports concurrent guests, so its consumers may overlap. The PMU is
   **not** a scarce resource and carries no cap: reverie
   measures retired conditional branches with per-task (`cpu = -1`) counters that
   the kernel context-switches, so only the running task's counters need be
