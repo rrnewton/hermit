@@ -130,6 +130,11 @@ pub struct HistoryRow {
     /// typed shape applies; supported schemas still require a complete value.
     #[serde(default)]
     pub cell_results: Option<CellResultsValue>,
+    /// Producer-owned terminal test results retained for aggregate replay.
+    /// Historical rows remain readable as `None`. A newer unrecognized shape
+    /// is preserved so the outer schema can refuse it without losing bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_results: Option<TestResultsValue>,
     #[serde(default)]
     pub gates: Vec<GateHistoryRow>,
     /// `tree` deliberately remains in this map even though it has a shared
@@ -479,6 +484,98 @@ pub struct CellResultsEvidence {
     pub cells: Vec<CellResult>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum TestResultVerdict {
+    Pass,
+    Fail,
+}
+
+/// One producer-owned terminal test result.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestResultRecord {
+    pub id: String,
+    pub result: TestResultVerdict,
+    pub attempts: u64,
+}
+
+/// The exact structured result written by one test-result producer.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestResultsRecord {
+    pub executed_tests: u64,
+    pub filtered_tests: u64,
+    pub results: Vec<TestResultRecord>,
+}
+
+/// One terminal DAG node and the structured result from its final attempt.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NodeTestResultsRecord {
+    pub node: String,
+    pub outer_attempt: u64,
+    pub test_results: TestResultsRecord,
+}
+
+/// Canonical retained bytes. Compatibility stays separate because its existing
+/// typed producer is the direct `compat.*` terminal-outcome projection, not a
+/// fabricated DAG node carrying an inner result file.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestResultsArtifactBody {
+    pub schema_version: u32,
+    pub nodes: Vec<NodeTestResultsRecord>,
+    pub compatibility: Option<TestResultsRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestResultsArtifact {
+    /// Parent-root-relative path below `ignored/validate/artifacts/`.
+    pub path: String,
+    pub sha256: String,
+}
+
+/// Receipt summary bound to canonical producer-owned test-result bytes.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestResultsEvidence {
+    pub run_id: String,
+    pub hermit_sha: String,
+    pub source_tree_dirty: bool,
+    pub node_count: u64,
+    pub recorded_count: u64,
+    pub executed_tests: u64,
+    pub passed_tests: u64,
+    pub filtered_tests: u64,
+    pub artifact: TestResultsArtifact,
+}
+
+/// A supported test-results shape, or exact JSON from a newer schema.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum TestResultsValue {
+    Typed(TestResultsEvidence),
+    Other(Value),
+}
+
+impl TestResultsValue {
+    pub fn typed(&self) -> Option<&TestResultsEvidence> {
+        match self {
+            Self::Typed(evidence) => Some(evidence),
+            Self::Other(_) => None,
+        }
+    }
+
+    pub fn typed_mut(&mut self) -> Option<&mut TestResultsEvidence> {
+        match self {
+            Self::Typed(evidence) => Some(evidence),
+            Self::Other(_) => None,
+        }
+    }
+}
+
 /// A supported cell-results shape, or the exact JSON from a newer shape that
 /// this reader does not understand yet. The typed arm is deliberately first:
 /// supported rows must keep their established serialization and receipt digest.
@@ -606,6 +703,46 @@ mod tests {
                 Err("malformed HistoryRow executed_nodes: expected a nonnegative integer")
             );
         }
+    }
+
+    #[test]
+    fn history_test_results_preserve_supported_and_future_shapes() {
+        let typed: HistoryRow = serde_json::from_str(
+            r#"{
+                "schema_version":8,
+                "test_results":{
+                    "run_id":"run-1",
+                    "hermit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "source_tree_dirty":false,
+                    "node_count":1,
+                    "recorded_count":1,
+                    "executed_tests":1,
+                    "passed_tests":1,
+                    "filtered_tests":2,
+                    "artifact":{
+                        "path":"ignored/validate/artifacts/run-1/test-results.json",
+                        "sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let evidence = typed
+            .test_results
+            .as_ref()
+            .and_then(TestResultsValue::typed)
+            .expect("schema-8 test results should use the typed shape");
+        assert_eq!(evidence.executed_tests, 1);
+        assert_eq!(evidence.passed_tests, 1);
+        assert_eq!(evidence.filtered_tests, 2);
+
+        let future: HistoryRow =
+            serde_json::from_str(r#"{"schema_version":9,"test_results":{"future_field":true}}"#)
+                .unwrap();
+        assert!(matches!(
+            future.test_results,
+            Some(TestResultsValue::Other(_))
+        ));
     }
 
     #[test]
