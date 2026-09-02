@@ -1360,7 +1360,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
 fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
     const MIB: i64 = 1024 * 1024;
     const EXPECTED: (i64, i64, Option<i64>, Option<i64>) =
-        (1800, 600, Some(64 * MIB), Some(1024 * MIB));
+        (21600, 7200, Some(64 * MIB), Some(1024 * MIB));
     fn policy(step: &Step) -> (i64, i64, Option<i64>, Option<i64>) {
         (
             dagrun::resolved_wall_timeout(step, 0, 1.0),
@@ -1396,7 +1396,7 @@ fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
     }
 
     println!(
-        "  shard coverage: old 60s wall/512 MiB bounds refused; 600s CPU with a derived 1800s wall backstop and 1 GiB hard memory retain the 64 MiB warm estimate"
+        "  shard coverage: old 60s wall/512 MiB bounds refused; the prior effective 7200s CPU budget is now committed with a derived 21600s wall backstop and 1 GiB hard memory"
     );
     Ok(())
 }
@@ -6454,6 +6454,34 @@ fn committed_validation_dag_bracket(root: &Path) -> Result<String, String> {
                 "committed DAG bracket: {} contains a generator-process fixture path: {}",
                 step.tag(),
                 step.cmd
+            ));
+        }
+    }
+    // These representatives cover each source of the old constructed policy:
+    // the lane-wide CPU default, explicit compatibility and super budgets, and
+    // one producer shared by profiles that previously assigned different
+    // defaults. The committed superset must preserve the maximum effective
+    // value; copying the smaller wall field into cpu_timeout makes ordinary
+    // computation fail under load, which is the defect this migration removes.
+    let expected_cpu = [
+        ("build.rust_scripts", 7200),
+        ("build.workspace", 7200),
+        ("privileged-build.privileged_tests", 7200),
+        ("test.app_strict_verify", 7200),
+        ("compat.echo", 120),
+        ("superstress.ptrace_strict_verify_01", 120),
+        ("super.build_workspace", 1200),
+    ];
+    for (tag, expected) in expected_cpu {
+        let step = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("committed DAG bracket: CPU-budget representative {tag} is absent"))?;
+        if step.cpu_timeout != expected {
+            return Err(format!(
+                "committed DAG bracket: {tag} has {}s CPU, expected the prior effective {expected}s",
+                step.cpu_timeout
             ));
         }
     }

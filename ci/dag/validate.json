@@ -93,7 +93,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 180,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -159,7 +159,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 300,
+      "cpu_timeout": 7200,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
@@ -190,7 +190,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -221,7 +221,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -252,7 +252,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -283,7 +283,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 120,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -314,7 +314,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 120,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -345,7 +345,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -376,7 +376,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -407,7 +407,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -438,7 +438,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -469,7 +469,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 120,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -500,7 +500,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 120,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -531,7 +531,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 2400,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -562,7 +562,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 300,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -593,7 +593,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 120,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -626,7 +626,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -657,7 +657,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 1200,
+      "cpu_timeout": 7200,
       "jobs_flag": "",
       "jobs_env": null,
       "hint": {
@@ -688,7 +688,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 1200,
+      "cpu_timeout": 7200,
       "jobs_flag": "",
       "jobs_env": null,
       "hint": {
@@ -720,7 +720,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 120,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -751,7 +751,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 900,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -782,7 +782,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -819,7 +819,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -858,7 +858,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": "",
       "jobs_env": null,
       "hint": {
@@ -891,7 +891,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 300,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -928,7 +928,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -967,7 +967,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": "",
       "jobs_env": null,
       "hint": {
@@ -1006,7 +1006,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1045,7 +1045,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1084,7 +1084,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1123,7 +1123,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1162,7 +1162,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1201,7 +1201,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1240,7 +1240,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1279,7 +1279,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": "",
       "jobs_env": null,
       "hint": {
@@ -1318,7 +1318,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1351,7 +1351,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 300,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1382,7 +1382,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 1200,
+      "cpu_timeout": 7200,
       "jobs_flag": "",
       "jobs_env": null,
       "hint": {
@@ -1413,7 +1413,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 900,
+      "cpu_timeout": 7200,
       "jobs_flag": "",
       "jobs_env": null,
       "hint": {
@@ -1432,7 +1432,7 @@
       "group": "doc",
       "job": "rustdoc",
       "desc": "Documentation (RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --all-features)",
-      "description": "MEM RE-DERIVATION 2026-08-25 (task re_derive_doc_rustdoc): rss_baseline 1181116006 -> 1505439744. The previous figure PREDATED the --all-features/-D warnings change and I flagged it stale when I made that change; this replaces it rather than leaving the caveat standing. method=cgroup-RECORDED (systemd-run --user -p MemoryAccounting=yes, MemoryPeak == cgroup memory.peak), pinned_jobs=8 via the CARGO_BUILD_JOBS=8 prefix, target_state=warm with `rm -rf target/doc` first so rustdoc actually reruns. n=2 complete runs, both result=success: 1505439744 and 1491546112 bytes (1.402 and 1.389 GiB); the larger is recorded. A THIRD, COLDER, INCOMPLETE run peaked HIGHER at 1913589760 (1.78 GiB) before it was killed, so a cold-cache run costs more than this warm figure and 1.78 GiB is a lower bound for that case -- the existing 3 GiB hard cap still clears it, which is why hard_mem_max_bytes is UNCHANGED. ⚠️ est_duration_s DELIBERATELY NOT UPDATED. Warm wall clock here was 12s against the recorded 150, but this box reports 316 effective CPUs (see the run-with-reverie-dbt-budget.sh banner), so its wall clock is not transferable to a CI runner. CPU time consumed was 33.4s, which is the portable number if anyone wants to re-derive duration properly. Memory peak transfers; wall clock on a 316-CPU host does not. ENFORCEMENT 2026-08-25 (task doc_rustdoc_cannot_fail): RUSTDOCFLAGS=-D warnings added. Until now this node ran cargo doc with no RUSTDOCFLAGS, so it EXITED 0 WHILE EMITTING WARNINGS -- it rendered documentation and could not fail on documentation defects. Measured against the real pre-fix source at 89288ed6ad^: the old command exits 0 with 3 warnings; with -D warnings it exits 101 and names both offending items and lines. --all-features added alongside, and HONESTLY IT IS PRECAUTIONARY RATHER THAN A FIX: measured today it changes nothing for rustdoc -- 13 crates and 920 HTML pages either way, zero delta -- because the feature-gated items in hermit-cli are #[doc(hidden)] re-exports and detcore-dbt is a workspace member documented regardless. It is here so that a DOCUMENTED item placed behind a feature gate later cannot become invisible, which is the mechanism that hid clippy findings until e602aaa991. Do not read it as closing a live gap. .github/workflows/docs.yml deliberately NOT changed: it PUBLISHES to gh-pages rather than gating, and a publisher that refuses to publish over a doc warning is a worse trade. MEM/CPU DERIVATION 2026-08-10 (tasks memory-caps-must-scale-with-job-count, fix_doc_rustdoc_dynamorio and p0_dynamorio_build_cache): pinned_jobs=8 via both CARGO_BUILD_JOBS=8 and preferred_inner_jobs=8. THIS NODE CARRIES THE SHARED DERIVATION for every step whose command starts with a CARGO_BUILD_JOBS=<N> prefix; target/debug/test-harness enforces the pairing as a rule over all such steps. The explicit preferred width is load-bearing: safe-ci's declarations-first default (agent-utils DEFAULT_SMALL_CPU_COUNT=1) otherwise boxes this eight-worker cold DynamoRIO build to cpu.max=1 core while the DBT ratchet derives 132s from eight effective workers. ROOT CAUSE, measured: hermit ab4a8c08 advanced the agent-utils gitlink a6f4232 ('make the SMALL default cap OPT-IN, default OFF') -> 1d893fbc, which contains ada564d ('activate small undeclared-step caps'); every head that failed pins the activated runner and both heads that passed pin a6f4232. LIVE CGROUP READ with the runner built at the pinned SHA, each step reporting its own /proc/self/cgroup -> cpu.max: an undeclared step gets '100000 100000' (1 core) and a preferred_inner_jobs=8 step gets '800000 100000' (8 cores). A/B ON THE IDENTICAL DynamoRIO cmake build --parallel 8 (316-core validation host, load avg 46): unboxed 15.37s wall / 102.51 CPU-s at 666% CPU, versus CPUQuota=100% 112.23s wall / 112.01 CPU-s at 99% CPU; cmake configure is a further 3.65s serial. 112s at one core is already 85% of the 132s budget for the build alone, and sharing that core with the node's concurrent rustdoc/cargo work produced the observed 185.51/187.79/188.06/286.70s. CONTROL: build.workspace and build.runtime_release were the only steps that already declared a width (32) and were the only cpu-bound steps that did not regress (91s -> 88s), while undeclared test.detcore_unit went 34s -> 103s. The 132s ratchet is UNCHANGED and stays fully live: 15.4s observed against 132s once eight cores are actually delivered. jobs_flag is empty so the declaration sizes the cgroup box only; CARGO_BUILD_JOBS already conveys the width to Cargo, and appending '-j 8' would edit argv (harmless here, but it would reach libtest or rustc on three sibling steps). rss_baseline=measured_peak@j8=1.1GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm Rust artifacts but a distinct cargo-doc reverie-dbt build-script OUT_DIR can still cold-build DynamoRIO; hermit@21b22c2b. headroom=+1.9GiB additive -> hard_mem_max_bytes=3.0GiB. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
+      "description": "MEM RE-DERIVATION 2026-08-25 (task re_derive_doc_rustdoc): rss_baseline 1181116006 -> 1505439744. The previous figure PREDATED the --all-features/-D warnings change and I flagged it stale when I made that change; this replaces it rather than leaving the caveat standing. method=cgroup-RECORDED (systemd-run --user -p MemoryAccounting=yes, MemoryPeak == cgroup memory.peak), pinned_jobs=8 via the CARGO_BUILD_JOBS=8 prefix, target_state=warm with `rm -rf target/doc` first so rustdoc actually reruns. n=2 complete runs, both result=success: 1505439744 and 1491546112 bytes (1.402 and 1.389 GiB); the larger is recorded. A THIRD, COLDER, INCOMPLETE run peaked HIGHER at 1913589760 (1.78 GiB) before it was killed, so a cold-cache run costs more than this warm figure and 1.78 GiB is a lower bound for that case -- the existing 3 GiB hard cap still clears it, which is why hard_mem_max_bytes is UNCHANGED. \u26a0\ufe0f est_duration_s DELIBERATELY NOT UPDATED. Warm wall clock here was 12s against the recorded 150, but this box reports 316 effective CPUs (see the run-with-reverie-dbt-budget.sh banner), so its wall clock is not transferable to a CI runner. CPU time consumed was 33.4s, which is the portable number if anyone wants to re-derive duration properly. Memory peak transfers; wall clock on a 316-CPU host does not. ENFORCEMENT 2026-08-25 (task doc_rustdoc_cannot_fail): RUSTDOCFLAGS=-D warnings added. Until now this node ran cargo doc with no RUSTDOCFLAGS, so it EXITED 0 WHILE EMITTING WARNINGS -- it rendered documentation and could not fail on documentation defects. Measured against the real pre-fix source at 89288ed6ad^: the old command exits 0 with 3 warnings; with -D warnings it exits 101 and names both offending items and lines. --all-features added alongside, and HONESTLY IT IS PRECAUTIONARY RATHER THAN A FIX: measured today it changes nothing for rustdoc -- 13 crates and 920 HTML pages either way, zero delta -- because the feature-gated items in hermit-cli are #[doc(hidden)] re-exports and detcore-dbt is a workspace member documented regardless. It is here so that a DOCUMENTED item placed behind a feature gate later cannot become invisible, which is the mechanism that hid clippy findings until e602aaa991. Do not read it as closing a live gap. .github/workflows/docs.yml deliberately NOT changed: it PUBLISHES to gh-pages rather than gating, and a publisher that refuses to publish over a doc warning is a worse trade. MEM/CPU DERIVATION 2026-08-10 (tasks memory-caps-must-scale-with-job-count, fix_doc_rustdoc_dynamorio and p0_dynamorio_build_cache): pinned_jobs=8 via both CARGO_BUILD_JOBS=8 and preferred_inner_jobs=8. THIS NODE CARRIES THE SHARED DERIVATION for every step whose command starts with a CARGO_BUILD_JOBS=<N> prefix; target/debug/test-harness enforces the pairing as a rule over all such steps. The explicit preferred width is load-bearing: safe-ci's declarations-first default (agent-utils DEFAULT_SMALL_CPU_COUNT=1) otherwise boxes this eight-worker cold DynamoRIO build to cpu.max=1 core while the DBT ratchet derives 132s from eight effective workers. ROOT CAUSE, measured: hermit ab4a8c08 advanced the agent-utils gitlink a6f4232 ('make the SMALL default cap OPT-IN, default OFF') -> 1d893fbc, which contains ada564d ('activate small undeclared-step caps'); every head that failed pins the activated runner and both heads that passed pin a6f4232. LIVE CGROUP READ with the runner built at the pinned SHA, each step reporting its own /proc/self/cgroup -> cpu.max: an undeclared step gets '100000 100000' (1 core) and a preferred_inner_jobs=8 step gets '800000 100000' (8 cores). A/B ON THE IDENTICAL DynamoRIO cmake build --parallel 8 (316-core validation host, load avg 46): unboxed 15.37s wall / 102.51 CPU-s at 666% CPU, versus CPUQuota=100% 112.23s wall / 112.01 CPU-s at 99% CPU; cmake configure is a further 3.65s serial. 112s at one core is already 85% of the 132s budget for the build alone, and sharing that core with the node's concurrent rustdoc/cargo work produced the observed 185.51/187.79/188.06/286.70s. CONTROL: build.workspace and build.runtime_release were the only steps that already declared a width (32) and were the only cpu-bound steps that did not regress (91s -> 88s), while undeclared test.detcore_unit went 34s -> 103s. The 132s ratchet is UNCHANGED and stays fully live: 15.4s observed against 132s once eight cores are actually delivered. jobs_flag is empty so the declaration sizes the cgroup box only; CARGO_BUILD_JOBS already conveys the width to Cargo, and appending '-j 8' would edit argv (harmless here, but it would reach libtest or rustc on three sibling steps). rss_baseline=measured_peak@j8=1.1GiB; method=cgroup-RECORDED (systemd MemoryPeak == cgroup memory.peak, NOT sampled); target_state=warm Rust artifacts but a distinct cargo-doc reverie-dbt build-script OUT_DIR can still cold-build DynamoRIO; hermit@21b22c2b. headroom=+1.9GiB additive -> hard_mem_max_bytes=3.0GiB. Artifact: experiments/dag-mem-caps-pinned-jobs_20260804/results.csv",
       "labels": [
         "full",
         "portable"
@@ -1444,7 +1444,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 900,
+      "cpu_timeout": 7200,
       "jobs_flag": "",
       "jobs_env": null,
       "hint": {
@@ -1476,7 +1476,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 900,
+      "cpu_timeout": 7200,
       "jobs_flag": "-j",
       "jobs_env": null,
       "hint": {
@@ -1508,7 +1508,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 900,
+      "cpu_timeout": 7200,
       "jobs_flag": "",
       "jobs_env": null,
       "hint": {
@@ -1540,7 +1540,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 900,
+      "cpu_timeout": 7200,
       "jobs_flag": "",
       "jobs_env": null,
       "hint": {
@@ -1572,7 +1572,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 720,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1604,7 +1604,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 720,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1680,7 +1680,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 1200,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1715,7 +1715,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 900,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1751,7 +1751,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 900,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1789,7 +1789,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 900,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1824,7 +1824,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 900,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1859,7 +1859,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 900,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1896,7 +1896,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 900,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1931,7 +1931,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 900,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -1967,7 +1967,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 720,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2002,7 +2002,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 720,
+      "cpu_timeout": 7200,
       "jobs_flag": "",
       "jobs_env": null,
       "hint": {
@@ -2034,7 +2034,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 900,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2065,7 +2065,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 900,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2134,7 +2134,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2165,7 +2165,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2196,7 +2196,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2227,7 +2227,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2258,7 +2258,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2289,7 +2289,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2320,7 +2320,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2351,7 +2351,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2382,7 +2382,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2413,7 +2413,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2444,7 +2444,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2475,7 +2475,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2506,7 +2506,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2537,7 +2537,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2568,7 +2568,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2599,7 +2599,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2630,7 +2630,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2661,7 +2661,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2692,7 +2692,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2723,7 +2723,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2754,7 +2754,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2785,7 +2785,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2816,7 +2816,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2847,7 +2847,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2878,7 +2878,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2909,7 +2909,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2940,7 +2940,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -2971,7 +2971,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3002,7 +3002,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3033,7 +3033,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3064,7 +3064,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3095,7 +3095,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3126,7 +3126,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3157,7 +3157,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3188,7 +3188,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3219,7 +3219,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3250,7 +3250,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3281,7 +3281,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3312,7 +3312,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3343,7 +3343,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 20,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3374,7 +3374,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3405,7 +3405,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3436,7 +3436,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3467,7 +3467,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3498,7 +3498,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3529,7 +3529,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3560,7 +3560,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3591,7 +3591,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3622,7 +3622,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3653,7 +3653,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3684,7 +3684,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3715,7 +3715,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3746,7 +3746,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 20,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3777,7 +3777,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3808,7 +3808,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3839,7 +3839,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3870,7 +3870,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 20,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3901,7 +3901,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3932,7 +3932,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3963,7 +3963,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -3994,7 +3994,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4025,7 +4025,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4056,7 +4056,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4087,7 +4087,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4118,7 +4118,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4149,7 +4149,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4180,7 +4180,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4211,7 +4211,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4242,7 +4242,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4273,7 +4273,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4304,7 +4304,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4335,7 +4335,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4366,7 +4366,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4397,7 +4397,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4428,7 +4428,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4459,7 +4459,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4490,7 +4490,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4521,7 +4521,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4552,7 +4552,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4583,7 +4583,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4614,7 +4614,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4645,7 +4645,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4676,7 +4676,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 20,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4707,7 +4707,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4738,7 +4738,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4769,7 +4769,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4800,7 +4800,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4831,7 +4831,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4862,7 +4862,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4893,7 +4893,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4924,7 +4924,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4955,7 +4955,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -4986,7 +4986,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5017,7 +5017,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5048,7 +5048,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5079,7 +5079,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5110,7 +5110,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5141,7 +5141,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5172,7 +5172,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5203,7 +5203,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5234,7 +5234,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5265,7 +5265,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5296,7 +5296,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5327,7 +5327,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5358,7 +5358,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5389,7 +5389,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5420,7 +5420,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5451,7 +5451,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5482,7 +5482,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5513,7 +5513,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5544,7 +5544,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5575,7 +5575,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5606,7 +5606,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5637,7 +5637,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5668,7 +5668,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5699,7 +5699,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5730,7 +5730,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5761,7 +5761,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5792,7 +5792,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5823,7 +5823,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5854,7 +5854,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5885,7 +5885,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5916,7 +5916,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5947,7 +5947,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -5978,7 +5978,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6009,7 +6009,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6040,7 +6040,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6071,7 +6071,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6102,7 +6102,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6133,7 +6133,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6164,7 +6164,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6195,7 +6195,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6226,7 +6226,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6257,7 +6257,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6288,7 +6288,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6319,7 +6319,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6350,7 +6350,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6381,7 +6381,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6412,7 +6412,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6443,7 +6443,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6474,7 +6474,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6505,7 +6505,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6536,7 +6536,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6567,7 +6567,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6598,7 +6598,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6629,7 +6629,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6660,7 +6660,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6691,7 +6691,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6722,7 +6722,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6753,7 +6753,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6784,7 +6784,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6815,7 +6815,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6846,7 +6846,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6877,7 +6877,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6908,7 +6908,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 20,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6939,7 +6939,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -6970,7 +6970,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7001,7 +7001,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7032,7 +7032,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7063,7 +7063,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7094,7 +7094,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7125,7 +7125,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7156,7 +7156,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7187,7 +7187,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7218,7 +7218,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7249,7 +7249,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7280,7 +7280,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7311,7 +7311,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7342,7 +7342,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7373,7 +7373,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7404,7 +7404,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7435,7 +7435,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7459,14 +7459,14 @@
         "full",
         "portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/ci/hermit-strict run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; f=$(mktemp); printf \"owner\\n\" >\"$f\"; chown --reference=$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md \"$f\"; stat -c \"%u:%g\" \"$f\"; rm -f \"$f\"' </dev/null",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/ci/hermit-strict run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; f=$(mktemp); printf \"owner\\n\" >\"$f\"; chown --reference=\"$1\" \"$f\"; stat -c \"%u:%g\" \"$f\"; rm -f \"$f\"' bash \"$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md\" </dev/null",
       "deps": [
         "compatprep.fixtures"
       ],
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7497,7 +7497,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7528,7 +7528,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7559,7 +7559,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7590,7 +7590,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7621,7 +7621,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7652,7 +7652,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7683,7 +7683,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7714,7 +7714,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7745,7 +7745,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7776,7 +7776,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7807,7 +7807,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7838,7 +7838,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7862,14 +7862,14 @@
         "full",
         "portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/ci/hermit-strict run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); install -m 640 $VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md \"$d/copied\"; stat -c \"%a %s\" \"$d/copied\"; rm -rf \"$d\"' </dev/null",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/target/ci/hermit-strict run --strict --verify --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test --env TMPDIR=/tmp -- bash -c 'set -euo pipefail; d=$(mktemp -d); install -m 640 \"$1\" \"$d/copied\"; stat -c \"%a %s\" \"$d/copied\"; rm -rf \"$d\"' bash \"$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md\" </dev/null",
       "deps": [
         "compatprep.fixtures"
       ],
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7900,7 +7900,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7931,7 +7931,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7962,7 +7962,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -7993,7 +7993,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 120,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8028,7 +8028,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 40,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8059,7 +8059,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 30,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8093,7 +8093,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 120,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8126,7 +8126,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 120,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8163,7 +8163,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 180,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8200,7 +8200,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 120,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8235,7 +8235,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 180,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8384,7 +8384,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 3600,
+      "cpu_timeout": 7200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8414,7 +8414,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 1200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8444,7 +8444,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 1800,
+      "cpu_timeout": 3600,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8475,7 +8475,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 1800,
+      "cpu_timeout": 3600,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8505,7 +8505,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 120,
+      "cpu_timeout": 240,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8535,7 +8535,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 120,
+      "cpu_timeout": 240,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8565,7 +8565,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 180,
+      "cpu_timeout": 360,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8595,7 +8595,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 1200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8625,7 +8625,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 1200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8655,7 +8655,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 1800,
+      "cpu_timeout": 3600,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8835,7 +8835,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 1200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8865,7 +8865,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 1200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8895,7 +8895,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 1200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8925,7 +8925,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 1200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8955,7 +8955,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 300,
+      "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -8985,7 +8985,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 300,
+      "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9015,7 +9015,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 300,
+      "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9045,7 +9045,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 180,
+      "cpu_timeout": 360,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9075,7 +9075,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 180,
+      "cpu_timeout": 360,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9105,7 +9105,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 180,
+      "cpu_timeout": 360,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9135,7 +9135,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 180,
+      "cpu_timeout": 360,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9165,7 +9165,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 300,
+      "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9195,7 +9195,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 300,
+      "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9225,7 +9225,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 300,
+      "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9255,7 +9255,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 300,
+      "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9285,7 +9285,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 180,
+      "cpu_timeout": 360,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9315,7 +9315,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 180,
+      "cpu_timeout": 360,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9345,7 +9345,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 30,
+      "cpu_timeout": 60,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9375,7 +9375,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 120,
+      "cpu_timeout": 240,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9435,7 +9435,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9465,7 +9465,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9495,7 +9495,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9525,7 +9525,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9555,7 +9555,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9585,7 +9585,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9615,7 +9615,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9645,7 +9645,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9675,7 +9675,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9705,7 +9705,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9735,7 +9735,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9765,7 +9765,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9795,7 +9795,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9825,7 +9825,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9855,7 +9855,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9885,7 +9885,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9915,7 +9915,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9945,7 +9945,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -9975,7 +9975,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10005,7 +10005,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10035,7 +10035,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10065,7 +10065,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10095,7 +10095,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10125,7 +10125,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10155,7 +10155,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10185,7 +10185,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10215,7 +10215,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10245,7 +10245,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10275,7 +10275,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10305,7 +10305,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10335,7 +10335,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10365,7 +10365,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10395,7 +10395,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10425,7 +10425,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10455,7 +10455,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10485,7 +10485,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10515,7 +10515,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10545,7 +10545,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10575,7 +10575,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10605,7 +10605,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10635,7 +10635,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10665,7 +10665,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10695,7 +10695,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10725,7 +10725,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10755,7 +10755,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10785,7 +10785,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10815,7 +10815,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10845,7 +10845,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10875,7 +10875,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10905,7 +10905,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10935,7 +10935,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10965,7 +10965,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -10995,7 +10995,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11025,7 +11025,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11055,7 +11055,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11085,7 +11085,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11115,7 +11115,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11145,7 +11145,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11175,7 +11175,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11205,7 +11205,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11235,7 +11235,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11266,7 +11266,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11297,7 +11297,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11328,7 +11328,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11359,7 +11359,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11390,7 +11390,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11421,7 +11421,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11452,7 +11452,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11483,7 +11483,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11514,7 +11514,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11545,7 +11545,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11576,7 +11576,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11607,7 +11607,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11638,7 +11638,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11669,7 +11669,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11700,7 +11700,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11731,7 +11731,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11762,7 +11762,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11793,7 +11793,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11824,7 +11824,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11855,7 +11855,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11886,7 +11886,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11917,7 +11917,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11948,7 +11948,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -11979,7 +11979,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12010,7 +12010,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12041,7 +12041,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12072,7 +12072,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12103,7 +12103,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12134,7 +12134,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12165,7 +12165,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12196,7 +12196,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12227,7 +12227,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12258,7 +12258,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12289,7 +12289,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12320,7 +12320,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12351,7 +12351,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12382,7 +12382,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12413,7 +12413,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12444,7 +12444,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12475,7 +12475,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 60,
+      "cpu_timeout": 120,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12505,7 +12505,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 1200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12535,7 +12535,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 1200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12565,7 +12565,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 1200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12595,7 +12595,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 1200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12629,7 +12629,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 1200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12659,7 +12659,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 1200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12689,7 +12689,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 1200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -12719,7 +12719,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "cpu_timeout": 600,
+      "cpu_timeout": 1200,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
