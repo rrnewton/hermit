@@ -3074,12 +3074,19 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
     // the lane copy still points back at gate.manifest.
     let full_lane = validate_plan::lane_nodes(root, "portable", "", "gate.manifest")?;
     let full_total = full_lane.len();
-    let full_steps = apply_selective_decision(
+    let mut full_steps = apply_selective_decision(
         full_lane,
         full_total,
         SelectDecision::Full("no trustworthy green baseline (self-test)".into()),
     )?;
     let mut full_nodes = validate_plan::preflight_nodes(root)?;
+    let reused_preflight = remove_preflight_duplicates(&mut full_steps, &full_nodes);
+    if reused_preflight != full_nodes.len() - 1 {
+        return Err(format!(
+            "selective bracket: full/no-baseline fallback reused {reused_preflight} committed preflight nodes, expected {} after setup.manifest_plan was already reused",
+            full_nodes.len() - 1
+        ));
+    }
     full_nodes.extend(full_steps);
     let submodules = full_nodes
         .iter()
@@ -8145,6 +8152,19 @@ fn apply_selective_decision(
     Ok(steps)
 }
 
+/// Remove committed preflight nodes from a selected lane before the caller
+/// prepends the already-built preflight spine. Dependencies keep their tags and
+/// therefore bind to that one retained copy.
+fn remove_preflight_duplicates(
+    steps: &mut Vec<dagrun::model::Step>,
+    preflight: &[dagrun::model::Step],
+) -> usize {
+    let tags = preflight.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    let before = steps.len();
+    steps.retain(|step| !tags.contains(&step.tag()));
+    before - steps.len()
+}
+
 /// Ask `ci/select-tests.rs` what to run.
 ///
 /// This is PLAN CONSTRUCTION, not a gate: the selector produces no verdict about
@@ -8245,7 +8265,8 @@ fn selective_plan(
         Some(b) => ask_selector(root, Some(b)),
         None => SelectDecision::Full("no trustworthy green baseline".into()),
     };
-    let steps = apply_selective_decision(all, total, decision)?;
+    let mut steps = apply_selective_decision(all, total, decision)?;
+    remove_preflight_duplicates(&mut steps, &pre);
     let mut nodes = pre;
     nodes.extend(steps);
     let cfg = validate_plan::config_from_base(&base, nodes, "selective portable subset");
