@@ -2682,6 +2682,7 @@ fn write_plan_after_scorecard_check(
             cmdtype: CmdType::Unknown,
             manifest: None,
             integration_test_binaries: None,
+            labels: Vec::new(),
             deps: preparation_deps,
             env: BTreeMap::new(),
             // `None` preserves the existing GLOBAL eager-exit behaviour, which is what
@@ -2866,6 +2867,7 @@ fn write_plan_after_scorecard_check(
                 cmdtype: CmdType::Unknown,
                 manifest: None,
                 integration_test_binaries: None,
+                labels: Vec::new(),
                 deps,
                 // Requalification evidence must exercise the same hermetic
                 // guest workdir contract as canonical validation. Otherwise a
@@ -2917,6 +2919,7 @@ fn write_plan_after_scorecard_check(
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
+        labels: Vec::new(),
         deps: cell_tags,
         env: BTreeMap::new(),
         // `None` preserves the existing GLOBAL eager-exit behaviour, which is what
