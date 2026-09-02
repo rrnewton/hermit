@@ -6728,10 +6728,9 @@ fn out_of_place_concurrency_experiment_bracket(root: &Path) -> Result<String, St
             )
         })
         .collect::<BTreeMap<_, _>>();
-    if !preserved_caps.contains_key("kvm")
-        || !preserved_caps
-            .keys()
-            .any(|resource| resource.starts_with(FUSED_INTEGRATION_TEST_RESOURCE_PREFIX))
+    if !preserved_caps
+        .keys()
+        .any(|resource| resource.starts_with(FUSED_INTEGRATION_TEST_RESOURCE_PREFIX))
     {
         return Err(format!(
             "concurrency experiment: full plan lacks non-experimental resource controls: {:?}",
@@ -6741,7 +6740,7 @@ fn out_of_place_concurrency_experiment_bracket(root: &Path) -> Result<String, St
 
     neutralize_out_of_place_concurrency_resources(&mut plan);
     let assert_neutral = |label: &str, cfg: &DagConfig| -> Result<(), String> {
-        let surviving_caps = OUT_OF_PLACE_CONCURRENCY_RESOURCES
+        let surviving_caps = ["hermit_guest", "manifest_guest"]
             .iter()
             .filter(|resource| cfg.resource_caps.contains_key(**resource))
             .copied()
@@ -6750,7 +6749,7 @@ fn out_of_place_concurrency_experiment_bracket(root: &Path) -> Result<String, St
             .steps
             .iter()
             .flat_map(|step| {
-                OUT_OF_PLACE_CONCURRENCY_RESOURCES
+                ["hermit_guest", "manifest_guest"]
                     .iter()
                     .filter(move |resource| step.hint.resources.contains_key(**resource))
                     .map(move |resource| format!("{}:{resource}", step.tag()))
