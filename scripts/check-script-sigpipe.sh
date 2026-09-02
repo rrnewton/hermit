@@ -103,8 +103,10 @@ else
 fi
 echo "check-script-sigpipe.sh: OK — producer manifest covers all $consumers rust-script entrypoint(s)"
 
-fake_rust_script="$tmp/rust-script"
-external_source="$tmp/external.rs"
+external_tmp="$(mktemp -d /tmp/hermit-rust-script-external.XXXXXXXX)"
+trap 'rm -rf "$tmp" "$external_tmp"' EXIT
+fake_rust_script="$external_tmp/rust-script"
+external_source="$external_tmp/external.rs"
 printf '%s\n' '#!/usr/bin/env bash' 'printf "delegated:%s\\n" "$*"' >"$fake_rust_script"
 printf '%s\n' 'fn main() {}' >"$external_source"
 chmod +x "$fake_rust_script"
@@ -117,7 +119,7 @@ delegated=$(HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 \
 }
 
 unlisted_source="$ROOT_DIR/target/ci/rust-script-unlisted-$$.rs"
-trap 'rm -rf "$tmp"; rm -f "$unlisted_source"' EXIT
+trap 'rm -rf "$tmp" "$external_tmp"; rm -f "$unlisted_source"' EXIT
 printf '%s\n' 'fn main() {}' >"$unlisted_source"
 if HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 \
     HERMIT_REAL_RUST_SCRIPT="$fake_rust_script" \

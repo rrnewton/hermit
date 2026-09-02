@@ -112,7 +112,7 @@
       "group": "gate",
       "job": "manifest",
       "desc": "Centralized test manifest and inventory",
-      "description": "",
+      "description": "The manifest gate's self-test population measured a 4,277,876 KiB maximum resident set on 2026-09-02 after the one-DAG and CPU-budget coverage was added. Its former 2 GiB hard cap produced six cgroup OOM kills before the gate could report a verdict. The 5 GiB baseline and 6 GiB hard ceiling retain measured headroom without making an unbounded process admissible.",
       "labels": [
         "full",
         "portable",
@@ -132,8 +132,8 @@
       "hint": {
         "resources": {},
         "est_duration_s": 0.0,
-        "rss_baseline_bytes": 2147483648,
-        "hard_mem_max_bytes": 2147483648,
+        "rss_baseline_bytes": 5368709120,
+        "hard_mem_max_bytes": 6442450944,
         "classification": "light",
         "preferred_inner_jobs": null,
         "measured_effective_cores": null,

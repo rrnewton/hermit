@@ -3,7 +3,7 @@
 #
 # The checker supplies its own positive and negative controls for parsed TOML
 # dependencies and parsed Rust paths. This companion test brackets the derived
-# wall-time budget: a sufficient declaration passes and an insufficient one
+# CPU-time budget: a sufficient declaration passes and an insufficient one
 # refuses before work starts.
 
 set -euo pipefail
@@ -46,7 +46,7 @@ graph = {
             "job": "backend_abstraction",
             "desc": "fixture",
             "cmd": "true",
-            "timeout": timeout,
+            "cpu_timeout": timeout,
         }
     ]
 }
@@ -58,7 +58,7 @@ PYEOF
 # A budget that comfortably covers the derived work must be accepted.
 write_dag 600
 if output=$("$LINT" --repo-root "$scratch" 2>&1); then
-    if ! grep -q "budget: 600s declared covers" <<< "$output"; then
+    if ! grep -q "CPU budget: 600s declared covers" <<< "$output"; then
         fail "a sufficient budget was accepted but not reported"
     else
         note "OK — a sufficient 600s budget is accepted and reported"
@@ -82,7 +82,7 @@ else
         fail "an insufficient budget was refused without naming the budget as the cause"
     elif ! grep -q "THIS IS NOT A TIMEOUT" <<< "$output"; then
         fail "an insufficient budget was refused without distinguishing itself from a timeout"
-    elif ! grep -qE "Raise check.backend_abstraction .* to at least [0-9]+" <<< "$output"; then
+    elif ! grep -qE "Raise check.backend_abstraction .*cpu_timeout.* to at least [0-9]+" <<< "$output"; then
         fail "an insufficient budget was refused without naming the value to set"
     else
         note "OK — an insufficient budget is refused, named as a budget, with the value to set"
