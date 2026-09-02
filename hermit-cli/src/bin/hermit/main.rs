@@ -458,6 +458,14 @@ fn main() {
 /// positions are consistent: the code channel exists to tell hermit's failures
 /// apart from the guest's, not to subdivide hermit's own.
 fn failure_exit_code(error: &Error) -> i32 {
+    // A completed comparison with a recorded PMU skid overshoot is an
+    // understood infrastructure failure. Hermit deliberately declines to
+    // vouch for the result, so it uses the same coarse exit class as other
+    // policy refusals; the verification receipt carries the finer cause and
+    // count.
+    if error.downcast_ref::<hermit::SkidOvershootError>().is_some() {
+        return detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
+    }
     // ⚠️ A REFUSAL IS NOT A FAILURE, AND IT IS CHECKED FIRST FOR THAT REASON.
     // A fail-closed policy stopping the run is hermit working; reporting it as
     // HERMIT_INTERNAL_FAILURE_EXIT tells the operator to file a bug against a
@@ -487,6 +495,12 @@ fn failure_exit_code(error: &Error) -> i32 {
 }
 
 fn classify_failure(error: &Error) -> String {
+    if let Some(overshoot) = error.downcast_ref::<hermit::SkidOvershootError>() {
+        return format!(
+            "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count={}",
+            overshoot.count()
+        );
+    }
     // ⚠️ REFUSAL BEFORE FAILURE. This arm and the ContainerChildExit arm below
     // describe the SAME observation -- a container child that exited -- and
     // only the status separates them. Ordering matters: a refusal that fell
@@ -567,15 +581,30 @@ fn display_error(error: Error) {
 mod tests {
     use clap::CommandFactory;
     use clap::Parser;
+    use hermit::Error;
 
     use super::Args;
     use super::Subcommand;
+    use super::classify_failure;
+    use super::failure_exit_code;
 
     #[test]
     fn clap_configuration_is_valid() {
         Args::command().debug_assert();
     }
 
+    #[test]
+    fn skid_overshoot_uses_the_policy_refusal_exit_and_marker() {
+        let error = Error::new(hermit::SkidOvershootError::new(2));
+        assert_eq!(
+            failure_exit_code(&error),
+            detcore_model::HERMIT_POLICY_REFUSAL_EXIT
+        );
+        assert_eq!(
+            classify_failure(&error),
+            "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2"
+        );
+    }
     /// Plant a previous invocation's GREEN verdict at `path`, the way a caller
     /// that reuses one `--verify-json` file across runs would have.
     fn plant_previous_green(path: &std::path::Path) {
