@@ -119,7 +119,8 @@ delegated=$(HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 \
 }
 
 unlisted_source="$ROOT_DIR/target/ci/rust-script-unlisted-$$.rs"
-trap 'rm -rf "$tmp" "$external_tmp"; rm -f "$unlisted_source"' EXIT
+nested_repo="$ROOT_DIR/target/ci/rust-script-nested-repo-$$"
+trap 'rm -rf "$tmp" "$external_tmp" "$nested_repo"; rm -f "$unlisted_source"' EXIT
 printf '%s\n' 'fn main() {}' >"$unlisted_source"
 if HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 \
     HERMIT_REAL_RUST_SCRIPT="$fake_rust_script" \
@@ -132,4 +133,16 @@ grep -q 'producer manifest has no unique entry' "$tmp/unlisted.err" || {
     cat "$tmp/unlisted.err" >&2
     exit 1
 }
-echo "check-script-sigpipe.sh: OK — external tooling delegates; unlisted repository scripts refuse"
+
+mkdir -p "$nested_repo"
+git -C "$nested_repo" init -q
+nested_source="$nested_repo/fixture.rs"
+printf '%s\n' 'fn main() {}' >"$nested_source"
+delegated=$(HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 \
+    HERMIT_REAL_RUST_SCRIPT="$fake_rust_script" \
+    ./ci/rust-script-bin/rust-script --force "$nested_source" -- fixture)
+[[ $delegated == "delegated:--force $nested_source -- fixture" ]] || {
+    echo "check-script-sigpipe.sh: nested fixture checkout was not delegated: $delegated" >&2
+    exit 1
+}
+echo "check-script-sigpipe.sh: OK — external and nested-checkout tooling delegates; unlisted repository scripts refuse"
