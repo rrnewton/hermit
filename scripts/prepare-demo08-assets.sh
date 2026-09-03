@@ -120,8 +120,8 @@ calibrate_crash_seed() {
   local artifacts="${DEMO08_ARTIFACTS:-$ROOT/ignored/demo08-run}"
   local image="$artifacts/chaos-buggy.img"
   local report="$artifacts/calibration.tsv"
-  local output seed source rc fixture cached_fixture engagement uaf ran i
-  local executed=0 attempted=0 engaged=0 uaf_hits=0 last_rc="" found_seed=""
+  local output seed source rc fixture cached_fixture engagement uaf ran qualifies i
+  local executed=0 attempted=0 engaged=0 uaf_hits=0 qualified=0 last_rc="" found_seed=""
   local cached_seed=""
   local -a seeds=() sources=()
 
@@ -163,7 +163,7 @@ calibrate_crash_seed() {
   done
 
   mkdir -p "$artifacts"
-  printf 'seed\tsource\tengagement\tuaf\texit\toutput\n' >"$report"
+  printf 'seed\tsource\tengagement\tuaf\texit\tqualifies\toutput\n' >"$report"
 
   # Boxing is fail-closed: hermit-box-run exits 3, having run nothing, when cgroup-v2 /
   # systemd --user scope is unavailable. On a GitHub-managed runner that is the normal case,
@@ -226,24 +226,43 @@ calibrate_crash_seed() {
       engagement=reached
       engaged=$((engaged + 1))
     fi
-    # ASAN can report the UAF on a thread whose process still exits 0, so the report text --
-    # not the exit status -- is the detector. The exit status is what proves the guest ran.
+    # The UAF report TEXT is not the success criterion, and treating it as one is what
+    # let this calibration persist a seed the demo then refused. The demo's criterion is
+    # the ASAN ABORT: guest 134, which it turns into its own outer 0. A run can print the
+    # first lines of a report on one thread and still exit 0, or be cut off at 124
+    # mid-report; both leave a truncated report and no abort. So record the text and the
+    # abort separately and require BOTH. `SUMMARY: AddressSanitizer` is ASAN's last line,
+    # so its presence is what separates a completed report from a truncated one.
     if grep -qa 'AddressSanitizer: heap-use-after-free' "$output"; then
       uaf=hit
       uaf_hits=$((uaf_hits + 1))
+      if grep -qa 'SUMMARY: AddressSanitizer' "$output"; then
+        uaf=complete
+      fi
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$seed" "$source" "$engagement" "$uaf" "$rc" "$output" >>"$report"
-    printf '  seed=%s source=%s engagement=%s uaf=%s rc=%s output=%s\n' \
-      "$seed" "$source" "$engagement" "$uaf" "$rc" "$output"
-    if [ "$ran" = yes ] && [ "$engagement" = reached ] && [ "$uaf" = hit ]; then
+    qualifies=no
+    if [ "$ran" = yes ] && [ "$engagement" = reached ] \
+       && [ "$uaf" = complete ] && [ "$rc" = 134 ]; then
+      qualifies=yes
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$seed" "$source" "$engagement" "$uaf" "$rc" "$qualifies" "$output" >>"$report"
+    printf '  seed=%s source=%s engagement=%s uaf=%s rc=%s qualifies=%s output=%s\n' \
+      "$seed" "$source" "$engagement" "$uaf" "$rc" "$qualifies" "$output"
+    if [ "$qualifies" = yes ]; then
+      qualified=$((qualified + 1))
       found_seed="$seed"
       break
     fi
   done
 
-  printf 'Demo 8 calibration summary: engagement=%s/%s uaf_hits=%s/%s executed=%s/%s report=%s\n' \
-    "$engaged" "$attempted" "$uaf_hits" "$attempted" "$executed" "$attempted" "$report"
+  # uaf_hits counts REPORT TEXT; qualified counts seeds that also aborted with a
+  # completed report. They differ exactly when a run printed part of a report and did
+  # not abort, which is the case the demo refuses, so print both rather than letting a
+  # hit count imply a usable seed.
+  printf 'Demo 8 calibration summary: engagement=%s/%s uaf_hits=%s/%s qualified=%s/%s executed=%s/%s report=%s\n' \
+    "$engaged" "$attempted" "$uaf_hits" "$attempted" "$qualified" "$attempted" \
+    "$executed" "$attempted" "$report"
   if [ -n "$found_seed" ]; then
     printf '%s %s\n' "$found_seed" "$fixture" >"$ASSETS/.crash-seed"
     rm -f -- "$image"

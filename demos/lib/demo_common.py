@@ -654,6 +654,50 @@ def make_temp_result_dir(assets: Path, prefix: str) -> Path:
     return Path(tempfile.mkdtemp(prefix="{}-".format(prefix), dir=str(work_root)))
 
 
+# Linux's sockaddr_un.sun_path is 108 bytes INCLUDING the NUL terminator, so a
+# bind or connect fails once the pathname reaches 108. This is a kernel ABI
+# constant, not a tunable.
+AF_UNIX_PATH_MAX = 107
+
+
+def make_socket_dir(prefix: str) -> Path:
+    """Create a short-rooted private directory to hold a Unix-domain socket.
+
+    A socket placed under the checkout inherits the checkout's depth, and the
+    prescribed validation location (`worktrees/validate/...`) is deep enough on
+    its own to push a `qmp.sock` past AF_UNIX_PATH_MAX -- measured at 119 bytes
+    on a standard validation checkout, which QEMU rejects. The same class was
+    already fixed globally for validation sockets by rooting them under
+    XDG_RUNTIME_DIR instead of below the parent checkout; sockets created here
+    were not going through that path, so they are rooted the same way now.
+
+    Only the SOCKET moves. Logs, disks and metadata stay in the per-run working
+    directory where the rest of the run's evidence lives.
+    """
+    runtime_root = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    root = Path(runtime_root) / "hermit-demos"
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="{}-".format(prefix), dir=str(root)))
+
+
+def make_socket_path(prefix: str, name: str) -> Path:
+    """Return a socket pathname that fits AF_UNIX, or refuse with the numbers.
+
+    Refusing names the measured length, the bound and the override rather than
+    letting QEMU fail later with a message that does not say which path was too
+    long.
+    """
+    path = make_socket_dir(prefix) / name
+    length = len(str(path).encode())
+    if length > AF_UNIX_PATH_MAX:
+        raise RuntimeError(
+            "socket path is {} bytes, over the {}-byte AF_UNIX limit: {}. "
+            "Set XDG_RUNTIME_DIR to a shorter directory, or TMPDIR if "
+            "XDG_RUNTIME_DIR is unset.".format(length, AF_UNIX_PATH_MAX, path)
+        )
+    return path
+
+
 def publish_anchor(work_dir: Path, anchor_dir: Path) -> bool:
     """Atomically publish ``work_dir`` as THE anchor directory.
 

@@ -7,7 +7,7 @@ controls common sources of nondeterminism, including thread scheduling, time,
 random data, CPUID results, address layout, and selected file metadata.
 
 The demo materials and Hermit source live in this repository. The walkthrough
-covers seven confirmed workflows:
+covers eight confirmed workflows:
 
 1. repeat an execution with stable guest-visible inputs;
 2. record an execution and replay it, with or without GDB;
@@ -15,7 +15,9 @@ covers seven confirmed workflows:
 4. bisect two schedules to identify the events that change the outcome;
 5. boot Linux in QEMU and save a live snapshot under Hermit's strict profile;
 6. resume that snapshot and inject repeatable commands over its serial port;
-7. inspect and advance the restored kernel without advancing it during reads.
+7. inspect and advance the restored kernel without advancing it during reads;
+8. expose a schedule-dependent use-after-free in btrfs-convert that blind
+   execution misses, and show the fix closing it on the same seed.
 
 > [!WARNING]
 >
@@ -95,6 +97,7 @@ demos/
   05-qemu-boot.py           # boot, snapshot, metadata, repeat verification
   06-qemu-resume.py         # resume, command snapshot, repeat verification
   07-drgn-kernel.sh         # reproducible kernel task-list evolution
+  08-btrfs-convert-uaf.sh   # schedule-dependent btrfs-convert UAF, and its fix
   WALKTHROUGH.md            # commands and expected output for the demo suite
   lib/
     demo_common.py          # hashes, metadata, QMP, serial, strict log diff
@@ -165,7 +168,12 @@ Run each demo individually so its output and result remain easy to inspect:
 ./demos/05-qemu-boot.py
 ./demos/06-qemu-resume.py 'ls /'
 ./demos/07-drgn-kernel.sh
+./demos/08-btrfs-convert-uaf.sh
 ```
+
+Demo 8 needs prebuilt ASAN `btrfs-convert` fixtures; build them first with
+`scripts/prepare-demo08-assets.sh`. Without them it reports SKIPPED and exits 0,
+or fails when `DEMO08_REQUIRE_ASSETS=1` is set, as the hosted gate sets it.
 
 Demo 4 is intentionally slow. Demo 5 must complete before Demos 6 and 7 because
 it creates their baseline QEMU snapshot.
