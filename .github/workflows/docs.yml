@@ -24,20 +24,20 @@ env:
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
   COMPATIBILITY_SITE_RELEASE_REPOSITORY: rrnewton/hermit
-  COMPATIBILITY_SITE_IDENTITY: 8feef179bed2bb48c81dd0bc8186d81df47c255d8c015dc4b0eb139eab439edc
-  COMPATIBILITY_SITE_RELEASE_TAG: compatibility-website-8feef179bed2bb48c81dd0bc8186d81df47c255d8c015dc4b0eb139eab439edc
-  COMPATIBILITY_SITE_RELEASE_TITLE: Historical compatibility website snapshot 8feef179bed2bb48c81dd0bc8186d81df47c255d8c015dc4b0eb139eab439edc
-  COMPATIBILITY_SITE_ASSET: compatibility-website-8feef179bed2bb48c81dd0bc8186d81df47c255d8c015dc4b0eb139eab439edc.tar.gz
-  COMPATIBILITY_SITE_ARCHIVE_SHA256: 073a3a135fdde091a5f4b88839ed979fc9ee8e9592b18c932179a8905249a2e6
-  COMPATIBILITY_SITE_ARCHIVE_BYTES: '15015443'
-  COMPATIBILITY_SITE_BUILD_SHA256: f0d925e91d0e7b0bcea43abb11c8de4133a73e727dd1410a8c5947a0f83d2024
-  COMPATIBILITY_SITE_MANIFEST_TREE_SHA256: 62cf955e153933c35b9f26a82d5fb39007e1b227ebc43c79c41127e1abf1e4cd
-  COMPATIBILITY_SITE_ARTIFACTS_SHA256: 532f9e56160bfa9bbddf431d3cc3f1e3374b9bbaccba03d9f4272b96bd08aef5
-  COMPATIBILITY_SITE_CONTENT_TREE_SHA256: 669e93ef1278b01d1caf0c126386ea785f1698a6323b07017b7e1c48de3cd337
+  COMPATIBILITY_SITE_IDENTITY: e75fe49e3b55c6357b32e0110d65731575fe287413f3239a92d9d4522e15a4fb
+  COMPATIBILITY_SITE_RELEASE_TAG: compatibility-website-e75fe49e3b55c6357b32e0110d65731575fe287413f3239a92d9d4522e15a4fb
+  COMPATIBILITY_SITE_RELEASE_TITLE: Compatibility website snapshot e75fe49e3b55c6357b32e0110d65731575fe287413f3239a92d9d4522e15a4fb
+  COMPATIBILITY_SITE_ASSET: compatibility-website-e75fe49e3b55c6357b32e0110d65731575fe287413f3239a92d9d4522e15a4fb.tar.gz
+  COMPATIBILITY_SITE_ARCHIVE_SHA256: 98eb2459286865081566242780056997a28a21d467ebe311a398ba4f77b84b46
+  COMPATIBILITY_SITE_ARCHIVE_BYTES: '13929857'
+  COMPATIBILITY_SITE_BUILD_SHA256: ada1279a5fbf4565efaf9cc5fdfcd5522c92e7a61c8b52a8bf43ab19420da695
+  COMPATIBILITY_SITE_MANIFEST_TREE_SHA256: 413f9fee6fc98f5335ab01441f9a61844d0568fe754f9cf373aea1b96239cca6
+  COMPATIBILITY_SITE_ARTIFACTS_SHA256: b06eb90e88b243d6af2bf45f7c53d694e988a7d538e77891e2baebc9983598a4
+  COMPATIBILITY_SITE_CONTENT_TREE_SHA256: cb1736cb2fc93a7962656b7a5a85d3f7c3095864996dad441bdc36b7e5a84883
   COMPATIBILITY_SITE_MODE_SHA256: bb176a41b861c4db27edf1b6e8a8254d1cbdba5fc232588f09ffa1d8ddee2a85
-  COMPATIBILITY_SITE_RECURSIVE_IDENTITY_SHA256: 862dc13ecc72d3deca7fcc91a2b5744dc5dd7c8e2c189b2552201eeb4102835a
+  COMPATIBILITY_SITE_RECURSIVE_IDENTITY_SHA256: d8e604d8ba3cf846a5599ab4e64628fa18bb2b803980e306f4416a6f269bd912
   COMPATIBILITY_SITE_FILE_COUNT: '94'
-  COMPATIBILITY_SITE_FILE_BYTES: '26348805'
+  COMPATIBILITY_SITE_FILE_BYTES: '29222036'
 
 jobs:
   build-and-deploy:
@@ -124,6 +124,7 @@ jobs:
 
         ARCHIVE = Path(sys.argv[1])
         TARGET = Path(sys.argv[2])
+        LATEST = TARGET.parent / "latest"
         IDENTITY = os.environ["COMPATIBILITY_SITE_IDENTITY"]
         BUILD_SHA256 = os.environ["COMPATIBILITY_SITE_BUILD_SHA256"]
         MANIFEST_TREE_SHA256 = os.environ["COMPATIBILITY_SITE_MANIFEST_TREE_SHA256"]
@@ -192,8 +193,8 @@ jobs:
 
 
         landing_contract = (
-            "<strong>Historical snapshot &mdash; not current:</strong>\n"
-            f'        <a href="compatibility/{IDENTITY}/">'
+            "<strong>Compatibility snapshot:</strong>\n"
+            '        <a href="compatibility/latest/">'
             "Open the real-ledger compatibility website</a>"
         ).encode()
         landing_path = TARGET.parent.parent / "index.html"
@@ -202,7 +203,7 @@ jobs:
         except OSError as error:
             refuse(f"cannot read the installed landing page: {error}")
         if landing_bytes.count(landing_contract) != 1:
-            refuse("landing page does not contain exactly one pinned historical link")
+            refuse("landing page does not contain exactly one compatibility/latest link")
 
 
         with tarfile.open(ARCHIVE, mode="r:gz") as archive:
@@ -406,9 +407,112 @@ jobs:
         if hashlib.sha256("".join(identity_rows).encode()).hexdigest() != RECURSIVE_IDENTITY_SHA256:
             refuse("extracted recursive identity disagrees with the reviewed build")
 
+
+        def tree_inventory(root: Path) -> tuple[tuple[str, str, int, int, str], ...]:
+            root_metadata = root.stat(follow_symlinks=False)
+            if not stat.S_ISDIR(root_metadata.st_mode):
+                refuse(f"published tree root is not a regular directory: {root}")
+
+            inventory = []
+            for path in [root, *sorted(root.rglob("*"))]:
+                relative = "" if path == root else path.relative_to(root).as_posix()
+                metadata = path.stat(follow_symlinks=False)
+                mode = stat.S_IMODE(metadata.st_mode)
+                if stat.S_ISDIR(metadata.st_mode):
+                    inventory.append((relative, "d", mode, 0, ""))
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    refuse(f"published tree contains a link or special file: {relative!r}")
+
+                descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                size = 0
+                sha256 = hashlib.sha256()
+                with os.fdopen(descriptor, "rb") as source:
+                    opened = os.fstat(source.fileno())
+                    if not stat.S_ISREG(opened.st_mode):
+                        refuse(f"published tree file is not regular: {relative!r}")
+                    while chunk := source.read(1 << 20):
+                        size += len(chunk)
+                        sha256.update(chunk)
+                inventory.append((relative, "f", mode, size, sha256.hexdigest()))
+            return tuple(inventory)
+
+
+        def copy_regular_tree(source_root: Path, destination_root: Path) -> None:
+            if destination_root.exists() or destination_root.is_symlink():
+                refuse("latest publication target already exists")
+
+            source_entries = [source_root, *sorted(source_root.rglob("*"))]
+            source_directories = []
+            source_files = []
+            for source in source_entries:
+                metadata = source.stat(follow_symlinks=False)
+                if stat.S_ISDIR(metadata.st_mode):
+                    source_directories.append(source)
+                elif stat.S_ISREG(metadata.st_mode):
+                    source_files.append(source)
+                else:
+                    relative = source.relative_to(source_root).as_posix()
+                    refuse(f"cannot copy link or special publication path: {relative!r}")
+
+            destination_root.mkdir(mode=0o700)
+            for source in sorted(
+                source_directories[1:],
+                key=lambda path: (
+                    len(path.relative_to(source_root).parts),
+                    path.relative_to(source_root).as_posix(),
+                ),
+            ):
+                relative = source.relative_to(source_root)
+                (destination_root / relative).mkdir(mode=0o700)
+
+            for source in source_files:
+                relative = source.relative_to(source_root)
+                destination = destination_root / relative
+                source_descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+                destination_descriptor = os.open(
+                    destination,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o400,
+                )
+                with (
+                    os.fdopen(source_descriptor, "rb") as input_file,
+                    os.fdopen(destination_descriptor, "wb") as output_file,
+                ):
+                    opened = os.fstat(input_file.fileno())
+                    if not stat.S_ISREG(opened.st_mode):
+                        refuse(f"copy source is not a regular file: {relative.as_posix()!r}")
+                    while chunk := input_file.read(1 << 20):
+                        output_file.write(chunk)
+                os.chmod(
+                    destination,
+                    stat.S_IMODE(opened.st_mode),
+                    follow_symlinks=False,
+                )
+
+            for source in sorted(
+                source_directories,
+                key=lambda path: len(path.relative_to(source_root).parts),
+                reverse=True,
+            ):
+                relative = source.relative_to(source_root)
+                destination = destination_root if not relative.parts else destination_root / relative
+                source_mode = stat.S_IMODE(source.stat(follow_symlinks=False).st_mode)
+                os.chmod(destination, source_mode, follow_symlinks=False)
+
+
+        pinned_inventory = tree_inventory(TARGET)
+        copy_regular_tree(TARGET, LATEST)
+        latest_inventory = tree_inventory(LATEST)
+        if latest_inventory != pinned_inventory:
+            refuse(
+                "latest copy differs from the pinned tree in path, type, size, content, or mode"
+            )
+
         print(
             f"verified compatibility website {IDENTITY}: "
-            f"{FILE_COUNT} files, {FILE_BYTES} bytes"
+            f"{FILE_COUNT} files, {FILE_BYTES} bytes; "
+            "published byte-identical pinned and latest trees"
         )
         PY
     - name: Deploy to GitHub Pages
