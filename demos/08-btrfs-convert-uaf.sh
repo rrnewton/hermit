@@ -44,7 +44,8 @@ Useful overrides:
   DEMO08_DIR=/path        asset directory (buggy/, fixed/, pop-tiny.img)
   DEMO08_ARTIFACTS=/path  per-run scratch + saved ASAN report
   DEMO08_CRASH_SEED=N     override the fixture's recorded crashing seed
-  DEMO08_TIMEOUT=90       per-run wall-clock timeout in seconds
+  DEMO08_TIMEOUT=90       per-run wall-clock timeout in seconds; scripts/prepare-demo08-assets.sh
+                          reads the same variable, so a seed is only calibrated if it fits here
   HERMIT_RELEASE=/path    release Hermit binary
   DEMO08_REQUIRE_ASSETS=1 fail instead of skipping when assets are absent
 EOF
@@ -139,6 +140,15 @@ asan_core() {
   grep -aE 'AddressSanitizer: heap-use-after-free|task_period_wait|print_copied_inodes|SUMMARY: AddressSanitizer' "$1" || true
 }
 
+# A partial report proves that ASAN started describing a fault, but not that the
+# guest reached the abort this demo promises to reproduce.  The calibration and
+# the demo deliberately use the same two-part definition of a completed UAF.
+complete_asan_uaf() {
+  local output="$1"
+  grep -qa 'AddressSanitizer: heap-use-after-free' "$output" \
+    && grep -qa 'SUMMARY: AddressSanitizer' "$output"
+}
+
 # hermit chaos invocation validated to reproduce this UAF. --no-virtualize-cpuid
 # because CPUID faulting is unavailable on the demo hosts; --sched-seed selects
 # the interleaving.
@@ -173,16 +183,22 @@ echo
 echo "--- Step 2: chaos buggy, --sched-seed $CRASH_SEED (expect ASAN UAF) ---"
 CHAOS_IMG="$ARTIFACTS/chaos-buggy.img"
 fresh_image "$CHAOS_IMG"
-if chaos_convert "$BUGGY" "$CRASH_SEED" "$CHAOS_IMG" "$ARTIFACTS/chaos-buggy.out"; then
-  echo "unexpected: chaos buggy seed $CRASH_SEED did not crash" >&2
-  echo "(try another seed via DEMO08_CRASH_SEED; the sweep in the experiment" >&2
-  echo " directory records which seeds crash)" >&2
+buggy_rc=0
+chaos_convert "$BUGGY" "$CRASH_SEED" "$CHAOS_IMG" "$ARTIFACTS/chaos-buggy.out" \
+  || buggy_rc=$?
+if [ "$buggy_rc" -ne 134 ]; then
+  echo "chaos buggy seed $CRASH_SEED did not complete with the ASAN abort:" \
+    "rc=$buggy_rc, expected 134" >&2
+  case "$buggy_rc" in
+    0)   echo "rc=0 means the required crash did not occur" >&2 ;;
+    124) echo "rc=124 means the ${TIMEOUT}s timeout cut the run off" >&2 ;;
+    125) echo "rc=125 is a safehermit bound, not a guest crash" >&2 ;;
+  esac
   exit 1
 fi
-if ! grep -qaE 'AddressSanitizer: heap-use-after-free' "$ARTIFACTS/chaos-buggy.out"; then
-  echo "chaos buggy seed $CRASH_SEED exited non-zero without an ASAN UAF report" >&2
-  echo "(likely a ${TIMEOUT}s timeout on a pathologically slow schedule; pick a" >&2
-  echo " different DEMO08_CRASH_SEED)" >&2
+if ! complete_asan_uaf "$ARTIFACTS/chaos-buggy.out"; then
+  echo "chaos buggy seed $CRASH_SEED exited 134 without a complete ASAN UAF report" >&2
+  echo "both the use-after-free line and closing SUMMARY are required" >&2
   exit 1
 fi
 asan_core "$ARTIFACTS/chaos-buggy.out" | tee "$ARTIFACTS/asan-report.txt"
@@ -236,8 +252,16 @@ echo
 # demonstrate replay. Re-copy a fresh ext4 image over the same path.
 echo "--- Step 4: replay --sched-seed $CRASH_SEED, confirm identical crash ---"
 fresh_image "$CHAOS_IMG"
-if chaos_convert "$BUGGY" "$CRASH_SEED" "$CHAOS_IMG" "$ARTIFACTS/chaos-buggy-replay.out"; then
-  echo "unexpected: replay did not crash" >&2
+replay_rc=0
+chaos_convert "$BUGGY" "$CRASH_SEED" "$CHAOS_IMG" "$ARTIFACTS/chaos-buggy-replay.out" \
+  || replay_rc=$?
+if [ "$replay_rc" -ne 134 ]; then
+  echo "replay did not complete with the ASAN abort: rc=$replay_rc, expected 134" >&2
+  exit 1
+fi
+if ! complete_asan_uaf "$ARTIFACTS/chaos-buggy-replay.out"; then
+  echo "replay exited 134 without a complete ASAN UAF report" >&2
+  echo "both the use-after-free line and closing SUMMARY are required" >&2
   exit 1
 fi
 asan_core "$ARTIFACTS/chaos-buggy-replay.out" >"$ARTIFACTS/asan-report-replay.txt"

@@ -155,13 +155,32 @@ suite at an exact Hermit commit, preserves per-demo logs, and stays failed on
 every demo red.
 
 Demo 8 seed calibration writes `ignored/demo08-run/calibration.tsv` plus one
-retained output per attempted seed. Each row records the seed, whether the
+retained output per run. Each row records the seed, whether it came from the
+cache or a cold sweep, which fixture variant ran, whether the
 `print_copied_inodes` progress-thread path engaged, whether ASAN reported the
-planted heap use-after-free, the exit status, and the output path. The summary
-always states `engagement=N/M` and `uaf_hits=H/M`. A cached crash seed is
-replayed and must supply 1/1 engagement evidence; it is never trusted merely
-because the cache file exists. Zero engagement is a refused `NO-RESULT`, not a
-clean sweep.
+planted heap use-after-free (`hit` for report text, `complete` once ASAN's
+closing `SUMMARY` line is present), the exit status, the wall seconds, whether
+the run qualifies as the crash the demo requires, and the output path. The
+`fixed` row carries `n/a` in the qualifies column, because the fixed variant is
+the differential control rather than a candidate crash; read its `exit` and
+`uaf` fields instead. The summary always states `engagement=N/M`,
+`uaf_hits=H/M`, `qualified=Q/M` and `unconfirmed=U`.
+
+Calibration and the demo apply the same success criterion and the same per-run
+wall budget, so the calibration cannot hand the demo a seed the demo refuses.
+Each run is capped at `DEMO08_TIMEOUT` (default 90s, the demo's own budget); a
+`DEMO08_CALIBRATION_TIMEOUT` above that budget is refused outright. A seed
+qualifies only on guest exit 134 with a complete ASAN report, and it is written
+to `.crash-seed` only after the calibration has also replayed it to the same
+abort and run the fixed variant on it cleanly — the two further runs the demo
+performs. A candidate cut off by the budget on either of those runs is not
+persisted and the sweep continues; a candidate that crashes once and not again,
+or a fixed variant that reports the use-after-free, refuses the whole
+calibration rather than searching for a more agreeable seed.
+
+A cached crash seed is replayed and must supply 1/1 engagement evidence; it is
+never trusted merely because the cache file exists. Zero engagement is a
+refused `NO-RESULT`, not a clean sweep.
 
 Run each demo individually so its output and result remain easy to inspect:
 

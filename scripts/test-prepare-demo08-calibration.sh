@@ -83,6 +83,31 @@ cat >"$TMP/runner.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 seed="${1:?seed required}"
+# The third argument is the fixture variant. The calibration confirms a candidate seed by
+# replaying the buggy variant and running the fixed one, so a runner that ignores the variant
+# could not distinguish the demo's crash from its differential control.
+variant="${3:-buggy}"
+
+# Per-(variant, seed) invocation counter, so a mode can answer differently on the sweep run
+# and on the confirmation replay of the same seed.
+count=1
+if [ -n "${DEMO08_TEST_COUNT_DIR:-}" ]; then
+  mkdir -p "$DEMO08_TEST_COUNT_DIR"
+  counter="$DEMO08_TEST_COUNT_DIR/$variant-$seed"
+  [ ! -r "$counter" ] || count=$(($(cat "$counter") + 1))
+  printf '%s\n' "$count" >"$counter"
+fi
+
+abort_with_uaf() {
+  ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 \
+    "${DEMO08_TEST_UAF_BIN:?UAF binary required}"
+}
+
+partial_report() {
+  echo '==123==ERROR: AddressSanitizer: heap-use-after-free on address 0x606000000210'
+  echo 'READ of size 8 at 0x606000000210 thread T1'
+}
+
 case "${DEMO08_TEST_MODE:?mode required}" in
   no-engagement)
     echo 'fixture exited before progress-thread path'
@@ -93,16 +118,52 @@ case "${DEMO08_TEST_MODE:?mode required}" in
     ;;
   planted-uaf)
     printf 'Copy inodes [o] [         0/         1]\r\n'
-    if [ "$seed" = "${DEMO08_TEST_UAF_SEED:?UAF seed required}" ]; then
-      ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 \
-        "${DEMO08_TEST_UAF_BIN:?UAF binary required}"
+    if [ "$variant" = buggy ] && [ "$seed" = "${DEMO08_TEST_UAF_SEED:?UAF seed required}" ]; then
+      abort_with_uaf
     else
       echo 'Conversion complete'
     fi
     ;;
+  replay-timeout)
+    # The candidate crashes on its sweep run and is cut off by the wall budget when the
+    # calibration replays it: a seed the demo would also cut off at DEMO08_TIMEOUT.
+    printf 'Copy inodes [o] [         0/         1]\r\n'
+    if [ "$variant" != buggy ]; then
+      echo 'Conversion complete'
+    elif [ "$count" -eq 1 ]; then
+      abort_with_uaf
+    else
+      partial_report
+      exit 124
+    fi
+    ;;
+  replay-clean)
+    # The candidate crashes once and not again. That is a disagreement between two runs of one
+    # seed, not a budget problem, so the calibration must refuse rather than try another seed.
+    printf 'Copy inodes [o] [         0/         1]\r\n'
+    if [ "$variant" != buggy ]; then
+      echo 'Conversion complete'
+    elif [ "$count" -eq 1 ]; then
+      abort_with_uaf
+    else
+      echo 'Conversion complete'
+    fi
+    ;;
+  fixed-timeout)
+    printf 'Copy inodes [o] [         0/         1]\r\n'
+    if [ "$variant" = buggy ]; then
+      abort_with_uaf
+    else
+      echo 'Conversion incomplete'
+      exit 124
+    fi
+    ;;
+  fixed-uaf)
+    printf 'Copy inodes [o] [         0/         1]\r\n'
+    abort_with_uaf
+    ;;
   uaf-no-engagement)
-    ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 \
-      "${DEMO08_TEST_UAF_BIN:?UAF binary required}"
+    abort_with_uaf
     ;;
   partial-uaf-rc0)
     # The exact shape the review caught in production: engagement, the first lines
@@ -126,8 +187,7 @@ case "${DEMO08_TEST_MODE:?mode required}" in
     ;;
   runner-failure-with-signatures)
     printf 'Copy inodes [o] [         0/         1]\r\n'
-    ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 \
-      "${DEMO08_TEST_UAF_BIN:?UAF binary required}" || true
+    abort_with_uaf || true
     exit 127
     ;;
   *)
@@ -144,6 +204,7 @@ run_prepare() {
     DEMO08_DIR="$assets" \
     DEMO08_BUILD_ROOT="$TMP/build-unused" \
     DEMO08_ARTIFACTS="$artifacts" \
+    DEMO08_TEST_COUNT_DIR="$artifacts/counts" \
     DEMO08_CALIBRATION_SEEDS="$seeds" \
     DEMO08_CALIBRATION_TIMEOUT=1 \
     DEMO08_CALIBRATION_RUNNER="$TMP/runner.sh" \
@@ -227,7 +288,7 @@ partial0_rc=$?
 set -e
 [ "$partial0_rc" -ne 0 ]
 [ ! -f "$assets/.crash-seed" ]
-[ "$(grep -c $'\treached\thit\t0\tno\t' "$artifacts/calibration.tsv")" -eq 2 ]
+[ "$(grep -cE $'\treached\thit\t0\t[0-9]+\tno\t' "$artifacts/calibration.tsv")" -eq 2 ]
 ! grep -q $'\tyes\t' "$artifacts/calibration.tsv"
 # The summary must distinguish report TEXT from a qualifying abort, or a reader
 # sees uaf_hits=2/2 next to a refusal and cannot tell why.
@@ -245,7 +306,7 @@ partial124_rc=$?
 set -e
 [ "$partial124_rc" -ne 0 ]
 [ ! -f "$assets/.crash-seed" ]
-[ "$(grep -c $'\treached\thit\t124\tno\t' "$artifacts/calibration.tsv")" -eq 2 ]
+[ "$(grep -cE $'\treached\thit\t124\t[0-9]+\tno\t' "$artifacts/calibration.tsv")" -eq 2 ]
 grep -q 'uaf_hits=2/2 qualified=0/2' <<<"$partial124_output"
 
 # Falsifiability bracket: seed 1 reaches the path and runs an actual ASAN
@@ -264,9 +325,107 @@ printf '%s\n' "$uaf_output" >"$TMP/cold.log"
 [ "$("$CLASSIFIER" --log "$TMP/cold.log" --force-cold true)" = cold-calibration ]
 fixture=$(sha256sum "$assets/buggy/btrfs-convert" | cut -d' ' -f1)
 [ "$(cat "$assets/.crash-seed")" = "1 $fixture" ]
-grep -q $'^1\tcold\treached\tcomplete\t134\tyes\t' "$artifacts/calibration.tsv"
+grep -qE $'^1\tcold\tbuggy\treached\tcomplete\t134\t[0-9]+\tyes\t' "$artifacts/calibration.tsv"
 grep -q 'AddressSanitizer: heap-use-after-free' \
   "$artifacts/calibration-cold-seed-1.out"
+# The demo replays the same seed and then runs the fixed variant on it. A seed is only
+# persisted after the calibration has observed both, so both rows must be in the report.
+grep -qE $'^1\tcold\tbuggy-replay\treached\tcomplete\t134\t[0-9]+\tyes\t' \
+  "$artifacts/calibration.tsv"
+grep -qE $'^1\tcold\tfixed\treached\tnone\t0\t[0-9]+\tn/a\t' "$artifacts/calibration.tsv"
+grep -q 'AddressSanitizer: heap-use-after-free' \
+  "$artifacts/calibration-confirm-replay-seed-1.out"
+[ "$(wc -l <"$artifacts/calibration.tsv")" -eq 5 ]
+
+# BUDGET PARITY. The demo cuts every run off at DEMO08_TIMEOUT, so a calibration that searches
+# above that budget certifies seeds the demo then refuses at rc=124. Reject the configuration
+# outright rather than producing a seed nobody can use.
+assets="$TMP/assets-budget"
+artifacts="$TMP/artifacts-budget"
+make_assets "$assets"
+set +e
+budget_output="$(DEMO08_TEST_MODE=planted-uaf DEMO08_TEST_UAF_SEED=1 \
+  DEMO08_TEST_UAF_BIN="$TMP/planted-uaf" DEMO08_TIMEOUT=30 env \
+  DEMO08_DIR="$assets" DEMO08_ARTIFACTS="$artifacts" \
+  DEMO08_CALIBRATION_SEEDS=2 DEMO08_CALIBRATION_TIMEOUT=60 \
+  DEMO08_CALIBRATION_RUNNER="$TMP/runner.sh" \
+  DEMO08_CALIBRATION_FIXTURE_MODE=1 DEMO08_CALIBRATION_FIXTURE_ROOT="$TMP" \
+  DEMO08_TEST_COUNT_DIR="$artifacts/counts" \
+  HERMIT_RELEASE="$TMP/not-used-hermit" "$PREP" 2>&1)"
+budget_rc=$?
+set -e
+[ "$budget_rc" -ne 0 ]
+grep -q 'exceeds the demo.s per-run budget' <<<"$budget_output"
+[ ! -e "$assets/.crash-seed" ]
+
+# A seed that crashes on its sweep run and is then cut off by the same budget on its replay is
+# exactly the seed the demo refuses. It must not be written to .crash-seed, and a sweep whose
+# every candidate behaves that way must say so rather than report an absent UAF.
+assets="$TMP/assets-replay-timeout"
+artifacts="$TMP/artifacts-replay-timeout"
+make_assets "$assets"
+set +e
+replay_timeout_output="$(DEMO08_TEST_MODE=replay-timeout \
+  DEMO08_TEST_UAF_BIN="$TMP/planted-uaf" \
+  run_prepare "$assets" "$artifacts" 2 2>&1)"
+replay_timeout_rc=$?
+set -e
+[ "$replay_timeout_rc" -ne 0 ]
+[ ! -e "$assets/.crash-seed" ]
+grep -q 'replayed past the 1s budget' <<<"$replay_timeout_output"
+grep -q 'qualifying seed(s) but confirmed none' <<<"$replay_timeout_output"
+grep -q 'unconfirmed=2' <<<"$replay_timeout_output"
+! grep -q 'no ASAN UAF found' <<<"$replay_timeout_output"
+[ "$(grep -cE $'\tbuggy-replay\treached\thit\t124\t[0-9]+\tno\t' \
+  "$artifacts/calibration.tsv")" -eq 2 ]
+
+# A seed that crashes once and not again is a disagreement between two runs of one seed. That
+# is what the demo exists to expose, so the calibration refuses instead of quietly moving on
+# to a seed that happens to behave.
+assets="$TMP/assets-replay-clean"
+artifacts="$TMP/artifacts-replay-clean"
+make_assets "$assets"
+set +e
+replay_clean_output="$(DEMO08_TEST_MODE=replay-clean \
+  DEMO08_TEST_UAF_BIN="$TMP/planted-uaf" \
+  run_prepare "$assets" "$artifacts" 2 2>&1)"
+replay_clean_rc=$?
+set -e
+[ "$replay_clean_rc" -ne 0 ]
+[ ! -e "$assets/.crash-seed" ]
+grep -q 'did not on its replay' <<<"$replay_clean_output"
+# It must stop at the first candidate rather than sweeping on: seed 0's two rows only.
+[ "$(wc -l <"$artifacts/calibration.tsv")" -eq 3 ]
+
+# The demo's Step 3 differential runs the fixed variant on the same seed. A fixed control the
+# budget cuts off makes the seed unusable; a fixed control that reports the use-after-free is a
+# product finding and must not be swapped away by choosing another seed.
+assets="$TMP/assets-fixed-timeout"
+artifacts="$TMP/artifacts-fixed-timeout"
+make_assets "$assets"
+set +e
+fixed_timeout_output="$(DEMO08_TEST_MODE=fixed-timeout \
+  DEMO08_TEST_UAF_BIN="$TMP/planted-uaf" \
+  run_prepare "$assets" "$artifacts" 1 2>&1)"
+fixed_timeout_rc=$?
+set -e
+[ "$fixed_timeout_rc" -ne 0 ]
+[ ! -e "$assets/.crash-seed" ]
+grep -q 'fixed control on seed 0 ran past the 1s budget' <<<"$fixed_timeout_output"
+grep -q 'unconfirmed=1' <<<"$fixed_timeout_output"
+
+assets="$TMP/assets-fixed-uaf"
+artifacts="$TMP/artifacts-fixed-uaf"
+make_assets "$assets"
+set +e
+fixed_uaf_output="$(DEMO08_TEST_MODE=fixed-uaf \
+  DEMO08_TEST_UAF_BIN="$TMP/planted-uaf" \
+  run_prepare "$assets" "$artifacts" 1 2>&1)"
+fixed_uaf_rc=$?
+set -e
+[ "$fixed_uaf_rc" -ne 0 ]
+[ ! -e "$assets/.crash-seed" ]
+grep -q 'fixed variant reported a use-after-free on seed 0' <<<"$fixed_uaf_output"
 
 # A UAF signature without the progress-thread witness does not qualify a seed.
 assets="$TMP/assets-unbound-uaf"
@@ -334,8 +493,11 @@ set -e
 [ "$forced_cached_rc" -ne 0 ]
 [ "$forced_cached" = cached-seed-replay ]
 [ "$(cat "$assets/.crash-seed")" = "1 $fixture" ]
-grep -q $'^1\tcached\treached\tcomplete\t134\tyes\t' "$artifacts/calibration.tsv"
-[ "$(wc -l <"$artifacts/calibration.tsv")" -eq 2 ]
+grep -qE $'^1\tcached\tbuggy\treached\tcomplete\t134\t[0-9]+\tyes\t' "$artifacts/calibration.tsv"
+grep -qE $'^1\tcached\tbuggy-replay\treached\tcomplete\t134\t[0-9]+\tyes\t' \
+  "$artifacts/calibration.tsv"
+grep -qE $'^1\tcached\tfixed\treached\tnone\t0\t[0-9]+\tn/a\t' "$artifacts/calibration.tsv"
+[ "$(wc -l <"$artifacts/calibration.tsv")" -eq 4 ]
 grep -q 'AddressSanitizer: heap-use-after-free' \
   "$artifacts/calibration-cached-seed-1.out"
 
@@ -353,7 +515,7 @@ cached_refused_rc=$?
 set -e
 [ "$cached_refused_rc" -ne 0 ]
 grep -q 'never executed the guest: 0 of 2 seeds' <<<"$cached_refused_output"
-grep -q $'^1\tcached\tdid-not-reach\tnone\t127\t' "$artifacts/calibration.tsv"
+grep -q $'^1\tcached\tbuggy\tdid-not-reach\tnone\t127\t' "$artifacts/calibration.tsv"
 [ "$(wc -l <"$artifacts/calibration.tsv")" -eq 3 ]
 
 # Missing and conflicting retained evidence are both refused by the exact
