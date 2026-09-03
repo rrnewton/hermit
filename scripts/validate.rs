@@ -5739,17 +5739,18 @@ fn committed_rust_script_producer(root: &Path) -> Result<Step, String> {
     Ok(producers[0].clone())
 }
 
+fn serialized_step(step: &Step) -> String {
+    let mut cfg = DagConfig::default();
+    cfg.steps.push(step.clone());
+    dag_to_json(&cfg)
+}
+
 fn assert_exact_rust_script_producer(
     actual: &Step,
     committed: &Step,
     context: &str,
 ) -> Result<(), String> {
-    let one_step_json = |step: &Step| {
-        let mut cfg = DagConfig::default();
-        cfg.steps.push(step.clone());
-        dag_to_json(&cfg)
-    };
-    if one_step_json(actual) != one_step_json(committed) {
+    if serialized_step(actual) != serialized_step(committed) {
         return Err(format!(
             "{context} changed the committed {RUST_SCRIPT_PRODUCER_TAG} definition; focused plans must copy its command, dependencies, labels, hints, and caps exactly"
         ));
@@ -6197,12 +6198,24 @@ fn assert_single_artifact_pointer_publisher(
 
 #[derive(Clone, Copy, Debug)]
 enum PrivilegedCommandRelation {
-    DeliberatelyDifferent,
+    BuildContract,
+    CpuidContract,
     Identical,
     FullRequiresInstall,
 }
 
 fn assert_privileged_profile_pairs(full: &DagConfig, privileged: &DagConfig) -> Result<(), String> {
+    let mut full_policy = full.clone();
+    let mut privileged_policy = privileged.clone();
+    full_policy.steps.clear();
+    privileged_policy.steps.clear();
+    if dag_to_json(&full_policy) != dag_to_json(&privileged_policy) {
+        return Err(
+            "committed DAG bracket: full and privileged-only selections drifted in their shared document resource policy"
+                .into(),
+        );
+    }
+
     let pairs: [(&str, &str, &str, &[&str], &[&str], PrivilegedCommandRelation); 7] = [
         (
             "privileged build",
@@ -6210,7 +6223,7 @@ fn assert_privileged_profile_pairs(full: &DagConfig, privileged: &DagConfig) -> 
             "privileged-only-build.privileged_tests",
             &["build.e2e_artifact", "build.liteinst_runtime_release", "gate.manifest"],
             &["gate.manifest"],
-            PrivilegedCommandRelation::DeliberatelyDifferent,
+            PrivilegedCommandRelation::BuildContract,
         ),
         (
             "CPUID faulting",
@@ -6218,7 +6231,7 @@ fn assert_privileged_profile_pairs(full: &DagConfig, privileged: &DagConfig) -> 
             "privileged-only-cpuid.faulting",
             &["privileged-build.privileged_tests"],
             &["privileged-only-build.privileged_tests"],
-            PrivilegedCommandRelation::DeliberatelyDifferent,
+            PrivilegedCommandRelation::CpuidContract,
         ),
         (
             "PMU preemption",
@@ -6288,6 +6301,8 @@ fn assert_privileged_profile_pairs(full: &DagConfig, privileged: &DagConfig) -> 
             || full_step.labels.iter().any(|label| label == "privileged")
             || !privileged_step.labels.iter().any(|label| label == "privileged")
             || privileged_step.labels.iter().any(|label| label == "full")
+            || full_step.fail_fast_family.as_deref() != Some(full_tag)
+            || privileged_step.fail_fast_family.as_deref() != Some(privileged_tag)
             || full.steps.iter().any(|step| step.tag() == privileged_tag)
             || privileged.steps.iter().any(|step| step.tag() == full_tag)
         {
@@ -6301,21 +6316,43 @@ fn assert_privileged_profile_pairs(full: &DagConfig, privileged: &DagConfig) -> 
                 privileged_step.deps
             ));
         }
+        let mut normalized_full = full_step.clone();
+        let mut normalized_privileged = privileged_step.clone();
+        for step in [&mut normalized_full, &mut normalized_privileged] {
+            step.group.clear();
+            step.job.clear();
+            step.labels
+                .retain(|label| label != "full" && label != "privileged");
+            step.deps.clear();
+            step.fail_fast_family = None;
+        }
         match relation {
-            PrivilegedCommandRelation::DeliberatelyDifferent => {
+            PrivilegedCommandRelation::BuildContract => {
                 if full_step.cmd == privileged_step.cmd {
                     return Err(format!(
                         "committed DAG bracket: {role} collapsed two deliberately different profile contracts into one command"
                     ));
                 }
+                for step in [&mut normalized_full, &mut normalized_privileged] {
+                    step.cmd.clear();
+                    step.desc.clear();
+                    step.description.clear();
+                    step.cpu_timeout = 0;
+                }
+            }
+            PrivilegedCommandRelation::CpuidContract => {
+                if full_step.cmd == privileged_step.cmd {
+                    return Err(format!(
+                        "committed DAG bracket: {role} collapsed the prebuilt-binary and Cargo execution contracts into one command"
+                    ));
+                }
+                for step in [&mut normalized_full, &mut normalized_privileged] {
+                    step.cmd.clear();
+                    step.description.clear();
+                }
             }
             PrivilegedCommandRelation::Identical => {
-                // JSON preserves both a printf `\\n` escape and a literal newline in a
-                // single-quoted shell argument.  They execute identically, so compare the
-                // commands after putting those two spellings in one form.
-                let full_command = full_step.cmd.replace("\\n", "\n");
-                let privileged_command = privileged_step.cmd.replace("\\n", "\n");
-                if full_command != privileged_command {
+                if full_step.cmd != privileged_step.cmd {
                     return Err(format!(
                         "committed DAG bracket: {role} commands drifted despite identical execution contracts"
                     ));
@@ -6331,7 +6368,14 @@ fn assert_privileged_profile_pairs(full: &DagConfig, privileged: &DagConfig) -> 
                         "committed DAG bracket: {role} commands differ by more than full's required complete-artifact flag"
                     ));
                 }
+                normalized_full.cmd = normalized.clone();
+                normalized_privileged.cmd = normalized;
             }
+        }
+        if serialized_step(&normalized_full) != serialized_step(&normalized_privileged) {
+            return Err(format!(
+                "committed DAG bracket: {role} serialized metadata or resource policy drifted outside its explicit profile contract"
+            ));
         }
     }
     Ok(())
@@ -6351,6 +6395,30 @@ fn committed_graph_invariants(
             .ok_or_else(|| format!("committed DAG bracket: required full step {tag} is absent"))
     };
     assert_privileged_profile_pairs(&full, privileged)?;
+    let mut resource_cap_drift = privileged.clone();
+    *resource_cap_drift
+        .resource_caps
+        .get_mut("manifest_guest")
+        .ok_or("committed DAG bracket: manifest_guest resource cap is absent")? += 1;
+    if assert_privileged_profile_pairs(&full, &resource_cap_drift).is_ok() {
+        return Err(
+            "committed DAG bracket: a planted privileged-only resource-cap drift was accepted"
+                .into(),
+        );
+    }
+    let mut hint_drift = privileged.clone();
+    let hint = hint_drift
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == "privileged-only-pmu.preemption")
+        .ok_or("committed DAG bracket: privileged-only PMU node is absent")?;
+    hint.hint.hard_mem_max_bytes = hint.hint.hard_mem_max_bytes.map(|bytes| bytes + 1);
+    if assert_privileged_profile_pairs(&full, &hint_drift).is_ok() {
+        return Err(
+            "committed DAG bracket: a planted privileged-only resource-hint drift was accepted"
+                .into(),
+        );
+    }
 
     let audits = full
         .steps
@@ -6943,7 +7011,7 @@ fn committed_validation_dag_bracket(root: &Path) -> Result<String, String> {
         ("e2e.manifest_backend_parity_c", 1800),
         ("e2e.manifest_c_programs", 2700),
         ("privileged-build.privileged_tests", 120),
-        ("privileged-only-build.privileged_tests", 600),
+        ("privileged-only-build.privileged_tests", 675),
         ("test.app_strict_verify", 900),
         ("quick.build", 3600),
         ("compat.echo", 120),
@@ -15206,7 +15274,11 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|step| step.group == "cell")
         .ok_or("requalification plan: exact pressure cell is absent")?;
-    if cell.manifest.is_some()
+    if cell.manifest
+        != Some(DagManifest {
+            lane: "portable".into(),
+            category: "applications".into(),
+        })
         || !cell.cmd.contains("--test 'applications/timed-progress-bar'")
         || !cell.cmd.contains("--mode 'verify'")
         || !cell.cmd.contains("--backend 'ptrace'")
@@ -15220,6 +15292,12 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
     {
         return Err(format!(
             "requalification plan: selected pressure cell lost its pressure-owned identity, runtime handoff, or canonical /test workdir: {cell:?}"
+        ));
+    }
+    let result_nodes = selected_manifest_result_nodes(plan.cfg.steps.iter())?;
+    if result_nodes.get(&("portable".into(), "applications".into())) != Some(&cell.tag()) {
+        return Err(format!(
+            "requalification plan: selected pressure cell is not the typed owner of its result rows: {result_nodes:?}"
         ));
     }
 

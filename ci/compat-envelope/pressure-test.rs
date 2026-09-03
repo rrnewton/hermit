@@ -38,6 +38,7 @@ use dagrun::io::dag_to_json;
 use dagrun::model::CmdType;
 use dagrun::model::DEFAULT_CPU_TIMEOUT_MULTIPLIER;
 use dagrun::model::DagConfig;
+use dagrun::model::DagManifest;
 use dagrun::model::ResourceHint;
 use dagrun::model::RunResult;
 use dagrun::model::Step;
@@ -3008,7 +3009,10 @@ fn construct_plan_after_scorecard_check(
                 labels: Vec::new(),
                 cmd,
                 cmdtype: CmdType::Unknown,
-                manifest: None,
+                manifest: Some(DagManifest {
+                    lane: cell.lane.clone(),
+                    category: cell.category.clone(),
+                }),
                 integration_test_binaries: None,
                 deps,
                 // Requalification evidence must exercise the same hermetic
@@ -6579,6 +6583,10 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("repeated exact preparation does not depend on its direct Hermit build".into());
     }
     let repeated_tags: BTreeSet<_> = repeated_cell_steps.iter().map(|step| step.tag()).collect();
+    let expected_repeated_manifest = DagManifest {
+        lane: exact_id.lane.clone(),
+        category: exact_id.category.clone(),
+    };
     for step in &repeated_cell_steps {
         if !step.deps.contains(&preparation_tag)
             || !step.deps.contains(&"setup.manifest_plan".to_string())
@@ -6597,9 +6605,10 @@ fn self_test(root: &Path) -> Result<(), String> {
                 series_run_index(&step.job)
             ))
             || !step.cmd.contains(&format!("/cells/{}/", step.job))
+            || step.manifest.as_ref() != Some(&expected_repeated_manifest)
         {
             return Err(format!(
-                "{} does not share preparation while retaining a unique run ID and result path",
+                "{} does not share preparation while retaining a unique run ID, result path, and typed manifest identity",
                 step.tag()
             ));
         }
