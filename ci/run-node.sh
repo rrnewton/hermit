@@ -105,6 +105,18 @@ if [[ -z $lane || -z $sel ]]; then
 fi
 shift 2
 
+# Both execution paths name one of the two hosted lanes. Keep this validation
+# ahead of every scratch/perf/state write: an edited command must not be able to
+# turn a typo into a plausible run against the unified superset DAG.
+case "$lane" in
+    portable) profile=(portable-only) ;;
+    privileged) profile=(--privileged-only) ;;
+    *)
+        echo "run-node.sh: unknown lane '$lane' (expected portable or privileged)" >&2
+        exit 2
+        ;;
+esac
+
 # Fail closed on anything else. Silently ignoring trailing arguments is what let
 # a swallowed test filter read as a targeted green; see the header.
 append=()
@@ -123,14 +135,6 @@ if (($# > 0)); then
 fi
 
 if ((${#append[@]} == 0)); then
-    case "$lane" in
-        portable) profile=(portable-only) ;;
-        privileged) profile=(--privileged-only) ;;
-        *)
-            echo "run-node.sh: unknown lane '$lane' (expected portable or privileged)" >&2
-            exit 2
-            ;;
-    esac
     extra=(--allow-local-off-the-record-run --selected "$sel" \
         --ignore-selected-deps --no-label-pr --verbose)
     scheduler_width=validate-default
@@ -171,6 +175,50 @@ if ((${#append[@]} > 0)); then
         echo "run-node.sh: '--' requires exactly one node tag, got '$sel'." >&2
         exit 2
     fi
+
+    # `--labels <lane>` selects every directly labelled step PLUS all of its
+    # dependencies. Validate against that same dependency-closed population,
+    # rather than against the whole committed superset or only direct labels.
+    # The latter would wrongly reject shared setup nodes such as gate.manifest;
+    # the former let `privileged` run a portable-only node. This check precedes
+    # creation of scratch, perf, and run-state directories, so a refused command
+    # leaves no state that could be mistaken for an attempted run.
+    RUN_NODE_LANE="$lane" RUN_NODE_TAG="$sel" python3 -c '
+import json, os, sys
+
+source = sys.argv[1]
+lane = os.environ["RUN_NODE_LANE"]
+tag = os.environ["RUN_NODE_TAG"]
+dag = json.load(open(source))
+
+steps = {}
+for step in dag["steps"]:
+    step_tag = "{}.{}".format(step.get("group", ""), step.get("job", ""))
+    if step_tag in steps:
+        sys.exit(f"run-node.sh: duplicate step tag {step_tag!r} in {source}")
+    steps[step_tag] = step
+
+selected = {
+    step_tag for step_tag, step in steps.items()
+    if lane in step.get("labels", [])
+}
+pending = list(selected)
+while pending:
+    current = pending.pop()
+    for dependency in steps[current].get("deps", []):
+        if dependency not in steps:
+            sys.exit(
+                f"run-node.sh: {current!r} names missing dependency {dependency!r} in {source}"
+            )
+        if dependency not in selected:
+            selected.add(dependency)
+            pending.append(dependency)
+
+if tag not in selected:
+    sys.exit(
+        f"run-node.sh: node {tag!r} is not in the selected dependency closure for lane {lane!r}"
+    )
+' "$dag" || exit 2
 fi
 
 quoted=""

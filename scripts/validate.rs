@@ -161,6 +161,18 @@ const REQUALIFICATION_RUN_ID_PLACEHOLDER: &str = "validate-requalification-run-i
 const QUICK_E2E_VERIFY_TIMEOUT_S: i64 = 1800;
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
+const DETCORE_MISC_TEST_PREBUILD_COMMAND: &str = r#"mkdir -p target/ci; tests_misc_json="target/ci/tests-misc.cargo.jsonl.tmp.$$"; tests_misc_pointer_tmp="target/ci/tests-misc.path.tmp.$$"; if ! CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run --message-format=json > "$tests_misc_json"; then exit 1; fi; mapfile -t tests_misc_bins < <(jq -er 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "tests_misc" and .executable != null) | .executable' "$tests_misc_json" | sort -u); if ((${#tests_misc_bins[@]} != 1)); then printf 'privileged build: expected one Cargo-reported tests_misc executable, found %d\n' "${#tests_misc_bins[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_bins[0]}"; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi; printf '%s\n' "$tests_misc" > "$tests_misc_pointer_tmp"; mv -f "$tests_misc_pointer_tmp" target/ci/tests-misc.path; mv -f "$tests_misc_json" target/ci/tests-misc.cargo.jsonl"#;
+const HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND: &str = "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run";
+const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"if [ ! -s target/ci/tests-misc.path ]; then printf 'privileged build: Cargo-reported tests_misc path is missing\n' >&2; exit 1; fi; mapfile -t tests_misc_paths < target/ci/tests-misc.path; if ((${#tests_misc_paths[@]} != 1)); then printf 'privileged build: Cargo-reported tests_misc path must contain exactly one line, found %d\n' "${#tests_misc_paths[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_paths[0]}"; case "$tests_misc" in "$PWD"/target/*) ;; *) printf 'privileged build: Cargo-reported tests_misc path is outside this target directory: %s\n' "$tests_misc" >&2; exit 1 ;; esac; case "${tests_misc##*/}" in tests_misc-*) ;; *) printf 'privileged build: Cargo-reported path does not name tests_misc: %s\n' "$tests_misc" >&2; exit 1 ;; esac; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi"#;
+
+fn full_privileged_test_build_command() -> String {
+    format!(
+        "./ci/run-with-hermit-e2e-artifact.sh --require-install true || exit 1; \
+         {DETCORE_MISC_TEST_PREBUILD_COMMAND}; \
+         {HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND} || exit 1; \
+         {TESTS_MISC_EXECUTABLE_READ_COMMAND}"
+    )
+}
 const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     "CARGO_BUILD_JOBS",
     STEP_STARTED_MONOTONIC_NS_ENV,
@@ -1102,6 +1114,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "300",
                 "./scripts/validate.rs",
                 ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION,
+                SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION,
                 "--only",
                 "portable",
                 "pre.submodules",
@@ -1131,7 +1144,9 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             // This fixture deliberately exercises the pre-driver bootstrap in
             // an independent checkout. It must compile that copied driver with
             // the real rust-script so a missing path dependency remains visible
-            // instead of consuming this checkout's prepared executable.
+            // instead of consuming this checkout's prepared executable. Its
+            // local commit may trail the source repository's moving main ref;
+            // that unrelated freshness relation cannot preempt this bracket.
             .env_remove("HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED")
             .env_remove("HERMIT_RUST_SCRIPT_ARTIFACT_ROOT");
         command
@@ -6051,6 +6066,64 @@ fn select_constructed_steps(
     Ok(())
 }
 
+fn dependency_ancestry_contains(
+    steps: &[Step],
+    dependent: &str,
+    required: &str,
+) -> Result<bool, String> {
+    let by_tag = steps
+        .iter()
+        .map(|step| (step.tag(), step))
+        .collect::<BTreeMap<_, _>>();
+    let start = by_tag
+        .get(dependent)
+        .ok_or_else(|| format!("dependency ancestry: missing dependent {dependent}"))?;
+    let mut seen = BTreeSet::new();
+    let mut pending = start.deps.clone();
+    while let Some(tag) = pending.pop() {
+        if !seen.insert(tag.clone()) {
+            continue;
+        }
+        if tag == required {
+            return Ok(true);
+        }
+        let step = by_tag
+            .get(&tag)
+            .ok_or_else(|| format!("dependency ancestry: {dependent} reaches missing step {tag}"))?;
+        pending.extend(step.deps.iter().cloned());
+    }
+    Ok(false)
+}
+
+fn assert_single_artifact_pointer_publisher(
+    profile: &str,
+    steps: &[Step],
+    expected_publisher: &str,
+) -> Result<(), String> {
+    let publishers = steps
+        .iter()
+        .filter(|step| step.cmd.contains("ci/publish-hermit-e2e-artifact.sh"))
+        .map(Step::tag)
+        .collect::<Vec<_>>();
+    if publishers.len() != 1 || publishers[0] != expected_publisher {
+        return Err(format!(
+            "committed DAG bracket: {profile} must have exactly one Hermit artifact pointer publisher ({expected_publisher}), got {publishers:?}"
+        ));
+    }
+    for consumer in steps.iter().filter(|step| {
+        step.cmd.contains("ci/run-with-hermit-e2e-artifact.sh")
+            || step.cmd.contains("ci/verify-hermit-e2e-artifact.sh")
+    }) {
+        if !dependency_ancestry_contains(steps, &consumer.tag(), expected_publisher)? {
+            return Err(format!(
+                "committed DAG bracket: {profile} artifact consumer {} is not ordered after {expected_publisher}",
+                consumer.tag()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn committed_graph_invariants(
     root: &Path,
     committed: &DagConfig,
@@ -6184,7 +6257,7 @@ fn committed_graph_invariants(
             || consumer.env.contains_key("E2E_ATTEMPT")
             || !consumer.cmd.contains("./ci/run-with-hermit-e2e-artifact.sh ")
             || !consumer.deps.iter().any(|dep| dep == producer)
-            || (lane == "portable" && !consumer.cmd.contains("--require-install"))
+            || !consumer.cmd.contains("--require-install")
         {
             return Err(format!(
                 "committed DAG bracket: {} lost its typed, unique, immutable result contract",
@@ -6194,14 +6267,57 @@ fn committed_graph_invariants(
     }
 
     let privileged_build = find("privileged-build.privileged_tests")?;
-    if privileged_build.deps != ["gate.manifest".to_string()]
-        || !privileged_build.cmd.contains("publish-hermit-e2e-artifact.sh")
-        || !privileged_build.cmd.contains("cargo test -p hermit-detcore --test tests_misc --no-run")
-        || !privileged_build
+    let required_full_build_deps = [
+        "build.e2e_artifact".to_string(),
+        "build.liteinst_runtime_release".to_string(),
+        "gate.manifest".to_string(),
+    ];
+    // JSON decodes the command's `\n` escapes into literal newlines. Keep the
+    // shell contract named once above, then compare its decoded form here so
+    // the executable producer, consumers, and committed DAG cannot drift.
+    let expected_full_build_suffix =
+        full_privileged_test_build_command().replace("\\n", "\n");
+    if privileged_build.deps != required_full_build_deps
+        || !privileged_build.cmd.ends_with(&expected_full_build_suffix)
+        || privileged_build
             .cmd
-            .contains("cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run")
+            .contains("publish-hermit-e2e-artifact.sh")
     {
-        return Err("committed DAG bracket: privileged build no longer publishes its artifact and prebuilds every privileged test binary after the manifest gate".into());
+        return Err("committed DAG bracket: full privileged build must reuse the complete artifact, prebuild and record every exact test binary, and never republish the pointer".into());
+    }
+    assert_single_artifact_pointer_publisher("full", &full.steps, "build.e2e_artifact")?;
+    let mut second_publisher = full.steps.clone();
+    second_publisher
+        .iter_mut()
+        .find(|step| step.tag() == "privileged-build.privileged_tests")
+        .expect("presence checked above")
+        .cmd
+        .push_str("; ./ci/publish-hermit-e2e-artifact.sh a b c");
+    if assert_single_artifact_pointer_publisher(
+        "full planted duplicate",
+        &second_publisher,
+        "build.e2e_artifact",
+    )
+    .is_ok()
+    {
+        return Err("committed DAG bracket: a planted second full artifact pointer publisher was accepted".into());
+    }
+    let mut unordered_consumer = full.steps.clone();
+    let planted = unordered_consumer
+        .iter_mut()
+        .find(|step| step.tag() == "privileged-build.privileged_tests")
+        .expect("presence checked above");
+    planted.deps.retain(|dependency| {
+        dependency != "build.e2e_artifact" && dependency != "build.liteinst_runtime_release"
+    });
+    if assert_single_artifact_pointer_publisher(
+        "full planted unordered consumer",
+        &unordered_consumer,
+        "build.e2e_artifact",
+    )
+    .is_ok()
+    {
+        return Err("committed DAG bracket: a full pointer consumer without publisher ancestry was accepted".into());
     }
     for (tag, producer) in [
         ("privileged-cpuid.faulting", "privileged-build.privileged_tests"),
@@ -6209,26 +6325,135 @@ fn committed_graph_invariants(
         ("privileged-test.cli_kvm", "privileged-build.privileged_tests"),
         ("privileged-test.pmu_buck_chaos_cases", "privileged-pmu.preemption"),
     ] {
-        let step = privileged
+        let step = full
             .steps
             .iter()
             .find(|step| step.tag() == tag)
-            .ok_or_else(|| format!("committed DAG bracket: privileged consumer {tag} is absent"))?;
+            .ok_or_else(|| format!("committed DAG bracket: full privileged consumer {tag} is absent"))?;
         if !step.deps.iter().any(|dep| dep == producer) {
             return Err(format!(
                 "committed DAG bracket: {tag} can run before producer {producer}"
             ));
         }
     }
-    let cpuid = privileged
+    let cpuid = full
         .steps
         .iter()
         .find(|step| step.tag() == "privileged-cpuid.faulting")
         .expect("presence checked above");
-    if !cpuid.cmd.contains("cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact")
-        || cpuid.cmd.contains("--no-run")
+    if cpuid.cmd.contains("cargo ")
+        || !cpuid.cmd.contains("target/ci/tests-misc.path")
+        || !cpuid.cmd.contains("\"$tests_misc\" rdrand_rdseed_is_masked --exact")
     {
-        return Err("committed DAG bracket: privileged CPUID node no longer executes the one prebuilt exact test".into());
+        return Err("committed DAG bracket: full CPUID node no longer executes the one Cargo-recorded prebuilt exact test directly".into());
+    }
+
+    let standalone_build = privileged
+        .steps
+        .iter()
+        .find(|step| step.tag() == "privileged-only-build.privileged_tests")
+        .ok_or("committed DAG bracket: privileged-only standalone builder is absent")?;
+    if standalone_build.deps != ["gate.manifest".to_string()]
+        || !standalone_build
+            .cmd
+            .contains("publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path")
+        || standalone_build.cmd.contains(" target/install_pkg")
+        || !standalone_build
+            .cmd
+            .contains("cargo test -p hermit-detcore --test tests_misc --no-run")
+    {
+        return Err("committed DAG bracket: privileged-only builder must remain gate-only and publish one binary-only artifact before prebuilding its tests".into());
+    }
+    assert_single_artifact_pointer_publisher(
+        "privileged-only",
+        &privileged.steps,
+        "privileged-only-build.privileged_tests",
+    )?;
+    for (tag, producer) in [
+        (
+            "privileged-only-cpuid.faulting",
+            "privileged-only-build.privileged_tests",
+        ),
+        (
+            "privileged-only-pmu.preemption",
+            "privileged-only-build.privileged_tests",
+        ),
+        (
+            "privileged-only-test.cli_kvm",
+            "privileged-only-build.privileged_tests",
+        ),
+        (
+            "privileged-only-test.pmu_buck_chaos_cases",
+            "privileged-only-pmu.preemption",
+        ),
+    ] {
+        let step = privileged
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| {
+                format!("committed DAG bracket: privileged-only consumer {tag} is absent")
+            })?;
+        if !step.deps.iter().any(|dependency| dependency == producer) {
+            return Err(format!(
+                "committed DAG bracket: {tag} can run before producer {producer}"
+            ));
+        }
+    }
+    let privileged_manifest_tags = privileged
+        .steps
+        .iter()
+        .filter(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestRun)
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
+    let privileged_scorecard_deps = privileged
+        .steps
+        .iter()
+        .find(|step| step.tag() == "privileged-scorecard.compatibility")
+        .ok_or("committed DAG bracket: privileged-only scorecard is absent")?
+        .deps
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if privileged_manifest_tags != privileged_scorecard_deps {
+        return Err(format!(
+            "committed DAG bracket: privileged-only scorecard does not depend on every manifest result: expected={privileged_manifest_tags:?} actual={privileged_scorecard_deps:?}"
+        ));
+    }
+    for consumer in privileged.steps.iter().filter(|step| {
+        validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+    }) {
+        if consumer.cmd.contains("--require-install") {
+            return Err(format!(
+                "committed DAG bracket: binary-only privileged consumer {} requires a complete artifact",
+                consumer.tag()
+            ));
+        }
+    }
+    for forbidden in [
+        "build.workspace",
+        "build.runtime_release",
+        "build.e2e_artifact",
+        "build.liteinst_runtime_release",
+    ] {
+        if privileged.steps.iter().any(|step| step.tag() == forbidden) {
+            return Err(format!(
+                "committed DAG bracket: privileged-only closure pulled portable build {forbidden}"
+            ));
+        }
+    }
+    let standalone_cpuid = privileged
+        .steps
+        .iter()
+        .find(|step| step.tag() == "privileged-only-cpuid.faulting")
+        .ok_or("committed DAG bracket: privileged-only CPUID node is absent")?;
+    if !standalone_cpuid
+        .cmd
+        .contains("cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact")
+        || standalone_cpuid.cmd.contains("--no-run")
+        || standalone_cpuid.deps != ["privileged-only-build.privileged_tests".to_string()]
+    {
+        return Err("committed DAG bracket: privileged-only CPUID node no longer uses its standalone Cargo path".into());
     }
     assert_fused_shared_integration_test_resources(&full.steps, &full.resource_caps)?;
     let mut missing_demand = full.steps.clone();
@@ -6593,10 +6818,11 @@ fn committed_validation_dag_bracket(root: &Path) -> Result<String, String> {
     if !privileged
         .steps
         .iter()
-        .any(|step| step.tag() == "privileged-cpuid.faulting")
+        .any(|step| step.tag() == "privileged-only-cpuid.faulting")
     {
         return Err(
-            "committed DAG bracket: privileged selection lost privileged-cpuid.faulting".into(),
+            "committed DAG bracket: privileged selection lost privileged-only-cpuid.faulting"
+                .into(),
         );
     }
     if dagrun::select_steps_by_labels(&committed, &["test.cli".into()]).is_ok() {
@@ -9229,7 +9455,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     // population. A command with any selection token this function does not
     // model must NOT be matched against the bucket accounting.
     let mut transformed = validate_plan::lane_nodes(root, "privileged", "", "gate.manifest")?;
-    let withheld_tag = "privileged-e2e.manifest_backend_parity_c";
+    let withheld_tag = "privileged-only-e2e.manifest_backend_parity_c";
     let shipped = transformed
         .iter()
         .find(|step| step.tag() == withheld_tag)
@@ -9391,7 +9617,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     // THE RETAINED DEPENDENT. A result consumer keeps running with the edge
     // dropped; ANY other dependent refuses the whole run rather than having a
     // prerequisite quietly removed from under it.
-    let gone: BTreeSet<String> = ["privileged-e2e.manifest_backend_parity_c".to_string()]
+    let gone: BTreeSet<String> = ["privileged-only-e2e.manifest_backend_parity_c".to_string()]
         .into_iter()
         .collect();
     let consumer = (
@@ -9400,14 +9626,14 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
          --lanes portable,privileged"
             .to_string(),
         vec![
-            "privileged-e2e.manifest_backend_parity_c".to_string(),
+            "privileged-only-e2e.manifest_backend_parity_c".to_string(),
             "e2e.manifest_util_c".to_string(),
         ],
     );
     let prerequisite = (
         "test.something".to_string(),
         "cargo nextest run -p hermit-detcore".to_string(),
-        vec!["privileged-e2e.manifest_backend_parity_c".to_string()],
+        vec!["privileged-only-e2e.manifest_backend_parity_c".to_string()],
     );
     let unrelated = (
         "lint.rustfmt".to_string(),
@@ -9419,7 +9645,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     if droppable
         != vec![(
             "scorecard.compatibility".to_string(),
-            "privileged-e2e.manifest_backend_parity_c".to_string(),
+            "privileged-only-e2e.manifest_backend_parity_c".to_string(),
         )]
         || !refusals.is_empty()
     {
@@ -9557,10 +9783,13 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
     // bracket is about, and every declaration in every lane parses. A bracket
     // that passed against an empty declaration set would prove nothing.
     let shipped = validate_plan::host_capability_requirements(root)?;
-    if shipped.get("privileged-cpuid.faulting") != Some(&HostCapability::CpuidFaulting) {
+    if shipped.get("privileged-cpuid.faulting") != Some(&HostCapability::CpuidFaulting)
+        || shipped.get("privileged-only-cpuid.faulting")
+            != Some(&HostCapability::CpuidFaulting)
+    {
         return Err(format!(
-            "host capability: ci/dag/validate.json must label privileged-cpuid.faulting with \
-             cpuid-faulting; got {shipped:?}"
+            "host capability: ci/dag/validate.json must label both full and privileged-only \
+             CPUID nodes with cpuid-faulting; got {shipped:?}"
         ));
     }
 
@@ -11276,8 +11505,8 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .map(|(_, cfg)| cfg)
         .ok_or("retry bounds: privileged lane is absent")?;
     for (tag, expected) in [
-        ("privileged-test.pmu_buck_chaos_cases", 6usize),
-        ("privileged-test.cli_kvm", 24usize),
+        ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
+        ("privileged-only-test.cli_kvm", 24usize),
     ] {
         let step = privileged
             .steps
@@ -12167,15 +12396,27 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         std::fs::write(
             e2e_root.join("results.jsonl"),
             "{\"attempt\":1,\"test\":\"applications/example\",\"category\":\"applications\",\"lane\":\"portable\",\"mode\":\"verify\",\"backend\":\"ptrace\",\"outcome\":\"FAIL\"}\n\
-{\"attempt\":2,\"test\":\"applications/example\",\"category\":\"applications\",\"lane\":\"portable\",\"mode\":\"verify\",\"backend\":\"ptrace\",\"outcome\":\"PASS\"}\n",
+{\"attempt\":2,\"test\":\"applications/example\",\"category\":\"applications\",\"lane\":\"portable\",\"mode\":\"verify\",\"backend\":\"ptrace\",\"outcome\":\"PASS\"}\n\
+{\"attempt\":1,\"test\":\"zz/privileged-example\",\"category\":\"applications\",\"lane\":\"privileged\",\"mode\":\"verify\",\"backend\":\"kvm\",\"outcome\":\"PASS\"}\n",
         )
         .map_err(|e| format!("end-of-run summary: cannot write E2E fixture: {e}"))?;
-        let e2e = e2e_test_observations(&e2e_root)?;
-        if e2e.len() != 2
+        let manifest_nodes = BTreeMap::from([
+            (
+                ("portable".to_string(), "applications".to_string()),
+                "e2e.manifest_applications".to_string(),
+            ),
+            (
+                ("privileged".to_string(), "applications".to_string()),
+                "privileged-only-e2e.manifest_applications".to_string(),
+            ),
+        ]);
+        let e2e = e2e_test_observations(&e2e_root, &manifest_nodes)?;
+        if e2e.len() != 3
             || e2e[0].node != "e2e.manifest_applications"
             || e2e[0].id != "applications/example [ptrace/verify]"
             || e2e[0].passed
             || !e2e[1].passed
+            || e2e[2].node != "privileged-only-e2e.manifest_applications"
         {
             return Err(format!(
                 "end-of-run summary: E2E rows did not retain test id, backend, mode, attempt, \
@@ -16458,7 +16699,31 @@ fn collect_e2e_result_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<()
     Ok(())
 }
 
-fn e2e_test_observations(root: &Path) -> Result<Vec<TestAttemptObservation>, String> {
+fn selected_manifest_result_nodes<'a>(
+    steps: impl Iterator<Item = &'a Step>,
+) -> Result<BTreeMap<(String, String), String>, String> {
+    let mut nodes = BTreeMap::new();
+    for step in steps {
+        let Some(manifest) = &step.manifest else {
+            continue;
+        };
+        let key = (manifest.lane.clone(), manifest.category.clone());
+        if let Some(previous) = nodes.insert(key.clone(), step.tag()) {
+            return Err(format!(
+                "selected plan has two manifest nodes for lane {}, category {}: {previous} and {}",
+                key.0,
+                key.1,
+                step.tag()
+            ));
+        }
+    }
+    Ok(nodes)
+}
+
+fn e2e_test_observations(
+    root: &Path,
+    manifest_nodes: &BTreeMap<(String, String), String>,
+) -> Result<Vec<TestAttemptObservation>, String> {
     let mut files = Vec::new();
     collect_e2e_result_files(root, &mut files)?;
     files.sort();
@@ -16499,19 +16764,17 @@ fn e2e_test_observations(root: &Path) -> Result<Vec<TestAttemptObservation>, Str
                     file.display(), line_number + 1
                 ));
             }
-            let group = match lane {
-                "portable" => "e2e",
-                "privileged" => "privileged-e2e",
-                _ => {
-                    return Err(format!(
-                        "{}:{} has unrecognized lane {lane}",
-                        file.display(), line_number + 1
-                    ));
-                }
-            };
-            let category = category.replace('-', "_");
+            let node = manifest_nodes
+                .get(&(lane.to_string(), category.to_string()))
+                .ok_or_else(|| {
+                    format!(
+                        "{}:{} has no selected manifest node for lane {lane}, category {category}",
+                        file.display(),
+                        line_number + 1
+                    )
+                })?;
             observations.push(TestAttemptObservation {
-                node: format!("{group}.manifest_{category}"),
+                node: node.clone(),
                 attempt,
                 id,
                 passed: outcome == "PASS",
@@ -18978,7 +19241,13 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             );
         }
     }
-    match e2e_test_observations(&e2e_result_root) {
+    let manifest_nodes = selected_manifest_result_nodes(
+        plan.cfg
+            .steps
+            .iter()
+            .chain(plan.second.iter().flat_map(|config| config.steps.iter())),
+    );
+    match manifest_nodes.and_then(|nodes| e2e_test_observations(&e2e_result_root, &nodes)) {
         Ok(mut observations) => test_observations.append(&mut observations),
         Err(error) => test_summary_errors.push(format!(
             "individual E2E test ids could not be read from the per-cell results: {error}; \
@@ -19314,6 +19583,165 @@ fn stop_test_seam(
         s.ledger = Some(ledger);
     }
     s
+}
+
+#[cfg(test)]
+mod full_privileged_build_tests {
+    use super::*;
+
+    fn write_executable(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn cold_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let cargo_log = root.path().join("cargo-calls");
+        write_executable(
+            &root.path().join("ci/run-with-hermit-e2e-artifact.sh"),
+            "#!/bin/sh\nset -eu\n[ \"$1\" = --require-install ]\nshift\nexec \"$@\"\n",
+        );
+        write_executable(
+            &root.path().join("bin/cargo"),
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$CARGO_CALL_LOG"
+case "$*" in
+  "test -p hermit-detcore --test tests_misc --no-run --message-format=json")
+    case "${CARGO_ARTIFACT_MODE:-current}" in
+      current)
+        artifact="$PWD/target/debug/build/hermit-detcore/cold/out/tests_misc-cold-fixture"
+        mkdir -p "$(dirname "$artifact")"
+        : > "$artifact"
+        chmod 700 "$artifact"
+        ;;
+      missing)
+        artifact="$PWD/target/debug/build/hermit-detcore/cold/out/tests_misc-missing"
+        ;;
+      wrong)
+        artifact="$PWD/target/debug/hermit"
+        mkdir -p "$(dirname "$artifact")"
+        : > "$artifact"
+        chmod 700 "$artifact"
+        ;;
+      ambiguous)
+        artifact="$PWD/target/debug/build/hermit-detcore/one/out/tests_misc-one"
+        second="$PWD/target/debug/build/hermit-detcore/two/out/tests_misc-two"
+        mkdir -p "$(dirname "$artifact")" "$(dirname "$second")"
+        : > "$artifact"
+        : > "$second"
+        chmod 700 "$artifact" "$second"
+        printf '{"reason":"compiler-artifact","profile":{"test":true},"target":{"name":"tests_misc"},"executable":"%s"}\n' "$second"
+        ;;
+      *)
+        exit 65
+        ;;
+    esac
+    printf '{"reason":"compiler-artifact","profile":{"test":true},"target":{"name":"tests_misc"},"executable":"%s"}\n' "$artifact"
+    ;;
+  "test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run")
+    :
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#,
+        );
+        let bin = root.path().join("bin");
+        (root, bin, cargo_log)
+    }
+
+    fn run_build(
+        command: &str,
+        root: &Path,
+        bin: &Path,
+        cargo_log: &Path,
+        artifact_mode: &str,
+    ) -> std::process::ExitStatus {
+        let mut path = vec![bin.to_path_buf()];
+        if let Some(existing) = std::env::var_os("PATH") {
+            path.extend(std::env::split_paths(&existing));
+        }
+        Command::new("bash")
+            .arg("-c")
+            .arg(command)
+            .current_dir(root)
+            .env("PATH", std::env::join_paths(path).unwrap())
+            .env("CARGO_CALL_LOG", cargo_log)
+            .env("CARGO_ARTIFACT_MODE", artifact_mode)
+            .status()
+            .unwrap()
+    }
+
+    #[test]
+    fn full_privileged_build_records_one_tests_misc_binary_before_consumers() {
+        let command = full_privileged_test_build_command();
+        assert!(command.starts_with("./ci/run-with-hermit-e2e-artifact.sh --require-install true"));
+        assert!(!command.contains("publish-hermit-e2e-artifact.sh"));
+        let missing_producer =
+            command.replacen(&format!("{DETCORE_MISC_TEST_PREBUILD_COMMAND}; "), "", 1);
+        assert_ne!(missing_producer, command);
+
+        let (old_root, old_bin, old_log) = cold_fixture();
+        assert!(
+            !run_build(
+                &missing_producer,
+                old_root.path(),
+                &old_bin,
+                &old_log,
+                "current",
+            )
+            .success(),
+            "a missing producer must fail rather than consume a missing tests_misc binary"
+        );
+        assert!(!old_root.path().join("target/ci/tests-misc.path").exists());
+
+        let (fixed_root, fixed_bin, fixed_log) = cold_fixture();
+        assert!(
+            run_build(
+                &command,
+                fixed_root.path(),
+                &fixed_bin,
+                &fixed_log,
+                "current",
+            )
+            .success()
+        );
+        assert!(
+            fixed_root
+                .path()
+                .join("target/debug/build/hermit-detcore/cold/out/tests_misc-cold-fixture")
+                .is_file()
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixed_root.path().join("target/ci/tests-misc.path")).unwrap(),
+            format!(
+                "{}/target/debug/build/hermit-detcore/cold/out/tests_misc-cold-fixture\n",
+                fixed_root.path().display()
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixed_log).unwrap(),
+            format!(
+                "test -p hermit-detcore --test tests_misc --no-run --message-format=json\n{}\n",
+                HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND
+                    .strip_prefix("CARGO_BUILD_JOBS=8 cargo ")
+                    .unwrap()
+            )
+        );
+
+        for mode in ["missing", "wrong", "ambiguous"] {
+            let (root, bin, log) = cold_fixture();
+            assert!(
+                !run_build(&command, root.path(), &bin, &log, mode).success(),
+                "the full build must refuse Cargo artifact mode {mode}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

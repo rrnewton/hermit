@@ -86,6 +86,12 @@ expect_refusal "'--' under \$CI" \
 expect_refusal "'--' under \$GITHUB_ACTIONS" \
     "refused in CI" \
     env GITHUB_ACTIONS=true "$RUN_NODE" "$LANE" "$NODE" -- --some-flag
+expect_refusal "'--' with an unknown lane" \
+    "unknown lane 'unknown'" \
+    "$RUN_NODE" unknown "$NODE" -- --some-flag
+expect_refusal "'--' with a node outside the requested lane" \
+    "not in the selected dependency closure for lane 'privileged'" \
+    "$RUN_NODE" privileged compat.echo -- --some-flag
 
 # Positive control for the whole file: the trailing-argument refusal must also
 # still print usage, so the operator is told the supported form rather than only
@@ -180,6 +186,41 @@ else
   actual:   $suffix"
     else
         printf 'run-node-args-test: ok — one node command extended by %s\n' "$suffix"
+    fi
+fi
+
+# Label selection is dependency-closed, so a shared producer without the
+# `privileged` label is still a legitimate privileged-lane target. This is the
+# positive half of the cross-lane refusal above: checking direct labels instead
+# of the closure would refuse gate.manifest even though every privileged
+# manifest node depends on it.
+dependency_node=gate.manifest
+dependency_cmd=$(RUN_NODE_PRINT_ONLY=1 run_local \
+    "$RUN_NODE" privileged "$dependency_node" -- --version 2>/dev/null)
+status=$?
+if ((status != 0)); then
+    fail "a legitimate privileged dependency node was refused: exit $status"
+else
+    dependency_tracked=$(python3 -c '
+import json, sys
+dag = json.load(open(sys.argv[1]))
+tag = sys.argv[2]
+hits = [s for s in dag["steps"]
+        if "{}.{}".format(s.get("group", ""), s.get("job", "")) == tag]
+if len(hits) != 1:
+    sys.exit("expected exactly one step tagged {}, found {}".format(tag, len(hits)))
+print(hits[0]["cmd"])
+' "$DAG" "$dependency_node") || {
+        fail "could not read the tracked command for $dependency_node"
+        dependency_tracked=
+    }
+    if [[ -n $dependency_tracked && $dependency_cmd == "$dependency_tracked"* \
+        && $dependency_cmd != "$dependency_tracked" ]]; then
+        printf 'run-node-args-test: ok — a dependency-only node remains selectable in its lane closure\n'
+    else
+        fail "the dependency-closure positive control did not extend the tracked command.
+  tracked: $dependency_tracked
+  edited:  $dependency_cmd"
     fi
 fi
 
@@ -278,4 +319,4 @@ if ((failures > 0)); then
     printf 'run-node-args-test: %d check(s) FAILED\n' "$failures" >&2
     exit 1
 fi
-printf 'run-node-args-test: OK — 5 reasoned refusals, 1 usage check, 1 real CI selection, scheduler-width default and override, 1 single-node edit, label forwarding/refusal, no resource-policy drift\n'
+printf 'run-node-args-test: OK — 7 reasoned refusals, 1 usage check, 1 real CI selection, scheduler-width default and override, 2 single-node edits (including dependency closure), label forwarding/refusal, no resource-policy drift\n'

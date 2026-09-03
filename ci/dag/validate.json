@@ -7980,14 +7980,15 @@
     {
       "group": "privileged-build",
       "job": "privileged_tests",
-      "desc": "Build Hermit and the focused test binaries used by the privileged lane",
-      "description": "MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which MISSED this privileged-lane build node): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 on all three Cargo commands (was unset -> cargo defaulted build phases to nproc; that cc1plus fan-out is the OOM class the pin bounds; the job-pin is the actual fix). The final command prebuilds the exact cli and hermit_modes integration binaries consumed by the privileged test nodes, so their wall budgets measure test execution instead of Cargo compilation or target-lock waiting. After the bin build, the content-addressed publisher verifies source type/mode/size, hashes before and after copying, verifies the published hash and atomically updates the pointer before any later Cargo invocation can relink target/debug/hermit. This privileged lane deliberately publishes a binary-only artifact; unlike portable DBT/SaBRe/LiteInst cells, it does not consume install_pkg resources. Cap KEPT at the existing generous 8.0GiB: a warm/incremental measurement read peak_bytes~1.64GiB @j8, but that reused build.workspace artifacts and UNDER-estimates a cold from-scratch privileged build, so the 8.0GiB headroom is retained rather than tightened on an unreliable warm figure. rss_baseline=5.0GiB (scheduling reservation). hermit@b384187e.",
+      "desc": "Verify the complete Hermit artifact and prebuild the focused privileged test binaries",
+      "description": "FULL-PROFILE CONTRACT: build.e2e_artifact is the one pointer publisher and includes the backend-resource bundle. This node runs only after that complete immutable barrier and the staged release LiteInst runtime, verifies that the pointer resolves to a complete bundle, then prebuilds the exact tests_misc, cli, and hermit_modes binaries needed by the privileged part of full validation. Cargo's compiler-artifact record, not a reconstructed target/debug path, identifies tests_misc; the path is validated before the CPUID consumer executes it directly. This node never republishes the pointer. The separate privileged-only node retains its standalone binary-only publication contract.",
       "labels": [
-        "full",
-        "privileged"
+        "full"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run && CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install true || exit 1; mkdir -p target/ci; tests_misc_json=\"target/ci/tests-misc.cargo.jsonl.tmp.$$\"; tests_misc_pointer_tmp=\"target/ci/tests-misc.path.tmp.$$\"; if ! CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run --message-format=json > \"$tests_misc_json\"; then exit 1; fi; mapfile -t tests_misc_bins < <(jq -er 'select(.reason == \"compiler-artifact\" and .profile.test == true and .target.name == \"tests_misc\" and .executable != null) | .executable' \"$tests_misc_json\" | sort -u); if ((${#tests_misc_bins[@]} != 1)); then printf 'privileged build: expected one Cargo-reported tests_misc executable, found %d\n' \"${#tests_misc_bins[@]}\" >&2; exit 1; fi; tests_misc=\"${tests_misc_bins[0]}\"; if [ ! -f \"$tests_misc\" ] || [ -L \"$tests_misc\" ] || [ ! -x \"$tests_misc\" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' \"$tests_misc\" >&2; exit 1; fi; printf '%s\n' \"$tests_misc\" > \"$tests_misc_pointer_tmp\"; mv -f \"$tests_misc_pointer_tmp\" target/ci/tests-misc.path; mv -f \"$tests_misc_json\" target/ci/tests-misc.cargo.jsonl; CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run || exit 1; if [ ! -s target/ci/tests-misc.path ]; then printf 'privileged build: Cargo-reported tests_misc path is missing\n' >&2; exit 1; fi; mapfile -t tests_misc_paths < target/ci/tests-misc.path; if ((${#tests_misc_paths[@]} != 1)); then printf 'privileged build: Cargo-reported tests_misc path must contain exactly one line, found %d\n' \"${#tests_misc_paths[@]}\" >&2; exit 1; fi; tests_misc=\"${tests_misc_paths[0]}\"; case \"$tests_misc\" in \"$PWD\"/target/*) ;; *) printf 'privileged build: Cargo-reported tests_misc path is outside this target directory: %s\n' \"$tests_misc\" >&2; exit 1 ;; esac; case \"${tests_misc##*/}\" in tests_misc-*) ;; *) printf 'privileged build: Cargo-reported path does not name tests_misc: %s\n' \"$tests_misc\" >&2; exit 1 ;; esac; if [ ! -f \"$tests_misc\" ] || [ -L \"$tests_misc\" ] || [ ! -x \"$tests_misc\" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' \"$tests_misc\" >&2; exit 1; fi",
       "deps": [
+        "build.e2e_artifact",
+        "build.liteinst_runtime_release",
         "gate.manifest"
       ],
       "env": {},
@@ -8018,10 +8019,9 @@
       "description": "REQUIRES A MACHINE FACILITY, DECLARED 2026-08-12 (hermit#2135, hermit#2148, hermit#2205). rdrand_rdseed_is_masked can only observe Detcore masking host feature bits if the kernel can trap the guest's CPUID, which needs arch_prctl(ARCH_SET_CPUID, 0) to succeed. Where it cannot, this node used to FAIL in 0.11 s with exit 101 and an empty detail block -- indistinguishable from a broken build -- and its eager-exit aborted the twelve other in-flight nodes and filtered twenty-seven more, so a machine that runs 31 of 33 nodes in 3m22s produced no receipt at all. `requires_host_capability` moves that judgement OUT of the node, to an out-of-band probe run during plan construction, and makes the outcome a third recorded state: host-inapplicable, which is neither a pass nor a failure and is written to the ledger as a typed intentional skip. THIS DOES NOT WEAKEN THE TEST. Where the capability is present the node runs unchanged and its assertions keep full force; the probe fails closed toward running, so a probe error or an unexpected errno still runs it. The capability name is checked against the closed vocabulary in scripts/lib/validate_plan.rs::HostCapability, and an unknown name refuses the whole run.",
       "labels": [
         "full",
-        "privileged",
         "cpuid-faulting"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; status=0; timeout --kill-after=5s 30s cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact || status=$?; if [ \"$status\" -eq 124 ] || [ \"$status\" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact Cargo timeout: exit %s)\\n' \"$status\" >&2; fi; exit \"$status\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; if [ ! -s target/ci/tests-misc.path ]; then printf 'privileged build: Cargo-reported tests_misc path is missing\n' >&2; exit 1; fi; mapfile -t tests_misc_paths < target/ci/tests-misc.path; if ((${#tests_misc_paths[@]} != 1)); then printf 'privileged build: Cargo-reported tests_misc path must contain exactly one line, found %d\n' \"${#tests_misc_paths[@]}\" >&2; exit 1; fi; tests_misc=\"${tests_misc_paths[0]}\"; case \"$tests_misc\" in \"$PWD\"/target/*) ;; *) printf 'privileged build: Cargo-reported tests_misc path is outside this target directory: %s\n' \"$tests_misc\" >&2; exit 1 ;; esac; case \"${tests_misc##*/}\" in tests_misc-*) ;; *) printf 'privileged build: Cargo-reported path does not name tests_misc: %s\n' \"$tests_misc\" >&2; exit 1 ;; esac; if [ ! -f \"$tests_misc\" ] || [ -L \"$tests_misc\" ] || [ ! -x \"$tests_misc\" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' \"$tests_misc\" >&2; exit 1; fi; status=0; timeout --kill-after=5s 30s \"$tests_misc\" rdrand_rdseed_is_masked --exact || status=$?; if [ \"$status\" -eq 124 ] || [ \"$status\" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact binary timeout: exit %s)\n' \"$status\" >&2; fi; exit \"$status\"",
       "deps": [
         "privileged-build.privileged_tests"
       ],
@@ -8049,8 +8049,7 @@
       "desc": "PMU smoke: retired-conditional-branch overflow delivery and skid measurement",
       "description": "",
       "labels": [
-        "full",
-        "privileged"
+        "full"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cc -O2 -Wall -Wextra -Werror tests/util/pmu_skid.c -o target/ci-pmu-skid && timeout 20 target/ci-pmu-skid --iterations 16 --period 100000",
       "deps": [
@@ -8080,8 +8079,7 @@
       "desc": "Run the six measured-passing Buck chaos cases under PMU preemption",
       "description": "The six enabled cases passed direct measurement on the privileged host. chaos_buck_nanosleep_parallel remains ignored because an interrupted nanosleep reports EINTR; chaos_buck_mem_race remains ignored because it produced no verdict within 300 seconds. Both remain visible in super.pmu_buck_chaos_cases. Depending on pmu.preemption keeps this coverage in the existing privileged PMU partition without changing quick or portable-only.",
       "labels": [
-        "full",
-        "privileged"
+        "full"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; NEXTEST_EXPECTED_EXECUTED=6 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit \"$status\"",
       "integration_test_binaries": [
@@ -8147,10 +8145,9 @@
       "desc": "Privileged manifest bucket: applications",
       "description": "The selected KVM application cell has a measured 60 s individual timeout and 10 s TERM/KILL grace. A 180 s node leaves 110 s for fixture/reporting work, so the named inner timeout wins without tightening a load-sensitive test.",
       "labels": [
-        "full",
-        "privileged"
+        "full"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_applications/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane privileged --category applications --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_applications/junit.xml\"",
       "manifest": {
         "lane": "privileged",
         "category": "applications"
@@ -8184,10 +8181,9 @@
       "desc": "Privileged manifest bucket: backend-parity-c",
       "description": "",
       "labels": [
-        "full",
-        "privileged"
+        "full"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_backend_parity_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_backend_parity_c/junit.xml\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_backend_parity_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_backend_parity_c/junit.xml\"",
       "manifest": {
         "lane": "privileged",
         "category": "backend-parity-c"
@@ -8222,7 +8218,6 @@
       "description": "Runs all KVM-specific hermit CLI tests on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource.",
       "labels": [
         "full",
-        "privileged",
         "kvm"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; NEXTEST_EXPECTED_EXECUTED=24 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
@@ -8251,6 +8246,243 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "privileged-test.cli_kvm"
+    },
+    {
+      "group": "privileged-only-build",
+      "job": "privileged_tests",
+      "desc": "Build Hermit and the focused test binaries used by the privileged-only lane",
+      "description": "PRIVILEGED-ONLY CONTRACT: this standalone lane has no portable build producer. It builds Hermit, publishes one binary-only content-addressed artifact, and prebuilds the exact tests_misc, cli, and hermit_modes binaries consumed by its nodes. The full profile uses the separate privileged-build.privileged_tests node, which reuses the complete artifact and never republishes this pointer.",
+      "labels": [
+        "privileged"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run && CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run",
+      "deps": [
+        "gate.manifest"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "cpu_timeout": 120,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {
+          "integration_test_binaries.cli": 1,
+          "integration_test_binaries.hermit_modes": 1
+        },
+        "est_duration_s": 60.0,
+        "rss_baseline_bytes": 5368709120,
+        "hard_mem_max_bytes": 8589934592,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "privileged-only-build.privileged_tests"
+    },
+    {
+      "group": "privileged-only-cpuid",
+      "job": "faulting",
+      "desc": "CPUID-faulting smoke: Detcore masks host RDRAND/RDSEED feature bits",
+      "description": "REQUIRES A MACHINE FACILITY, DECLARED 2026-08-12 (hermit#2135, hermit#2148, hermit#2205). The privileged-only lane executes the exact test through Cargo after its standalone builder prebuilds tests_misc. The full profile has a separate node that executes the Cargo-recorded binary directly.",
+      "labels": [
+        "privileged",
+        "cpuid-faulting"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; status=0; timeout --kill-after=5s 30s cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact || status=$?; if [ \"$status\" -eq 124 ] || [ \"$status\" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact Cargo timeout: exit %s)\n' \"$status\" >&2; fi; exit \"$status\"",
+      "deps": [
+        "privileged-only-build.privileged_tests"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "cpu_timeout": 40,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 15.0,
+        "rss_baseline_bytes": 8589934592,
+        "hard_mem_max_bytes": 17179869184,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "privileged-only-cpuid.faulting"
+    },
+    {
+      "group": "privileged-only-pmu",
+      "job": "preemption",
+      "desc": "PMU smoke: retired-conditional-branch overflow delivery and skid measurement",
+      "description": "",
+      "labels": [
+        "privileged"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cc -O2 -Wall -Wextra -Werror tests/util/pmu_skid.c -o target/ci-pmu-skid && timeout 20 target/ci-pmu-skid --iterations 16 --period 100000",
+      "deps": [
+        "privileged-only-build.privileged_tests"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "cpu_timeout": 30,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 5.0,
+        "rss_baseline_bytes": 8589934592,
+        "hard_mem_max_bytes": 17179869184,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "privileged-only-pmu.preemption"
+    },
+    {
+      "group": "privileged-only-test",
+      "job": "pmu_buck_chaos_cases",
+      "desc": "Run the six measured-passing Buck chaos cases under PMU preemption",
+      "description": "The six enabled cases passed direct measurement on the privileged host. chaos_buck_nanosleep_parallel remains ignored because an interrupted nanosleep reports EINTR; chaos_buck_mem_race remains ignored because it produced no verdict within 300 seconds. Both remain visible in super.pmu_buck_chaos_cases. Depending on the privileged-only PMU probe keeps this coverage in the existing privileged partition without pulling portable builds into that profile.",
+      "labels": [
+        "privileged"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; NEXTEST_EXPECTED_EXECUTED=6 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit \"$status\"",
+      "integration_test_binaries": [
+        "hermit_modes"
+      ],
+      "deps": [
+        "privileged-only-pmu.preemption"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "cpu_timeout": 120,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {
+          "integration_test_binaries.hermit_modes": 1
+        },
+        "est_duration_s": 45.0,
+        "rss_baseline_bytes": 8589934592,
+        "hard_mem_max_bytes": 17179869184,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "privileged-only-test.pmu_buck_chaos_cases"
+    },
+    {
+      "group": "privileged-only-e2e",
+      "job": "manifest_applications",
+      "desc": "Privileged manifest bucket: applications",
+      "description": "The selected KVM application cell has a measured 60 s individual timeout and 10 s TERM/KILL grace. A 180 s node leaves 110 s for fixture/reporting work, so the named inner timeout wins without tightening a load-sensitive test.",
+      "labels": [
+        "privileged"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_applications/junit.xml\"",
+      "manifest": {
+        "lane": "privileged",
+        "category": "applications"
+      },
+      "deps": [
+        "privileged-only-build.privileged_tests",
+        "privileged-build.manifest_guests",
+        "gate.manifest"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "cpu_timeout": 180,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 90.0,
+        "rss_baseline_bytes": 8589934592,
+        "hard_mem_max_bytes": 17179869184,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "privileged-only-e2e.manifest_applications"
+    },
+    {
+      "group": "privileged-only-e2e",
+      "job": "manifest_backend_parity_c",
+      "desc": "Privileged manifest bucket: backend-parity-c",
+      "description": "",
+      "labels": [
+        "privileged"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_backend_parity_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_backend_parity_c/junit.xml\"",
+      "manifest": {
+        "lane": "privileged",
+        "category": "backend-parity-c"
+      },
+      "deps": [
+        "privileged-only-build.privileged_tests",
+        "privileged-build.manifest_guests",
+        "gate.manifest"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "cpu_timeout": 120,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 5.0,
+        "rss_baseline_bytes": 8589934592,
+        "hard_mem_max_bytes": 17179869184,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "privileged-only-e2e.manifest_backend_parity_c"
+    },
+    {
+      "group": "privileged-only-test",
+      "job": "cli_kvm",
+      "desc": "All 24 run_kvm_ CLI tests",
+      "description": "Runs all KVM-specific hermit CLI tests on the privileged-only lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource.",
+      "labels": [
+        "privileged",
+        "kvm"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; NEXTEST_EXPECTED_EXECUTED=24 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
+      "integration_test_binaries": [
+        "cli"
+      ],
+      "deps": [
+        "privileged-only-build.privileged_tests"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "cpu_timeout": 180,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {
+          "integration_test_binaries.cli": 1
+        },
+        "est_duration_s": 60.0,
+        "rss_baseline_bytes": 8589934592,
+        "hard_mem_max_bytes": 17179869184,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "privileged-only-test.cli_kvm"
     },
     {
       "group": "full-scorecard",
@@ -8348,8 +8580,8 @@
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/compat-envelope/scorecard.rs verify-results --results \"$E2E_RESULT_ROOT\" --lanes privileged",
       "deps": [
-        "privileged-e2e.manifest_applications",
-        "privileged-e2e.manifest_backend_parity_c"
+        "privileged-only-e2e.manifest_applications",
+        "privileged-only-e2e.manifest_backend_parity_c"
       ],
       "env": {},
       "networkonly": false,

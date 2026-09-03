@@ -18,8 +18,8 @@ it is.
 the outer validate scope. This is the same idea widened to every rung,
 including the ones that script does not cover.
 
-All values measured 2026-08-26 against `rrnewton/hermit` `main`
-`f77d7c44067a12ba11e75b5a85864ce0bc23e8f4`. Re-measure before quoting them; the
+The deployed-policy counts below were re-measured 2026-09-02 from the committed
+DAG in the same revision as this document. Re-measure before quoting them; the
 point of this file is the *structure*, and the numbers move.
 
 ## What each rung bounds
@@ -37,7 +37,8 @@ agreeing with each other.
 | manifest fixture `timeout_seconds` | fixture preparation for **one manifest cell** | `tests/e2e/manifests/*.yaml`, per cell | the harness stops the preparation process group after the wall deadline | preparation error |
 | manifest cell CPU budget | all post-preparation attempts or seeds for **one manifest cell** | the same resolved `timeout_seconds` value | the harness stops the current process group after aggregate live CPU reaches the budget | timeout with `error_kind=cpu-timeout` |
 | manifest cell wall backstop | the same post-preparation population when it stops consuming CPU | three times the resolved cell CPU budget | the harness stops the current process group | timeout with `error_kind=wall-timeout` |
-| dagrun step `timeout` | **one DAG node**, i.e. a whole batch of cells or tests | `ci/dag/validate.json` | dagrun stops the step | node failure |
+| dagrun step `cpu_timeout` | **CPU consumed by one DAG node's whole cgroup**, including descendants | `ci/dag/validate.json`; every committed validation step declares one | dagrun stops the step when cgroup CPU reaches the platform-scaled budget | `CPU-TIMEOUT >Ns cpu`, node failure |
+| dagrun step wall backstop | elapsed wall time for that same DAG node | explicit step/document `timeout`, otherwise `max(1800s, 3 × platform-scaled cpu_timeout)` | dagrun stops a node that is not consuming enough CPU to reach its primary budget | `TIMEOUT >Ns`, node failure |
 | validate run budget | the whole outer validate graph | `HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS` or `--run-timeout` | dagrun stops admitting work and records unfinished nodes | incomplete validation, with named unfinished nodes |
 | validate systemd scope | the same outer run plus teardown grace | validate's safe-ci scope | systemd stops the whole process tree | outer-scope timeout |
 | `safehermit --sh-deadline` | **the whole wrapped process tree** | `bin/safehermit`, default 3600s | `systemd-run --user RuntimeMaxSec`, a **cgroup kill** | exit 124, `safehermit: bound.wall=` |
@@ -51,8 +52,15 @@ Distribution of the values actually deployed today:
   meaning and add `execution_cpu_timeout_seconds` and
   `execution_wall_timeout_seconds`; older rows with neither additive field stay
   readable, while a half-present or inconsistent pair is refused.
-- dagrun step `timeout`: 600s ×15, 900s ×15, 120s ×11, 180s ×6, 60s ×6, 720s ×5,
-  1200s ×4, 300s ×3, 2400s ×1, 40s ×1, 30s ×1.
+- dagrun step `cpu_timeout`: 30s ×3, 40s ×2, 60s ×7, 120s ×305,
+  180s ×4, 240s ×3, 300s ×5, 360s ×7, 420s ×2, 600s ×28,
+  720s ×4, 900s ×16, 1200s ×18, 1500s ×1, 1800s ×1, 2400s ×1,
+  2700s ×1, 3600s ×4.
+- dagrun derived wall backstop at a 1.0 platform multiplier: 1800s ×366,
+  2160s ×4, 2700s ×16, 3600s ×18, 4500s ×1, 5400s ×1, 7200s ×1,
+  8100s ×1, 10800s ×4. The committed DAG declares no explicit step or
+  document wall timeout, so these are all derived rather than independently
+  authored deadlines.
 
 ## Gentle first, hard as fallback
 
@@ -103,6 +111,8 @@ greppable marker, and that marker — not the status — is what a caller keys o
 | a nextest-named test with wrapper exit 100 | the test **process** exceeded its per-test cap | `.config/nextest.toml` |
 | `error_kind=cpu-timeout` | the manifest cell consumed its aggregate post-preparation CPU budget | the cell's measured CPU need |
 | `error_kind=wall-timeout` | the manifest process stopped making enough CPU progress to reach its CPU budget | the wedged process or a missing inner bound |
+| `CPU-TIMEOUT >Ns cpu` | a DAG node's cgroup reached its CPU-second budget | the node's measured CPU need or its platform multiplier |
+| `TIMEOUT >Ns` | a DAG node reached its elapsed-time backstop before its CPU budget | a hang, missing inner bound, or insufficient derived wall headroom |
 | exit 124 with **no marker at all** | something outside hermit killed it without typed harness evidence | the missing inner bound |
 
 That last row is the useful one. **A cell process that exits 124 with neither a
@@ -159,13 +169,18 @@ inheriting a guarantee nobody measured for it.
 
 ## The invariant
 
-**Each rung must be strictly smaller than the rung outside it.**
+**Each rung must be strictly smaller than the rung outside it when both bound
+the same quantity and population.**
 
-If an inner bound is greater than or equal to its outer bound, the inner one can
-never fire. It is then dead configuration that reads as protection — and the
-run is stopped by the outer rung instead, hard and unnamed. The symptom is a
-test that looks intermittently killed for no stated reason, which is why this
-belongs in a configuration check and not in a debugging session.
+CPU seconds and wall seconds are different quantities and cannot be ordered by
+comparing their numbers. The DAG therefore uses CPU as the primary work budget
+and derives a deliberately loose wall backstop from the platform-scaled CPU
+budget. Within comparable units, if an inner bound is greater than or equal to
+its outer bound, the inner one can never fire. It is then dead configuration
+that reads as protection — and the run is stopped by the outer rung instead,
+hard and unnamed. The symptom is a test that looks intermittently killed for no
+stated reason, which is why this belongs in a configuration check and not in a
+debugging session.
 
 `ci/validate-timeout-layers-test.sh` exercises the named DAG-step and outer-scope
 stops. `scripts/validate.rs --self-test` brackets the generated strict-compat
