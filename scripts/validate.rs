@@ -6961,6 +6961,55 @@ fn committed_graph_invariants(
     Ok(())
 }
 
+fn rendered_timeout_distributions(config: &DagConfig) -> Result<(String, String), String> {
+    if config.cpu_timeout_multiplier != 1.0 {
+        return Err(format!(
+            "timeout distribution: the committed DAG multiplier is {}, not the documented 1.0",
+            config.cpu_timeout_multiplier
+        ));
+    }
+    if config.default_step_timeout != 0
+        || config.steps.iter().any(|step| step.timeout != 0)
+    {
+        return Err(
+            "timeout distribution: the committed DAG has an explicit wall timeout".into(),
+        );
+    }
+
+    let mut cpu_counts = BTreeMap::<i64, usize>::new();
+    let mut wall_counts = BTreeMap::<i64, usize>::new();
+    for step in &config.steps {
+        if step.cpu_timeout <= 0 {
+            return Err(format!(
+                "timeout distribution: {} has no positive CPU timeout",
+                step.tag()
+            ));
+        }
+        *cpu_counts.entry(step.cpu_timeout).or_default() += 1;
+        let wall = dagrun::resolved_wall_timeout(
+            step,
+            config.default_step_timeout,
+            config.cpu_timeout_multiplier,
+        );
+        *wall_counts.entry(wall).or_default() += 1;
+    }
+
+    let render = |counts: &BTreeMap<i64, usize>| {
+        counts
+            .iter()
+            .map(|(seconds, count)| format!("{seconds}s ×{count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Ok((
+        format!("- dagrun step `cpu_timeout`: {}.", render(&cpu_counts)),
+        format!(
+            "- dagrun derived wall backstop at a 1.0 platform multiplier: {}. The committed DAG declares no explicit step or document wall timeout, so these are all derived rather than independently authored deadlines.",
+            render(&wall_counts)
+        ),
+    ))
+}
+
 /// Prove that the checked-in validation DAG is canonical and that every public
 /// validation level is only a dagrun label selection over those committed bytes.
 fn committed_validation_dag_bracket(root: &Path) -> Result<String, String> {
@@ -6980,6 +7029,42 @@ fn committed_validation_dag_bracket(root: &Path) -> Result<String, String> {
             "committed DAG bracket: document wall timeout must remain derived, got {}s",
             committed.default_step_timeout
         ));
+    }
+    let timeout_doc_path = root.join("docs/TIMEOUT_LADDER.md");
+    let timeout_doc = std::fs::read_to_string(&timeout_doc_path).map_err(|error| {
+        format!(
+            "committed DAG bracket: cannot read {}: {error}",
+            timeout_doc_path.display()
+        )
+    })?;
+    let normalized_timeout_doc = timeout_doc.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (cpu_distribution, wall_distribution) = rendered_timeout_distributions(&committed)?;
+    for expected in [&cpu_distribution, &wall_distribution] {
+        if !normalized_timeout_doc.contains(expected) {
+            return Err(format!(
+                "committed DAG bracket: {} does not match the committed DAG: {expected}",
+                timeout_doc_path.display()
+            ));
+        }
+    }
+    let mut planted_timeout_drift = committed.clone();
+    let planted_step = planted_timeout_drift
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == "privileged-only-build.privileged_tests")
+        .ok_or_else(|| {
+            "committed DAG bracket: standalone privileged builder is absent".to_string()
+        })?;
+    planted_step.cpu_timeout = 600;
+    let (planted_cpu_distribution, planted_wall_distribution) =
+        rendered_timeout_distributions(&planted_timeout_drift)?;
+    if normalized_timeout_doc.contains(&planted_cpu_distribution)
+        || normalized_timeout_doc.contains(&planted_wall_distribution)
+    {
+        return Err(
+            "committed DAG bracket: planted timeout-distribution drift still matches the documentation"
+                .into(),
+        );
     }
     for step in &committed.steps {
         if step.cmd.contains("/home/") || step.cmd.contains("/tmp/run-state") {

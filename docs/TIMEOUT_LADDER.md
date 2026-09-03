@@ -53,14 +53,14 @@ Distribution of the values actually deployed today:
   `execution_wall_timeout_seconds`; older rows with neither additive field stay
   readable, while a half-present or inconsistent pair is refused.
 - dagrun step `cpu_timeout`: 30s ×3, 40s ×2, 60s ×7, 120s ×305,
-  180s ×4, 240s ×3, 300s ×5, 360s ×7, 420s ×2, 600s ×28,
+  180s ×4, 240s ×3, 300s ×5, 360s ×7, 420s ×2, 600s ×27, 675s ×1,
   720s ×4, 900s ×16, 1200s ×18, 1500s ×1, 1800s ×1, 2400s ×1,
   2700s ×1, 3600s ×4.
-- dagrun derived wall backstop at a 1.0 platform multiplier: 1800s ×366,
-  2160s ×4, 2700s ×16, 3600s ×18, 4500s ×1, 5400s ×1, 7200s ×1,
-  8100s ×1, 10800s ×4. The committed DAG declares no explicit step or
-  document wall timeout, so these are all derived rather than independently
-  authored deadlines.
+- dagrun derived wall backstop at a 1.0 platform multiplier: 1800s ×365,
+  2025s ×1, 2160s ×4, 2700s ×16, 3600s ×18, 4500s ×1, 5400s ×1,
+  7200s ×1, 8100s ×1, 10800s ×4. The committed DAG declares no explicit
+  step or document wall timeout, so these are all derived rather than
+  independently authored deadlines.
 
 Known accounting gap: pinned-root Podman payload CPU is not currently charged
 to the dagrun step cgroup. RUN1659 measured the outer twin at only 1.298 CPU
