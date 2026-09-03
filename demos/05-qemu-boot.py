@@ -13,10 +13,10 @@ ROOT = DEMO_DIR.parent
 sys.path.insert(0, str(DEMO_DIR / "lib"))
 
 from demo_common import (  # noqa: E402
-    make_socket_path,
     archive_result_dir,
     banner,
     canonicalize_qcow2_snapshot_timestamp,
+    canonicalize_qemu_runtime_path,
     check_dependencies,
     check_qemu_dependencies,
     compare_runs,
@@ -27,6 +27,7 @@ from demo_common import (  # noqa: E402
     hash_file,
     hermit_tmp_args,
     load_committed_anchor,
+    make_socket_path,
     make_temp_result_dir,
     print_comparison,
     print_header,
@@ -164,8 +165,8 @@ def main() -> int:
     # Everything for this run lives in a private working directory so any number
     # of runs can boot QEMU concurrently without sharing sockets, disks, or logs.
     run_dir = make_temp_result_dir(ASSETS, "boot")
-    # The socket is rooted short rather than under the deep per-run directory:
-    # see make_socket_path. Everything else for the run stays in run_dir.
+    # Keep the socket with the run when that fits AF_UNIX; make_socket_path moves
+    # only an overlong path to its short, host-visible fallback.
     qmp_socket = make_socket_path(run_dir / "qmp.sock", "boot")
     # Boot backs the serial console with a `-serial file:` transcript, not a unix
     # socket: a socket chardev adds a host-timing-driven pollable fd that can
@@ -343,9 +344,14 @@ def main() -> int:
         # concurrent runs by design. Fold that path to a stable token so the
         # anchor comparison reflects genuine differences, not the per-run temp
         # directory name.
-        canonical_argv = [arg.replace(str(run_dir), "<run-dir>") for arg in qemu_argv]
+        canonical_argv = [
+            canonicalize_qemu_runtime_path(arg, run_dir, qmp_socket)
+            for arg in qemu_argv
+        ]
         info_log.write_text(
-            info_log.read_text(errors="replace").replace(str(run_dir), "<run-dir>")
+            canonicalize_qemu_runtime_path(
+                info_log.read_text(errors="replace"), run_dir, qmp_socket
+            )
         )
         current = save_metadata(
             run_dir,
