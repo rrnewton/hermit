@@ -17,15 +17,23 @@ An adversarial reviewer who has **run the touched demo(s) to a GREEN result**
 records a commit-message trailer (in any commit of the PR / landing commit):
 
 ```
-Demo-Green-Review: reviewer=<agent-id> demo=<demos/path|all> result=GREEN evidence=<url|path|sha>
+Demo-Green-Review: reviewer=<agent-id> demo=<demos/path[,demos/path...]|all> result=GREEN evidence=<url|path|sha>
 ```
 
-- `reviewer=` — the reviewing agent, which **should differ from the implementer**
-  (independence; the review is adversarial).
+- `reviewer=` — the reviewing agent, which **must differ from the implementer**
+  named by the commit's `role=impl` disclosure (independence; the review is
+  adversarial). A trailer cannot turn the implementer's own run into an
+  independent review.
 - `demo=` — which demo was run (or `all`).
 - `result=GREEN` — the demo reached its success state (e.g. demo5 boots to the
   serial shell and exits rc=0). Anything other than GREEN does not satisfy the gate.
 - `evidence=` — a link/path/SHA to the run log or artifact.
+
+A `result=GREEN` trailer is invalid when the same commit body reports only a
+non-green mechanical result such as `PARTIAL` or `FAILURE` for a demo covered by
+that trailer. Deliberate failing checks remain compatible with a later reported
+successful real run; the checker does not treat the presence of a negative
+control as a failed review.
 
 ## Enforcement (mechanical)
 

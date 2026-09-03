@@ -12,7 +12,8 @@
 #   Demo-Green-Review: reviewer=<agent-id> demo=<demos/path[,demos/path...]|all> result=GREEN evidence=<url|path|sha>
 #
 # result must be GREEN; reviewer and evidence must be non-empty. The reviewer
-# should be a DIFFERENT agent than the implementer (independence) -- see policy.
+# must be a DIFFERENT agent than the role=impl disclosure (independence), and a
+# GREEN claim must not contradict the commit body's reported demo result.
 #
 # Modes:
 #   --range <BASE>..<HEAD>              # CI / lander: scan a commit range
@@ -67,22 +68,123 @@ any_demo_touched() {  # stdin: NUL- or newline-separated paths
     return $hit
 }
 
+# Emit the implementer identities carried by canonical disclosure tags. Git's
+# author is the repository owner for agent-authored commits, so it cannot
+# establish whether reviewer=<agent-id> is independent.
+implementer_identities() {  # $1 = commit message
+    local line tag identity
+    while IFS= read -r line; do
+        [[ "$line" =~ ^\[([^]]+)\] ]] || continue
+        tag="${BASH_REMATCH[1]}"
+        [[ ",$tag," =~ ,[[:space:]]*role=impl[[:space:]]*, ]] || continue
+        identity=$(printf '%s\n' "$tag" | cut -d, -f2 | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+        [ -n "$identity" ] && printf '%s\n' "$identity"
+    done <<<"$1" | sort -u
+}
+
+# Does a demo= claim include the numbered demo reported by a mechanical result
+# line such as "demo 5 wired: FIRST RUN SAVED, PARTIAL"?
+claim_covers_demo_number() {  # $1 = comma-separated demo= value, $2 = number
+    local claims="$1" wanted="$2" value number
+    while IFS= read -r value; do
+        [ "$value" = all ] && return 0
+        if [[ "$value" =~ ^demos/0*([0-9]+)([^0-9]|$) ]]; then
+            number="${BASH_REMATCH[1]}"
+            [ "$((10#$number))" = "$((10#$wanted))" ] && return 0
+        fi
+    done < <(printf '%s\n' "$claims" | tr ',' '\n')
+    return 1
+}
+
+# A body's mechanical result lines may include deliberate negative controls as
+# well as the real run. A claim is contradicted when it covers a numbered demo
+# for which the body reports a non-green result and no green result. This makes
+# a forced-failure check followed by a successful real run valid, while a body
+# that reports only PARTIAL or FAILURE cannot claim GREEN.
+claim_contradicts_body() {  # $1 = commit message, $2 = demo= value
+    local text="$1" claims="$2" line number result
+    declare -A green=() nongreen=()
+    while IFS= read -r line; do
+        if [[ "${line,,}" =~ ^[[:space:]]*(=+[[:space:]]*)?demo[[:space:]]*0*([0-9]+)[^:]*:[[:space:]]*(first[[:space:]]+run[[:space:]]+saved,[[:space:]]*)?([a-z_-]+) ]]; then
+            number="${BASH_REMATCH[2]}"
+            result="${BASH_REMATCH[4]}"
+            case "$result" in
+                green|pass|success) green[$((10#$number))]=1 ;;
+                partial|fail|failure|failed|red|skip|skipped|incomplete|no_result|no-result|error)
+                    nongreen[$((10#$number))]=1 ;;
+            esac
+        fi
+    done <<<"$text"
+    for number in "${!nongreen[@]}"; do
+        [ "${green[$number]:-0}" = 1 ] && continue
+        claim_covers_demo_number "$claims" "$number" && return 0
+    done
+    return 1
+}
+
+# Emit one trailer field's value only when the field occurs exactly once. A
+# repeated field is malformed: accepting one value while silently ignoring the
+# other would let the same trailer state conflicting reviewer or result claims.
+single_trailer_field() {  # $1 = trailer line, $2 = field, $3 = value pattern
+    local line="$1" field="$2" pattern="$3" token value
+    local -a tokens=() values=()
+    read -r -a tokens <<<"$line"
+    for token in "${tokens[@]}"; do
+        [[ "$token" = "$field="* ]] || continue
+        value="${token#*=}"
+        [[ "$value" =~ ^${pattern}$ ]] || return 1
+        values+=("$value")
+    done
+    [ "${#values[@]}" -eq 1 ] || return 1
+    printf '%s\n' "${values[0]}"
+}
+
 # Emit every demo path named by a valid trailer, one per line. A trailer may
 # cover several exact paths with a comma-separated demo= value; `all` and
-# directory coverage retain their documented meanings.
-attested_demos() {  # $1 = text blob
-    local line
+# directory coverage retain their documented meanings. Invalid trailers are
+# reported and withheld while later valid trailers remain usable.
+attested_demos() {  # $1 = text blob, $2 = report rejected trailers (optional)
+    local text="$1" report="${2:-}" line reviewer demos result implementer self_review
     while IFS= read -r line; do
         printf '%s\n' "$line" | grep -qE '^[[:space:]]*Demo-Green-Review:' || continue
-        printf '%s\n' "$line" | grep -qE '(^|[[:space:]])reviewer=[^[:space:]]+([[:space:]]|$)' || continue
-        printf '%s\n' "$line" | grep -qE '(^|[[:space:]])demo=(all|demos/[^[:space:]]+)([[:space:]]|$)' || continue
-        printf '%s\n' "$line" | grep -qE '(^|[[:space:]])result=GREEN([[:space:]]|$)' || continue
-        printf '%s\n' "$line" | grep -qE '(^|[[:space:]])evidence=[^[:space:]]+([[:space:]]|$)' || continue
-        printf '%s\n' "$line" \
-            | grep -oE '(^|[[:space:]])demo=[^[:space:]]+' \
-            | sed -E 's/^[[:space:]]*demo=//' \
-            | tr ',' '\n'
-    done <<<"$1"
+        reviewer=$(single_trailer_field "$line" reviewer '[^[:space:]]+') || {
+            [ "$report" = report ] && echo "demo-review gate: REFUSED malformed trailer: reviewer= must occur exactly once" >&2
+            continue
+        }
+        demos=$(single_trailer_field "$line" demo '(all|demos/[^[:space:]]+)') || {
+            [ "$report" = report ] && echo "demo-review gate: REFUSED malformed trailer: demo= must occur exactly once" >&2
+            continue
+        }
+        result=$(single_trailer_field "$line" result '[^[:space:]]+') || {
+            [ "$report" = report ] && echo "demo-review gate: REFUSED malformed trailer: result= must occur exactly once" >&2
+            continue
+        }
+        single_trailer_field "$line" evidence '[^[:space:]]+' >/dev/null || {
+            [ "$report" = report ] && echo "demo-review gate: REFUSED malformed trailer: evidence= must occur exactly once" >&2
+            continue
+        }
+        [ "$result" = GREEN ] || continue
+        self_review=0
+        while IFS= read -r implementer; do
+            if [ "$reviewer" = "$implementer" ]; then
+                self_review=1
+                break
+            fi
+        done < <(implementer_identities "$text")
+        if [ "$self_review" = 1 ]; then
+            if [ "$report" = report ]; then
+                echo "demo-review gate: REFUSED trailer: reviewer=$reviewer is also the role=impl identity" >&2
+            fi
+            continue
+        fi
+        if claim_contradicts_body "$text" "$demos"; then
+            if [ "$report" = report ]; then
+                echo "demo-review gate: REFUSED trailer: demo=$demos result=GREEN contradicts the body's reported result" >&2
+            fi
+            continue
+        fi
+        printf '%s\n' "$demos" | tr ',' '\n'
+    done <<<"$text"
 }
 
 # Does one attested demo= value cover a touched path?
@@ -138,6 +240,19 @@ touched=$(printf '%s\n' "$changed" | any_demo_touched) || {
     echo "demo-review gate: no runnable demo files touched in $where -- OK."
     exit 0
 }
+
+# Name each rejected claim once. Coverage below may inspect the same commit for
+# several touched paths, but repeating one refusal per path hides the useful
+# reason in noise.
+if [ "$mode" = range ]; then
+    for candidate in $commits; do
+        candidate_msg=$(git log -1 --format='%B' "$candidate" 2>/dev/null) \
+            || git_refused "commit $candidate"
+        attested_demos "$candidate_msg" report >/dev/null
+    done
+else
+    attested_demos "$messages" report >/dev/null
+fi
 
 # A review applies only to the paths it names, and it must be at or after the
 # last change to each path. One old `demo=all` trailer must not bless later
