@@ -242,6 +242,96 @@ class InfoLogAdmissionTest(unittest.TestCase):
                 any(line.startswith("PASS: exact Hermit log") for line in report)
             )
 
+    def _compare_logs(self, tmp, anchor_text, current_text):
+        root = Path(tmp)
+        anchor_log = root / "anchor.log"
+        current_log = root / "current.log"
+        anchor_log.write_text(anchor_text)
+        current_log.write_text(current_text)
+        return dc.compare_runs(self._metadata(anchor_log), self._metadata(current_log))
+
+    # The address comparator folds the constant stack-base offset between two
+    # hermit invocations. It must NOT fold a change in which addresses are used,
+    # the order they first appear in, or whether two sites share one. Masking
+    # every address to a single token did exactly that; these four cases pin the
+    # difference. Each uses two addresses, because a relationship needs two.
+
+    def test_a_uniform_address_shift_still_compares_equal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, report = self._compare_logs(
+                tmp,
+                "INFO detcore: a 0x7fffffffa210 b 0x7fffffffa310\n",
+                "INFO detcore: a 0x7fffffff9210 b 0x7fffffff9310\n",
+            )
+            self.assertTrue(
+                passed, "a constant offset on every address is host layout, not divergence"
+            )
+            self.assertTrue(
+                any(line.startswith("PASS: exact Hermit log") for line in report)
+            )
+
+    def test_two_addresses_that_become_aliased_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, _ = self._compare_logs(
+                tmp,
+                "INFO detcore: a 0x7fffffffa210 b 0x7fffffffa310\n",
+                "INFO detcore: a 0x7fffffff9210 b 0x7fffffff9210\n",
+            )
+            self.assertFalse(
+                passed, "two distinct addresses collapsing into one is a real change"
+            )
+
+    def test_one_address_splitting_into_two_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, _ = self._compare_logs(
+                tmp,
+                "INFO detcore: a 0x7fffffffa210 b 0x7fffffffa210\n",
+                "INFO detcore: a 0x7fffffff9210 b 0x7fffffff9310\n",
+            )
+            self.assertFalse(
+                passed, "one address becoming two distinct ones is a real change"
+            )
+
+    def test_a_site_that_stops_reusing_an_earlier_address_is_refused(self):
+        # Anchor's third site reuses the first address; current uses a fresh one.
+        # That is an identity change at a site, not a shift of the whole layout.
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, _ = self._compare_logs(
+                tmp,
+                "INFO detcore: a 0x7fffffffa210 b 0x7fffffffa310\n"
+                "INFO detcore: c 0x7fffffffa210\n",
+                "INFO detcore: a 0x7fffffff9210 b 0x7fffffff9310\n"
+                "INFO detcore: c 0x7fffffff9410\n",
+            )
+            self.assertFalse(
+                passed, "a site that stops reusing an earlier address changed identity"
+            )
+
+    def test_a_pure_relabelling_is_a_documented_blind_spot(self):
+        # Swapping two addresses everywhere is structurally isomorphic: every
+        # site keeps the same sharing relationships, so first-appearance
+        # canonicalization cannot see it and reports PASS.
+        #
+        # This is recorded rather than fixed. Catching it needs an offset from a
+        # single base, and that was MEASURED against real demo 6 logs: stack and
+        # mmap regions shift by different amounts between runs, so offsets from
+        # one base change legitimately and the comparator reds a correct run.
+        # A comparator that reds correct runs would be reverted or muted, which
+        # is a worse outcome than a named blind spot.
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, _ = self._compare_logs(
+                tmp,
+                "INFO detcore: a 0x7fffffffa210 b 0x7fffffffa310\n"
+                "INFO detcore: c 0x7fffffffa210\n",
+                "INFO detcore: a 0x7fffffffa310 b 0x7fffffffa210\n"
+                "INFO detcore: c 0x7fffffffa310\n",
+            )
+            self.assertTrue(
+                passed,
+                "a pure relabelling is isomorphic; this pins the known limit so a "
+                "future change that closes it fails here and gets read",
+            )
+
     def test_info_divergence_fails_even_when_vm_artifacts_match(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
