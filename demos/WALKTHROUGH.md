@@ -359,3 +359,7 @@ hermit's logical clock. Full detail: `demos/08-btrfs-convert-uaf.md`.
 
 Useful overrides: `DEMO08_CRASH_SEED` (default 15), `DEMO08_TIMEOUT` (default
 90), `DEMO08_DIR`, `DEMO08_ARTIFACTS`, and `HERMIT_RELEASE`.
+
+`DEMO08_TIMEOUT` bounds each calibration run as well as each demo run, so the
+calibration cannot select a seed that the demo would then cut off. Raising it
+raises both.

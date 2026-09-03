@@ -36,7 +36,7 @@ VARIANT_SOURCE="$ROOT/demos/fixtures/demo08"
 BTRFS_REPO="${DEMO08_BTRFS_REPO:-https://github.com/kdave/btrfs-progs.git}"
 BTRFS_TAG=v7.1
 BTRFS_COMMIT=4ab0e80be9e3bb1db2e6038e6d4316d35fb7ba8b
-PREP_VERSION=1
+PREP_VERSION=2
 STAMP="$ASSETS/.nightly-prep-version"
 JOBS="${DEMO08_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
 HERMIT_RELEASE="${HERMIT_RELEASE:-$ROOT/target/release/hermit}"
@@ -121,6 +121,25 @@ fixture_identity() {
   sha256sum "$ASSETS/buggy/btrfs-convert" | cut -d' ' -f1
 }
 
+# fixture_identity hashes the BUILT binary, so it can only speak about assets that already
+# exist; it cannot say whether a cached build is stale with respect to the sources it was
+# built from. This does: it digests the patch and every variant source that build_variant
+# consumes. Without it, editing the patch left `prep=` and `btrfs=` unchanged, so a cached
+# asset set built before the edit was reused as if it matched -- and an asset set predating
+# `abort_on_error=1` prints a complete report and exits 1, which the demo's exit-134 criterion
+# now refuses. The digest is over relative names and contents only, so it does not change when
+# the checkout moves. scripts/test-prepare-demo08-calibration.sh builds the same stamp; the two
+# must be changed together.
+fixture_source_identity() {
+  {
+    sha256sum <"$PATCH"
+    find "$VARIANT_SOURCE" -type f -printf '%P\n' | LC_ALL=C sort | while read -r relative; do
+      printf '%s ' "$relative"
+      sha256sum <"$VARIANT_SOURCE/$relative"
+    done
+  } | sha256sum | cut -d' ' -f1
+}
+
 # A guest that ran leaves one of: a clean conversion (0), an ASAN abort (134), or a wall-clock
 # truncation (124). Any other status is the wrapper/toolchain failing before or around the guest,
 # which is NOT the same fact as "this seed did not crash" and must never be reported as one.
@@ -152,7 +171,15 @@ run_variant() {
   local variant=$1 seed=$2 image=$3 output=$4
   local rc start engagement=did-not-reach uaf=none
 
-  cp --reflink=auto "$ASSETS/pop-tiny.img" "$image"
+  # ⚠️ CHECKED EXPLICITLY BECAUSE errexit IS NOT IN FORCE HERE. confirm_seed is invoked as
+  # `if confirm_seed ...`, and testing a function's status suppresses errexit for everything
+  # it calls. A failed copy would therefore leave the PREVIOUS run's already-converted image
+  # in place, the replay would disagree with the first run, and the mismatch would be reported
+  # as a determinism failure -- blaming the scheduler for an I/O fault.
+  cp --reflink=auto "$ASSETS/pop-tiny.img" "$image" ||
+    fail "Demo 8 could not stage a fresh image for the $variant run on seed $seed:" \
+      "copying $ASSETS/pop-tiny.img to $image failed. This is an I/O or environment fault," \
+      "not a disagreement between two runs of the same seed."
   start=$SECONDS
   set +e
   if [ -n "$CALIBRATION_RUNNER" ]; then
@@ -227,6 +254,14 @@ record_run() {
 # disagreement between two runs of one seed is a determinism failure or an environment
 # failure, and searching for a friendlier seed would hide exactly what the demo exists to
 # show, so those refuse the whole calibration.
+#
+# The two rejections below are both rc=124 but they are not the same fact: one says the SEED
+# is too slow for the demo's budget, the other says the FIXED CONTROL is. Counting them
+# together produced a refusal that told every reader the first story regardless of which had
+# happened. They are counted separately for that reason and reported separately below.
+REJECTED_REPLAY_BUDGET=0
+REJECTED_FIXED_BUDGET=0
+
 confirm_seed() {
   local report=$1 artifacts=$2 seed=$3 source=$4
   local rc elapsed engagement uaf output qualifies
@@ -244,6 +279,7 @@ confirm_seed() {
     if [ "$rc" = 124 ]; then
       echo "Demo 8 seed $seed replayed past the ${CALIBRATION_TIMEOUT}s budget (rc=124);" \
         "the demo would cut the same run off, so this seed is not accepted." >&2
+      REJECTED_REPLAY_BUDGET=$((REJECTED_REPLAY_BUDGET + 1))
       return 1
     fi
     fail "Demo 8 seed $seed crashed on its first run and did not on its replay" \
@@ -264,6 +300,7 @@ confirm_seed() {
   if [ "$rc" = 124 ]; then
     echo "Demo 8 fixed control on seed $seed ran past the ${CALIBRATION_TIMEOUT}s budget" \
       "(rc=124); the demo's differential would be cut off, so this seed is not accepted." >&2
+    REJECTED_FIXED_BUDGET=$((REJECTED_FIXED_BUDGET + 1))
     return 1
   fi
   if [ "$rc" != 0 ]; then
@@ -278,7 +315,11 @@ calibrate_crash_seed() {
   local image="$artifacts/chaos-buggy.img"
   local report="$artifacts/calibration.tsv"
   local output seed source rc elapsed fixture cached_fixture engagement uaf qualifies i
-  local executed=0 attempted=0 engaged=0 uaf_hits=0 qualified=0 rejected=0
+  # complete_reports is a strict subset of uaf_hits: uaf_hits counts any report text, and this
+  # counts the ones that also reached ASAN's closing SUMMARY. The difference is what separates
+  # "the report was cut off" from "the report finished and the guest never aborted", and the
+  # refusals below cannot name the right remedy without it.
+  local executed=0 attempted=0 engaged=0 uaf_hits=0 complete_reports=0 qualified=0 rejected=0
   local last_rc="" found_seed="" found_source=""
   local cached_seed=""
   local -a seeds=() sources=()
@@ -371,6 +412,9 @@ calibrate_crash_seed() {
     if [ "$uaf" != none ]; then
       uaf_hits=$((uaf_hits + 1))
     fi
+    if [ "$uaf" = complete ]; then
+      complete_reports=$((complete_reports + 1))
+    fi
     qualifies=no
     if run_qualifies "$rc" "$engagement" "$uaf" "$output"; then
       qualifies=yes
@@ -420,19 +464,35 @@ calibrate_crash_seed() {
       "(hermit, hermit-box-run, or the fixture binary), NOT an absence of the UAF."
   fi
   if [ "$qualified" -gt 0 ]; then
-    fail "Demo 8 calibration found $qualified qualifying seed(s) but confirmed none: every" \
-      "candidate ran past the ${CALIBRATION_TIMEOUT}s per-run budget the demo also applies," \
-      "so no seed is usable at DEMO08_TIMEOUT=$DEMO_TIMEOUT (report: $report)"
+    fail "Demo 8 calibration found $qualified qualifying seed(s) but confirmed none:" \
+      "$REJECTED_REPLAY_BUDGET seed(s) replayed past the ${CALIBRATION_TIMEOUT}s per-run budget" \
+      "and $REJECTED_FIXED_BUDGET had a fixed control that ran past it. The first says the seed" \
+      "is too slow for the demo; the second says the differential is, which is a property of" \
+      "the fixed variant rather than of the seed. Either way no seed is usable at" \
+      "DEMO08_TIMEOUT=$DEMO_TIMEOUT (report: $report)"
   fi
   if [ "$engaged" -eq 0 ]; then
     fail "Demo 8 calibration NO-RESULT: path engagement 0/$attempted; $uaf_hits UAF hits" \
       "cannot qualify without the progress-thread witness (report: $report)"
   fi
+  # ⚠️ "no UAF" IS ONLY TRUE WHEN uaf_hits IS ZERO. A seed can print a COMPLETE report and
+  # still not abort -- a fixture built without abort_on_error does exactly that -- and the
+  # earlier wording announced an absent use-after-free while the report sat in the artifacts.
+  # scripts/test-prepare-demo08-calibration.sh's complete-uaf-rc0 bracket reaches this line
+  # with uaf_hits equal to the attempt count.
+  if [ "$uaf_hits" -gt 0 ]; then
+    fail "Demo 8 calibration found $uaf_hits use-after-free report(s) in $attempted attempted" \
+      "seeds and qualified none: $complete_reports were COMPLETE but the guest did not abort" \
+      "with 134, which is what a fixture built without abort_on_error produces, and" \
+      "$((uaf_hits - complete_reports)) stopped before ASAN's closing SUMMARY, which is a run" \
+      "cut off or interleaved with another thread. A qualifying run needs the complete report" \
+      "AND the abort. This is not an absent use-after-free (report: $report)"
+  fi
   fail "no ASAN UAF found after $attempted attempted seeds; path engagement" \
     "$engaged/$attempted ($executed seeds executed; report: $report)"
 }
 
-expected_stamp="prep=$PREP_VERSION btrfs=$BTRFS_COMMIT"
+expected_stamp="prep=$PREP_VERSION btrfs=$BTRFS_COMMIT fixture-src=$(fixture_source_identity)"
 if [ "$(cat "$STAMP" 2>/dev/null || true)" = "$expected_stamp" ] \
    && [ -x "$ASSETS/buggy/btrfs-convert" ] \
    && [ -x "$ASSETS/fixed/btrfs-convert" ] \

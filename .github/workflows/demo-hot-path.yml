@@ -189,7 +189,13 @@ jobs:
           path: |
             ignored/demo08-btrfs
             ignored/demo08-build/btrfs-progs-v7.1
-          key: hermit-demo-assets-v1-${{ runner.os }}-${{ runner.arch }}
+          # The fixture digest is part of the key because the cached entry IS a build of
+          # these sources. Without it, editing the patch or a variant source restored a
+          # build made before the edit, and an asset set predating `abort_on_error=1`
+          # prints a complete report and exits 1 -- which the demo's exit-134 criterion
+          # now refuses, turning the demo red for a stale cache rather than a real defect.
+          # scripts/prepare-demo08-assets.sh digests the same inputs into its own stamp.
+          key: hermit-demo-assets-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('demos/fixtures/demo08-convert-main-v7.1.patch', 'demos/fixtures/demo08/**') }}
 
       - name: Select the Demo 8 calibration path
         shell: bash

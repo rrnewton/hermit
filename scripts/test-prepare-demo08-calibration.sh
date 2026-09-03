@@ -9,6 +9,21 @@ CLASSIFIER="$ROOT/scripts/demo08-calibration-path.sh"
 TMP="$(mktemp -d -t demo08-calibration-test.XXXXXX)"
 trap 'rm -rf -- "$TMP"' EXIT
 
+# The same digest scripts/prepare-demo08-assets.sh puts in its cache stamp, over the patch and
+# every Demo 8 variant source. Duplicated rather than exported because the script has no
+# stamp-printing mode; if the two drift, make_assets writes a stamp prepare rejects and every
+# case below fails loudly on the build path rather than silently skipping calibration.
+fixture_source_digest() {
+  {
+    sha256sum <"$ROOT/demos/fixtures/demo08-convert-main-v7.1.patch"
+    find "$ROOT/demos/fixtures/demo08" -type f -printf '%P\n' | LC_ALL=C sort |
+      while read -r relative; do
+        printf '%s ' "$relative"
+        sha256sum <"$ROOT/demos/fixtures/demo08/$relative"
+      done
+  } | sha256sum | cut -d' ' -f1
+}
+
 make_assets() {
   local assets="$1"
   mkdir -p "$assets/buggy" "$assets/fixed"
@@ -16,8 +31,11 @@ make_assets() {
   printf '#!/usr/bin/env bash\nexit 0\n' >"$assets/fixed/btrfs-convert"
   chmod +x "$assets/buggy/btrfs-convert" "$assets/fixed/btrfs-convert"
   : >"$assets/pop-tiny.img"
-  printf '%s\n' \
-    'prep=1 btrfs=4ab0e80be9e3bb1db2e6038e6d4316d35fb7ba8b' \
+  # Must match expected_stamp in scripts/prepare-demo08-assets.sh exactly, or prepare takes
+  # the BUILD path instead of the cached one and every case below stops testing calibration.
+  # The fixture digest is computed the same way there; the two must be changed together.
+  printf 'prep=2 btrfs=4ab0e80be9e3bb1db2e6038e6d4316d35fb7ba8b fixture-src=%s\n' \
+    "$(fixture_source_digest)" \
     >"$assets/.nightly-prep-version"
 }
 
