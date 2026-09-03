@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# Enforce the core-change review protocol on one pull request.
+#
+# Background: after PR #1095 landed a core change without the required dual
+# adversarial review, the review protocol lived only in agent skills that a
+# forgetful actor could bypass. This script is the "code that never forgets"
+# version: a preland/merge-gate lint that BLOCKS landing when a PR carries the
+# contract's post-facto label but has not actually been reviewed and approved,
+# or is missing a required PR-body section.
+#
+# A PR carrying that label may only land when ALL hold:
+#   (a) every review family in the shared contract has a numbered activity label;
+#   (b) every family has its approval label (these are invalidated on every new
+#       push, so their presence means the current revision is approved);
+#   (c) the PR body contains the required sections: Summary, Determinism,
+#       Linux Semantics, Validation, Human Review Required, and — when the PR
+#       touches KVM — Relationship to gVisor.
+#
+# A PR without the contract's post-facto label passes unconditionally; this
+# lint never second-guesses whether the label should have been applied.
+#
+# Inputs (environment variables):
+#   PR_LABELS  newline-separated label names on the PR (may be empty)
+#   PR_BODY    the PR description body text (may be empty)
+#   PR_IS_KVM  "true" when the PR changes KVM code (default: "false")
+#   PR_NUMBER  PR number, used only in diagnostics (default: "unknown")
+#
+# Exit status:
+#   0  protocol satisfied, or the PR does not carry the post-facto label
+#   1  the PR is labeled but violates the protocol (landing must be blocked)
+#   2  usage / internal error
+#
+# Those are the only statuses this script emits deliberately.  In particular,
+# a command used by a match predicate may return 2 for its own error, 126 when
+# it cannot be executed, 127 when it cannot be found, or another nonzero status.
+# None of those means "no match": every predicate accepts only 0 (match) and 1
+# (no match), and converts every other status to this script's internal-error 2.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly REVIEW_CONTRACT_ADAPTER="$SCRIPT_DIR/review_contract_adapter.py"
+
+if ! contract_output=$(python3 "$REVIEW_CONTRACT_ADAPTER" --format lint-records); then
+    echo "::error::PR #${PR_NUMBER:-unknown}: cannot load the accepted review labels; refusing to guess." >&2
+    exit 2
+fi
+
+post_facto_label=
+declare -a review_families=()
+declare -A approval_labels=()
+declare -A round_labels_csv=()
+while IFS=$'\t' read -r first second third extra; do
+    if [ "$first" = post-facto ]; then
+        if [ -n "$post_facto_label" ] || [ -z "$second" ] || [ -n "$third" ] || [ -n "$extra" ]; then
+            echo "::error::PR #${PR_NUMBER:-unknown}: malformed post-facto review-label contract record." >&2
+            exit 2
+        fi
+        post_facto_label=$second
+    else
+        if [ -z "$first" ] || [ -z "$second" ] || [ -z "$third" ] || [ -n "$extra" ] \
+            || [ -n "${approval_labels[$first]+set}" ]; then
+            echo "::error::PR #${PR_NUMBER:-unknown}: malformed review-family contract record." >&2
+            exit 2
+        fi
+        review_families+=("$first")
+        approval_labels[$first]=$second
+        round_labels_csv[$first]=$third
+    fi
+done <<<"$contract_output"
+
+if [ -z "$post_facto_label" ] || [ "${#review_families[@]}" -eq 0 ]; then
+    echo "::error::PR #${PR_NUMBER:-unknown}: review-label contract is incomplete." >&2
+    exit 2
+fi
+
+pr="${PR_NUMBER:-unknown}"
+is_kvm="${PR_IS_KVM:-false}"
+
+# A grep predicate has three possible outcomes even though a shell condition is
+# only true or false: 0 is a match, 1 is a clean no-match, and every other status
+# means the comparison did not complete.  Keep that third outcome distinct;
+# otherwise a missing or unexecutable grep (127/126) is read as "label absent",
+# and the first label check below reports a not-applicable pass.
+match_status_or_refuse() {
+    local operation=$1 status=$2
+    case "$status" in
+        0 | 1)
+            return "$status"
+            ;;
+        *)
+            echo "::error::PR #${pr}: ${operation} could not decide (exit ${status}); refusing rather than treating it as no match." >&2
+            exit 2
+            ;;
+    esac
+}
+
+# UNSET IS NOT THE SAME STATE AS EMPTY, AND ONLY ONE OF THEM IS AN ANSWER.
+#
+# This previously read `labels="${PR_LABELS-}"`, which collapses "the caller
+# never supplied the labels" into "the PR has no labels". The second is a fact
+# about the PR; the first is a fact about the invocation. Collapsed together,
+# a hand spot-check that forgot the variable took the not-applicable fast path
+# and printed a PASS having checked NOTHING -- the gate answered a question it
+# had not been given the inputs to answer.
+#
+# CI is unaffected either way: .github/workflows/merge-gate.yml sets PR_LABELS
+# and PR_BODY explicitly. The silent pass only ever reached a human running
+# this by hand, which is exactly the reader least able to notice.
+if [ -z "${PR_LABELS+set}" ]; then
+    echo "::error::PR #${pr}: PR_LABELS is not set. This gate cannot decide anything" >&2
+    echo "  without the PR's labels, and it will not report a pass it did not establish." >&2
+    echo "  Pass PR_LABELS as newline-separated label names; pass an EMPTY string to" >&2
+    echo "  mean the PR genuinely has no labels. Those are different states." >&2
+    exit 2
+fi
+labels="$PR_LABELS"
+
+# True when an exact label name is present (full-line match).
+has_label() {
+    local status=0
+    grep -Fxq -- "$1" <<<"$labels" || status=$?
+    match_status_or_refuse "label lookup" "$status"
+}
+
+# True when one of the contract's exact numbered labels is present.
+has_round_label() {
+    local family=$1 round_label
+    local -a accepted=()
+    IFS=, read -r -a accepted <<<"${round_labels_csv[$family]}"
+    for round_label in "${accepted[@]}"; do
+        has_label "$round_label" && return 0
+    done
+    return 1
+}
+
+# Spell the exact accepted alternatives from the shared contract.
+round_label_alternatives() {
+    local family=$1
+    printf '%s' "${round_labels_csv[$family]//,/, }"
+}
+
+# True when the body contains SECTION as a heading. Accepts a Markdown ATX
+# heading (`## Section`), a bold label (`**Section**`), or a bare heading line
+# ending in a colon (`Section:`), matched case-insensitively at line start. The
+# leading marker requirement keeps prose mentions ("in summary, ...") from
+# counting as the section.
+has_section() {
+    local section=$1
+    local status=0
+    grep -Eiq \
+        "^[[:space:]]*(#{1,6}[[:space:]]*${section}|\*\*[[:space:]]*${section}|${section}[[:space:]]*:)" \
+        <<<"$body" \
+        || status=$?
+    match_status_or_refuse "PR-body section lookup" "$status"
+}
+
+if ! has_label "$post_facto_label"; then
+    # Report the genuinely-empty case distinctly from "has labels, but not this
+    # one". Both are correct passes, and a reader who cannot tell them apart
+    # cannot tell a real not-applicable from a lost label set.
+    if [ -z "$labels" ]; then
+        echo "PR #${pr}: the PR has NO labels at all (empty set, supplied); \
+core-review protocol not applicable."
+    else
+        echo "PR #${pr}: no ${post_facto_label} label; core-review protocol not applicable."
+    fi
+    exit 0
+fi
+
+# Only now is the body load-bearing, so only now is its absence an error --
+# validating it earlier would refuse callers on the not-applicable fast path
+# that never read it. Same distinction as above: unset is a broken invocation,
+# empty is a PR with no description (which then legitimately fails (c) below).
+if [ -z "${PR_BODY+set}" ]; then
+    echo "::error::PR #${pr}: PR_BODY is not set, and this PR is labeled" >&2
+    echo "  ${post_facto_label}, so the required-section checks below cannot run." >&2
+    echo "  Refusing rather than reporting five phantom 'missing section' errors for a" >&2
+    echo "  body that was never supplied. Pass an EMPTY string for a PR with no body." >&2
+    exit 2
+fi
+body="$PR_BODY"
+
+echo "PR #${pr}: ${post_facto_label} present; enforcing the core-change review protocol."
+
+errors=0
+fail() {
+    echo "::error::PR #${pr}: $*"
+    errors=$((errors + 1))
+}
+
+# (a) Adversarial review happened for every family (any accepted round).
+#
+# STATE THE OBSERVATION, NOT A CAUSE THIS GATE CANNOT SEE. A label is a cache,
+# not the event: this script reads label names and has no view of reviews,
+# commits, or which revision anything was approved against. "codex has not
+# approved the current revision" is a DIAGNOSIS; "the label is absent from the
+# supplied set" is the OBSERVATION, and only the second is established here.
+#
+# The distinction is not pedantry. An absent approval label has more than one
+# cause, and the routine one is not misconduct: the invalidator strips approval
+# labels when a new commit lands, so "approved, then the PR moved" and
+# "never approved" look identical from here. Naming only the second sends the
+# author to argue with a reviewer instead of re-requesting review after a push.
+#
+# Where the gate CAN narrow it, it does: the round label is evidence it holds.
+# This is why the message below is not a flat "could be anything" -- an
+# unconditional list of candidates would be the same defect wearing humility.
+missing_approval() {
+    local reviewer=$1
+    local approval_label=${approval_labels[$reviewer]}
+    local alternatives
+    alternatives=$(round_label_alternatives "$reviewer")
+    if has_round_label "$reviewer"; then
+        fail "${approval_label} is absent from the supplied labels, but one of \
+${alternatives} is present. Review ran; the approval label is not here. \
+Either ${reviewer} has not approved, or it approved an earlier revision and a later push \
+invalidated the label -- re-request review at the current head."
+    else
+        fail "${approval_label} is absent from the supplied labels, and none of \
+${alternatives} is present: no round label for ${reviewer} is present at all. \
+No ${reviewer} review is recorded on this PR."
+    fi
+}
+
+for reviewer in "${review_families[@]}"; do
+    if ! has_round_label "$reviewer"; then
+        fail "no accepted ${reviewer} round label is present in the supplied labels \
+(need one of $(round_label_alternatives "$reviewer"))."
+    fi
+done
+
+# (b) The latest reviews approved.
+for reviewer in "${review_families[@]}"; do
+    has_label "${approval_labels[$reviewer]}" || missing_approval "$reviewer"
+done
+
+# (c) Required PR-body sections.
+for section in "Summary" "Determinism" "Linux Semantics" "Validation" "Human Review Required"; do
+    has_section "$section" \
+        || fail "PR body is missing the required \"${section}\" section."
+done
+if [ "$is_kvm" = true ]; then
+    has_section "Relationship to gVisor" \
+        || fail "KVM change: PR body is missing the required \"Relationship to gVisor\" section."
+fi
+
+if [ "$errors" -gt 0 ]; then
+    echo "::error::PR #${pr}: core-change review protocol NOT satisfied (${errors} problem(s)); blocking landing."
+    exit 1
+fi
+
+echo "PR #${pr}: core-change review protocol satisfied."

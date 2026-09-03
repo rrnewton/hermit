@@ -1,0 +1,423 @@
+name: Docs
+
+# Build the rustdoc API documentation for the workspace and publish it to the
+# `gh-pages` branch, which GitHub Pages serves at
+# https://rrnewton.github.io/hermit/. The workspace rustdoc remains available
+# below the landing page at `hermit/index.html`.
+
+on:
+  workflow_dispatch:
+
+# Supersede older runs for the same ref so documentation deploys do not
+# accumulate behind newer commits.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# peaceiris/actions-gh-pages pushes the built docs to the gh-pages branch using
+# GITHUB_TOKEN, which needs write access to repository contents.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings -C link-arg=-llzma
+  RUSTDOCFLAGS: -D warnings
+  COMPATIBILITY_SITE_RELEASE_REPOSITORY: rrnewton/hermit
+  COMPATIBILITY_SITE_IDENTITY: 8feef179bed2bb48c81dd0bc8186d81df47c255d8c015dc4b0eb139eab439edc
+  COMPATIBILITY_SITE_RELEASE_TAG: compatibility-website-8feef179bed2bb48c81dd0bc8186d81df47c255d8c015dc4b0eb139eab439edc
+  COMPATIBILITY_SITE_RELEASE_TITLE: Historical compatibility website snapshot 8feef179bed2bb48c81dd0bc8186d81df47c255d8c015dc4b0eb139eab439edc
+  COMPATIBILITY_SITE_ASSET: compatibility-website-8feef179bed2bb48c81dd0bc8186d81df47c255d8c015dc4b0eb139eab439edc.tar.gz
+  COMPATIBILITY_SITE_ARCHIVE_SHA256: 073a3a135fdde091a5f4b88839ed979fc9ee8e9592b18c932179a8905249a2e6
+  COMPATIBILITY_SITE_ARCHIVE_BYTES: '15015443'
+  COMPATIBILITY_SITE_BUILD_SHA256: f0d925e91d0e7b0bcea43abb11c8de4133a73e727dd1410a8c5947a0f83d2024
+  COMPATIBILITY_SITE_MANIFEST_TREE_SHA256: 62cf955e153933c35b9f26a82d5fb39007e1b227ebc43c79c41127e1abf1e4cd
+  COMPATIBILITY_SITE_ARTIFACTS_SHA256: 532f9e56160bfa9bbddf431d3cc3f1e3374b9bbaccba03d9f4272b96bd08aef5
+  COMPATIBILITY_SITE_CONTENT_TREE_SHA256: 669e93ef1278b01d1caf0c126386ea785f1698a6323b07017b7e1c48de3cd337
+  COMPATIBILITY_SITE_MODE_SHA256: bb176a41b861c4db27edf1b6e8a8254d1cbdba5fc232588f09ffa1d8ddee2a85
+  COMPATIBILITY_SITE_RECURSIVE_IDENTITY_SHA256: 862dc13ecc72d3deca7fcc91a2b5744dc5dd7c8e2c189b2552201eeb4102835a
+  COMPATIBILITY_SITE_FILE_COUNT: '94'
+  COMPATIBILITY_SITE_FILE_BYTES: '26348805'
+
+jobs:
+  build-and-deploy:
+    name: Build rustdoc and deploy to GitHub Pages
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        # The release download and deploy steps receive the token explicitly;
+        # do not leave the write credential in git configuration while building.
+        persist-credentials: false
+    - name: Initialize dagrun submodule
+      run: git submodule update --init --depth 1 -- agent-utils
+    - name: Dependencies
+      run: sudo apt-get install -y libunwind-dev liblzma-dev
+    - name: Build documentation
+      run: cargo doc --workspace --no-deps
+    - name: Add Hermetic Infra landing page
+      run: |
+        install -m 0644 docs/site/index.html target/doc/index.html
+        install -m 0644 docs/site/site.css target/doc/site.css
+    - name: Add reviewed compatibility website
+      # The release asset is the checksum-bound handoff from the separately reviewed
+      # real-ledger build. Select it by exact tag, name, size, and GitHub digest;
+      # then independently validate every byte and path before publishing it.
+      if: github.ref == 'refs/heads/main'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        umask 077
+
+        scratch=$(mktemp -d)
+        trap 'rm -rf -- "$scratch"' EXIT
+        release_json="$scratch/release.json"
+        archive="$scratch/$COMPATIBILITY_SITE_ASSET"
+
+        gh api \
+          "repos/$COMPATIBILITY_SITE_RELEASE_REPOSITORY/releases/tags/$COMPATIBILITY_SITE_RELEASE_TAG" \
+          > "$release_json"
+        asset_id=$(
+          jq -er \
+            --arg tag "$COMPATIBILITY_SITE_RELEASE_TAG" \
+            --arg title "$COMPATIBILITY_SITE_RELEASE_TITLE" \
+            --arg name "$COMPATIBILITY_SITE_ASSET" \
+            --arg digest "sha256:$COMPATIBILITY_SITE_ARCHIVE_SHA256" \
+            --argjson size "$COMPATIBILITY_SITE_ARCHIVE_BYTES" \
+            '
+              if .tag_name != $tag or .name != $title
+                   or .draft != false or .prerelease != false then
+                error("release identity or publication state disagrees with the pin")
+              else . end
+              | ([.assets[] | select(.name == $name)]
+                 | if length == 1 then .[0]
+                   else error("release must contain exactly one pinned asset") end)
+              | if .state == "uploaded"
+                   and .size == $size
+                   and .digest == $digest
+                   and (.id | type) == "number"
+                then .id
+                else error("release asset metadata disagrees with the pin") end
+            ' "$release_json"
+        )
+        gh api \
+          -H 'Accept: application/octet-stream' \
+          "repos/$COMPATIBILITY_SITE_RELEASE_REPOSITORY/releases/assets/$asset_id" \
+          > "$archive"
+
+        observed_archive_sha256=$(sha256sum "$archive" | awk '{print $1}')
+        test "$observed_archive_sha256" = "$COMPATIBILITY_SITE_ARCHIVE_SHA256"
+        test "$(stat -c %s "$archive")" = "$COMPATIBILITY_SITE_ARCHIVE_BYTES"
+
+        python3 - "$archive" \
+          "target/doc/compatibility/$COMPATIBILITY_SITE_IDENTITY" <<'PY'
+        import hashlib
+        import json
+        import os
+        import stat
+        import sys
+        import tarfile
+        from pathlib import Path, PurePosixPath
+
+
+        ARCHIVE = Path(sys.argv[1])
+        TARGET = Path(sys.argv[2])
+        IDENTITY = os.environ["COMPATIBILITY_SITE_IDENTITY"]
+        BUILD_SHA256 = os.environ["COMPATIBILITY_SITE_BUILD_SHA256"]
+        MANIFEST_TREE_SHA256 = os.environ["COMPATIBILITY_SITE_MANIFEST_TREE_SHA256"]
+        ARTIFACTS_SHA256 = os.environ["COMPATIBILITY_SITE_ARTIFACTS_SHA256"]
+        CONTENT_TREE_SHA256 = os.environ["COMPATIBILITY_SITE_CONTENT_TREE_SHA256"]
+        MODE_SHA256 = os.environ["COMPATIBILITY_SITE_MODE_SHA256"]
+        RECURSIVE_IDENTITY_SHA256 = os.environ[
+            "COMPATIBILITY_SITE_RECURSIVE_IDENTITY_SHA256"
+        ]
+        FILE_COUNT = int(os.environ["COMPATIBILITY_SITE_FILE_COUNT"])
+        FILE_BYTES = int(os.environ["COMPATIBILITY_SITE_FILE_BYTES"])
+        DIRECTORIES = ("assets", "cells", "data", "runs", "tests")
+        EXPECTED_COUNTS = {
+            "current_validation_run_row_count": 60,
+            "green_cell_count": 596,
+            "in_manifest_cell_count": 5744,
+            "never_measured_cell_count": 5103,
+            "physical_row_count": 14541,
+            "red_cell_count": 30,
+            "represented_run_count": 20724,
+            "selected_by_full_custom_command_count": 3,
+            "test_count": 359,
+            "validation_history_row_count": 64,
+        }
+
+
+        def refuse(message: str) -> None:
+            raise SystemExit(f"compatibility website refused: {message}")
+
+
+        def canonical(value: object) -> bytes:
+            return json.dumps(
+                value, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode()
+
+
+        def digest(value: object) -> str:
+            return hashlib.sha256(canonical(value)).hexdigest()
+
+
+        def normalized_member_name(name: str) -> str:
+            path = PurePosixPath(name)
+            if path.is_absolute() or ".." in path.parts:
+                refuse(f"unsafe archive path {name!r}")
+            parts = tuple(part for part in path.parts if part not in ("", "."))
+            normalized = "/".join(parts)
+            expected = "." if not normalized else f"./{normalized}"
+            if name != expected:
+                refuse(f"non-canonical archive path {name!r}")
+            return normalized
+
+
+        def artifact_path(value: object) -> str:
+            if not isinstance(value, str):
+                refuse("manifest contains a non-string artifact path")
+            path = PurePosixPath(value)
+            if (
+                path.is_absolute()
+                or ".." in path.parts
+                or len(path.parts) not in (1, 2)
+                or (len(path.parts) == 2 and path.parts[0] not in DIRECTORIES)
+                or value != path.as_posix()
+            ):
+                refuse(f"manifest contains unsafe artifact path {value!r}")
+            return value
+
+
+        landing_contract = (
+            "<strong>Historical snapshot &mdash; not current:</strong>\n"
+            f'        <a href="compatibility/{IDENTITY}/">'
+            "Open the real-ledger compatibility website</a>"
+        ).encode()
+        landing_path = TARGET.parent.parent / "index.html"
+        try:
+            landing_bytes = landing_path.read_bytes()
+        except OSError as error:
+            refuse(f"cannot read the installed landing page: {error}")
+        if landing_bytes.count(landing_contract) != 1:
+            refuse("landing page does not contain exactly one pinned historical link")
+
+
+        with tarfile.open(ARCHIVE, mode="r:gz") as archive:
+            members = archive.getmembers()
+            by_name = {}
+            for member in members:
+                name = normalized_member_name(member.name)
+                if name in by_name:
+                    refuse(f"duplicate archive path {name!r}")
+                if not member.isdir() and not member.isreg():
+                    refuse(f"archive path {name!r} is a link or special file")
+                expected_mode = 0o555 if member.isdir() else 0o444
+                if stat.S_IMODE(member.mode) != expected_mode:
+                    refuse(f"archive path {name!r} has mode {member.mode:o}")
+                by_name[name] = member
+
+            build_member = by_name.get("build.json")
+            if build_member is None or not build_member.isreg():
+                refuse("archive has no regular build.json")
+            build_stream = archive.extractfile(build_member)
+            if build_stream is None:
+                refuse("archive build.json cannot be read")
+            build_bytes = build_stream.read()
+            if hashlib.sha256(build_bytes).hexdigest() != BUILD_SHA256:
+                refuse("build.json digest disagrees with the reviewed build")
+            try:
+                manifest = json.loads(build_bytes)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                refuse(f"build.json is invalid: {error}")
+            if canonical(manifest) + b"\n" != build_bytes:
+                refuse("build.json is not canonical JSON plus one newline")
+
+            expected_manifest_fields = {
+                "artifacts",
+                "artifacts_sha256",
+                "counts",
+                "directories",
+                "directories_sha256",
+                "freshness_sha256",
+                "generator",
+                "inputs",
+                "provenance",
+                "schema_version",
+                "tree_sha256",
+            }
+            if not isinstance(manifest, dict) or set(manifest) != expected_manifest_fields:
+                refuse("build.json field inventory is not exact")
+            if manifest["schema_version"] != 1:
+                refuse("build.json schema is unsupported")
+            if manifest["counts"] != EXPECTED_COUNTS:
+                refuse("build.json counts disagree with the reviewed build")
+            if manifest["freshness_sha256"] != IDENTITY or TARGET.name != IDENTITY:
+                refuse("artifact identity disagrees with the publication path")
+            if manifest["tree_sha256"] != MANIFEST_TREE_SHA256:
+                refuse("manifest tree digest disagrees with the reviewed build")
+            if manifest["artifacts_sha256"] != ARTIFACTS_SHA256:
+                refuse("artifact-list digest disagrees with the reviewed build")
+
+            artifacts = manifest["artifacts"]
+            if not isinstance(artifacts, list):
+                refuse("manifest artifacts is not an array")
+            paths = []
+            rows = {}
+            expected_row_fields = {
+                "bytes",
+                "content_encoding",
+                "content_type",
+                "path",
+                "sha256",
+            }
+            for row in artifacts:
+                if not isinstance(row, dict) or set(row) != expected_row_fields:
+                    refuse("manifest artifact row fields are not exact")
+                path = artifact_path(row["path"])
+                if (
+                    path == "build.json"
+                    or not isinstance(row["bytes"], int)
+                    or isinstance(row["bytes"], bool)
+                    or row["bytes"] < 0
+                    or not isinstance(row["sha256"], str)
+                    or len(row["sha256"]) != 64
+                ):
+                    refuse(f"manifest artifact row is invalid: {path!r}")
+                try:
+                    bytes.fromhex(row["sha256"])
+                except ValueError:
+                    refuse(f"manifest artifact digest is invalid: {path!r}")
+                paths.append(path)
+                rows[path] = row
+            if paths != sorted(set(paths)) or len(rows) != FILE_COUNT - 1:
+                refuse("manifest artifact inventory is not sorted, unique, and exact")
+            if digest(artifacts) != ARTIFACTS_SHA256:
+                refuse("artifact-list digest disagrees with its rows")
+
+            grouped = {".": []}
+            grouped.update({directory: [] for directory in DIRECTORIES})
+            for row in artifacts:
+                parts = PurePosixPath(row["path"]).parts
+                grouped["." if len(parts) == 1 else parts[0]].append(row)
+            directories = [
+                {
+                    "artifacts_sha256": digest(grouped[directory]),
+                    "file_count": len(grouped[directory]),
+                    "path": directory,
+                }
+                for directory in sorted(grouped)
+            ]
+            if manifest["directories"] != directories:
+                refuse("manifest directory inventory disagrees with artifact rows")
+            if manifest["directories_sha256"] != digest(directories):
+                refuse("manifest directory digest disagrees with its rows")
+            if digest(
+                {
+                    "artifacts_sha256": manifest["artifacts_sha256"],
+                    "directories_sha256": manifest["directories_sha256"],
+                }
+            ) != MANIFEST_TREE_SHA256:
+                refuse("manifest tree digest disagrees with its inventories")
+
+            expected_names = {"", "build.json", *DIRECTORIES, *paths}
+            if set(by_name) != expected_names or len(members) != 100:
+                refuse("archive member inventory disagrees with build.json")
+            for directory in ("", *DIRECTORIES):
+                if not by_name[directory].isdir():
+                    refuse(f"archive directory is not a directory: {directory!r}")
+            for path in ("build.json", *paths):
+                if not by_name[path].isreg():
+                    refuse(f"archive file is not regular: {path!r}")
+
+            if TARGET.exists() or TARGET.is_symlink():
+                refuse("publication target already exists")
+            publication_root = TARGET.parent
+            if publication_root.exists() or publication_root.is_symlink():
+                refuse("compatibility publication root already exists")
+            if not publication_root.parent.is_dir() or publication_root.parent.is_symlink():
+                refuse("documentation target is not a regular directory")
+            publication_root.mkdir()
+            os.chmod(publication_root, 0o755, follow_symlinks=False)
+            TARGET.mkdir(mode=0o700)
+            for directory in sorted(DIRECTORIES):
+                (TARGET / directory).mkdir(mode=0o700)
+
+            observed = {}
+            for path in ("build.json", *paths):
+                member = by_name[path]
+                source = archive.extractfile(member)
+                if source is None:
+                    refuse(f"archive file cannot be read: {path!r}")
+                destination = TARGET.joinpath(*PurePosixPath(path).parts)
+                descriptor = os.open(
+                    destination,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o400,
+                )
+                size = 0
+                sha256 = hashlib.sha256()
+                with os.fdopen(descriptor, "wb") as output:
+                    while chunk := source.read(1 << 20):
+                        output.write(chunk)
+                        size += len(chunk)
+                        sha256.update(chunk)
+                os.chmod(destination, 0o444, follow_symlinks=False)
+                observed[path] = (size, sha256.hexdigest())
+
+            if observed["build.json"] != (len(build_bytes), BUILD_SHA256):
+                refuse("extracted build.json differs from the inspected member")
+            for path, row in rows.items():
+                if observed[path] != (row["bytes"], row["sha256"]):
+                    refuse(f"extracted artifact bytes disagree with build.json: {path}")
+            for directory in (*DIRECTORIES, ""):
+                os.chmod(TARGET / directory, 0o555, follow_symlinks=False)
+
+        entries = [TARGET, *sorted(TARGET.rglob("*"))]
+        files = [path for path in entries if path.is_file()]
+        if len(files) != FILE_COUNT or sum(path.stat().st_size for path in files) != FILE_BYTES:
+            refuse("extracted file count or byte count disagrees with the reviewed build")
+        if any(path.is_symlink() or (not path.is_file() and not path.is_dir()) for path in entries):
+            refuse("extracted tree contains a link or special file")
+
+        content = hashlib.sha256()
+        for path in sorted(files):
+            relative = path.relative_to(TARGET).as_posix()
+            content.update(hashlib.sha256(path.read_bytes()).hexdigest().encode())
+            content.update(b"  ./")
+            content.update(relative.encode())
+            content.update(b"\n")
+        if content.hexdigest() != CONTENT_TREE_SHA256:
+            refuse("extracted content tree disagrees with the reviewed build")
+
+        mode_rows = []
+        identity_rows = []
+        for path in entries:
+            relative = "" if path == TARGET else path.relative_to(TARGET).as_posix()
+            kind = "d" if path.is_dir() else "f" if path.is_file() else "o"
+            mode = stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
+            file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest() if kind == "f" else ""
+            mode_rows.append(f"{relative}\t{kind}\t{mode:o}\n")
+            identity_rows.append(f"{relative}\t{kind}\t{mode:o}\t{file_sha256}\n")
+        if hashlib.sha256("".join(sorted(mode_rows)).encode()).hexdigest() != MODE_SHA256:
+            refuse("extracted modes disagree with the reviewed build")
+        if hashlib.sha256("".join(identity_rows).encode()).hexdigest() != RECURSIVE_IDENTITY_SHA256:
+            refuse("extracted recursive identity disagrees with the reviewed build")
+
+        print(
+            f"verified compatibility website {IDENTITY}: "
+            f"{FILE_COUNT} files, {FILE_BYTES} bytes"
+        )
+        PY
+    - name: Deploy to GitHub Pages
+      # Only publish from the canonical branch, not from manual dispatch on a
+      # feature branch.
+      if: github.ref == 'refs/heads/main'
+      uses: peaceiris/actions-gh-pages@v4
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./target/doc
+        # Overwrite the branch each run instead of accumulating history.
+        force_orphan: true
