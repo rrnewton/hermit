@@ -68,6 +68,11 @@ env:
   # fixture root. Bind one workspace path so build.manifest_guests can publish
   # its output and later selected manifest steps can consume those same files.
   E2E_BUILD_ROOT: ${{ github.workspace }}/ignored/e2e/build
+  # Match the locally validated split path: every constructed guest gets the
+  # minimal environment and a fresh tmpfs mounted at /test. Without this, the
+  # hosted shards silently fall back to ambient environment inheritance and a
+  # host-bound /tmp/test working directory.
+  HERMIT_E2E_EMPTY_WORKDIR: /test
   MANIFEST_PLAN_ARTIFACT: hermit-manifest-plan-${{ github.run_id }}
   MANIFEST_PLAN_TARBALL: hermit-manifest-plan.tgz
   DEBUG_ARTIFACT: hermit-debug-${{ github.run_id }}
@@ -777,6 +782,7 @@ jobs:
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /test
       - name: Download debug prebuilt tree
         uses: actions/download-artifact@v4
         with:
@@ -870,6 +876,7 @@ jobs:
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /test
           unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
       - name: Download debug prebuilt tree
         uses: actions/download-artifact@v4
@@ -956,6 +963,7 @@ jobs:
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /test
           unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
       - name: Download full release prebuilt tree
         uses: actions/download-artifact@v4
@@ -1002,7 +1010,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+          sudo apt-get install -y bc binutils bsdextrautils btrfs-progs bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Install rust-script
         env:
           RUSTFLAGS: ""
@@ -1012,7 +1020,16 @@ jobs:
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /test
           unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
+      - name: Provide Btrfs sysfs state for system-utils
+        if: matrix.slug == 'system_utils'
+        run: |
+          sudo truncate -s 128M /tmp/hermit-ci-btrfs.img
+          sudo mkfs.btrfs -q -f /tmp/hermit-ci-btrfs.img
+          sudo install -d /mnt/hermit-ci-btrfs
+          sudo mount -o loop /tmp/hermit-ci-btrfs.img /mnt/hermit-ci-btrfs
+          compgen -G '/sys/fs/btrfs/*/commit_stats' >/dev/null
       - name: Download debug prebuilt tree
         uses: actions/download-artifact@v4
         with:
@@ -1107,6 +1124,7 @@ jobs:
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /test
           unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
       - name: Download full release prebuilt tree
         uses: actions/download-artifact@v4
