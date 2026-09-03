@@ -172,6 +172,7 @@ lint: lint-checks lint-cargo ## Run the full lint suite matching CI (rustfmt, sh
 lint-checks: ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
 	$(MAKE) -C demos --no-print-directory test
 	./scripts/test-prepare-demo08-calibration.sh
+	./scripts/test-demo08-fixed-control.sh
 	./scripts/test-check-demo-review.sh
 	@base="$$(git merge-base HEAD origin/main)" || { \
 		echo "demo-review: cannot find the merge base of HEAD and origin/main" >&2; \
