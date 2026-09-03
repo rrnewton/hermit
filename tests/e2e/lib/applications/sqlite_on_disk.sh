@@ -100,7 +100,10 @@ fi
 source "$(dirname -- "$0")/common.sh"
 require_commands sqlite3 sha256sum timeout
 
-work_root=$(mktemp -d "${TMPDIR:-/tmp}/hermit-sqlite-e2e.XXXXXX")
+# Keep the verified database beneath the guest's private /tmp.  The validation
+# driver deliberately points TMPDIR at a host-side results tree; using that
+# value here lets run 2 observe the directory left by run 1.
+work_root=$(mktemp -d /tmp/hermit-sqlite-e2e.XXXXXX)
 trap 'rm -rf -- "$work_root"' EXIT
 
 native_first=$(run_sqlite_workload "$work_root/native")

@@ -5486,13 +5486,16 @@ fn a_stopped_stderr_reader_does_not_hang_hermit_on_its_way_out() {
     // diagnose than one that dies reporting it badly.
     use std::os::unix::io::FromRawFd;
     const F_SETPIPE_SZ: i32 = 1031;
+    const F_GETPIPE_SZ: i32 = 1032;
 
     let program = String::from("/nonexistent-guest-program-for-this-test");
     let mut fds = [0i32; 2];
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
     let (read_fd, write_fd) = (fds[0], fds[1]);
     unsafe { libc::fcntl(write_fd, F_SETPIPE_SZ, 4096) };
-    let filler = vec![b'x'; 3900];
+    let pipe_bytes = unsafe { libc::fcntl(write_fd, F_GETPIPE_SZ) };
+    assert!(pipe_bytes > 196, "read pipe capacity after F_SETPIPE_SZ");
+    let filler = vec![b'x'; pipe_bytes as usize - 196];
     assert_eq!(
         unsafe { libc::write(write_fd, filler.as_ptr().cast(), filler.len()) },
         filler.len() as isize,
@@ -5646,14 +5649,19 @@ fn diagnostics_survive_a_nonblocking_stderr_under_back_pressure() {
         expected.len()
     );
 
-    // A 4096-byte pipe pre-filled to 3900, so only 196 bytes are free, and the
-    // write end made nonblocking exactly as a guest's fcntl would leave it.
+    // A pipe with exactly 196 bytes free, and the write end made nonblocking
+    // exactly as a guest's fcntl would leave it. Some kernels refuse to shrink
+    // a pipe to 4096 bytes, so measure the capacity after requesting it rather
+    // than treating F_SETPIPE_SZ as infallible.
     let mut fds = [0 as libc::c_int; 2];
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
     let (read_fd, write_fd) = (fds[0], fds[1]);
     const F_SETPIPE_SZ: libc::c_int = 1031;
+    const F_GETPIPE_SZ: libc::c_int = 1032;
     unsafe { libc::fcntl(write_fd, F_SETPIPE_SZ, 4096) };
-    let filler = vec![b'F'; 3900];
+    let pipe_bytes = unsafe { libc::fcntl(write_fd, F_GETPIPE_SZ) };
+    assert!(pipe_bytes > 196, "read pipe capacity after F_SETPIPE_SZ");
+    let filler = vec![b'F'; pipe_bytes as usize - 196];
     let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
     unsafe { libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
     let mut filled = 0usize;
@@ -6095,22 +6103,24 @@ fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
 fn the_stderr_deadline_is_spent_once_across_writes_not_restarted_by_each() {
     use std::os::unix::io::FromRawFd;
     const F_SETPIPE_SZ: i32 = 1031;
-    const PIPE_BYTES: usize = 4096;
+    const F_GETPIPE_SZ: i32 = 1032;
 
     let program = String::from("/nonexistent-guest-program-for-the-shared-deadline-cell");
     let mut fds = [0i32; 2];
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
     let (read_fd, write_fd) = (fds[0], fds[1]);
-    unsafe { libc::fcntl(write_fd, F_SETPIPE_SZ, PIPE_BYTES as i32) };
+    unsafe { libc::fcntl(write_fd, F_SETPIPE_SZ, 4096) };
+    let pipe_bytes = unsafe { libc::fcntl(write_fd, F_GETPIPE_SZ) };
+    assert!(pipe_bytes > 0, "read pipe capacity after F_SETPIPE_SZ");
 
     // ⚠️ COMPLETELY FULL, NOT NEARLY FULL. Leaving even a couple of hundred bytes
     // free lets the first line through and collapses this back into the N=1 case
     // the cell above already covers. Filled while still BLOCKING, before O_NONBLOCK
     // goes on, so the fill itself cannot short-write.
-    let filler = vec![b'x'; PIPE_BYTES];
+    let filler = vec![b'x'; pipe_bytes as usize];
     assert_eq!(
         unsafe { libc::write(write_fd, filler.as_ptr().cast(), filler.len()) },
-        PIPE_BYTES as isize,
+        pipe_bytes as isize,
         "the pipe must start completely full or this cell silently tests the N=1 case"
     );
     let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };

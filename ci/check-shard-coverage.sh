@@ -191,6 +191,40 @@ workflow_job_action_values() {
     ' <<<"$body"
 }
 
+workflow_global_env_value() {
+    local name=$1 workflow_text=$2
+    awk -v marker="  ${name}:" -v env_name="$name" '
+        /^env:$/ { in_env = 1; next }
+        in_env && /^[^ ]/ { exit }
+        in_env && index($0, marker) == 1 {
+            line = $0
+            sub("^  " env_name ":[[:space:]]*", "", line)
+            print line
+            count += 1
+        }
+        END { if (count != 1) exit 1 }
+    ' <<<"$workflow_text"
+}
+
+workflow_job_prepares_isolated_workdir() {
+    local job=$1 workflow_text=$2 body
+    body=$(workflow_job_body "$job" "$workflow_text") || return 1
+    grep -Fqx '          sudo install -d -o "$(id -u)" -g "$(id -g)" /test' <<<"$body"
+}
+
+workflow_e2e_prepares_btrfs() {
+    local workflow_text=$1 body
+    body=$(workflow_job_body e2e "$workflow_text") || return 1
+    grep -Eq '^          sudo apt-get install -y .* btrfs-progs( |$)' <<<"$body" &&
+        grep -Fqx '      - name: Provide Btrfs sysfs state for system-utils' <<<"$body" &&
+        grep -Fqx "        if: matrix.slug == 'system_utils'" <<<"$body" &&
+        grep -Fqx '          sudo truncate -s 128M /tmp/hermit-ci-btrfs.img' <<<"$body" &&
+        grep -Fqx '          sudo mkfs.btrfs -q -f /tmp/hermit-ci-btrfs.img' <<<"$body" &&
+        grep -Fqx '          sudo install -d /mnt/hermit-ci-btrfs' <<<"$body" &&
+        grep -Fqx '          sudo mount -o loop /tmp/hermit-ci-btrfs.img /mnt/hermit-ci-btrfs' <<<"$body" &&
+        grep -Fqx "          compgen -G '/sys/fs/btrfs/*/commit_stats' >/dev/null" <<<"$body"
+}
+
 workflow_job_needs_exactly() {
     local job=$1 expected_csv=$2 workflow_text=$3 actual expected
     actual=$(workflow_job_needs "$job" "$workflow_text" | sort) || return 1
@@ -213,7 +247,14 @@ workflow_wiring_contract() {
     # Keep these exact. The dependency checks below treat predecessor groups as
     # supplied only because this job graph orders them and these artifact edges
     # move the build products across runner boundaries.
-    workflow_job_needs_exactly preflight 'select' "$workflow_text" &&
+    [[ $(workflow_global_env_value HERMIT_E2E_EMPTY_WORKDIR "$workflow_text") == /test ]] &&
+        workflow_job_prepares_isolated_workdir test-debug "$workflow_text" &&
+        workflow_job_prepares_isolated_workdir strict-compat "$workflow_text" &&
+        workflow_job_prepares_isolated_workdir test-release "$workflow_text" &&
+        workflow_job_prepares_isolated_workdir e2e "$workflow_text" &&
+        workflow_job_prepares_isolated_workdir sabre_non_gated_parity "$workflow_text" &&
+        workflow_e2e_prepares_btrfs "$workflow_text" &&
+        workflow_job_needs_exactly preflight 'select' "$workflow_text" &&
         workflow_job_needs_exactly checks 'select,preflight' "$workflow_text" &&
         workflow_job_needs_exactly build-debug 'select,preflight' "$workflow_text" &&
         workflow_job_needs_exactly build-release 'select,preflight' "$workflow_text" &&
@@ -275,6 +316,41 @@ if [[ $missing_artifact == "$workflow_text" ]]; then
     status=1
 elif workflow_wiring_contract "$missing_artifact"; then
     echo "check-shard-coverage.sh: FAIL — workflow guard accepted a planted missing artifact download" >&2
+    status=1
+fi
+missing_workdir_env=${workflow_text/$'  HERMIT_E2E_EMPTY_WORKDIR: /test\n'/}
+if [[ $missing_workdir_env == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — isolated-workdir mutation did not change the workflow fixture" >&2
+    status=1
+elif workflow_wiring_contract "$missing_workdir_env"; then
+    echo "check-shard-coverage.sh: FAIL — workflow guard accepted a missing hosted isolated workdir" >&2
+    status=1
+fi
+workdir_setup=$'          sudo install -d -o "$(id -u)" -g "$(id -g)" /test\n'
+missing_workdir_setup=${workflow_text/"$workdir_setup"/}
+if [[ $missing_workdir_setup == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — isolated-workdir setup mutation did not change the workflow fixture" >&2
+    status=1
+elif workflow_wiring_contract "$missing_workdir_setup"; then
+    echo "check-shard-coverage.sh: FAIL — workflow guard accepted a test job without the hosted isolated-workdir setup" >&2
+    status=1
+fi
+btrfs_setup_name="      - name: Provide Btrfs sysfs state for system-utils"
+missing_btrfs_setup=${workflow_text/"$btrfs_setup_name"/}
+if [[ $missing_btrfs_setup == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — Btrfs setup mutation did not change the workflow fixture" >&2
+    status=1
+elif workflow_wiring_contract "$missing_btrfs_setup"; then
+    echo "check-shard-coverage.sh: FAIL — workflow guard accepted missing Btrfs setup" >&2
+    status=1
+fi
+btrfs_slug="        if: matrix.slug == 'system_utils'"
+wrong_btrfs_slug=${workflow_text/"$btrfs_slug"/"        if: matrix.slug == 'applications'"}
+if [[ $wrong_btrfs_slug == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — Btrfs slug mutation did not change the workflow fixture" >&2
+    status=1
+elif workflow_wiring_contract "$wrong_btrfs_slug"; then
+    echo "check-shard-coverage.sh: FAIL — workflow guard accepted Btrfs setup on the wrong E2E shard" >&2
     status=1
 fi
 
