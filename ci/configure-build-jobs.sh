@@ -193,8 +193,17 @@ fi
 # The five intervening commits do not touch a native DBT recipe input. The
 # measured native-build budget carries unchanged; fresh Rust build and validate
 # evidence is still required for the Backend API change.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c2e2c8fbe52c2e5e8c65a56c2a547785f76c731e ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c2e2c8fbe52c2e5e8c65a56c2a547785f76c731e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO ce841d74 (2026-09-02): all three source_recipe_key repository
+# inputs are byte-identical to c2e2c8fb by git object id:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# The sole intervening commit changes only reverie-process cloned-child stack
+# allocation and its test. It cannot affect the DynamoRIO content-key miss, so
+# the measured native-build budget carries unchanged. Fresh Hermit validation
+# remains required for the process-launch change.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ce841d744cc74b1627ac52b42f711b33b1c72a45 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ce841d744cc74b1627ac52b42f711b33b1c72a45 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
