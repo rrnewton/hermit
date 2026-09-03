@@ -984,7 +984,10 @@ jobs:
       matrix: ${{ fromJSON(needs.build-debug.outputs.e2e_matrix) }}
     env:
       E2E_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-      E2E_RESULT_ROOT: ignored/e2e/${{ matrix.slug }}
+      # Local split validation binds its durable result tree at /results. Keep
+      # the hosted guest-visible HOME/XDG/fixture paths identical instead of
+      # leaking the runner checkout path into the scheduled environment.
+      E2E_RESULT_ROOT: /results/${{ matrix.slug }}
     steps:
       - uses: actions/checkout@v4
       - name: Initialize dagrun submodule
@@ -1003,6 +1006,7 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           sudo install -d -o "$(id -u)" -g "$(id -g)" /test
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /results
           unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
       - name: Provide Btrfs sysfs state for system-utils
         if: matrix.slug == 'system_utils'

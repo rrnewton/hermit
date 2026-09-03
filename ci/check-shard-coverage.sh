@@ -212,6 +212,13 @@ workflow_job_prepares_isolated_workdir() {
     grep -Fqx '          sudo install -d -o "$(id -u)" -g "$(id -g)" /test' <<<"$body"
 }
 
+workflow_e2e_uses_pinned_result_root() {
+    local workflow_text=$1 body
+    body=$(workflow_job_body e2e "$workflow_text") || return 1
+    grep -Fqx '      E2E_RESULT_ROOT: /results/${{ matrix.slug }}' <<<"$body" &&
+        grep -Fqx '          sudo install -d -o "$(id -u)" -g "$(id -g)" /results' <<<"$body"
+}
+
 workflow_e2e_prepares_btrfs() {
     local workflow_text=$1 body
     body=$(workflow_job_body e2e "$workflow_text") || return 1
@@ -253,6 +260,7 @@ workflow_wiring_contract() {
         workflow_job_prepares_isolated_workdir test-release "$workflow_text" &&
         workflow_job_prepares_isolated_workdir e2e "$workflow_text" &&
         workflow_job_prepares_isolated_workdir sabre_non_gated_parity "$workflow_text" &&
+        workflow_e2e_uses_pinned_result_root "$workflow_text" &&
         workflow_e2e_prepares_btrfs "$workflow_text" &&
         workflow_job_needs_exactly preflight 'select' "$workflow_text" &&
         workflow_job_needs_exactly checks 'select,preflight' "$workflow_text" &&
@@ -333,6 +341,15 @@ if [[ $missing_workdir_setup == "$workflow_text" ]]; then
     status=1
 elif workflow_wiring_contract "$missing_workdir_setup"; then
     echo "check-shard-coverage.sh: FAIL — workflow guard accepted a test job without the hosted isolated-workdir setup" >&2
+    status=1
+fi
+result_root=$'      E2E_RESULT_ROOT: /results/${{ matrix.slug }}'
+wrong_result_root=${workflow_text/"$result_root"/$'      E2E_RESULT_ROOT: ignored/e2e/${{ matrix.slug }}'}
+if [[ $wrong_result_root == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — result-root mutation did not change the workflow fixture" >&2
+    status=1
+elif workflow_wiring_contract "$wrong_result_root"; then
+    echo "check-shard-coverage.sh: FAIL — workflow guard accepted a hosted result root outside /results" >&2
     status=1
 fi
 btrfs_setup_name="      - name: Provide Btrfs sysfs state for system-utils"
