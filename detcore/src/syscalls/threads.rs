@@ -992,7 +992,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Still a pass-through: Linux owns the registration and supplies the
     /// result, and Detcore only records the head address so it can replay
     /// `exit_robust_list()` when the thread dies (see
-    /// [`Self::run_robust_list_owner_death`]). Recording happens only after the
+    /// `Self::run_robust_list_owner_death`). Recording happens only after the
     /// kernel accepts the call, so a rejected length or address never becomes
     /// Detcore state.
     ///
