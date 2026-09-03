@@ -112,6 +112,11 @@ ignored/demo08-btrfs/pop-tiny.img
 Overrides: `DEMO08_DIR`, `DEMO08_ARTIFACTS`, `DEMO08_CRASH_SEED` (default 15),
 `DEMO08_TIMEOUT` (default 90), `HERMIT_RELEASE`.
 
+`DEMO08_TIMEOUT` is not the demo's budget alone: `scripts/prepare-demo08-assets.sh`
+caps each calibration run at the same value, and refuses a
+`DEMO08_CALIBRATION_TIMEOUT` above it, so a seed can never be calibrated above the
+budget the demo will apply to it.
+
 ## Build recipe
 
 Build btrfs-progs **v7.1** twice, applying the vendored sources from

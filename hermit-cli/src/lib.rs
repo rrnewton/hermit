@@ -220,9 +220,17 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //              bare-name-on-guest-PATH form currently exits 125 instead, which
 //              is an inconsistency tracked as `hermit_reports_a_missing`, not a
 //              second meaning for 127.
-//   128 + N    killed by signal N (shell convention). Hermit does not emit these
-//              deliberately; a wrapper reporting a signal death must use them
-//              rather than borrow a code that already means something.
+//   128 + N    killed by signal N (shell convention). HERMIT PRODUCES THESE
+//              DELIBERATELY, BY TWO SEPARATE ROUTES. A guest that dies by a
+//              signal arrives as `ExitStatus::Signaled`, and `raise_or_exit`
+//              (`hermit-cli/src/bin/hermit/main.rs:406`) re-raises that signal
+//              on hermit itself, so the shell reports 128 + N. That is where
+//              Demo 8's 134 for a SIGABRT'd guest comes from, and its crash
+//              criterion now requires exactly that value. Separately, hermit's
+//              own `SignalDeath` shutdown returns `signal_exit_status(signo)`
+//              as an ordinary exit code (`main.rs:493`). A wrapper reporting a
+//              signal death must use these rather than borrow a code that
+//              already means something.
 //
 // ⚠️ NO CODE IS EXCLUSIVELY HERMIT'S. Every value in 0..=255 is a legal guest
 // status, so a guest may return 125 or 127 of its own accord and this table
