@@ -44,7 +44,10 @@ fi
 source "$(dirname -- "$0")/common.sh"
 require_commands cmake date make od sha256sum timeout tr
 
-work_root=$(mktemp -d "${TMPDIR:-/tmp}/hermit-build-e2e.XXXXXX")
+# Verification isolates guest /tmp between runs. Keep all guest-visible build
+# state there instead of under the host-side validation TMPDIR, which persists
+# across both runs and makes the second run observe the first run's directory.
+work_root=$(mktemp -d /tmp/hermit-build-e2e.XXXXXX)
 trap 'rm -rf -- "$work_root"' EXIT
 
 native_first=$(run_build_workload "$work_root/native")
