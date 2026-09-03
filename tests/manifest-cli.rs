@@ -43,6 +43,9 @@ mod rust_script_prelude;
 #[path = "../ci/manifest-plan/src/manifest_value.rs"]
 mod manifest_value;
 
+// This rust-script adapter uses only the schema-facing subset of the shared
+// timeout module; the manifest-plan crate consumes its calibration API.
+#[allow(dead_code)]
 #[path = "../ci/manifest-plan/src/timeouts.rs"]
 mod timeouts;
 
