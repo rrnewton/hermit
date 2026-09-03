@@ -166,7 +166,7 @@ def main() -> int:
     run_dir = make_temp_result_dir(ASSETS, "boot")
     # The socket is rooted short rather than under the deep per-run directory:
     # see make_socket_path. Everything else for the run stays in run_dir.
-    qmp_socket = make_socket_path("boot", "qmp.sock")
+    qmp_socket = make_socket_path(run_dir / "qmp.sock", "boot")
     # Boot backs the serial console with a `-serial file:` transcript, not a unix
     # socket: a socket chardev adds a host-timing-driven pollable fd that can
     # starve the -icount vCPU under the deterministic scheduler (the 600s boot
