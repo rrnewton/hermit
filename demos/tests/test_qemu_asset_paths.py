@@ -3,6 +3,7 @@
 
 import os
 import runpy
+import socket
 import subprocess
 import sys
 import tempfile
@@ -154,10 +155,6 @@ class DefaultQemuAssetsTest(unittest.TestCase):
                 self.assertIn("env=environment", text[launch:])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SocketPathBoundTest(unittest.TestCase):
     """A Unix-domain socket path must fit AF_UNIX, and must move only if it must.
 
@@ -178,11 +175,58 @@ class SocketPathBoundTest(unittest.TestCase):
             "qemu-linux/.work/boot-ab12cd34/qmp.sock"
         )
         self.assertGreater(len(str(too_long).encode()), dc.AF_UNIX_PATH_MAX)
-        got = dc.make_socket_path(too_long, "boot")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("QEMU_SOCKET_DIR", None)
+            got = dc.make_socket_path(too_long, "boot")
         self.assertNotEqual(got, too_long)
         self.assertLessEqual(len(str(got).encode()), dc.AF_UNIX_PATH_MAX)
-        self.assertEqual(got.name, "qmp.sock")
+        self.assertEqual(
+            got.parent, Path("/var/tmp/hermit-qmp-{}".format(os.getuid()))
+        )
+        self.assertTrue(got.name.startswith("boot-"))
+        self.assertTrue(got.name.endswith(".sock"))
+
+    def test_relocation_is_stable_bindable_and_repeat_canonicalization_is_stable(self):
+        prefix = "/a" + "/deep" * 24
+        first_run = Path(prefix + "/boot-first")
+        second_run = Path(prefix + "/boot-second")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("QEMU_SOCKET_DIR", None)
+            first = dc.make_socket_path(first_run / "qmp.sock", "boot")
+            self.assertEqual(
+                dc.make_socket_path(first_run / "qmp.sock", "boot"), first
+            )
+            second = dc.make_socket_path(second_run / "qmp.sock", "boot")
+        self.assertNotEqual(first, second)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            first.unlink(missing_ok=True)
+            listener.bind(str(first))
+        first.unlink(missing_ok=True)
+
+        first_arg = "unix:{},server=on,wait=off".format(first)
+        second_arg = "unix:{},server=on,wait=off".format(second)
+        self.assertEqual(
+            dc.canonicalize_qemu_runtime_path(first_arg, first_run, first),
+            dc.canonicalize_qemu_runtime_path(second_arg, second_run, second),
+        )
+
+    def test_override_must_still_leave_room_for_the_socket(self):
+        too_long = Path("/a" + "/deep" * 24 + "/qmp.sock")
+        override = "/var/tmp/" + "x" * 100
+        with mock.patch.dict(os.environ, {"QEMU_SOCKET_DIR": override}):
+            with self.assertRaisesRegex(RuntimeError, "AF_UNIX limit"):
+                dc.make_socket_path(too_long, "boot")
+
+    def test_host_tmp_override_is_refused_because_hermit_hides_it(self):
+        too_long = Path("/a" + "/deep" * 24 + "/qmp.sock")
+        with mock.patch.dict(os.environ, {"QEMU_SOCKET_DIR": "/tmp/qmp"}):
+            with self.assertRaisesRegex(RuntimeError, "Hermit normally hides"):
+                dc.make_socket_path(too_long, "boot")
 
     def test_the_bound_is_the_kernel_constant(self):
         # sockaddr_un.sun_path is 108 bytes including the NUL.
         self.assertEqual(dc.AF_UNIX_PATH_MAX, 107)
+
+
+if __name__ == "__main__":
+    unittest.main()

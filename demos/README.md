@@ -81,6 +81,11 @@ hide those QEMU inputs. The Hermit
 command also identity-mounts host `/tmp`, keeping the checkout-local controller
 and per-run paths visible.
 
+When a deep checkout would put a QMP socket over Linux's AF_UNIX pathname
+limit, Demos 5 and 6 move only that socket under `/var/tmp`, which remains
+visible to QEMU under Hermit. Set `QEMU_SOCKET_DIR` to another short writable
+host-visible directory outside `/tmp` when `/var/tmp` is unavailable.
+
 ## Layout
 
 ```text
@@ -145,18 +150,20 @@ make demos
 ```
 
 Demo logs and the machine-readable summary are written under
-`target/demo-sweep/`. The manually dispatched and scheduled P0 Demo Gate runs
-the suite at an exact Hermit commit, preserves per-demo logs, and stays failed
-on every demo red.
+`target/demo-sweep/`. The manually dispatched Demo Hot Path workflow runs the
+suite at an exact Hermit commit, preserves per-demo logs, and stays failed on
+every demo red.
 
 Demo 8 seed calibration writes `ignored/demo08-run/calibration.tsv` plus one
 retained output per attempted seed. Each row records the seed, whether the
 `print_copied_inodes` progress-thread path engaged, whether ASAN reported the
-planted heap use-after-free, the exit status, and the output path. The summary
-always states `engagement=N/M` and `uaf_hits=H/M`. A cached crash seed is
-replayed and must supply 1/1 engagement evidence; it is never trusted merely
-because the cache file exists. Zero engagement is a refused `NO-RESULT`, not a
-clean sweep.
+planted heap use-after-free, the exit status, whether that evidence qualifies,
+and the output path. A seed qualifies only when the path engaged and a complete
+ASAN report ended in the expected abort status 134; rc=0 and timeout-truncated
+rc=124 reports are refused. The summary states `engagement=N/M`,
+`uaf_hits=H/M`, and `qualified=Q/M`. A cached crash seed is replayed and must
+supply qualifying 1/1 evidence; it is never trusted merely because the cache
+file exists. Zero engagement is a refused `NO-RESULT`, not a clean sweep.
 
 Run each demo individually so its output and result remain easy to inspect:
 

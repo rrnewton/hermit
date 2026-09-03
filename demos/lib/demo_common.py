@@ -682,29 +682,66 @@ def make_socket_path(preferred: Path, prefix: str) -> Path:
     if len(str(preferred).encode()) <= AF_UNIX_PATH_MAX:
         return preferred
 
-    runtime_root = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
-    root = Path(runtime_root) / "hermit-demos"
+    # The validation driver shortens its own TMPDIR under XDG_RUNTIME_DIR, but
+    # these QMP sockets are constructed explicitly and never pass through that
+    # mechanism.  Do not use host /tmp here: Hermit normally mounts a private
+    # tmpfs over /tmp, which would hide an outer controller's socket from QEMU
+    # running under Hermit.  /var/tmp is deliberately also used by
+    # default_qemu_assets for this namespace-visibility reason.
+    base = Path(os.environ.get("QEMU_SOCKET_DIR", "/var/tmp"))
+    if _under_host_tmp(base):
+        raise RuntimeError(
+            "socket path {} is {} bytes, over the {}-byte AF_UNIX limit, but "
+            "QEMU_SOCKET_DIR={} is under host /tmp, which Hermit normally hides "
+            "with a private tmpfs. Choose a short host-visible directory outside "
+            "/tmp, or set QEMU_ASSETS to a short path so relocation is "
+            "unnecessary.".format(
+                preferred, len(str(preferred).encode()), AF_UNIX_PATH_MAX, base
+            )
+        )
+    root = base / "hermit-qmp-{}".format(os.getuid())
     try:
-        root.mkdir(parents=True, exist_ok=True)
-        relocated = Path(tempfile.mkdtemp(prefix="{}-".format(prefix), dir=str(root)))
+        root.mkdir(parents=True, mode=0o700, exist_ok=True)
     except OSError as error:
         raise RuntimeError(
             "socket path {} is {} bytes, over the {}-byte AF_UNIX limit, and the "
-            "short fallback root {} is unusable: {}. Set XDG_RUNTIME_DIR or "
-            "TMPDIR to a short writable directory.".format(
+            "host-visible fallback root {} is unusable: {}. Set QEMU_SOCKET_DIR "
+            "to a short writable directory outside /tmp, or set QEMU_ASSETS to "
+            "a short path so relocation is unnecessary.".format(
                 preferred, len(str(preferred).encode()), AF_UNIX_PATH_MAX, root, error
             )
         ) from error
 
-    path = relocated / preferred.name
+    # Hash the complete preferred path.  Demo 5's preferred path includes its
+    # unique run directory, so concurrent runs remain isolated.  Demo 6's
+    # preferred path is stable and protected by its existing lock, so repeats
+    # reuse the same spelling.  Unlike mkdtemp this mapping is deterministic:
+    # callers can canonicalize the one known relocated socket without masking
+    # any other QEMU argument.
+    identity = hashlib.sha256(os.fsencode(str(preferred.resolve()))).hexdigest()[:16]
+    path = root / "{}-{}.sock".format(prefix, identity)
     length = len(str(path).encode())
     if length > AF_UNIX_PATH_MAX:
         raise RuntimeError(
             "socket path is {} bytes even after relocating under {}, over the "
-            "{}-byte AF_UNIX limit: {}. Set XDG_RUNTIME_DIR or TMPDIR to a "
-            "shorter directory.".format(length, root, AF_UNIX_PATH_MAX, path)
+            "{}-byte AF_UNIX limit: {}. Set QEMU_SOCKET_DIR to a shorter "
+            "host-visible directory outside /tmp.".format(
+                length, root, AF_UNIX_PATH_MAX, path
+            )
         )
     return path
+
+
+def canonicalize_qemu_runtime_path(text: str, run_dir: Path, qmp_socket: Path) -> str:
+    """Fold only the private runtime paths whose spelling varies between runs."""
+    run_dir = Path(run_dir)
+    qmp_socket = Path(qmp_socket)
+    normalized = text.replace(str(run_dir), "<run-dir>")
+    try:
+        qmp_socket.relative_to(run_dir)
+    except ValueError:
+        normalized = normalized.replace(str(qmp_socket), "<qmp-socket>")
+    return normalized
 
 
 def publish_anchor(work_dir: Path, anchor_dir: Path) -> bool:

@@ -242,6 +242,42 @@ class InfoLogAdmissionTest(unittest.TestCase):
                 any(line.startswith("PASS: exact Hermit log") for line in report)
             )
 
+    def test_relocated_qmp_socket_is_stable_for_repeat_comparison(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_run = root / "first-run"
+            second_run = root / "second-run"
+            first_run.mkdir()
+            second_run.mkdir()
+            first_log = first_run / "hermit-info.log"
+            second_log = second_run / "hermit-info.log"
+            first_log.write_text(BASE_LOG)
+            second_log.write_text(BASE_LOG)
+
+            first_socket = Path("/var/tmp/hermit-qmp-test/boot-first.sock")
+            second_socket = Path("/var/tmp/hermit-qmp-test/boot-second.sock")
+            first_record = _boot_record(first_run, info_log=first_log)
+            second_record = _boot_record(second_run, info_log=second_log)
+            first_record["qemu_argv"] = [
+                dc.canonicalize_qemu_runtime_path(
+                    "-qmp=unix:{}".format(first_socket), first_run, first_socket
+                )
+            ]
+            second_record["qemu_argv"] = [
+                dc.canonicalize_qemu_runtime_path(
+                    "-qmp=unix:{}".format(second_socket), second_run, second_socket
+                )
+            ]
+
+            passed, report = dc.compare_runs(
+                dc.parse_run_metadata(first_record),
+                dc.parse_run_metadata(second_record),
+            )
+
+            self.assertTrue(passed, report)
+            self.assertEqual(first_record["qemu_argv"], ["-qmp=unix:<qmp-socket>"])
+            self.assertEqual(first_record["qemu_argv"], second_record["qemu_argv"])
+
     def _compare_logs(self, tmp, anchor_text, current_text):
         root = Path(tmp)
         anchor_log = root / "anchor.log"
