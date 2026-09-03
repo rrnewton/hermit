@@ -15,7 +15,11 @@
 #
 # The crash and replay must each return the ASAN abort status 134 and contain a
 # completed report.  A repeatable rc=0 or timeout-truncated rc=124 fragment is
-# not the promised crash and must not reach SUCCESS.
+# not the promised crash and must not reach SUCCESS.  Those are two independent
+# requirements, so each has a control that fails on it ALONE: the rc=0/rc=124
+# cases meet neither, and truncated-abort meets the status and fails only the
+# completeness check.  Without the second, deleting the SUMMARY grep from
+# complete_asan_uaf leaves this whole file green.
 #
 # These brackets drive the real demos/08-btrfs-convert-uaf.sh through its
 # documented DEMO08_DIR / HERMIT_RELEASE / SAFEHERMIT seams, so they exercise
@@ -88,6 +92,8 @@ case "$conv" in
       complete-abort) cat "$DEMO08_TEST_UAF_FILE"; exit 134 ;;
       partial-rc0) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 0 ;;
       partial-rc124) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 124 ;;
+      # The abort happened and the report did not finish: the converse of the two above.
+      truncated-abort) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 134 ;;
       replay-partial-rc0)
         if [ "$count" -eq 1 ]; then cat "$DEMO08_TEST_UAF_FILE"; exit 134; fi
         cat "$DEMO08_TEST_PARTIAL_FILE"; exit 0 ;;
@@ -202,6 +208,15 @@ run_case 1 "an rc=0 partial replay does not reach SUCCESS" \
 run_case 1 "an rc=124 partial replay does not reach SUCCESS" \
   clean "replay did not complete with the ASAN abort" replay-partial-rc124
 
-printf 'test-demo08-fixed-control: %s passed, %s failed (1 positive, 8 refusals)\n' \
+# Each of the four above is refused on its exit status, so none of them exercises the
+# completeness half of the bar: drop the SUMMARY requirement and they all still pass.  This
+# one closes that.  The guest DID abort -- rc=134, the status the demo requires -- and its
+# report stops mid-way, which is what a report interleaved with another thread's output or
+# clipped by a wrapper's byte cap looks like.  The status check passes, so complete_asan_uaf
+# is the only thing left refusing the run, and the needle pins the refusal to Step 2.
+run_case 1 "an rc=134 with a truncated report is not a complete crash" \
+  clean "chaos buggy seed 7 exited 134 without a complete" truncated-abort
+
+printf 'test-demo08-fixed-control: %s passed, %s failed (1 positive, 9 refusals)\n' \
   "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
