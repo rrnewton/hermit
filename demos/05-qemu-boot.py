@@ -13,6 +13,7 @@ ROOT = DEMO_DIR.parent
 sys.path.insert(0, str(DEMO_DIR / "lib"))
 
 from demo_common import (  # noqa: E402
+    make_socket_path,
     archive_result_dir,
     banner,
     canonicalize_qcow2_snapshot_timestamp,
@@ -163,7 +164,9 @@ def main() -> int:
     # Everything for this run lives in a private working directory so any number
     # of runs can boot QEMU concurrently without sharing sockets, disks, or logs.
     run_dir = make_temp_result_dir(ASSETS, "boot")
-    qmp_socket = run_dir / "qmp.sock"
+    # The socket is rooted short rather than under the deep per-run directory:
+    # see make_socket_path. Everything else for the run stays in run_dir.
+    qmp_socket = make_socket_path("boot", "qmp.sock")
     # Boot backs the serial console with a `-serial file:` transcript, not a unix
     # socket: a socket chardev adds a host-timing-driven pollable fd that can
     # starve the -icount vCPU under the deterministic scheduler (the 600s boot

@@ -104,6 +104,22 @@ case "${DEMO08_TEST_MODE:?mode required}" in
     ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 \
       "${DEMO08_TEST_UAF_BIN:?UAF binary required}"
     ;;
+  partial-uaf-rc0)
+    # The exact shape the review caught in production: engagement, the first lines
+    # of a UAF report on a thread whose process still exits 0, and NO SUMMARY, so
+    # the report is truncated and there was no abort.
+    printf 'Copy inodes [o] [         0/         1]\r\n'
+    echo '==123==ERROR: AddressSanitizer: heap-use-after-free on address 0x606000000210'
+    echo 'READ of size 8 at 0x606000000210 thread T1'
+    exit 0
+    ;;
+  partial-uaf-rc124)
+    # Same partial report, cut off by the per-seed wall timeout instead.
+    printf 'Copy inodes [o] [         0/         1]\r\n'
+    echo '==123==ERROR: AddressSanitizer: heap-use-after-free on address 0x606000000210'
+    echo 'READ of size 8 at 0x606000000210 thread T1'
+    exit 124
+    ;;
   runner-failure)
     echo 'fixture runner failed before guest execution' >&2
     exit 127
@@ -196,6 +212,42 @@ grep -q 'path engagement 2/2' <<<"$engaged_output"
 ! grep -q 'NO-RESULT' <<<"$engaged_output"
 [ "$(grep -c $'\treached\tnone\t' "$artifacts/calibration.tsv")" -eq 2 ]
 
+# A UAF report TEXT is not the success criterion; the ASAN ABORT is. A run that
+# prints the first lines of a report on a thread and still exits 0 produced no
+# abort, and the demo refuses such a seed -- so the calibration must never
+# persist one. This is the exact shape found in production at 0fd1653f, where a
+# seed selected on report text with rc=0 was handed to the demo and rejected.
+assets="$TMP/assets-partial-rc0"
+artifacts="$TMP/artifacts-partial-rc0"
+make_assets "$assets"
+set +e
+partial0_output="$(DEMO08_TEST_MODE=partial-uaf-rc0 \
+  run_prepare "$assets" "$artifacts" 2 2>&1)"
+partial0_rc=$?
+set -e
+[ "$partial0_rc" -ne 0 ]
+[ ! -f "$assets/.crash-seed" ]
+[ "$(grep -c $'\treached\thit\t0\tno\t' "$artifacts/calibration.tsv")" -eq 2 ]
+! grep -q $'\tyes\t' "$artifacts/calibration.tsv"
+# The summary must distinguish report TEXT from a qualifying abort, or a reader
+# sees uaf_hits=2/2 next to a refusal and cannot tell why.
+grep -q 'uaf_hits=2/2 qualified=0/2' <<<"$partial0_output"
+
+# The same partial report truncated by the per-seed wall timeout is refused for
+# the same reason: 124 is a cut-off, not an abort.
+assets="$TMP/assets-partial-rc124"
+artifacts="$TMP/artifacts-partial-rc124"
+make_assets "$assets"
+set +e
+partial124_output="$(DEMO08_TEST_MODE=partial-uaf-rc124 \
+  run_prepare "$assets" "$artifacts" 2 2>&1)"
+partial124_rc=$?
+set -e
+[ "$partial124_rc" -ne 0 ]
+[ ! -f "$assets/.crash-seed" ]
+[ "$(grep -c $'\treached\thit\t124\tno\t' "$artifacts/calibration.tsv")" -eq 2 ]
+grep -q 'uaf_hits=2/2 qualified=0/2' <<<"$partial124_output"
+
 # Falsifiability bracket: seed 1 reaches the path and runs an actual ASAN
 # use-after-free. The harness must select it and preserve the signature.
 assets="$TMP/assets-uaf"
@@ -212,7 +264,7 @@ printf '%s\n' "$uaf_output" >"$TMP/cold.log"
 [ "$("$CLASSIFIER" --log "$TMP/cold.log" --force-cold true)" = cold-calibration ]
 fixture=$(sha256sum "$assets/buggy/btrfs-convert" | cut -d' ' -f1)
 [ "$(cat "$assets/.crash-seed")" = "1 $fixture" ]
-grep -q $'^1\tcold\treached\thit\t' "$artifacts/calibration.tsv"
+grep -q $'^1\tcold\treached\tcomplete\t134\tyes\t' "$artifacts/calibration.tsv"
 grep -q 'AddressSanitizer: heap-use-after-free' \
   "$artifacts/calibration-cold-seed-1.out"
 
@@ -270,7 +322,7 @@ printf '1 %s\n' "$fixture" >"$assets/.crash-seed"
 cached_output="$(DEMO08_TEST_MODE=planted-uaf \
   DEMO08_TEST_UAF_SEED=1 DEMO08_TEST_UAF_BIN="$TMP/planted-uaf" \
   run_prepare "$assets" "$artifacts" 3 2>&1)"
-grep -q 'engagement=1/1 uaf_hits=1/1 executed=1/1' <<<"$cached_output"
+grep -q 'engagement=1/1 uaf_hits=1/1 qualified=1/1 executed=1/1' <<<"$cached_output"
 grep -q 'Demo 8 crash seed replayed: cached seed 1' <<<"$cached_output"
 ! grep -q 'Demo 8 crash seed calibrated:' <<<"$cached_output"
 printf '%s\n' "$cached_output" >"$TMP/cached.log"
@@ -282,7 +334,7 @@ set -e
 [ "$forced_cached_rc" -ne 0 ]
 [ "$forced_cached" = cached-seed-replay ]
 [ "$(cat "$assets/.crash-seed")" = "1 $fixture" ]
-grep -q $'^1\tcached\treached\thit\t' "$artifacts/calibration.tsv"
+grep -q $'^1\tcached\treached\tcomplete\t134\tyes\t' "$artifacts/calibration.tsv"
 [ "$(wc -l <"$artifacts/calibration.tsv")" -eq 2 ]
 grep -q 'AddressSanitizer: heap-use-after-free' \
   "$artifacts/calibration-cached-seed-1.out"

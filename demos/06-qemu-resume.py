@@ -15,6 +15,7 @@ ROOT = DEMO_DIR.parent
 sys.path.insert(0, str(DEMO_DIR / "lib"))
 
 from demo_common import (  # noqa: E402
+    make_socket_path,
     acquire_demo_lock,
     banner,
     canonicalize_qcow2_snapshot_timestamp,
@@ -197,7 +198,9 @@ def main() -> int:
     serial_pipe = ASSETS / "serial-pipe"
     serial_pipe_in = Path(str(serial_pipe) + ".in")
     serial_pipe_out = Path(str(serial_pipe) + ".out")
-    qmp_socket = ASSETS / "qmp.sock"
+    # Same AF_UNIX bound as Demo 5: root the socket short, not under the assets
+    # directory, which inherits the checkout's depth.
+    qmp_socket = make_socket_path("resume", "qmp.sock")
     serial_log = ASSETS / "serial.log"
     archived_serial_log = run_dir / "serial.log"
     info_log = run_dir / "hermit-info.log"
