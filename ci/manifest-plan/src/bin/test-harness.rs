@@ -78,10 +78,10 @@ Execution and output options:
   --junit <PATH>                   Write JUnit output to PATH
   --format <text|json>             Plan output format (default: text)
   --jobs <N>                       Run at most N cells concurrently (run only)
-  -h, --help                       Print this help
+  -h, --help                       Print this help";
 
-Environment:
-  E2E_RESULT_ROOT=<PATH>                 Result root (default: ignored/e2e)
+const PUBLIC_EXECUTION_ENVIRONMENT: &str =
+    "  E2E_RESULT_ROOT=<PATH>                 Result root (default: ignored/e2e)
   E2E_BUILD_ROOT=<PATH>                  Prepared-program build root
   E2E_RUN_ID=<ID>                        Run identifier and result subdirectory
   E2E_RUN_INDEX=<N>                      Non-negative run index recorded in results
@@ -92,6 +92,137 @@ Environment:
   E2E_KEEP_VERIFY_LOGS=1                 Retain successful verification logs
   HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER=<N> Positive finite CPU-time multiplier
   HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER=<N> Positive finite wall-time multiplier";
+
+const FILTER_OPTIONS: &str = "  --lane <portable|privileged>
+  --category <CATEGORY>
+  --test <ID>
+  --mode <verify|chaos|replay|naked|custom>
+  --backend <ptrace|dbt|kvm|sabre|liteinst>";
+
+const AMBIENT_PREPARATION_ENVIRONMENT: &str =
+    "  HOME=<PATH>                            Base for default Rust toolchain homes
+  RUSTUP_HOME=<PATH>                     Rustup home preserved during preparation only
+  CARGO_HOME=<PATH>                      Cargo home preserved during preparation only";
+
+#[derive(Clone, Copy)]
+enum CommandEnvironment {
+    None,
+    Execution,
+    Run,
+}
+
+fn print_command_help(command: &str) -> bool {
+    let (summary, filter_options, options, environment) = match command {
+        "validate" => (
+            "Validate manifests and their CI/DAG correspondence.",
+            false,
+            "",
+            CommandEnvironment::None,
+        ),
+        "plan" => (
+            "List selected required cells.",
+            true,
+            "  --include-occasional             Include occasional cells\n  \
+             --include-manual                 Include manual cells; requires exact test and mode\n  \
+             --format <text|json>             Output format (default: text)",
+            CommandEnvironment::None,
+        ),
+        "expected-plan" => (
+            "Print the expected CI plan as JSON.",
+            false,
+            "",
+            CommandEnvironment::None,
+        ),
+        "audit-gaps" => (
+            "List selected disabled cells.",
+            true,
+            "  --include-occasional             Include occasional cells\n  \
+             --format <text|json>             Output format (default: text)",
+            CommandEnvironment::None,
+        ),
+        "audit-inventory" => (
+            "Validate the manifest-owned test inventory.",
+            false,
+            "",
+            CommandEnvironment::None,
+        ),
+        "audit-test-binary-registration" => (
+            "Validate test binary registration.",
+            false,
+            "",
+            CommandEnvironment::None,
+        ),
+        "audit-test-footprints" => (
+            "Check the generated test footprints.",
+            false,
+            "",
+            CommandEnvironment::None,
+        ),
+        "audit-ci" => (
+            "Audit DAG, budget, and expected-plan correspondence.",
+            false,
+            "",
+            CommandEnvironment::None,
+        ),
+        "build" => (
+            "Prepare selected test programs.",
+            true,
+            "  --ci-only                        Select required CI cells\n  \
+             --include-occasional             Include occasional cells\n  \
+             --include-manual                 Include manual cells; requires exact test and mode\n  \
+             --allow-empty                    Permit an empty CI selection; requires --ci-only and lane/category",
+            CommandEnvironment::Execution,
+        ),
+        "audit-compile" => (
+            "Compile selected C test programs.",
+            false,
+            "  --lane <portable|privileged>\n  --category <CATEGORY>\n  --test <ID>",
+            CommandEnvironment::Execution,
+        ),
+        "run" => (
+            "Execute selected cells.",
+            true,
+            "  --ci-only                        Select required CI cells\n  \
+             --include-occasional             Include occasional cells\n  \
+             --include-manual                 Include manual cells; requires exact test and mode\n  \
+             --probe-disabled                 Run one disabled cell; requires exact test/mode/backend\n  \
+             --prebuilt                       Reuse prepared test programs\n  \
+             --allow-empty                    Permit an empty CI selection; requires --ci-only and category\n  \
+             --results <PATH>                 Write JSONL cell results to PATH\n  \
+             --junit <PATH>                   Write JUnit output to PATH\n  \
+             --jobs <N>                       Run at most N cells concurrently",
+            CommandEnvironment::Run,
+        ),
+        _ => return false,
+    };
+    let options_marker = if filter_options || !options.is_empty() {
+        " [OPTIONS]"
+    } else {
+        ""
+    };
+    println!("Usage: test-harness {command}{options_marker}\n\n{summary}\n\nOptions:");
+    if filter_options {
+        println!("{FILTER_OPTIONS}");
+    }
+    if !options.is_empty() {
+        println!("{options}");
+    }
+    println!("  -h, --help                       Print this help");
+    if matches!(
+        environment,
+        CommandEnvironment::Execution | CommandEnvironment::Run
+    ) {
+        println!("\nEnvironment:\n{PUBLIC_EXECUTION_ENVIRONMENT}");
+        println!("\nAmbient fixture-preparation environment:\n{AMBIENT_PREPARATION_ENVIRONMENT}");
+    }
+    if matches!(environment, CommandEnvironment::Run) {
+        println!(
+            "\nInternal runner protocol:\n  \
+             DAGRUN_TEST_COUNTS_PATH=<PATH>       Write schema-2 test counts for dagrun"
+        );
+    }
+    true
+}
 
 fn fail(message: impl std::fmt::Display) -> ! {
     eprintln!("test-harness: {message}");
@@ -363,8 +494,13 @@ fn validate_args(command: &str, args: &Args) {
 fn main() -> ExitCode {
     let values = std::env::args().skip(1).collect::<Vec<_>>();
     if matches!(values.as_slice(), [flag] if is_help_flag(flag)) {
-        println!("{HELP}");
+        println!("{HELP}\n\nEnvironment:\n{PUBLIC_EXECUTION_ENVIRONMENT}");
         return ExitCode::SUCCESS;
+    }
+    if let [command, flag] = values.as_slice() {
+        if is_help_flag(flag) && print_command_help(command) {
+            return ExitCode::SUCCESS;
+        }
     }
     let mut values = values.into_iter();
     let command = values
