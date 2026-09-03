@@ -37,7 +37,7 @@ agreeing with each other.
 | manifest fixture `timeout_seconds` | fixture preparation for **one manifest cell** | `tests/e2e/manifests/*.yaml`, per cell | the harness stops the preparation process group after the wall deadline | preparation error |
 | manifest cell CPU budget | all post-preparation attempts or seeds for **one manifest cell** | the same resolved `timeout_seconds` value | the harness stops the current process group after aggregate live CPU reaches the budget | timeout with `error_kind=cpu-timeout` |
 | manifest cell wall backstop | the same post-preparation population when it stops consuming CPU | three times the resolved cell CPU budget | the harness stops the current process group | timeout with `error_kind=wall-timeout` |
-| dagrun step `cpu_timeout` | **CPU consumed by one DAG node's whole cgroup**, including descendants | `ci/dag/validate.json`; every committed validation step declares one | dagrun stops the step when cgroup CPU reaches the platform-scaled budget | `CPU-TIMEOUT >Ns cpu`, node failure |
+| dagrun step `cpu_timeout` | **CPU charged to one DAG node's cgroup**, including descendants that remain in that cgroup | `ci/dag/validate.json`; every committed validation step declares one | dagrun stops the step when cgroup CPU reaches the platform-scaled budget | `CPU-TIMEOUT >Ns cpu`, node failure |
 | dagrun step wall backstop | elapsed wall time for that same DAG node | explicit step/document `timeout`, otherwise `max(1800s, 3 × platform-scaled cpu_timeout)` | dagrun stops a node that is not consuming enough CPU to reach its primary budget | `TIMEOUT >Ns`, node failure |
 | validate run budget | the whole outer validate graph | `HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS` or `--run-timeout` | dagrun stops admitting work and records unfinished nodes | incomplete validation, with named unfinished nodes |
 | validate systemd scope | the same outer run plus teardown grace | validate's safe-ci scope | systemd stops the whole process tree | outer-scope timeout |
@@ -61,6 +61,14 @@ Distribution of the values actually deployed today:
   8100s ×1, 10800s ×4. The committed DAG declares no explicit step or
   document wall timeout, so these are all derived rather than independently
   authored deadlines.
+
+Known accounting gap: pinned-root Podman payload CPU is not currently charged
+to the dagrun step cgroup. RUN1659 measured the outer twin at only 1.298 CPU
+seconds over 206.929 wall seconds, so a `_in_pinned_root` node's recorded CPU
+cap and timing are not authoritative measurements of its container work. Use
+the host twin, or the corresponding selected node in a full run, when sizing a
+budget until the container-cgroup accounting defect is fixed; that fix is out
+of scope for this change.
 
 ## Gentle first, hard as fallback
 

@@ -161,15 +161,15 @@ const REQUALIFICATION_RUN_ID_PLACEHOLDER: &str = "validate-requalification-run-i
 const QUICK_E2E_VERIFY_TIMEOUT_S: i64 = 1800;
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
-const DETCORE_MISC_TEST_PREBUILD_COMMAND: &str = r#"mkdir -p target/ci; tests_misc_json="target/ci/tests-misc.cargo.jsonl.tmp.$$"; tests_misc_pointer_tmp="target/ci/tests-misc.path.tmp.$$"; if ! CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run --message-format=json > "$tests_misc_json"; then exit 1; fi; mapfile -t tests_misc_bins < <(jq -er 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "tests_misc" and .executable != null) | .executable' "$tests_misc_json" | sort -u); if ((${#tests_misc_bins[@]} != 1)); then printf 'privileged build: expected one Cargo-reported tests_misc executable, found %d\n' "${#tests_misc_bins[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_bins[0]}"; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi; printf '%s\n' "$tests_misc" > "$tests_misc_pointer_tmp"; mv -f "$tests_misc_pointer_tmp" target/ci/tests-misc.path; mv -f "$tests_misc_json" target/ci/tests-misc.cargo.jsonl"#;
+const DETCORE_MISC_TEST_PREBUILD_COMMAND: &str = r#"mkdir -p target/ci || exit 1; tests_misc_json="target/ci/tests-misc.cargo.jsonl.tmp.$$"; tests_misc_pointer_tmp="target/ci/tests-misc.path.tmp.$$"; tests_misc_cleanup() { rm -f "$tests_misc_json" "$tests_misc_pointer_tmp" target/ci/tests-misc.cargo.jsonl target/ci/tests-misc.path; }; tests_misc_cleanup || exit 1; if ! CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run --message-format=json > "$tests_misc_json"; then tests_misc_cleanup; exit 1; fi; mapfile -t tests_misc_bins < <(jq -er 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "tests_misc" and .executable != null) | .executable' "$tests_misc_json" | sort -u); if ((${#tests_misc_bins[@]} != 1)); then printf 'privileged build: expected one Cargo-reported tests_misc executable, found %d\n' "${#tests_misc_bins[@]}" >&2; tests_misc_cleanup; exit 1; fi; tests_misc="${tests_misc_bins[0]}"; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; tests_misc_cleanup; exit 1; fi; if ! printf '%s\n' "$tests_misc" > "$tests_misc_pointer_tmp"; then tests_misc_cleanup; exit 1; fi; if ! mv -f "$tests_misc_json" target/ci/tests-misc.cargo.jsonl; then tests_misc_cleanup; exit 1; fi; if ! mv -f "$tests_misc_pointer_tmp" target/ci/tests-misc.path; then tests_misc_cleanup; exit 1; fi"#;
 const HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND: &str = "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run";
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"if [ ! -s target/ci/tests-misc.path ]; then printf 'privileged build: Cargo-reported tests_misc path is missing\n' >&2; exit 1; fi; mapfile -t tests_misc_paths < target/ci/tests-misc.path; if ((${#tests_misc_paths[@]} != 1)); then printf 'privileged build: Cargo-reported tests_misc path must contain exactly one line, found %d\n' "${#tests_misc_paths[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_paths[0]}"; case "$tests_misc" in "$PWD"/target/*) ;; *) printf 'privileged build: Cargo-reported tests_misc path is outside this target directory: %s\n' "$tests_misc" >&2; exit 1 ;; esac; case "${tests_misc##*/}" in tests_misc-*) ;; *) printf 'privileged build: Cargo-reported path does not name tests_misc: %s\n' "$tests_misc" >&2; exit 1 ;; esac; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi"#;
 
 fn full_privileged_test_build_command() -> String {
     format!(
-        "./ci/run-with-hermit-e2e-artifact.sh --require-install true || exit 1; \
-         {DETCORE_MISC_TEST_PREBUILD_COMMAND}; \
-         {HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND} || exit 1; \
+        "./ci/run-with-hermit-e2e-artifact.sh --require-install true && \
+         {DETCORE_MISC_TEST_PREBUILD_COMMAND} && \
+         {HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND} && \
          {TESTS_MISC_EXECUTABLE_READ_COMMAND}"
     )
 }
@@ -2416,7 +2416,7 @@ fn self_test() -> Result<(), String> {
         validate_receipt::self_test()?,
         validate_runtime::self_test()?,
         validate_super::self_test()?,
-        prebuilt_rust_script_plan_bracket()?,
+        prebuilt_rust_script_plan_bracket(&root)?,
         pinned_root_plan_bracket()?,
         committed_validation_dag_bracket(&root)?,
         committed_validation_execution_bracket(&root)?,
@@ -5723,23 +5723,38 @@ const RUST_SCRIPT_COMMAND_PREFIX: &str = "export PATH=\"$PWD/ci/rust-script-bin:
     export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; \
     export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ";
 
-fn rust_script_producer_step() -> Step {
-    let mut step = step_with_caps(
-        "build",
-        "rust_scripts",
-        "Build every tracked rust-script before graph consumers run",
-        "./ci/prepare-rust-scripts.sh".into(),
-        Vec::new(),
-        0,
-        300,
-        2 * 1024 * 1024 * 1024,
-    );
-    step.description = "Discovers every tracked rust-script entrypoint, runs the existing clippy contract, and publishes release executables plus test harnesses. It runs after checkout and pin verification; every compiling consumer resolves rust-script through the read-only manifest, so compilation cost cannot migrate according to scheduler order.".into();
-    step.hint.classification = dagrun::model::StepClass::CpuBound;
-    step.hint.preferred_inner_jobs = Some(8);
-    step.jobs_flag = Some(String::new());
-    step.jobs_env = Some("CARGO_BUILD_JOBS".into());
-    step
+fn committed_rust_script_producer(root: &Path) -> Result<Step, String> {
+    let cfg = validate_plan::validation_config(root)?;
+    let producers = cfg
+        .steps
+        .iter()
+        .filter(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
+        .collect::<Vec<_>>();
+    if producers.len() != 1 {
+        return Err(format!(
+            "committed validation DAG contains {} {RUST_SCRIPT_PRODUCER_TAG} definitions; expected exactly one",
+            producers.len()
+        ));
+    }
+    Ok(producers[0].clone())
+}
+
+fn assert_exact_rust_script_producer(
+    actual: &Step,
+    committed: &Step,
+    context: &str,
+) -> Result<(), String> {
+    let one_step_json = |step: &Step| {
+        let mut cfg = DagConfig::default();
+        cfg.steps.push(step.clone());
+        dag_to_json(&cfg)
+    };
+    if one_step_json(actual) != one_step_json(committed) {
+        return Err(format!(
+            "{context} changed the committed {RUST_SCRIPT_PRODUCER_TAG} definition; focused plans must copy its command, dependencies, labels, hints, and caps exactly"
+        ));
+    }
+    Ok(())
 }
 
 /// Put rust-script compilation at one explicit point in each scheduled DAG.
@@ -5754,9 +5769,11 @@ fn rust_script_producer_step() -> Step {
 /// omit predecessors supplied by earlier jobs, so those plans require and check
 /// the transported producer output instead of synthesizing another writer.
 fn configure_prebuilt_rust_scripts(
+    root: &Path,
     plan: &mut Plan,
     require_external_output: bool,
 ) -> Result<(), String> {
+    let committed_producer = committed_rust_script_producer(root)?;
     for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
         if cfg.steps.is_empty() {
             continue;
@@ -5778,6 +5795,11 @@ fn configure_prebuilt_rust_scripts(
                 .iter()
                 .find(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
                 .expect("counted exactly once");
+            assert_exact_rust_script_producer(
+                producer,
+                &committed_producer,
+                "prebuilt rust-script plan",
+            )?;
             if !producer.cmd.ends_with("./ci/prepare-rust-scripts.sh") {
                 return Err(format!(
                     "committed rust-script producer command drifted: {}",
@@ -5791,7 +5813,7 @@ fn configure_prebuilt_rust_scripts(
                 if require_external_output {
                     String::new()
                 } else {
-                    cfg.steps.push(rust_script_producer_step());
+                    cfg.steps.push(committed_producer.clone());
                     RUST_SCRIPT_PRODUCER_TAG.to_string()
                 }
             }
@@ -5801,6 +5823,11 @@ fn configure_prebuilt_rust_scripts(
                     .iter()
                     .find(|step| step.tag() == *tag)
                     .expect("counted exactly once");
+                assert_exact_rust_script_producer(
+                    producer,
+                    &committed_producer,
+                    "prebuilt rust-script plan",
+                )?;
                 if producer.cmd != "./ci/prepare-rust-scripts.sh"
                     && !producer.cmd.ends_with("./ci/prepare-rust-scripts.sh")
                 {
@@ -5861,7 +5888,7 @@ fn configure_prebuilt_rust_scripts(
     Ok(())
 }
 
-fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
+fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
     let step = |job: &str, deps: Vec<String>| {
         step_with_caps("fixture", job, "fixture", "true".into(), deps, 0, 30, 1024 * 1024)
     };
@@ -5875,14 +5902,14 @@ fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
         ),
         ..Default::default()
     };
-    configure_prebuilt_rust_scripts(&mut plan, false)?;
+    configure_prebuilt_rust_scripts(root, &mut plan, false)?;
     let producer = plan
         .cfg
         .steps
         .iter()
         .find(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
         .ok_or("rust-script producer bracket did not add the producer")?;
-    let root = plan
+    let root_step = plan
         .cfg
         .steps
         .iter()
@@ -5895,23 +5922,61 @@ fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
         .find(|step| step.tag() == "fixture.child")
         .ok_or("rust-script producer bracket lost the child fixture")?;
     if producer.cmd != format!("{RUST_SCRIPT_COMMAND_PREFIX}./ci/prepare-rust-scripts.sh")
-        || root.deps != [RUST_SCRIPT_PRODUCER_TAG.to_string()]
+        || root_step.deps != [RUST_SCRIPT_PRODUCER_TAG.to_string()]
         || child.deps != ["fixture.root".to_string()]
-        || !root.cmd.starts_with(RUST_SCRIPT_COMMAND_PREFIX)
+        || !root_step.cmd.starts_with(RUST_SCRIPT_COMMAND_PREFIX)
         || !child.cmd.starts_with(RUST_SCRIPT_COMMAND_PREFIX)
     {
         return Err(format!(
-            "rust-script producer bracket lost its single-producer ordering or command wrapper: producer={producer:?} root={root:?} child={child:?}"
+            "rust-script producer bracket lost its single-producer ordering or command wrapper: producer={producer:?} root={root_step:?} child={child:?}"
         ));
     }
+
+    let focused_args = parse_argv(&[
+        ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+        "--only".into(),
+        "portable".into(),
+        "test.detcore_unit".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("rust-script producer bracket: focused parser exited {code}"))?;
+    let mut focused = build_plan(
+        root,
+        &focused_args,
+        &std::env::temp_dir().join("validate-rust-script-focused-plan"),
+    )?;
+    configure_prebuilt_rust_scripts(root, &mut focused, false)?;
+    let focused_producer = focused
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
+        .ok_or("rust-script producer bracket: focused plan lost the committed producer")?;
+    let committed = committed_rust_script_producer(root)?;
+    assert_exact_rust_script_producer(focused_producer, &committed, "focused --only plan")?;
+    let mut focused_cap_drift = focused_producer.clone();
+    focused_cap_drift.cpu_timeout -= 1;
+    if assert_exact_rust_script_producer(
+        &focused_cap_drift,
+        &committed,
+        "focused --only planted cap drift",
+    )
+    .is_ok()
+    {
+        return Err("rust-script producer bracket accepted focused CPU-cap drift".into());
+    }
+
     let mut duplicated = Plan {
         cfg: validate_plan::config_from(
-            vec![rust_script_producer_step(), rust_script_producer_step()],
+            vec![
+                committed_rust_script_producer(root)?,
+                committed_rust_script_producer(root)?,
+            ],
             "duplicate rust-script producer bracket",
         ),
         ..Default::default()
     };
-    if configure_prebuilt_rust_scripts(&mut duplicated, false).is_ok() {
+    if configure_prebuilt_rust_scripts(root, &mut duplicated, false).is_ok() {
         return Err("rust-script producer bracket accepted duplicate writers".into());
     }
     let mut transported = Plan {
@@ -5921,7 +5986,7 @@ fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
         ),
         ..Default::default()
     };
-    configure_prebuilt_rust_scripts(&mut transported, true)?;
+    configure_prebuilt_rust_scripts(root, &mut transported, true)?;
     if transported
         .cfg
         .steps
@@ -5943,13 +6008,19 @@ fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
         ),
         ..Default::default()
     };
-    configure_prebuilt_rust_scripts(&mut preflight, false)?;
+    configure_prebuilt_rust_scripts(root, &mut preflight, false)?;
     let producer = preflight
         .cfg
         .steps
         .iter()
         .find(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
         .ok_or("rust-script preflight bracket lost the producer")?;
+    assert_exact_rust_script_producer(producer, &committed, "canonical preflight")?;
+    let mut cap_drift = producer.clone();
+    cap_drift.cpu_timeout -= 1;
+    if assert_exact_rust_script_producer(&cap_drift, &committed, "planted cap drift").is_ok() {
+        return Err("rust-script producer bracket accepted a planted CPU-cap drift".into());
+    }
     let manifest_plan = preflight
         .cfg
         .steps
@@ -5963,7 +6034,7 @@ fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
             "rust-script preflight bracket did not place compilation between pin verification and manifest compilation: producer={producer:?} manifest={manifest_plan:?}"
         ));
     }
-    Ok("rust-script build: one producer follows checkout verification and precedes graph consumers; prepared binaries are read-only and duplicate producers refuse".into())
+    Ok("rust-script build: every plan copies the one committed producer definition; exact command/deps/labels/hints/caps, cap-drift refusal, read-only consumers, and duplicate-writer refusal bracketed".into())
 }
 
 /// Keep a subgraph of the plan that validate has already constructed.
@@ -6124,6 +6195,148 @@ fn assert_single_artifact_pointer_publisher(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PrivilegedCommandRelation {
+    DeliberatelyDifferent,
+    Identical,
+    FullRequiresInstall,
+}
+
+fn assert_privileged_profile_pairs(full: &DagConfig, privileged: &DagConfig) -> Result<(), String> {
+    let pairs: [(&str, &str, &str, &[&str], &[&str], PrivilegedCommandRelation); 7] = [
+        (
+            "privileged build",
+            "privileged-build.privileged_tests",
+            "privileged-only-build.privileged_tests",
+            &["build.e2e_artifact", "build.liteinst_runtime_release", "gate.manifest"],
+            &["gate.manifest"],
+            PrivilegedCommandRelation::DeliberatelyDifferent,
+        ),
+        (
+            "CPUID faulting",
+            "privileged-cpuid.faulting",
+            "privileged-only-cpuid.faulting",
+            &["privileged-build.privileged_tests"],
+            &["privileged-only-build.privileged_tests"],
+            PrivilegedCommandRelation::DeliberatelyDifferent,
+        ),
+        (
+            "PMU preemption",
+            "privileged-pmu.preemption",
+            "privileged-only-pmu.preemption",
+            &["privileged-build.privileged_tests"],
+            &["privileged-only-build.privileged_tests"],
+            PrivilegedCommandRelation::Identical,
+        ),
+        (
+            "PMU Buck chaos cases",
+            "privileged-test.pmu_buck_chaos_cases",
+            "privileged-only-test.pmu_buck_chaos_cases",
+            &["privileged-pmu.preemption"],
+            &["privileged-only-pmu.preemption"],
+            PrivilegedCommandRelation::Identical,
+        ),
+        (
+            "privileged manifest applications",
+            "privileged-e2e.manifest_applications",
+            "privileged-only-e2e.manifest_applications",
+            &["privileged-build.privileged_tests", "privileged-build.manifest_guests", "gate.manifest"],
+            &["privileged-only-build.privileged_tests", "privileged-build.manifest_guests", "gate.manifest"],
+            PrivilegedCommandRelation::FullRequiresInstall,
+        ),
+        (
+            "privileged manifest backend-parity-c",
+            "privileged-e2e.manifest_backend_parity_c",
+            "privileged-only-e2e.manifest_backend_parity_c",
+            &["privileged-build.privileged_tests", "privileged-build.manifest_guests", "gate.manifest"],
+            &["privileged-only-build.privileged_tests", "privileged-build.manifest_guests", "gate.manifest"],
+            PrivilegedCommandRelation::FullRequiresInstall,
+        ),
+        (
+            "privileged CLI KVM",
+            "privileged-test.cli_kvm",
+            "privileged-only-test.cli_kvm",
+            &["privileged-build.privileged_tests"],
+            &["privileged-only-build.privileged_tests"],
+            PrivilegedCommandRelation::Identical,
+        ),
+    ];
+
+    for (role, full_tag, privileged_tag, full_deps, privileged_deps, relation) in pairs {
+        let full_step = full
+            .steps
+            .iter()
+            .find(|step| step.tag() == full_tag)
+            .ok_or_else(|| format!("committed DAG bracket: full {role} node {full_tag} is absent"))?;
+        let privileged_step = privileged
+            .steps
+            .iter()
+            .find(|step| step.tag() == privileged_tag)
+            .ok_or_else(|| {
+                format!(
+                    "committed DAG bracket: privileged-only {role} node {privileged_tag} is absent"
+                )
+            })?;
+        let expected_full_deps = full_deps.iter().map(|dep| (*dep).to_string()).collect::<Vec<_>>();
+        let expected_privileged_deps = privileged_deps
+            .iter()
+            .map(|dep| (*dep).to_string())
+            .collect::<Vec<_>>();
+        if full_step.deps != expected_full_deps
+            || privileged_step.deps != expected_privileged_deps
+            || !full_step.labels.iter().any(|label| label == "full")
+            || full_step.labels.iter().any(|label| label == "privileged")
+            || !privileged_step.labels.iter().any(|label| label == "privileged")
+            || privileged_step.labels.iter().any(|label| label == "full")
+            || full.steps.iter().any(|step| step.tag() == privileged_tag)
+            || privileged.steps.iter().any(|step| step.tag() == full_tag)
+        {
+            return Err(format!(
+                "committed DAG bracket: {role} profile split changed: full=({}, {:?}, {:?}) privileged-only=({}, {:?}, {:?})",
+                full_step.tag(),
+                full_step.labels,
+                full_step.deps,
+                privileged_step.tag(),
+                privileged_step.labels,
+                privileged_step.deps
+            ));
+        }
+        match relation {
+            PrivilegedCommandRelation::DeliberatelyDifferent => {
+                if full_step.cmd == privileged_step.cmd {
+                    return Err(format!(
+                        "committed DAG bracket: {role} collapsed two deliberately different profile contracts into one command"
+                    ));
+                }
+            }
+            PrivilegedCommandRelation::Identical => {
+                // JSON preserves both a printf `\\n` escape and a literal newline in a
+                // single-quoted shell argument.  They execute identically, so compare the
+                // commands after putting those two spellings in one form.
+                let full_command = full_step.cmd.replace("\\n", "\n");
+                let privileged_command = privileged_step.cmd.replace("\\n", "\n");
+                if full_command != privileged_command {
+                    return Err(format!(
+                        "committed DAG bracket: {role} commands drifted despite identical execution contracts"
+                    ));
+                }
+            }
+            PrivilegedCommandRelation::FullRequiresInstall => {
+                let normalized = full_step.cmd.replacen("--require-install ", "", 1);
+                if !full_step.cmd.contains("--require-install ")
+                    || privileged_step.cmd.contains("--require-install")
+                    || normalized != privileged_step.cmd
+                {
+                    return Err(format!(
+                        "committed DAG bracket: {role} commands differ by more than full's required complete-artifact flag"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn committed_graph_invariants(
     root: &Path,
     committed: &DagConfig,
@@ -6137,6 +6350,7 @@ fn committed_graph_invariants(
             .find(|step| step.tag() == tag)
             .ok_or_else(|| format!("committed DAG bracket: required full step {tag} is absent"))
     };
+    assert_privileged_profile_pairs(&full, privileged)?;
 
     let audits = full
         .steps
@@ -6220,6 +6434,22 @@ fn committed_graph_invariants(
         .iter()
         .map(|step| step.tag())
         .collect::<BTreeSet<_>>();
+    let full_manifest_nodes = selected_manifest_result_nodes(full.steps.iter())?;
+    for (category, expected) in [
+        ("applications", "privileged-e2e.manifest_applications"),
+        (
+            "backend-parity-c",
+            "privileged-e2e.manifest_backend_parity_c",
+        ),
+    ] {
+        if full_manifest_nodes.get(&("privileged".to_string(), category.to_string()))
+            != Some(&expected.to_string())
+        {
+            return Err(format!(
+                "committed DAG bracket: full privileged manifest {category} does not attribute results to {expected}"
+            ));
+        }
+    }
     let scorecard_deps = find("full-scorecard.compatibility")?
         .deps
         .iter()
@@ -6406,6 +6636,25 @@ fn committed_graph_invariants(
         .filter(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestRun)
         .map(Step::tag)
         .collect::<BTreeSet<_>>();
+    let privileged_manifest_nodes = selected_manifest_result_nodes(privileged.steps.iter())?;
+    for (category, expected) in [
+        (
+            "applications",
+            "privileged-only-e2e.manifest_applications",
+        ),
+        (
+            "backend-parity-c",
+            "privileged-only-e2e.manifest_backend_parity_c",
+        ),
+    ] {
+        if privileged_manifest_nodes.get(&("privileged".to_string(), category.to_string()))
+            != Some(&expected.to_string())
+        {
+            return Err(format!(
+                "committed DAG bracket: privileged-only manifest {category} does not attribute results to {expected}"
+            ));
+        }
+    }
     let privileged_scorecard_deps = privileged
         .steps
         .iter()
@@ -6693,7 +6942,8 @@ fn committed_validation_dag_bracket(root: &Path) -> Result<String, String> {
         ("build.runtime_release", 1500),
         ("e2e.manifest_backend_parity_c", 1800),
         ("e2e.manifest_c_programs", 2700),
-        ("privileged-build.privileged_tests", 600),
+        ("privileged-build.privileged_tests", 120),
+        ("privileged-only-build.privileged_tests", 600),
         ("test.app_strict_verify", 900),
         ("quick.build", 3600),
         ("compat.echo", 120),
@@ -8067,10 +8317,6 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             .iter()
             .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
             .cloned();
-        let rust_script_producer = pre
-            .iter()
-            .find(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
-            .cloned();
         let mut steps = pre;
         let selected_gate = if args.allow_local_off_the_record_run {
             // Iteration must not be blocked by an unrelated red manifest audit:
@@ -8078,8 +8324,13 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             // the whole validation spine green. Keep the cheap source/pin checks
             // that anchor the checkout, then run the selected node against the
             // already-built tree exactly as --only already promises.
-            steps.retain(|step| matches!(step.tag().as_str(), "pre.submodules" | PIN_GATE_TAG));
-            PIN_GATE_TAG
+            steps.retain(|step| {
+                matches!(
+                    step.tag().as_str(),
+                    "pre.submodules" | PIN_GATE_TAG | RUST_SCRIPT_PRODUCER_TAG
+                )
+            });
+            RUST_SCRIPT_PRODUCER_TAG
         } else {
             gate
         };
@@ -8141,9 +8392,6 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
                     || manifest_plan_consumers.contains(tag)
             });
         if needs_manifest_plan {
-            steps.push(rust_script_producer.ok_or(
-                "--only: canonical preflight lost build.rust_scripts",
-            )?);
             steps.push(manifest_plan_producer.ok_or(
                 "--only: canonical preflight lost setup.manifest_plan",
             )?);
@@ -9383,6 +9631,98 @@ fn possible_missing_artifact_nodes<'a>(
         .collect()
 }
 
+fn manifest_node_vacuity_profile_bracket(
+    root: &Path,
+    absent: &BTreeMap<validate_plan::HostCapability, String>,
+    label: &str,
+    withheld_tag: &str,
+    committed_scorecard_tag: &str,
+) -> Result<(), String> {
+    let mut steps = validate_plan::lane_nodes(root, label, "", "gate.manifest")?;
+    let shipped = steps
+        .iter()
+        .find(|step| step.tag() == withheld_tag)
+        .ok_or_else(|| {
+            format!(
+                "node vacuity: {label} selection lost privileged backend-parity-c bucket {withheld_tag}"
+            )
+        })?;
+    if manifest_bucket_of(shipped)
+        != Some(("privileged".to_string(), "backend-parity-c".to_string()))
+    {
+        return Err(format!(
+            "node vacuity: {withheld_tag} must bind to privileged/backend-parity-c; got {:?}",
+            manifest_bucket_of(shipped)
+        ));
+    }
+
+    attach_compatibility_scorecard(&mut steps, &["privileged"], "")?;
+    let generated_scorecard_tag = "scorecard.compatibility";
+    let before = steps
+        .iter()
+        .map(|step| (step.tag(), step.deps.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for result_consumer in [generated_scorecard_tag, committed_scorecard_tag] {
+        if !before
+            .get(result_consumer)
+            .is_some_and(|deps| deps.iter().any(|dep| dep == withheld_tag))
+        {
+            return Err(format!(
+                "node vacuity: {label} result consumer {result_consumer} does not depend on {withheld_tag}"
+            ));
+        }
+    }
+    let mut expected = before.clone();
+    if expected.remove(withheld_tag).is_none() {
+        return Err(format!(
+            "node vacuity: {label} plan lost expected bucket {withheld_tag}"
+        ));
+    }
+    for result_consumer in [generated_scorecard_tag, committed_scorecard_tag] {
+        let deps = expected.get_mut(result_consumer).ok_or_else(|| {
+            format!("node vacuity: {label} plan lost result consumer {result_consumer}")
+        })?;
+        let before = deps.len();
+        deps.retain(|dep| dep != withheld_tag);
+        if deps.len() + 1 != before {
+            return Err(format!(
+                "node vacuity: expected exactly one {result_consumer} edge to {withheld_tag}"
+            ));
+        }
+    }
+
+    let mut actual = Plan {
+        cfg: DagConfig {
+            steps,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    withhold_vacuous_manifest_nodes(root, &mut actual, absent)?;
+    let after = actual
+        .cfg
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step.deps.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if after != expected {
+        return Err(format!(
+            "node vacuity: {label} withholding changed more than {withheld_tag} and its scorecard edges: expected={expected:?} actual={after:?}"
+        ));
+    }
+    if actual.host_inapplicable.len() != 1
+        || actual.host_inapplicable[0].tag != withheld_tag
+        || actual.host_inapplicable[0].capability
+            != validate_plan::HostCapability::CpuidFaulting
+    {
+        return Err(format!(
+            "node vacuity: {label} plan did not withhold exactly {withheld_tag}: {:?}",
+            actual.host_inapplicable
+        ));
+    }
+    Ok(())
+}
+
 /// Two-sided bracket for withholding a manifest bucket NODE whose entire cell
 /// population is withheld.
 ///
@@ -9454,20 +9794,31 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     // the command is checked only to prove that execution selects the same
     // population. A command with any selection token this function does not
     // model must NOT be matched against the bucket accounting.
-    let mut transformed = validate_plan::lane_nodes(root, "privileged", "", "gate.manifest")?;
-    let withheld_tag = "privileged-only-e2e.manifest_backend_parity_c";
-    let shipped = transformed
-        .iter()
-        .find(|step| step.tag() == withheld_tag)
-        .ok_or("node vacuity: transformed lane lost privileged backend-parity-c bucket")?
-        .clone();
-    if manifest_bucket_of(&shipped)
-        != Some(("privileged".to_string(), "backend-parity-c".to_string()))
-    {
-        return Err(format!(
-            "node vacuity: the shipped bucket command must bind to its bucket; got {:?}",
-            manifest_bucket_of(&shipped)
-        ));
+    let mut shipped_buckets = Vec::new();
+    for (label, tag) in [
+        ("full", "privileged-e2e.manifest_backend_parity_c"),
+        (
+            "privileged",
+            "privileged-only-e2e.manifest_backend_parity_c",
+        ),
+    ] {
+        let steps = validate_plan::lane_nodes(root, label, "", "gate.manifest")?;
+        let shipped = steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| {
+                format!("node vacuity: {label} selection lost privileged bucket {tag}")
+            })?
+            .clone();
+        if manifest_bucket_of(&shipped)
+            != Some(("privileged".to_string(), "backend-parity-c".to_string()))
+        {
+            return Err(format!(
+                "node vacuity: shipped bucket {tag} must bind to privileged/backend-parity-c; got {:?}",
+                manifest_bucket_of(&shipped)
+            ));
+        }
+        shipped_buckets.push(shipped);
     }
     let unmodelled = [
         // A narrower selection than the accounting was taken with.
@@ -9491,33 +9842,35 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         "target/debug/test-harness build --lane privileged --ci-only --allow-empty",
         "cargo test -p hermit-detcore",
     ];
-    for cmd in unmodelled {
-        let mut step = shipped.clone();
-        step.cmd = cmd.to_string();
-        if manifest_bucket_of(&step).is_some() {
-            return Err(format!(
-                "node vacuity: {cmd:?} selects a cell population this function cannot prove \
-                 equal to the bucket accounting and must NOT be a withholding candidate"
-            ));
+    for shipped in &shipped_buckets {
+        for cmd in unmodelled {
+            let mut step = shipped.clone();
+            step.cmd = cmd.to_string();
+            if manifest_bucket_of(&step).is_some() {
+                return Err(format!(
+                    "node vacuity: {cmd:?} selects a cell population this function cannot prove \
+                     equal to the bucket accounting and must NOT be a withholding candidate"
+                ));
+            }
         }
-    }
-    let mut mismatched = shipped.clone();
-    mismatched.manifest = Some(DagManifest {
-        lane: "portable".into(),
-        category: "backend-parity-c".into(),
-    });
-    if manifest_bucket_of(&mismatched).is_some() {
-        return Err(
-            "node vacuity: a command and typed manifest that name different lanes must refuse"
-                .into(),
-        );
-    }
-    let mut untyped = shipped;
-    untyped.manifest = None;
-    if manifest_bucket_of(&untyped).is_some() {
-        return Err(
-            "node vacuity: command text alone must not supply manifest lane/category".into(),
-        );
+        let mut mismatched = shipped.clone();
+        mismatched.manifest = Some(DagManifest {
+            lane: "portable".into(),
+            category: "backend-parity-c".into(),
+        });
+        if manifest_bucket_of(&mismatched).is_some() {
+            return Err(
+                "node vacuity: a command and typed manifest that name different lanes must refuse"
+                    .into(),
+            );
+        }
+        let mut untyped = shipped.clone();
+        untyped.manifest = None;
+        if manifest_bucket_of(&untyped).is_some() {
+            return Err(
+                "node vacuity: command text alone must not supply manifest lane/category".into(),
+            );
+        }
     }
 
     // THE CHECKED-IN ACCOUNTING — the required plan itself carries the host
@@ -9548,132 +9901,89 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         );
     }
 
-    // INTEGRATION: exercise the production transformed command, checked-in
-    // bucket accounting, withholding mutation, and scorecard edge handling
-    // together. This catches drift between the command producer and parser.
-    attach_compatibility_scorecard(&mut transformed, &["privileged"], "")?;
-    let scorecard_tag = "scorecard.compatibility";
-    let before: BTreeMap<String, Vec<String>> = transformed
-        .iter()
-        .map(|step| (step.tag(), step.deps.clone()))
-        .collect();
-    if !before
-        .get(scorecard_tag)
-        .is_some_and(|deps| deps.iter().any(|dep| dep == withheld_tag))
-    {
-        return Err(
-            "node vacuity: actual compatibility scorecard did not depend on the transformed \
-             host-inapplicable bucket"
-                .into(),
-        );
-    }
-    let mut expected = before.clone();
-    if expected.remove(withheld_tag).is_none() {
-        return Err("node vacuity: transformed plan lost the expected bucket".into());
-    }
-    for result_consumer in [scorecard_tag, "privileged-scorecard.compatibility"] {
-        let scorecard_deps = expected
-            .get_mut(result_consumer)
-            .ok_or_else(|| format!("node vacuity: transformed plan lost result consumer {result_consumer}"))?;
-        let scorecard_deps_before = scorecard_deps.len();
-        scorecard_deps.retain(|dep| dep != withheld_tag);
-        if scorecard_deps.len() + 1 != scorecard_deps_before {
-            return Err(format!(
-                "node vacuity: expected exactly one {result_consumer} edge to the bucket"
-            ));
-        }
-    }
-    let mut actual_plan = Plan {
-        cfg: DagConfig {
-            steps: transformed,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    withhold_vacuous_manifest_nodes(root, &mut actual_plan, &absent)?;
-    let after: BTreeMap<String, Vec<String>> = actual_plan
-        .cfg
-        .steps
-        .iter()
-        .map(|step| (step.tag(), step.deps.clone()))
-        .collect();
-    if after != expected {
-        return Err(format!(
-            "node vacuity: actual withholding changed more than the bucket and its scorecard \
-             edge: expected={expected:?} actual={after:?}"
-        ));
-    }
-    if actual_plan.host_inapplicable.len() != 1
-        || actual_plan.host_inapplicable[0].tag != withheld_tag
-        || actual_plan.host_inapplicable[0].capability
-            != validate_plan::HostCapability::CpuidFaulting
-    {
-        return Err(format!(
-            "node vacuity: actual transformed plan did not withhold exactly {withheld_tag}: {:?}",
-            actual_plan.host_inapplicable
-        ));
+    // INTEGRATION: exercise both actual selected tag families through the same
+    // production accounting, withholding mutation, and scorecard edge logic.
+    for (label, withheld_tag, committed_scorecard_tag) in [
+        (
+            "full",
+            "privileged-e2e.manifest_backend_parity_c",
+            "full-scorecard.compatibility",
+        ),
+        (
+            "privileged",
+            "privileged-only-e2e.manifest_backend_parity_c",
+            "privileged-scorecard.compatibility",
+        ),
+    ] {
+        manifest_node_vacuity_profile_bracket(
+            root,
+            &absent,
+            label,
+            withheld_tag,
+            committed_scorecard_tag,
+        )?;
     }
 
     // THE RETAINED DEPENDENT. A result consumer keeps running with the edge
     // dropped; ANY other dependent refuses the whole run rather than having a
     // prerequisite quietly removed from under it.
-    let gone: BTreeSet<String> = ["privileged-only-e2e.manifest_backend_parity_c".to_string()]
-        .into_iter()
-        .collect();
-    let consumer = (
-        "scorecard.compatibility".to_string(),
-        "./ci/compat-envelope/scorecard.rs verify-results --results \"$E2E_RESULT_ROOT\" \
-         --lanes portable,privileged"
-            .to_string(),
-        vec![
-            "privileged-only-e2e.manifest_backend_parity_c".to_string(),
-            "e2e.manifest_util_c".to_string(),
-        ],
-    );
-    let prerequisite = (
-        "test.something".to_string(),
-        "cargo nextest run -p hermit-detcore".to_string(),
-        vec!["privileged-only-e2e.manifest_backend_parity_c".to_string()],
-    );
-    let unrelated = (
-        "lint.rustfmt".to_string(),
-        "cargo fmt --all -- --check".to_string(),
-        vec!["quick.build".to_string()],
-    );
-    let (droppable, refusals) =
-        classify_withheld_dependents(&[consumer.clone(), unrelated.clone()], &gone);
-    if droppable
-        != vec![(
+    for gone_tag in [
+        "privileged-e2e.manifest_backend_parity_c",
+        "privileged-only-e2e.manifest_backend_parity_c",
+    ] {
+        let gone = BTreeSet::from([gone_tag.to_string()]);
+        let consumer = (
             "scorecard.compatibility".to_string(),
-            "privileged-only-e2e.manifest_backend_parity_c".to_string(),
-        )]
-        || !refusals.is_empty()
-    {
-        return Err(format!(
-            "node vacuity: exactly the result consumer's edge to the withheld node may be \
-             dropped; got droppable={droppable:?} refusals={refusals:?}"
-        ));
-    }
-    let (droppable, refusals) =
-        classify_withheld_dependents(&[prerequisite.clone(), unrelated.clone()], &gone);
-    if !droppable.is_empty() || refusals.len() != 1 {
-        return Err(format!(
-            "node vacuity: a NON-result-consuming dependent must REFUSE the run, never have its \
-             prerequisite silently removed; got droppable={droppable:?} refusals={refusals:?}"
-        ));
-    }
-    // Nothing withheld: no edge is touched and nothing refuses.
-    let (droppable, refusals) =
-        classify_withheld_dependents(&[consumer, prerequisite, unrelated], &BTreeSet::new());
-    if !droppable.is_empty() || !refusals.is_empty() {
-        return Err("node vacuity: with nothing withheld, no dependency edge may change".into());
+            "./ci/compat-envelope/scorecard.rs verify-results --results \"$E2E_RESULT_ROOT\" \
+             --lanes portable,privileged"
+                .to_string(),
+            vec![gone_tag.to_string(), "e2e.manifest_util_c".to_string()],
+        );
+        let prerequisite = (
+            "test.something".to_string(),
+            "cargo nextest run -p hermit-detcore".to_string(),
+            vec![gone_tag.to_string()],
+        );
+        let unrelated = (
+            "lint.rustfmt".to_string(),
+            "cargo fmt --all -- --check".to_string(),
+            vec!["quick.build".to_string()],
+        );
+        let (droppable, refusals) =
+            classify_withheld_dependents(&[consumer.clone(), unrelated.clone()], &gone);
+        if droppable
+            != vec![("scorecard.compatibility".to_string(), gone_tag.to_string())]
+            || !refusals.is_empty()
+        {
+            return Err(format!(
+                "node vacuity: exactly the result consumer's edge to {gone_tag} may be dropped; \
+                 got droppable={droppable:?} refusals={refusals:?}"
+            ));
+        }
+        let (droppable, refusals) =
+            classify_withheld_dependents(&[prerequisite.clone(), unrelated.clone()], &gone);
+        if !droppable.is_empty() || refusals.len() != 1 {
+            return Err(format!(
+                "node vacuity: a NON-result-consuming dependent on {gone_tag} must REFUSE; \
+                 got droppable={droppable:?} refusals={refusals:?}"
+            ));
+        }
+        let (droppable, refusals) = classify_withheld_dependents(
+            &[consumer, prerequisite, unrelated],
+            &BTreeSet::new(),
+        );
+        if !droppable.is_empty() || !refusals.is_empty() {
+            return Err(
+                "node vacuity: with nothing withheld, no dependency edge may change".into(),
+            );
+        }
     }
 
     println!(
         "  node vacuity: 2 withheld / 7 not-withheld (3 un-withholding, 3 nothing-withheld, \
          1 empty-bucket), 1 transformed command bound / 15 refused, accounting parser 1 good / \
-         3 malformed, dependents 1 edge-dropped / 1 refusal / 1 inert, actual plan 1 bucket \
-         withheld / 2 scorecard edges dropped / 0 other changes"
+         3 malformed, both tag families each have 1 edge-dropped / 1 refusal / 1 inert and one \
+         bucket withheld / 2 scorecard edges dropped / 0 other changes"
     );
     Ok(())
 }
@@ -11499,16 +11809,27 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             streamed_nextest_nodes += 1;
         }
     }
-    let privileged = lane_configs
-        .iter()
-        .find(|(lane, _)| *lane == "privileged")
-        .map(|(_, cfg)| cfg)
-        .ok_or("retry bounds: privileged lane is absent")?;
-    for (tag, expected) in [
-        ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
-        ("privileged-only-test.cli_kvm", 24usize),
+    let full_cfg = validate_plan::lane_config(root, "full")?;
+    for (lane, tag, expected) in [
+        ("full", "privileged-test.pmu_buck_chaos_cases", 6usize),
+        ("full", "privileged-test.cli_kvm", 24usize),
+        (
+            "privileged",
+            "privileged-only-test.pmu_buck_chaos_cases",
+            6usize,
+        ),
+        ("privileged", "privileged-only-test.cli_kvm", 24usize),
     ] {
-        let step = privileged
+        let cfg = if lane == "full" {
+            &full_cfg
+        } else {
+            lane_configs
+                .iter()
+                .find(|(candidate, _)| *candidate == lane)
+                .map(|(_, cfg)| cfg)
+                .ok_or_else(|| format!("retry bounds: {lane} lane is absent"))?
+        };
+        let step = cfg
             .steps
             .iter()
             .find(|step| step.tag() == tag)
@@ -12411,12 +12732,20 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             ),
         ]);
         let e2e = e2e_test_observations(&e2e_root, &manifest_nodes)?;
+        let mut full_manifest_nodes = manifest_nodes.clone();
+        full_manifest_nodes.insert(
+            ("privileged".to_string(), "applications".to_string()),
+            "privileged-e2e.manifest_applications".to_string(),
+        );
+        let full_e2e = e2e_test_observations(&e2e_root, &full_manifest_nodes)?;
         if e2e.len() != 3
+            || full_e2e.len() != 3
             || e2e[0].node != "e2e.manifest_applications"
             || e2e[0].id != "applications/example [ptrace/verify]"
             || e2e[0].passed
             || !e2e[1].passed
             || e2e[2].node != "privileged-only-e2e.manifest_applications"
+            || full_e2e[2].node != "privileged-e2e.manifest_applications"
         {
             return Err(format!(
                 "end-of-run summary: E2E rows did not retain test id, backend, mode, attempt, \
@@ -17950,7 +18279,9 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         }
     }
 
-    if let Err(error) = configure_prebuilt_rust_scripts(&mut plan, args.ignore_selected_deps) {
+    if let Err(error) =
+        configure_prebuilt_rust_scripts(&root, &mut plan, args.ignore_selected_deps)
+    {
         return RunSummary::refused(
             2,
             &plan.profile,
@@ -19612,7 +19943,7 @@ printf '%s\n' "$*" >> "$CARGO_CALL_LOG"
 case "$*" in
   "test -p hermit-detcore --test tests_misc --no-run --message-format=json")
     case "${CARGO_ARTIFACT_MODE:-current}" in
-      current)
+      current|publication-failure)
         artifact="$PWD/target/debug/build/hermit-detcore/cold/out/tests_misc-cold-fixture"
         mkdir -p "$(dirname "$artifact")"
         : > "$artifact"
@@ -19651,6 +19982,20 @@ case "$*" in
 esac
 "#,
         );
+        write_executable(
+            &root.path().join("bin/mv"),
+            r#"#!/bin/sh
+set -eu
+last=
+for argument in "$@"; do
+  last=$argument
+done
+if [ "${CARGO_ARTIFACT_MODE:-current}" = publication-failure ] && [ "$last" = target/ci/tests-misc.path ]; then
+  exit 70
+fi
+exec /bin/mv "$@"
+"#,
+        );
         let bin = root.path().join("bin");
         (root, bin, cargo_log)
     }
@@ -19683,7 +20028,7 @@ esac
         assert!(command.starts_with("./ci/run-with-hermit-e2e-artifact.sh --require-install true"));
         assert!(!command.contains("publish-hermit-e2e-artifact.sh"));
         let missing_producer =
-            command.replacen(&format!("{DETCORE_MISC_TEST_PREBUILD_COMMAND}; "), "", 1);
+            command.replacen(&format!("{DETCORE_MISC_TEST_PREBUILD_COMMAND} && "), "", 1);
         assert_ne!(missing_producer, command);
 
         let (old_root, old_bin, old_log) = cold_fixture();
@@ -19741,6 +20086,35 @@ esac
                 "the full build must refuse Cargo artifact mode {mode}"
             );
         }
+
+        let (root, bin, log) = cold_fixture();
+        let stale = root
+            .path()
+            .join("target/debug/build/hermit-detcore/stale/out/tests_misc-stale");
+        write_executable(&stale, "#!/bin/sh\nexit 0\n");
+        std::fs::create_dir_all(root.path().join("target/ci")).unwrap();
+        std::fs::write(
+            root.path().join("target/ci/tests-misc.path"),
+            format!("{}\n", stale.display()),
+        )
+        .unwrap();
+        assert!(
+            !run_build(&command, root.path(), &bin, &log, "publication-failure").success(),
+            "a failed atomic pointer publication must fail the producer"
+        );
+        assert!(
+            !root.path().join("target/ci/tests-misc.path").exists(),
+            "a failed publication must remove the stale pointer"
+        );
+        assert!(
+            !root.path().join("target/ci/tests-misc.cargo.jsonl").exists(),
+            "a failed pointer publication must remove its incomplete provenance record"
+        );
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "test -p hermit-detcore --test tests_misc --no-run --message-format=json\n",
+            "the failed producer must stop before later consumers can accept stale provenance"
+        );
     }
 }
 
