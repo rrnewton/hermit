@@ -105,12 +105,12 @@ claim_contradicts_body() {  # $1 = commit message, $2 = demo= value
     local text="$1" claims="$2" line number result
     declare -A green=() nongreen=()
     while IFS= read -r line; do
-        if [[ "${line,,}" =~ ^[[:space:]]*demo[[:space:]]*0*([0-9]+)[^:]*:[[:space:]]*(first[[:space:]]+run[[:space:]]+saved,[[:space:]]*)?([a-z_-]+) ]]; then
-            number="${BASH_REMATCH[1]}"
-            result="${BASH_REMATCH[3]}"
+        if [[ "${line,,}" =~ ^[[:space:]]*(=+[[:space:]]*)?demo[[:space:]]*0*([0-9]+)[^:]*:[[:space:]]*(first[[:space:]]+run[[:space:]]+saved,[[:space:]]*)?([a-z_-]+) ]]; then
+            number="${BASH_REMATCH[2]}"
+            result="${BASH_REMATCH[4]}"
             case "$result" in
                 green|pass|success) green[$((10#$number))]=1 ;;
-                partial|failure|failed|red|skip|skipped|incomplete|no_result|no-result|error)
+                partial|fail|failure|failed|red|skip|skipped|incomplete|no_result|no-result|error)
                     nongreen[$((10#$number))]=1 ;;
             esac
         fi
@@ -122,20 +122,48 @@ claim_contradicts_body() {  # $1 = commit message, $2 = demo= value
     return 1
 }
 
+# Emit one trailer field's value only when the field occurs exactly once. A
+# repeated field is malformed: accepting one value while silently ignoring the
+# other would let the same trailer state conflicting reviewer or result claims.
+single_trailer_field() {  # $1 = trailer line, $2 = field, $3 = value pattern
+    local line="$1" field="$2" pattern="$3" token value
+    local -a tokens=() values=()
+    read -r -a tokens <<<"$line"
+    for token in "${tokens[@]}"; do
+        [[ "$token" = "$field="* ]] || continue
+        value="${token#*=}"
+        [[ "$value" =~ ^${pattern}$ ]] || return 1
+        values+=("$value")
+    done
+    [ "${#values[@]}" -eq 1 ] || return 1
+    printf '%s\n' "${values[0]}"
+}
+
 # Emit every demo path named by a valid trailer, one per line. A trailer may
 # cover several exact paths with a comma-separated demo= value; `all` and
 # directory coverage retain their documented meanings. Invalid trailers are
 # reported and withheld while later valid trailers remain usable.
 attested_demos() {  # $1 = text blob, $2 = report rejected trailers (optional)
-    local text="$1" report="${2:-}" line reviewer demos implementer self_review
+    local text="$1" report="${2:-}" line reviewer demos result implementer self_review
     while IFS= read -r line; do
         printf '%s\n' "$line" | grep -qE '^[[:space:]]*Demo-Green-Review:' || continue
-        printf '%s\n' "$line" | grep -qE '(^|[[:space:]])reviewer=[^[:space:]]+([[:space:]]|$)' || continue
-        printf '%s\n' "$line" | grep -qE '(^|[[:space:]])demo=(all|demos/[^[:space:]]+)([[:space:]]|$)' || continue
-        printf '%s\n' "$line" | grep -qE '(^|[[:space:]])result=GREEN([[:space:]]|$)' || continue
-        printf '%s\n' "$line" | grep -qE '(^|[[:space:]])evidence=[^[:space:]]+([[:space:]]|$)' || continue
-        reviewer=$(printf '%s\n' "$line" | grep -oE '(^|[[:space:]])reviewer=[^[:space:]]+' | sed -E 's/^[[:space:]]*reviewer=//')
-        demos=$(printf '%s\n' "$line" | grep -oE '(^|[[:space:]])demo=[^[:space:]]+' | sed -E 's/^[[:space:]]*demo=//')
+        reviewer=$(single_trailer_field "$line" reviewer '[^[:space:]]+') || {
+            [ "$report" = report ] && echo "demo-review gate: REFUSED malformed trailer: reviewer= must occur exactly once" >&2
+            continue
+        }
+        demos=$(single_trailer_field "$line" demo '(all|demos/[^[:space:]]+)') || {
+            [ "$report" = report ] && echo "demo-review gate: REFUSED malformed trailer: demo= must occur exactly once" >&2
+            continue
+        }
+        result=$(single_trailer_field "$line" result '[^[:space:]]+') || {
+            [ "$report" = report ] && echo "demo-review gate: REFUSED malformed trailer: result= must occur exactly once" >&2
+            continue
+        }
+        single_trailer_field "$line" evidence '[^[:space:]]+' >/dev/null || {
+            [ "$report" = report ] && echo "demo-review gate: REFUSED malformed trailer: evidence= must occur exactly once" >&2
+            continue
+        }
+        [ "$result" = GREEN ] || continue
         self_review=0
         while IFS= read -r implementer; do
             if [ "$reviewer" = "$implementer" ]; then
