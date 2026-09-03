@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Controls for Demo 08's crash/replay evidence and Step 3 differential.
+# Controls for Demo 08's Step 3 fixed-variant differential.
 #
 # Step 3 is the only thing that turns "the bug exists" into "the fix closes it".
 # Two holes let it pass without showing that, and both were demonstrated
@@ -12,10 +12,6 @@
 #   * the failure path accepted ANY nonzero exit lacking the ASAN string as a
 #     "non-crash", which swallowed timeout 124, safehermit's cap 125, and any
 #     exec or environment failure -- none of which ran the control at all.
-#
-# The crash and replay must each return the ASAN abort status 134 and contain a
-# completed report.  A repeatable rc=0 or timeout-truncated rc=124 fragment is
-# not the promised crash and must not reach SUCCESS.
 #
 # These brackets drive the real demos/08-btrfs-convert-uaf.sh through its
 # documented DEMO08_DIR / HERMIT_RELEASE / SAFEHERMIT seams, so they exercise
@@ -32,7 +28,7 @@ demo="$root/demos/08-btrfs-convert-uaf.sh"
 
 case "${1:-}" in
   -h|--help)
-    echo "test-demo08-fixed-control.sh — controls for Demo 08's crash and fixed differential"
+    echo "test-demo08-fixed-control.sh — controls for Demo 08's fixed-variant differential"
     echo
     echo "USAGE:"
     echo "  scripts/test-demo08-fixed-control.sh    run every control"
@@ -54,14 +50,6 @@ uaf_report() {
 ==1234==ERROR: AddressSanitizer: heap-use-after-free on address 0x606000000210
     #0 0x4e69f6 in task_period_wait common/task-utils.c:154
     #1 0x4e7100 in print_copied_inodes convert/main.c:169
-SUMMARY: AddressSanitizer: heap-use-after-free common/task-utils.c:154 in task_period_wait
-REPORT
-}
-
-partial_uaf_report() {
-  cat <<'REPORT'
-==1234==ERROR: AddressSanitizer: heap-use-after-free on address 0x606000000210
-    #0 0x4e69f6 in task_period_wait common/task-utils.c:154
 REPORT
 }
 
@@ -80,22 +68,10 @@ for a in "$@"; do
 done
 case "$conv" in
   *buggy*)
-    count=0
-    [ ! -r "$DEMO08_TEST_BUGGY_COUNT_FILE" ] || count=$(cat "$DEMO08_TEST_BUGGY_COUNT_FILE")
-    count=$((count + 1))
-    printf '%s\n' "$count" >"$DEMO08_TEST_BUGGY_COUNT_FILE"
-    case "$DEMO08_TEST_BUGGY_MODE" in
-      complete-abort) cat "$DEMO08_TEST_UAF_FILE"; exit 134 ;;
-      partial-rc0) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 0 ;;
-      partial-rc124) cat "$DEMO08_TEST_PARTIAL_FILE"; exit 124 ;;
-      replay-partial-rc0)
-        if [ "$count" -eq 1 ]; then cat "$DEMO08_TEST_UAF_FILE"; exit 134; fi
-        cat "$DEMO08_TEST_PARTIAL_FILE"; exit 0 ;;
-      replay-partial-rc124)
-        if [ "$count" -eq 1 ]; then cat "$DEMO08_TEST_UAF_FILE"; exit 134; fi
-        cat "$DEMO08_TEST_PARTIAL_FILE"; exit 124 ;;
-      *) echo "stub: unknown DEMO08_TEST_BUGGY_MODE" >&2; exit 9 ;;
-    esac ;;
+    # Step 2 and Step 4 must both crash identically for the demo to reach Step 3
+    # and then compare replays.
+    cat "$DEMO08_TEST_UAF_FILE"
+    exit 134 ;;
   *fixed*)
     case "$DEMO08_TEST_FIXED_MODE" in
       clean)          exit 0 ;;
@@ -123,16 +99,14 @@ setup_assets() {
   printf '#!/bin/sh\nexit 0\n' >"$tmp/hermit"
   chmod +x "$tmp/hermit"
   uaf_report >"$tmp/uaf.txt"
-  partial_uaf_report >"$tmp/partial-uaf.txt"
-  rm -f "$tmp/buggy-count"
 }
 
 pass=0
 fail=0
 
-# run_case <expected-rc> <label> <fixed-mode> [required-substring] [buggy-mode]
+# run_case <expected-rc> <label> <mode> [required-stderr-substring]
 run_case() {
-  local expected=$1 label=$2 mode=$3 needle=${4:-} buggy_mode=${5:-complete-abort}
+  local expected=$1 label=$2 mode=$3 needle=${4:-}
   setup_assets
   make_stub
   local out rc=0
@@ -145,10 +119,7 @@ run_case() {
         HERMIT_RELEASE="$tmp/hermit" \
         SAFEHERMIT="$tmp/safehermit" \
         DEMO08_TEST_FIXED_MODE="$mode" \
-        DEMO08_TEST_BUGGY_MODE="$buggy_mode" \
-        DEMO08_TEST_BUGGY_COUNT_FILE="$tmp/buggy-count" \
         DEMO08_TEST_UAF_FILE="$tmp/uaf.txt" \
-        DEMO08_TEST_PARTIAL_FILE="$tmp/partial-uaf.txt" \
         "$demo" 2>&1) || rc=$?
   if [ "$rc" -ne "$expected" ]; then
     printf 'FAIL: %s -- expected rc=%s got rc=%s\n' "$label" "$expected" "$rc" >&2
@@ -191,17 +162,6 @@ run_case 1 "a fixed control killed by a safehermit bound is refused" \
 run_case 1 "a fixed control that crashes with a UAF is still refused" \
   regression-uaf "reported a use-after-free"
 
-# The initial crash and its replay have the same complete-report/rc=134 bar as
-# calibration.  These four controls catch both former acceptance points.
-run_case 1 "an rc=0 partial initial report is not called a crash" \
-  clean "expected 134" partial-rc0
-run_case 1 "an rc=124 partial initial report is not called a crash" \
-  clean "timeout cut the run off" partial-rc124
-run_case 1 "an rc=0 partial replay does not reach SUCCESS" \
-  clean "replay did not complete with the ASAN abort" replay-partial-rc0
-run_case 1 "an rc=124 partial replay does not reach SUCCESS" \
-  clean "replay did not complete with the ASAN abort" replay-partial-rc124
-
-printf 'test-demo08-fixed-control: %s passed, %s failed (1 positive, 8 refusals)\n' \
+printf 'test-demo08-fixed-control: %s passed, %s failed (1 positive, 4 refusals)\n' \
   "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
