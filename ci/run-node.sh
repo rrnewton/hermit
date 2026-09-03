@@ -14,24 +14,24 @@
 # an upstream build job. Historically this shim loaded ci/dag/<lane>.json itself,
 # missing validate's plan construction. It also RE-IMPLEMENTED node execution in
 # jq+bash (extract each node's `.cmd`, `bash -c` it) because the pinned runner
-# predated its `run --only` node selector. That made GitHub Actions a SECOND
+# predated its `run --selected` node selector. That made GitHub Actions a SECOND
 # execution engine that diverged from the runner: it ignored each node's
 # jobs_flag, timeout, cpu_timeout, and cgroup boxing. This rewrite kills that
 # divergence. Hosted execution now asks scripts/validate.rs to construct the
 # ordinary plan and retain the requested tags. The raw-lane path below remains
 # only for the explicitly edited, local-only command mode.
 #
-# REQUIRES the pinned agent-utils runner to support `run --only` (added upstream
-# in the same commit as the tracked common/bin engine resolver and
-# --allow-cgroup-failure). At an older pin this script fails closed (argparse
-# rejects --only), which is intentional: the run-node.sh rewrite and the
+# REQUIRES the pinned agent-utils runner to support `run --selected` with
+# `--ignore-selected-deps`. At an older pin this script fails closed (argparse
+# rejects the selector), which is intentional: the run-node.sh rewrite and the
 # agent-utils gitlink advance are a COUPLED change and must land together.
 #
 # Usage:
 #   ci/run-node.sh <lane> <group.job>[,<group.job>...] [-- <extra args>]
 #     <lane>   portable | privileged  (selects ci/dag/<lane>.json)
 #     nodes    one or more "group.job" tags, comma-separated. Passed verbatim to
-#              `run --only`: the runner executes EXACTLY those steps (dependency
+#              `run --selected --ignore-selected-deps`: the runner executes
+#              EXACTLY those steps (dependency
 #              edges to steps OUTSIDE the selection are dropped — their outputs
 #              are assumed already present from an upstream build/cache job),
 #              while edges AMONG the selected steps are preserved so a selected
@@ -354,4 +354,5 @@ if [[ -n ${GITHUB_ACTIONS:-} || -n ${CI:-} ]]; then
 fi
 
 echo "run-node.sh: lane=$lane runner=$runner nodes=$sel -j$jobs cargo-jobs=$CARGO_BUILD_JOBS reverie-dbt-budget=portable-build-child-only perf-dir=$perf_dir${acf+ (unboxed: ephemeral CI VM)}" >&2
-exec "$runner" run --dag "$dag" --only "$sel" -j "$jobs" --perf-dir "$perf_dir" "${acf[@]}" -v
+exec "$runner" run --dag "$dag" --selected "$sel" --ignore-selected-deps \
+    -j "$jobs" --perf-dir "$perf_dir" "${acf[@]}" -v

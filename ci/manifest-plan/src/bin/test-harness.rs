@@ -41,6 +41,7 @@ use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
 const EXPECTED_PLAN_SCHEMA: u64 = 1;
+const DEFAULT_BUILD_JOBS: usize = 16;
 
 const HELP: &str = "\
 Usage: test-harness <COMMAND> [OPTIONS]
@@ -77,7 +78,7 @@ Execution and output options:
   --results <PATH>                 Write JSONL cell results to PATH
   --junit <PATH>                   Write JUnit output to PATH
   --format <text|json>             Plan output format (default: text)
-  --jobs <N>                       Run at most N cells concurrently (run only)
+  --jobs <N>                       Prepare/run at most N tests/cells concurrently
   -h, --help                       Print this help";
 
 const PUBLIC_EXECUTION_ENVIRONMENT: &str =
@@ -414,6 +415,10 @@ fn scheduled_worker_capacity(args: &Args) -> ScheduledWorkerCapacity {
     ScheduledWorkerCapacity::new(args.jobs.unwrap_or(1))
 }
 
+fn build_worker_capacity(args: &Args) -> ScheduledWorkerCapacity {
+    ScheduledWorkerCapacity::new(args.jobs.unwrap_or(DEFAULT_BUILD_JOBS))
+}
+
 fn required_value(values: &mut impl Iterator<Item = String>, option: &str) -> String {
     let value = values
         .next()
@@ -455,8 +460,8 @@ fn validate_args(command: &str, args: &Args) {
     if command == "build" && args.prebuilt {
         fail("build does not accept --prebuilt");
     }
-    if command != "run" && args.jobs.is_some() {
-        fail("--jobs is accepted by run only");
+    if !matches!(command, "build" | "run") && args.jobs.is_some() {
+        fail("--jobs is accepted by build and run only");
     }
     if args.selection.include_manual
         && (args.selection.test.is_none() || args.selection.mode.is_none())
@@ -1413,15 +1418,33 @@ fn build(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     if cells.is_empty() && !args.allow_empty {
         fail("filters selected no cells");
     }
+    let capacity = build_worker_capacity(args);
     let context = RunContext::from_env(root.to_path_buf(), false).unwrap_or_else(|e| fail(e));
     let mut seen = BTreeSet::new();
+    let cells = cells
+        .into_iter()
+        .filter(|cell| seen.insert(cell.id.test.clone()))
+        .collect::<Vec<_>>();
+    let mut results = std::iter::repeat_with(|| None)
+        .take(cells.len())
+        .collect::<Vec<Option<Result<(), String>>>>();
+    for_each_parallel(
+        cells.len(),
+        capacity,
+        |index, emit| {
+            let cell = &cells[index];
+            let dir = context.build_root.join(cell.id.test.replace('/', "-"));
+            let result = hermit_manifest_plan::runner::prepare_test(&context, cell, &dir).map(drop);
+            let _ = emit(result, false);
+        },
+        |index, result, _| {
+            results[index] = Some(result);
+            true
+        },
+    );
     let mut failed = false;
-    for cell in cells {
-        if !seen.insert(cell.id.test.clone()) {
-            continue;
-        }
-        let dir = context.build_root.join(cell.id.test.replace('/', "-"));
-        match hermit_manifest_plan::runner::prepare_test(&context, &cell, &dir) {
+    for (cell, result) in cells.iter().zip(results) {
+        match result.expect("every fixture preparation worker returns one result") {
             Ok(_) => println!("BUILT {}", cell.id.test),
             Err(e) => {
                 eprintln!("ERROR {}: {e}", cell.id.test);
@@ -1429,6 +1452,11 @@ fn build(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             }
         }
     }
+    println!(
+        "test-harness: completed {} preparation(s) with up to {} concurrent worker(s)",
+        cells.len(),
+        capacity.workers_for(cells.len())
+    );
     if failed {
         ExitCode::FAILURE
     } else {
@@ -1855,11 +1883,13 @@ mod tests {
     use hermit_manifest_plan::runner::ManifestSet;
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 
+    use super::DEFAULT_BUILD_JOBS;
     use super::EXPECTED_PLAN_SCHEMA;
     use super::HostCapability;
     use super::HostCapabilityVerdict;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
+    use super::build_worker_capacity;
     use super::command_jobs;
     use super::expected_plan_document;
     use super::for_each_parallel;
@@ -2044,6 +2074,17 @@ mod tests {
         assert_eq!(explicit.configured(), 7);
         assert_eq!(explicit.workers_for(12), 7);
         assert_eq!(explicit.workers_for(1), 1);
+    }
+
+    #[test]
+    fn build_jobs_default_to_the_measured_useful_width_and_accept_an_override() {
+        let default = build_worker_capacity(&parse(std::iter::empty()));
+        assert_eq!(default.configured(), DEFAULT_BUILD_JOBS);
+
+        let explicit =
+            build_worker_capacity(&parse(["--jobs", "3"].into_iter().map(str::to_string)));
+        assert_eq!(explicit.configured(), 3);
+        assert_eq!(explicit.workers_for(2), 2);
     }
 
     #[test]

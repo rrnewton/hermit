@@ -98,9 +98,10 @@
       "cmd": "target/debug/test-harness build --lane privileged --ci-only --allow-empty",
       "deps": ["e2e.metadata"],
       "timeout": 120,
+      "jobs_flag": "--jobs",
       "hint": {"est_duration_s": 75,
                "rss_baseline_bytes": 1073741824, "hard_mem_max_bytes": 3221225472,
-               "classification": "cpu-bound"}
+               "classification": "cpu-bound", "preferred_inner_jobs": 3}
     },
     {
       "group": "e2e", "job": "manifest_applications",
