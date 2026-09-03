@@ -40,6 +40,16 @@ if [ ! -x "$HERMIT" ]; then
   exit 1
 fi
 echo "Hermit record/replay binary: $HERMIT"
+# Say this at RUNTIME, not only in the comment above. A reader of the demo's
+# output would otherwise see a clean pass and have no way to know the release
+# path is untested here, which is how a substitution becomes permanent.
+echo "NOTE: this demo exercises the DEBUG profile only. Release replay is"
+echo "      currently broken -- it injects an execveat whose envp is invalid and"
+echo "      fails EFAULT at hermit-cli/src/replayer.rs:748, while record"
+echo "      succeeds. The release record/replay path is therefore NOT covered by"
+echo "      this demo. Tracked as release_profile_replay_injects; when that is"
+echo "      fixed, restore the release binary here and add a required release"
+echo "      record/replay regression."
 
 export DEMO_DATA_DIR="$DEMO_TMP/recordings"
 mkdir -p "$DEMO_DATA_DIR"
