@@ -182,6 +182,47 @@ else
     fi
 fi
 
+# Exercise the final runner argv as well as the scratch-DAG edit. The pinned
+# runner retired `--only` in favor of `--selected --ignore-selected-deps`; a
+# print-only test exits before that handoff and therefore cannot catch the two
+# interfaces drifting apart. This stub runs no node, but accepts only the
+# current selector pair and records that run-node.sh actually supplied it.
+selector_probe="$ROOT_DIR/ignored/ci/run-node/selector-probe.$$"
+mkdir -p "$(dirname "$selector_probe")"
+trap 'rm -f -- "$selector_probe"' EXIT
+cat >"$selector_probe" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+selected=0
+ignore_deps=0
+for arg in "$@"; do
+    case "$arg" in
+        --selected) selected=1 ;;
+        --ignore-selected-deps) ignore_deps=1 ;;
+        --only)
+            echo "selector-probe: retired --only reached the runner" >&2
+            exit 2
+            ;;
+    esac
+done
+if ((selected != 1 || ignore_deps != 1)); then
+    echo "selector-probe: current selector pair was incomplete" >&2
+    exit 2
+fi
+echo "selector-probe: current selector pair reached the runner"
+EOF
+chmod +x "$selector_probe"
+selector_output=$(run_local env DAGRUN_BIN="$selector_probe" \
+    "$RUN_NODE" "$LANE" "$NODE" -- --selector-probe 2>&1)
+selector_status=$?
+if ((selector_status != 0)); then
+    fail "the edited-node runner handoff exited $selector_status. Output: $selector_output"
+elif [[ $selector_output != *"current selector pair reached the runner"* ]]; then
+    fail "the edited-node runner handoff did not reach the selector probe. Output: $selector_output"
+else
+    printf 'run-node-args-test: ok — edited-node handoff uses --selected --ignore-selected-deps\n'
+fi
+
 # ...and nothing else in the DAG moved. The scratch DAG carries TWO edits and the
 # guard has to tell them apart: the lane CPU budget stamped onto every step that
 # declared none, and the appended command on exactly one step. "Some steps
@@ -257,4 +298,4 @@ if ((failures > 0)); then
     printf 'run-node-args-test: %d check(s) FAILED\n' "$failures" >&2
     exit 1
 fi
-printf 'run-node-args-test: OK — 5 reasoned refusals, 1 usage check, 1 real CI selection, scheduler-width default and override, 1 single-node edit, lane CPU budget carried, no unexplained drift\n'
+printf 'run-node-args-test: OK — 5 reasoned refusals, 1 usage check, 1 real CI selection, scheduler-width default and override, 1 single-node edit, current runner selector, lane CPU budget carried, no unexplained drift\n'

@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
+use std::process::Output;
 use std::process::Stdio;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -41,6 +43,9 @@ use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
 const EXPECTED_PLAN_SCHEMA: u64 = 1;
+const VALIDATE_AUDIT_JOBS: usize = 2;
+const PREBUILT_RUST_SCRIPTS_REQUIRED: &str = "HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED";
+const DEFAULT_BUILD_JOBS: usize = 16;
 
 const HELP: &str = "\
 Usage: test-harness <COMMAND> [OPTIONS]
@@ -77,7 +82,7 @@ Execution and output options:
   --results <PATH>                 Write JSONL cell results to PATH
   --junit <PATH>                   Write JUnit output to PATH
   --format <text|json>             Plan output format (default: text)
-  --jobs <N>                       Run at most N cells concurrently (run only)
+  --jobs <N>                       Prepare/run at most N tests/cells concurrently
   -h, --help                       Print this help";
 
 const PUBLIC_EXECUTION_ENVIRONMENT: &str =
@@ -414,6 +419,10 @@ fn scheduled_worker_capacity(args: &Args) -> ScheduledWorkerCapacity {
     ScheduledWorkerCapacity::new(args.jobs.unwrap_or(1))
 }
 
+fn build_worker_capacity(args: &Args) -> ScheduledWorkerCapacity {
+    ScheduledWorkerCapacity::new(args.jobs.unwrap_or(DEFAULT_BUILD_JOBS))
+}
+
 fn required_value(values: &mut impl Iterator<Item = String>, option: &str) -> String {
     let value = values
         .next()
@@ -455,8 +464,8 @@ fn validate_args(command: &str, args: &Args) {
     if command == "build" && args.prebuilt {
         fail("build does not accept --prebuilt");
     }
-    if command != "run" && args.jobs.is_some() {
-        fail("--jobs is accepted by run only");
+    if !matches!(command, "build" | "run") && args.jobs.is_some() {
+        fail("--jobs is accepted by build and run only");
     }
     if args.selection.include_manual
         && (args.selection.test.is_none() || args.selection.mode.is_none())
@@ -552,42 +561,54 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
     // the expected-plan comparison during the shell removal.
     audit_dag_correspondence(root, manifests).unwrap_or_else(|error| fail(error));
     audit_budget_ordering(root).unwrap_or_else(|error| fail(error));
-    run_audit(
-        root,
-        &root.join("target/debug/generate-test-footprints"),
-        &["--check"],
-    );
-    run_audit(
-        root,
-        &root.join("tests/backend-parity/split_asymmetric_pr.py"),
-        &["--self-test"],
-    );
     audit_determinism_stress_evidence(root);
-    run_audit(root, &root.join("tests/manifest-cli.rs"), &["self-test"]);
-    // The DBT budget wrapper gates roughly twenty portable nodes and fails
-    // CLOSED on a pin it is not calibrated for. Nothing else notices: a
-    // truncated node reads like a fast one. This asserts end to end that the
-    // wrapper still REACHES its wrapped command at the recorded pin.
-    run_audit(
+    // These self-contained audits read the same checked-out tree but keep all
+    // generated state in their own temporary directories. The validation DAG
+    // supplies immutable prebuilt rust-script binaries; without that guarantee,
+    // retain the old serial order instead of making rust-script compilers contend
+    // for their shared cache. Run no more than two at once: two is the largest
+    // clean concurrent validation width established on this host, and a wider
+    // unmeasured default would turn this speed change into a new concurrency
+    // assumption. Capture each child independently and replay it in the original
+    // order so diagnostics remain attributable.
+    let audit_jobs = if std::env::var(PREBUILT_RUST_SCRIPTS_REQUIRED).as_deref() == Ok("1") {
+        VALIDATE_AUDIT_JOBS
+    } else {
+        1
+    };
+    run_audits_parallel(
         root,
-        &root.join("ci/run-with-reverie-dbt-budget-test.sh"),
-        &[],
+        &[
+            (
+                root.join("target/debug/generate-test-footprints"),
+                vec!["--check"],
+            ),
+            (
+                root.join("tests/backend-parity/split_asymmetric_pr.py"),
+                vec!["--self-test"],
+            ),
+            (root.join("tests/manifest-cli.rs"), vec!["self-test"]),
+            // The DBT budget wrapper gates roughly twenty portable nodes and
+            // fails CLOSED on a pin it is not calibrated for. Nothing else
+            // notices: a truncated node reads like a fast one. This asserts end
+            // to end that the wrapper still REACHES its wrapped command at the
+            // recorded pin.
+            (root.join("ci/run-with-reverie-dbt-budget-test.sh"), vec![]),
+            (
+                root.join("ci/compat-envelope/scorecard.rs"),
+                vec!["self-test-and-check"],
+            ),
+            (
+                root.join("ci/compat-envelope/pressure-test.rs"),
+                vec!["self-test"],
+            ),
+            // The removed shell front door accumulated plan/scheduler/receipt
+            // guards that now belong to the Rust validate driver. Exercise
+            // those brackets without executing the validation DAG.
+            (root.join("scripts/validate.rs"), vec!["--self-test"]),
+        ],
+        audit_jobs,
     );
-    run_audit(
-        root,
-        &root.join("ci/compat-envelope/scorecard.rs"),
-        &["self-test-and-check"],
-    );
-    run_audit(
-        root,
-        &root.join("ci/compat-envelope/pressure-test.rs"),
-        &["self-test"],
-    );
-    // The removed shell front door accumulated plan/scheduler/receipt guards
-    // that now belong to the Rust validate driver.  Exercise those brackets
-    // here without executing the validation DAG; otherwise deleting the shell
-    // would also silently delete its protection against incomplete plans.
-    run_audit(root, &root.join("scripts/validate.rs"), &["--self-test"]);
     audit_cli_brackets(root);
     let cells = audit_expected_plan(root, manifests);
     println!(
@@ -888,6 +909,69 @@ fn run_audit(root: &Path, program: &Path, args: &[&str]) {
         }
         fail(format!("{} {} failed", program.display(), args.join(" ")));
     }
+}
+
+fn run_audits_parallel(root: &Path, audits: &[(PathBuf, Vec<&str>)], jobs: usize) {
+    let mut results = std::iter::repeat_with(|| None)
+        .take(audits.len())
+        .collect::<Vec<Option<Result<Output, String>>>>();
+    for_each_parallel(
+        audits.len(),
+        ScheduledWorkerCapacity::new(jobs),
+        |index, emit| {
+            let (program, args) = &audits[index];
+            let result = Command::new(program)
+                .args(args)
+                .current_dir(root)
+                .output()
+                .map_err(|error| format!("cannot execute {}: {error}", program.display()));
+            let _ = emit(result, false);
+        },
+        |index, result, _| {
+            results[index] = Some(result);
+            true
+        },
+    );
+
+    for ((program, args), result) in audits.iter().zip(results) {
+        let output = result
+            .expect("every validation audit worker returns one result")
+            .unwrap_or_else(|error| fail(error));
+        std::io::stdout()
+            .write_all(&output.stdout)
+            .unwrap_or_else(|error| {
+                fail(format!(
+                    "cannot replay {} stdout: {error}",
+                    program.display()
+                ))
+            });
+        std::io::stderr()
+            .write_all(&output.stderr)
+            .unwrap_or_else(|error| {
+                fail(format!(
+                    "cannot replay {} stderr: {error}",
+                    program.display()
+                ))
+            });
+        if !output.status.success() {
+            if output.status.code() == Some(127) {
+                fail(format!(
+                    "cannot run {}: exited 127, which means its interpreter was not found, \
+                     not that the audit failed. This program runs under \
+                     `#!/usr/bin/env -S rust-script --force`; install it with \
+                     `cargo install rust-script` or put it on PATH (on a dev box it is \
+                     usually ~/.cargo/bin, which a non-login shell does not inherit).",
+                    program.display()
+                ));
+            }
+            fail(format!("{} {} failed", program.display(), args.join(" ")));
+        }
+    }
+    println!(
+        "test-harness: completed {} independent validation audits with up to {} concurrent workers",
+        audits.len(),
+        jobs.min(audits.len())
+    );
 }
 
 fn audit_determinism_stress_evidence(root: &Path) {
@@ -1413,15 +1497,33 @@ fn build(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     if cells.is_empty() && !args.allow_empty {
         fail("filters selected no cells");
     }
+    let capacity = build_worker_capacity(args);
     let context = RunContext::from_env(root.to_path_buf(), false).unwrap_or_else(|e| fail(e));
     let mut seen = BTreeSet::new();
+    let cells = cells
+        .into_iter()
+        .filter(|cell| seen.insert(cell.id.test.clone()))
+        .collect::<Vec<_>>();
+    let mut results = std::iter::repeat_with(|| None)
+        .take(cells.len())
+        .collect::<Vec<Option<Result<(), String>>>>();
+    for_each_parallel(
+        cells.len(),
+        capacity,
+        |index, emit| {
+            let cell = &cells[index];
+            let dir = context.build_root.join(cell.id.test.replace('/', "-"));
+            let result = hermit_manifest_plan::runner::prepare_test(&context, cell, &dir).map(drop);
+            let _ = emit(result, false);
+        },
+        |index, result, _| {
+            results[index] = Some(result);
+            true
+        },
+    );
     let mut failed = false;
-    for cell in cells {
-        if !seen.insert(cell.id.test.clone()) {
-            continue;
-        }
-        let dir = context.build_root.join(cell.id.test.replace('/', "-"));
-        match hermit_manifest_plan::runner::prepare_test(&context, &cell, &dir) {
+    for (cell, result) in cells.iter().zip(results) {
+        match result.expect("every fixture preparation worker returns one result") {
             Ok(_) => println!("BUILT {}", cell.id.test),
             Err(e) => {
                 eprintln!("ERROR {}: {e}", cell.id.test);
@@ -1429,6 +1531,11 @@ fn build(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             }
         }
     }
+    println!(
+        "test-harness: completed {} preparation(s) with up to {} concurrent worker(s)",
+        cells.len(),
+        capacity.workers_for(cells.len())
+    );
     if failed {
         ExitCode::FAILURE
     } else {
@@ -1855,11 +1962,13 @@ mod tests {
     use hermit_manifest_plan::runner::ManifestSet;
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 
+    use super::DEFAULT_BUILD_JOBS;
     use super::EXPECTED_PLAN_SCHEMA;
     use super::HostCapability;
     use super::HostCapabilityVerdict;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
+    use super::build_worker_capacity;
     use super::command_jobs;
     use super::expected_plan_document;
     use super::for_each_parallel;
@@ -2044,6 +2153,17 @@ mod tests {
         assert_eq!(explicit.configured(), 7);
         assert_eq!(explicit.workers_for(12), 7);
         assert_eq!(explicit.workers_for(1), 1);
+    }
+
+    #[test]
+    fn build_jobs_default_to_the_measured_useful_width_and_accept_an_override() {
+        let default = build_worker_capacity(&parse(std::iter::empty()));
+        assert_eq!(default.configured(), DEFAULT_BUILD_JOBS);
+
+        let explicit =
+            build_worker_capacity(&parse(["--jobs", "3"].into_iter().map(str::to_string)));
+        assert_eq!(explicit.configured(), 3);
+        assert_eq!(explicit.workers_for(2), 2);
     }
 
     #[test]

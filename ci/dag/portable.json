@@ -243,11 +243,14 @@
     {
       "group": "build", "job": "manifest_guests",
       "desc": "Prepare every CI-enabled portable manifest guest",
+      "description": "The harness used to prepare every distinct guest in one serial loop. On 2026-09-03 at Hermit a58e9ecf, three paired runs of the 158-test c-programs bucket measured --jobs 1 at 10.04/9.64/9.75s wall and 8.34/8.17/8.06s CPU, versus --jobs 16 at 1.29/1.29/1.29s wall and 8.12/8.31/8.15s CPU. Width 32 saved only another 0.15s in one sweep while doubling requested capacity, so 16 is the measured useful width. Host load averages were 22.6-25.9 (1m), 34.4-35.1 (5m), and 41.7-42.2 (15m); paired order and stable CPU cost limit that contamination. The implementation keeps one output directory per test and prints results in manifest order after all workers finish.",
       "cmd": "target/debug/test-harness build --lane portable --ci-only --allow-empty",
       "deps": ["e2e.metadata"],
       "timeout": 600,
+      "jobs_flag": "--jobs",
       "hint": {"est_duration_s": 90, "rss_baseline_bytes": 1073741824,
-               "hard_mem_max_bytes": 3221225472, "classification": "cpu-bound"}
+               "hard_mem_max_bytes": 3221225472, "classification": "cpu-bound",
+               "preferred_inner_jobs": 16}
     },
     {
       "group": "e2e", "job": "manifest_applications",
