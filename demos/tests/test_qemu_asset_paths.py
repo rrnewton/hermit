@@ -156,3 +156,33 @@ class DefaultQemuAssetsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SocketPathBoundTest(unittest.TestCase):
+    """A Unix-domain socket path must fit AF_UNIX, and must move only if it must.
+
+    Relocating unconditionally passed locally and broke the hosted runner, where
+    XDG_RUNTIME_DIR is unusable and the in-checkout path had always fit, so the
+    ordering here is the fix and not an optimisation.
+    """
+
+    def test_a_path_that_fits_is_returned_unchanged(self):
+        fits = Path("/runner-state/_work/hermit/hermit/ignored/q/.work/boot-ab/qmp.sock")
+        self.assertLessEqual(len(str(fits).encode()), dc.AF_UNIX_PATH_MAX)
+        self.assertEqual(dc.make_socket_path(fits, "boot"), fits)
+
+    def test_a_path_over_the_bound_is_relocated_within_it(self):
+        too_long = Path(
+            "/home/newton/work/dev-hermit/worktrees/validate/"
+            "validate-fresh-27be9dc9b2a6-3837008-c9ce93ba/hermit/ignored/"
+            "qemu-linux/.work/boot-ab12cd34/qmp.sock"
+        )
+        self.assertGreater(len(str(too_long).encode()), dc.AF_UNIX_PATH_MAX)
+        got = dc.make_socket_path(too_long, "boot")
+        self.assertNotEqual(got, too_long)
+        self.assertLessEqual(len(str(got).encode()), dc.AF_UNIX_PATH_MAX)
+        self.assertEqual(got.name, "qmp.sock")
+
+    def test_the_bound_is_the_kernel_constant(self):
+        # sockaddr_un.sun_path is 108 bytes including the NUL.
+        self.assertEqual(dc.AF_UNIX_PATH_MAX, 107)

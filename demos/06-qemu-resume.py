@@ -200,7 +200,7 @@ def main() -> int:
     serial_pipe_out = Path(str(serial_pipe) + ".out")
     # Same AF_UNIX bound as Demo 5: root the socket short, not under the assets
     # directory, which inherits the checkout's depth.
-    qmp_socket = make_socket_path("resume", "qmp.sock")
+    qmp_socket = make_socket_path(ASSETS / "qmp.sock", "resume")
     serial_log = ASSETS / "serial.log"
     archived_serial_log = run_dir / "serial.log"
     info_log = run_dir / "hermit-info.log"

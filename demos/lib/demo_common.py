@@ -660,40 +660,49 @@ def make_temp_result_dir(assets: Path, prefix: str) -> Path:
 AF_UNIX_PATH_MAX = 107
 
 
-def make_socket_dir(prefix: str) -> Path:
-    """Create a short-rooted private directory to hold a Unix-domain socket.
+def make_socket_path(preferred: Path, prefix: str) -> Path:
+    """Return a socket pathname for ``preferred``, relocating only if it must.
 
-    A socket placed under the checkout inherits the checkout's depth, and the
-    prescribed validation location (`worktrees/validate/...`) is deep enough on
-    its own to push a `qmp.sock` past AF_UNIX_PATH_MAX -- measured at 119 bytes
-    on a standard validation checkout, which QEMU rejects. The same class was
-    already fixed globally for validation sockets by rooting them under
-    XDG_RUNTIME_DIR instead of below the parent checkout; sockets created here
-    were not going through that path, so they are rooted the same way now.
+    Linux rejects a Unix-domain socket path at or over AF_UNIX_PATH_MAX. The
+    natural home for these sockets is the per-run working directory, alongside
+    the run's other evidence, and from most checkouts that fits. From the
+    prescribed validation location it does not: measured at 119 bytes against
+    the 107-byte bound, which QEMU rejects, taking Demos 6 and 7 down with it
+    for want of a snapshot.
 
-    Only the SOCKET moves. Logs, disks and metadata stay in the per-run working
-    directory where the rest of the run's evidence lives.
+    ⚠️ RELOCATION IS THE FALLBACK, NOT THE DEFAULT, and that ordering is load
+    bearing. QEMU runs UNDER Hermit, so a socket outside the checkout is not
+    necessarily visible to both the guest that creates it and the controller
+    that connects to it. Relocating unconditionally to XDG_RUNTIME_DIR passed
+    locally and FAILED on the hosted runner, where that directory is unusable
+    and the in-checkout path had always fit. So keep the working path wherever
+    it works, and move only when the bound forces it.
     """
+    preferred = Path(preferred)
+    if len(str(preferred).encode()) <= AF_UNIX_PATH_MAX:
+        return preferred
+
     runtime_root = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
     root = Path(runtime_root) / "hermit-demos"
-    root.mkdir(parents=True, exist_ok=True)
-    return Path(tempfile.mkdtemp(prefix="{}-".format(prefix), dir=str(root)))
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        relocated = Path(tempfile.mkdtemp(prefix="{}-".format(prefix), dir=str(root)))
+    except OSError as error:
+        raise RuntimeError(
+            "socket path {} is {} bytes, over the {}-byte AF_UNIX limit, and the "
+            "short fallback root {} is unusable: {}. Set XDG_RUNTIME_DIR or "
+            "TMPDIR to a short writable directory.".format(
+                preferred, len(str(preferred).encode()), AF_UNIX_PATH_MAX, root, error
+            )
+        ) from error
 
-
-def make_socket_path(prefix: str, name: str) -> Path:
-    """Return a socket pathname that fits AF_UNIX, or refuse with the numbers.
-
-    Refusing names the measured length, the bound and the override rather than
-    letting QEMU fail later with a message that does not say which path was too
-    long.
-    """
-    path = make_socket_dir(prefix) / name
+    path = relocated / preferred.name
     length = len(str(path).encode())
     if length > AF_UNIX_PATH_MAX:
         raise RuntimeError(
-            "socket path is {} bytes, over the {}-byte AF_UNIX limit: {}. "
-            "Set XDG_RUNTIME_DIR to a shorter directory, or TMPDIR if "
-            "XDG_RUNTIME_DIR is unset.".format(length, AF_UNIX_PATH_MAX, path)
+            "socket path is {} bytes even after relocating under {}, over the "
+            "{}-byte AF_UNIX limit: {}. Set XDG_RUNTIME_DIR or TMPDIR to a "
+            "shorter directory.".format(length, root, AF_UNIX_PATH_MAX, path)
         )
     return path
 
