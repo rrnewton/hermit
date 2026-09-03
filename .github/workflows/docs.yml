@@ -50,6 +50,8 @@ jobs:
         # The release download and deploy steps receive the token explicitly;
         # do not leave the write credential in git configuration while building.
         persist-credentials: false
+    - name: Initialize dagrun submodule
+      run: git submodule update --init --depth 1 -- agent-utils
     - name: Dependencies
       run: sudo apt-get install -y libunwind-dev liblzma-dev
     - name: Build documentation
