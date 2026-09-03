@@ -2983,7 +2983,9 @@ impl RunOpts {
         // allowed to depend on:
         if config.max_timeslice.is_some() && !perf_supported {
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
-            eprintln!(
+            let mut stderr = detcore::util::RetryingStderr;
+            let _ = writeln!(
+                stderr,
                 "WARNING: --max-timeslice requires user-space perf counters, but \
                  perf_event_open is unavailable; continuing with \
                  --max-timeslice=disabled. Check the host perf_event_paranoid value and \
