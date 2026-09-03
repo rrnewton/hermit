@@ -181,6 +181,25 @@ case "${DEMO08_TEST_MODE:?mode required}" in
     echo 'READ of size 8 at 0x606000000210 thread T1'
     exit 124
     ;;
+  complete-uaf-rc0)
+    # A COMPLETE report -- closing SUMMARY line included -- from a guest that never
+    # aborted. A fixture built without abort_on_error prints exactly this and exits
+    # normally, so every text-based check passes and only the exit status can tell
+    # this apart from the crash the demo publishes.
+    #
+    # The fixed variant converts cleanly, so nothing ELSE would refuse this seed:
+    # remove the exit-status check and the confirmation runs succeed and the seed is
+    # persisted. That is what makes this bracket a test of the status check alone.
+    printf 'Copy inodes [o] [         0/         1]\r\n'
+    if [ "$variant" != buggy ]; then
+      echo 'Conversion complete'
+    else
+      echo '==123==ERROR: AddressSanitizer: heap-use-after-free on address 0x606000000210'
+      echo 'READ of size 8 at 0x606000000210 thread T1'
+      echo 'SUMMARY: AddressSanitizer: heap-use-after-free common/task-utils.c:154 in task_period_wait'
+      exit 0
+    fi
+    ;;
   runner-failure)
     echo 'fixture runner failed before guest execution' >&2
     exit 127
@@ -308,6 +327,30 @@ set -e
 [ ! -f "$assets/.crash-seed" ]
 [ "$(grep -cE $'\treached\thit\t124\t[0-9]+\tno\t' "$artifacts/calibration.tsv")" -eq 2 ]
 grep -q 'uaf_hits=2/2 qualified=0/2' <<<"$partial124_output"
+
+# THE ABORT STATUS, NOT THE REPORT'S COMPLETENESS. The two brackets above are both refused
+# because their report is truncated, so neither of them exercises the required exit status:
+# delete that requirement and they still pass. This one closes that. The report here is
+# COMPLETE -- `uaf=complete`, SUMMARY line and all -- and the guest still never aborted,
+# which is what a fixture built without abort_on_error does. Every text check therefore
+# succeeds and `run_qualifies`' exit-status check is the only thing left refusing the seed.
+assets="$TMP/assets-complete-rc0"
+artifacts="$TMP/artifacts-complete-rc0"
+make_assets "$assets"
+set +e
+complete0_output="$(DEMO08_TEST_MODE=complete-uaf-rc0 \
+  run_prepare "$assets" "$artifacts" 2 2>&1)"
+complete0_rc=$?
+set -e
+[ "$complete0_rc" -ne 0 ]
+[ ! -e "$assets/.crash-seed" ]
+# `complete`, not `hit`: the text bar is fully met and the seed is refused anyway.
+[ "$(grep -cE $'\tbuggy\treached\tcomplete\t0\t[0-9]+\tno\t' "$artifacts/calibration.tsv")" -eq 2 ]
+! grep -q $'\tyes\t' "$artifacts/calibration.tsv"
+# A seed that never qualified must not reach confirmation, so no replay or fixed row exists.
+! grep -q $'\tbuggy-replay\t' "$artifacts/calibration.tsv"
+! grep -q $'\tfixed\t' "$artifacts/calibration.tsv"
+grep -q 'uaf_hits=2/2 qualified=0/2' <<<"$complete0_output"
 
 # Falsifiability bracket: seed 1 reaches the path and runs an actual ASAN
 # use-after-free. The harness must select it and preserve the signature.
