@@ -48,6 +48,8 @@ printf 'demo\tstatus\texit\tduration_seconds\tlog\n' >>"$SUMMARY"
 export DEMO_TMP="${DEMO_TMP:-$(mktemp -d -t hermit-demo.XXXXXX)}"
 
 failures=0
+passes=0
+skips=0
 for demo in "${demos[@]}"; do
   log="$LOG_DIR/$demo.log"
   started=$SECONDS
@@ -59,8 +61,20 @@ for demo in "${demos[@]}"; do
   duration=$((SECONDS - started))
 
   if [ "$rc" -eq 0 ]; then
-    status=PASS
-    printf '=== %s: PASS (%ss) ===\n' "$demo" "$duration"
+    # A demo that declined to run exits 0 by design (demo8 does this when its
+    # ASAN assets are absent), so the exit code alone cannot tell a pass from a
+    # non-run. Recording that as PASS is how an unrun demo reaches the summary
+    # as evidence it never produced -- the same absence-reported-as-pass shape
+    # the demo-review gate exists to catch. Read the demo's own SKIPPED marker.
+    if grep -qE '^=== Demo [0-9]+: SKIPPED' "$log"; then
+      status=SKIP
+      skips=$((skips + 1))
+      printf '=== %s: SKIP (%ss; log %s) ===\n' "$demo" "$duration" "$log"
+    else
+      status=PASS
+      passes=$((passes + 1))
+      printf '=== %s: PASS (%ss) ===\n' "$demo" "$duration"
+    fi
     # Demos 2-4 consume the same already-built Hermit binaries as demo 1.
     [ "$demo" != demo1 ] || export DEMO_SKIP_BUILD=1
   else
@@ -98,8 +112,17 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
 fi
 
 if [ "$failures" -ne 0 ]; then
-  printf '\n=== Demo suite: FAILURE — %s demo(s) failed ===\n' "$failures" >&2
+  printf '\n=== Demo suite: FAILURE — %s demo(s) failed, %s passed, %s skipped ===\n' \
+    "$failures" "$passes" "$skips" >&2
   exit 1
+fi
+
+# Never claim the requested count as the passed count: a skipped demo produced
+# no evidence, so saying "all N passed" would report a number nobody measured.
+if [ "$skips" -ne 0 ]; then
+  printf '\n=== Demo suite: INCOMPLETE — %s of %s requested demos passed, %s skipped and unmeasured ===\n' \
+    "$passes" "${#demos[@]}" "$skips"
+  exit 0
 fi
 
 printf '\n=== Demo suite: SUCCESS — all %s requested demos passed ===\n' \
