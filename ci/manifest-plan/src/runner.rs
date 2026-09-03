@@ -39,13 +39,29 @@ use crate::stress_series::HostCapabilities;
 use crate::stress_series::HostCapability;
 #[cfg(test)]
 use crate::stress_series::HostCapabilityVerdict;
+#[cfg(test)]
+use crate::timeouts::CALIBRATED_CI_CELL_COUNT;
+#[cfg(test)]
+use crate::timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS;
+#[cfg(test)]
+use crate::timeouts::DEFAULT_TEST_WALL_TIMEOUT_SECONDS;
 use crate::timeouts::DEFAULTS_FILE;
+#[cfg(test)]
+use crate::timeouts::EXPLICIT_TIMEOUT_CALIBRATIONS;
 use crate::timeouts::MANIFEST_SCHEMA;
+use crate::timeouts::ResolvedTestTimeouts;
+use crate::timeouts::TimeoutMultipliers;
+#[cfg(test)]
+use crate::timeouts::UNSAMPLED_NON_CI_CELL_COUNT;
+use crate::timeouts::resolve_test_timeouts;
 use crate::timeouts::resolve_timeout_seconds;
+use crate::timeouts::timeout_multipliers_from_env;
 use crate::timeouts::validate_timeout_seconds;
 
 const BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
+const CELL_CPU_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const CELL_CPU_ACCOUNTING_GRACE: Duration = Duration::from_secs(1);
 pub const CELL_RESULT_SCHEMA: u64 = 4;
 pub const E2E_MACHINE_SHORTNAME_ENV: &str = "E2E_MACHINE_SHORTNAME";
 pub const E2E_KERNEL_VERSION_ENV: &str = "E2E_KERNEL_VERSION";
@@ -110,6 +126,7 @@ pub fn requires_capability(token: &str) -> Result<Option<HostCapability>, String
 pub struct ManifestDefaults {
     pub schema: u64,
     pub timeout_seconds: u64,
+    pub cpu_timeout_seconds: u64,
     #[serde(default)]
     pub nextest: Vec<NextestTimeout>,
 }
@@ -201,6 +218,8 @@ pub struct ModeRecipe {
     #[serde(default)]
     pub timeout_seconds: BTreeMap<String, u64>,
     #[serde(default)]
+    pub cpu_timeout_seconds: BTreeMap<String, u64>,
+    #[serde(default)]
     pub slow_reason: BTreeMap<String, String>,
 }
 
@@ -219,7 +238,7 @@ pub struct Assertions {
 #[derive(Clone, Debug)]
 pub struct ManifestSet {
     pub documents: Vec<ManifestDocument>,
-    tests: BTreeMap<String, (String, u64, TestRecipe)>,
+    tests: BTreeMap<String, (String, u64, u64, TestRecipe)>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -275,6 +294,7 @@ pub struct SelectedCell {
     pub id: CellId,
     pub enabled: bool,
     pub timeout_seconds: u64,
+    pub cpu_timeout_seconds: u64,
 }
 
 impl ManifestSet {
@@ -293,6 +313,8 @@ impl ManifestSet {
         }
         let global_timeout_seconds =
             validate_timeout_seconds(defaults.timeout_seconds, "global default")?;
+        let global_cpu_timeout_seconds =
+            validate_timeout_seconds(defaults.cpu_timeout_seconds, "global CPU default")?;
         let mut nextest_filters = BTreeSet::new();
         for timeout in &defaults.nextest {
             if timeout.filter.trim().is_empty() {
@@ -339,7 +361,13 @@ impl ManifestSet {
             let document: ManifestDocument = serde_yaml::from_str(&source)
                 .map_err(|e| format!("{}: invalid YAML: {e}", path.display()))?;
             let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or_default();
-            validate_document(&document, stem, root, global_timeout_seconds)?;
+            validate_document_with_cpu(
+                &document,
+                stem,
+                root,
+                global_timeout_seconds,
+                global_cpu_timeout_seconds,
+            )?;
             let bucket_timeout_seconds =
                 resolve_timeout_seconds(global_timeout_seconds, document.timeout_seconds, None);
             for test in &document.test {
@@ -349,6 +377,7 @@ impl ManifestSet {
                         (
                             document.bucket.clone(),
                             bucket_timeout_seconds,
+                            global_cpu_timeout_seconds,
                             test.clone(),
                         ),
                     )
@@ -376,7 +405,9 @@ impl ManifestSet {
     pub fn select(&self, selection: &Selection) -> Result<Vec<SelectedCell>, String> {
         let population = selection.population.unwrap_or(Population::Enabled);
         let mut cells = Vec::new();
-        for (id, (category, bucket_timeout_seconds, test)) in &self.tests {
+        for (id, (category, bucket_timeout_seconds, default_cpu_timeout_seconds, test)) in
+            &self.tests
+        {
             if selection
                 .lane
                 .as_deref()
@@ -431,6 +462,11 @@ impl ManifestSet {
                             None,
                             recipe.timeout_seconds.get("native").copied(),
                         ),
+                        cpu_timeout_seconds: recipe
+                            .cpu_timeout_seconds
+                            .get("native")
+                            .copied()
+                            .unwrap_or(*default_cpu_timeout_seconds),
                     });
                     continue;
                 }
@@ -462,6 +498,11 @@ impl ManifestSet {
                         None,
                         recipe.timeout_seconds.get(&backend).copied(),
                     );
+                    let cpu_timeout_seconds = recipe
+                        .cpu_timeout_seconds
+                        .get(&backend)
+                        .copied()
+                        .unwrap_or(*default_cpu_timeout_seconds);
                     cells.push(SelectedCell {
                         category: category.clone(),
                         test: test.clone(),
@@ -472,6 +513,7 @@ impl ManifestSet {
                         },
                         enabled,
                         timeout_seconds,
+                        cpu_timeout_seconds,
                     });
                 }
             }
@@ -480,10 +522,17 @@ impl ManifestSet {
         Ok(cells)
     }
 
-    pub fn all_tests(&self) -> impl Iterator<Item = (&str, u64, &TestRecipe)> {
+    pub fn all_tests(&self) -> impl Iterator<Item = (&str, u64, u64, &TestRecipe)> {
         self.tests
             .values()
-            .map(|(category, timeout_seconds, test)| (category.as_str(), *timeout_seconds, test))
+            .map(|(category, timeout_seconds, cpu_timeout_seconds, test)| {
+                (
+                    category.as_str(),
+                    *timeout_seconds,
+                    *cpu_timeout_seconds,
+                    test,
+                )
+            })
     }
 }
 
@@ -495,11 +544,28 @@ fn population_accepts(population: Population, ci: bool, enabled: bool) -> bool {
     }
 }
 
+#[cfg(test)]
 fn validate_document(
     document: &ManifestDocument,
     stem: &str,
     root: &Path,
     global_timeout_seconds: u64,
+) -> Result<(), String> {
+    validate_document_with_cpu(
+        document,
+        stem,
+        root,
+        global_timeout_seconds,
+        DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+    )
+}
+
+fn validate_document_with_cpu(
+    document: &ManifestDocument,
+    stem: &str,
+    root: &Path,
+    global_timeout_seconds: u64,
+    global_cpu_timeout_seconds: u64,
 ) -> Result<(), String> {
     if document.schema != MANIFEST_SCHEMA {
         return Err(format!("{stem}: schema must be {MANIFEST_SCHEMA}"));
@@ -561,17 +627,40 @@ fn validate_document(
             return Err(format!("{}: modes must be exactly {expected:?}", test.id));
         }
         for (mode, recipe) in &test.modes {
-            validate_mode(&test.id, mode, recipe, bucket_timeout_seconds)?;
+            validate_mode_with_cpu(
+                &test.id,
+                mode,
+                recipe,
+                bucket_timeout_seconds,
+                global_cpu_timeout_seconds,
+            )?;
         }
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_mode(
     id: &str,
     mode: &str,
     recipe: &ModeRecipe,
     bucket_timeout_seconds: u64,
+) -> Result<(), String> {
+    validate_mode_with_cpu(
+        id,
+        mode,
+        recipe,
+        bucket_timeout_seconds,
+        DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+    )
+}
+
+fn validate_mode_with_cpu(
+    id: &str,
+    mode: &str,
+    recipe: &ModeRecipe,
+    bucket_timeout_seconds: u64,
+    default_cpu_timeout_seconds: u64,
 ) -> Result<(), String> {
     validate_mode_workdir(
         id,
@@ -603,6 +692,19 @@ fn validate_mode(
     {
         return Err(format!("{id}: {mode} has an empty backend-disabled reason"));
     }
+    let wall_timeout_keys: BTreeSet<_> =
+        recipe.timeout_seconds.keys().map(String::as_str).collect();
+    let cpu_timeout_keys: BTreeSet<_> = recipe
+        .cpu_timeout_seconds
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let reason_keys: BTreeSet<_> = recipe.slow_reason.keys().map(String::as_str).collect();
+    if wall_timeout_keys != cpu_timeout_keys || wall_timeout_keys != reason_keys {
+        return Err(format!(
+            "{id}: {mode} timeout_seconds, cpu_timeout_seconds, and slow_reason must name the same backends"
+        ));
+    }
     for (backend, timeout) in &recipe.timeout_seconds {
         if !enabled.contains(backend.as_str()) {
             return Err(format!(
@@ -618,16 +720,29 @@ fn validate_mode(
                 "{id}: {mode}/{backend} slow_reason must be non-empty"
             ));
         }
-        if *timeout == bucket_timeout_seconds {
+    }
+    for (backend, timeout) in &recipe.cpu_timeout_seconds {
+        if !enabled.contains(backend.as_str()) {
             return Err(format!(
-                "{id}: {mode}/{backend} timeout_seconds redundantly repeats its inherited value"
+                "{id}: {mode} cpu_timeout_seconds names disabled backend {backend}"
+            ));
+        }
+        validate_timeout_seconds(*timeout, &format!("{id}: {mode}/{backend} CPU"))?;
+        let reason = recipe.slow_reason.get(backend).ok_or_else(|| {
+            format!("{id}: {mode}/{backend} cpu_timeout_seconds requires slow_reason")
+        })?;
+        if reason.trim().is_empty() {
+            return Err(format!(
+                "{id}: {mode}/{backend} slow_reason must be non-empty"
             ));
         }
     }
-    for backend in recipe.slow_reason.keys() {
-        if !recipe.timeout_seconds.contains_key(backend) {
+    for backend in &wall_timeout_keys {
+        if recipe.timeout_seconds[*backend] == bucket_timeout_seconds
+            && recipe.cpu_timeout_seconds[*backend] == default_cpu_timeout_seconds
+        {
             return Err(format!(
-                "{id}: {mode}/{backend} slow_reason has no timeout_seconds"
+                "{id}: {mode}/{backend} timeout pair redundantly repeats its inherited values"
             ));
         }
     }
@@ -930,11 +1045,12 @@ pub struct AttemptResult {
     pub timed_out: bool,
     #[serde(default)]
     pub duration_ms: u128,
-    /// CPU consumed by the launched process and the descendants it reaped.
+    /// CPU consumed by the launched process group.
     ///
-    /// This comes from `wait4` at the same point that owns the process. It is
-    /// not inferred from wall time and remains attributable when cells execute
-    /// concurrently or move their work outside the enclosing DAG cgroup.
+    /// Completed commands use `wait4`; a CPU timeout retains the last live
+    /// process-group observation when that is larger. It is not inferred from
+    /// wall time and remains attributable when cells execute concurrently or
+    /// move their work outside the enclosing DAG cgroup.
     #[serde(default)]
     pub cpu_usage_usec: Option<u64>,
     pub observation_sha256: Option<String>,
@@ -1055,9 +1171,20 @@ pub struct CellResult {
     #[serde(default)]
     pub failure_class: Option<FailureClass>,
     pub error_kind: Option<String>,
-    /// The cell wall-clock bound used for this observation.
+    /// The cell wall-clock bound recorded by schema 4. It remains the fixture
+    /// preparation and inner-invocation wall bound; the additive fields below
+    /// describe the post-preparation policy without changing this field's
+    /// meaning for existing readers.
     #[serde(default)]
     pub timeout_seconds: u64,
+    /// Aggregate post-preparation CPU budget across attempts and seeds.
+    /// Absent only on rows written before this policy became explicit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_cpu_timeout_seconds: Option<u64>,
+    /// Outer post-preparation wall backstop for a near-zero-CPU wedge.
+    /// Absent only on rows written before this policy became explicit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_wall_timeout_seconds: Option<u64>,
     /// Measured wall time for a cell that reached execution. Absent when the
     /// cell never ran; a measured zero remains a valid sub-millisecond result.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1120,6 +1247,38 @@ pub struct CellResult {
 }
 
 impl CellResult {
+    /// Validate the additive timeout fields while keeping earlier schema-4 rows
+    /// readable. `timeout_seconds` retains its original wall-bound meaning;
+    /// only rows carrying both new fields claim the execution CPU/backstop
+    /// policy.
+    pub fn validate_timeout_policy(&self) -> Result<(), String> {
+        match (
+            self.execution_cpu_timeout_seconds,
+            self.execution_wall_timeout_seconds,
+        ) {
+            (None, None) => Ok(()),
+            (Some(cpu), Some(wall)) if cpu > 0 && wall == self.timeout_seconds && wall > cpu => {
+                Ok(())
+            }
+            (cpu, wall) => Err(format!(
+                "timeout policy disagrees: timeout_seconds={} execution_cpu_timeout_seconds={cpu:?} execution_wall_timeout_seconds={wall:?}",
+                self.timeout_seconds
+            )),
+        }
+    }
+
+    /// Require evidence emitted by the current runner rather than a readable
+    /// schema-4 row written before the additive timeout fields existed.
+    pub fn require_current_timeout_policy(&self) -> Result<(), String> {
+        self.validate_timeout_policy()?;
+        if self.execution_cpu_timeout_seconds.is_none()
+            || self.execution_wall_timeout_seconds.is_none()
+        {
+            return Err("current result omitted explicit execution timeout bounds".into());
+        }
+        Ok(())
+    }
+
     /// Check the classification fields written by the current framework.
     ///
     /// Both fields remain optional in the deserializer because schema 4 also
@@ -1167,26 +1326,25 @@ impl CellResult {
                     ));
                 }
             }
-            "ERROR" => {
-                if self.result.is_some() {
-                    return Err(format!(
-                        "ERROR result must not carry a product observation, got {:?}",
-                        self.result
-                    ));
-                }
-                match self.failure_class {
+            "ERROR" => match (self.result, self.failure_class) {
+                (
+                    None,
                     Some(
                         FailureClass::UnderstoodInfrastructureFailure
                         | FailureClass::UnderstoodPrerequisiteFailure
                         | FailureClass::NoResult,
-                    ) => {}
-                    other => {
-                        return Err(format!(
-                            "ERROR result must carry a non-product failure_class, got {other:?}"
-                        ));
-                    }
+                    ),
+                )
+                | (
+                    Some(ObservedResult::Timeout | ObservedResult::Oom),
+                    Some(FailureClass::NoResult),
+                ) => {}
+                other => {
+                    return Err(format!(
+                        "ERROR result must carry a non-product observation/classification, got {other:?}"
+                    ));
                 }
-            }
+            },
             other => return Err(format!("unknown cell outcome {other:?}")),
         }
         Ok(())
@@ -1241,6 +1399,9 @@ pub struct RunContext {
     pub keep_logs: bool,
     pub run_verify_strict: bool,
     pub record_verify_strict: bool,
+    /// Per-machine scaling for individual test CPU and wall bounds. This is execution policy,
+    /// not part of the canonical manifest.
+    pub timeout_multipliers: TimeoutMultipliers,
     pub scheduled_worker_capacity: ScheduledWorkerCapacity,
     pub isolated_workdir: Option<PathBuf>,
 }
@@ -1354,6 +1515,7 @@ impl RunContext {
             keep_logs: std::env::var("E2E_KEEP_VERIFY_LOGS").as_deref() == Ok("1"),
             run_verify_strict,
             record_verify_strict,
+            timeout_multipliers: timeout_multipliers_from_env()?,
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir,
         })
@@ -1493,11 +1655,13 @@ pub fn prepare_test(
     cell: &SelectedCell,
     dir: &Path,
 ) -> Result<Vec<String>, String> {
+    let timeouts = cell_timeouts(context, cell)?;
     prepare_test_until(
         context,
         cell,
         dir,
-        Instant::now() + Duration::from_secs(cell.timeout_seconds),
+        execution_deadline_after_preparation(Instant::now(), timeouts.wall_seconds)?,
+        timeouts.wall_seconds,
     )
     .map(|(guest, _cpu_usage_usec)| guest)
 }
@@ -1507,6 +1671,7 @@ fn prepare_test_until(
     cell: &SelectedCell,
     dir: &Path,
     deadline: Instant,
+    wall_timeout_seconds: u64,
 ) -> Result<(Vec<String>, u64), String> {
     prepare_dirs(&context.root, dir)?;
     let mut cpu_usage_usec = 0u64;
@@ -1554,7 +1719,7 @@ fn prepare_test_until(
                         "cc",
                         &args,
                         deadline,
-                        cell.timeout_seconds,
+                        wall_timeout_seconds,
                     )?)
                     .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
             }
@@ -1583,7 +1748,7 @@ fn prepare_test_until(
                         "rustc",
                         &args,
                         deadline,
-                        cell.timeout_seconds,
+                        wall_timeout_seconds,
                     )?)
                     .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
             }
@@ -1600,7 +1765,7 @@ fn prepare_test_until(
                         &path,
                         &["--prepare".into()],
                         deadline,
-                        cell.timeout_seconds,
+                        wall_timeout_seconds,
                     )?)
                     .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
             }
@@ -1684,15 +1849,7 @@ fn remaining_cell_time(deadline: Instant) -> Duration {
 }
 
 fn remaining_cell_seconds(deadline: Instant) -> u64 {
-    remaining_cell_seconds_at(deadline, Instant::now())
-}
-
-fn remaining_cell_time_at(deadline: Instant, now: Instant) -> Duration {
-    deadline.saturating_duration_since(now)
-}
-
-fn remaining_cell_seconds_at(deadline: Instant, now: Instant) -> u64 {
-    let remaining = remaining_cell_time_at(deadline, now);
+    let remaining = remaining_cell_time(deadline);
     if remaining.is_zero() {
         return 1;
     }
@@ -1701,8 +1858,28 @@ fn remaining_cell_seconds_at(deadline: Instant, now: Instant) -> u64 {
         .saturating_add(u64::from(remaining.subsec_nanos() != 0))
 }
 
-fn execution_deadline_after_preparation(prepared_at: Instant, timeout_seconds: u64) -> Instant {
-    prepared_at + Duration::from_secs(timeout_seconds)
+fn remaining_cell_time_at(deadline: Instant, now: Instant) -> Duration {
+    deadline.saturating_duration_since(now)
+}
+
+fn cell_timeouts(
+    context: &RunContext,
+    cell: &SelectedCell,
+) -> Result<ResolvedTestTimeouts, String> {
+    resolve_test_timeouts(
+        cell.cpu_timeout_seconds,
+        cell.timeout_seconds,
+        context.timeout_multipliers,
+    )
+}
+
+fn execution_deadline_after_preparation(
+    prepared_at: Instant,
+    wall_timeout_seconds: u64,
+) -> Result<Instant, String> {
+    prepared_at
+        .checked_add(Duration::from_secs(wall_timeout_seconds))
+        .ok_or_else(|| format!("wall timeout {wall_timeout_seconds}s exceeds clock range"))
 }
 
 fn require_executable_program(path: &Path, captures: &Path) -> Result<(), String> {
@@ -1743,13 +1920,13 @@ fn run_preparation(
         &preparation_env(dir),
         &captures.join("prepare.stdout"),
         &captures.join("prepare.stderr"),
-        deadline,
+        (deadline, None),
     )?;
-    if output.timed_out || !output.status.success() {
+    if output.timeout.is_some() || !output.status.success() {
         // Carry the child's own words back. This used to return the bare sentence
         // and drop `prepare.stderr` on the floor, which turned every denied or
         // broken compile into the same uninformative line.
-        let how = if output.timed_out {
+        let how = if output.timeout.is_some() {
             format!("cell exceeded {cell_timeout_seconds} s during fixture preparation")
         } else {
             match output.status.code() {
@@ -1980,15 +2157,19 @@ pub fn build_spec(
 pub fn execute_spec(spec: &CellRunSpec) -> Result<AttemptResult, String> {
     execute_spec_until(
         spec,
-        Instant::now() + Duration::from_secs(spec.timeout_seconds),
+        execution_deadline_after_preparation(Instant::now(), spec.timeout_seconds)?,
         spec.timeout_seconds,
+        spec.timeout_seconds,
+        None,
     )
 }
 
 fn execute_spec_until(
     spec: &CellRunSpec,
     deadline: Instant,
-    cell_timeout_seconds: u64,
+    cpu_timeout_seconds: u64,
+    wall_timeout_seconds: u64,
+    remaining_cpu_usec: Option<u64>,
 ) -> Result<AttemptResult, String> {
     // The attempt label comes from the spec rather than a parallel parameter.
     // `build_spec` already stored it, and every caller passed the same value to
@@ -2022,13 +2203,22 @@ fn execute_spec_until(
     let stderr_path = captures.join(format!("{}-{index}.stderr", spec.id.mode));
     let started = Instant::now();
     let remaining = remaining_cell_time(deadline);
-    if remaining.is_zero() {
+    let exhausted = if remaining.is_zero() {
+        Some(ProcessTimeout::Wall)
+    } else if remaining_cpu_usec == Some(0) {
+        Some(ProcessTimeout::Cpu)
+    } else {
+        None
+    };
+    if let Some(timeout) = exhausted {
         fs::write(&stdout_path, b"").map_err(|e| e.to_string())?;
         fs::write(&stderr_path, b"").map_err(|e| e.to_string())?;
         return Ok(cell_timeout_attempt(
             spec,
-            cell_timeout_seconds,
+            cpu_timeout_seconds,
+            wall_timeout_seconds,
             started.elapsed(),
+            timeout,
         ));
     }
     let output = execute_process(
@@ -2038,7 +2228,7 @@ fn execute_spec_until(
         &spec.env,
         &stdout_path,
         &stderr_path,
-        deadline,
+        (deadline, remaining_cpu_usec),
     )?;
     if spec.id.mode == "verify" && spec.id.backend.as_deref() == Some("ptrace") {
         if let Some(directory) = &spec.verification_log_dir {
@@ -2047,15 +2237,15 @@ fn execute_spec_until(
     }
     let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
     let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
-    let mut outcome = if output.timed_out || !output.status.success() {
+    let mut outcome = if output.timeout.is_some() || !output.status.success() {
         "FAIL"
     } else {
         "PASS"
     }
     .to_string();
     let mut reason = output
-        .timed_out
-        .then(|| format!("cell exceeded {cell_timeout_seconds} s"));
+        .timeout
+        .map(|kind| kind.reason(cpu_timeout_seconds, wall_timeout_seconds));
     let mut error_kind = None;
     let failure_class_line = stderr.lines().next().unwrap_or_default();
     let launch_refusal = spec.id.mode != "naked"
@@ -2090,7 +2280,7 @@ fn execute_spec_until(
     });
     let backend_unavailable = spec.id.mode != "naked"
         && !launch_refusal
-        && !output.timed_out
+        && output.timeout.is_none()
         && !output.status.success()
         && stdout.is_empty()
         && unavailable_class
@@ -2110,7 +2300,7 @@ fn execute_spec_until(
     // A producer class that cannot satisfy the requested backend or execution
     // shape is unavailable evidence, not a product crash. In particular, the
     // human error line must never override a mismatched class into FAIL.
-    let invalid_backend_evidence = !output.timed_out
+    let invalid_backend_evidence = output.timeout.is_none()
         && !output.status.success()
         && !backend_unavailable
         && failure_class_line
@@ -2125,7 +2315,7 @@ fn execute_spec_until(
     // The producer did write a class, but it did not establish a more specific
     // result. Keep that absence as no-result instead of letting the following
     // English line manufacture a product failure.
-    let unclassified_internal_failure = !output.timed_out
+    let unclassified_internal_failure = output.timeout.is_none()
         && !output.status.success()
         && !launch_refusal
         && !backend_unavailable
@@ -2221,7 +2411,7 @@ fn execute_spec_until(
                                     crate::canonical_verdict::NoResultReason::FirstRunRejected { .. }
                                 ) | None
                             )
-                            && !output.timed_out
+                            && output.timeout.is_none()
                             && output.status.code().is_some_and(|code| code != 0)
                         {
                             // The producer correctly has no comparison to
@@ -2242,7 +2432,7 @@ fn execute_spec_until(
                         } else if let Err(error) = report.require_canonical_match() {
                             outcome = "FAIL".into();
                             reason = Some(error);
-                        } else if !output.timed_out
+                        } else if output.timeout.is_none()
                             && (output.status.success() || spec.id.mode == "chaos")
                         {
                             // Chaos deliberately admits a reproduced nonzero
@@ -2275,13 +2465,17 @@ fn execute_spec_until(
             }
         }
     }
+    if let Some(timeout) = output.timeout {
+        error_kind = Some(timeout.error_kind().into());
+        reason = Some(timeout.reason(cpu_timeout_seconds, wall_timeout_seconds));
+    }
     Ok(AttemptResult {
         index: index.into(),
         outcome,
         error_kind,
         status: output.status.code(),
         signal: std::os::unix::process::ExitStatusExt::signal(&output.status),
-        timed_out: output.timed_out,
+        timed_out: output.timeout.is_some(),
         duration_ms: started.elapsed().as_millis(),
         cpu_usage_usec: Some(output.cpu_usage_usec),
         observation_sha256: None,
@@ -2340,10 +2534,40 @@ fn normalize_ptrace_golden(hermit: &str, directory: &Path) -> Result<(), String>
     fs::write(status_path, format!("{status}\n")).map_err(|e| e.to_string())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessTimeout {
+    Wall,
+    Cpu,
+}
+
+impl ProcessTimeout {
+    fn error_kind(self) -> &'static str {
+        match self {
+            Self::Wall => "wall-timeout",
+            Self::Cpu => "cpu-timeout",
+        }
+    }
+
+    fn reason(self, cpu_seconds: u64, wall_seconds: u64) -> String {
+        match self {
+            Self::Wall => {
+                format!("cell exceeded {wall_seconds} wall s backstop ({cpu_seconds} s CPU budget)")
+            }
+            Self::Cpu => format!("cell exceeded {cpu_seconds} CPU s"),
+        }
+    }
+}
+
 struct ProcessOutput {
     status: ExitStatus,
-    timed_out: bool,
+    timeout: Option<ProcessTimeout>,
     cpu_usage_usec: u64,
+}
+
+struct ProcessLimits {
+    deadline: Instant,
+    cpu_budget_usec: Option<u64>,
+    cpu_poll_interval: Duration,
 }
 
 /// Add two complete CPU measurements, refusing missing or overflowing input.
@@ -2389,6 +2613,48 @@ fn wait4_process(pid: u32, options: libc::c_int) -> Result<Option<(ExitStatus, u
     }
 }
 
+/// Live user-plus-system CPU consumed by one process group, including CPU from
+/// children already reaped by a still-live member.
+///
+/// `wait4` is the authoritative final measurement, but it becomes available
+/// only after the process exits and therefore cannot enforce a budget. Reuse
+/// dagrun's process-group reader: its one short-lived snapshot is shared by all
+/// concurrent cells, rather than making every cell enumerate the host's entire
+/// `/proc` tree on every poll.
+fn process_group_cpu_usage_usec(pgid: u32) -> Result<Option<u64>, String> {
+    dagrun::proccpu::subtree_cpu_seconds(pgid)
+        .map(|seconds| {
+            let usec = seconds * 1_000_000.0;
+            if !usec.is_finite() || usec.is_sign_negative() || usec > u64::MAX as f64 {
+                return Err(format!(
+                    "process group {pgid} returned invalid live CPU seconds {seconds}"
+                ));
+            }
+            Ok(usec as u64)
+        })
+        .transpose()
+}
+
+fn stop_process_group(pid: u32) -> Result<(ExitStatus, u64), String> {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGTERM);
+    }
+    let grace = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(result) = wait4_process(pid, libc::WNOHANG)? {
+            return Ok(result);
+        }
+        if Instant::now() >= grace {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    wait4_process(pid, 0)?.ok_or_else(|| format!("blocking wait4({pid}) returned no child"))
+}
+
 fn execute_process(
     cwd: &Path,
     program: &str,
@@ -2396,8 +2662,37 @@ fn execute_process(
     env: &BTreeMap<String, String>,
     stdout: &Path,
     stderr: &Path,
-    deadline: Instant,
+    limits: (Instant, Option<u64>),
 ) -> Result<ProcessOutput, String> {
+    execute_process_with_cpu_poll_interval(
+        cwd,
+        program,
+        args,
+        env,
+        stdout,
+        stderr,
+        ProcessLimits {
+            deadline: limits.0,
+            cpu_budget_usec: limits.1,
+            cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+        },
+    )
+}
+
+fn execute_process_with_cpu_poll_interval(
+    cwd: &Path,
+    program: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    stdout: &Path,
+    stderr: &Path,
+    limits: ProcessLimits,
+) -> Result<ProcessOutput, String> {
+    let ProcessLimits {
+        deadline,
+        cpu_budget_usec,
+        cpu_poll_interval,
+    } = limits;
     let stdout_file = File::create(stdout).map_err(|e| format!("{}: {e}", stdout.display()))?;
     let stderr_file = File::create(stderr).map_err(|e| format!("{}: {e}", stderr.display()))?;
     let mut command = Command::new(program);
@@ -2420,40 +2715,51 @@ fn execute_process(
         .spawn()
         .map_err(|e| format!("cannot execute {program}: {e}"))?;
     let pid = child.id();
+    let mut next_cpu_poll = Instant::now() + cpu_poll_interval;
+    let mut cpu_accounting_missing_since = None;
     loop {
         if let Some((status, cpu_usage_usec)) = wait4_process(pid, libc::WNOHANG)? {
+            let timeout = cpu_budget_usec
+                .filter(|limit| cpu_usage_usec >= *limit)
+                .map(|_| ProcessTimeout::Cpu);
             return Ok(ProcessOutput {
                 status,
-                timed_out: false,
+                timeout,
                 cpu_usage_usec,
             });
         }
-        if Instant::now() >= deadline {
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGTERM);
-            }
-            let grace = Instant::now() + Duration::from_secs(10);
-            loop {
-                if let Some((status, cpu_usage_usec)) = wait4_process(pid, libc::WNOHANG)? {
-                    return Ok(ProcessOutput {
-                        status,
-                        timed_out: true,
-                        cpu_usage_usec,
-                    });
+        let now = Instant::now();
+        let (timeout, observed_cpu_usec) = if now >= deadline {
+            (Some(ProcessTimeout::Wall), None)
+        } else if let Some(limit) = cpu_budget_usec.filter(|_| now >= next_cpu_poll) {
+            next_cpu_poll = now + cpu_poll_interval;
+            match process_group_cpu_usage_usec(pid)? {
+                Some(used) => {
+                    cpu_accounting_missing_since = None;
+                    ((used >= limit).then_some(ProcessTimeout::Cpu), Some(used))
                 }
-                if Instant::now() >= grace {
-                    break;
+                None => {
+                    let missing_since = cpu_accounting_missing_since.get_or_insert(now);
+                    if now.duration_since(*missing_since) >= CELL_CPU_ACCOUNTING_GRACE {
+                        let _ = stop_process_group(pid);
+                        return Err(format!(
+                            "cannot measure live CPU for process group {pid}; stopped it rather than silently disabling its CPU budget"
+                        ));
+                    }
+                    (None, None)
                 }
-                thread::sleep(Duration::from_millis(20));
             }
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
-            let (status, cpu_usage_usec) = wait4_process(pid, 0)?
-                .ok_or_else(|| format!("blocking wait4({pid}) returned no child"))?;
+        } else {
+            (None, None)
+        };
+        if let Some(timeout) = timeout {
+            let (status, final_cpu_usage_usec) = stop_process_group(pid)?;
+            let cpu_usage_usec = observed_cpu_usec.map_or(final_cpu_usage_usec, |observed| {
+                observed.max(final_cpu_usage_usec)
+            });
             return Ok(ProcessOutput {
                 status,
-                timed_out: true,
+                timeout: Some(timeout),
                 cpu_usage_usec,
             });
         }
@@ -2463,12 +2769,15 @@ fn execute_process(
 
 fn cell_timeout_attempt(
     spec: &CellRunSpec,
-    cell_timeout_seconds: u64,
+    cpu_timeout_seconds: u64,
+    wall_timeout_seconds: u64,
     duration: Duration,
+    timeout: ProcessTimeout,
 ) -> AttemptResult {
     let index = spec.attempt.as_str();
-    // Preparation consumed the cell's whole budget, so no process exists from
-    // which to recover an exit status or signal.  Record that fact with the
+    // A post-preparation bound was already exhausted before this attempt could
+    // start, so no process exists from which to recover an exit status or signal.
+    // Record that fact with the
     // same typed NotRun report Hermit uses before its first guest run.  A
     // synthetic exit code would make a scheduler decision look like a process
     // result, while a bare FAIL makes the retained attempt unreadable to every
@@ -2479,7 +2788,7 @@ fn cell_timeout_attempt(
     AttemptResult {
         index: index.into(),
         outcome: "ERROR".into(),
-        error_kind: Some("incomplete-verification-evidence".into()),
+        error_kind: Some(timeout.error_kind().into()),
         status: None,
         signal: None,
         timed_out: true,
@@ -2505,7 +2814,8 @@ fn cell_timeout_attempt(
         sabre_path_evidence: None,
         sabre_path_evidence_sha256: None,
         reason: Some(format!(
-            "cell exceeded {cell_timeout_seconds} s before attempt {index} started"
+            "{} before attempt {index} started",
+            timeout.reason(cpu_timeout_seconds, wall_timeout_seconds)
         )),
     }
 }
@@ -2634,20 +2944,28 @@ fn apply_failed_chaos_assertion(
 pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, String> {
     let dir = cell_artifact_dir(context, cell);
     let started = Instant::now();
-    let preparation_deadline = started + Duration::from_secs(cell.timeout_seconds);
+    let timeouts = cell_timeouts(context, cell)?;
+    let preparation_deadline =
+        execution_deadline_after_preparation(started, timeouts.wall_seconds)?;
     let binary_before = fs::read(&context.hermit_bin)
         .ok()
         .map(|bytes| hex_digest(&bytes));
-    let (guest, preparation_cpu_usage_usec) =
-        prepare_test_until(context, cell, &dir, preparation_deadline)?;
-    // The manifest timeout bounds guest execution. In the canonical prebuilt
-    // path, fixture copying is already bounded by the enclosing 600-second
-    // manifest DAG node; a second 15-second copy bound would duplicate that
-    // policy and is exactly what made cold/contended copies consume the guest's
-    // entire allowance. Local non-prebuilt compilation keeps its existing
-    // preparation bound above. In both paths the guest receives a fresh full
-    // allowance once preparation is complete.
-    let deadline = execution_deadline_after_preparation(Instant::now(), cell.timeout_seconds);
+    let (guest, preparation_cpu_usage_usec) = prepare_test_until(
+        context,
+        cell,
+        &dir,
+        preparation_deadline,
+        timeouts.wall_seconds,
+    )?;
+    // Fixture preparation keeps its scaled wall-clock guard above. Post-preparation
+    // execution uses its separately measured bound as an aggregate CPU-second budget
+    // across all attempts/seeds, so time spent descheduled by a busy host cannot
+    // turn a valid run into no_result. The wider wall deadline is retained only
+    // for a wedged process that consumes no CPU and therefore cannot reach the
+    // primary bound.
+    let deadline = execution_deadline_after_preparation(Instant::now(), timeouts.wall_seconds)?;
+    let execution_cpu_budget_usec = timeouts.cpu_seconds.saturating_mul(1_000_000);
+    let mut execution_cpu_usage_usec = 0u64;
     let mode = cell.test.modes.get(&cell.id.mode).unwrap();
     let mut attempts = Vec::new();
     match cell.id.mode.as_str() {
@@ -2667,8 +2985,18 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                     &cell.test.observation,
                     &dir,
                     deadline,
-                    cell.timeout_seconds,
+                    timeouts.cpu_seconds,
+                    timeouts.wall_seconds,
+                    Some(execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec)),
                 )?);
+                execution_cpu_usage_usec = execution_cpu_usage_usec
+                    .checked_add(
+                        attempts
+                            .last()
+                            .and_then(|attempt| attempt.cpu_usage_usec)
+                            .unwrap_or(0),
+                    )
+                    .ok_or_else(|| "cell execution CPU usage overflowed u64".to_string())?;
                 if attempts.last().is_some_and(|attempt| attempt.timed_out) {
                     break;
                 }
@@ -2698,8 +3026,18 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                     &cell.test.observation,
                     &dir,
                     deadline,
-                    cell.timeout_seconds,
+                    timeouts.cpu_seconds,
+                    timeouts.wall_seconds,
+                    Some(execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec)),
                 )?);
+                execution_cpu_usage_usec = execution_cpu_usage_usec
+                    .checked_add(
+                        attempts
+                            .last()
+                            .and_then(|attempt| attempt.cpu_usage_usec)
+                            .unwrap_or(0),
+                    )
+                    .ok_or_else(|| "cell execution CPU usage overflowed u64".to_string())?;
                 if attempts.last().is_some_and(|attempt| attempt.timed_out) {
                     break;
                 }
@@ -2721,8 +3059,18 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                     &cell.test.observation,
                     &dir,
                     deadline,
-                    cell.timeout_seconds,
+                    timeouts.cpu_seconds,
+                    timeouts.wall_seconds,
+                    Some(execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec)),
                 )?);
+                execution_cpu_usage_usec = execution_cpu_usage_usec
+                    .checked_add(
+                        attempts
+                            .last()
+                            .and_then(|attempt| attempt.cpu_usage_usec)
+                            .unwrap_or(0),
+                    )
+                    .ok_or_else(|| "cell execution CPU usage overflowed u64".to_string())?;
                 if attempts.last().is_some_and(|attempt| attempt.timed_out) {
                     break;
                 }
@@ -2743,7 +3091,9 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                 &cell.test.observation,
                 &dir,
                 deadline,
-                cell.timeout_seconds,
+                timeouts.cpu_seconds,
+                timeouts.wall_seconds,
+                Some(execution_cpu_budget_usec),
             )?);
         }
     }
@@ -2902,7 +3252,9 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         result,
         failure_class,
         error_kind,
-        timeout_seconds: cell.timeout_seconds,
+        timeout_seconds: timeouts.wall_seconds,
+        execution_cpu_timeout_seconds: Some(timeouts.cpu_seconds),
+        execution_wall_timeout_seconds: Some(timeouts.wall_seconds),
         duration_ms: Some(started.elapsed().as_millis()),
         cpu_usage_usec,
         runtime: attempts.iter().find_map(|attempt| attempt.runtime.clone()),
@@ -2951,6 +3303,7 @@ pub fn infrastructure_error_result(
     reason: String,
 ) -> CellResult {
     let dir = cell_artifact_dir(context, cell);
+    let timeouts = cell_timeouts(context, cell).ok();
     CellResult {
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
@@ -2977,7 +3330,11 @@ pub fn infrastructure_error_result(
         result: None,
         failure_class: Some(FailureClass::UnderstoodInfrastructureFailure),
         error_kind: Some("infrastructure".into()),
-        timeout_seconds: cell.timeout_seconds,
+        timeout_seconds: timeouts
+            .map(|policy| policy.wall_seconds)
+            .unwrap_or(cell.timeout_seconds),
+        execution_cpu_timeout_seconds: timeouts.map(|policy| policy.cpu_seconds),
+        execution_wall_timeout_seconds: timeouts.map(|policy| policy.wall_seconds),
         duration_ms: None,
         cpu_usage_usec: None,
         runtime: None,
@@ -3020,6 +3377,7 @@ pub fn host_inapplicable_result(
     reason: String,
 ) -> CellResult {
     let dir = cell_artifact_dir(context, cell);
+    let timeouts = cell_timeouts(context, cell).ok();
     CellResult {
         artifact_dir: dir.display().to_string(),
         schema: CELL_RESULT_SCHEMA,
@@ -3044,7 +3402,11 @@ pub fn host_inapplicable_result(
         result: None,
         failure_class: Some(FailureClass::UnderstoodPrerequisiteFailure),
         error_kind: None,
-        timeout_seconds: cell.timeout_seconds,
+        timeout_seconds: timeouts
+            .map(|policy| policy.wall_seconds)
+            .unwrap_or(cell.timeout_seconds),
+        execution_cpu_timeout_seconds: timeouts.map(|policy| policy.cpu_seconds),
+        execution_wall_timeout_seconds: timeouts.map(|policy| policy.wall_seconds),
         duration_ms: None,
         cpu_usage_usec: None,
         runtime: None,
@@ -3261,6 +3623,7 @@ pub fn prepare_result_path(path: &Path) -> Result<(), String> {
 
 pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
     result.require_current_classification()?;
+    result.require_current_timeout_policy()?;
     // A missing prerequisite means the cell did not execute. Keep the typed
     // value for the harness summary and JUnit skip, but do not publish a cell
     // row that downstream readers could count as an observation. The validate
@@ -3668,9 +4031,17 @@ fn execute_observed_until(
     observation: &Observation,
     dir: &Path,
     deadline: Instant,
-    cell_timeout_seconds: u64,
+    cpu_timeout_seconds: u64,
+    wall_timeout_seconds: u64,
+    remaining_cpu_usec: Option<u64>,
 ) -> Result<AttemptResult, String> {
-    let mut attempt = execute_spec_until(spec, deadline, cell_timeout_seconds)?;
+    let mut attempt = execute_spec_until(
+        spec,
+        deadline,
+        cpu_timeout_seconds,
+        wall_timeout_seconds,
+        remaining_cpu_usec,
+    )?;
     attempt.observation_sha256 = Some(observation_hash(observation, &attempt, dir));
     Ok(attempt)
 }
@@ -3851,7 +4222,10 @@ mod tests {
         let id = test.id.clone();
         let set = ManifestSet {
             documents: Vec::new(),
-            tests: BTreeMap::from([(id.clone(), ("fixture".into(), 15, test))]),
+            tests: BTreeMap::from([(
+                id.clone(),
+                ("fixture".into(), 15, DEFAULT_TEST_CPU_TIMEOUT_SECONDS, test),
+            )]),
         };
         assert!(set.knows_test(&id), "a declared test must be known");
         assert!(
@@ -3928,6 +4302,7 @@ mod tests {
             test,
             enabled: true,
             timeout_seconds: 600,
+            cpu_timeout_seconds: 22,
         }
     }
 
@@ -3969,6 +4344,7 @@ mod tests {
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
         }
@@ -4008,7 +4384,10 @@ mod tests {
         let test = recipe(false);
         let set = ManifestSet {
             documents: Vec::new(),
-            tests: BTreeMap::from([(test.id.clone(), ("fixture".into(), 15, test))]),
+            tests: BTreeMap::from([(
+                test.id.clone(),
+                ("fixture".into(), 15, DEFAULT_TEST_CPU_TIMEOUT_SECONDS, test),
+            )]),
         };
         assert!(
             set.select(&Selection {
@@ -4058,6 +4437,7 @@ mod tests {
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
         };
@@ -4074,6 +4454,7 @@ mod tests {
         mode.backends_enabled = vec!["ptrace".into(), "liteinst".into()];
         mode.backends_disabled.remove("liteinst");
         mode.timeout_seconds.insert("ptrace".into(), 30);
+        mode.cpu_timeout_seconds.insert("ptrace".into(), 25);
         mode.slow_reason.insert(
             "ptrace".into(),
             "three complete validation runs measured this cell above the inherited limit".into(),
@@ -4081,7 +4462,10 @@ mod tests {
         validate_mode("fixture/test", "verify", mode, 20).unwrap();
         let set = ManifestSet {
             documents: Vec::new(),
-            tests: BTreeMap::from([(test.id.clone(), ("fixture".into(), 20, test))]),
+            tests: BTreeMap::from([(
+                test.id.clone(),
+                ("fixture".into(), 20, DEFAULT_TEST_CPU_TIMEOUT_SECONDS, test),
+            )]),
         };
         let cells = set
             .select(&Selection {
@@ -4115,7 +4499,11 @@ mod tests {
             &fs::read_to_string(root.join("tests/e2e/manifests/defaults.yaml")).unwrap(),
         )
         .unwrap();
-        assert_eq!(defaults.timeout_seconds, 15);
+        assert_eq!(defaults.timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
+        assert_eq!(
+            defaults.cpu_timeout_seconds,
+            DEFAULT_TEST_CPU_TIMEOUT_SECONDS
+        );
 
         let cells = ManifestSet::load(&root)
             .unwrap()
@@ -4128,7 +4516,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(cells.len(), 1);
-        assert_eq!(cells[0].timeout_seconds, 60);
+        assert_eq!(cells[0].timeout_seconds, 74);
+        assert_eq!(cells[0].cpu_timeout_seconds, 25);
     }
 
     #[test]
@@ -4145,7 +4534,66 @@ mod tests {
             })
             .unwrap();
         assert_eq!(cells.len(), 1);
-        assert_eq!(cells[0].timeout_seconds, 45);
+        assert_eq!(cells[0].timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
+        assert_eq!(
+            cells[0].cpu_timeout_seconds,
+            DEFAULT_TEST_CPU_TIMEOUT_SECONDS
+        );
+    }
+
+    #[test]
+    fn shipped_plan_matches_the_frozen_timeout_calibration_partition() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifests = ManifestSet::load(&root).unwrap();
+        let required = manifests
+            .select(&Selection {
+                population: Some(Population::Required),
+                ..Selection::default()
+            })
+            .unwrap();
+        let enabled = manifests
+            .select(&Selection {
+                population: Some(Population::Enabled),
+                ..Selection::default()
+            })
+            .unwrap();
+        assert_eq!(required.len(), CALIBRATED_CI_CELL_COUNT);
+        assert_eq!(
+            enabled.len() - required.len(),
+            UNSAMPLED_NON_CI_CELL_COUNT,
+            "the frozen census records no samples for exactly the enabled ci:false cells"
+        );
+
+        let observed = required
+            .iter()
+            .filter(|cell| {
+                cell.cpu_timeout_seconds != DEFAULT_TEST_CPU_TIMEOUT_SECONDS
+                    || cell.timeout_seconds != DEFAULT_TEST_WALL_TIMEOUT_SECONDS
+            })
+            .map(|cell| {
+                (
+                    (
+                        cell.id.test.as_str(),
+                        cell.id.mode.as_str(),
+                        cell.id.backend.as_deref().unwrap_or("native"),
+                    ),
+                    (cell.cpu_timeout_seconds, cell.timeout_seconds),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let expected = EXPLICIT_TIMEOUT_CALIBRATIONS
+            .iter()
+            .map(|calibration| {
+                (
+                    (calibration.test, calibration.mode, calibration.backend),
+                    (
+                        calibration.configured_cpu_seconds,
+                        calibration.configured_wall_seconds,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(observed, expected);
     }
 
     #[test]
@@ -4176,42 +4624,42 @@ mod tests {
         mode.timeout_seconds.insert("ptrace".into(), 30);
         assert_eq!(
             validate_mode("fixture/test", "verify", &mode, 15).unwrap_err(),
-            "fixture/test: verify/ptrace timeout_seconds requires slow_reason"
+            "fixture/test: verify timeout_seconds, cpu_timeout_seconds, and slow_reason must name the same backends"
         );
+        mode.cpu_timeout_seconds.insert("ptrace".into(), 25);
         mode.slow_reason
             .insert("ptrace".into(), "measured above the inherited limit".into());
         assert!(validate_mode("fixture/test", "verify", &mode, 15).is_ok());
     }
 
     #[test]
-    fn later_invocations_receive_only_the_remaining_cell_time() {
+    fn execution_wall_backstop_is_wider_than_the_cpu_budget() {
         let started = Instant::now();
-        let deadline = started + Duration::from_secs(15);
-        assert_eq!(remaining_cell_seconds_at(deadline, started), 15);
+        let deadline = execution_deadline_after_preparation(started, 57).unwrap();
         assert_eq!(
-            remaining_cell_seconds_at(deadline, started + Duration::from_millis(4_250)),
-            11
+            remaining_cell_time_at(deadline, started),
+            Duration::from_secs(57)
         );
         assert_eq!(
-            remaining_cell_time_at(deadline, started + Duration::from_secs(15)),
+            remaining_cell_time_at(deadline, started + Duration::from_secs(57)),
             Duration::ZERO
         );
     }
 
     #[test]
-    fn slow_preparation_does_not_reduce_the_guest_timeout() {
+    fn slow_preparation_does_not_reduce_the_execution_backstop() {
         let preparation_started = Instant::now();
         let prepared_at = preparation_started + Duration::from_millis(47_770);
-        let execution_deadline = execution_deadline_after_preparation(prepared_at, 15);
+        let execution_deadline = execution_deadline_after_preparation(prepared_at, 57).unwrap();
         assert_eq!(
-            remaining_cell_seconds_at(execution_deadline, prepared_at),
-            15,
-            "the measured 47.77-second preparation must not consume the 15-second guest bound"
+            remaining_cell_time_at(execution_deadline, prepared_at),
+            Duration::from_secs(57),
+            "preparation must not consume the fresh explicit wall backstop"
         );
     }
 
     #[test]
-    fn an_expired_preparation_budget_emits_typed_not_run_without_a_process() {
+    fn an_expired_wall_backstop_emits_typed_not_run_without_a_process() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-prelaunch-timeout-{}",
             std::process::id()
@@ -4239,15 +4687,12 @@ mod tests {
             fixed_workdir_source: root.join("workdir/1"),
         };
 
-        // This is the exact boundary reached after fixture preparation uses
-        // the whole cell budget: execution is asked to begin with no time
-        // remaining, so no child process can exist or have an exit status.
-        let attempt = execute_spec_until(&spec, Instant::now(), 15).unwrap();
+        // This is the exact boundary reached when the aggregate execution
+        // backstop is gone before a later attempt starts: no child process can
+        // exist or have an exit status.
+        let attempt = execute_spec_until(&spec, Instant::now(), 15, 57, None).unwrap();
         assert_eq!(attempt.outcome, "ERROR");
-        assert_eq!(
-            attempt.error_kind.as_deref(),
-            Some("incomplete-verification-evidence")
-        );
+        assert_eq!(attempt.error_kind.as_deref(), Some("wall-timeout"));
         assert!(attempt.timed_out);
         assert_eq!((attempt.status, attempt.signal), (None, None));
         let report = attempt
@@ -4282,6 +4727,30 @@ mod tests {
     }
 
     #[test]
+    fn an_exhausted_cpu_budget_is_typed_before_the_next_process_starts() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-prelaunch-cpu-timeout-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let spec = bounded_spec(&root, "prelaunch-cpu-timeout", "/bin/false");
+        let attempt = execute_spec_until(
+            &spec,
+            Instant::now() + Duration::from_secs(5),
+            1,
+            5,
+            Some(0),
+        )
+        .unwrap();
+        assert_eq!(attempt.outcome, "ERROR");
+        assert_eq!(attempt.error_kind.as_deref(), Some("cpu-timeout"));
+        assert!(attempt.timed_out);
+        assert_eq!((attempt.status, attempt.signal), (None, None));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn wait4_cpu_usage_moves_with_descendant_work() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-cpu-usage-bracket-{}",
@@ -4297,7 +4766,7 @@ mod tests {
                 &BTreeMap::new(),
                 &root.join(format!("{label}.stdout")),
                 &root.join(format!("{label}.stderr")),
-                Instant::now() + Duration::from_secs(10),
+                (Instant::now() + Duration::from_secs(10), None),
             )
             .unwrap()
         };
@@ -4314,6 +4783,261 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn bounded_process(
+        root: &Path,
+        label: &str,
+        script: &str,
+        wall: Duration,
+        cpu_budget_usec: u64,
+    ) -> ProcessOutput {
+        execute_process(
+            root,
+            "/bin/sh",
+            &["-c".into(), script.into()],
+            &BTreeMap::new(),
+            &root.join(format!("{label}.stdout")),
+            &root.join(format!("{label}.stderr")),
+            (Instant::now() + wall, Some(cpu_budget_usec)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn live_cpu_accounting_excludes_an_unrelated_process_group() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-owned-cpu-accounting-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("3");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        // `stop_process_group` below owns the matching wait4; discard only the
+        // std handle so the test exercises the production reaper.
+        drop(child);
+        let unrelated = bounded_process(
+            &root,
+            "unrelated",
+            "while :; do :; done",
+            Duration::from_millis(650),
+            5_000_000,
+        );
+        assert_eq!(unrelated.timeout, Some(ProcessTimeout::Wall));
+        let used = process_group_cpu_usage_usec(pid)
+            .unwrap()
+            .expect("the launched sleeper must remain measurable");
+        assert!(
+            used < 100_000,
+            "an idle process group unexpectedly included unrelated CPU: {used} usec"
+        );
+        stop_process_group(pid).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn bounded_spec(root: &Path, label: &str, script: &str) -> CellRunSpec {
+        CellRunSpec {
+            id: CellId {
+                test: format!("fixture/{label}"),
+                mode: "naked".into(),
+                backend: None,
+            },
+            lane: "portable".into(),
+            category: "fixture".into(),
+            cwd: root.to_owned(),
+            env: BTreeMap::new(),
+            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            guest_argv: vec![script.into()],
+            timeout_seconds: 1,
+            verdict_path: None,
+            verification_log_dir: None,
+            sabre_path_evidence: None,
+            cell_dir: root.join(label),
+            attempt: "1".into(),
+            fixed_workdir_source: root.join(label).join("workdir/1"),
+        }
+    }
+
+    #[test]
+    fn cpu_burner_is_stopped_by_the_cpu_budget() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-live-cpu-budget-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let spec = bounded_spec(&root, "burner", "while :; do :; done");
+        let attempt = execute_spec_until(
+            &spec,
+            Instant::now() + Duration::from_secs(5),
+            1,
+            5,
+            Some(1_000_000),
+        )
+        .unwrap();
+        assert!(attempt.timed_out);
+        assert_eq!(attempt.error_kind.as_deref(), Some("cpu-timeout"));
+        assert_eq!(attempt.reason.as_deref(), Some("cell exceeded 1 CPU s"));
+        assert!(attempt.cpu_usage_usec.unwrap() >= 1_000_000);
+        assert_eq!(
+            serde_json::to_value(&attempt).unwrap()["error_kind"],
+            "cpu-timeout",
+            "the retained evidence must distinguish a CPU timeout from wall timeout"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completed_process_is_checked_against_cpu_budget_between_polls() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-completed-cpu-budget-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let output = execute_process_with_cpu_poll_interval(
+            &root,
+            "/bin/sh",
+            &[
+                "-c".into(),
+                "head -c 8388608 /dev/zero | sha256sum >/dev/null".into(),
+            ],
+            &BTreeMap::new(),
+            &root.join("completed.stdout"),
+            &root.join("completed.stderr"),
+            ProcessLimits {
+                deadline: Instant::now() + Duration::from_secs(5),
+                cpu_budget_usec: Some(1),
+                cpu_poll_interval: Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.timeout, Some(ProcessTimeout::Cpu));
+        assert!(output.cpu_usage_usec >= 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sleeping_process_is_stopped_by_the_wall_backstop() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-live-wall-budget-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let spec = bounded_spec(&root, "sleeper", "sleep 5");
+        let attempt = execute_spec_until(
+            &spec,
+            Instant::now() + Duration::from_secs(1),
+            1,
+            1,
+            Some(5_000_000),
+        )
+        .unwrap();
+        assert!(attempt.timed_out);
+        assert_eq!(attempt.error_kind.as_deref(), Some("wall-timeout"));
+        assert_eq!(
+            attempt.reason.as_deref(),
+            Some("cell exceeded 1 wall s backstop (1 s CPU budget)")
+        );
+        assert!(attempt.cpu_usage_usec.unwrap() < 5_000_000);
+        assert_eq!(
+            serde_json::to_value(&attempt).unwrap()["error_kind"],
+            "wall-timeout",
+            "the retained evidence must distinguish a wall timeout from CPU timeout"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn descheduled_process_may_exceed_the_old_wall_bound_and_pass() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-descheduled-process-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let started = Instant::now();
+        let output = bounded_process(
+            &root,
+            "stopped",
+            "(sleep 0.3; kill -CONT $$) & kill -STOP $$; printf resumed",
+            Duration::from_secs(2),
+            200_000,
+        );
+        assert!(output.status.success());
+        assert_eq!(output.timeout, None);
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "the process did not remain descheduled long enough to exercise wall-vs-CPU"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_cpu_budget_counts_descendant_work() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-descendant-cpu-budget-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let output = bounded_process(
+            &root,
+            "descendant",
+            "sh -c 'while :; do :; done' & wait",
+            Duration::from_secs(5),
+            100_000,
+        );
+        assert_eq!(output.timeout, Some(ProcessTimeout::Cpu));
+        assert!(output.cpu_usage_usec >= 100_000);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_processes_share_one_aggregate_cpu_budget() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-aggregate-cpu-budget-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let limit = 300_000u64;
+        let first = bounded_process(
+            &root,
+            "first",
+            "head -c 8388608 /dev/zero | sha256sum >/dev/null",
+            Duration::from_secs(5),
+            limit,
+        );
+        assert!(first.status.success());
+        assert_eq!(first.timeout, None);
+        assert!(first.cpu_usage_usec < limit);
+        let second = bounded_process(
+            &root,
+            "second",
+            "while :; do :; done",
+            Duration::from_secs(5),
+            limit - first.cpu_usage_usec,
+        );
+        assert_eq!(second.timeout, Some(ProcessTimeout::Cpu));
+        assert!(
+            first.cpu_usage_usec.saturating_add(second.cpu_usage_usec) >= limit,
+            "second process did not consume the remainder of the shared CPU budget"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn cpu_usage_aggregation_refuses_missing_or_overflowing_measurements() {
         assert_eq!(checked_add_cpu_usage(Some(2), Some(3)), Some(5));
@@ -4323,7 +5047,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_invocations_share_one_outer_cell_deadline() {
+    fn sleeping_repeated_invocations_do_not_consume_the_cpu_budget() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-cell-deadline-{}",
             std::process::id()
@@ -4332,10 +5056,15 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
 
         let mut test = recipe(true);
+        let counter = root.join("counter");
         test.direct = Some(DirectCommand::Argv(vec![
             "/bin/sh".into(),
             "-c".into(),
-            "sleep 0.7; printf complete".into(),
+            format!(
+                "count=$(cat '{}' 2>/dev/null || printf 0); count=$((count + 1)); printf '%s' \"$count\" > '{}'; sleep 0.7; printf '%s\\n' \"$count\"",
+                counter.display(),
+                counter.display()
+            ),
         ]));
         let mut mode = test.modes.remove("verify").unwrap();
         mode.runs = Some(3);
@@ -4349,7 +5078,8 @@ mod tests {
             },
             test,
             enabled: true,
-            timeout_seconds: 1,
+            timeout_seconds: 3,
+            cpu_timeout_seconds: 1,
         };
         let context = RunContext {
             root: root.clone(),
@@ -4369,26 +5099,22 @@ mod tests {
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
         };
 
         let result = run_cell(&context, &cell).unwrap();
-        assert_eq!(result.attempts.len(), 2);
-        assert!(!result.attempts[0].timed_out);
-        assert!(result.attempts[1].timed_out);
-        assert_eq!(result.result, Some(ObservedResult::Timeout));
-        assert_eq!(result.failure_class, Some(FailureClass::NoResult));
-        assert_eq!(
-            result.attempts[1].reason.as_deref(),
-            Some("cell exceeded 1 s")
-        );
+        assert_eq!(result.attempts.len(), 3);
+        assert!(result.attempts.iter().all(|attempt| !attempt.timed_out));
+        assert_eq!(result.result, Some(ObservedResult::Pass));
+        assert_eq!(result.failure_class, None);
         let duration_ms = result
             .duration_ms
             .expect("a cell that executed must report measured wall time");
         assert!(
-            duration_ms < 2_000,
-            "three independent one-second bounds would take longer: {duration_ms}ms"
+            (2_000..3_000).contains(&duration_ms),
+            "three sleeping attempts should pass despite exceeding the old one-second wall cap: {duration_ms}ms"
         );
         let attempt_cpu_usage_usec = result.attempts.iter().try_fold(0u64, |total, attempt| {
             checked_add_cpu_usage(Some(total), attempt.cpu_usage_usec)
@@ -4420,6 +5146,7 @@ mod tests {
             test,
             enabled: true,
             timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
         };
         let context = RunContext {
             root: root.clone(),
@@ -4439,6 +5166,7 @@ mod tests {
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
         };
@@ -4513,6 +5241,7 @@ mod tests {
             test,
             enabled: true,
             timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
         };
         let mut context = RunContext {
             root: root.clone(),
@@ -4532,6 +5261,7 @@ mod tests {
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
         };
@@ -4669,7 +5399,10 @@ mod tests {
         validate_mode("fixture/test", "verify", mode, 15).unwrap();
         let set = ManifestSet {
             documents: Vec::new(),
-            tests: BTreeMap::from([(test.id.clone(), ("fixture".into(), 15, test))]),
+            tests: BTreeMap::from([(
+                test.id.clone(),
+                ("fixture".into(), 15, DEFAULT_TEST_CPU_TIMEOUT_SECONDS, test),
+            )]),
         };
         let required = set
             .select(&Selection {
@@ -4780,6 +5513,7 @@ backends_disabled:
             test,
             enabled: true,
             timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -4799,6 +5533,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: true,
             record_verify_strict: true,
+            timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
         };
@@ -4834,6 +5569,7 @@ backends_disabled:
             test,
             enabled: true,
             timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -4853,6 +5589,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: true,
             record_verify_strict: true,
+            timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
             isolated_workdir: Some(PathBuf::from("/test")),
         };
@@ -4893,6 +5630,7 @@ backends_disabled:
             test: replay_test,
             enabled: true,
             timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
         };
         let replay = build_spec(
             &context,
@@ -4934,6 +5672,7 @@ backends_disabled:
             test: custom_test,
             enabled: true,
             timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
         };
         let custom = build_spec(
             &context,
@@ -4971,6 +5710,7 @@ backends_disabled:
             test: naked_test,
             enabled: true,
             timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
         };
         let naked_error = build_spec(
             &context,
@@ -5082,6 +5822,7 @@ backends_disabled:
             test,
             enabled: true,
             timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -5101,6 +5842,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: true,
             record_verify_strict: true,
+            timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
         };
@@ -5169,6 +5911,7 @@ backends_disabled:
             test,
             enabled: true,
             timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
         };
         let context = RunContext {
             root: PathBuf::from("/repo"),
@@ -5188,6 +5931,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: true,
             record_verify_strict: true,
+            timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
             isolated_workdir: None,
         };
@@ -5238,6 +5982,7 @@ backends_disabled:
             test: replay_test,
             enabled: true,
             timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
         };
         let replay = build_spec(
             &context,
@@ -5281,6 +6026,7 @@ backends_disabled:
             test: custom_test,
             enabled: true,
             timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
         };
         let custom = build_spec(
             &context,
@@ -5502,7 +6248,9 @@ backends_disabled:
             result: Some(ObservedResult::Pass),
             failure_class: None,
             error_kind: None,
-            timeout_seconds: 1,
+            timeout_seconds: 3,
+            execution_cpu_timeout_seconds: Some(1),
+            execution_wall_timeout_seconds: Some(3),
             duration_ms: Some(1),
             cpu_usage_usec: Some(1),
             runtime: None,
@@ -5608,6 +6356,47 @@ backends_disabled:
         assert_eq!(decoded.run_index, Some(4));
     }
 
+    #[test]
+    fn schema4_keeps_its_wall_field_and_adds_explicit_execution_bounds() {
+        let row = cell_result_that_located_nothing();
+        let mut rendered = serde_json::to_value(&row).expect("cell result serializes");
+        assert_eq!(rendered["timeout_seconds"], 3);
+        assert_eq!(rendered["execution_cpu_timeout_seconds"], 1);
+        assert_eq!(rendered["execution_wall_timeout_seconds"], 3);
+        row.require_current_timeout_policy().unwrap();
+
+        let mut half_present = row.clone();
+        half_present.execution_wall_timeout_seconds = None;
+        assert!(half_present.validate_timeout_policy().is_err());
+        let publication = std::env::temp_dir().join(format!(
+            "hermit-runner-timeout-policy-publication-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&publication);
+        assert!(append_result(&publication, &half_present).is_err());
+        assert!(
+            !publication.exists(),
+            "a malformed current timeout policy reached the results file"
+        );
+        let mut wrong_cpu = row.clone();
+        wrong_cpu.execution_cpu_timeout_seconds = Some(3);
+        assert!(wrong_cpu.validate_timeout_policy().is_err());
+        let mut wrong_wall = row.clone();
+        wrong_wall.execution_wall_timeout_seconds = Some(2);
+        assert!(wrong_wall.validate_timeout_policy().is_err());
+
+        let object = rendered.as_object_mut().unwrap();
+        object.remove("execution_cpu_timeout_seconds");
+        object.remove("execution_wall_timeout_seconds");
+        let retained: CellResult = serde_json::from_value(rendered)
+            .expect("a schema-4 row written before the additive fields remains readable");
+        assert_eq!(retained.timeout_seconds, 3);
+        assert_eq!(retained.execution_cpu_timeout_seconds, None);
+        assert_eq!(retained.execution_wall_timeout_seconds, None);
+        retained.validate_timeout_policy().unwrap();
+        assert!(retained.require_current_timeout_policy().is_err());
+    }
+
     fn attempt_with_sabre_evidence(evidence: &str) -> AttemptResult {
         AttemptResult {
             first_divergent_scheduler_turn: None,
@@ -5686,8 +6475,14 @@ backends_disabled:
             error_with_product_result
                 .require_current_classification()
                 .unwrap_err(),
-            "ERROR result must not carry a product observation, got Some(CrashError)"
+            "ERROR result must carry a non-product observation/classification, got (Some(CrashError), Some(ProductFailure))"
         );
+
+        let mut timeout = cell_result_that_located_nothing();
+        timeout.outcome = "ERROR".into();
+        timeout.result = Some(ObservedResult::Timeout);
+        timeout.failure_class = Some(FailureClass::NoResult);
+        timeout.require_current_classification().unwrap();
     }
 
     #[test]
@@ -6430,6 +7225,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
         };
@@ -6485,6 +7281,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
         };
@@ -6499,6 +7296,7 @@ backends_disabled:
             test,
             enabled: true,
             timeout_seconds: 1,
+            cpu_timeout_seconds: 1,
         };
 
         let error = run_preparation(
@@ -6576,6 +7374,7 @@ backends_disabled:
             test,
             enabled: true,
             timeout_seconds: 2,
+            cpu_timeout_seconds: 1,
         };
         let context = run_context(&root);
 
@@ -6617,6 +7416,7 @@ backends_disabled:
             test,
             enabled: true,
             timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
         };
         let context = RunContext {
             root: root.clone(),
@@ -6636,6 +7436,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
         };

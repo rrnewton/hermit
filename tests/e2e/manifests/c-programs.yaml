@@ -1371,9 +1371,11 @@ test:
       chaos:
         ci: true
         timeout_seconds:
-          ptrace: 40
+          ptrace: 105
+        cpu_timeout_seconds:
+          ptrace: 46
         slow_reason:
-          ptrace: Retained validation measured 24 passes at 25.239-33.633 seconds and 10 deadline-bound nonpasses at 30.426-30.964 seconds.
+          ptrace: Across 59 retained typed passing rows, nearest-rank p90 was 34.964 wall seconds and 30.251855 CPU seconds; 4x wall exceeds 120, so ceil(3x wall)=105 and ceil(1.5x CPU)=46.
         # The chaos argument preserves the default full floating-point result
         # used by strict verification, but prints only its low three bits here.
         # That gives an exact eight-class ceiling: the output can express at

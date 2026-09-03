@@ -26,6 +26,8 @@ use hermit_manifest_plan::ci_selection::CiSelectionSpec;
 use hermit_manifest_plan::runner::REQUIRES_VOCABULARY;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::validate_mode_workdir;
+#[cfg(test)]
+use hermit_manifest_plan::timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS;
 use hermit_manifest_plan::timeouts::DEFAULTS_FILE;
 use hermit_manifest_plan::timeouts::MANIFEST_SCHEMA;
 use hermit_manifest_plan::timeouts::MAX_TIMEOUT_SECONDS;
@@ -98,6 +100,7 @@ struct PlanRow {
     /// non-empty reason for every disabled backend, so this is never invented.
     not_applicable_reason: Option<String>,
     timeout_seconds: i64,
+    cpu_timeout_seconds: i64,
     attempts: Option<i64>,
 }
 
@@ -168,7 +171,12 @@ fn main() {
     });
     ensure_keys(
         &defaults,
-        &["schema", "timeout_seconds", "nextest"],
+        &[
+            "schema",
+            "timeout_seconds",
+            "cpu_timeout_seconds",
+            "nextest",
+        ],
         DEFAULTS_FILE,
     );
     if defaults.get("schema").and_then(Value::as_integer) != Some(MANIFEST_SCHEMA as i64) {
@@ -177,6 +185,10 @@ fn main() {
     let global_timeout_seconds = required_timeout_seconds(
         defaults.get("timeout_seconds"),
         "global default.timeout_seconds",
+    );
+    let global_cpu_timeout_seconds = required_timeout_seconds(
+        defaults.get("cpu_timeout_seconds"),
+        "global default.cpu_timeout_seconds",
     );
     if let Some(nextest) = defaults.get("nextest") {
         let entries = nextest
@@ -285,6 +297,7 @@ fn main() {
                 test,
                 bucket,
                 inherited_timeout_seconds,
+                global_cpu_timeout_seconds,
                 &location,
                 &repo_root,
                 &mut seen_ids,
@@ -359,6 +372,7 @@ fn main() {
                         "enabled": row.enabled,
                         "not_applicable_reason": row.not_applicable_reason,
                         "timeout_seconds": row.timeout_seconds,
+                        "cpu_timeout_seconds": row.cpu_timeout_seconds,
                         "attempts": row.attempts,
                     })
                 })
@@ -754,15 +768,14 @@ fn cell_timeout_overrides(
     id: &str,
     mode: &str,
     enabled: &BTreeSet<String>,
-    inherited_timeout_seconds: i64,
+    _inherited_timeout_seconds: i64,
+    field: &str,
 ) -> std::collections::BTreeMap<String, i64> {
     let timeouts = spec
-        .get("timeout_seconds")
+        .get(field)
         .map(|value| {
             value.as_table().unwrap_or_else(|| {
-                die(format!(
-                    "{id}.modes.{mode}.timeout_seconds must be a backend table"
-                ))
+                die(format!("{id}.modes.{mode}.{field} must be a backend table"))
             })
         })
         .cloned()
@@ -778,37 +791,33 @@ fn cell_timeout_overrides(
         })
         .cloned()
         .unwrap_or_default();
-    let timeout_keys = timeouts.keys().cloned().collect::<BTreeSet<_>>();
-    let reason_keys = reasons.keys().cloned().collect::<BTreeSet<_>>();
-    if timeout_keys != reason_keys {
-        die(format!(
-            "{id}.modes.{mode}: timeout_seconds and slow_reason must name the same backends"
-        ));
-    }
     let mut resolved = std::collections::BTreeMap::new();
     for (backend, value) in timeouts {
         if !enabled.contains(&backend) {
             die(format!(
-                "{id}.modes.{mode}.timeout_seconds names disabled backend `{backend}`"
+                "{id}.modes.{mode}.{field} names disabled backend `{backend}`"
             ));
         }
         let timeout = required_timeout_seconds(
             Some(&value),
-            &format!("{id}.modes.{mode}.timeout_seconds.{backend}"),
+            &format!("{id}.modes.{mode}.{field}.{backend}"),
         );
-        let reason = reasons[&backend].as_str().unwrap_or_else(|| {
-            die(format!(
-                "{id}.modes.{mode}.slow_reason.{backend} must be a string"
-            ))
-        });
+        let reason = reasons
+            .get(&backend)
+            .unwrap_or_else(|| {
+                die(format!(
+                    "{id}.modes.{mode}.{field}.{backend} requires slow_reason"
+                ))
+            })
+            .as_str()
+            .unwrap_or_else(|| {
+                die(format!(
+                    "{id}.modes.{mode}.slow_reason.{backend} must be a string"
+                ))
+            });
         if reason.trim().is_empty() {
             die(format!(
                 "{id}.modes.{mode}.slow_reason.{backend} must be non-empty"
-            ));
-        }
-        if timeout == inherited_timeout_seconds {
-            die(format!(
-                "{id}.modes.{mode}.timeout_seconds.{backend} redundantly repeats its inherited value"
             ));
         }
         resolved.insert(backend, timeout);
@@ -826,6 +835,7 @@ fn validate_and_expand(
     test: &Value,
     bucket: &str,
     inherited_timeout_seconds: i64,
+    inherited_cpu_timeout_seconds: i64,
     location: &str,
     repo_root: &Path,
     seen_ids: &mut BTreeSet<String>,
@@ -950,12 +960,12 @@ fn validate_and_expand(
 
     let row_start = rows.len();
     for mode in MODES {
-        validate_mode(
+        validate_mode_with_cpu(
             &id,
             bucket,
             lane,
             mode,
-            inherited_timeout_seconds,
+            (inherited_timeout_seconds, inherited_cpu_timeout_seconds),
             modes.get(mode).unwrap(),
             rows,
         );
@@ -997,6 +1007,7 @@ fn validate_observation(test: &Value, id: &str) {
     }
 }
 
+#[cfg(test)]
 fn validate_mode(
     id: &str,
     bucket: &str,
@@ -1006,6 +1017,30 @@ fn validate_mode(
     spec: &Value,
     rows: &mut Vec<PlanRow>,
 ) {
+    validate_mode_with_cpu(
+        id,
+        bucket,
+        lane,
+        mode,
+        (
+            inherited_timeout_seconds,
+            DEFAULT_TEST_CPU_TIMEOUT_SECONDS as i64,
+        ),
+        spec,
+        rows,
+    );
+}
+
+fn validate_mode_with_cpu(
+    id: &str,
+    bucket: &str,
+    lane: &str,
+    mode: &str,
+    inherited_timeouts: (i64, i64),
+    spec: &Value,
+    rows: &mut Vec<PlanRow>,
+) {
+    let (inherited_timeout_seconds, inherited_cpu_timeout_seconds) = inherited_timeouts;
     let spec_value = spec;
     let spec = spec_value
         .as_table()
@@ -1018,6 +1053,7 @@ fn validate_mode(
         "guest_args",
         "workdir",
         "timeout_seconds",
+        "cpu_timeout_seconds",
         "slow_reason",
     ];
     match mode {
@@ -1126,7 +1162,40 @@ fn validate_mode(
         mode,
         &enabled_set,
         inherited_timeout_seconds,
+        "timeout_seconds",
     );
+    let cpu_timeout_overrides = cell_timeout_overrides(
+        spec_value,
+        id,
+        mode,
+        &enabled_set,
+        inherited_cpu_timeout_seconds,
+        "cpu_timeout_seconds",
+    );
+    let wall_override_keys = timeout_overrides.keys().cloned().collect::<BTreeSet<_>>();
+    let cpu_override_keys = cpu_timeout_overrides
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let reason_keys = spec
+        .get("slow_reason")
+        .and_then(Value::as_table)
+        .map(|reasons| reasons.keys().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
+    if wall_override_keys != cpu_override_keys || wall_override_keys != reason_keys {
+        die(format!(
+            "{id}.modes.{mode}: timeout_seconds, cpu_timeout_seconds, and slow_reason must name the same backends"
+        ));
+    }
+    for backend in &wall_override_keys {
+        if timeout_overrides[backend] == inherited_timeout_seconds
+            && cpu_timeout_overrides[backend] == inherited_cpu_timeout_seconds
+        {
+            die(format!(
+                "{id}.modes.{mode}.{backend} timeout pair redundantly repeats its inherited values"
+            ));
+        }
+    }
     validate_mode_workdir(id, mode, workdir, &enabled).unwrap_or_else(|error| die(error));
     let disabled = spec
         .get("backends_disabled")
@@ -1351,6 +1420,10 @@ fn validate_mode(
             .get(&backend)
             .copied()
             .unwrap_or(inherited_timeout_seconds);
+        let cpu_timeout_seconds = cpu_timeout_overrides
+            .get(&backend)
+            .copied()
+            .unwrap_or(inherited_cpu_timeout_seconds);
         let selected = ci.selected(&backend);
         let ci_disabled_reason = ci.reason(&backend).cloned();
         rows.push(PlanRow {
@@ -1364,6 +1437,7 @@ fn validate_mode(
             enabled: true,
             not_applicable_reason: None,
             timeout_seconds,
+            cpu_timeout_seconds,
             attempts,
         });
     }
@@ -1382,6 +1456,7 @@ fn validate_mode(
             enabled: false,
             not_applicable_reason,
             timeout_seconds: inherited_timeout_seconds,
+            cpu_timeout_seconds: inherited_cpu_timeout_seconds,
             attempts,
         });
     }
@@ -1765,6 +1840,7 @@ liteinst = "unsupported"
 ci = true
 backends_enabled = ["ptrace"]
 timeout_seconds = { ptrace = 30 }
+cpu_timeout_seconds = { ptrace = 25 }
 slow_reason = { ptrace = "three measured runs exceeded the inherited limit" }
 
 [backends_disabled]
@@ -1786,6 +1862,7 @@ liteinst = "unsupported"
         );
         let ptrace = rows.iter().find(|row| row.backend == "ptrace").unwrap();
         assert_eq!(ptrace.timeout_seconds, 30);
+        assert_eq!(ptrace.cpu_timeout_seconds, 25);
         assert!(
             rows.iter()
                 .filter(|row| row.backend != "ptrace")
@@ -1794,13 +1871,14 @@ liteinst = "unsupported"
     }
 
     #[test]
-    #[should_panic(expected = "timeout_seconds and slow_reason must name the same backends")]
+    #[should_panic(expected = "timeout_seconds.ptrace requires slow_reason")]
     fn rejects_a_cell_timeout_without_its_named_reason() {
         let spec = parse_mode(
             r#"
 ci = true
 backends_enabled = ["ptrace"]
 timeout_seconds = { ptrace = 30 }
+cpu_timeout_seconds = { ptrace = 25 }
 
 [backends_disabled]
 dbt = "unsupported"

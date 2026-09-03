@@ -5,6 +5,20 @@ set -uo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 readonly RESULT_WRITER="$SCRIPT_DIR/nextest-test-results.rs"
+readonly TIMEOUT_CONFIG_WRITER="$SCRIPT_DIR/nextest-timeout-config.rs"
+
+nextest_config=
+
+function cleanup_nextest_config {
+    if [[ -n $nextest_config ]]; then
+        rm -f -- "$nextest_config"
+        nextest_config=
+    fi
+}
+
+function configured_wall_timeout_multiplier {
+    printf '%s\n' "${HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER-1}"
+}
 
 function emit_libtest_count {
     local events=$1 status=${2:-0} path=${DAGRUN_TEST_COUNTS_PATH:--}
@@ -19,17 +33,27 @@ function emit_libtest_count {
 }
 
 function run_nextest {
-    local events_log=$1 status count_status=0
-    shift
+    local events_log=$1 wall_multiplier=$2 status count_status=0
+    shift 2
+
+    cleanup_nextest_config
+    nextest_config=$(mktemp "${TMPDIR:-/tmp}/hermit-nextest-config.XXXXXX.toml")
+    if ! "$TIMEOUT_CONFIG_WRITER" \
+        "$SCRIPT_DIR/../.config/nextest.toml" "$wall_multiplier" "$nextest_config"; then
+        cleanup_nextest_config
+        return 2
+    fi
 
     set +e
     # nextest's stderr remains presentation. The versioned stdout event stream
     # is the only input to the aggregate count and per-test result adapter.
-    NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --color never \
+    NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest \
+        --config-file "$nextest_config" run --color never \
         --message-format libtest-json-plus --message-format-version 0.1 \
         "$@" >"$events_log"
     status=$?
     set -e
+    cleanup_nextest_config
 
     emit_libtest_count "$events_log" "$status" || count_status=$?
     if ((status != 0)); then
@@ -39,7 +63,7 @@ function run_nextest {
 }
 
 function self_test {
-    local scratch got expected status=0
+    local scratch got expected status=0 wall_multiplier
     scratch=$(mktemp -d)
     trap 'rm -rf "$scratch"' RETURN
 
@@ -108,6 +132,11 @@ PYEOF
     [[ $status == 2 ]] || return 1
     grep -q 'NEXTEST_EXPECTED_EXECUTED' "$scratch/invalid-count.stderr" || return 1
 
+    [[ $(configured_wall_timeout_multiplier) == 1 ]] || return 1
+    wall_multiplier=$(HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER=1.5 \
+        configured_wall_timeout_multiplier)
+    [[ $wall_multiplier == 1.5 ]] || return 1
+
     printf '%s\n' \
         '{"type":"suite","event":"started","test_count":1,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
         '{"type":"test","event":"started","name":"suite::suite$fails"}' \
@@ -130,6 +159,8 @@ PYEOF
     # Exercise the real wrapper path, not only its parser: a failed nextest run
     # must emit the count and still return nextest's original nonzero status.
     function cargo {
+        [[ $1 == nextest && $2 == --config-file && -f $3 && $4 == run ]] || return 99
+        cp -- "$3" "$scratch/scaled-nextest.toml"
         printf '%s\n' \
             '{"type":"suite","event":"started","test_count":0,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
             '{"type":"suite","event":"failed","passed":0,"failed":0,"ignored":0,"measured":0,"filtered_out":0,"exec_time":0.0,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}'
@@ -137,8 +168,8 @@ PYEOF
         return 100
     }
     set +e
-    got=$(DAGRUN_TEST_COUNTS_PATH="$scratch/wrapper-counts.json" \
-        run_nextest "$scratch/wrapper-events")
+    got=$(TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/wrapper-counts.json" \
+        run_nextest "$scratch/wrapper-events" "$wall_multiplier")
     status=$?
     set -e
     unset -f cargo
@@ -147,6 +178,11 @@ PYEOF
     [[ $got != *'test result: ok.'* ]] || return 1
     [[ $(<"$scratch/wrapper-counts.json") == \
         '{"executed_tests":0,"filtered_tests":0,"results":[],"schema":2}' ]] || return 1
+    grep -q 'period = "86s"' "$scratch/scaled-nextest.toml" || return 1
+    if compgen -G "$scratch/hermit-nextest-config.*.toml" >/dev/null; then
+        printf 'run-nextest-counted: temporary nextest config leaked\n' >&2
+        return 1
+    fi
 
     printf '%s\n' \
         '{"type":"test","event":"future","name":"suite::suite$case"}' \
@@ -168,5 +204,5 @@ if [[ ${1:-} == --self-test ]]; then
 fi
 
 events_log=$(mktemp)
-trap 'rm -f "$events_log"' EXIT
-run_nextest "$events_log" "$@"
+trap 'cleanup_nextest_config; rm -f "$events_log"' EXIT
+run_nextest "$events_log" "$(configured_wall_timeout_multiplier)" "$@"

@@ -880,6 +880,21 @@ struct PressureInvocation {
     attempts: Vec<ObservedAttemptInvocation>,
 }
 
+fn is_prelaunch_timeout_disposition(
+    timed_out: bool,
+    status: Option<i64>,
+    signal: Option<i64>,
+    error_kind: Option<&str>,
+) -> bool {
+    timed_out
+        && status.is_none()
+        && signal.is_none()
+        && matches!(
+            error_kind,
+            Some("incomplete-verification-evidence" | "cpu-timeout" | "wall-timeout")
+        )
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ResultRow {
     schema: u64,
@@ -905,6 +920,10 @@ struct ResultRow {
     error_kind: Option<String>,
     #[serde(default)]
     timeout_seconds: u64,
+    #[serde(default)]
+    execution_cpu_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    execution_wall_timeout_seconds: Option<u64>,
     log_level: Option<String>,
     effective_args: Vec<String>,
     argv: Vec<String>,
@@ -961,6 +980,32 @@ fn default_attempt() -> u64 {
 }
 
 impl ResultRow {
+    fn validate_timeout_policy(&self) -> Result<(), String> {
+        match (
+            self.execution_cpu_timeout_seconds,
+            self.execution_wall_timeout_seconds,
+        ) {
+            (None, None) => Ok(()),
+            (Some(cpu), Some(wall)) if cpu > 0 && wall == self.timeout_seconds && wall > cpu => {
+                Ok(())
+            }
+            (cpu, wall) => Err(format!(
+                "timeout policy disagrees: timeout_seconds={} execution_cpu_timeout_seconds={cpu:?} execution_wall_timeout_seconds={wall:?}",
+                self.timeout_seconds
+            )),
+        }
+    }
+
+    fn require_current_timeout_policy(&self) -> Result<(), String> {
+        self.validate_timeout_policy()?;
+        if self.execution_cpu_timeout_seconds.is_none()
+            || self.execution_wall_timeout_seconds.is_none()
+        {
+            return Err("current result omitted explicit execution timeout bounds".into());
+        }
+        Ok(())
+    }
+
     fn id(&self) -> Option<CellId> {
         let backend = match self.backend.as_deref() {
             Some(backend) => backend.to_string(),
@@ -1791,11 +1836,12 @@ impl ResultRow {
                             })?;
                         let disposition = matches!((status, signal), (Some(status), None) if status != 0)
                             || matches!((status, signal), (None, Some(_)));
-                        let no_process_timeout = timed_out
-                            && status.is_none()
-                            && signal.is_none()
-                            && attempt.get("error_kind").and_then(JsonValue::as_str)
-                                == Some("incomplete-verification-evidence");
+                        let no_process_timeout = is_prelaunch_timeout_disposition(
+                            timed_out,
+                            status,
+                            signal,
+                            attempt.get("error_kind").and_then(JsonValue::as_str),
+                        );
                         if attempt.get("outcome").and_then(JsonValue::as_str) != Some("ERROR")
                             || attempt
                                 .get("error_kind")
@@ -5994,6 +6040,13 @@ fn read_result_candidates(
             }
             let mut row: ResultRow = serde_json::from_str(line)
                 .map_err(|e| format!("invalid JSON at {}:{}: {e}", path.display(), index + 1))?;
+            row.require_current_timeout_policy().map_err(|error| {
+                format!(
+                    "invalid timeout policy at {}:{}: {error}",
+                    path.display(),
+                    index + 1
+                )
+            })?;
             // Before ANY use, including the provenance checks below, so every
             // downstream consumer and the tracked file agree on one spelling.
             normalise_recorded_root(&mut row);
@@ -6107,6 +6160,13 @@ fn read_retained_results(
             let mut row: ResultRow = serde_json::from_value(raw).map_err(|e| {
                 format!(
                     "invalid schema-{CELL_RESULT_SCHEMA} row at {}:{}: {e}",
+                    path.display(),
+                    index + 1
+                )
+            })?;
+            row.validate_timeout_policy().map_err(|error| {
+                format!(
+                    "invalid timeout policy at {}:{}: {error}",
                     path.display(),
                     index + 1
                 )
@@ -7118,6 +7178,30 @@ fn recorded_shell_quote(value: &str) -> String {
 }
 
 fn self_test() -> Result<(), String> {
+    for error_kind in [
+        "incomplete-verification-evidence",
+        "cpu-timeout",
+        "wall-timeout",
+    ] {
+        if !is_prelaunch_timeout_disposition(true, None, None, Some(error_kind)) {
+            return Err(format!(
+                "typed pre-launch timeout {error_kind} was not accepted"
+            ));
+        }
+    }
+    for (timed_out, status, signal, error_kind) in [
+        (false, None, None, Some("cpu-timeout")),
+        (true, Some(0), None, Some("cpu-timeout")),
+        (true, None, Some(15), Some("wall-timeout")),
+        (true, None, None, Some("infrastructure")),
+        (true, None, None, None),
+    ] {
+        if is_prelaunch_timeout_disposition(timed_out, status, signal, error_kind) {
+            return Err(format!(
+                "invalid pre-launch timeout disposition was accepted: timed_out={timed_out} status={status:?} signal={signal:?} error_kind={error_kind:?}"
+            ));
+        }
+    }
     let summary = fresh_result_summary(172, "fixture-sha", 170, 2, 2);
     let expected_summary = "Fresh result check: 172/172 selected cells passed at fixture-sha \
 (170 compatibility green, including 2 chaos; 2 custom outside the comparable denominator).";
@@ -7159,6 +7243,8 @@ fn self_test() -> Result<(), String> {
             failure_class: (outcome != "PASS").then_some(FailureClass::ProductFailure),
             error_kind: None,
             timeout_seconds: 15,
+            execution_cpu_timeout_seconds: Some(10),
+            execution_wall_timeout_seconds: Some(15),
             log_level: Some("info".into()),
             effective_args: vec!["run".into()],
             argv: vec!["hermit".into(), "run".into()],
@@ -7241,6 +7327,32 @@ fn self_test() -> Result<(), String> {
         }
     };
     let current_identity = candidate("PASS").row;
+    current_identity.validate_timeout_policy()?;
+    let mut retained_without_explicit_bounds = current_identity.clone();
+    retained_without_explicit_bounds.execution_cpu_timeout_seconds = None;
+    retained_without_explicit_bounds.execution_wall_timeout_seconds = None;
+    retained_without_explicit_bounds.validate_timeout_policy()?;
+    if retained_without_explicit_bounds
+        .require_current_timeout_policy()
+        .is_ok()
+    {
+        return Err("a current row without explicit execution bounds was accepted".into());
+    }
+    let mut half_present_timeout = current_identity.clone();
+    half_present_timeout.execution_wall_timeout_seconds = None;
+    if half_present_timeout.validate_timeout_policy().is_ok() {
+        return Err("a half-present additive timeout policy was accepted".into());
+    }
+    let mut wrong_cpu_timeout = current_identity.clone();
+    wrong_cpu_timeout.execution_cpu_timeout_seconds = Some(15);
+    if wrong_cpu_timeout.validate_timeout_policy().is_ok() {
+        return Err("an execution CPU bound not below wall was accepted".into());
+    }
+    let mut wrong_wall_timeout = current_identity.clone();
+    wrong_wall_timeout.execution_wall_timeout_seconds = Some(14);
+    if wrong_wall_timeout.validate_timeout_policy().is_ok() {
+        return Err("an execution wall bound disagreeing with timeout_seconds was accepted".into());
+    }
     let mut legacy_identity = current_identity.clone();
     legacy_identity.result = None;
     legacy_identity.failure_class = None;
@@ -8073,6 +8185,8 @@ red/`measured-and-passed` count is **0**.",
         failure_class: Some(FailureClass::ProductFailure),
         error_kind: None,
         timeout_seconds: 15,
+        execution_cpu_timeout_seconds: Some(10),
+        execution_wall_timeout_seconds: Some(15),
         log_level: Some("info".into()),
         effective_args: vec!["run".into()],
         argv: vec!["hermit".into(), "run".into()],
@@ -10754,6 +10868,8 @@ red/`measured-and-passed` count is **0**.",
         failure_class: None,
         error_kind: None,
         timeout_seconds: 15,
+        execution_cpu_timeout_seconds: Some(10),
+        execution_wall_timeout_seconds: Some(15),
         log_level: None,
         effective_args: Vec::new(),
         argv: vec!["fixture".into()],

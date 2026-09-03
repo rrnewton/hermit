@@ -132,6 +132,27 @@ fn identity_value(identity: &CellIdentity) -> Result<Value, String> {
         .map_err(|error| format!("cannot encode selected cell identity: {error}"))
 }
 
+fn require_current_timeout_policy(row: &Value) -> Result<(), String> {
+    let timeout = row
+        .get("timeout_seconds")
+        .and_then(Value::as_u64)
+        .ok_or("current cell result has no timeout_seconds")?;
+    let cpu = row
+        .get("execution_cpu_timeout_seconds")
+        .and_then(Value::as_u64)
+        .ok_or("current cell result omitted execution_cpu_timeout_seconds")?;
+    let wall = row
+        .get("execution_wall_timeout_seconds")
+        .and_then(Value::as_u64)
+        .ok_or("current cell result omitted execution_wall_timeout_seconds")?;
+    if cpu == 0 || wall != timeout || wall <= cpu {
+        return Err(format!(
+            "current cell result timeout policy disagrees: timeout_seconds={timeout} execution_cpu_timeout_seconds={cpu} execution_wall_timeout_seconds={wall}"
+        ));
+    }
+    Ok(())
+}
+
 fn canonical_report(
     value: Value,
 ) -> Result<Option<(VerificationReport, ComparisonSpec, ComparedLogCounts)>, String> {
@@ -569,6 +590,8 @@ pub fn retain(
                     file.display()
                 ));
             }
+            require_current_timeout_policy(&row)
+                .map_err(|error| format!("{}:{line_number} {error}", file.display()))?;
             let row_run_id = string(&row, "run_id")?;
             match run_id.as_deref() {
                 None => run_id = Some(row_run_id.into()),
@@ -791,8 +814,57 @@ mod tests {
             "backend": "ptrace",
             "outcome": "PASS",
             "reason": null,
+            "timeout_seconds": 57,
+            "execution_cpu_timeout_seconds": 22,
+            "execution_wall_timeout_seconds": 57,
             "attempts": [attempt(&matched)]
         })
+    }
+
+    #[test]
+    fn current_timeout_policy_is_required_without_breaking_legacy_raw_reads() {
+        let commit = "1515151515151515151515151515151515151515";
+        for (label, remove, replacement, expected_error) in [
+            (
+                "missing",
+                Some("execution_cpu_timeout_seconds"),
+                None,
+                "omitted execution_cpu_timeout_seconds",
+            ),
+            (
+                "half-present",
+                Some("execution_wall_timeout_seconds"),
+                None,
+                "omitted execution_wall_timeout_seconds",
+            ),
+            (
+                "wrong-value",
+                None,
+                Some(("execution_wall_timeout_seconds", 56_u64)),
+                "timeout policy disagrees",
+            ),
+        ] {
+            let root = fixture_root();
+            let results = root.join("results");
+            let mut row = result_row(&format!("validate-{label}"), commit);
+            let object = row.as_object_mut().unwrap();
+            if let Some(field) = remove {
+                object.remove(field);
+            }
+            if let Some((field, value)) = replacement {
+                object.insert(field.into(), Value::from(value));
+            }
+            write_result(&results, &row);
+            assert_eq!(
+                all_result_rows(&results).unwrap().len(),
+                1,
+                "legacy raw-row reading must retain additive-field compatibility"
+            );
+            let error = retain(&root, &results, commit, &expected(&row))
+                .expect_err("a malformed current timeout policy reached the ledger");
+            assert!(error.contains(expected_error), "{label}: {error}");
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     fn expected(row: &Value) -> Vec<Value> {
@@ -1049,10 +1121,14 @@ mod tests {
         first["reason"] = Value::String("forced first failure".into());
         first["duration_ms"] = Value::from(111);
         first["timeout_seconds"] = Value::from(15);
+        first["execution_cpu_timeout_seconds"] = Value::from(10);
+        first["execution_wall_timeout_seconds"] = Value::from(15);
         let mut second = result_row("validate-retry", commit);
         second["attempt"] = Value::from(2);
         second["duration_ms"] = Value::from(222);
         second["timeout_seconds"] = Value::from(15);
+        second["execution_cpu_timeout_seconds"] = Value::from(10);
+        second["execution_wall_timeout_seconds"] = Value::from(15);
         append_result_row(&results, &first);
         append_result_row(&results, &second);
 

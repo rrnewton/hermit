@@ -1,24 +1,3 @@
 schema: 3
-timeout_seconds: 15
-nextest:
-  - filter: test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)
-    timeout_seconds: 45
-    slow_reason: Across 85 attempts of this source audit's 12 separate Hermit processes, results were 64 passed and 21 timed out at the old 30s threshold; the longest passing attempt was 29.935s, so 45s is 1.50x that passing maximum.
-  - filter: test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)
-    timeout_seconds: 45
-    slow_reason: This test forces the smallest expressible 1-second timeout plus the 10-second RUN_TIMEOUT_UNWIND_GRACE, then polls up to 20 seconds for cleanup. Full-validate history includes passing times from 11.115s through 29.636s, and RUN 1600 hit the old cap at 30.002s; 45 seconds is 1.52x the longest passing observation without changing the shipped grace.
-  - filter: binary(=container_init_deadline)
-    timeout_seconds: 30
-    slow_reason: This binary deliberately exercises a 15-second timeout and cleanup paths with a 20-second teardown budget; once registered, a sibling test hit the 15-second default at 15.002 seconds, so all three tests receive the owner's 30-second exception.
-  - filter: test(/(^|::)common_commands_are_deterministic_under_strict_verify$/)
-    timeout_seconds: 30
-    slow_reason: Retained validate logs contain 257 passes for this exact test with p95 10.879 seconds and maximum 14.972 seconds, plus 5 timeout runs from 15.001 through 16.630 seconds including solo RUN 1624 at 15.001 seconds; this 30-second exception changes only the test's cap.
-  - filter: test(/(^|::)liteinst_strict_verify_shell_and_entropy_consumer$/)
-    timeout_seconds: 30
-    slow_reason: Retained validate logs contain 210 passes for this exact test with a 12.837-second maximum and 6 runs that exhausted the 15-second default; under two concurrent validates RUN 1613 timed out at 15.002 seconds while peer RUN 1612 passed in 2.155 seconds.
-  - filter: test(/(^|::)liteinst_strict_verify_virtual_identity_and_time$/)
-    timeout_seconds: 30
-    slow_reason: Retained validate logs contain 211 passes for this exact test with an 11.148-second maximum and 4 runs that exhausted the 15-second default; under two concurrent validates RUN 1613 timed out at 15.002 seconds while peer RUN 1612 passed in 4.088 seconds.
-  - filter: test(/(^|::)sabre_non_racy_examples_verify_current_envelope$/)
-    timeout_seconds: 30
-    slow_reason: Retained validate logs contain 181 passes for this exact test with a 20.295-second maximum and 10 runs that exhausted the 15-second default; RUN 1613 again timed out at 15.002 seconds under two concurrent validates.
+timeout_seconds: 57
+cpu_timeout_seconds: 22

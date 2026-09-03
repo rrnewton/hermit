@@ -13,15 +13,13 @@ status-level = "pass"
 final-status-level = "slow"
 failure-output = "immediate-final"
 success-output = "never"
-# This is the per-test-process bound, below the enclosing DAG node's batch
-# bound. Hermit failures commonly stop making progress instead of exiting, so a
-# single test that has not completed in 15 seconds is terminated and named by
-# nextest rather than consuming the rest of a 900-second node allowance. These
-# nextest clocks begin after cargo has built and enumerated the suite; the DAG
-# step's typed CPU and wall bounds remain conservative backups for that earlier
-# work. Keep nextest output live so a missing scheduler event is not confused
-# with a period in which no test was running.
-slow-timeout = { period = "15s", terminate-after = 1, grace-period = "2s" }
+# Individual test processes use the owner-approved wall backstop derived from
+# the completing data-handling/dd-partial-transfers observation:
+# ceil(4 * 14.019s) = 57s. This remains alongside the manifest runner's CPU
+# budget because a wedged process can consume no CPU. Machine-specific wall
+# scaling from HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER is applied to this canonical
+# file by ci/run-nextest-counted.sh.
+slow-timeout = { period = "57s", terminate-after = 1, grace-period = "2s" }
 global-timeout = "60m"
 
 [profile.ci]
@@ -36,70 +34,6 @@ path = "junit.xml"
 # each test in a separate process, so keep their shared contract explicit.
 [test-groups.hermit-serialized]
 max-threads = 1
-
-# This source-audit test deliberately runs all six named `record` container
-# sites under both injected child-fault classes: 12 separate Hermit processes.
-# Across 85 attempts, 64 passed and 21 timed out at the old 30s threshold; the
-# longest passing attempt was 29.935s. 45s is 1.50x that passing maximum and
-# changes only this test's threshold. This threshold change requires
-# adversarial review.
-[[profile.default.overrides]]
-filter = "test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)"
-slow-timeout = { period = "45s", terminate-after = 1, grace-period = "2s" }
-
-# This cell forces hermit's `--timeout` SIGALRM fallback to fire, so its runtime
-# is a SUM OF TWO DELIBERATE CONSTANTS, not a measurement that might drift: the
-# smallest expressible bound (1s, the flag takes a NonZeroU64) plus
-# RUN_TIMEOUT_UNWIND_GRACE (10s, hermit-cli/src/lib.rs), followed by a bounded
-# cleanup poll of up to 20s. Full-validate history includes passing times from
-# 11.115s through 29.636s, and RUN 1600 hit the old cap at 30.002s. A 45s bound
-# is 1.52x the longest passing observation and remains local to this test.
-#
-# It cannot be made faster without making the grace itself configurable, which
-# would mean the cell no longer exercises the shipped constant. See
-# docs/TIMEOUT_LADDER.md -- an inner bound that is not comfortably smaller than
-# its outer bound is exactly the failure this override avoids.
-[[profile.default.overrides]]
-filter = "test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)"
-slow-timeout = { period = "45s", terminate-after = 1, grace-period = "2s" }
-
-# This binary deliberately exercises a 15s timeout and a 20s teardown budget.
-# Once the previously unregistered binary actually ran, one of
-# its sibling tests hit the 15s default at 15.002s. Give all three tests the
-# owner's 30s exception without widening any other test binary.
-[[profile.default.overrides]]
-filter = "binary(=container_init_deadline)"
-slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
-
-# Retained validate logs contain 257 passes for this exact test (p95 10.879s,
-# maximum 14.972s) and 5 timeout runs at the 15s default between 15.001s and
-# 16.630s, including solo RUN 1624 at 15.001s. The 30s exception changes
-# only this test; its commands and verification remain unchanged.
-[[profile.default.overrides]]
-filter = "test(/(^|::)common_commands_are_deterministic_under_strict_verify$/)"
-slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
-
-# Retained validate logs contain 210 passes for this exact test (maximum
-# 12.837s) and 6 runs that exhausted the 15s default. Under two concurrent
-# validates, RUN 1613 timed out at 15.002s while peer RUN 1612 passed in 2.155s.
-[[profile.default.overrides]]
-filter = "test(/(^|::)liteinst_strict_verify_shell_and_entropy_consumer$/)"
-slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
-
-# Retained validate logs contain 211 passes for this exact test (maximum
-# 11.148s) and 4 runs that exhausted the 15s default. Under two concurrent
-# validates, RUN 1613 timed out at 15.002s while peer RUN 1612 passed in 4.088s.
-[[profile.default.overrides]]
-filter = "test(/(^|::)liteinst_strict_verify_virtual_identity_and_time$/)"
-slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
-
-# Retained validate logs contain 181 passes for this exact test (maximum
-# 20.295s) and 10 runs that exhausted the 15s default. RUN 1613 again timed out
-# at 15.002s under two concurrent validates. The 30s exception changes only
-# this multi-example SaBRe verification test.
-[[profile.default.overrides]]
-filter = "test(/(^|::)sabre_non_racy_examples_verify_current_envelope$/)"
-slow-timeout = { period = "30s", terminate-after = 1, grace-period = "2s" }
 
 [[profile.default.overrides]]
 filter = "package(=hermit) & kind(=test)"

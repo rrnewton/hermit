@@ -6597,10 +6597,6 @@ test:
     modes:
       verify:
         ci: true
-        timeout_seconds:
-          ptrace: 45
-        slow_reason:
-          ptrace: Across 155 retained observations this cell recorded 149 canonical passes; passing guest attempts had p95 5.238 seconds and a 7.889-second maximum. RUN 1613 under two concurrent validates exhausted the inherited 15-second deadline twice at 14.993 and 15.025 seconds despite using only 4.920 and 4.939 CPU-seconds. RUN 1622 then exhausted the 30-second bound in a solo full DAG at 30.021 seconds and 10.341 CPU-seconds before its retry passed canonically in 21.224 seconds and 9.356 CPU-seconds. A 45-second bound preserves measured host-load headroom without changing the canonical comparison.
         backends_enabled:
           - ptrace
         guest_args:

@@ -105,11 +105,11 @@
     {
       "group": "e2e", "job": "manifest_applications",
       "desc": "Privileged manifest bucket: applications",
-      "description": "The selected KVM application cell has a measured 60 s individual timeout and 10 s TERM/KILL grace. A 180 s node leaves 110 s for fixture/reporting work, so the named inner timeout wins without tightening a load-sensitive test.",
+      "description": "The selected KVM cell has a measured 74 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop.",
       "manifest": {"lane": "privileged", "category": "applications"},
       "cmd": "./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --ci-only --allow-empty --prebuilt",
       "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],
-      "timeout": 180,
+      "timeout": 600,
       "hint": {"est_duration_s": 90,
                "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}
@@ -117,10 +117,11 @@
     {
       "group": "e2e", "job": "manifest_backend_parity_c",
       "desc": "Privileged manifest bucket: backend-parity-c",
+      "description": "The selected cells use the 57 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop.",
       "manifest": {"lane": "privileged", "category": "backend-parity-c"},
       "cmd": "./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --allow-empty --prebuilt",
       "deps": ["build.privileged_tests", "build.manifest_guests", "e2e.metadata"],
-      "timeout": 120,
+      "timeout": 600,
       "hint": {"est_duration_s": 5,
                "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "latency-bound"}

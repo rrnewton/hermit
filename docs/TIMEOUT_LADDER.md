@@ -18,9 +18,9 @@ it is.
 the outer validate scope. This is the same idea widened to every rung,
 including the ones that script does not cover.
 
-All values measured 2026-08-26 against `rrnewton/hermit` `main`
-`f77d7c44067a12ba11e75b5a85864ce0bc23e8f4`. Re-measure before quoting them; the
-point of this file is the *structure*, and the numbers move.
+The individual-test values below were calibrated from retained results through
+2026-09-03 02:18:30 UTC. Re-measure before quoting them; the point of this file
+is the *structure*, and the numbers move.
 
 ## What each rung bounds
 
@@ -33,18 +33,50 @@ agreeing with each other.
 | `hermit run --timeout N` | **one hermit invocation** = one guest execution, **ptrace and liteinst only** | the caller's argument | hermit drops the guest future and unwinds its own container | exit 124, `HERMIT_RUN_TIMEOUT class=run-timeout` |
 | hermit's unwind fallback | the same invocation, `N + 10s` | `RUN_TIMEOUT_UNWIND_GRACE` in `hermit-cli/src/lib.rs` | `_exit(124)` from a `SIGALRM` handler; no destructors | exit 124, `HERMIT_RUN_TIMEOUT_FALLBACK` |
 | `hermit record --record-timeout N` | one recording | the caller's argument | `_exit(124)` from a `SIGALRM` handler | exit 124 |
-| nextest `slow-timeout` | **one cargo test process**, which may invoke hermit zero or many times | `.config/nextest.toml`: 15s default, two named 30s overrides | `SIGTERM` to the test binary, 2s grace, then `SIGKILL` | wrapper exit 100, test named by nextest |
-| manifest cell `timeout_seconds` | **one manifest cell** | `tests/e2e/manifests/*.yaml`, per cell | `timeout --kill-after=10s Ns` around the cell command | exit 124 |
+| nextest `slow-timeout` | **one cargo test process**, which may invoke hermit zero or many times | `.config/nextest.toml`: 57s base, scaled by the machine wall multiplier | `SIGTERM` to the test binary, 2s grace, then `SIGKILL` | wrapper exit 100, test named by nextest |
+| manifest cell CPU limit | all process-group CPU consumed by a cell's executions, aggregated across attempts or seeds | `cpu_timeout_seconds`: 22s default plus measured cell overrides, scaled by the machine CPU multiplier | the harness stops the process group and retains `error_kind=cpu-timeout` | typed cell `ERROR` |
+| manifest cell wall limit | fixture preparation and, separately, the complete execution phase | `timeout_seconds`: 57s default plus measured cell overrides, scaled by the machine wall multiplier | the harness stops the process group and retains `error_kind=wall-timeout` | typed cell `ERROR` |
 | dagrun step `timeout` | **one DAG node**, i.e. a whole batch of cells or tests | `ci/dag/{portable,privileged}.json` | dagrun stops the step | node failure |
 | validate run budget | the whole outer validate graph | `HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS` or `--run-timeout` | dagrun stops admitting work and records unfinished nodes | incomplete validation, with named unfinished nodes |
 | validate systemd scope | the same outer run plus teardown grace | validate's safe-ci scope | systemd stops the whole process tree | outer-scope timeout |
 | `safehermit --sh-deadline` | **the whole wrapped process tree** | `bin/safehermit`, default 3600s | `systemd-run --user RuntimeMaxSec`, a **cgroup kill** | exit 124, `safehermit: bound.wall=` |
 
-Distribution of the values actually deployed today:
+Distribution of the selected CI-cell values calibrated at that cutoff:
 
-- manifest `timeout_seconds`: 90s ×310, 60s ×25, 120s ×22, 600s ×1.
+- manifest CPU: 22s ×488, 25s ×1, 32s ×1, 46s ×1, 56s ×1.
+- manifest wall: 57s ×487, 58s ×1, 74s ×1, 91s ×1, 105s ×1, 118s ×1.
 - dagrun step `timeout`: 600s ×15, 900s ×15, 120s ×11, 180s ×6, 60s ×6, 720s ×5,
   1200s ×4, 300s ×3, 2400s ×1, 40s ×1, 30s ×1.
+
+## Individual-test CPU and wall policy
+
+CPU and wall time are independent measurements. For each retained passing
+population, the CPU bound is `ceil(1.5 * p90 CPU)`. The wall bound is
+`ceil(4 * p90 wall)` unless that exceeds 120 seconds, in which case it is
+`ceil(3 * p90 wall)`. Whole-second rounding is always upward.
+
+The ordinary 22-second CPU and 57-second wall defaults are anchored by the
+completing `data-handling/dd-partial-transfers` sample that prompted the policy
+(14.298 CPU seconds and 14.019 wall seconds). The current retained p90 census
+requires five explicit pairs: `kvm-python-examples` 25/74,
+`timed-progress-bar` 32/91, `fp-reduction-nondeterminism` chaos 46/105,
+`dd-partial-transfers` 22/58, and `zstd-multithread` 56/118 (CPU/wall seconds).
+The other 487 selected cells require at most 12/49. The 188 runnable but
+`ci:false` cells had no retained passing samples and are reported as unsampled,
+not treated as calibrated.
+
+Machine-specific CPU and wall multipliers are deliberately separate:
+`HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER` and
+`HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER`. Each defaults to `1`, must be a positive
+finite number, and scales its configured component with ceiling rounding. The
+nextest wrapper parses and rewrites every `slow-timeout.period` into a temporary
+TOML config with the wall multiplier, passes it with `--config-file`, and removes
+it on all exits. Validation refuses a wall multiplier whose scaled inner bounds
+would outgrow a committed outer DAG backup. Current result rows carry both
+effective bounds as
+`execution_cpu_timeout_seconds` and `execution_wall_timeout_seconds`; readers
+accept older rows with neither field but refuse current publication unless both
+are present and consistent.
 
 ## Gentle first, hard as fallback
 
@@ -149,7 +181,7 @@ inheriting a guarantee nobody measured for it.
 
 ## The invariant
 
-**Each rung must be strictly smaller than the rung outside it.**
+**Each wall-clock rung must be strictly smaller than the rung outside it.**
 
 If an inner bound is greater than or equal to its outer bound, the inner one can
 never fire. It is then dead configuration that reads as protection — and the
@@ -157,30 +189,14 @@ run is stopped by the outer rung instead, hard and unnamed. The symptom is a
 test that looks intermittently killed for no stated reason, which is why this
 belongs in a configuration check and not in a debugging session.
 
+CPU consumption is a separate axis: a multi-threaded process can consume more
+than one CPU-second per wall second, while a wedged or descheduled process can
+consume almost none. That is why neither bound replaces the other.
+
 `ci/validate-timeout-layers-test.sh` exercises the named DAG-step and outer-scope
-stops. `scripts/validate.rs --self-test` brackets the generated strict-compat
-per-probe budgets and proves those probes do not start a nested scheduler.
-Nothing enforces the invariant across the manifest, nextest and native rungs
-yet.
-
-## Reading a "global default" for the manifest
-
-⚠️ **EVERY CELL ALREADY DECLARES AN EXPLICIT `timeout_seconds`.** Measured
-2026-08-26: **358 of 358 cells across all 13 manifests**, with no gaps. That
-makes "global default" ambiguous in a way that has opposite consequences, so the
-schema has to say which it means:
-
-- **As a fallback for cells that omit the field**, it applies to **0 of 358**
-  cells on the day it lands. It is correct, and it is also inert until some
-  future cell omits the field — the shape of mechanism this project has been
-  bitten by before.
-- **As a value that overrides the per-cell declaration**, it retimes **310
-  cells from 90s to 15s at once**, a six-fold tightening. Already known to
-  bite: `applications/timed-progress-bar` declares 120s and measures about 18s,
-  so it fails immediately.
-
-Neither is wrong; they are different features. The per-cell override to 30s that
-the owner named is a third, separate thing and does not resolve the ambiguity.
+stops. `scripts/validate.rs --self-test` also proves the checked-in nextest and
+manifest wall defaults agree and that representative multiplier scaling uses
+the same ceiling rule; planted base and multiplier mismatches are rejected.
 
 ## Known gap
 
@@ -192,7 +208,5 @@ yields 50 targets and that file is not among them, so those cells never run in
 validation. The regression cells for `hermit run --timeout` are in
 `hermit-cli/tests/cli.rs` for that reason.
 
-If that file is ever wired in, note that it declares a 15-second deadline, a
-12-second startup budget and a 20-second teardown budget, so it needs a named
-per-test override above the 15-second nextest default or it will cut its own
-tests and present as a product bug.
+If that file is ever wired in, its own 12-second startup and 20-second teardown
+budgets must remain below the enclosing 57-second nextest base bound.

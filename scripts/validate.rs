@@ -46,6 +46,7 @@
 //! dagrun = { path = "../agent-utils/rs/dagrun" }
 //! hermit-manifest-plan = { path = "../ci/manifest-plan" }
 //! serde_json = "1"
+//! toml = "0.8.23"
 //! sha2 = "0.10"
 //! libc = "0.2"
 //! tempfile = "3"
@@ -135,6 +136,10 @@ use hermit_manifest_plan::runner::E2E_MACHINE_SHORTNAME_ENV;
 use hermit_manifest_plan::service_result::FinalValidateStatus;
 use hermit_manifest_plan::service_result::ScorecardWriteback;
 use hermit_manifest_plan::service_result::ValidationServiceResult;
+use hermit_manifest_plan::timeouts::DEFAULT_TEST_WALL_TIMEOUT_SECONDS;
+use hermit_manifest_plan::timeouts::scale_timeout_seconds;
+use hermit_manifest_plan::timeouts::timeout_multiplier_from_env;
+use hermit_manifest_plan::timeouts::TEST_WALL_TIMEOUT_MULTIPLIER_ENV;
 
 use validate_plan::CompatMode;
 use validate_plan::CompatDisposition;
@@ -1186,11 +1191,22 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     // Overlay exactly this test's production files, then commit only when that
     // changed the clone. The real child therefore still runs from a clean SHA.
     for relative in [
+        ".config/nextest.toml",
         "Makefile",
         "ci/dag/portable.json",
+        "ci/dag/privileged.json",
+        "ci/manifest-plan/src/runner.rs",
+        "ci/manifest-plan/src/timeouts.rs",
+        "ci/nextest-timeout-config.rs",
+        "ci/run-nextest-counted.sh",
         "ci/verify-submodules.sh",
         "scripts/validate.rs",
         "scripts/lib/validate_plan.rs",
+        "tests/e2e/manifests/applications.yaml",
+        "tests/e2e/manifests/backend-parity-c.yaml",
+        "tests/e2e/manifests/c-programs.yaml",
+        "tests/e2e/manifests/data-handling.yaml",
+        "tests/e2e/manifests/defaults.yaml",
     ] {
         std::fs::copy(root.join(relative), checkout.join(relative)).map_err(|error| {
             format!("submodule service result: cannot copy {relative} into fixture: {error}")
@@ -1201,11 +1217,22 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             .args([
                 "add",
                 "--",
+                ".config/nextest.toml",
                 "Makefile",
                 "ci/dag/portable.json",
+                "ci/dag/privileged.json",
+                "ci/manifest-plan/src/runner.rs",
+                "ci/manifest-plan/src/timeouts.rs",
+                "ci/nextest-timeout-config.rs",
+                "ci/run-nextest-counted.sh",
                 "ci/verify-submodules.sh",
                 "scripts/validate.rs",
                 "scripts/lib/validate_plan.rs",
+                "tests/e2e/manifests/applications.yaml",
+                "tests/e2e/manifests/backend-parity-c.yaml",
+                "tests/e2e/manifests/c-programs.yaml",
+                "tests/e2e/manifests/data-handling.yaml",
+                "tests/e2e/manifests/defaults.yaml",
             ])
             .current_dir(&checkout),
         "stage the fixture sources",
@@ -11937,137 +11964,229 @@ mod scheduler_explanation_tests {
 
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NextestTimeoutCap {
+    period_seconds: u64,
+    terminate_after: u64,
+    grace_seconds: u64,
+}
+
+fn nextest_duration_seconds(value: &toml::Value, field: &str) -> Result<u64, String> {
+    let duration = value
+        .as_str()
+        .ok_or_else(|| format!("nextest {field} must be a duration string"))?;
+    let digits = duration.strip_suffix('s').ok_or_else(|| {
+        format!("nextest {field} must be a positive whole-second duration, got {duration:?}")
+    })?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "nextest {field} must be a positive whole-second duration, got {duration:?}"
+        ));
+    }
+    let seconds = digits
+        .parse::<u64>()
+        .map_err(|error| format!("invalid nextest {field} {duration:?}: {error}"))?;
+    if seconds == 0 {
+        return Err(format!("nextest {field} must be greater than zero"));
+    }
+    Ok(seconds)
+}
+
+fn parse_nextest_timeout_caps(source: &str) -> Result<Vec<NextestTimeoutCap>, String> {
+    fn visit(value: &toml::Value, caps: &mut Vec<NextestTimeoutCap>) -> Result<(), String> {
+        match value {
+            toml::Value::Table(table) => {
+                for (key, value) in table {
+                    if key == "slow-timeout" {
+                        let timeout = value
+                            .as_table()
+                            .ok_or("nextest slow-timeout must be a table")?;
+                        let period_seconds = nextest_duration_seconds(
+                            timeout
+                                .get("period")
+                                .ok_or("nextest slow-timeout is missing period")?,
+                            "slow-timeout.period",
+                        )?;
+                        let terminate_after = timeout
+                            .get("terminate-after")
+                            .and_then(toml::Value::as_integer)
+                            .and_then(|value| u64::try_from(value).ok())
+                            .filter(|value| *value > 0)
+                            .ok_or("nextest slow-timeout.terminate-after must be positive")?;
+                        let grace_seconds = nextest_duration_seconds(
+                            timeout
+                                .get("grace-period")
+                                .ok_or("nextest slow-timeout is missing grace-period")?,
+                            "slow-timeout.grace-period",
+                        )?;
+                        caps.push(NextestTimeoutCap {
+                            period_seconds,
+                            terminate_after,
+                            grace_seconds,
+                        });
+                    } else {
+                        visit(value, caps)?;
+                    }
+                }
+            }
+            toml::Value::Array(values) => {
+                for value in values {
+                    visit(value, caps)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    let document = source
+        .parse::<toml::Value>()
+        .map_err(|error| format!("cannot parse nextest config: {error}"))?;
+    let mut caps = Vec::new();
+    visit(&document, &mut caps)?;
+    if caps.is_empty() {
+        return Err("nextest config contains no slow-timeout".into());
+    }
+    Ok(caps)
+}
+
+fn render_scaled_nextest_config(root: &Path, multiplier: f64) -> Result<String, String> {
+    let scratch = tempfile::tempdir()
+        .map_err(|error| format!("cannot create nextest config scratch directory: {error}"))?;
+    let output_path = scratch.path().join("nextest.toml");
+    let output = Command::new(root.join("ci/nextest-timeout-config.rs"))
+        .arg(root.join(".config/nextest.toml"))
+        .arg(multiplier.to_string())
+        .arg(&output_path)
+        .output()
+        .map_err(|error| format!("cannot run nextest timeout transformer: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "nextest timeout transformer exited {}: {}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "by signal".into(), |code| code.to_string()),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    std::fs::read_to_string(&output_path)
+        .map_err(|error| format!("cannot read generated nextest config: {error}"))
+}
+
+fn require_matching_scaled_default(
+    manifest_base_seconds: u64,
+    multiplier: f64,
+    nextest_caps: &[NextestTimeoutCap],
+) -> Result<u64, String> {
+    let expected = scale_timeout_seconds(manifest_base_seconds, multiplier, "wall multiplier")?;
+    let actual = nextest_caps
+        .first()
+        .ok_or("generated nextest config contains no default timeout")?
+        .period_seconds;
+    if actual != expected {
+        return Err(format!(
+            "generated nextest default is {actual}s, but manifest {manifest_base_seconds}s scaled by {multiplier} with ceiling rounding is {expected}s"
+        ));
+    }
+    Ok(expected)
+}
+
+fn require_outer_timeout_headroom(
+    tag: &str,
+    node_timeout_seconds: i64,
+    base_inner_seconds: u64,
+    termination_grace_seconds: u64,
+    attempts: u64,
+    wall_multiplier: f64,
+) -> Result<i64, String> {
+    let node_timeout_seconds = u64::try_from(node_timeout_seconds)
+        .map_err(|_| format!("retry bounds: {tag} has a nonpositive node timeout"))?;
+    let scaled_inner_seconds = scale_timeout_seconds(
+        base_inner_seconds,
+        wall_multiplier,
+        &format!("{tag} wall multiplier"),
+    )?;
+    let one_attempt_seconds = scaled_inner_seconds
+        .checked_add(termination_grace_seconds)
+        .ok_or_else(|| format!("retry bounds: {tag} timeout plus grace overflowed"))?;
+    let required_seconds = attempts
+        .checked_mul(one_attempt_seconds)
+        .ok_or_else(|| format!("retry bounds: {tag} attempt allowance overflowed"))?;
+    if node_timeout_seconds <= required_seconds {
+        return Err(format!(
+            "retry bounds: {tag} has a {node_timeout_seconds}s node timeout but {attempts} inner attempt(s) at wall multiplier {wall_multiplier} can consume {required_seconds}s ({scaled_inner_seconds}s plus {termination_grace_seconds}s termination grace each)"
+        ));
+    }
+    i64::try_from(node_timeout_seconds - required_seconds)
+        .map_err(|error| format!("retry bounds: {tag} headroom is too large: {error}"))
+}
+
 #[cfg(test)]
 mod nextest_timeout_tests {
-    /// The per-test cap stays at 15s, and every exemption from it is named,
-    /// measured, and justified IN PLACE.
-    ///
-    /// ⚠️ WIDENED FROM ONE OVERRIDE TO SEVEN, DELIBERATELY AND WITH EACH
-    /// EXCEPTION PINNED.
-    /// This gate is a ratchet against exemptions accumulating quietly, so adding
-    /// one had to be a visible edit here rather than a silently passing config
-    /// change -- which is exactly what it did: each added override failed this
-    /// test first. The ratchet is stricter than a count alone: it pins all seven
-    /// filters and requires each override's justification text to be present, so
-    /// an eighth exemption still cannot appear without an author changing this
-    /// list and supplying a reason. The count alone was the weaker check.
+    use super::*;
+
     #[test]
-    fn nextest_uses_the_manifest_default_and_named_overrides() {
-        let config = include_str!("../.config/nextest.toml");
-        let manifest = include_str!("../tests/e2e/manifests/defaults.yaml");
-        let manifest_timeout_stanzas = [
-            "- filter: test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)\n    timeout_seconds: 45",
-            "- filter: test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)\n    timeout_seconds: 45",
-            "- filter: binary(=container_init_deadline)\n    timeout_seconds: 30",
-            "- filter: test(/(^|::)common_commands_are_deterministic_under_strict_verify$/)\n    timeout_seconds: 30",
-            "- filter: test(/(^|::)liteinst_strict_verify_shell_and_entropy_consumer$/)\n    timeout_seconds: 30",
-            "- filter: test(/(^|::)liteinst_strict_verify_virtual_identity_and_time$/)\n    timeout_seconds: 30",
-            "- filter: test(/(^|::)sabre_non_racy_examples_verify_current_envelope$/)\n    timeout_seconds: 30",
-        ];
-        let manifest_timeouts_match = |source: &str| {
-            manifest_timeout_stanzas
-                .iter()
-                .all(|stanza| source.contains(stanza))
-        };
-        assert!(manifest_timeouts_match(manifest));
-        for wrong_timeout in [44, 30] {
-            let mutated = manifest.replacen(
-                "timeout_seconds: 45",
-                &format!("timeout_seconds: {wrong_timeout}"),
-                1,
-            );
-            assert!(
-                !manifest_timeouts_match(&mutated),
-                "source-audit timeout mutation 45->{wrong_timeout} escaped the ratchet"
-            );
-        }
-        let fallback_timeout_mutation = manifest.replacen(
-            "- filter: test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)\n    timeout_seconds: 45",
-            "- filter: test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)\n    timeout_seconds: 30",
-            1,
+    fn nextest_and_manifest_share_base_and_scaled_wall_bounds() {
+        let root = Path::new(file!())
+            .parent()
+            .and_then(Path::parent)
+            .expect("validate.rs has a repository parent")
+            .to_path_buf();
+        let config = std::fs::read_to_string(root.join(".config/nextest.toml")).unwrap();
+        let manifest =
+            std::fs::read_to_string(root.join("tests/e2e/manifests/defaults.yaml")).unwrap();
+        let base_caps = parse_nextest_timeout_caps(&config).unwrap();
+        assert_eq!(
+            base_caps,
+            vec![NextestTimeoutCap {
+                period_seconds: DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
+                terminate_after: 1,
+                grace_seconds: 2,
+            }]
+        );
+        assert!(manifest.lines().any(|line| line == "timeout_seconds: 57"));
+        assert!(
+            manifest
+                .lines()
+                .any(|line| line == "cpu_timeout_seconds: 22")
+        );
+
+        let multiplier = 1.25;
+        let scaled = render_scaled_nextest_config(&root, multiplier).unwrap();
+        let scaled_caps = parse_nextest_timeout_caps(&scaled).unwrap();
+        require_matching_scaled_default(
+            DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
+            multiplier,
+            &scaled_caps,
+        )
+        .unwrap();
+
+        assert!(
+            require_matching_scaled_default(56, multiplier, &scaled_caps).is_err(),
+            "a planted committed-base mismatch escaped the consistency gate"
         );
         assert!(
-            !manifest_timeouts_match(&fallback_timeout_mutation),
-            "fallback timeout mutation 45->30 escaped the ratchet"
+            require_matching_scaled_default(DEFAULT_TEST_WALL_TIMEOUT_SECONDS, 1.20, &scaled_caps,)
+                .is_err(),
+            "a planted multiplier drift escaped the consistency gate"
         );
-        let timeouts: Vec<&str> = config
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with("slow-timeout ="))
-            .collect();
+    }
+
+    #[test]
+    fn enclosing_timeout_checks_scale_and_refuse_unsafe_multipliers() {
         assert_eq!(
-            timeouts,
-            vec![
-                "slow-timeout = { period = \"15s\", terminate-after = 1, grace-period = \"2s\" }",
-                "slow-timeout = { period = \"45s\", terminate-after = 1, grace-period = \"2s\" }",
-                "slow-timeout = { period = \"45s\", terminate-after = 1, grace-period = \"2s\" }",
-                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
-                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
-                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
-                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
-                "slow-timeout = { period = \"30s\", terminate-after = 1, grace-period = \"2s\" }",
-            ],
-            "the per-test timeout must stay at 15s with two justified 45s overrides and five justified 30s overrides"
+            require_outer_timeout_headroom("fixture", 600, 74, 10, 2, 1.0).unwrap(),
+            432
         );
-        for required in [
-            "test(/(^|::)every_record_container_site_classifies_a_child_fault_by_name$/)",
-            "test(/(^|::)run_timeout_fallback_fires_when_the_unwind_does_not_finish$/)",
-            "binary(=container_init_deadline)",
-            "test(/(^|::)common_commands_are_deterministic_under_strict_verify$/)",
-            "test(/(^|::)liteinst_strict_verify_shell_and_entropy_consumer$/)",
-            "test(/(^|::)liteinst_strict_verify_virtual_identity_and_time$/)",
-            "test(/(^|::)sabre_non_racy_examples_verify_current_envelope$/)",
-        ] {
-            assert!(config.contains(required), "nextest config lost {required}");
-            assert!(manifest.contains(required), "manifest lost {required}");
-        }
-        for required in [
-            "12 separate Hermit processes",
-            "85 attempts",
-            "64 passed",
-            "21 timed out",
-            "29.935s",
-            "45s is 1.50x",
-        ] {
-            assert!(config.contains(required), "nextest config lost {required}");
-            assert!(manifest.contains(required), "manifest lost {required}");
-        }
-        assert!(config.contains("exercises a 15s timeout"));
-        assert!(config.contains("20s teardown budget"));
-        assert!(config.contains("15.002s"));
-        assert!(config.contains("RUN_TIMEOUT_UNWIND_GRACE"));
-        for required in ["29.636s", "30.002s", "1.52x"] {
-            assert!(config.contains(required), "nextest config lost {required}");
-            assert!(manifest.contains(required), "manifest lost {required}");
-        }
-        assert!(manifest.contains("15-second timeout"));
-        assert!(manifest.contains("20-second teardown budget"));
-        assert!(manifest.contains("15.002 seconds"));
-        for required in [
-            "257 passes",
-            "p95 10.879",
-            "14.972",
-            "5 timeout runs",
-            "16.630",
-            "solo RUN 1624",
-        ] {
-            assert!(config.contains(required), "nextest config lost {required}");
-            assert!(manifest.contains(required), "manifest lost {required}");
-        }
-        for required in [
-            "210 passes",
-            "12.837",
-            "211 passes",
-            "11.148",
-            "181 passes",
-            "20.295",
-            "RUN 1613",
-            "two concurrent validates",
-        ] {
-            assert!(config.contains(required), "nextest config lost {required}");
-            assert!(manifest.contains(required), "manifest lost {required}");
-        }
-        assert!(manifest.contains("timeout_seconds: 15"));
+        assert_eq!(
+            require_outer_timeout_headroom("fixture", 600, 74, 10, 2, 1.5).unwrap(),
+            358
+        );
+        let error = require_outer_timeout_headroom("fixture", 600, 118, 10, 2, 10.0)
+            .expect_err("an oversized wall multiplier must not outgrow the outer backup");
+        assert!(error.contains("wall multiplier 10"), "{error}");
+        assert!(error.contains("can consume 2380s"), "{error}");
     }
 }
 
@@ -12090,20 +12209,9 @@ fn unreported_non_intentional_steps(
 }
 
 fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
-    const DEFAULT_TEST_CAP_S: i64 = 15;
+    const DEFAULT_TEST_CAP_S: i64 = DEFAULT_TEST_WALL_TIMEOUT_SECONDS as i64;
     const NEXTEST_TERMINATION_GRACE_S: i64 = 2;
     const MANIFEST_TERMINATION_GRACE_S: i64 = 10;
-
-    fn quoted_seconds(line: &str, field: &str) -> Result<i64, String> {
-        let prefix = format!("{field} = \"");
-        let value = line
-            .split_once(&prefix)
-            .and_then(|(_, rest)| rest.split_once("s\"").map(|(seconds, _)| seconds))
-            .ok_or_else(|| format!("retry bounds: cannot parse {field} from {line:?}"))?;
-        value
-            .parse::<i64>()
-            .map_err(|e| format!("retry bounds: invalid {field} in {line:?}: {e}"))
-    }
 
     fn require_live_nextest_output(tag: &str, command: &str) -> Result<(), String> {
         let Some(wrapper) = command.find("run-nextest-counted.sh") else {
@@ -12139,40 +12247,66 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
 
     let nextest = std::fs::read_to_string(root.join(".config/nextest.toml"))
         .map_err(|e| format!("retry bounds: cannot read nextest config: {e}"))?;
-    let manifest_defaults =
-        std::fs::read_to_string(root.join("tests/e2e/manifests/defaults.yaml"))
-            .map_err(|e| format!("retry bounds: cannot read manifest defaults: {e}"))?;
-    if !nextest.contains(
-        "slow-timeout = { period = \"15s\", terminate-after = 1, grace-period = \"2s\" }",
-    ) || !manifest_defaults
+    let nextest_wrapper = std::fs::read_to_string(root.join("ci/run-nextest-counted.sh"))
+        .map_err(|e| format!("retry bounds: cannot read nextest wrapper: {e}"))?;
+    if !nextest_wrapper.contains("${HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER-1}") {
+        return Err(format!(
+            "retry bounds: nextest wrapper does not read {TEST_WALL_TIMEOUT_MULTIPLIER_ENV} with an unset-only identity default"
+        ));
+    }
+    let manifest_defaults = std::fs::read_to_string(root.join("tests/e2e/manifests/defaults.yaml"))
+        .map_err(|e| format!("retry bounds: cannot read manifest defaults: {e}"))?;
+    if !manifest_defaults
         .lines()
-        .any(|line| line == "timeout_seconds: 15")
+        .any(|line| line == "timeout_seconds: 57")
     {
         return Err(
-            "retry bounds: the owner-ruled 15-second per-test default is not present in both \
-             nextest and the manifest defaults"
+            "retry bounds: the owner-ruled 57-second wall default is absent from manifest defaults"
                 .into(),
         );
     }
-    let nextest_caps = nextest
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("slow-timeout ="))
-        .map(|line| {
-            if !line.contains("terminate-after = 1") {
+    let base_nextest_caps = parse_nextest_timeout_caps(&nextest)?;
+    if base_nextest_caps.len() != 1
+        || base_nextest_caps[0].period_seconds != DEFAULT_TEST_WALL_TIMEOUT_SECONDS
+        || base_nextest_caps[0].terminate_after != 1
+        || base_nextest_caps[0].grace_seconds != NEXTEST_TERMINATION_GRACE_S as u64
+    {
+        return Err(format!(
+            "retry bounds: nextest must carry exactly the canonical {DEFAULT_TEST_CAP_S}s wall cap with one termination period and {NEXTEST_TERMINATION_GRACE_S}s grace, got {base_nextest_caps:?}"
+        ));
+    }
+    let largest_base_nextest_cap_s = base_nextest_caps
+        .iter()
+        .map(|cap| cap.period_seconds)
+        .max()
+        .ok_or("retry bounds: no declared base nextest cap")?;
+    // Validate the exact machine setting consumed by both the manifest runner
+    // and nextest wrapper, not a second default that can drift from execution.
+    let validated_wall_multiplier =
+        timeout_multiplier_from_env(TEST_WALL_TIMEOUT_MULTIPLIER_ENV)?;
+    let scaled_nextest = render_scaled_nextest_config(root, validated_wall_multiplier)?;
+    let scaled_nextest_caps = parse_nextest_timeout_caps(&scaled_nextest)?;
+    require_matching_scaled_default(
+        DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
+        validated_wall_multiplier,
+        &scaled_nextest_caps,
+    )?;
+    let nextest_caps = scaled_nextest_caps
+        .iter()
+        .map(|cap| {
+            if cap.terminate_after != 1 {
                 return Err(format!(
-                    "retry bounds: slow-timeout is not a one-period cap: {line:?}"
+                    "retry bounds: generated nextest slow-timeout is not a one-period cap: {cap:?}"
                 ));
             }
-            let period = quoted_seconds(line, "period")?;
-            let grace = quoted_seconds(line, "grace-period")?;
-            if grace != NEXTEST_TERMINATION_GRACE_S {
+            if cap.grace_seconds != NEXTEST_TERMINATION_GRACE_S as u64 {
                 return Err(format!(
-                    "retry bounds: expected {NEXTEST_TERMINATION_GRACE_S}s termination grace, \
-                     got {grace}s in {line:?}"
+                    "retry bounds: expected {NEXTEST_TERMINATION_GRACE_S}s termination grace, got {}s",
+                    cap.grace_seconds
                 ));
             }
-            Ok(period)
+            i64::try_from(cap.period_seconds)
+                .map_err(|error| format!("retry bounds: nextest period is too large: {error}"))
         })
         .collect::<Result<Vec<_>, String>>()?;
     let largest_nextest_cap_s = nextest_caps
@@ -12185,12 +12319,8 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .into_iter()
         .map(|lane| validate_plan::lane_config(root, lane).map(|cfg| (lane, cfg)))
         .collect::<Result<Vec<_>, _>>()?;
-    let smallest_enclosing_deadline_s = lane_configs
-        .iter()
-        .map(|(_, cfg)| cfg.default_step_timeout)
-        .min()
-        .ok_or("retry bounds: no enclosing lane deadline")?;
     let mut streamed_nextest_nodes = 0usize;
+    let mut tightest_nextest_headroom_s = i64::MAX;
     for (_, cfg) in &lane_configs {
         for step in cfg
             .steps
@@ -12198,6 +12328,26 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             .filter(|step| step.cmd.contains("run-nextest-counted.sh"))
         {
             require_live_nextest_output(&step.tag(), &step.cmd)?;
+            let actual_headroom = require_outer_timeout_headroom(
+                &step.tag(),
+                step.timeout,
+                largest_base_nextest_cap_s,
+                NEXTEST_TERMINATION_GRACE_S as u64,
+                1,
+                validated_wall_multiplier,
+            )?;
+            // A 1.5x slow-host factor is the representative non-identity
+            // control. The same helper below receives the actual configured
+            // factor once its external binding is read.
+            require_outer_timeout_headroom(
+                &step.tag(),
+                step.timeout,
+                DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
+                NEXTEST_TERMINATION_GRACE_S as u64,
+                1,
+                1.5,
+            )?;
+            tightest_nextest_headroom_s = tightest_nextest_headroom_s.min(actual_headroom);
             streamed_nextest_nodes += 1;
         }
     }
@@ -12226,53 +12376,54 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             "retry bounds: buffered-output mutation did not fail by node name: {buffered_error}"
         ));
     }
-    let count_error = require_expected_nextest_count(
-        "test.fixture",
-        "./ci/run-nextest-counted.sh -p fixture",
-        7,
-    )
-    .expect_err("missing exact-count declaration mutation must be refused");
+    let count_error =
+        require_expected_nextest_count("test.fixture", "./ci/run-nextest-counted.sh -p fixture", 7)
+            .expect_err("missing exact-count declaration mutation must be refused");
     if !count_error.contains("test.fixture") || !count_error.contains("exactly 7") {
         return Err(format!(
             "retry bounds: exact-count mutation did not fail by node name: {count_error}"
         ));
     }
-    let attempts = validate_runtime::MAX_ATTEMPTS_PER_CELL as i64;
-    let default_with_grace_s = DEFAULT_TEST_CAP_S + NEXTEST_TERMINATION_GRACE_S;
+    let attempts = validate_runtime::MAX_ATTEMPTS_PER_CELL as u64;
+    let default_with_grace_s = i64::try_from(scale_timeout_seconds(
+        DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
+        validated_wall_multiplier,
+        "validated wall multiplier",
+    )?)
+    .map_err(|error| format!("retry bounds: scaled default is too large: {error}"))?
+        + NEXTEST_TERMINATION_GRACE_S;
     let largest_nextest_with_grace_s = largest_nextest_cap_s + NEXTEST_TERMINATION_GRACE_S;
 
     let manifests = ManifestSet::load(root)
         .map_err(|e| format!("retry bounds: cannot load E2E manifests: {e}"))?;
     let mut checked_manifest_nodes = 0usize;
     let mut tightest_manifest_headroom_s = i64::MAX;
-    let mut check_manifest_selection =
-        |tag: &str, node_timeout_s: i64, selection: Selection| -> Result<(), String> {
-            let cells = manifests
-                .select(&selection)
-                .map_err(|e| format!("retry bounds: cannot select cells for {tag}: {e}"))?;
-            let Some(largest_cell_cap_s) = cells
-                .iter()
-                .map(|cell| i64::try_from(cell.timeout_seconds))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("retry bounds: invalid cell timeout for {tag}: {e}"))?
-                .into_iter()
-                .max()
-            else {
-                return Ok(());
-            };
-            let required_s = attempts * (largest_cell_cap_s + MANIFEST_TERMINATION_GRACE_S);
-            let headroom_s = node_timeout_s - required_s;
-            if headroom_s <= 0 {
-                return Err(format!(
-                    "retry bounds: {tag} has a {node_timeout_s}s node timeout but two cell \
-                     attempts can consume {required_s}s ({largest_cell_cap_s}s plus \
-                     {MANIFEST_TERMINATION_GRACE_S}s termination grace each)"
-                ));
-            }
-            checked_manifest_nodes += 1;
-            tightest_manifest_headroom_s = tightest_manifest_headroom_s.min(headroom_s);
-            Ok(())
+    let check_manifest_selection = |tag: &str,
+                                    node_timeout_s: i64,
+                                    selection: &Selection,
+                                    wall_multiplier: f64|
+     -> Result<Option<i64>, String> {
+        let cells = manifests
+            .select(selection)
+            .map_err(|e| format!("retry bounds: cannot select cells for {tag}: {e}"))?;
+        let Some(largest_cell_cap_s) = cells
+            .iter()
+            .map(|cell| cell.timeout_seconds)
+            .into_iter()
+            .max()
+        else {
+            return Ok(None);
         };
+        require_outer_timeout_headroom(
+            tag,
+            node_timeout_s,
+            largest_cell_cap_s,
+            MANIFEST_TERMINATION_GRACE_S as u64,
+            attempts,
+            wall_multiplier,
+        )
+        .map(Some)
+    };
     for (lane, cfg) in &lane_configs {
         for step in cfg
             .steps
@@ -12291,58 +12442,89 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             if manifest_lane != lane {
                 return Err(format!(
                     "retry bounds: manifest node {} records lane {} in the {lane} DAG",
-                    step.tag(), manifest_lane
+                    step.tag(),
+                    manifest_lane
                 ));
             }
-            check_manifest_selection(
-                &format!("{lane}:{}", step.tag()),
-                step.timeout,
-                Selection {
-                    population: Some(Population::Required),
-                    lane: Some((*lane).into()),
-                    category: Some(category.clone()),
-                    ..Default::default()
-                },
-            )?;
+            let tag = format!("{lane}:{}", step.tag());
+            let selection = Selection {
+                population: Some(Population::Required),
+                lane: Some((*lane).into()),
+                category: Some(category.clone()),
+                ..Default::default()
+            };
+            if let Some(headroom_s) =
+                check_manifest_selection(&tag, step.timeout, &selection, validated_wall_multiplier)?
+            {
+                checked_manifest_nodes += 1;
+                tightest_manifest_headroom_s = tightest_manifest_headroom_s.min(headroom_s);
+            }
+            check_manifest_selection(&tag, step.timeout, &selection, 1.5)?;
         }
+    }
+    let quick_selection = Selection {
+        population: Some(Population::Required),
+        lane: Some("portable".into()),
+        mode: Some("verify".into()),
+        backend: Some("ptrace".into()),
+        ..Default::default()
+    };
+    if let Some(headroom_s) = check_manifest_selection(
+        "quick.e2e_verify",
+        QUICK_E2E_VERIFY_TIMEOUT_S,
+        &quick_selection,
+        validated_wall_multiplier,
+    )? {
+        checked_manifest_nodes += 1;
+        tightest_manifest_headroom_s = tightest_manifest_headroom_s.min(headroom_s);
     }
     check_manifest_selection(
         "quick.e2e_verify",
         QUICK_E2E_VERIFY_TIMEOUT_S,
-        Selection {
-            population: Some(Population::Required),
-            lane: Some("portable".into()),
-            mode: Some("verify".into()),
-            backend: Some("ptrace".into()),
-            ..Default::default()
-        },
+        &quick_selection,
+        1.5,
     )?;
+    let oversized_error = require_outer_timeout_headroom(
+        "oversized-multiplier-control",
+        600,
+        118,
+        MANIFEST_TERMINATION_GRACE_S as u64,
+        attempts,
+        10.0,
+    )
+    .expect_err("an oversized multiplier must be refused by the enclosing bound gate");
+    if !oversized_error.contains("wall multiplier 10") {
+        return Err(format!(
+            "retry bounds: oversized-multiplier control failed for the wrong reason: {oversized_error}"
+        ));
+    }
 
     // Non-manifest DAG nodes get one outer execution, with their test framework
     // enforcing its own per-test cap. Manifest retries happen inside one node,
     // so both bounded cell attempts and both cleanup grace periods must fit that
     // node's declared timeout.
     if attempts != 2
-        || nextest_caps.first().copied() != Some(DEFAULT_TEST_CAP_S)
-        || default_with_grace_s >= smallest_enclosing_deadline_s
-        || largest_nextest_with_grace_s >= smallest_enclosing_deadline_s
+        || nextest_caps.first().copied() != Some(default_with_grace_s - NEXTEST_TERMINATION_GRACE_S)
+        || tightest_nextest_headroom_s == i64::MAX
         || checked_manifest_nodes == 0
     {
         return Err(format!(
             "retry bounds: attempts={attempts}; default nextest cap including grace=\
              {default_with_grace_s}s; largest nextest cap including grace=\
              {largest_nextest_with_grace_s}s; checked manifest nodes=\
-             {checked_manifest_nodes}; smallest enclosing lane deadline=\
-             {smallest_enclosing_deadline_s}s"
+             {checked_manifest_nodes}; tightest nextest node headroom=\
+             {tightest_nextest_headroom_s}s"
         ));
     }
     Ok(format!(
         "retry bounds: {streamed_nextest_nodes} nextest node(s) keep test events live; \
          outer DAG nodes run once; default nextest cap including grace=\
          {default_with_grace_s}s and largest nextest cap including grace=\
-         {largest_nextest_with_grace_s}s are below the smallest enclosing lane deadline of \
-         {smallest_enclosing_deadline_s}s; {checked_manifest_nodes} manifest node(s) fit both \
-         cell attempts in one node deadline with at least {tightest_manifest_headroom_s}s left"
+         {largest_nextest_with_grace_s}s leave at least {tightest_nextest_headroom_s}s in every \
+         enclosing nextest node; {checked_manifest_nodes} manifest node(s) fit both cell attempts \
+         at {validated_wall_multiplier}x and 1.5x with at least \
+         {tightest_manifest_headroom_s}s left at {validated_wall_multiplier}x; an oversized factor \
+         is refused"
     ))
 }
 

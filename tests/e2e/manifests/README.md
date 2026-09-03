@@ -54,18 +54,22 @@ gaps remain cells of that one row rather than creating backend-private rows.
 
 ## Schema contract
 
-`defaults.yaml` supplies the global `timeout_seconds`; it is 15 seconds. A
-bucket may override that value with top-level `timeout_seconds` plus a
-non-empty `slow_reason`. An exact `(test, mode, backend)` cell may override the
-inherited value under its mode, again with a reason for the same backend. Cell
-values win over bucket values, and bucket values win over the global default.
-The timeout is manifest policy: runners consume the resolved value and do not
-carry a fallback constant.
+`defaults.yaml` supplies independent global bounds: 22 CPU seconds and 57 wall
+seconds. A bucket may override the wall value with top-level `timeout_seconds`
+plus a non-empty `slow_reason`. An exact `(test, mode, backend)` exception must
+declare `cpu_timeout_seconds`, `timeout_seconds`, and `slow_reason` for the same
+backend. Cell wall values win over bucket wall values, and bucket values win
+over the global wall default. Runners consume the resolved values and do not
+carry fallback timeout literals.
 
-The same defaults document records the named nextest exceptions. Nextest still
-requires its native TOML syntax at execution time, so validation requires
-`.config/nextest.toml` to carry the same 15-second default, filters, values, and
-reasons.
+Nextest still requires its native TOML syntax at execution time, so validation
+requires `.config/nextest.toml` to carry the same 57-second base wall bound.
+The counted wrapper supplies a temporary parsed TOML configuration with the
+`HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER` value applied; it never rewrites the
+checked-in file. The manifest runner independently applies
+`HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER` and
+`HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER`; unset values mean `1`, and invalid values
+refuse before a cell starts.
 
 ```yaml
 schema: 3
@@ -75,9 +79,11 @@ test:
     modes:
       verify:
         timeout_seconds:
-          ptrace: 30
+          ptrace: 91
+        cpu_timeout_seconds:
+          ptrace: 32
         slow_reason:
-          ptrace: Three complete validation runs measured this cell above 15 seconds.
+          ptrace: Retained p90 measurements require the explicit CPU/wall pair.
 ```
 
 Every entry under `test` names either a repo-relative `program` or a `direct` shell
