@@ -193,17 +193,39 @@ echo
 echo "--- Step 3: chaos fixed, --sched-seed $CRASH_SEED (expect clean) ---"
 FIXED_IMG="$ARTIFACTS/chaos-fixed.img"
 fresh_image "$FIXED_IMG"
-if chaos_convert "$FIXED" "$CRASH_SEED" "$FIXED_IMG" "$ARTIFACTS/chaos-fixed.out"; then
-  echo "chaos fixed: clean exit on the crashing seed (73e211a7 closes the window)"
-else
-  rc=$?
-  if grep -qaE 'AddressSanitizer: heap-use-after-free' "$ARTIFACTS/chaos-fixed.out"; then
-    echo "regression: fixed variant reproduced the UAF" >&2
-    exit 1
-  fi
-  echo "chaos fixed: non-crash exit rc=$rc (no UAF; likely the slow-schedule" \
-       "timeout, not the bug)"
+# This control is the whole differential: without a fixed run that BOTH
+# completed and stayed clean, Step 2's crash shows only that the bug exists, not
+# that the fix closes it. Two earlier holes let it pass without showing that.
+#
+# The exit status was trusted on its own, so a fixed run that exited 0 while
+# printing an ASAN use-after-free was called clean -- the report was never read
+# on the success path. And any nonzero exit without the ASAN string was accepted
+# as a "non-crash": that swallowed timeout 124, safehermit's cap 125, an exec
+# failure and any environment failure, none of which ran the control to
+# completion. Both were demonstrated reaching "Demo 08: SUCCESS" with outer rc=0.
+#
+# So read the output FIRST, which covers a UAF at any exit status, and only then
+# require completion. A control that did not finish is a refusal, not a pass.
+fixed_rc=0
+chaos_convert "$FIXED" "$CRASH_SEED" "$FIXED_IMG" "$ARTIFACTS/chaos-fixed.out" \
+  || fixed_rc=$?
+if grep -qaE 'AddressSanitizer: heap-use-after-free' "$ARTIFACTS/chaos-fixed.out"; then
+  echo "regression: the fixed variant reported a use-after-free (rc=$fixed_rc)" >&2
+  echo "the fix does not close the window on seed $CRASH_SEED" >&2
+  exit 1
 fi
+if [ "$fixed_rc" -ne 0 ]; then
+  echo "the fixed control did not complete: rc=$fixed_rc, no UAF reported" >&2
+  case "$fixed_rc" in
+    124) echo "rc=124 is the ${TIMEOUT}s timeout: the control was cut off" >&2 ;;
+    125) echo "rc=125 is a safehermit bound, not a guest result" >&2 ;;
+    *)   echo "rc=$fixed_rc is an execution or environment failure" >&2 ;;
+  esac
+  echo "a control that did not run to completion cannot show the fix closed the" >&2
+  echo "window, so this refuses rather than accepting it as a non-crash" >&2
+  exit 1
+fi
+echo "chaos fixed: completed rc=0 with no UAF report (73e211a7 closes the window)"
 echo
 
 # --- Step 4: the chaos crash replays byte-for-byte ----------------------------
