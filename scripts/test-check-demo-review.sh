@@ -233,5 +233,17 @@ run_range "$r" 1
 check "another demo's non-green result does not invalidate scoped evidence" 0 "$RC" "$OUT"
 rm -rf "$r"
 
+# 20. A bad historical trailer does not poison a later independent review.
+r=$(new_repo)
+commit_demo "$r" demos/06-f.py v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 6
+
+Demo-Green-Review: reviewer=implementer demo=demos/06-f.py result=GREEN evidence=self.log"
+git -C "$r" commit -q --allow-empty -m "independent review
+
+Demo-Green-Review: reviewer=other demo=demos/06-f.py result=GREEN evidence=review.log"
+run_range "$r" 2
+check "later independent review supersedes bad historical trailer" 0 "$RC" "$OUT"
+rm -rf "$r"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

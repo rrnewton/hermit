@@ -17,7 +17,7 @@ An adversarial reviewer who has **run the touched demo(s) to a GREEN result**
 records a commit-message trailer (in any commit of the PR / landing commit):
 
 ```
-Demo-Green-Review: reviewer=<agent-id> demo=<demos/path|all> result=GREEN evidence=<url|path|sha>
+Demo-Green-Review: reviewer=<agent-id> demo=<demos/path[,demos/path...]|all> result=GREEN evidence=<url|path|sha>
 ```
 
 - `reviewer=` — the reviewing agent, which **must differ from the implementer**
