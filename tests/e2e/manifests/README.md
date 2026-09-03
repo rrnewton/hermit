@@ -251,6 +251,55 @@ Callers that combine explicit mode/backend filters with CI policy must add
 `--ci-only`. This is how `scripts/validate.rs quick` avoids expanding the manual C
 inventory.
 
+## Running one cell
+
+`test-harness` is the canonical manifest cell runner. Select all three parts of
+the cell identity explicitly when reproducing CI behavior:
+
+```sh
+target/debug/test-harness run \
+  --test system-utils/example-devrand --mode verify --backend ptrace
+```
+
+Add `--lane portable --ci-only --prebuilt` when reproducing a portable CI node
+against fixtures from `test-harness build`. The runner owns manifest selection,
+host-capability checks, CPU and wall limits, retries, and JSONL/JUnit results.
+
+`tests/manifest-cli.rs` is the interactive inventory and command renderer. Use
+`list` to find a test and `get` to inspect the direct Hermit command:
+
+```sh
+./tests/manifest-cli.rs list --bucket system-utils
+./tests/manifest-cli.rs get system-utils/example-devrand \
+  --mode verify --backend ptrace --lane portable
+```
+
+Its `run` subcommand can inject extra Hermit flags after `--`, which is useful
+when debugging Hermit itself, but it does not provide the test harness's typed
+results, retry policy, or aggregate CPU accounting. Therefore it is not the
+canonical reproduction command even though it can launch the same guest.
+
+To run the cell through one existing validation node, keeping that node's
+boxing and limits, use the node wrapper. This path assumes its build artifacts
+already exist and reports iteration evidence only:
+
+```sh
+./ci/run-node.sh portable e2e.manifest_system_utils -- \
+  --test system-utils/example-devrand --mode verify --backend ptrace
+```
+
+For the heavier validation-owned requalification path, including its declared
+preparation and evidence checks, use:
+
+```sh
+./scripts/validate.rs --requalify-cell \
+  system-utils/example-devrand verify ptrace \
+  --allow-local-off-the-record-run --no-label-pr
+```
+
+That focused validation is intentionally not suite-complete and cannot publish
+a whole-suite validation receipt.
+
 ## Inventory and validation
 
 `inventory/test-files.json` classifies every regular file and symlink below
