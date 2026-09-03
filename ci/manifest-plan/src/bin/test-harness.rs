@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
+use std::process::Output;
 use std::process::Stdio;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -41,6 +43,7 @@ use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
 const EXPECTED_PLAN_SCHEMA: u64 = 1;
+const VALIDATE_AUDIT_JOBS: usize = 2;
 const DEFAULT_BUILD_JOBS: usize = 16;
 
 const HELP: &str = "\
@@ -557,42 +560,45 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
     // the expected-plan comparison during the shell removal.
     audit_dag_correspondence(root, manifests).unwrap_or_else(|error| fail(error));
     audit_budget_ordering(root).unwrap_or_else(|error| fail(error));
-    run_audit(
-        root,
-        &root.join("target/debug/generate-test-footprints"),
-        &["--check"],
-    );
-    run_audit(
-        root,
-        &root.join("tests/backend-parity/split_asymmetric_pr.py"),
-        &["--self-test"],
-    );
     audit_determinism_stress_evidence(root);
-    run_audit(root, &root.join("tests/manifest-cli.rs"), &["self-test"]);
-    // The DBT budget wrapper gates roughly twenty portable nodes and fails
-    // CLOSED on a pin it is not calibrated for. Nothing else notices: a
-    // truncated node reads like a fast one. This asserts end to end that the
-    // wrapper still REACHES its wrapped command at the recorded pin.
-    run_audit(
+    // These self-contained audits read the same checked-out tree but keep all
+    // generated state in their own temporary directories. Run no more than two
+    // at once: two is the largest clean concurrent validation width established
+    // on this host, and a wider unmeasured default would turn this speed change
+    // into a new concurrency assumption. Capture each child independently and
+    // replay it in the original order so diagnostics remain attributable.
+    run_audits_parallel(
         root,
-        &root.join("ci/run-with-reverie-dbt-budget-test.sh"),
-        &[],
+        &[
+            (
+                root.join("target/debug/generate-test-footprints"),
+                vec!["--check"],
+            ),
+            (
+                root.join("tests/backend-parity/split_asymmetric_pr.py"),
+                vec!["--self-test"],
+            ),
+            (root.join("tests/manifest-cli.rs"), vec!["self-test"]),
+            // The DBT budget wrapper gates roughly twenty portable nodes and
+            // fails CLOSED on a pin it is not calibrated for. Nothing else
+            // notices: a truncated node reads like a fast one. This asserts end
+            // to end that the wrapper still REACHES its wrapped command at the
+            // recorded pin.
+            (root.join("ci/run-with-reverie-dbt-budget-test.sh"), vec![]),
+            (
+                root.join("ci/compat-envelope/scorecard.rs"),
+                vec!["self-test-and-check"],
+            ),
+            (
+                root.join("ci/compat-envelope/pressure-test.rs"),
+                vec!["self-test"],
+            ),
+            // The removed shell front door accumulated plan/scheduler/receipt
+            // guards that now belong to the Rust validate driver. Exercise
+            // those brackets without executing the validation DAG.
+            (root.join("scripts/validate.rs"), vec!["--self-test"]),
+        ],
     );
-    run_audit(
-        root,
-        &root.join("ci/compat-envelope/scorecard.rs"),
-        &["self-test-and-check"],
-    );
-    run_audit(
-        root,
-        &root.join("ci/compat-envelope/pressure-test.rs"),
-        &["self-test"],
-    );
-    // The removed shell front door accumulated plan/scheduler/receipt guards
-    // that now belong to the Rust validate driver.  Exercise those brackets
-    // here without executing the validation DAG; otherwise deleting the shell
-    // would also silently delete its protection against incomplete plans.
-    run_audit(root, &root.join("scripts/validate.rs"), &["--self-test"]);
     audit_cli_brackets(root);
     let cells = audit_expected_plan(root, manifests);
     println!(
@@ -893,6 +899,69 @@ fn run_audit(root: &Path, program: &Path, args: &[&str]) {
         }
         fail(format!("{} {} failed", program.display(), args.join(" ")));
     }
+}
+
+fn run_audits_parallel(root: &Path, audits: &[(PathBuf, Vec<&str>)]) {
+    let mut results = std::iter::repeat_with(|| None)
+        .take(audits.len())
+        .collect::<Vec<Option<Result<Output, String>>>>();
+    for_each_parallel(
+        audits.len(),
+        ScheduledWorkerCapacity::new(VALIDATE_AUDIT_JOBS),
+        |index, emit| {
+            let (program, args) = &audits[index];
+            let result = Command::new(program)
+                .args(args)
+                .current_dir(root)
+                .output()
+                .map_err(|error| format!("cannot execute {}: {error}", program.display()));
+            let _ = emit(result, false);
+        },
+        |index, result, _| {
+            results[index] = Some(result);
+            true
+        },
+    );
+
+    for ((program, args), result) in audits.iter().zip(results) {
+        let output = result
+            .expect("every validation audit worker returns one result")
+            .unwrap_or_else(|error| fail(error));
+        std::io::stdout()
+            .write_all(&output.stdout)
+            .unwrap_or_else(|error| {
+                fail(format!(
+                    "cannot replay {} stdout: {error}",
+                    program.display()
+                ))
+            });
+        std::io::stderr()
+            .write_all(&output.stderr)
+            .unwrap_or_else(|error| {
+                fail(format!(
+                    "cannot replay {} stderr: {error}",
+                    program.display()
+                ))
+            });
+        if !output.status.success() {
+            if output.status.code() == Some(127) {
+                fail(format!(
+                    "cannot run {}: exited 127, which means its interpreter was not found, \
+                     not that the audit failed. This program runs under \
+                     `#!/usr/bin/env -S rust-script --force`; install it with \
+                     `cargo install rust-script` or put it on PATH (on a dev box it is \
+                     usually ~/.cargo/bin, which a non-login shell does not inherit).",
+                    program.display()
+                ));
+            }
+            fail(format!("{} {} failed", program.display(), args.join(" ")));
+        }
+    }
+    println!(
+        "test-harness: completed {} independent validation audits with up to {} concurrent workers",
+        audits.len(),
+        VALIDATE_AUDIT_JOBS.min(audits.len())
+    );
 }
 
 fn audit_determinism_stress_evidence(root: &Path) {
