@@ -185,5 +185,53 @@ printf '%s' "$OUT" | grep -q 'demos/08-h.sh' \
     || { echo "FAIL: message should name uncovered Demo 8"; fail=$((fail + 1)); }
 rm -rf "$r"
 
+# 16. A reviewer cannot attest its own implementation.
+r=$(new_repo)
+commit_demo "$r" demos/06-f.py v1 "[hermit2, directives, unresolved, host, role=impl] touch demo 6
+
+Demo-Green-Review: reviewer=directives demo=demos/06-f.py result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "reviewer equal to role=impl identity fails" 1 "$RC" "$OUT"
+printf '%s' "$OUT" | grep -q 'reviewer=directives is also the role=impl identity' \
+    || { echo "FAIL: message should identify the self-review"; fail=$((fail + 1)); }
+rm -rf "$r"
+
+# 17. A GREEN trailer cannot cover a demo whose only reported result is PARTIAL.
+r=$(new_repo)
+commit_demo "$r" demos/05-e.py v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 5
+
+demo 5 wired: FIRST RUN SAVED, PARTIAL
+demo 5 unwired: FIRST RUN SAVED, PARTIAL
+
+Demo-Green-Review: reviewer=other demo=all result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "GREEN contradicted by body PARTIAL result fails" 1 "$RC" "$OUT"
+printf '%s' "$OUT" | grep -q "contradicts the body's reported result" \
+    || { echo "FAIL: message should identify the contradictory result"; fail=$((fail + 1)); }
+rm -rf "$r"
+
+# 18. A deliberate failing check does not contradict a later successful real run.
+r=$(new_repo)
+commit_demo "$r" demos/06-f.py v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 6
+
+demo 6 forced cap: FAILURE
+demo 6 wired: FIRST RUN SAVED, SUCCESS, SUCCESS
+
+Demo-Green-Review: reviewer=other demo=demos/06-f.py result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "distinct reviewer with successful real run passes" 0 "$RC" "$OUT"
+rm -rf "$r"
+
+# 19. A non-green result for another demo does not invalidate scoped evidence.
+r=$(new_repo)
+commit_demo "$r" demos/06-f.py v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 6
+
+demo 5 wired: FIRST RUN SAVED, PARTIAL
+
+Demo-Green-Review: reviewer=other demo=demos/06-f.py result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "another demo's non-green result does not invalidate scoped evidence" 0 "$RC" "$OUT"
+rm -rf "$r"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
