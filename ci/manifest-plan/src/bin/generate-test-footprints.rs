@@ -28,6 +28,12 @@ const OUTPUT: &str = "ci/test-footprints.json";
 const DAG: &str = "ci/dag/portable.json";
 const REGENERATE: &str = "cargo run -p hermit-manifest-plan --bin generate-test-footprints";
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Args {
+    check: bool,
+    stdout: bool,
+}
+
 #[derive(Debug)]
 struct Package {
     name: String,
@@ -554,34 +560,38 @@ fn render(root: &Path) -> String {
     rendered
 }
 
-fn main() -> ExitCode {
-    let root = repo_root();
-    let generated = render(&root);
-    let mut check = false;
-    let mut stdout = false;
-    for argument in env::args().skip(1) {
+fn parse_args(arguments: impl Iterator<Item = String>) -> Option<Args> {
+    let mut args = Args::default();
+    for argument in arguments {
         match argument.as_str() {
-            "--check" => check = true,
-            "--stdout" => stdout = true,
-            "-h" | "--help" => {
-                println!(
-                    "Usage: generate-test-footprints [--check | --stdout]\n\n\
-                     With no option, writes {OUTPUT}. --check fails if it is stale."
-                );
-                return ExitCode::SUCCESS;
-            }
+            "--check" => args.check = true,
+            "--stdout" => args.stdout = true,
+            "-h" | "--help" => return None,
             _ => die(format!("unknown argument `{argument}`")),
         }
     }
-    if check && stdout {
+    if args.check && args.stdout {
         die("--check and --stdout are mutually exclusive");
     }
-    if stdout {
+    Some(args)
+}
+
+fn main() -> ExitCode {
+    let Some(args) = parse_args(env::args().skip(1)) else {
+        println!(
+            "Usage: generate-test-footprints [--check | --stdout]\n\n\
+             With no option, writes {OUTPUT}. --check fails if it is stale."
+        );
+        return ExitCode::SUCCESS;
+    };
+    let root = repo_root();
+    let generated = render(&root);
+    if args.stdout {
         print!("{generated}");
         return ExitCode::SUCCESS;
     }
     let output = root.join(OUTPUT);
-    if check {
+    if args.check {
         let current = fs::read_to_string(&output).unwrap_or_default();
         if current != generated {
             eprintln!("generate-test-footprints: {OUTPUT} is stale; run `{REGENERATE}`");
@@ -599,6 +609,11 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_arguments_still_select_artifact_write() {
+        assert_eq!(parse_args(std::iter::empty()), Some(Args::default()));
+    }
 
     fn package(name: &str, dependencies: &[&str]) -> Package {
         Package {

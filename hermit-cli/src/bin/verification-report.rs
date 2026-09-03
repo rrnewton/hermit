@@ -12,6 +12,18 @@ use std::process::ExitCode;
 use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
 
+const HELP: &str = "\
+Usage: verification-report <REQUIREMENT> <PATH>
+
+Read a current Hermit --verify-json report through the producer-owned schema.
+
+Requirements:
+  matched          Require a typed matched verdict
+  canonical-match  Require a typed match under the canonical comparison policy
+
+Options:
+  -h, --help       Print this help";
+
 fn refuse(message: impl std::fmt::Display) -> ExitCode {
     eprintln!("verification-report: REFUSED: {message}");
     ExitCode::from(2)
@@ -55,7 +67,12 @@ fn require_match(report: &VerificationReport) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if matches!(arguments.as_slice(), [flag] if matches!(flag.as_str(), "-h" | "--help")) {
+        println!("{HELP}");
+        return ExitCode::SUCCESS;
+    }
+    let mut args = arguments.into_iter();
     let Some(requirement) = args.next() else {
         return refuse("usage: verification-report matched|canonical-match PATH");
     };

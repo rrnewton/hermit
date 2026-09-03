@@ -22,6 +22,7 @@ use hermit_manifest_plan::ci_selection::CiDisabledReasonData;
 use hermit_manifest_plan::ci_selection::CiDisabledReasonSpec;
 use hermit_manifest_plan::ci_selection::CiSelection;
 use hermit_manifest_plan::ci_selection::CiSelectionSpec;
+use hermit_manifest_plan::cli_help::is_help_flag;
 #[cfg(test)]
 use hermit_manifest_plan::runner::REQUIRES_VOCABULARY;
 use hermit_manifest_plan::runner::requires_capability;
@@ -45,6 +46,16 @@ const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
 const CI_REASON_BASELINE: &str = "ci/ci-reason-baseline.json";
 const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
+
+const HELP: &str = "\
+Usage: hermit-manifest-plan [--format <FORMAT>]
+
+Validate the centralized end-to-end manifests and print their expanded plan.
+
+Options:
+  --format <FORMAT>  Output format: text, json, matrix-json, harness-json, or
+                     host-requirements (default: text)
+  -h, --help         Print this help";
 
 /// Every `(capability, test-id)` pair whose manifest token has a reviewed
 /// absence proof. This reads declarations only; the machine probe is separate.
@@ -131,9 +142,14 @@ fn die(msg: impl std::fmt::Display) -> ! {
     panic!("manifest-plan: {msg}");
 }
 
-fn parse_format() -> Format {
+fn parse_format() -> Option<Format> {
     let mut format = Format::Text;
-    let mut args = std::env::args().skip(1);
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if matches!(arguments.as_slice(), [flag] if is_help_flag(flag)) {
+        println!("{HELP}");
+        return None;
+    }
+    let mut args = arguments.into_iter();
     while let Some(arg) = args.next() {
         let value = if arg == "--format" {
             args.next()
@@ -152,11 +168,13 @@ fn parse_format() -> Format {
             _ => die(format!("unknown format: {value}")),
         };
     }
-    format
+    Some(format)
 }
 
 fn main() {
-    let format = parse_format();
+    let Some(format) = parse_format() else {
+        return;
+    };
     let script_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/manifests");
     let repo_root = script_dir.join("../../..");
 

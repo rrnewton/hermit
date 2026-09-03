@@ -14,6 +14,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use hermit_manifest_plan::cli_help::is_help_flag;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
@@ -197,6 +198,19 @@ struct Args {
     accepted: PathBuf,
 }
 
+const HELP: &str = "\
+Usage: strict-green-authority --claims <PATH> --evidence-root <DIR>
+                              --expected-sha <SHA> --accepted <PATH>
+
+Verify strict-green claims against retained evidence and write the accepted records.
+
+Options:
+  --claims <PATH>        JSON claims document to verify
+  --evidence-root <DIR>  Root containing the claimed evidence files
+  --expected-sha <SHA>   Exact 40-hex Hermit commit expected in every claim
+  --accepted <PATH>      JSON output for accepted strict-green records
+  -h, --help             Print this help";
+
 fn main() -> ExitCode {
     match real_main() {
         Ok(()) => ExitCode::SUCCESS,
@@ -208,7 +222,12 @@ fn main() -> ExitCode {
 }
 
 fn real_main() -> Result<(), String> {
-    let args = parse_args(std::env::args().skip(1))?;
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if matches!(arguments.as_slice(), [flag] if is_help_flag(flag)) {
+        println!("{HELP}");
+        return Ok(());
+    }
+    let args = parse_args(arguments.into_iter())?;
     if args.claims == args.accepted {
         return Err("--claims and --accepted must be different paths".into());
     }

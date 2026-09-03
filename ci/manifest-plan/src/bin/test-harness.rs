@@ -13,6 +13,7 @@ use std::thread;
 
 use dagrun::TestResult;
 use dagrun::TestResults;
+use hermit_manifest_plan::cli_help::is_help_flag;
 use hermit_manifest_plan::runner::CellResult;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
@@ -40,6 +41,57 @@ use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
 const EXPECTED_PLAN_SCHEMA: u64 = 1;
+
+const HELP: &str = "\
+Usage: test-harness <COMMAND> [OPTIONS]
+
+Validate, inspect, build, and run the centralized Hermit end-to-end manifests.
+
+Commands:
+  validate                         Validate manifests and their CI/DAG correspondence
+  plan                             List selected required cells
+  expected-plan                    Print the expected CI plan as JSON
+  audit-gaps                       List selected disabled cells
+  audit-inventory                  Validate the manifest-owned test inventory
+  audit-test-binary-registration   Validate test binary registration
+  audit-test-footprints            Check the generated test footprints
+  audit-ci                         Audit DAG, budget, and expected-plan correspondence
+  build                            Prepare selected test programs
+  audit-compile                    Compile selected C test programs
+  run                              Execute selected cells
+
+Selection options:
+  --lane <portable|privileged>
+  --category <CATEGORY>
+  --test <ID>
+  --mode <verify|chaos|replay|naked|custom>
+  --backend <ptrace|dbt|kvm|sabre|liteinst>
+  --ci-only                        Select required CI cells
+  --include-occasional             Include occasional cells
+  --include-manual                 Include manual cells; requires exact test and mode
+  --probe-disabled                 Run one exact disabled cell
+
+Execution and output options:
+  --prebuilt                       Reuse prepared test programs (run only)
+  --allow-empty                    Permit an empty explicit CI selection
+  --results <PATH>                 Write JSONL cell results to PATH
+  --junit <PATH>                   Write JUnit output to PATH
+  --format <text|json>             Plan output format (default: text)
+  --jobs <N>                       Run at most N cells concurrently (run only)
+  -h, --help                       Print this help
+
+Environment:
+  E2E_RESULT_ROOT=<PATH>                 Result root (default: ignored/e2e)
+  E2E_BUILD_ROOT=<PATH>                  Prepared-program build root
+  E2E_RUN_ID=<ID>                        Run identifier and result subdirectory
+  E2E_RUN_INDEX=<N>                      Non-negative run index recorded in results
+  E2E_MACHINE_SHORTNAME=<NAME>           Machine name recorded in results
+  E2E_KERNEL_VERSION=<VERSION>           Kernel version recorded in results
+  HERMIT_BIN=<PATH>                      Hermit executable (default: target/debug/hermit)
+  HERMIT_E2E_EMPTY_WORKDIR=/test         Use the isolated /test working directory
+  E2E_KEEP_VERIFY_LOGS=1                 Retain successful verification logs
+  HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER=<N> Positive finite CPU-time multiplier
+  HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER=<N> Positive finite wall-time multiplier";
 
 fn fail(message: impl std::fmt::Display) -> ! {
     eprintln!("test-harness: {message}");
@@ -309,8 +361,15 @@ fn validate_args(command: &str, args: &Args) {
 }
 
 fn main() -> ExitCode {
-    let mut values = std::env::args().skip(1);
-    let command = values.next().unwrap_or_else(|| fail("missing command"));
+    let values = std::env::args().skip(1).collect::<Vec<_>>();
+    if matches!(values.as_slice(), [flag] if is_help_flag(flag)) {
+        println!("{HELP}");
+        return ExitCode::SUCCESS;
+    }
+    let mut values = values.into_iter();
+    let command = values
+        .next()
+        .unwrap_or_else(|| fail("missing command; try `test-harness --help`"));
     let values = values.collect::<Vec<_>>();
     if command == "expected-plan" && !values.is_empty() {
         fail("expected-plan accepts no options");
