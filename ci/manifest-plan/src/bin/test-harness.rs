@@ -44,6 +44,7 @@ use serde_yaml::Value as YamlValue;
 
 const EXPECTED_PLAN_SCHEMA: u64 = 1;
 const VALIDATE_AUDIT_JOBS: usize = 2;
+const PREBUILT_RUST_SCRIPTS_REQUIRED: &str = "HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED";
 const DEFAULT_BUILD_JOBS: usize = 16;
 
 const HELP: &str = "\
@@ -562,11 +563,19 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
     audit_budget_ordering(root).unwrap_or_else(|error| fail(error));
     audit_determinism_stress_evidence(root);
     // These self-contained audits read the same checked-out tree but keep all
-    // generated state in their own temporary directories. Run no more than two
-    // at once: two is the largest clean concurrent validation width established
-    // on this host, and a wider unmeasured default would turn this speed change
-    // into a new concurrency assumption. Capture each child independently and
-    // replay it in the original order so diagnostics remain attributable.
+    // generated state in their own temporary directories. The validation DAG
+    // supplies immutable prebuilt rust-script binaries; without that guarantee,
+    // retain the old serial order instead of making rust-script compilers contend
+    // for their shared cache. Run no more than two at once: two is the largest
+    // clean concurrent validation width established on this host, and a wider
+    // unmeasured default would turn this speed change into a new concurrency
+    // assumption. Capture each child independently and replay it in the original
+    // order so diagnostics remain attributable.
+    let audit_jobs = if std::env::var(PREBUILT_RUST_SCRIPTS_REQUIRED).as_deref() == Ok("1") {
+        VALIDATE_AUDIT_JOBS
+    } else {
+        1
+    };
     run_audits_parallel(
         root,
         &[
@@ -598,6 +607,7 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
             // those brackets without executing the validation DAG.
             (root.join("scripts/validate.rs"), vec!["--self-test"]),
         ],
+        audit_jobs,
     );
     audit_cli_brackets(root);
     let cells = audit_expected_plan(root, manifests);
@@ -901,13 +911,13 @@ fn run_audit(root: &Path, program: &Path, args: &[&str]) {
     }
 }
 
-fn run_audits_parallel(root: &Path, audits: &[(PathBuf, Vec<&str>)]) {
+fn run_audits_parallel(root: &Path, audits: &[(PathBuf, Vec<&str>)], jobs: usize) {
     let mut results = std::iter::repeat_with(|| None)
         .take(audits.len())
         .collect::<Vec<Option<Result<Output, String>>>>();
     for_each_parallel(
         audits.len(),
-        ScheduledWorkerCapacity::new(VALIDATE_AUDIT_JOBS),
+        ScheduledWorkerCapacity::new(jobs),
         |index, emit| {
             let (program, args) = &audits[index];
             let result = Command::new(program)
@@ -960,7 +970,7 @@ fn run_audits_parallel(root: &Path, audits: &[(PathBuf, Vec<&str>)]) {
     println!(
         "test-harness: completed {} independent validation audits with up to {} concurrent workers",
         audits.len(),
-        VALIDATE_AUDIT_JOBS.min(audits.len())
+        jobs.min(audits.len())
     );
 }
 

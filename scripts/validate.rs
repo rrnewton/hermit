@@ -6434,7 +6434,7 @@ fn rust_script_producer_step() -> Step {
         900,
         2 * 1024 * 1024 * 1024,
     );
-    step.description = "Discovers every tracked rust-script entrypoint, runs the existing clippy contract, and publishes release executables plus test harnesses. It runs after checkout and pin verification; every compiling consumer resolves rust-script through the read-only manifest, so compilation cost cannot migrate according to scheduler order.".into();
+    step.description = "Discovers every tracked rust-script entrypoint, generates one Cargo workspace, runs the existing clippy, release-build, and test-harness phases over that workspace, and publishes the executables. Cargo schedules packages and shared dependencies internally while the producer remains the only writer. It runs after checkout and pin verification; every compiling consumer resolves rust-script through the read-only manifest, so compilation cost cannot migrate according to scheduler order.".into();
     step.hint.classification = dagrun::model::StepClass::CpuBound;
     step.hint.preferred_inner_jobs = Some(8);
     step.jobs_flag = Some(String::new());

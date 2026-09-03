@@ -248,8 +248,10 @@ if ! cargo clippy -V >"$packages/clippy-version.out" 2>&1; then
     exit 2
 fi
 
+keys=()
 for source in "${entrypoints[@]}"; do
     key=$(printf '%s' "$source" | sha256sum | cut -c1-16)
+    keys+=("$key")
     package_dir=$packages/$key
     output=$packages/$key.output
     if ! "$real_rust_script" --package --pkg-path "$package_dir" "$source" >"$output" 2>&1; then
@@ -257,37 +259,87 @@ for source in "${entrypoints[@]}"; do
         cat "$output" >&2
         exit 2
     fi
-    # validate deliberately keeps TMPDIR under target/validation so its cleanup
-    # owns every temporary file. Cargo then walks upward from this generated
-    # manifest, finds the repository workspace, and refuses the package because
-    # it is not a workspace member. Make the generated package its own workspace;
-    # rust-script does not emit this table itself.
-    if ! grep -qE '^\[workspace([.]|])' "$package_dir/Cargo.toml"; then
-        printf '\n[workspace]\n' >>"$package_dir/Cargo.toml"
-    fi
-    if ! package_name=$(cargo metadata --format-version 1 --no-deps \
-        --manifest-path "$package_dir/Cargo.toml" 2>"$output" | jq -er '.packages | if length == 1 then .[0].targets[] | select(.kind == ["bin"]) | .name else empty end'); then
-        printf 'prepare-rust-scripts: cannot identify generated binary target for %s\n' "$source" >&2
-        cat "$output" >&2
-        exit 2
-    fi
-    [[ -n $package_name ]] || {
-        printf 'prepare-rust-scripts: generated package for %s has no unique binary target\n' "$source" >&2
-        exit 2
-    }
+done
 
-    if ! cargo clippy --manifest-path "$package_dir/Cargo.toml" --target-dir "$build_target" \
-        -- -D warnings "${CLIPPY_WAIVERS[@]}" >"$output" 2>&1; then
-        report_cargo_failure "$source" "$package_dir/Cargo.toml" "$output" \
-            'check with clippy' || exit $?
+# Resolve the generated packages together. Each script remains a separate Cargo
+# package with its own dependency declaration, while one workspace lockfile
+# stops Cargo from resolving the same registry and git graph once per script.
+# Keep the single outer flock above: this is one writer using Cargo's internal
+# parallelism, not competing writers racing the published directory.
+workspace_manifest=$packages/Cargo.toml
+{
+    printf '[workspace]\nresolver = "2"\nmembers = [\n'
+    printf '  "%s",\n' "${keys[@]}"
+    printf ']\n\n[profile.release]\nstrip = true\n'
+} >"$workspace_manifest"
+metadata=$packages/metadata.json
+output=$packages/workspace.output
+if ! cargo metadata --format-version 1 --no-deps --manifest-path "$workspace_manifest" \
+    >"$metadata" 2>"$output"; then
+    printf 'prepare-rust-scripts: cannot resolve the generated workspace\n' >&2
+    cat "$output" >&2
+    exit 2
+fi
+package_count=$(jq -er '.packages | length' "$metadata") || exit 2
+if ((package_count != ${#entrypoints[@]})); then
+    printf 'prepare-rust-scripts: generated workspace has %d packages, expected %d\n' \
+        "$package_count" "${#entrypoints[@]}" >&2
+    exit 2
+fi
+
+package_names=()
+test_package_args=()
+for index in "${!entrypoints[@]}"; do
+    source=${entrypoints[$index]}
+    key=${keys[$index]}
+    package_dir=$packages/$key
+    package_manifest=$(realpath -- "$package_dir/Cargo.toml")
+    if ! package_name=$(jq -er --arg manifest "$package_manifest" '
+        [.packages[] | select(.manifest_path == $manifest)
+         | .targets[] | select(.kind == ["bin"]) | .name]
+        | if length == 1 then .[0] else empty end
+    ' "$metadata"); then
+        printf 'prepare-rust-scripts: cannot identify generated binary target for %s\n' "$source" >&2
+        exit 2
     fi
-    cat "$output"
-    if ! cargo build --release --manifest-path "$package_dir/Cargo.toml" \
-        --target-dir "$build_target" >"$output" 2>&1; then
-        report_cargo_failure "$source" "$package_dir/Cargo.toml" "$output" \
-            'build release executable for' || exit $?
+    package_names+=("$package_name")
+    if grep -q '#\[cfg(test)\]' -- "$source"; then
+        test_package_args+=(--package "$package_name")
     fi
-    cat "$output"
+done
+
+# One Cargo invocation per phase keeps its internal dependency graph intact, so
+# common dependencies compile once and Cargo chooses the safe parallel width.
+# The outer flock still makes this the only writer to the persistent target and
+# published directories.
+output=$packages/workspace.output
+if ! cargo clippy --manifest-path "$workspace_manifest" --workspace \
+    --target-dir "$build_target" \
+    -- -D warnings "${CLIPPY_WAIVERS[@]}" >"$output" 2>&1; then
+    report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
+        'check with clippy' || exit $?
+fi
+cat "$output"
+if ! cargo build --release --manifest-path "$workspace_manifest" --workspace \
+    --target-dir "$build_target" >"$output" 2>&1; then
+    report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
+        'build release executables for' || exit $?
+fi
+cat "$output"
+
+test_json=$packages/tests.jsonl
+if ! cargo test --no-run --message-format=json \
+    --manifest-path "$workspace_manifest" "${test_package_args[@]}" \
+    --target-dir "$build_target" >"$test_json" 2>"$output"; then
+    report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
+        'build test harnesses for' || exit $?
+fi
+cat "$output"
+
+for index in "${!entrypoints[@]}"; do
+    source=${entrypoints[$index]}
+    key=${keys[$index]}
+    package_name=${package_names[$index]}
     run_source=$build_target/release/$package_name
     [[ -x $run_source ]] || {
         printf 'prepare-rust-scripts: release binary missing for %s: %s\n' "$source" "$run_source" >&2
@@ -299,13 +351,6 @@ for source in "${entrypoints[@]}"; do
 
     test_rel=-
     if grep -q '#\[cfg(test)\]' -- "$source"; then
-        test_json=$packages/$key.test.jsonl
-        if ! cargo test --no-run --message-format=json \
-            --manifest-path "$package_dir/Cargo.toml" --target-dir "$build_target" \
-            >"$test_json" 2>"$output"; then
-            report_cargo_failure "$source" "$package_dir/Cargo.toml" "$output" \
-                'build test harness for' || exit $?
-        fi
         mapfile -t test_binaries < <(jq -er --arg name "$package_name" \
             'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == $name and .executable != null) | .executable' \
             "$test_json" | sort -u)
