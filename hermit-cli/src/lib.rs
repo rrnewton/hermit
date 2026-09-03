@@ -200,10 +200,10 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //              bug. Defined in `detcore-model` because `detcore` emits it and
 //              this crate recognises it, and that is the only crate both
 //              depend on.
-//   123        DO NOT USE. dev-hermit's `bin/safehermit` LOG BYTE CAP kill.
+//   123        DO NOT USE. This repository's `bin/safehermit` LOG BYTE CAP kill.
 //              It moved here FROM 125 so it would stop colliding with the line
 //              below; taking 123 back would undo that.
-//   124        DO NOT USE. GNU `timeout`'s deadline, and dev-hermit's
+//   124        DO NOT USE. GNU `timeout`'s deadline, and this repository's
 //              `bin/safehermit` WALL DEADLINE kill. `tests/cli.rs` asserts
 //              `assert_ne!(code, Some(124))` on the awk-mincore probe.
 //   125        HERMIT_INTERNAL_FAILURE_EXIT -- hermit itself failed, no guest

@@ -215,8 +215,9 @@ fn main() {
         println!(
             "check-checker-scheduling: refuse a tracked checker entrypoint that no DAG\n\
              node and no `make lint-checks` recipe line can reach, directly or\n\
-             transitively. Workflows are not a reachability source: the integration-\n\
-             branch portable run is supplemental and the others are manual.\n\
+             transitively. Workflows are not a reachability source: the\n\
+             integration-branch portable and demo-review runs are supplemental\n\
+             and the other nine workflows are manual.\n\
              Deliberate exceptions live in\n\
              ALLOWLIST with a reason each."
         );
