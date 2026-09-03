@@ -12409,7 +12409,6 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         let Some(largest_cell_cap_s) = cells
             .iter()
             .map(|cell| cell.timeout_seconds)
-            .into_iter()
             .max()
         else {
             return Ok(None);
