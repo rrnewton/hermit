@@ -181,7 +181,16 @@ fi
 # enum dispatch, and the common Backend output API, but no native DBT recipe
 # input. The measured native-build budget therefore carries unchanged; the Rust
 # API change still requires a fresh Hermit build and validation.
-expected_pin=c2e2c8fbe52c2e5e8c65a56c2a547785f76c731e
+# CARRY TO ce841d74 (2026-09-02): all three source_recipe_key repository
+# inputs are byte-identical to c2e2c8fb by git object id:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# The sole intervening commit changes only reverie-process cloned-child stack
+# allocation and its test. It cannot affect the DynamoRIO content-key miss, so
+# the measured native-build budget carries unchanged. Fresh Hermit validation
+# remains required for the process-launch change.
+expected_pin=ce841d744cc74b1627ac52b42f711b33b1c72a45
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
