@@ -1,0 +1,26 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Exit status for a run HERMIT DELIBERATELY REFUSED, as distinct from one where hermit itself broke."><title>HERMIT_POLICY_REFUSAL_EXIT in detcore_model - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-203241e4.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="detcore_model" data-themes="" data-resource-suffix="" data-rustdoc-version="1.100.0-nightly (2e2b193f8 2026-09-02)" data-channel="nightly" data-search-js="search-b167f383.js" data-stringdex-js="stringdex-b5109af9.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-1814ead3.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-9f56287d.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc constant"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">HERMIT_POLICY_REFUSAL_EXIT</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../detcore_model/index.html">detcore_<wbr>model</a><span class="version">0.2.0</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">detcore_model</a></div><h1>Constant <span class="constant">HERMIT_<wbr>POLICY_<wbr>REFUSAL_<wbr>EXIT</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/detcore_model/lib.rs.html#44">Source</a> </span></div><pre class="rust item-decl"><code>pub const HERMIT_POLICY_REFUSAL_EXIT: <a class="primitive" href="https://doc.rust-lang.org/nightly/std/primitive.i32.html">i32</a> = 122;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Exit status for a run HERMIT DELIBERATELY REFUSED, as distinct from one
+where hermit itself broke.</p>
+<p>⚠️ “REFUSED” AND “BROKE” DEMAND OPPOSITE RESPONSES, AND THEY WERE THE SAME
+NUMBER. A fail-closed policy stopping a run is hermit working correctly: the
+operator must read the refusal and change their program or their flags.
+<code>HERMIT_INTERNAL_FAILURE_EXIT</code> (125) says hermit is broken and the operator
+must file a bug. Reporting the first as the second sends a reader looking
+for a defect in a shutdown path that behaved exactly as designed.</p>
+<p>⚠️ WHY IT IS NOT 1, WHICH IS WHAT THIS PATH USED TO EXIT.
+<code>unrecoverable_shutdown</code> called <code>std::process::exit(1)</code>, so the container
+child exited 1 and the parent’s classifier — whose arm is documented “the
+child died with a status it did not pick” — turned a status hermit HAD
+picked into <code>class=container-child-exit</code> and 125. Restoring 1 would fix the
+misclassification and reintroduce a worse one: 1 is the commonest guest exit
+status, so it cannot distinguish “hermit refused” from “your program
+returned 1”.</p>
+<p>⚠️ WHY 122. It sits immediately below the reserved band (123 safehermit log
+cap, 124 deadline, 125 hermit broke, 126/127 GNU exec-level), keeping the
+reserved codes contiguous, and it is the cheapest possible narrowing of the
+guest range. See the full allocation above the constants in
+<code>hermit-cli/src/lib.rs</code>.</p>
+<p>⚠️ IT LIVES IN <code>detcore-model</code> BECAUSE BOTH SIDES NEED IT. <code>detcore</code> emits it
+and <code>hermit-cli</code> recognises it; <code>detcore-model</code> is the only crate both
+depend on. A copy on each side is exactly the defect that left eight cli
+tests asserting a stale exit status for a day after the product moved.</p>
+</div></details></section></div></main></body></html>

@@ -1,0 +1,29 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="A fingerprint of this build’s `Config` wire payload and named shape, for detecting a plugin and a coordinator compiled from different definitions of it."><title>config_wire_fingerprint in detcore - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-203241e4.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.100.0-nightly (2e2b193f8 2026-09-02)" data-channel="nightly" data-search-js="search-b167f383.js" data-stringdex-js="stringdex-b5109af9.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-1814ead3.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-9f56287d.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">config_wire_fingerprint</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../detcore/index.html">detcore</a><span class="version">0.2.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">config_<wbr>wire_<wbr>fingerprint</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#why-this-exists" title="Why this exists">Why this exists</a></li><li><a href="#what-it-measures" title="What it measures">What it measures</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="index.html">In crate detcore</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">detcore</a></div><h1>Function <span class="fn">config_<wbr>wire_<wbr>fingerprint</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"></span></div><pre class="rust item-decl"><code>pub fn config_wire_fingerprint() -&gt; <a class="struct" href="https://doc.rust-lang.org/nightly/alloc/string/struct.String.html" title="struct alloc::string::String">String</a></code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>A fingerprint of this build’s <a href="struct.Config.html" title="struct detcore::Config"><code>Config</code></a> wire payload and named shape, for
+detecting a plugin and a coordinator compiled from different definitions of it.</p>
+<h2 id="why-this-exists"><a class="doc-anchor" href="#why-this-exists">§</a>Why this exists</h2>
+<p>An out-of-process plugin such as <code>libdetcore_sabre.so</code> is a separate Cargo
+artifact that lands in the same target directory as <code>hermit</code>. Changing
+<code>Config</code> – or merely switching branches – leaves the plugin stale while
+everything still <em>looks</em> built. <code>Config</code> is transferred during the RPC
+handshake, so a stale plugin decodes it against the wrong layout and the
+failure surfaces as an opaque codec error: measured, one added <code>bool</code> field
+produced <code>Decode(InvalidBooleanValue(20))</code> at connect, which points nowhere
+near “your plugin is from a different build” and cost a long diagnosis while
+blocking every SaBRe measurement.</p>
+<h2 id="what-it-measures"><a class="doc-anchor" href="#what-it-measures">§</a>What it measures</h2>
+<p>Two encodings of <code>Config::default()</code> and the source definitions that produce
+them are fingerprinted with separate domains:</p>
+<ul>
+<li>the exact legacy-bincode bytes used by Reverie RPC, which detect changes
+such as <code>u32</code> to <code>u64</code> even when both default to JSON number zero; and</li>
+<li>the JSON encoding, which carries every field name and makes a pure rename
+visible even though bincode is positional; and</li>
+<li>the source files defining <code>Config</code> and its local serialized field types,
+which catch wire-incompatible changes hidden by a default such as
+<code>Option&lt;u64&gt;::None</code> to <code>Option&lt;u32&gt;::None</code>.</li>
+</ul>
+<p>The source and JSON domains are deliberately stricter than the wire format
+strictly requires. A documentation-only edit in one of these files can
+require rebuilding the plugin; missing a wire-incompatible hidden variant
+can make it decode the rest of the handshake at the wrong offsets.</p>
+</div></details></section></div></main></body></html>

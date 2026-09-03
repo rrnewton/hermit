@@ -1,0 +1,30 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Determinize the statistics counters carried by `NETLINK_ROUTE` link dumps."><title>detcore::netlink_route - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-203241e4.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.100.0-nightly (2e2b193f8 2026-09-02)" data-channel="nightly" data-search-js="search-b167f383.js" data-stringdex-js="stringdex-b5109af9.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-1814ead3.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-9f56287d.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module netlink_route</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore/index.html">detcore</a><span class="version">0.2.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module netlink_<wbr>route</a></h2><h3><a href="#functions">Module Items</a></h3><ul class="block"><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate detcore</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore</a></div><h1>Module <span>netlink_<wbr>route</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore/netlink_route.rs.html#9-346">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Determinize the statistics counters carried by <code>NETLINK_ROUTE</code> link dumps.</p>
+<p>A guest that resolves a hostname or enumerates interfaces reaches
+<code>NETLINK_ROUTE</code> through glibc, which issues <code>RTM_GETLINK</code> and receives one
+<code>RTM_NEWLINK</code> message per interface. Those messages carry LIVE COUNTERS that
+advance continuously on a running host, so two executions of the same guest
+milliseconds apart receive byte-different payloads of IDENTICAL LENGTH.</p>
+<p>MEASURED NATIVELY, outside Hermit, on two consecutive <code>RTM_GETLINK</code> dumps:
+both replies were 3060 bytes, 47 bytes differed, and of the first twelve
+64-bit fields that moved, TWELVE INCREASED AND ZERO DECREASED — monotonic
+counters. Every differing byte was attributed to an attribute; none fell
+outside one:</p>
+<div class="example-wrap"><pre class="language-text"><code>  AF_SPEC -&gt; AF_INET6 -&gt; IFLA_INET6_STATS       30 bytes
+  AF_SPEC -&gt; AF_INET6 -&gt; IFLA_INET6_CACHEINFO     4 bytes (guest payload only)
+  IFLA_STATS64                               8 bytes
+  IFLA_STATS                                 8 bytes</code></pre></div>
+<p>THE ATTRIBUTION IS WHY THIS ZEROES THREE ATTRIBUTES RATHER THAN ONE. The
+obvious fix — zero <code>IFLA_STATS64</code> — addresses 8 of 47 differing bytes and
+leaves the guest still diverging on the other 39. The nested IPv6 SNMP block
+inside <code>AF_SPEC</code> is the LARGEST contributor and is easy to miss because it is
+two levels of nesting below the message.</p>
+<p>Nothing else in the dump moved: no timestamps, no sequence numbers, no
+addresses, no interface indices. Zeroing exactly these three makes the reply
+byte-stable without touching anything a guest legitimately reads for
+identity or topology.</p>
+<p>The counters are ZEROED rather than virtualized to advance. Freezing them is
+the same choice <code>crate::sock_diag</code> already makes for socket inodes, and a
+guest under Hermit has no deterministic clock against which advancing
+counters would mean anything. A guest that reads interface statistics sees
+zeros; that is a deliberate and stated consequence.</p>
+</div></details><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.sanitize_route_link_stats.html" title="fn detcore::netlink_route::sanitize_route_link_stats">sanitize_<wbr>route_<wbr>link_<wbr>stats</a></dt><dd>Zero the live counters in a <code>NETLINK_ROUTE</code> reply, in place.</dd></dl></section></div></main></body></html>

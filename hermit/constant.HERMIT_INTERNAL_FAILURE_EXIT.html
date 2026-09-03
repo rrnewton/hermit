@@ -1,0 +1,46 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Exit status for a failure of HERMIT ITSELF, as distinct from the guest’s."><title>HERMIT_INTERNAL_FAILURE_EXIT in hermit - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-203241e4.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="hermit" data-themes="" data-resource-suffix="" data-rustdoc-version="1.100.0-nightly (2e2b193f8 2026-09-02)" data-channel="nightly" data-search-js="search-b167f383.js" data-stringdex-js="stringdex-b5109af9.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../static.files/main-1814ead3.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-9f56287d.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc constant"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">HERMIT_INTERNAL_FAILURE_EXIT</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../hermit/index.html">hermit</a><span class="version">0.2.0</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="index.html">hermit</a></div><h1>Constant <span class="constant">HERMIT_<wbr>INTERNAL_<wbr>FAILURE_<wbr>EXIT</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/hermit/lib.rs.html#123">Source</a> </span></div><pre class="rust item-decl"><code>pub const HERMIT_INTERNAL_FAILURE_EXIT: <a class="primitive" href="https://doc.rust-lang.org/nightly/std/primitive.i32.html">i32</a> = 125;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Exit status for a failure of HERMIT ITSELF, as distinct from the guest’s.</p>
+<p>⚠️ EVERY CLI ERROR USED TO BE <code>Exited(1)</code>, WHICH IS THE SINGLE MOST COMMON
+GUEST FAILURE CODE. A tracer panic and a guest that exited 1 of its own
+accord were therefore INDISTINGUISHABLE from <code>$?</code> alone — and every harness,
+gate and script on this project decides pass/fail from exactly that value.
+The information was not missing, only discarded: reverie’s container reports
+the child’s real status as a typed <code>ExitStatus</code>, and hermit collapsed it to
+prose and then to <code>1</code>.</p>
+<p>WHY THIS DOES NOT BREAK THE “hermit’s exit IS the guest’s exit” CONTRACT.
+That contract describes the case where the guest RAN AND EXITED, and it is
+untouched: a guest status still flows through <code>raise_or_exit</code> unchanged, and
+only the <code>Err</code> arm — where there is NO guest exit code, because hermit failed
+before or instead of producing one — uses this value. The contract did not
+cover that case; it does now.</p>
+<p>WHY 125. It is the established convention for “the wrapper tool itself
+failed” — GNU <code>env</code>, <code>chroot</code> and <code>timeout</code> all reserve 125 for exactly this,
+leaving 126/127 for exec-level problems. It is not a value hermit emits
+anywhere else.</p>
+<p>⚠️ THIS REDUCES A COLLISION, IT DOES NOT REMOVE ONE. A guest is free to exit
+125 deliberately, and every value in 0..=255 is a legal guest status, so no
+code can be reserved outright. What it removes is the GUARANTEED collision
+with the most common failure code. For an unambiguous signal, read the
+<code>HERMIT_TASK_PANIC</code> marker on stderr or the verification JSON; this makes the
+cheap check — <code>$?</code> — stop actively lying.</p>
+<p>⚠️ IT LIVES IN THE LIBRARY, NOT IN <code>main.rs</code>, AND THAT PLACEMENT IS THE FIX
+FOR HOW IT WENT STALE. It was a private <code>const</code> inside the binary, so
+<code>tests/cli.rs</code> — the only thing that asserts on it — could not name it and
+wrote the number out by hand instead. When hermit#2558 moved the value from
+<code>1</code> to <code>125</code>, the definition moved and the sixteen copies did not: eight cli
+tests went red on main and stayed red, each failing an assertion about the
+exit code rather than about the behaviour it exists to check. Same shape as
+<a href="constant.RECORD_REPLAY_HASHES_IO_BUFFERS.html" title="constant hermit::RECORD_REPLAY_HASHES_IO_BUFFERS"><code>RECORD_REPLAY_HASHES_IO_BUFFERS</code></a> above — a decision carried in two places
+that had to agree and had no way to. Exported here, the tests move with it.</p>
+<p>⚠️ DO NOT FLIP EVERY <code>Some(1)</code> YOU FIND. <code>tests/stress_suite.rs</code>
+asserts <code>Some(1)</code> as THE GUEST’S OWN SIGNAL, not as a stale copy of this
+constant: there <code>Some(1) =&gt; GuestOutcome::Exposed</code>, and
+<code>status.code() == Some(1)</code> IS the <code>exposes_bug</code> predicate. It is
+pattern-identical to the tests that DID go stale, and it is the OPPOSITE
+case – the assertion is CORRECT and must not move with this constant.</p>
+<p>⚠️ ITS FAILURE MODE IS SILENT SUCCESS. Changing it to 125 would not
+turn the stress suite red; it would make <code>exposes_bug</code> NEVER FIRE, so the
+suite would report no bug exposed forever and pass while blind. A red is
+recoverable; a green that cannot fail is not.</p>
+<p>REVIEWER RULE: a change to <code>tests/stress_suite.rs</code> inside an exit-code head
+SHOULD BE REFUSED ON SIGHT AND QUESTIONED.</p>
+</div></details></section></div></main></body></html>

@@ -1,0 +1,69 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Total wall-clock ALL diagnostic writes in ONE PROCESS may spend waiting for a reader that is not draining. Hermit forks, so read the fork note below before treating this as the whole exit path’s budget."><title>STDERR_DIAGNOSTIC_DEADLINE in detcore::util - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-203241e4.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.100.0-nightly (2e2b193f8 2026-09-02)" data-channel="nightly" data-search-js="search-b167f383.js" data-stringdex-js="stringdex-b5109af9.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-1814ead3.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-9f56287d.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc constant"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">STDERR_DIAGNOSTIC_DEADLINE</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore/index.html">detcore</a><span class="version">0.2.0</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In detcore::<wbr>util</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore</a>::<wbr><a href="index.html">util</a></div><h1>Constant <span class="constant">STDERR_<wbr>DIAGNOSTIC_<wbr>DEADLINE</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore/util.rs.html#183">Source</a> </span></div><pre class="rust item-decl"><code>pub const STDERR_DIAGNOSTIC_DEADLINE: <a class="struct" href="https://doc.rust-lang.org/nightly/core/time/struct.Duration.html" title="struct core::time::Duration">Duration</a>;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Total wall-clock ALL diagnostic writes in ONE PROCESS may spend waiting for a
+reader that is not draining. Hermit forks, so read the fork note below before
+treating this as the whole exit path’s budget.</p>
+<p>⚠️ WITHOUT A CEILING THIS LOOP NEVER ENDS, AND IT RUNS WHILE HERMIT IS ALREADY
+FAILING. <code>EAGAIN</code> -&gt; <code>poll(POLLOUT, 1s)</code> -&gt; retry is correct for a reader that
+is SLOW and unbounded for a reader that is STOPPED. Measured 2026-08-26 on a
+4096-byte pipe filled to 3900 with <code>O_NONBLOCK</code> set, where nothing ever reads:</p>
+<div class="example-wrap"><pre class="language-text"><code>  before RetryingStderr (eprintln!)   EXITED rc=101 immediately
+  RetryingStderr, no ceiling          STILL RUNNING after 25s, no exit</code></pre></div>
+<p>The first is wrong loudly; the second does not return at all, on the path that
+reports why hermit is stopping. A supervisor that hangs while reporting an
+error is harder to diagnose than one that dies reporting it badly.</p>
+<p>⚠️ THIS IS A TOTAL FOR THE WHOLE PROCESS, NOT A BUDGET PER <code>write()</code> CALL, AND
+THE DIFFERENCE IS THE ENTIRE GUARANTEE. An earlier version started the clock
+inside <code>fn write</code>, so every call got the full allowance. Nothing writes to
+stderr exactly once on the exit path:</p>
+<div class="example-wrap"><pre class="language-text"><code>  hermit-cli/src/bin/hermit/main.rs      the failure class, the head of the
+                                         error chain, then ONE PER CAUSE in
+                                         `for cause in chain` -- 2 + chain length
+  hermit-cli/src/bin/hermit/tracing.rs   .with_writer(|| RetryingStderr) is the
+                                         writer for the WHOLE subscriber: one
+                                         write per log event
+  detcore/src/tool_global.rs             a multi-part `write!`, which `write_fmt`
+                                         splits into several `write` calls</code></pre></div>
+<p>With a per-call budget the process-level cost was N times this number, N is
+bounded by the error chain rather than by anything here, and every caller’s
+<code>let _ =</code> swallowed the overrun silently. A <code>--log info</code> run measured at 138
+lines would have been minutes, not seconds.</p>
+<p>⚠️ THE VALUE IS DERIVED FROM THE BOUND THAT ENCLOSES IT, NOT CHOSEN. Diagnostics
+on the exit path run inside <code>RUN_TIMEOUT_UNWIND_GRACE</code> (10s,
+<code>hermit-cli/src/lib.rs</code>): the window between a <code>--timeout</code> expiring and the
+SIGALRM fallback calling <code>_exit</code>. Overrun there does not merely delay the
+report, it loses it – the fallback fires mid-sentence and additionally emits
+<code>HERMIT_RUN_TIMEOUT_FALLBACK</code>, which is supposed to mean the teardown wedged.
+So the arithmetic is:</p>
+<p>⚠️ IT USED TO APPLY ONCE PER PROCESS, BECAUSE HERMIT FORKS. <code>Container::run</code>
+forks the container init, which got its own COPY of the process-wide clock and
+spent its own full deadline; both write diagnostics to the same fd 2 on the way
+out. Measured 2026-08-26 against a stopped reader on a real guest, which is the
+case where both processes report:</p>
+<div class="example-wrap"><pre class="language-text"><code>  deadline 5000ms   -&gt;  10.03s observed   two processes, one deadline each
+  deadline 2500ms   -&gt;   5.02s observed   the same two, halved
+  deadline 2500ms   -&gt;   2.52s observed   missing guest: only ONE process reports</code></pre></div>
+<p>⚠️ AND THE MULTIPLIER WAS NOT ALWAYS TWO, WHICH IS WHY IT IS NO LONGER A
+CONSTANT. <code>hermit run --verify</code> runs the guest twice and forks once per run, so
+it is the outer hermit plus TWO container inits – three writers, and siblings
+rather than a chain. From the call structure, so it needs no sampling:</p>
+<div class="example-wrap"><pre class="language-text"><code>  run.rs  fn verify()      Run1 -&gt; self.run_verify(..)   Run2 -&gt; self.run_verify(..)
+          fn run_verify()  -&gt; with_container(..) forks a container init</code></pre></div>
+<p>At three, <code>3 x 2500ms x 2 = 15s</code> against a 10s grace: the stated split does not
+hold. Correcting the constant to three would force the deadline to ~1666ms and
+leave a hardcoded count for the next differently-forking path to falsify.</p>
+<p>So the ORIGIN is shared across the invocation instead (see
+<code>STDERR_ORIGIN_ADDR</code>): every hermit process measures from the same start, the
+invocation spends ONE deadline however many processes write, and the count
+stops being an input. The arithmetic no longer contains it:</p>
+<div class="example-wrap"><pre class="language-text"><code>  RUN_TIMEOUT_UNWIND_GRACE                    10s     the enclosing bound
+  diagnostics may have half of it              5s     leaving 5s for the unwind
+  this deadline, per INVOCATION             2500ms    comfortably inside the 5s</code></pre></div>
+<p>Half is a split, not a measurement, and is stated as one. What is ALSO measured is
+that the previous arrangement could not fit: at 5s per CALL, the same real-guest
+fixture took 15.04s – three blocked writes – against a 10s grace, so the inner
+bound exceeded its outer bound before any unwind work happened at all.
+<code>hermit-cli</code> asserts this relationship in a test, so raising either side without
+the other fails by name.</p>
+<p>On expiry the write returns <code>WouldBlock</code>, <code>writeln!</code> gives up, the caller’s
+<code>let _ =</code> drops that line, and hermit exits — the pre-existing contract for a
+diagnostic that cannot be delivered.</p>
+</div></details></section></div></main></body></html>

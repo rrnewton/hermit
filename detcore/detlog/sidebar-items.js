@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["RECORD_SCHEMA","RECORD_SEPARATOR"],"enum":["DetLogEvent"],"fn":["set_forwarder"],"struct":["DetLogRecord"],"type":["DetlogForwarder"]};
