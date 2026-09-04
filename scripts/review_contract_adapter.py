@@ -135,11 +135,29 @@ def lint_records() -> tuple[str, ...]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--materialize-authority",
+        metavar="DIR",
+        default="",
+        help=(
+            "write the verified authority under DIR at its pinned relative "
+            "path and exit, so later invocations can read it locally via "
+            "DEV_HERMIT_PARENT instead of fetching it again"
+        ),
+    )
     parser.add_argument("--format", choices=("lint-records",), default="lint-records")
-    parser.parse_args(argv)
+    args = parser.parse_args(argv)
     # Nothing on stdout when the contract cannot be consulted: callers read
     # stdout as the records. The distinction rides the exit status.
     try:
+        if args.materialize_authority:
+            # Same purpose as in check_outcome_adapter: one fetch per checker
+            # instead of one per process, which is what removes the window the
+            # codex lane reproduced. Digest-verified before writing.
+            target = Path(args.materialize_authority) / AUTHORITY_RELATIVE_PATH
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(_verified_source())
+            return 0
         records = lint_records()
     except AuthorityUnavailable as unavailable:
         print(

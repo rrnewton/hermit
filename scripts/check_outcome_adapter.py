@@ -191,6 +191,16 @@ def annotate_rollups(value: object) -> object:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--materialize-authority",
+        metavar="DIR",
+        default="",
+        help=(
+            "write the verified authority under DIR at its pinned relative "
+            "path and exit, so later invocations can read it locally via "
+            "DEV_HERMIT_PARENT instead of fetching it again"
+        ),
+    )
     parser.add_argument("--status", default="")
     parser.add_argument("--conclusion", default="")
     parser.add_argument("--annotate-rollups", action="store_true")
@@ -208,6 +218,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     # stderr, so a caller that has not been taught about it fails loudly rather
     # than quietly mis-reading an outage as an answer.
     try:
+        if args.materialize_authority:
+            # ⚠️ THIS IS WHAT CLOSES THE RACE. Obtaining the authority ONCE and
+            # writing it where later invocations read it locally means a
+            # checker performs exactly one fetch, instead of one per adapter
+            # process. Reported by the independent codex lane at head
+            # 327f6713: the preflight probe fetched, succeeded, and then every
+            # later fetch was an independent chance to hit the 504 -- so a
+            # transport failure arriving AFTER the probe still made the checker
+            # exit nonzero, which classify_run correctly ranks above any marker.
+            #
+            # The digest is verified by _verified_source before anything is
+            # written, so materialising cannot launder a wrong authority: a
+            # mismatch still raises AuthorityIntegrityError and never lands here.
+            target = Path(args.materialize_authority) / AUTHORITY_RELATIVE_PATH
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(_verified_source())
+            return 0
         if args.annotate_rollups:
             json.dump(
                 annotate_rollups(json.load(sys.stdin)), sys.stdout, separators=(",", ":")
