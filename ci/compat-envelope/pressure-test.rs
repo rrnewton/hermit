@@ -166,7 +166,7 @@ Usage: ci/compat-envelope/pressure-test.rs COMMAND [OPTIONS]
 
 Commands:
   run [--results DIR] [--mode MODE] [--sample COUNT] [--seed SEED]
-      [--green --repetitions COUNT] [--jobs COUNT]
+      [--green --backend BACKEND --repetitions COUNT] [--jobs COUNT]
       [--probe-disabled --backend BACKEND]
       Run bounded probes for the selected red cells. An exact-cell run uses the
       current working tree for fast fix/test iteration; a dirty result is
@@ -188,7 +188,7 @@ Commands:
       Only unfiltered --green covers the complete current green set; an exact
       cell, --mode, or --sample is partial evidence.
   plan --results DIR [--mode MODE] [--sample COUNT] [--seed SEED]
-      [--green --repetitions COUNT] [--jobs COUNT]
+      [--green --backend BACKEND --repetitions COUNT] [--jobs COUNT]
       [--probe-disabled --backend BACKEND]
       Generate the same safe-ci execution plan without running it. The default
       output is DIR/dag.json.
@@ -453,7 +453,9 @@ fn validate_repetition_selection(selection: &CellSelection) -> Result<(), String
     // required so a broad run cannot accidentally exercise every unsupported
     // implementation.
     if selection.test.is_some()
-        || (selection.backend.is_some() && !selection.probe_disabled)
+        || (selection.backend.is_some()
+            && !selection.probe_disabled
+            && !selection.selects_green_population())
     {
         return Err(
             "a repeated batch accepts only an optional --mode filter, unless \
@@ -1656,7 +1658,7 @@ fn result_options(
         if selection.test.is_some() && selection.mode.is_none() {
             return Err("--probe-disabled with --test also requires --mode".into());
         }
-    } else {
+    } else if !selection.green {
         let exact_fields = [
             selection.test.is_some(),
             selection.mode.is_some() && (selection.test.is_some() || selection.backend.is_some()),
@@ -6197,6 +6199,27 @@ fn self_test(root: &Path) -> Result<(), String> {
         || parsed_disabled_batch.is_exact()
     {
         return Err("disabled-backend batch options did not retain their selection".into());
+    }
+    let mut green_backend_args = vec![
+        "--results".to_string(),
+        "ignored/compat-envelope/green-backend-self-test".to_string(),
+        "--green".to_string(),
+        "--backend".to_string(),
+        "kvm".to_string(),
+        "--mode".to_string(),
+        "verify".to_string(),
+        "--repetitions".to_string(),
+        "3".to_string(),
+    ]
+    .into_iter();
+    let (_, _, parsed_green_backend) =
+        result_options(root, &mut green_backend_args, false, true)?;
+    if !parsed_green_backend.green
+        || parsed_green_backend.backend.as_deref() != Some("kvm")
+        || parsed_green_backend.mode.as_deref() != Some("verify")
+        || parsed_green_backend.is_exact()
+    {
+        return Err("green-backend batch options did not retain their selection".into());
     }
     for arguments in [
         vec!["--probe-disabled"],
