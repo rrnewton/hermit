@@ -34,9 +34,9 @@ test:
           ptrace: Across 60 retained typed passing rows, nearest-rank p90 was 22.531 wall seconds and 20.710660 CPU seconds; ceil(4x wall)=91 and ceil(1.5x CPU)=32.
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT application coverage is owned by backend parity
-          kvm: KVM requires the privileged runner
           sabre: SaBRe does not yet determinize busy-wait polling on virtual wall-clock advancement; main validation has observed verify failure under load
           liteinst: LiteInst application coverage is owned by backend compatibility
       replay:
