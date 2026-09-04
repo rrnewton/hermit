@@ -409,6 +409,45 @@ impl CellSelection {
     }
 }
 
+fn validate_selection_shape(selection: &CellSelection) -> Result<(), String> {
+    if selection.probe_disabled {
+        if selection.backend.is_none() {
+            return Err("--probe-disabled requires --backend".into());
+        }
+        if selection.green {
+            return Err("--probe-disabled and --green are mutually exclusive".into());
+        }
+        if selection.test.is_some() && selection.mode.is_none() {
+            return Err("--probe-disabled with --test also requires --mode".into());
+        }
+    } else {
+        let exact_fields = [
+            selection.test.is_some(),
+            selection.mode.is_some() && (selection.test.is_some() || selection.backend.is_some()),
+            selection.backend.is_some(),
+        ];
+        if (selection.test.is_some() || !selection.green)
+            && exact_fields.iter().any(|present| *present)
+            && !exact_fields.iter().all(|present| *present)
+        {
+            return Err(
+                "an exact-cell selection requires --test, --mode, and --backend together".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn population_label(green: bool, probe_disabled: bool) -> &'static str {
+    if green {
+        "green"
+    } else if probe_disabled {
+        "disabled"
+    } else {
+        "red"
+    }
+}
+
 fn validate_repetition_selection(selection: &CellSelection) -> Result<(), String> {
     let Some(repetitions) = selection.repetitions else {
         if selection.run_id_prefix.is_some() {
@@ -1319,7 +1358,7 @@ fn run() -> Result<(), String> {
             }
             if !selection.allows_dirty_source() && worktree_dirty(&root)? {
                 return Err(
-                    "plan refuses a dirty checkout except for one exact red cell; commit first so every batch or repeated check binds to one source commit"
+                    "plan refuses a dirty checkout except for one exact cell; commit first so every batch or repeated check binds to one source commit"
                         .into(),
                 );
             }
@@ -1496,8 +1535,9 @@ fn print_sample(metadata: &RunMetadata) {
 
 fn print_unavailable(metadata: &RunMetadata) {
     if metadata.unavailable_cells > 0 {
+        let population = population_label(metadata.green, metadata.probe_disabled);
         println!(
-            "Unavailable red chaos cells omitted: {} (their manifests declare no seeds, so no guest command exists)",
+            "Unavailable {population} cells omitted: {} (their manifests declare no executable attempts)",
             metadata.unavailable_cells
         );
     }
@@ -1648,31 +1688,7 @@ fn result_options(
             _ => return Err(format!("unknown option `{arg}`\n\n{USAGE}")),
         }
     }
-    if selection.probe_disabled {
-        if selection.backend.is_none() {
-            return Err("--probe-disabled requires --backend".into());
-        }
-        if selection.green {
-            return Err("--probe-disabled and --green are mutually exclusive".into());
-        }
-        if selection.test.is_some() && selection.mode.is_none() {
-            return Err("--probe-disabled with --test also requires --mode".into());
-        }
-    } else {
-        let exact_fields = [
-            selection.test.is_some(),
-            selection.mode.is_some() && (selection.test.is_some() || selection.backend.is_some()),
-            selection.backend.is_some(),
-        ];
-        if (selection.test.is_some() || !selection.green)
-            && exact_fields.iter().any(|present| *present)
-            && !exact_fields.iter().all(|present| *present)
-        {
-            return Err(
-                "an exact-cell selection requires --test, --mode, and --backend together".into(),
-            );
-        }
-    }
+    validate_selection_shape(&selection)?;
     // A REPEATED BATCH MAY CARRY IT TOO. The per-cell cap is the bound that
     // actually stops a hung repetition -- the whole-run bound is a wall-clock
     // backstop whose firing means this one did not do its job -- so refusing it
@@ -2042,6 +2058,7 @@ fn check_scorecard(root: &Path) -> Result<CheckedScorecard<'_>, String> {
 }
 
 fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCells, String> {
+    validate_selection_shape(selection)?;
     validate_repetition_selection(selection)?;
     if selection.sample == Some(0) {
         return Err("--sample must be positive".into());
@@ -2171,9 +2188,10 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     }
     selected_cells.sort_by(|left, right| left.id.cmp(&right.id));
     if selected_cells.is_empty() {
+        let population = population_label(selection.green, selection.probe_disabled);
         if !unavailable.is_empty() {
             return Err(format!(
-                "the selected red population has no executable commands; {} chaos cell(s) are unavailable because their manifests declare no seeds",
+                "the selected {population} population has no executable commands; {} cell(s) are unavailable because their manifests declare no executable attempts",
                 unavailable.len()
             ));
         }
@@ -2187,6 +2205,10 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     format!(
                         "{test}/{mode}/{backend} is not an enabled green tracked cell; use the scorecard or manifest CLI to inspect it"
                     )
+                } else if selection.probe_disabled {
+                    format!(
+                        "{test}/{mode}/{backend} is not a disabled tracked cell; use the scorecard or manifest CLI to inspect it"
+                    )
                 } else {
                     format!(
                         "{test}/{mode}/{backend} is not a currently red tracked cell; use the scorecard or manifest CLI to inspect it"
@@ -2195,11 +2217,15 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
             } else if let Some(mode) = selection.mode.as_deref() {
                 if selection.selects_green_population() {
                     format!("tracked scorecard has no enabled green cells for mode `{mode}`")
+                } else if selection.probe_disabled {
+                    format!("tracked scorecard has no disabled cells for mode `{mode}`")
                 } else {
                     format!("tracked scorecard has no red cells for mode `{mode}`")
                 }
             } else if selection.selects_green_population() {
                 "tracked scorecard has no enabled green cells".into()
+            } else if selection.probe_disabled {
+                "tracked scorecard has no disabled cells".into()
             } else {
                 "tracked scorecard has no red cells".into()
             },
@@ -2214,8 +2240,9 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     selected_cells.len()
                 )
             } else {
+                let population = population_label(selection.green, selection.probe_disabled);
                 format!(
-                    "--sample {count} exceeds the {} red cells with executable commands in the selected population; {} selected red chaos cell(s) are unavailable because their manifests declare no seeds",
+                    "--sample {count} exceeds the {} {population} cells with executable commands in the selected population; {} selected {population} cell(s) are unavailable because their manifests declare no executable attempts",
                     selected_cells.len(),
                     unavailable.len()
                 )
@@ -2899,11 +2926,7 @@ fn write_plan_after_scorecard_check(
                 group: "cell".into(),
                 job: slug,
                 desc: if let Some(number) = repetition {
-                    let population = if selection.selects_green_population() {
-                        "green"
-                    } else {
-                        "red"
-                    };
+                    let population = population_label(selection.green, selection.probe_disabled);
                     format!(
                         "Repeat {population} cell {}/{}/{}@{} ({number}/{})",
                         cell.test,
@@ -2913,8 +2936,9 @@ fn write_plan_after_scorecard_check(
                         selection.run_count()
                     )
                 } else {
+                    let population = population_label(selection.green, selection.probe_disabled);
                     format!(
-                        "Attempt red cell {}/{}/{}@{}",
+                        "Attempt {population} cell {}/{}/{}@{}",
                         cell.test, cell.mode, cell.backend, cell.lane
                     )
                 },
@@ -2963,13 +2987,16 @@ fn write_plan_after_scorecard_check(
     steps.push(Step {
         group: "pressure".into(),
         job: "summarize".into(),
-        desc: if selection.selects_green_population() {
-            "Wait for every repeated green-cell check before reading retained runner evidence"
-                .into()
-        } else if selection.repeats_cells() {
-            "Wait for every repeated red-cell check before reading retained runner evidence".into()
+        desc: if selection.repeats_cells() {
+            format!(
+                "Wait for every repeated {}-cell check before reading retained runner evidence",
+                population_label(selection.green, selection.probe_disabled)
+            )
         } else {
-            "Wait for every red-cell attempt before reading retained runner evidence".into()
+            format!(
+                "Wait for every {}-cell attempt before reading retained runner evidence",
+                population_label(selection.green, selection.probe_disabled)
+            )
         },
         description: String::new(),
         cmd: "true".into(),
@@ -3227,7 +3254,7 @@ fn validate_run_contract(
             || metadata.sample.is_some()
             || metadata.seed.is_some())
     {
-        return Err("dirty pressure results are accepted only for one exact red cell".into());
+        return Err("dirty pressure results are accepted only for one exact cell".into());
     }
     if metadata.source_tree_dirty && metadata.repetitions.is_some() {
         return Err("repeated-cell results require a clean committed source tree".into());
@@ -3285,8 +3312,9 @@ fn validate_run_contract(
         }
     }
     if metadata.unavailable_cells != pressure_cells.unavailable.len() {
+        let population = population_label(metadata.green, metadata.probe_disabled);
         return Err(format!(
-            "run metadata records {} unavailable red cell(s), current manifest selection has {}",
+            "run metadata records {} unavailable {population} cell(s), current manifest selection has {}",
             metadata.unavailable_cells,
             pressure_cells.unavailable.len()
         ));
@@ -3295,7 +3323,10 @@ fn validate_run_contract(
     let mut expected = BTreeMap::new();
     for tracked in expected_cells {
         if expected.insert(tracked.id, tracked.enabled).is_some() {
-            return Err("tracked scorecard contains a duplicate red-cell identity".into());
+            return Err(format!(
+                "tracked scorecard contains a duplicate {}-cell identity",
+                population_label(metadata.green, metadata.probe_disabled)
+            ));
         }
     }
     let actual: BTreeSet<_> = metadata.cells.iter().cloned().collect();
@@ -3844,6 +3875,13 @@ fn verify_repetition_summary_json(
     attempted: usize,
     retried_repetitions: usize,
 ) -> Result<(), String> {
+    if summary
+        .get("probe_disabled")
+        .and_then(JsonValue::as_bool)
+        .is_none()
+    {
+        return Err("summary JSON lost its disabled-population identity".into());
+    }
     if summary.get("attempted").and_then(JsonValue::as_u64) != Some(attempted as u64) {
         return Err("summary JSON lost the retained harness-attempt count".into());
     }
@@ -3881,12 +3919,15 @@ fn verify_repetition_summary_json(
 }
 
 fn summary_heading(metadata: &RunMetadata) -> &'static str {
+    let population = population_label(metadata.green, metadata.probe_disabled);
     if metadata.repetitions.is_some() {
-        if metadata.green {
-            "# Repeated green-cell results"
-        } else {
-            "# Repeated red-cell results"
+        match population {
+            "green" => "# Repeated green-cell results",
+            "disabled" => "# Repeated disabled-cell results",
+            _ => "# Repeated red-cell results",
         }
+    } else if metadata.probe_disabled {
+        "# Disabled-cell pressure-test results"
     } else {
         "# Red-cell pressure-test results"
     }
@@ -3919,7 +3960,7 @@ fn repeated_summary_line(
             )
         }
     } else {
-        let population = if metadata.green { "green" } else { "red" };
+        let population = population_label(metadata.green, metadata.probe_disabled);
         format!(
             "Repeated {population}-cell batch: {terminal_passes}/{total} terminally passed; {clean_passes}/{total} passed cleanly; {result}."
         )
@@ -4891,9 +4932,10 @@ fn summarize(
         );
         Some(result)
     } else {
+        let population = population_label(metadata.green, metadata.probe_disabled);
         println!(
-            "{} red cell(s) passed once; they are candidates for repeated confirmation, not automatic promotion.",
-            passing.len()
+            "{} {population} cell(s) passed once; they are candidates for repeated confirmation, not automatic promotion.",
+            passing.len(),
         );
         for id in passing.iter().take(20) {
             println!("  PASS {id}");
@@ -4916,6 +4958,7 @@ fn summarize(
         "repetitions": metadata.repetitions,
         "run_id_prefix": metadata.run_id_prefix,
         "green": metadata.green,
+        "probe_disabled": metadata.probe_disabled,
         "jobs": metadata.jobs,
         "eligible_cells": (metadata.eligible_cells != 0).then_some(metadata.eligible_cells),
         "selected_cells": metadata.cells.len(),
@@ -6161,6 +6204,29 @@ fn self_test(root: &Path) -> Result<(), String> {
     {
         return Err("explicit disabled-cell probing lost its exact requested cell".into());
     }
+    let red_kvm = tracked
+        .cells
+        .iter()
+        .find(|cell| {
+            cell.status == "red" && cell.id.mode == "verify" && cell.id.backend == "kvm"
+        })
+        .ok_or("self-test needs at least one red KVM verify cell")?;
+    let red_as_disabled = CellSelection {
+        test: Some(red_kvm.id.test.clone()),
+        mode: Some(red_kvm.id.mode.clone()),
+        backend: Some(red_kvm.id.backend.clone()),
+        probe_disabled: true,
+        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+        ..CellSelection::default()
+    };
+    let red_as_disabled_error = pressure_cells(root, &red_as_disabled)
+        .err()
+        .ok_or("disabled-cell probe accepted an enabled red cell")?;
+    if !red_as_disabled_error.contains("is not a disabled tracked cell") {
+        return Err(format!(
+            "disabled-cell probe of an enabled red cell reported the wrong error: {red_as_disabled_error}"
+        ));
+    }
     let disabled_batch_selection = CellSelection {
         mode: Some("verify".into()),
         backend: Some("kvm".into()),
@@ -6179,6 +6245,19 @@ fn self_test(root: &Path) -> Result<(), String> {
         })
     {
         return Err("disabled-backend batch selected an enabled or mismatched cell".into());
+    }
+    let oversized_disabled_sample = CellSelection {
+        sample: Some(disabled_batch.eligible_cells + 1),
+        seed: Some(7),
+        ..disabled_batch_selection.clone()
+    };
+    let oversized_disabled_error = pressure_cells(root, &oversized_disabled_sample)
+        .err()
+        .ok_or("oversized disabled-cell sample was accepted")?;
+    if !oversized_disabled_error.contains("disabled cells with executable commands") {
+        return Err(format!(
+            "oversized disabled-cell sample reported the wrong population: {oversized_disabled_error}"
+        ));
     }
     let mut disabled_batch_args = vec![
         "--results".to_string(),
@@ -6201,6 +6280,30 @@ fn self_test(root: &Path) -> Result<(), String> {
     {
         return Err("disabled-backend batch options did not retain their selection".into());
     }
+    let disabled_batch_results = scratch.join("disabled-batch-plan");
+    let (disabled_batch_metadata, disabled_batch_dag) = write_plan_after_scorecard_check(
+        &checked_scorecard,
+        &disabled_batch_results,
+        &disabled_batch_results.join("dag.json"),
+        &disabled_batch_selection,
+    )?;
+    if !disabled_batch_metadata.probe_disabled
+        || disabled_batch_dag
+            .steps
+            .iter()
+            .filter(|step| step.group == "cell")
+            .any(|step| !step.desc.starts_with("Repeat disabled cell "))
+        || disabled_batch_dag
+            .steps
+            .iter()
+            .find(|step| step.group == "pressure" && step.job == "summarize")
+            .is_none_or(|step| {
+                step.desc
+                    != "Wait for every repeated disabled-cell check before reading retained runner evidence"
+            })
+    {
+        return Err("disabled-backend plan lost its population identity".into());
+    }
     let mut green_backend_args = vec![
         "--results".to_string(),
         "ignored/compat-envelope/green-backend-self-test".to_string(),
@@ -6222,25 +6325,62 @@ fn self_test(root: &Path) -> Result<(), String> {
     {
         return Err("green-backend batch options did not retain their selection".into());
     }
-    for arguments in [
-        vec!["--probe-disabled"],
-        vec!["--probe-disabled", "--backend", "kvm", "--green"],
-        vec![
-            "--probe-disabled",
-            "--backend",
-            "kvm",
-            "--test",
-            "fixture/test",
-        ],
+    for (arguments, expected_error) in [
+        (
+            vec![
+                "--results",
+                "ignored/compat-envelope/invalid-selection-self-test",
+                "--probe-disabled",
+            ],
+            "--probe-disabled requires --backend",
+        ),
+        (
+            vec![
+                "--results",
+                "ignored/compat-envelope/invalid-selection-self-test",
+                "--probe-disabled",
+                "--backend",
+                "kvm",
+                "--green",
+            ],
+            "--probe-disabled and --green are mutually exclusive",
+        ),
+        (
+            vec![
+                "--results",
+                "ignored/compat-envelope/invalid-selection-self-test",
+                "--probe-disabled",
+                "--backend",
+                "kvm",
+                "--test",
+                "fixture/test",
+            ],
+            "--probe-disabled with --test also requires --mode",
+        ),
     ] {
         let mut arguments = arguments.into_iter().map(str::to_string);
-        if result_options(root, &mut arguments, false, true).is_ok() {
-            return Err("invalid disabled-backend selection was accepted".into());
+        let error = result_options(root, &mut arguments, false, true)
+            .err()
+            .ok_or("invalid disabled-backend selection was accepted")?;
+        if !error.contains(expected_error) {
+            return Err(format!(
+                "invalid disabled-backend selection reported the wrong error: {error}"
+            ));
         }
     }
     for arguments in [
-        vec!["--green", "--repetitions", "3", "--test", "fixture/test"],
         vec![
+            "--results",
+            "ignored/compat-envelope/invalid-selection-self-test",
+            "--green",
+            "--repetitions",
+            "3",
+            "--test",
+            "fixture/test",
+        ],
+        vec![
+            "--results",
+            "ignored/compat-envelope/invalid-selection-self-test",
             "--green",
             "--repetitions",
             "3",
@@ -6251,8 +6391,13 @@ fn self_test(root: &Path) -> Result<(), String> {
         ],
     ] {
         let mut arguments = arguments.into_iter().map(str::to_string);
-        if result_options(root, &mut arguments, false, true).is_ok() {
-            return Err("incomplete exact green selection was accepted".into());
+        let error = result_options(root, &mut arguments, false, true)
+            .err()
+            .ok_or("incomplete exact green selection was accepted")?;
+        if !error.contains("an exact-cell selection requires --test, --mode, and --backend") {
+            return Err(format!(
+                "incomplete exact green selection reported the wrong error: {error}"
+            ));
         }
     }
     let exact_id = unfiltered
@@ -6600,6 +6745,39 @@ fn self_test(root: &Path) -> Result<(), String> {
     if validate_run_contract(root, &repeated_results, &dirty_repeated_metadata, true).is_ok() {
         return Err("dirty repeated run metadata was accepted".into());
     }
+    let mut impossible_population_metadata = repeated_metadata.clone();
+    impossible_population_metadata.green = true;
+    impossible_population_metadata.probe_disabled = true;
+    let impossible_population_error = validate_run_contract(
+        root,
+        &repeated_results,
+        &impossible_population_metadata,
+        false,
+    )
+    .err()
+    .ok_or("retained run accepted mutually exclusive green and disabled populations")?;
+    if !impossible_population_error.contains("--probe-disabled and --green are mutually exclusive")
+    {
+        return Err(format!(
+            "retained green-plus-disabled run reported the wrong error: {impossible_population_error}"
+        ));
+    }
+    let mut unscoped_disabled_metadata = repeated_metadata.clone();
+    unscoped_disabled_metadata.probe_disabled = true;
+    unscoped_disabled_metadata.backend = None;
+    let unscoped_disabled_error = validate_run_contract(
+        root,
+        &repeated_results,
+        &unscoped_disabled_metadata,
+        false,
+    )
+    .err()
+    .ok_or("retained run accepted an unscoped disabled population")?;
+    if !unscoped_disabled_error.contains("--probe-disabled requires --backend") {
+        return Err(format!(
+            "retained unscoped disabled run reported the wrong error: {unscoped_disabled_error}"
+        ));
+    }
 
     let repeated_build_results = scratch.join("repeated-build-markers");
     let setup_marker = build_marker(&repeated_build_results, "setup.manifest_plan");
@@ -6744,6 +6922,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     let mut red_batch_result_metadata = green_batch_metadata.clone();
     red_batch_result_metadata.green = false;
+    let disabled_batch_result_metadata = disabled_batch_metadata;
     if !repeated_metadata.is_exact()
         || green_batch_metadata.is_exact()
         || top_level_repeated_result_description(&repeated_metadata, 1, 1, 0, 0, 2)
@@ -6773,6 +6952,9 @@ fn self_test(root: &Path) -> Result<(), String> {
         repeated_summary_line(&red_batch_result_metadata, 0, 0, 0, 2, 2);
     let green_batch_heading = summary_heading(&green_batch_metadata);
     let green_batch_result = repeated_summary_line(&green_batch_metadata, 1, 1, 0, 0, 2);
+    let disabled_batch_heading = summary_heading(&disabled_batch_result_metadata);
+    let disabled_batch_result =
+        repeated_summary_line(&disabled_batch_result_metadata, 1, 1, 0, 0, 2);
     if exact_red_heading != "# Repeated red-cell results"
         || exact_red_result
             != "Repeated result: 1/2 terminally passed; 1/2 passed cleanly; flaky."
@@ -6794,12 +6976,16 @@ fn self_test(root: &Path) -> Result<(), String> {
         || green_batch_heading != "# Repeated green-cell results"
         || green_batch_result
             != "Repeated green-cell batch: 1/2 terminally passed; 1/2 passed cleanly; one or more repeated checks failed or required a retry."
+        || disabled_batch_heading != "# Repeated disabled-cell results"
+        || disabled_batch_result
+            != "Repeated disabled-cell batch: 1/2 terminally passed; 1/2 passed cleanly; one or more repeated checks failed or required a retry."
     {
         return Err(format!(
-            "repeated summary rendering mislabeled an exact red, red batch, or green batch: \
+            "repeated summary rendering mislabeled an exact red, red batch, green batch, or disabled batch: \
              exact={exact_red_heading:?}/{exact_red_result:?} \
              red_batch={red_batch_heading:?}/{red_batch_result:?} \
-             green_batch={green_batch_heading:?}/{green_batch_result:?}"
+             green_batch={green_batch_heading:?}/{green_batch_result:?} \
+             disabled_batch={disabled_batch_heading:?}/{disabled_batch_result:?}"
         ));
     }
     let green_batch_dag_text = fs::read_to_string(green_batch_results.join("dag.json"))
@@ -7767,7 +7953,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         .and_then(JsonValue::as_array)
         .and_then(|cells| cells.first())
         .ok_or("production retry summary lost its repeated cell")?;
-    if summarize_json["attempted"] != 2
+    if summarize_json["probe_disabled"] != false
+        || summarize_json["attempted"] != 2
         || summarize_json["retried_repetitions"] != 1
         || summarized_cell["passes"] != 1
         || summarized_cell["clean_passes"] != 0
@@ -7798,6 +7985,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     let all_terminal_failures =
         repeated_cell_summary(&sample_a, 0, 0, 2, 2, "failed every repetition");
     let exact_recovered_json = json!({
+        "probe_disabled": false,
         "attempted": 2,
         "retried_repetitions": 1,
         "repeated_result": top_level_repeated_result_description(
@@ -7811,6 +7999,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         "repeated_cells": [one_recovered],
     });
     let exact_all_recovered_json = json!({
+        "probe_disabled": false,
         "attempted": 4,
         "retried_repetitions": 2,
         "repeated_result": top_level_repeated_result_description(
@@ -7824,6 +8013,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         "repeated_cells": [all_recovered.clone()],
     });
     let batch_one_recovered_json = json!({
+        "probe_disabled": false,
         "attempted": 3,
         "retried_repetitions": 1,
         "repeated_result": top_level_repeated_result_description(
@@ -7837,6 +8027,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         "repeated_cells": [retry_summary.clone()],
     });
     let batch_recovered_json = json!({
+        "probe_disabled": false,
         "attempted": 4,
         "retried_repetitions": 2,
         "repeated_result": top_level_repeated_result_description(
@@ -7850,6 +8041,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         "repeated_cells": [all_recovered],
     });
     let exact_failed_json = json!({
+        "probe_disabled": false,
         "attempted": 4,
         "retried_repetitions": 2,
         "repeated_result": top_level_repeated_result_description(
@@ -7863,6 +8055,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         "repeated_cells": [all_terminal_failures.clone()],
     });
     let batch_failed_json = json!({
+        "probe_disabled": false,
         "attempted": 4,
         "retried_repetitions": 2,
         "repeated_result": top_level_repeated_result_description(
@@ -7914,11 +8107,17 @@ fn self_test(root: &Path) -> Result<(), String> {
     verify_repetition_summary_json(&exact_failed_json, 4, 2)?;
     verify_repetition_summary_json(&batch_failed_json, 4, 2)?;
     let summary_accounting = json!({
+        "probe_disabled": true,
         "attempted": 3,
         "retried_repetitions": 1,
         "repeated_cells": [retry_summary],
     });
     verify_repetition_summary_json(&summary_accounting, 3, 1)?;
+    let mut missing_population_identity = summary_accounting.clone();
+    missing_population_identity
+        .as_object_mut()
+        .expect("summary fixture is an object")
+        .remove("probe_disabled");
     let mut missing_retry_count = summary_accounting.clone();
     missing_retry_count
         .as_object_mut()
@@ -7934,7 +8133,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     let mut impossible_cell = missing_retry_count.clone();
     impossible_cell["retried_repetitions"] = json!(1);
     impossible_cell["repeated_cells"][0]["retried_repetitions"] = json!(3);
-    if verify_repetition_summary_json(&missing_retry_count, 3, 1).is_ok()
+    if verify_repetition_summary_json(&missing_population_identity, 3, 1).is_ok()
+        || verify_repetition_summary_json(&missing_retry_count, 3, 1).is_ok()
         || verify_repetition_summary_json(&wrong_attempt_count, 3, 1).is_ok()
         || verify_repetition_summary_json(&incomplete_cell, 3, 1).is_ok()
         || verify_repetition_summary_json(&impossible_cell, 3, 1).is_ok()
