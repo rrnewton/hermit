@@ -1,5 +1,4 @@
-#[path = "../../../hermit-cli/src/canonical_verdict.rs"]
-pub mod canonical_verdict;
+pub use detcore_model::canonical_verdict;
 pub mod ci_selection;
 pub mod cli_help;
 pub mod host_capability;
