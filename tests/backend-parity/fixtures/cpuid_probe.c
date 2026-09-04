@@ -8,8 +8,10 @@
 
 /*
  * Backend-parity contract: Detcore virtualizes CPUID to one fixed synthetic CPU
- * identity, so leaf 0 reports max=0000000d / "GenuineIntel" and leaf 1 reports
- * signature 00000663 with the RDRAND bit (ECX bit 30) clear, on every host.
+ * identity, so leaf 0 reports max=0000000d / "GenuineIntel", leaf 1 reports
+ * signature 00000663 with the RDRAND bit (ECX bit 30) clear, and unsupported
+ * subleaf 1 of each indexed basic leaf at or below the advertised maximum
+ * returns zero in every register, on every host.
  *
  * EMISSION CONTRACT: stdout carries the observed CPUID identity on EVERY path.
  * Previously the values were printed only on the success path, so every failure
@@ -24,16 +26,6 @@
  * compiles THIS file and compares stdout literally, and
  * tests/backend-parity/run_matrix.py's "cpuid_policy" row expects the same
  * bytes. Only the previously-silent failure paths gained output.
- *
- * KNOWN LANE DEFECT, not fixed here and not fixable inside this file: the
- * portable lane passes --no-virtualize-cpuid (ci/test_harness.sh applies it to
- * every lane=='portable' cell, and every backend-parity-c test is lane
- * 'portable'). With CPUID virtualization off, the real host CPU leaks through
- * and this contract is unsatisfiable by construction -- on an AMD host it now
- * prints `cpuid max=00000010 vendor=AuthenticAMD ...` and exits 1. It is not red
- * today only because its cell is ci=false. The fix is a lane/flag decision in
- * tests/e2e/manifests/backend-parity-c.toml, which is owned by another agent
- * (hermit-parityc), so it is routed rather than made here.
  */
 
 #include <cpuid.h>
@@ -73,6 +65,29 @@ int main(void) {
     fprintf(stderr, "unexpected CPUID leaf 1: eax=%08x ecx=%08x\n", sig_eax,
             sig_ecx);
     return 2;
+  }
+
+  const uint32_t indexed_leaves[] = {UINT32_C(0x04), UINT32_C(0x07),
+                                     UINT32_C(0x0b), UINT32_C(0x0d)};
+  for (unsigned int i = 0;
+       i < sizeof(indexed_leaves) / sizeof(indexed_leaves[0]); ++i) {
+    uint32_t subleaf_eax;
+    uint32_t subleaf_ebx;
+    uint32_t subleaf_ecx;
+    uint32_t subleaf_edx;
+    __cpuid_count(indexed_leaves[i], 1, subleaf_eax, subleaf_ebx, subleaf_ecx,
+                  subleaf_edx);
+    if (subleaf_eax != 0 || subleaf_ebx != 0 || subleaf_ecx != 0 ||
+        subleaf_edx != 0) {
+      printf("CPUID-MISMATCH max=%08x vendor=%s signature=%08x rdrand=%u\n",
+             max_leaf, vendor, sig_eax, (unsigned)((sig_ecx >> 30) & 1u));
+      fprintf(stderr,
+              "unexpected CPUID leaf %x subleaf 1: eax=%08x ebx=%08x "
+              "ecx=%08x edx=%08x\n",
+              indexed_leaves[i], subleaf_eax, subleaf_ebx, subleaf_ecx,
+              subleaf_edx);
+      return 3;
+    }
   }
 
   /* Success line held byte-identical for cli.rs and run_matrix.py. */
