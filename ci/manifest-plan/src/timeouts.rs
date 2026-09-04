@@ -15,14 +15,16 @@ pub const DEFAULT_TEST_WALL_TIMEOUT_SECONDS: u64 = 57;
 pub const TEST_CPU_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER";
 pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER";
 
-/// Frozen retained-data census used to calibrate the per-test policy.
+/// Frozen retained-data census used to calibrate the previously selected
+/// population. The LiteInst ratchet adds its reviewed three-repetition
+/// qualification evidence.
 pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
-pub const CALIBRATED_CI_CELL_COUNT: usize = 492;
-pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
-pub const UNSAMPLED_NON_CI_CELL_COUNT: usize = 188;
-/// Among the 487 calibrated cells without an explicit override, these are the
+pub const CALIBRATED_CI_CELL_COUNT: usize = 726;
+pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 721;
+pub const UNSAMPLED_NON_CI_CELL_COUNT: usize = 166;
+/// Among the 721 calibrated cells without an explicit override, these are the
 /// largest bounds produced by the owner-approved formula.
-pub const DEFAULT_COVERED_MAX_REQUIRED_CPU_SECONDS: u64 = 12;
+pub const DEFAULT_COVERED_MAX_REQUIRED_CPU_SECONDS: u64 = 13;
 pub const DEFAULT_COVERED_MAX_REQUIRED_WALL_SECONDS: u64 = 49;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -279,7 +281,7 @@ mod tests {
             DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
             DEFAULT_COVERED_MAX_REQUIRED_WALL_SECONDS,
         );
-        assert_eq!(UNSAMPLED_NON_CI_CELL_COUNT, 188);
+        assert_eq!(UNSAMPLED_NON_CI_CELL_COUNT, 166);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS {
             assert!(calibration.samples > 0);
             assert_eq!(

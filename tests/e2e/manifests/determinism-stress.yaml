@@ -272,11 +272,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
           kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst coverage is owned by its backend compatibility partition
       replay:
         ci: false
         backends_enabled: []

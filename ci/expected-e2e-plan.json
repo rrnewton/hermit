@@ -3446,6 +3446,1647 @@
       "lane": "privileged",
       "mode": "verify",
       "test": "applications/kvm-shell-environment"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/aio-refusal"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/append-pwrite"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/bind-getsockname"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/cachestat-refusal"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/child-subreaper-refusal"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/close-range-fds"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/copy-file-range-refusal"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/cpu-virtualization"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/cwd-roundtrip"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/dup-shared-offset"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/epoll-pwait2"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/epoll-readiness"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/event-delivery-ordering"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/eventfd-semantics"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/faccessat2-flags"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/fadvise-hints"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/fallocate-extents"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/fchmod-bits"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/fchmodat2-flags"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/fcntl-owner"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/fd-duplication"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/file-backed-mmap"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/file-io-roundtrip"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/flock-lifecycle"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/fsync-durability"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/ftruncate-sparse"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/getcpu-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/getpriority-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/hardware-trap-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/host-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/inline-syscall-sites"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/inotify-watch"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/ioctl-fionread"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/kcmp-refusal"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/linkat-flags"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/lseek-positioning"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/mce-kill-refusal"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/membarrier-query"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/memfd-create"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/mempolicy-default"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/mincore-residency"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/mixed-inline-and-libc-syscalls"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/mkdir-rmdir"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/mknod-special"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/msync-writeback"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/name-to-handle-refusal"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/no-new-privs-refusal"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/numa-node-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/o-tmpfile-anon"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/openat-flags"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/openat2-refusal"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/path-file-ops"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/personality-domain"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/pidfd-open-self"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/pipe-capacity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/pipe-capacity-pin"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/pipe-ipc"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/pipe2-flags"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/poll-readiness"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/prctl-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/prctl-pdeathsig"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/preadv2-flags"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/pthread-lifecycle"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/readdir-entries"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/readdir-order-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/record-lock"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/rename-ops"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/renameat2-flags"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/rlimit-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/robust-list"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/sched-getaffinity-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/seccomp-refusal"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/sendfile-copy"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/set-tid-address"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/short-io-split-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/shutdown-socketpair"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/signal-delivery-sequence"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/signal-waitstatus-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/signalfd-create"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/socket-epoll-ordering"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/socket-options"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/socketpair-flags"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/sockname-unnamed"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/statfs-free-determinism"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/statx-metadata"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/symlink-ops"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/sync-file-range"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/sysv-ipc-refusal"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/thp-disable"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/umask-mode"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/uname-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/utimensat-determinism"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/vectored-file-io"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/vectored-io"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/acct-refusal-probe"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/add-key-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/adjtimex-deterministic"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/bpf-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/cachestat-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/clock-adjtime-deterministic"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/clone"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/copy-file-range-refusal-probe"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/dbt-copied-tiocgpgrp"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/dbt-exec-failure"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/dbt-mmap-exec"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/dbt-prlimit-self"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/dbt-self-sigqueue"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/dbt-wait-lifecycle"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/fp-reduction-nondeterminism"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/futex-requeue-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/futex-waitv-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/futex-wake-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/get-robust-list-child"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/get-robust-list-self"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/get-robust-list-thread"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/getcpu"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/getitimer-determinism-probe"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/getsockopt-null"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/hello-alarm"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/hello-signals"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/io-uring-fallback"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/io-uring-ring-determinism"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ioctl-fioclex"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ioctl-siocethtool"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/just-spin"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/kcmp-eperm"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/keyctl-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/keyctl-passthrough"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/listmount-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/lsm-get-self-attr-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/lsm-list-modules-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/lsm-set-self-attr-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/madvise-determinism"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/map-shadow-stack-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/memfd-secret-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/meminfo-available-deterministic"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/meminfo-cached-deterministic"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/meminfo-free-deterministic"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/memorypress"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/mmap-stress-determinism"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/netns-cookie-tcp4"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/netns-cookie-tcp6"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/netns-cookie-udp4"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/pause-alarm-interrupt"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/perf-event-hardware-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/perf-event-open-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/perf-event-software-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/perf-event-watchpoint-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/periodic-setitimer-delivery"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/pidfd-open-self"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/pidfd-poll-self"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/pidfd-waitid-child"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/pipe2-errno-precedence"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ppoll-readv"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ppoll-simulation"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/prctl-dumpable"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/prctl-option-policy"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/print-memaddrs"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/printf-with-threads"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/proc-fdinfo"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/proc-locks"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/process-mrelease-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/process-vm-readv-refusal-probe"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/process-vm-writev-refusal-probe"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/procfs-identity-agreement"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/procfs-positioned-probe"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/prodcons-determinism"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/pselect6-simulation"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ptrace-attach-eperm"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ptrace-eperm"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ptrace-seize-eperm"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ptrace-traceme-eperm"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/pty-nr-count"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/random-sources"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/rcx-canonicalization"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/record-replay-setsockopt"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/recvmsg-scm-rights-mmap"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/remap-file-pages-anonymous-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/remap-file-pages-memfd-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/remap-file-pages-tmpfile-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/request-key-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sched-setattr-batch"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sched-setattr-idle"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sched-setattr-other"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sched-yield-progress"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/scheduler-policy-queries"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/session-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/setitimer-determinism"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sigmask-preemption"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sigpipe-siginfo"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sigtimedwait-timeout-0s"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sigtimedwait-timeout-1s"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/splice-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/statmount-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/syscall-file-io"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/syscall-file-metadata"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/syscall-quick-wins"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sysfs-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sysinfo"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sysinfo-uptime"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/syslog-deterministic"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sysv-sem-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sysv-shm-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/tcp-info-accept4"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/tcp-info-accept6"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/tcp-info-client4"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/tee-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/thread-self-procfs-handoff"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/threadexhaustion"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/timer-create-determinism"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/uname"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ustat-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/vmsplice-enosys"
+    },
+    {
+      "backend": "liteinst",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/wait-on-child"
+    },
+    {
+      "backend": "liteinst",
+      "category": "chaos-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "chaos-c/lock-granularity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/order-violation"
+    },
+    {
+      "backend": "liteinst",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/lock-free"
+    },
+    {
+      "backend": "liteinst",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/mmap-fork-shared"
+    },
+    {
+      "backend": "liteinst",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/pid-tid"
+    },
+    {
+      "backend": "liteinst",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/pipe-prefill"
+    },
+    {
+      "backend": "liteinst",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/producer-consumer"
+    },
+    {
+      "backend": "liteinst",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/signal-order"
+    },
+    {
+      "backend": "liteinst",
+      "category": "determinism-stress-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress-c/thread-stress"
+    },
+    {
+      "backend": "liteinst",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/rust-hashmap-iteration"
+    },
+    {
+      "backend": "liteinst",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/clock-determinism"
+    },
+    {
+      "backend": "liteinst",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/du-tree-summary"
+    },
+    {
+      "backend": "liteinst",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/errno-path-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/file-timestamp-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/find-tree-metadata"
+    },
+    {
+      "backend": "liteinst",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/record-getpid"
+    },
+    {
+      "backend": "liteinst",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/shm-coherency-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/startup-surface-identity"
+    },
+    {
+      "backend": "liteinst",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/startup-tls-guards"
+    },
+    {
+      "backend": "liteinst",
+      "category": "backend-parity-c",
+      "lane": "privileged",
+      "mode": "verify",
+      "requires_host_capabilities": [
+        "cpuid-faulting"
+      ],
+      "test": "backend-parity-c/cpuid-probe"
     }
   ],
   "schema": 1
