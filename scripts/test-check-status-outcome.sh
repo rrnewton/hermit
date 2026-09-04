@@ -25,9 +25,21 @@ PYTHON_CLASSIFIER="$ROOT_DIR/scripts/check_outcome_adapter.py"
 #
 # Only exit 3 from the probe takes this path; see scripts/authority-available.sh
 # for why 3 cannot be a refusal, a bug, or a tampered authority.
-if ! _authority_dir="$("$ROOT_DIR/scripts/authority-available.sh")"; then
+_auth_rc=0
+_authority_dir=$("$ROOT_DIR/scripts/authority-available.sh") || _auth_rc=$?
+# ⚠️ ONLY EXIT 3 MAY SKIP, AND AN EARLIER VERSION OF THIS GUARD GOT IT WRONG.
+# It treated ANY nonzero from the helper as "unavailable", so a TAMPERED
+# authority -- fetched successfully, wrong bytes, AuthorityIntegrityError, exit
+# 1 -- was laundered into a no-result skip. That is the most dangerous possible
+# reading: the one failure mode the content pin exists to catch, silently
+# reported as "could not evaluate". Measured 2026-09-04: checker exited 0 with a
+# marker against a deliberately corrupted authority.
+if [ "$_auth_rc" -eq 3 ]; then
     echo "NO-RESULT-CASE: test-check-status-outcome.sh: the pinned check-status authority could not be consulted; no case in this checker was evaluated"
     exit 0
+elif [ "$_auth_rc" -ne 0 ]; then
+    echo "test-check-status-outcome.sh: obtaining the pinned check-status authority failed with exit $_auth_rc; that is not an outage and is not being skipped" >&2
+    exit "$_auth_rc"
 fi
 # ⚠️ EXPORTING THIS IS THE POINT, not tidiness. Every later adapter process in
 # this checker now reads the authority from disk instead of fetching it again,

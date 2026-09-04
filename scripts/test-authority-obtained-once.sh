@@ -64,8 +64,41 @@ if ! "$ROOT_DIR/scripts/check_outcome_adapter.py" --materialize-authority "$auth
 fi
 
 failures=0
-for checker in test-required-check-outcomes.sh test-check-status-outcome.sh \
-               check-merge-gate-policy.sh core-review-protocol-lint-test.sh; do
+# ⚠️ THE LIST IS CHECKED AGAINST THE TARGET, NOT JUST WRITTEN DOWN. A hard-coded
+# list is exactly where a newly added authority consumer goes untested: the new
+# checker fetches, nobody notices, and the race is reachable again through it.
+# So every script named in the lint-checks recipe that references an authority
+# adapter must appear below, and this fails if one does not.
+GUARDED="test-required-check-outcomes.sh test-check-status-outcome.sh check-merge-gate-policy.sh core-review-protocol-lint-test.sh test_pr_status.py"
+# Two scripts reference an adapter without being consumers of its verdict: they
+# are tests OF the adapter and deliberately drive it into states, including
+# unreachable ones, that this property does not apply to. Exempting them is
+# stated here rather than achieved by leaving them off the list silently.
+EXEMPT="test-authority-obtained-once.sh test_check_outcome_adapter_authority.py"
+consumers=$(sed -n '/^lint-checks:/,/^$/p' "$ROOT_DIR/Makefile" \
+    | grep -oE 'scripts/[A-Za-z0-9_.-]+' | sort -u)
+missing=0
+for consumer in $consumers; do
+    file="$ROOT_DIR/$consumer"
+    [ -f "$file" ] || continue
+    grep -qE 'check_outcome_adapter|review_contract_adapter|classify-required-check' "$file" || continue
+    base=$(basename "$consumer")
+    case " $EXEMPT " in
+        *" $base "*) continue ;;
+    esac
+    case " $GUARDED " in
+        *" $base "*) ;;
+        *)
+            echo "FAIL: ${base} is in lint-checks and consults an authority adapter, but is not covered here" >&2
+            missing=$((missing + 1))
+            ;;
+    esac
+done
+if [ "$missing" -ne 0 ]; then
+    exit 1
+fi
+
+for checker in $GUARDED; do
     calls="$work/calls"
     : > "$calls"
     # DEV_HERMIT_PARENT is deliberately pointed at an EMPTY directory: the
@@ -80,6 +113,7 @@ for checker in test-required-check-outcomes.sh test-check-status-outcome.sh \
     if ! env PATH="$work/bin:$PATH" DEV_HERMIT_PARENT="$empty" \
             OBTAINED_ONCE_PAYLOAD="$payload" \
             OBTAINED_ONCE_GH_CALLS="$calls" \
+            $(case "$checker" in *.py) echo python3 ;; esac) \
             "$ROOT_DIR/scripts/$checker" >"$work/out" 2>&1; then
         echo "FAIL: ${checker} did not complete with the authority already obtained" >&2
         tail -5 "$work/out" >&2
@@ -92,6 +126,32 @@ for checker in test-required-check-outcomes.sh test-check-status-outcome.sh \
         failures=$((failures + 1))
     fi
 done
+
+# ⚠️ AN INTEGRITY FAILURE MUST NOT BECOME A SKIP. Serving a CORRECTLY REACHABLE
+# but WRONG authority is the one failure the content pin exists to catch. An
+# earlier version of the guard treated any nonzero from the helper as
+# "unavailable", so a tampered authority exited the checker 0 with a no-result
+# marker -- measured 2026-09-04. If this ever passes with a marker again, the
+# pin has been turned into a suggestion.
+tamper="$work/tamper"
+mkdir -p "$tamper/bin"
+cat "$authority/ci-hub/check_outcome.py" > "$tamper/payload"
+printf '# tampered\n' >> "$tamper/payload"
+cat > "$tamper/bin/gh" <<STUB
+#!/usr/bin/env bash
+exec cat "$tamper/payload"
+STUB
+chmod +x "$tamper/bin/gh"
+mkdir -p "$tamper/empty"
+tamper_out="$work/tamper.out"
+if env PATH="$tamper/bin:$PATH" DEV_HERMIT_PARENT="$tamper/empty" \
+        "$ROOT_DIR/scripts/test-required-check-outcomes.sh" >"$tamper_out" 2>&1; then
+    echo "FAIL: a tampered authority did not fail the checker" >&2
+    failures=$((failures + 1))
+elif grep -q '^NO-RESULT-CASE:' "$tamper_out"; then
+    echo "FAIL: a tampered authority was reported as could-not-determine; an integrity refusal is not an outage" >&2
+    failures=$((failures + 1))
+fi
 
 if [ "$failures" -ne 0 ]; then
     exit 1
