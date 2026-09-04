@@ -4660,6 +4660,111 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/vmsplice-enosys"
+    },
+    {
+      "backend": "kvm",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/cpu-virtualization"
+    },
+    {
+      "backend": "kvm",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/dup-shared-offset"
+    },
+    {
+      "backend": "kvm",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/fd-duplication"
+    },
+    {
+      "backend": "kvm",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/getcpu-identity"
+    },
+    {
+      "backend": "kvm",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/getpriority-identity"
+    },
+    {
+      "backend": "kvm",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/lseek-positioning"
+    },
+    {
+      "backend": "kvm",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/pidfd-open-self"
+    },
+    {
+      "backend": "kvm",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/rlimit-identity"
+    },
+    {
+      "backend": "kvm",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/sched-getaffinity-identity"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/epoll-determinism"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/madvise-determinism"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/mmap-determinism"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/netlink-autobind-generic"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/netlink-autobind-route"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/netlink-autobind-usersock"
     }
   ],
   "schema": 1

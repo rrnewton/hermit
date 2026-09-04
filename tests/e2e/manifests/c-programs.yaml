@@ -1274,7 +1274,7 @@ test:
       verify:
         ci:
           ptrace: true
-          kvm: false
+          kvm: true
           sabre: true
           liteinst: true
         backends_enabled:
@@ -1293,11 +1293,6 @@ test:
             - multi
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-        ci_disabled_reason:
-          kvm:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -3244,7 +3239,7 @@ test:
       verify:
         ci:
           ptrace: true
-          kvm: false
+          kvm: true
           sabre: true
         backends_enabled:
           - ptrace
@@ -3256,11 +3251,6 @@ test:
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
-        ci_disabled_reason:
-          kvm:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -3679,7 +3669,7 @@ test:
       verify:
         ci:
           ptrace: true
-          kvm: false
+          kvm: true
           sabre: true
           liteinst: true
         backends_enabled:
@@ -3698,11 +3688,6 @@ test:
             - multiple
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-        ci_disabled_reason:
-          kvm:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -4275,7 +4260,7 @@ test:
       verify:
         ci:
           ptrace: true
-          kvm: false
+          kvm: true
           sabre: true
           liteinst: true
         backends_enabled:
@@ -4285,11 +4270,6 @@ test:
           - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-        ci_disabled_reason:
-          kvm:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -4342,7 +4322,7 @@ test:
       verify:
         ci:
           ptrace: true
-          kvm: false
+          kvm: true
           sabre: true
           liteinst: true
         backends_enabled:
@@ -4352,11 +4332,6 @@ test:
           - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-        ci_disabled_reason:
-          kvm:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -4409,7 +4384,7 @@ test:
       verify:
         ci:
           ptrace: true
-          kvm: false
+          kvm: true
           sabre: true
           liteinst: true
         backends_enabled:
@@ -4419,11 +4394,6 @@ test:
           - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-        ci_disabled_reason:
-          kvm:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
