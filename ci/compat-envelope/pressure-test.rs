@@ -74,7 +74,7 @@ const PORTABLE_DAG: &str = "ci/dag/portable.json";
 /// schema N". That is a fail-closed refusal rather than silent misreading, but
 /// it takes the pressure test offline entirely, and nothing in either file
 /// points at the other -- which is how it was missed when 5 became 6.
-const TRACKED_CELLS_SCHEMA: u64 = 7;
+const TRACKED_CELLS_SCHEMA: u64 = 8;
 const RUN_SCHEMA: u64 = 3;
 const SUMMARY_SCHEMA: u64 = 4;
 const REQUIRED_BUILD_TAGS: [&str; 5] = [
@@ -7682,6 +7682,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
         relaxations: Vec::new(),
         execution_path: None,
+        backend_parity: None,
         diversity: None,
         attempts: vec![fixture_attempt("FAIL", 1)],
         reason: None,
@@ -8346,6 +8347,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
         relaxations: Vec::new(),
         execution_path: None,
+        backend_parity: None,
         diversity: None,
         attempts: vec![fixture_attempt("PASS", 0)],
         reason: None,

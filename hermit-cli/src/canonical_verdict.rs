@@ -123,6 +123,7 @@ pub enum ComparedLogScope {
 pub enum RecordEnvelopeReport {
     AllRecordsV1,
     DbtEvidenceTransportV1,
+    CrossBackendDetcoreV1,
     CallerDefined,
 }
 
@@ -135,6 +136,7 @@ impl RecordEnvelopeReport {
         match self {
             Self::AllRecordsV1 => "all_records_v1",
             Self::DbtEvidenceTransportV1 => "dbt_evidence_transport_v1",
+            Self::CrossBackendDetcoreV1 => "cross_backend_detcore_v1",
             Self::CallerDefined => "caller_defined",
         }
     }
@@ -184,6 +186,39 @@ pub struct ComparedLogMessages {
     pub right: u64,
 }
 
+/// Content identity and disposition of one guest execution.
+///
+/// The bytes themselves remain in the invoking process or retained artifacts;
+/// these fields make the exact stdout/stderr/status comparison independently
+/// checkable without attempting to recover guest stderr from controller logs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComparedOutput {
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub stdout_sha256: String,
+    pub stdout_bytes: u64,
+    pub stderr_sha256: String,
+    pub stderr_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComparedOutputs {
+    pub left: ComparedOutput,
+    pub right: ComparedOutput,
+}
+
+impl ComparedOutputs {
+    pub fn require_exact_match(&self) -> Result<(), String> {
+        if self.left == self.right {
+            Ok(())
+        } else {
+            Err("verification operands differ in status, stdout, or stderr".into())
+        }
+    }
+}
+
 /// The complete machine-readable report written by `--verify-json`.
 ///
 /// This type is shared by the Hermit producer, the manifest runner, the
@@ -207,6 +242,10 @@ pub struct VerificationReport {
     #[serde(deserialize_with = "present_but_nullable_comparison")]
     pub comparison: Option<ComparisonReport>,
     pub compared_log_messages: Option<ComparedLogMessages>,
+    /// Exact output/status evidence for both executions. Optional only so
+    /// retained reports written before this field remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compared_outputs: Option<ComparedOutputs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dbt_counted_branches: Option<DbtCountedBranchComparison>,
     /// Runtime totals for the two compared executions when the producer could
@@ -301,6 +340,7 @@ impl VerificationReport {
             infrastructure_error: None,
             comparison: None,
             compared_log_messages: None,
+            compared_outputs: None,
             dbt_counted_branches: None,
             runtime: None,
             guest_exit_code: None,
@@ -401,6 +441,17 @@ impl VerificationReport {
                     "incomplete verification report: missing current producer field `{field}`"
                 ));
             }
+        }
+        let verdict = object.get("verdict").and_then(serde_json::Value::as_str);
+        if matches!(verdict, Some("matched" | "diverged"))
+            && object
+                .get("compared_outputs")
+                .is_none_or(serde_json::Value::is_null)
+        {
+            return Err(
+                "incomplete verification report: missing current producer field `compared_outputs`"
+                    .into(),
+            );
         }
         if let Some(comparison) = object
             .get("comparison")
@@ -629,6 +680,7 @@ mod tests {
                 skip_detlog: None,
             }),
             compared_log_messages: Some(ComparedLogMessages { left, right }),
+            compared_outputs: None,
             dbt_counted_branches: None,
             runtime: None,
             guest_exit_code: None,
@@ -849,6 +901,24 @@ mod tests {
                 "skip_detlog": false
             },
             "compared_log_messages": {"left": 1, "right": 1},
+            "compared_outputs": {
+                "left": {
+                    "exit_code": 0,
+                    "signal": null,
+                    "stdout_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "stdout_bytes": 4,
+                    "stderr_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "stderr_bytes": 0
+                },
+                "right": {
+                    "exit_code": 0,
+                    "signal": null,
+                    "stdout_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "stdout_bytes": 4,
+                    "stderr_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "stderr_bytes": 0
+                }
+            },
             "guest_exit_code": 0,
             "guest_signal": null,
             "first_divergent_scheduler_turn": null,
@@ -864,6 +934,19 @@ mod tests {
         assert_eq!(comparison.compare_io_buffers, Some(true));
         assert_eq!(comparison.log_scope, Some(ComparedLogScope::Info));
         assert_eq!(parsed.guest_exit_code, Some(0));
+        let mut missing_outputs = current.clone();
+        missing_outputs
+            .as_object_mut()
+            .unwrap()
+            .remove("compared_outputs");
+        let error = VerificationReport::from_current_json_value(missing_outputs)
+            .expect_err("a completed current report must carry exact output evidence");
+        assert!(error.contains("compared_outputs"), "{error}");
+        let mut null_outputs = current.clone();
+        null_outputs["compared_outputs"] = serde_json::Value::Null;
+        let error = VerificationReport::from_current_json_value(null_outputs)
+            .expect_err("null is not output evidence for a completed current report");
+        assert!(error.contains("compared_outputs"), "{error}");
         current["comparison"]
             .as_object_mut()
             .unwrap()
