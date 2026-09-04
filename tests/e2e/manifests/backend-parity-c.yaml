@@ -3757,7 +3757,7 @@ test:
         ci:
           ptrace: true
           dbt: false
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
@@ -3770,10 +3770,6 @@ test:
             result: infrastructure-error
             evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
             reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
-          kvm:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -4097,7 +4093,7 @@ test:
         ci:
           ptrace: true
           dbt: false
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
@@ -4110,10 +4106,6 @@ test:
             result: infrastructure-error
             evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
             reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
-          kvm:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -4684,7 +4676,7 @@ test:
         ci:
           ptrace: true
           dbt: false
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
@@ -4697,10 +4689,6 @@ test:
             result: infrastructure-error
             evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
             reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
-          kvm:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -4758,7 +4746,7 @@ test:
         ci:
           ptrace: true
           dbt: false
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
@@ -4771,10 +4759,6 @@ test:
             result: infrastructure-error
             evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
             reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
-          kvm:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -4832,7 +4816,7 @@ test:
         ci:
           ptrace: true
           dbt: false
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
@@ -4845,10 +4829,6 @@ test:
             result: infrastructure-error
             evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
             reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
-          kvm:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -4906,7 +4886,7 @@ test:
         ci:
           ptrace: true
           dbt: false
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
@@ -4919,10 +4899,6 @@ test:
             result: infrastructure-error
             evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
             reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
-          kvm:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -4980,13 +4956,9 @@ test:
         ci:
           ptrace: true
           dbt: false
-          kvm: false
+          kvm: true
         ci_disabled_reason:
           dbt: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
-          kvm:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
         backends_enabled:
           - ptrace
           - dbt
@@ -5051,13 +5023,9 @@ test:
         ci:
           ptrace: true
           dbt: false
-          kvm: false
+          kvm: true
         ci_disabled_reason:
           dbt: {"result": "determinism-failure", "evidence": "Published parent series at dev-hermit 90a55d8190dd2551179a9394be3504ee89a6a5a9 retains pressure-test results pass and determinism-failure for Detcore tree 077a5d847f6541daa5ef145536a7065868e9d3ab; first divergent record 80 and syscall 32.", "reason": "Published canonical verification at the same Detcore tree contains both passing and divergent observations. The 20 clean repetitions in this campaign do not erase the retained divergence, so this backend remains excluded pending separate qualification."}
-          kvm:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
         backends_enabled:
           - ptrace
           - dbt
@@ -5122,7 +5090,7 @@ test:
         ci:
           ptrace: true
           dbt: false
-          kvm: false
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
@@ -5135,10 +5103,6 @@ test:
             result: infrastructure-error
             evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
             reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
-          kvm:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Both canonical full-validation attempts produced verdict=no_result during Run1 after guest exception vector 13 at 0x1014dac; no comparison was made, so this backend remains red without a divergence claim.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
