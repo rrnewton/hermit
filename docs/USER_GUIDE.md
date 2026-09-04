@@ -297,8 +297,13 @@ diagnostic, not strict determinism. Use
 required.
 
 Matching verification logs are temporary by default; divergent comparisons
-retain both. Keep both runs regardless of verdict with `--keep-logs`; Hermit
-prints only the final, readable paths. The default
+retain both. Hermit keeps the newest 64 implicitly retained failed comparisons
+under `$XDG_STATE_HOME/hermit/verify-failures` (or a bounded directory under the
+system temporary directory when no state directory is available) and prints
+their final, readable paths. A `hermit log-diff` reading one of those paths
+prevents its comparison directory from being retired until the read finishes.
+Keep both runs regardless of verdict, without that automatic retirement, with
+`--keep-logs`; Hermit prints only the final, readable paths. The default
 destination is `$XDG_STATE_HOME/hermit/verify-logs`, normally
 `~/.local/state/hermit/verify-logs`, and `--verify-log-dir=DIR` selects another
 durable directory. `--print-verify-logs` instead copies the first run's captured

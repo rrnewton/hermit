@@ -72,6 +72,7 @@ use super::verify::VerificationReport;
 use super::verify::VerificationRuntime;
 use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
+use super::verify::default_failed_verify_log_retention;
 use super::verify::retain_verification_logs;
 use super::verify::temp_log_files_in;
 use super::verify::validate_log_level;
@@ -2601,6 +2602,7 @@ impl RunOpts {
             diagnostic_full_trace: self.verify_verbose,
             compare_io_buffers: config.detlog_io_buffers,
             keep_logs: self.keep_logs,
+            failed_log_retention: (!self.keep_logs).then(default_failed_verify_log_retention),
             record_envelope: RecordEnvelope::all_records_v1(),
             // Read from the LIVE config, not a constant: `--no-virtualize-time`
             // makes this a genuine runtime choice on the run path, so a hard-coded

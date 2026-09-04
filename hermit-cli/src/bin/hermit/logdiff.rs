@@ -23,6 +23,7 @@ use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::record_envelope::RecordEnvelopeArg;
 use super::record_envelope::RecordEnvelopePolicy;
+use super::verify::lock_failed_verification_logs_for_read;
 
 fn write_canonical_info(
     file: &Path,
@@ -139,6 +140,15 @@ impl LogDiffCLIOpts {
 
     /// Print one log canonically or compare two logs.
     pub fn main(&self, _global: &GlobalOpts) -> ExitStatus {
+        let mut inputs = vec![self.file_a.clone()];
+        inputs.extend(self.file_b.iter().cloned());
+        let _retention_locks = match lock_failed_verification_logs_for_read(inputs) {
+            Ok(locks) => locks,
+            Err(error) => {
+                eprintln!("hermit log-diff: could not protect retained logs: {error}");
+                return ExitStatus::Exited(2);
+            }
+        };
         let record_envelope = self.record_envelope.envelope();
         eprintln!(
             "hermit log-diff: record envelope {}",
