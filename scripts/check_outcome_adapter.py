@@ -42,6 +42,49 @@ class AuthorityUnavailable(RuntimeError):
     """
 
 
+class AuthorityRefused(RuntimeError):
+    """The authority was REACHED and the answer was no.
+
+    ⚠️ NOT AN OUTAGE, AND CONFLATING THE TWO IS THE INVERSION OF THIS FILE'S
+    WHOLE PURPOSE. Measured 2026-09-04: `gh` returning ``Not Found (HTTP 404)``
+    -- the pinned commit or path gone -- came back as AuthorityUnavailable, so
+    every guarded checker printed a no-result marker and exited 0. A revoked
+    credential (403) did the same. Those are refusals: the request arrived and
+    was answered. Reporting them as "could not reach it" is the mirror of
+    reporting a 504 as a refusal, and it is worse, because it is silent.
+    """
+
+
+def _is_transport_failure(detail: str) -> bool:
+    """Whether `gh`'s failure is POSITIVELY identifiable as transport.
+
+    ⚠️ DEFAULT LOUD. Anything not matched here is treated as a refusal and fails
+    the checker rather than skipping it. That direction is deliberate: a missed
+    transport signature costs a false red that someone investigates, while a
+    missed refusal costs a silent skip of the check itself.
+    """
+    lowered = detail.lower()
+    for status in ("http 500", "http 502", "http 503", "http 504", "http 429"):
+        if status in lowered:
+            return True
+    return any(
+        signature in lowered
+        for signature in (
+            "could not resolve host",
+            "temporary failure in name resolution",
+            "connection refused",
+            "connection reset",
+            "network is unreachable",
+            "no route to host",
+            "operation timed out",
+            "timeout",
+            "tls handshake",
+            "unexpected eof",
+            "proxy",
+        )
+    )
+
+
 class AuthorityIntegrityError(RuntimeError):
     """The authority was obtained and does NOT match the pin.
 
@@ -94,12 +137,17 @@ def _fetch_pinned_source() -> bytes:
     result = subprocess.run(command, capture_output=True, check=False)
     if result.returncode != 0:
         detail = result.stderr.decode(errors="replace").strip() or "no error output"
-        # Transport, not verdict. `gh` exits nonzero for HTTP 5xx, DNS failure,
-        # a proxy refusal and an expired credential alike; none of them is a
-        # statement about any check.
-        raise AuthorityUnavailable(
-            "cannot fetch the pinned check-status authority with gh api: "
-            f"{detail}"
+        # `gh` exits nonzero for a 504, a 404 and a revoked credential alike, so
+        # the exit code alone cannot tell an outage from an answer. Classify on
+        # the message, and default to the loud reading.
+        if _is_transport_failure(detail):
+            raise AuthorityUnavailable(
+                "cannot fetch the pinned check-status authority with gh api: "
+                f"{detail}"
+            )
+        raise AuthorityRefused(
+            "the pinned check-status authority was reached and refused: "
+            f"{detail}. This is not an outage and is not being skipped"
         )
     return result.stdout
 
