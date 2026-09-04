@@ -24,16 +24,6 @@
  * compiles THIS file and compares stdout literally, and
  * tests/backend-parity/run_matrix.py's "cpuid_policy" row expects the same
  * bytes. Only the previously-silent failure paths gained output.
- *
- * KNOWN LANE DEFECT, not fixed here and not fixable inside this file: the
- * portable lane passes --no-virtualize-cpuid (ci/test_harness.sh applies it to
- * every lane=='portable' cell, and every backend-parity-c test is lane
- * 'portable'). With CPUID virtualization off, the real host CPU leaks through
- * and this contract is unsatisfiable by construction -- on an AMD host it now
- * prints `cpuid max=00000010 vendor=AuthenticAMD ...` and exits 1. It is not red
- * today only because its cell is ci=false. The fix is a lane/flag decision in
- * tests/e2e/manifests/backend-parity-c.toml, which is owned by another agent
- * (hermit-parityc), so it is routed rather than made here.
  */
 
 #include <cpuid.h>
@@ -58,6 +48,12 @@ int main(void) {
   uint32_t sig_ecx;
   __cpuid_count(1, 0, sig_eax, ebx, sig_ecx, edx);
 
+  uint32_t subleaf_eax;
+  uint32_t subleaf_ebx;
+  uint32_t subleaf_ecx;
+  uint32_t subleaf_edx;
+  __cpuid_count(7, 1, subleaf_eax, subleaf_ebx, subleaf_ecx, subleaf_edx);
+
   if (max_leaf != UINT32_C(0x0000000d) || strcmp(vendor, "GenuineIntel") != 0) {
     /* stdout, not just stderr: the cell observes stdout and status only. */
     printf("CPUID-MISMATCH max=%08x vendor=%s signature=%08x rdrand=%u\n",
@@ -73,6 +69,16 @@ int main(void) {
     fprintf(stderr, "unexpected CPUID leaf 1: eax=%08x ecx=%08x\n", sig_eax,
             sig_ecx);
     return 2;
+  }
+
+  if (subleaf_eax != 0 || subleaf_ebx != 0 || subleaf_ecx != 0 || subleaf_edx != 0) {
+    printf("CPUID-MISMATCH max=%08x vendor=%s signature=%08x rdrand=%u\n",
+           max_leaf, vendor, sig_eax, (unsigned)((sig_ecx >> 30) & 1u));
+    fprintf(stderr,
+            "unexpected CPUID leaf 7 subleaf 1: eax=%08x ebx=%08x ecx=%08x "
+            "edx=%08x\n",
+            subleaf_eax, subleaf_ebx, subleaf_ecx, subleaf_edx);
+    return 3;
   }
 
   /* Success line held byte-identical for cli.rs and run_matrix.py. */
