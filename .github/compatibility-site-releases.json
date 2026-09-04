@@ -1,7 +1,37 @@
 {
-  "latest_identity": "e75fe49e3b55c6357b32e0110d65731575fe287413f3239a92d9d4522e15a4fb",
+  "latest_identity": "74aa0520de2ab80d4da1180c0784ad945c3ee47d05ad6f71c3bb10865af89c51",
   "release_repository": "rrnewton/hermit",
   "releases": [
+    {
+      "archive_bytes": 13947577,
+      "archive_member_count": 100,
+      "archive_sha256": "3d021e60e190e3215508dbc7c9d413eb4efd1b76938d2cca6a5f2b01fd2e5e74",
+      "artifacts_sha256": "a8848ccfc252d5f09d1083dbff1c0aba19b67ba4c93429077841bae76fe3fc8d",
+      "asset": "compatibility-website-74aa0520de2ab80d4da1180c0784ad945c3ee47d05ad6f71c3bb10865af89c51.tar.gz",
+      "build_sha256": "e0ffebe4f9e57bd91480caf2d90d397d9312a66b61f82a7ade08a9d5ae623e72",
+      "content_tree_sha256": "866a12a6f5f461fb9186121a3ef7a47f4424acfdf2e074fd0a6c174d546efc63",
+      "counts": {
+        "current_validation_run_row_count": 60,
+        "green_cell_count": 596,
+        "in_manifest_cell_count": 5744,
+        "never_measured_cell_count": 5103,
+        "physical_row_count": 14541,
+        "red_cell_count": 30,
+        "represented_run_count": 20724,
+        "selected_by_full_custom_command_count": 3,
+        "test_count": 359,
+        "validation_history_row_count": 64
+      },
+      "directories": ["assets", "cells", "data", "runs", "tests"],
+      "file_bytes": 29292788,
+      "file_count": 94,
+      "identity": "74aa0520de2ab80d4da1180c0784ad945c3ee47d05ad6f71c3bb10865af89c51",
+      "manifest_tree_sha256": "30b1fd9597ecb10db8aa060270a42aa429e24895c430f85dea3bd15e5fd5180f",
+      "mode_sha256": "bb176a41b861c4db27edf1b6e8a8254d1cbdba5fc232588f09ffa1d8ddee2a85",
+      "recursive_identity_sha256": "b491615c6358a400e863734271c76f3f3b53309d1d515c9694f31e6cecd9154a",
+      "release_title": "Compatibility website snapshot 74aa0520de2ab80d4da1180c0784ad945c3ee47d05ad6f71c3bb10865af89c51",
+      "tag": "compatibility-website-74aa0520de2ab80d4da1180c0784ad945c3ee47d05ad6f71c3bb10865af89c51"
+    },
     {
       "archive_bytes": 15015443,
       "archive_member_count": 100,
