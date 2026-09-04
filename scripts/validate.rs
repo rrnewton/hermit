@@ -2722,7 +2722,7 @@ cleared-caps refusal names {} starved step(s)",
             );
         }
         for consumer in manifest_consumers {
-            let DagManifest { lane, category: _ } = consumer.manifest.as_ref().ok_or_else(|| {
+            let DagManifest { lane, category: _, .. } = consumer.manifest.as_ref().ok_or_else(|| {
                 format!(
                     "full-plan bracket: {} manifest consumer lacks typed manifest selection",
                     consumer.tag()
@@ -4164,6 +4164,7 @@ fn super_plan_bracket() -> Result<(), String> {
             cmdtype: CmdType::Unknown,
             manifest: None,
             integration_test_binaries: None,
+            result_manifests: None,
             labels: Vec::new(),
             deps: vec![],
             env: BTreeMap::new(),
@@ -6902,6 +6903,7 @@ fn manifest_bucket_of(step: &Step) -> Option<(String, String)> {
     let DagManifest {
         lane: declared_lane,
         category: declared_category,
+        ..
     } = manifest;
     let tail = step.cmd.split_once("target/debug/test-harness run ")?.1;
     let tokens: Vec<&str> = tail.split_whitespace().collect();
@@ -9449,6 +9451,7 @@ fn step_with_caps(
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
+        result_manifests: None,
         labels: Vec::new(),
         deps,
         env: BTreeMap::new(),
@@ -10248,6 +10251,9 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     mismatched.manifest = Some(DagManifest {
         lane: "portable".into(),
         category: "backend-parity-c".into(),
+        test: None,
+        mode: None,
+        backend: None,
     });
     if manifest_bucket_of(&mismatched).is_some() {
         return Err(
@@ -10435,6 +10441,7 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
+        result_manifests: None,
         labels: Vec::new(),
         deps,
         env: BTreeMap::new(),
@@ -11046,6 +11053,9 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
     cell.manifest = Some(DagManifest {
         lane: "portable".into(),
         category: "applications".into(),
+        test: None,
+        mode: None,
+        backend: None,
     });
     cell.env.insert("FIXTURE_VALUE".into(), "literal".into());
     let mut plan = Plan {
@@ -11231,11 +11241,17 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
     first.manifest = Some(DagManifest {
         lane: "portable".into(),
         category: "applications".into(),
+        test: None,
+        mode: None,
+        backend: None,
     });
     let mut second = step("e2e", "manifest_second", "true", vec![]);
     second.manifest = Some(DagManifest {
         lane: "privileged".into(),
         category: "applications".into(),
+        test: None,
+        mode: None,
+        backend: None,
     });
     let mut sequential = Plan {
         cfg: validate_plan::config_from(
@@ -12432,6 +12448,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             let DagManifest {
                 lane: manifest_lane,
                 category,
+                ..
             } = step.manifest.as_ref().ok_or_else(|| {
                 format!(
                     "retry bounds: manifest node {} lacks typed manifest selection",
@@ -13493,6 +13510,9 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     e2e_step.manifest = Some(DagManifest {
         lane: "portable".into(),
         category: "applications".into(),
+        test: None,
+        mode: None,
+        backend: None,
     });
     let e2e_retry = run_lane_once(
         &DagConfig { steps: vec![e2e_step], ..Default::default() },
@@ -20589,6 +20609,9 @@ mod e2e_attempt_tests {
         step.manifest = Some(DagManifest {
             lane: "portable".into(),
             category: "applications".into(),
+            test: None,
+            mode: None,
+            backend: None,
         });
         step
     }
