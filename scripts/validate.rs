@@ -157,7 +157,7 @@ const LEDGER_PRODUCER: &str = "hermit-validate-rs";
 /// The Reverie-pin preflight node's tag. Named once so the plan that creates it
 /// and the fail-closed assertion that requires it cannot drift apart.
 const PIN_GATE_TAG: &str = "pre.reverie_pin";
-const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
+const MANIFEST_AUDIT_COMMAND: &str = validate_plan::MANIFEST_AUDIT_COMMAND;
 const INTEGRATION_ARTIFACT_WRAPPER: &str =
     "./ci/run-with-hermit-e2e-artifact.sh --require-install ";
 const STRICT_COMPAT_PLACEHOLDER_TAG: &str = "test.strict_compat";
@@ -392,6 +392,9 @@ struct Args {
     show_plan: bool,
     show_plan_json: bool,
     write_constructed_dag: Option<PathBuf>,
+    /// Generator-only escape hatch: render the pre-cutover source builders even
+    /// after ordinary profiles consume the committed labelled DAG.
+    write_source_plan: Option<PathBuf>,
     selected: Option<String>,
     ignore_selected_deps: bool,
 }
@@ -467,6 +470,8 @@ fn usage() -> &'static str {
      \x20 --show-plan-json Print the constructed plan before environment wrapping as JSON.\n\
      \x20 --write-constructed-dag FILE\n\
      \x20                  Write one complete constructed DagConfig JSON for ci/run-dag.sh.\n\
+     \x20 --write-source-plan FILE\n\
+     \x20                  Generator-only: write the declarative source plan before cutover.\n\
      \x20 --selected <group.job>[,...]  Keep these steps from the constructed plan.\n\
      \x20 --ignore-selected-deps       Omit predecessors supplied by an external harness.\n\
      \x20 --self-test      Run inert policy/data brackets plus one bounded disposable\n\
@@ -481,7 +486,8 @@ fn usage() -> &'static str {
      post-verdict scorecard write-back failure preserves that line and exits 75;\n\
      current readers distinguish the two through ValidationServiceResult. No line\n\
      means validate died before reporting.\n\
-     Help, --show-plan, --write-constructed-dag, and --probe-host-capability do\n\
+     Help, --show-plan, --write-constructed-dag, --write-source-plan, and\n\
+     --probe-host-capability do\n\
      not attempt validation and therefore do not emit a final validate status.\n\
      \n\
      Environment: VALIDATE_LEVEL, VALIDATE_LABEL_PR,\n\
@@ -578,6 +584,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         show_plan: false,
         show_plan_json: false,
         write_constructed_dag: None,
+        write_source_plan: None,
         selected: None,
         ignore_selected_deps: false,
     };
@@ -657,6 +664,19 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                     }
                     _ => {
                         eprintln!("validate: --write-constructed-dag needs a FILE");
+                        return Err(2);
+                    }
+                }
+            }
+            "--write-source-plan" => {
+                i += 1;
+                match argv.get(i) {
+                    Some(v) if !v.is_empty() => {
+                        show_plan = true;
+                        args.write_source_plan = Some(PathBuf::from(v));
+                    }
+                    _ => {
+                        eprintln!("validate: --write-source-plan needs a FILE");
                         return Err(2);
                     }
                 }
@@ -779,7 +799,10 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
     args.show_plan = show_plan;
     args.show_plan_json = show_plan_json;
     args.focused = focused.pop();
-    if args.show_plan_json && args.write_constructed_dag.is_some() {
+    let output_forms = usize::from(args.show_plan_json)
+        + usize::from(args.write_constructed_dag.is_some())
+        + usize::from(args.write_source_plan.is_some());
+    if output_forms > 1 {
         eprintln!("validate: choose only one constructed-plan output form");
         return Err(2);
     }
@@ -2245,11 +2268,30 @@ fn self_test() -> Result<(), String> {
     {
         return Err("constructed DAG export: parser lost the output path or inert-plan mode".into());
     }
+    let source = parse_argv(&[
+        "full".into(),
+        "--write-source-plan".into(),
+        "/tmp/source.json".into(),
+    ])
+    .map_err(|code| format!("source DAG export: valid argv refused with exit {code}"))?;
+    if !source.show_plan
+        || source.write_source_plan.as_deref() != Some(Path::new("/tmp/source.json"))
+    {
+        return Err("source DAG export: parser lost the output path or inert-plan mode".into());
+    }
     if parse_argv(&["--write-constructed-dag".into()]).is_ok()
+        || parse_argv(&["--write-source-plan".into()]).is_ok()
         || parse_argv(&[
             "--write-constructed-dag".into(),
             "/tmp/constructed.json".into(),
             "--show-plan-json".into(),
+        ])
+        .is_ok()
+        || parse_argv(&[
+            "--write-constructed-dag".into(),
+            "/tmp/constructed.json".into(),
+            "--write-source-plan".into(),
+            "/tmp/source.json".into(),
         ])
         .is_ok()
     {
@@ -7670,7 +7712,7 @@ fn materialize_requalification_plan(
 }
 
 /// Build the execution plan for the selected level/mode.
-fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
+fn build_source_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     let with_proxy = has_cmd("with-proxy");
     let pre = validate_plan::preflight_nodes(root, with_proxy);
     let gate = "gate.manifest";
@@ -8023,7 +8065,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             steps.push(step_with_caps("quick", job, desc, cmd, deps, t, t * 2, mem));
         };
         add("build", "Build workspace", "cargo build --workspace --features third-party-backends".into(), vec![gate.into()], 3600, 16 * 1024 * 1024 * 1024);
-        add("e2e_metadata", "Portable E2E metadata", "target/debug/test-harness validate".into(), vec!["quick.build".into()], 600, 4 * 1024 * 1024 * 1024);
+        add("e2e_metadata", "Portable E2E metadata", MANIFEST_AUDIT_COMMAND.into(), vec!["quick.build".into()], 600, 4 * 1024 * 1024 * 1024);
         add("e2e_verify", "Portable ptrace E2E verification", "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], QUICK_E2E_VERIFY_TIMEOUT_S, 8 * 1024 * 1024 * 1024);
         add("detcore_unit", "Detcore core unit tests", "./ci/run-nextest-counted.sh -p hermit-detcore --lib".into(), vec!["quick.build".into(), "setup.nextest".into()], 1800, 8 * 1024 * 1024 * 1024);
         add("run_smoke", "Hermit run smoke test",
@@ -8301,6 +8343,35 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         compat: compat.then_some(CompatMode::PortableStrict),
         ..Default::default()
     })
+}
+
+/// Runtime plan construction boundary.
+///
+/// Commit 1 keeps this delegation byte-for-byte equivalent while the generated
+/// superset and freshness checks land. Commit 2 changes only this boundary for
+/// standard profiles to select the committed DAG by label; the source builder
+/// remains reachable solely through `--write-source-plan` for regeneration.
+fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
+    build_source_plan(root, args, tmp)
+}
+
+/// Make every inherited CPU budget explicit before a source plan crosses the
+/// DAG document boundary. `dag_to_json` intentionally does not serialize the
+/// execution-only default, so leaving zeroes here would turn validate's 7200s
+/// fallback into dagrun's 10s undeclared-node forcing function on reload.
+fn materialize_source_cpu_timeouts(cfg: &mut DagConfig) -> Result<(), String> {
+    if cfg.default_step_cpu_timeout <= 0 {
+        return Err(format!(
+            "source plan has no positive default CPU timeout (got {})",
+            cfg.default_step_cpu_timeout
+        ));
+    }
+    for step in &mut cfg.steps {
+        if step.cpu_timeout <= 0 {
+            step.cpu_timeout = cfg.default_step_cpu_timeout;
+        }
+    }
+    Ok(())
 }
 
 /// Build the `super` plan from the mechanically extracted gate table.
@@ -18649,6 +18720,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     let dirty_at_admission = tree_dirty();
     let wt_dirty = worktree_dirty();
     if args.write_constructed_dag.is_none()
+        && args.write_source_plan.is_none()
         && dirty_worktree_requires_refusal(
             nesting.nested,
             wt_dirty,
@@ -18687,7 +18759,8 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     match rebase_freshness(
         args.skip_inner_dirty_working_tree_and_rebase_freshness_checks
             || nesting.nested
-            || args.write_constructed_dag.is_some(),
+            || args.write_constructed_dag.is_some()
+            || args.write_source_plan.is_some(),
     ) {
         Ok(msg) => eprintln!("validate: {msg}"),
         Err(msg) => {
@@ -18743,6 +18816,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     let tmp = args
         .write_constructed_dag
         .as_ref()
+        .or(args.write_source_plan.as_ref())
         .and_then(|path| path.parent())
         .map(|parent| parent.join("run-state"))
         .unwrap_or_else(|| {
@@ -18779,7 +18853,11 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         }
     }
 
-    let mut plan = match build_plan(&root, &args, &tmp) {
+    let mut plan = match if args.write_source_plan.is_some() {
+        build_source_plan(&root, &args, &tmp)
+    } else {
+        build_plan(&root, &args, &tmp)
+    } {
         Ok(p) => p,
         Err(e) => {
             eprintln!("validate: cannot build the execution plan: {e}");
@@ -18830,6 +18908,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     if args.selected.is_none()
         && !args.show_plan_json
         && args.write_constructed_dag.is_none()
+        && args.write_source_plan.is_none()
     {
         if let Err(error) = apply_pinned_root(&mut plan, &root, false) {
             return RunSummary::refused(
@@ -19021,7 +19100,11 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // Print the plan and exit. This makes "what will actually run, and under what
     // caps" reviewable without spending a validate slot — and it is how the
     // declared-caps claim above can be checked by eye rather than trusted.
-    if let Some(path) = &args.write_constructed_dag {
+    if let Some(path) = args
+        .write_constructed_dag
+        .as_ref()
+        .or(args.write_source_plan.as_ref())
+    {
         if plan.second.is_some() {
             return RunSummary::refused(
                 2,
@@ -19033,7 +19116,18 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
                 ],
             );
         }
-        if let Err(error) = std::fs::write(path, format!("{}\n", dag_to_json(&plan.cfg))) {
+        let mut exported = plan.cfg.clone();
+        if args.write_source_plan.is_some() {
+            if let Err(error) = materialize_source_cpu_timeouts(&mut exported) {
+                return RunSummary::refused(
+                    2,
+                    &plan.profile,
+                    "source DAG export",
+                    vec![error],
+                );
+            }
+        }
+        if let Err(error) = std::fs::write(path, format!("{}\n", dag_to_json(&exported))) {
             return RunSummary::refused(
                 2,
                 &plan.profile,
