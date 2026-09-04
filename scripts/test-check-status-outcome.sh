@@ -25,10 +25,17 @@ PYTHON_CLASSIFIER="$ROOT_DIR/scripts/check_outcome_adapter.py"
 #
 # Only exit 3 from the probe takes this path; see scripts/authority-available.sh
 # for why 3 cannot be a refusal, a bug, or a tampered authority.
-if ! "$ROOT_DIR/scripts/authority-available.sh"; then
+if ! _authority_dir="$("$ROOT_DIR/scripts/authority-available.sh")"; then
     echo "NO-RESULT-CASE: test-check-status-outcome.sh: the pinned check-status authority could not be consulted; no case in this checker was evaluated"
     exit 0
 fi
+# ⚠️ EXPORTING THIS IS THE POINT, not tidiness. Every later adapter process in
+# this checker now reads the authority from disk instead of fetching it again,
+# so a 504 arriving after the check above cannot turn a case into a nonzero
+# exit. Probing alone left exactly that window open; see
+# scripts/authority-available.sh.
+export DEV_HERMIT_PARENT="$_authority_dir"
+trap 'rm -rf "$_authority_dir"' EXIT
 
 check() {
     local expected=$1 status=$2 conclusion=$3 python_result shell_result

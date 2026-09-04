@@ -171,22 +171,58 @@ class TheProbeHelperReportsOnlyTheOutage(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
 
     def test_probe_says_unreachable_only_on_exit_three(self) -> None:
+        """An adapter failing for any OTHER reason must not be read as an outage.
+
+        The helper takes adapter PATHS, so the stub is an executable file rather
+        than an interpreter plus a script.
+        """
+        import stat as stat_module
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
-            # An adapter that exits 1 is an ordinary error, NOT an outage, and
-            # the probe must not report it as one -- otherwise a broken adapter
-            # would make every guarded checker skip silently.
-            stub = Path(tmp) / "stub.py"
-            stub.write_text("import sys\nsys.exit(1)\n")
+            stub = Path(tmp) / "ordinary-error-adapter"
+            stub.write_text("#!/usr/bin/env python3\nimport sys\nsys.exit(1)\n")
+            stub.chmod(stub.stat().st_mode | stat_module.S_IEXEC)
             result = subprocess.run(
-                [str(SCRIPTS / "authority-available.sh"), sys.executable, str(stub)],
+                [str(SCRIPTS / "authority-available.sh"), str(stub)],
                 capture_output=True, text=True, check=False,
             )
-        self.assertEqual(
-            result.returncode, 0,
-            "only exit 3 may be reported as unreachable; exit 1 must not skip",
+
+        self.assertNotEqual(
+            result.returncode, 3,
+            "an ordinary adapter error must not be reported as unreachable, or a "
+            "broken adapter would make every guarded checker skip silently",
         )
+        self.assertNotEqual(result.returncode, 0, "and it must not be reported as success")
+
+    def test_one_obtained_authority_serves_every_later_invocation(self) -> None:
+        """⚠️ THE RACE THE CODEX LANE FOUND. Obtaining must remove later fetches,
+        not merely answer a question about the first one."""
+        import tempfile
+
+        probe = subprocess.run(
+            [str(SCRIPTS / "authority-available.sh")],
+            capture_output=True, text=True, check=False,
+        )
+        if probe.returncode == 3:
+            self.skipTest("authority genuinely unreachable here")
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        materialized = Path(probe.stdout.strip())
+        try:
+            # The directory the caller exports must actually satisfy the adapter
+            # with no network available at all -- that is what closes the window.
+            result = subprocess.run(
+                [sys.executable, str(ADAPTER), "--status", "completed",
+                 "--conclusion", "failure"],
+                capture_output=True, text=True, check=False,
+                env=dict(os.environ, DEV_HERMIT_PARENT=str(materialized), PATH=""),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "FAILED")
+        finally:
+            import shutil as shutil_module
+            shutil_module.rmtree(materialized, ignore_errors=True)
+
 
 
 if __name__ == "__main__":

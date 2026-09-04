@@ -16,11 +16,17 @@ set -euo pipefail
 # no_result (exit 75) instead of fail. A nonzero exit could never be reported as
 # no_result -- classify_run lets a real failure outrank any marker.
 _probe_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-if ! "$_probe_root/scripts/authority-available.sh" \
-        "$_probe_root/scripts/review_contract_adapter.py" --format lint-records; then
+if ! _authority_dir="$("$_probe_root/scripts/authority-available.sh" "$_probe_root/scripts/review_contract_adapter.py")"; then
     echo "NO-RESULT-CASE: core-review-protocol-lint-test.sh: the pinned review-label contract could not be consulted; no case in this checker was evaluated"
     exit 0
 fi
+# ⚠️ EXPORTING THIS IS THE POINT, not tidiness. Every later adapter process in
+# this checker now reads the authority from disk instead of fetching it again,
+# so a 504 arriving after the check above cannot turn a case into a nonzero
+# exit. Probing alone left exactly that window open; see
+# scripts/authority-available.sh.
+export DEV_HERMIT_PARENT="$_authority_dir"
+trap 'rm -rf "$_authority_dir"' EXIT
 
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
