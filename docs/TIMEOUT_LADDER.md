@@ -203,7 +203,7 @@ the same ceiling rule; planted base and multiplier mismatches are rejected.
 `hermit-cli/tests/container_init_deadline.rs` — which defends `PR_SET_PDEATHSIG`
 and the container-init stop handlers, i.e. the guarantee that an external
 deadline can end a hung run at all — **is in no DAG node**. Enumerating every
-`--test <target>` across `ci/dag/portable.json` and `ci/dag/privileged.json`
+`--test <target>` across the labelled populations in `ci/dag/validate.json`
 yields 50 targets and that file is not among them, so those cells never run in
 validation. The regression cells for `hermit run --timeout` are in
 `hermit-cli/tests/cli.rs` for that reason.

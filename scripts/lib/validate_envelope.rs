@@ -185,20 +185,6 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
     out
 }
 
-/// The workspace build node the measurement hangs off.
-pub fn build_node(gate_dep: &str) -> Step {
-    node(
-        "envelope",
-        "build",
-        "Build workspace for envelope measurement",
-        "cargo build --workspace --features third-party-backends".to_string(),
-        vec![gate_dep.to_string()],
-        3600,
-        7200,
-        16 * 1024 * 1024 * 1024,
-    )
-}
-
 /// Per-probe, per-level pass bits derived from typed outcomes.
 ///
 /// A node that never ran (skipped because its dependency failed) scores 0, which

@@ -2,7 +2,7 @@
   "_comment": [
     "Policy inputs that Cargo metadata cannot derive for ci/test-footprints.json.",
     "Run `cargo run -p hermit-manifest-plan --bin generate-test-footprints` after",
-    "changing this file, the workspace Cargo graph, or ci/dag/portable.json.",
+    "changing this file, the workspace Cargo graph, or ci/dag/validate.json.",
     "",
     "Keep ci_irrelevant deliberately narrow: it is the only classification that can",
     "skip CI. Unmatched paths still force the complete suite. Package Rust sources,",
