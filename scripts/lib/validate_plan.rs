@@ -415,100 +415,8 @@ mod tests {
     }
 }
 
-/// Remove a lane's duplicate manifest-plan producer and bind its consumers to
-/// the always-on preflight producer.
-///
-/// Lane JSON retains the producer because it is also executable independently.
-/// Once a lane is attached to validate's preflight, however, keeping that root
-/// would either duplicate the tag or recreate the old `gate -> producer -> gate`
-/// cycle. Refuse command drift before remapping the dependency.
-pub fn lane_nodes_reusing_manifest_producer(
-    root: &Path,
-    lane: &str,
-    prefix: &str,
-    gate_dep: &str,
-) -> Result<Vec<Step>, String> {
-    let mut steps = lane_nodes(root, lane, prefix, gate_dep)?;
-    if !reuse_preflight_manifest_producer(&mut steps, &format!("lane {lane}"))? {
-        return Err(format!("lane {lane} has no manifest-plan producer"));
-    }
-    Ok(steps)
-}
-
-/// Replace a selected lane's manifest-plan producer with the equivalent node
-/// already present in validate's preflight spine.
-///
-/// Returning `false` for an absent producer is intentional: a selective set may
-/// not need any manifest-plan consumer. If the selector did include it, its tag
-/// remains valid selection vocabulary and every selected dependent is remapped
-/// to the preflight node before the lane is attached.
-pub fn reuse_preflight_manifest_producer(
-    steps: &mut Vec<Step>,
-    context: &str,
-) -> Result<bool, String> {
-    let producer_indexes: Vec<usize> = steps
-        .iter()
-        .enumerate()
-        .filter_map(|(index, step)| (step.job == "manifest_plan").then_some(index))
-        .collect();
-    if producer_indexes.len() > 1 {
-        return Err(format!(
-            "{context} contains {} manifest-plan producers",
-            producer_indexes.len()
-        ));
-    }
-    let Some(index) = producer_indexes.first().copied() else {
-        return Ok(false);
-    };
-    if steps[index].cmd != MANIFEST_PLAN_BUILD_COMMAND {
-        return Err(format!(
-            "{context} manifest-plan producer command drifted: {}",
-            steps[index].cmd
-        ));
-    }
-    let lane_producer_tag = steps[index].tag();
-    steps.remove(index);
-    for step in steps.iter_mut() {
-        for dependency in &mut step.deps {
-            if dependency == &lane_producer_tag {
-                *dependency = MANIFEST_PLAN_PRODUCER_TAG.to_string();
-            }
-        }
-        step.deps.sort();
-        step.deps.dedup();
-    }
-    Ok(true)
-}
-
-/// THE one place a CI lane's file is resolved.
-///
-/// `target/debug/test-harness` audits that this expression appears EXACTLY ONCE in this
-/// file, so that a lane's node set can never be resolved from two places that
-/// could drift. Both `lane_nodes` (steps) and `lane_config` (top-level config)
-/// go through here; adding a second construction of the path is what the audit
-/// exists to catch, and it caught exactly that when `lane_config` was added.
 pub fn validation_dag_path(root: &Path) -> std::path::PathBuf {
     root.join("ci").join("dag").join("validate.json")
-}
-
-/// Load one shipped CI lane (`ci/dag/<lane>.json`) and hang it off the preflight.
-///
-/// `prefix` disambiguates tags when two lanes are fused into one DAG; it is empty
-/// for a single-lane run so tags stay byte-identical to the shipped file (which
-/// keeps `ci/run-node.sh`, the perf store, and the coverage predicate keyed the
-/// same way).
-pub fn lane_nodes(
-    root: &Path,
-    lane: &str,
-    prefix: &str,
-    gate_dep: &str,
-) -> Result<Vec<Step>, String> {
-    if !prefix.is_empty() || gate_dep != "gate.manifest" {
-        return Err(format!(
-            "committed validation labels do not support runtime retagging or dependency injection: prefix={prefix:?} gate_dep={gate_dep:?}"
-        ));
-    }
-    Ok(lane_config(root, lane)?.steps)
 }
 
 // ------------------------------------------------- host-capability requirements
@@ -565,8 +473,7 @@ pub struct HostInapplicableNode {
 
 /// The `requires_host_capability` declarations in one lane, keyed by runner tag.
 ///
-/// Reads the same file `lane_nodes` reads, through the same single path helper.
-/// `prefix` matches the retagging `lane_nodes` applies when lanes are fused.
+/// Reads the sole committed validation DAG through the same path helper.
 /// An unparseable capability name is an ERROR: refusing the whole run is the
 /// only safe response to a declaration nobody can evaluate.
 pub fn lane_host_capability_requirements(
@@ -745,41 +652,6 @@ pub fn compat_nodes_for(
     Ok(out)
 }
 
-/// Keep only the named lane nodes, pruning each survivor's deps to the kept set.
-///
-/// Port of `build_selected_portable_dag` (validate.sh:4400), which did the same
-/// `jq` surgery into a temporary DAG file consumed through
-/// `RUN_DAG_FILE_OVERRIDE`. Here the plan is already in memory, so no temp file
-/// and no second DAG-loading path are involved.
-///
-/// `ci/select-tests.rs` emits a dependency-CLOSED node set, so pruning cannot
-/// drop a genuine dependency — but that is the selector's guarantee, not this
-/// function's, so the caller is told how many edges were pruned and how many of
-/// the requested tags were not found. An unknown tag is a selector/DAG mismatch
-/// and is reported rather than silently ignored.
-pub struct Selection {
-    pub steps: Vec<Step>,
-    pub pruned_edges: usize,
-    pub unknown_tags: Vec<String>,
-}
-
-pub fn select_lane_nodes(all: Vec<Step>, keep: &std::collections::BTreeSet<String>) -> Selection {
-    let present: std::collections::BTreeSet<String> = all.iter().map(|s| s.tag()).collect();
-    let unknown_tags: Vec<String> = keep.difference(&present).cloned().collect();
-    let mut pruned_edges = 0usize;
-    let steps = all
-        .into_iter()
-        .filter(|s| keep.contains(&s.tag()))
-        .map(|mut s| {
-            let before = s.deps.len();
-            s.deps.retain(|d| keep.contains(d) || !present.contains(d));
-            pruned_edges += before - s.deps.len();
-            s
-        })
-        .collect();
-    Selection { steps, pruned_edges, unknown_tags }
-}
-
 /// DAG tags are `group.job`, so a job containing `.` would produce an ambiguous
 /// tag. Corpus labels are shell-command names (`c++filt`, `wc-lines`), none of
 /// which contain a dot today, but the mapping is applied rather than assumed.
@@ -787,15 +659,8 @@ pub fn sanitize_job(label: &str) -> String {
     label.replace('.', "_")
 }
 
-/// Assemble a `DagConfig` from steps, applying the profile-level CPU-time default
-/// that the shipped lane JSON does not carry.
-/// Load a lane's FULL `DagConfig` -- not just its steps.
-///
-/// `lane_nodes` returns steps because the fusion path rewrites their tags, but a
-/// DAG file is more than a bag of steps: `resource_caps`, `default_step_timeout`,
-/// `mem_cap_factor`, `mem_cap_floor_bytes` and `outer_mem_safety_factor` are all
-/// top-level, and every one of them silently reverts to `DagConfig::default()` if
-/// the caller rebuilds the config instead of carrying it.
+/// Load the complete committed DAG and select one label with its dependency
+/// closure while preserving every top-level scheduler setting.
 pub fn lane_config(root: &Path, lane: &str) -> Result<DagConfig, String> {
     let path = validation_dag_path(root);
     let text = std::fs::read_to_string(&path)
