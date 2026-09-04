@@ -16,9 +16,21 @@ set -euo pipefail
 # no_result (exit 75) instead of fail. A nonzero exit could never be reported as
 # no_result -- classify_run lets a real failure outrank any marker.
 _probe_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-if ! _authority_dir="$("$_probe_root/scripts/authority-available.sh" "$_probe_root/scripts/review_contract_adapter.py")"; then
+_auth_rc=0
+_authority_dir=$("$_probe_root/scripts/authority-available.sh" "$_probe_root/scripts/review_contract_adapter.py") || _auth_rc=$?
+# ⚠️ ONLY EXIT 3 MAY SKIP, AND AN EARLIER VERSION OF THIS GUARD GOT IT WRONG.
+# It treated ANY nonzero from the helper as "unavailable", so a TAMPERED
+# authority -- fetched successfully, wrong bytes, AuthorityIntegrityError, exit
+# 1 -- was laundered into a no-result skip. That is the most dangerous possible
+# reading: the one failure mode the content pin exists to catch, silently
+# reported as "could not evaluate". Measured 2026-09-04: checker exited 0 with a
+# marker against a deliberately corrupted authority.
+if [ "$_auth_rc" -eq 3 ]; then
     echo "NO-RESULT-CASE: core-review-protocol-lint-test.sh: the pinned review-label contract could not be consulted; no case in this checker was evaluated"
     exit 0
+elif [ "$_auth_rc" -ne 0 ]; then
+    echo "core-review-protocol-lint-test.sh: obtaining the pinned review-label contract failed with exit $_auth_rc; that is not an outage and is not being skipped" >&2
+    exit "$_auth_rc"
 fi
 # ⚠️ EXPORTING THIS IS THE POINT, not tidiness. Every later adapter process in
 # this checker now reads the authority from disk instead of fetching it again,
