@@ -28,6 +28,7 @@ const PACKAGED_SKILLS: &[&str] = &[
     "determinism-regression-debugging",
     "fabler",
     "hermit-debugging",
+    "how-to-build-a-cli",
     "post-facto-review",
     "presenting-quantitative-data",
     "progress-rubric",
