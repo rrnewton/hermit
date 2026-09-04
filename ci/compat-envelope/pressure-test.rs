@@ -69,7 +69,7 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 
 const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
-const PORTABLE_DAG: &str = "ci/dag/portable.json";
+const PORTABLE_DAG: &str = "ci/dag/validate.json";
 /// ⚠️ COUPLED TO `SCHEMA` IN ci/compat-envelope/scorecard.rs. Both tools read
 /// cells.json and both pin its version, so a bump in one WITHOUT the other
 /// leaves this tool refusing every tracked file with "unsupported tracked cell
@@ -281,7 +281,7 @@ Other options:
 How it runs:
   Plan generation first checks the tracked scorecard and reads selection and
   budgets from the typed manifest tool. The in-memory graph then reuses the
-  canonical Hermit/resource build commands from ci/dag/portable.json without
+  canonical Hermit/resource build commands from ci/dag/validate.json without
   recursively running the full validation metadata audit. Fixture preparation
   is serialized. Every selected-cell repetition then runs in its own safe-ci
   cgroup. Existing resource caps admit
@@ -1139,7 +1139,7 @@ fn execute_typed_dag(
         }
 
         passes += 1;
-        // This graph clones the canonical build steps out of ci/dag/portable.json,
+        // This graph clones the canonical build steps out of ci/dag/validate.json,
         // including the two that bake a 32-wide cargo invocation into the command and
         // therefore carry an empty jobs_flag. The runner refuses before any node
         // starts if the CPU budget is narrower than such a step's declared width, and
@@ -2561,7 +2561,7 @@ fn retain_required_build_dependencies(
         // commands that are not present in this generated plan. Pressure plan
         // generation performs its scorecard and typed-manifest checks before
         // execution instead.
-        if dependency == "e2e.metadata"
+        if matches!(dependency.as_str(), "e2e.metadata" | "gate.manifest")
             && matches!(tag.as_str(), "build.workspace" | "build.runtime_release")
         {
             continue;

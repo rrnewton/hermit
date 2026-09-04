@@ -7,32 +7,28 @@ with explicit dependencies and resource limits, so the scheduler can run
 independent gates concurrently. On hosts with delegated cgroup v2 support, it
 can also box each node for memory limits and full process-subtree teardown.
 
-- [`portable.json`](portable.json) — contributes committed data to the plan
-  constructed for `scripts/validate.rs`'s **`--portable-only`** lane and the
-  manually dispatched GitHub-managed portable `regular` diagnostic in
-  [`.github/workflows/ci-portable.yml`](../../.github/workflows/ci-portable.yml).
-  No PMU / CPUID interception required.
-- [`privileged.json`](privileged.json) — contributes the focused capability
-  contract selected by the manually dispatched privileged diagnostic in
-  [`.github/workflows/ci-privileged.yml`](../../.github/workflows/ci-privileged.yml).
-  Requires PMU + `/dev/kvm`.
+- [`validate.json`](validate.json) — the one committed superset. Steps declare
+  `quick`, `portable`, `full`, `super`, and `privileged` labels; dagrun selects
+  the requested label and its dependency ancestry without rewriting the graph.
 
 Run a lane with the wrapper:
 
 ```sh
 ci/run-dag.sh portable   --max-mem 32G          # memory-aware -j
 ci/run-dag.sh privileged -j 2                    # PMU lane, one gate at a time
-ci/run-dag.sh portable   ascii                   # visualize instead of run
+agent-utils/py/bin/dagrun ascii --dag ci/dag/validate.json  # inspect the superset
 ```
 
 ## Status: active local lanes and manual hosted diagnostics
 
-`scripts/validate.rs` constructs the plan from the committed validation data.
-The hosted workflows pass selected step tags back to that plan builder; they do
-not read a lane file as an executable plan or restate a step command. The
-constructed plan is therefore the source of truth for individual gate commands,
-dependencies, and resource declarations even when the hosted workflow groups
-those steps across separate jobs.
+`scripts/validate.rs` reads `validate.json` and selects the requested label.
+The hosted workflows select from the same file. Standard profile execution does
+not merge lane files, regenerate nodes, or rewrite commands and resource caps.
+
+`generate-validation-dag --check` is a maintenance check, not part of runtime
+plan construction. It treats static nodes in `validate.json` as authored source
+and regenerates only the namespaced compatibility/stress partition from the
+manifest corpus. `--write` updates this same file; there is no secondary DAG.
 
 The privileged DAG is limited to the focused build, CPUID faulting, PMU skid,
 manifest validation, and KVM E2E cells so the manual self-hosted smoke stays
@@ -160,17 +156,10 @@ runtime output.
 
 ### Command fidelity
 
-Node `cmd`s are the **verbatim** commands `scripts/validate.rs` runs, with three
-deliberate exceptions, chosen to avoid duplicating script logic that has many
-moving parts:
-
-- **Portable strict compatibility is a generated expansion.** The committed
-  `test.strict_compat` row is a fail-closed marker; `scripts/validate.rs`
-  replaces it with one run-unique fixture-preparation node and the corpus-derived
-  `compat.*` nodes before invoking dagrun. This keeps the corpus JSON as the one
-  source of argv while exposing every probe and its resource demand to the one
-  outer scheduler. The privileged `rr.compat_baseline` composite still reuses
-  `./scripts/validate.rs --rr-compat-only`.
+Node `cmd`s are the **verbatim** commands `scripts/validate.rs` runs. Portable
+strict compatibility is committed as one fixture producer plus direct
+`compat.*` steps. The stable `test.strict_compat` shard/selection alias expands
+only to those already-committed steps; it never constructs or rewrites them.
 - **The DBT stderr-isolation CLI case is a separate 120-second node** so a
   backend hang fails quickly without consuming the aggregate CLI budget. The
   aggregate node skips that case, so the test set remains unchanged.
