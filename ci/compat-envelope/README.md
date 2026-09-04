@@ -127,6 +127,21 @@ Every enabled manifest cell outside the selected plan is red. Manifest-disabled
 cells are not applicable. A red cell can have a passing measurement, and a green
 cell can have a divergence; the two fields answer different questions.
 
+To measure a disabled backend population before changing its manifest
+eligibility, name the backend explicitly. The backend requirement prevents an
+unfiltered probe from attempting every unsupported combination:
+
+```console
+./ci/compat-envelope/pressure-test.rs run \
+  --probe-disabled --backend kvm --mode verify --repetitions 1 \
+  --cell-timeout 60 --run-timeout 7200
+```
+
+These probes use the harness's existing `--probe-disabled` execution path and
+retain the backend filter in `run.json`. They do not change cell status or
+manifest selection; a later reviewed change may enable only cells supported by
+the measured evidence.
+
 ## Divergence positions: where a cell diverged, and how well you know it
 
 A red cell should say WHERE it diverged, not only that it did. Each observation
