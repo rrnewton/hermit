@@ -20,6 +20,16 @@ pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
 pub const CALIBRATED_CI_CELL_COUNT: usize = 492;
 pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
 pub const UNSAMPLED_NON_CI_CELL_COUNT: usize = 188;
+/// Additional selected cells covered by the KVM qualification evidence.
+pub const KVM_RATCHET_CALIBRATION_SHA: &str = "92bacf12deba6a717f77cfcbd6afefc5ffb383f2";
+pub const KVM_RATCHET_CALIBRATION_COMPLETED_UTC: &str = "2026-09-04T04:39:00Z";
+pub const KVM_RATCHET_CI_CELL_COUNT: usize = 183;
+pub const KVM_RATCHET_DEFAULT_COVERED_CI_CELL_COUNT: usize = 182;
+/// Among the 182 KVM ratchet cells covered by the ordinary defaults, retained
+/// passing evidence has one to three samples per cell. These are the largest
+/// bounds produced by the owner-approved formula.
+pub const KVM_RATCHET_DEFAULT_COVERED_MAX_REQUIRED_CPU_SECONDS: u64 = 5;
+pub const KVM_RATCHET_DEFAULT_COVERED_MAX_REQUIRED_WALL_SECONDS: u64 = 22;
 /// Among the 487 calibrated cells without an explicit override, these are the
 /// largest bounds produced by the owner-approved formula.
 pub const DEFAULT_COVERED_MAX_REQUIRED_CPU_SECONDS: u64 = 12;
@@ -103,6 +113,22 @@ pub const EXPLICIT_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 5] = [
         configured_wall_seconds: 118,
     },
 ];
+
+/// KVM cells whose qualification evidence needs a bound above the ordinary
+/// default. This is separate from the earlier full retained-data census so its
+/// source revision and sample count stay explicit.
+pub const KVM_RATCHET_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [TimeoutCalibration {
+    test: "applications/timed-progress-bar",
+    mode: "verify",
+    backend: "kvm",
+    samples: 3,
+    p90_cpu_usec: 15_647_292,
+    p90_wall_millis: 19_937,
+    required_cpu_seconds: 24,
+    required_wall_seconds: 80,
+    configured_cpu_seconds: 24,
+    configured_wall_seconds: 80,
+}];
 
 const fn ceil_ratio(numerator: u64, denominator: u64) -> u64 {
     let quotient = numerator / denominator;
@@ -271,6 +297,18 @@ mod tests {
             CALIBRATED_CI_CELL_COUNT,
             DEFAULT_COVERED_CI_CELL_COUNT + EXPLICIT_TIMEOUT_CALIBRATIONS.len()
         );
+        assert_eq!(
+            KVM_RATCHET_CALIBRATION_SHA,
+            "92bacf12deba6a717f77cfcbd6afefc5ffb383f2"
+        );
+        assert_eq!(
+            KVM_RATCHET_CALIBRATION_COMPLETED_UTC,
+            "2026-09-04T04:39:00Z"
+        );
+        assert_eq!(
+            KVM_RATCHET_CI_CELL_COUNT,
+            KVM_RATCHET_DEFAULT_COVERED_CI_CELL_COUNT + KVM_RATCHET_TIMEOUT_CALIBRATIONS.len()
+        );
         assert_covers(
             DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
             DEFAULT_COVERED_MAX_REQUIRED_CPU_SECONDS,
@@ -279,8 +317,20 @@ mod tests {
             DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
             DEFAULT_COVERED_MAX_REQUIRED_WALL_SECONDS,
         );
+        assert_covers(
+            DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+            KVM_RATCHET_DEFAULT_COVERED_MAX_REQUIRED_CPU_SECONDS,
+        );
+        assert_covers(
+            DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
+            KVM_RATCHET_DEFAULT_COVERED_MAX_REQUIRED_WALL_SECONDS,
+        );
         assert_eq!(UNSAMPLED_NON_CI_CELL_COUNT, 188);
-        for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS {
+        for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
+            .iter()
+            .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)
+            .copied()
+        {
             assert!(calibration.samples > 0);
             assert_eq!(
                 calibration.required_cpu_seconds,
