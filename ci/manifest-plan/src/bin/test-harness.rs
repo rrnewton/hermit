@@ -1089,6 +1089,7 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
             let dagrun::DagManifest {
                 lane: manifest_lane,
                 category,
+                ..
             } = manifest;
             if manifest_lane != lane {
                 return Err(format!(
