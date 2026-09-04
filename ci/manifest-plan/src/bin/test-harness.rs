@@ -1019,9 +1019,12 @@ fn command_jobs(command: &str) -> Result<Option<i64>, String> {
 }
 
 fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), String> {
+    let committed_path = root.join("ci/dag/validate.json");
+    let committed = read_dag(&committed_path)?;
     for lane in ["portable", "privileged"] {
-        let path = root.join(format!("ci/dag/{lane}.json"));
-        let dag = read_dag(&path)?;
+        let path = &committed_path;
+        let dag = dagrun::select_steps_by_labels(&committed, &[lane.to_string()])
+            .map_err(|error| format!("{}: cannot select label {lane}: {error}", path.display()))?;
         if dag
             .steps
             .iter()
@@ -1054,7 +1057,7 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
         if dag
             .steps
             .iter()
-            .filter(|step| step.cmd == "target/debug/test-harness validate")
+            .filter(|step| step.cmd.ends_with("target/debug/test-harness validate"))
             .count()
             != 1
         {
@@ -1065,7 +1068,13 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
         }
         let build =
             format!("target/debug/test-harness build --lane {lane} --ci-only --allow-empty");
-        if dag.steps.iter().filter(|step| step.cmd == build).count() != 1 {
+        if dag
+            .steps
+            .iter()
+            .filter(|step| step.cmd.ends_with(&build))
+            .count()
+            != 1
+        {
             return Err(format!(
                 "{} must contain exactly one Rust manifest build node",
                 path.display()
@@ -1078,11 +1087,11 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
             .map(|document| document.bucket.clone())
             .collect::<BTreeSet<_>>();
         let mut actual = BTreeSet::new();
-        for step in dag
-            .steps
-            .iter()
-            .filter(|step| step.group == "e2e" && step.job.starts_with("manifest_"))
-        {
+        for step in dag.steps.iter().filter(|step| {
+            step.manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.lane == lane)
+        }) {
             let manifest = step.manifest.as_ref().ok_or_else(|| {
                 format!("{}.{} lacks typed manifest identity", step.group, step.job)
             })?;
@@ -1149,8 +1158,11 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
 }
 
 fn audit_budget_ordering(root: &Path) -> Result<(), String> {
-    let portable = read_dag(&root.join("ci/dag/portable.json"))?;
-    let privileged = read_dag(&root.join("ci/dag/privileged.json"))?;
+    let committed = read_dag(&root.join("ci/dag/validate.json"))?;
+    let portable = dagrun::select_steps_by_labels(&committed, &["portable".into()])
+        .map_err(|error| format!("cannot select portable DAG steps: {error}"))?;
+    let privileged = dagrun::select_steps_by_labels(&committed, &["privileged".into()])
+        .map_err(|error| format!("cannot select privileged DAG steps: {error}"))?;
     for (lane, dag) in [("portable", &portable), ("privileged", &privileged)] {
         for step in &dag.steps {
             if step.timeout <= 0 {

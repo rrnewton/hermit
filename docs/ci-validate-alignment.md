@@ -77,11 +77,9 @@ configuration is never read.
 
 ## DAG wiring
 
-`ci/dag/portable.json` has one metadata node and one resource-serialized E2E
-node per category. Those nodes depend on `build.workspace`; other build, lint,
-documentation, and unit-test nodes retain their existing dependencies.
-
-`ci/dag/privileged.json` contains only:
+`ci/dag/validate.json` is the single committed validation graph. Its `portable`
+label selects one metadata node and one resource-serialized E2E node per
+category, plus their dependency closure. Its `privileged` label selects:
 
 - the focused Hermit and Detcore build;
 - CPUID-faulting validation;
@@ -89,17 +87,15 @@ documentation, and unit-test nodes retain their existing dependencies.
 - the KVM E2E shell/environment sentinel.
 
 The 139-program record/replay compatibility ratchet runs as a separate step in
-the manually dispatched full-validation job. It is intentionally outside the
-five-minute privileged smoke DAG, whose workflow enforces a 270-second outer bound.
-The DAG's longest configured timeout path is 240 seconds (120-second build plus
-120-second KVM E2E), and the manifest audit fails if later edits exceed the
-outer bound.
+the manually dispatched full-validation job. The privileged workflow's outer
+bound is kept beyond the selected graph's computed critical path, and the
+manifest audit fails if either side changes without the other.
 
-Both `scripts/validate.rs` and GitHub Actions execute these exact DAG files. Use
-`ci/run-dag.sh portable ascii` or `ci/run-dag.sh privileged ascii` to audit the
-dependency layers without running tests. `target/debug/test-harness audit-ci`
+Both `scripts/validate.rs` and GitHub Actions select labels from this exact DAG.
+Use `dagrun ascii --dag ci/dag/validate.json` to inspect the superset without
+running tests. `target/debug/test-harness audit-ci`
 checks unique node IDs, dependency references, Rust harness commands, and the
-typed manifest bucket selectors in both DAGs. It also compares the required cells with
+typed manifest bucket selectors in both labelled populations. It also compares the required cells with
 `ci/expected-e2e-plan.json`, so the blocking denominator cannot silently shrink.
 
 ## Reconciliation checklist

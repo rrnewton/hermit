@@ -118,7 +118,7 @@ move the identities or update the designation" >&2
         rm -f "$fixture"
         return 1
     fi
-    is_build_or_run_file ci/dag/privileged.json || {
+    is_build_or_run_file ci/dag/validate.json || {
         echo "portability self-test: scope predicate said no to a file it must scan" >&2
         rm -f "$fixture"
         return 1
