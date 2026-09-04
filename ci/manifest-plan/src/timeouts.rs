@@ -19,7 +19,7 @@ pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MUL
 pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
 pub const CALIBRATED_CI_CELL_COUNT: usize = 492;
 pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
-pub const NON_CI_CELL_COUNT: usize = 183;
+pub const NON_CI_CELL_COUNT: usize = 187;
 /// Additional selected cells covered by the KVM qualification evidence.
 pub const KVM_RATCHET_CALIBRATION_SHA: &str = "92bacf12deba6a717f77cfcbd6afefc5ffb383f2";
 pub const KVM_RATCHET_CALIBRATION_COMPLETED_UTC: &str = "2026-09-04T04:39:00Z";
@@ -33,6 +33,13 @@ pub const KVM_RUN_1709_CI_REMOVAL_COUNT: usize = 10;
 /// Cells selected after each passed three first-attempt canonical KVM L2 runs
 /// with zero retries in the pinned glibc 2.42 validation image.
 pub const KVM_PINNED_IMAGE_QUALIFIED_CI_CELL_COUNT: usize = 15;
+/// Further KVM cells selected after three first-attempt canonical L2 passes
+/// with zero retries in the pinned glibc 2.42 validation image.
+pub const KVM_NEXT40_QUALIFICATION_SHA: &str = "4d8f866102882b6eeabdf99cc7e81433cc3c95c5";
+pub const KVM_NEXT40_QUALIFICATION_COMPLETED_UTC: &str = "2026-09-04T20:26:39Z";
+pub const KVM_NEXT40_QUALIFIED_CI_CELL_COUNT: usize = 32;
+pub const KVM_NEXT40_DEFAULT_COVERED_MAX_REQUIRED_CPU_SECONDS: u64 = 3;
+pub const KVM_NEXT40_DEFAULT_COVERED_MAX_REQUIRED_WALL_SECONDS: u64 = 7;
 /// Among the 182 KVM ratchet cells covered by the ordinary defaults, retained
 /// passing evidence has one to three samples per cell. These are the largest
 /// bounds produced by the owner-approved formula.
@@ -341,7 +348,24 @@ mod tests {
             DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
             KVM_RATCHET_DEFAULT_COVERED_MAX_REQUIRED_WALL_SECONDS,
         );
-        assert_eq!(NON_CI_CELL_COUNT, 183);
+        assert_eq!(
+            KVM_NEXT40_QUALIFICATION_SHA,
+            "4d8f866102882b6eeabdf99cc7e81433cc3c95c5"
+        );
+        assert_eq!(
+            KVM_NEXT40_QUALIFICATION_COMPLETED_UTC,
+            "2026-09-04T20:26:39Z"
+        );
+        assert_eq!(KVM_NEXT40_QUALIFIED_CI_CELL_COUNT, 32);
+        assert_covers(
+            DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+            KVM_NEXT40_DEFAULT_COVERED_MAX_REQUIRED_CPU_SECONDS,
+        );
+        assert_covers(
+            DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
+            KVM_NEXT40_DEFAULT_COVERED_MAX_REQUIRED_WALL_SECONDS,
+        );
+        assert_eq!(NON_CI_CELL_COUNT, 187);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)

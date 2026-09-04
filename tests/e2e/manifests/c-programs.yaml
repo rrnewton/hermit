@@ -6188,8 +6188,8 @@ test:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
           kvm:
             result: timeout
-            evidence: RUN1709 at Hermit 8c2bb5620f13e5d351e7bdb5d20c8dcec1f3eaba
-            reason: Both canonical full-validation attempts exceeded the 57-second wall backstop and produced no comparison, so KVM remains red without a divergence claim.
+            evidence: KVM next-40 qualification at Hermit 4d8f866102882b6eeabdf99cc7e81433cc3c95c5; all-results.jsonl sha256 a14c6a90d249389336b894087fe16f56970298ca04620a1aadf7e94186e016ce
+            reason: All three canonical repetitions exceeded the 57-second wall backstop on both attempts and produced no comparison, so KVM remains red without a divergence claim.
       naked:
         ci: false
         backends_enabled: []
@@ -9120,8 +9120,8 @@ test:
         ci_disabled_reason:
           kvm:
             result: determinism-failure
-            evidence: RUN1709 at Hermit 8c2bb5620f13e5d351e7bdb5d20c8dcec1f3eaba
-            reason: Both canonical full-validation attempts diverged at turn 5, record 109, syscall 43, so KVM remains enabled but is not selected by CI pending separate qualification.
+            evidence: KVM next-40 qualification at Hermit 4d8f866102882b6eeabdf99cc7e81433cc3c95c5; all-results.jsonl sha256 a14c6a90d249389336b894087fe16f56970298ca04620a1aadf7e94186e016ce
+            reason: All three canonical repetitions diverged on both attempts at scheduler turn 5, record 108, syscall 43, so KVM remains enabled but unselected.
       naked:
         ci: false
         backends_enabled: []
@@ -10629,9 +10629,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
