@@ -8,12 +8,9 @@
  */
 //! Guard the GitHub Pages compatibility-site publication contract.
 //!
-//! The reviewed snapshot has two public paths: its pinned content-addressed
-//! path and `compatibility/latest`. The latter must be a complete regular-file
-//! copy, not a redirect or symlink, so deep links and query/hash navigation work
-//! on static Pages. This checker deliberately lives apart from the Actions
-//! trigger-policy checker: publication integrity and workflow scheduling are
-//! different contracts.
+//! This checker owns orchestration facts. The Python publisher owns registry,
+//! archive, tree, and append-only-history semantics and is exercised as a
+//! black box here; those rules must not be reimplemented in this file.
 
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
@@ -21,130 +18,15 @@ mod rust_script_prelude;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 
 const WORKFLOW: &str = ".github/workflows/docs.yml";
+const RELEASE_PINS: &str = ".github/compatibility-site-releases.json";
+const PUBLISHER: &str = ".github/scripts/publish-compatibility-site.py";
 const LANDING_PAGE: &str = "docs/site/index.html";
 const PUBLICATION_STEP: &str = "Add reviewed compatibility website";
 const LANDING_ALIAS: &str = "href=\"compatibility/latest/\"";
 const LANDING_WORDING: &str = "<strong>Compatibility snapshot:</strong>";
-
-const PIN_VALUES: &[(&str, &str)] = &[
-    ("COMPATIBILITY_SITE_RELEASE_REPOSITORY", "rrnewton/hermit"),
-    (
-        "COMPATIBILITY_SITE_IDENTITY",
-        "e75fe49e3b55c6357b32e0110d65731575fe287413f3239a92d9d4522e15a4fb",
-    ),
-    (
-        "COMPATIBILITY_SITE_RELEASE_TAG",
-        "compatibility-website-e75fe49e3b55c6357b32e0110d65731575fe287413f3239a92d9d4522e15a4fb",
-    ),
-    (
-        "COMPATIBILITY_SITE_RELEASE_TITLE",
-        "Compatibility website snapshot e75fe49e3b55c6357b32e0110d65731575fe287413f3239a92d9d4522e15a4fb",
-    ),
-    (
-        "COMPATIBILITY_SITE_ASSET",
-        "compatibility-website-e75fe49e3b55c6357b32e0110d65731575fe287413f3239a92d9d4522e15a4fb.tar.gz",
-    ),
-    (
-        "COMPATIBILITY_SITE_ARCHIVE_SHA256",
-        "98eb2459286865081566242780056997a28a21d467ebe311a398ba4f77b84b46",
-    ),
-    ("COMPATIBILITY_SITE_ARCHIVE_BYTES", "'13929857'"),
-    (
-        "COMPATIBILITY_SITE_BUILD_SHA256",
-        "ada1279a5fbf4565efaf9cc5fdfcd5522c92e7a61c8b52a8bf43ab19420da695",
-    ),
-    (
-        "COMPATIBILITY_SITE_MANIFEST_TREE_SHA256",
-        "413f9fee6fc98f5335ab01441f9a61844d0568fe754f9cf373aea1b96239cca6",
-    ),
-    (
-        "COMPATIBILITY_SITE_ARTIFACTS_SHA256",
-        "b06eb90e88b243d6af2bf45f7c53d694e988a7d538e77891e2baebc9983598a4",
-    ),
-    (
-        "COMPATIBILITY_SITE_CONTENT_TREE_SHA256",
-        "cb1736cb2fc93a7962656b7a5a85d3f7c3095864996dad441bdc36b7e5a84883",
-    ),
-    (
-        "COMPATIBILITY_SITE_MODE_SHA256",
-        "bb176a41b861c4db27edf1b6e8a8254d1cbdba5fc232588f09ffa1d8ddee2a85",
-    ),
-    (
-        "COMPATIBILITY_SITE_RECURSIVE_IDENTITY_SHA256",
-        "d8e604d8ba3cf846a5599ab4e64628fa18bb2b803980e306f4416a6f269bd912",
-    ),
-    ("COMPATIBILITY_SITE_FILE_COUNT", "'94'"),
-    ("COMPATIBILITY_SITE_FILE_BYTES", "'29222036'"),
-];
-
-const REVIEWED_ARTIFACT_VALUES: &[&str] = &[
-    "DIRECTORIES = (\"assets\", \"cells\", \"data\", \"runs\", \"tests\")",
-    "\"current_validation_run_row_count\": 60,",
-    "\"green_cell_count\": 596,",
-    "\"in_manifest_cell_count\": 5744,",
-    "\"never_measured_cell_count\": 5103,",
-    "\"physical_row_count\": 14541,",
-    "\"red_cell_count\": 30,",
-    "\"represented_run_count\": 20724,",
-    "\"selected_by_full_custom_command_count\": 3,",
-    "\"test_count\": 359,",
-    "\"validation_history_row_count\": 64,",
-    "len(members) != 100",
-];
-
-const SHELL_VERIFICATION: &[&str] = &[
-    "repos/$COMPATIBILITY_SITE_RELEASE_REPOSITORY/releases/tags/$COMPATIBILITY_SITE_RELEASE_TAG",
-    "--arg tag \"$COMPATIBILITY_SITE_RELEASE_TAG\"",
-    "--arg title \"$COMPATIBILITY_SITE_RELEASE_TITLE\"",
-    "--arg name \"$COMPATIBILITY_SITE_ASSET\"",
-    "--arg digest \"sha256:$COMPATIBILITY_SITE_ARCHIVE_SHA256\"",
-    "--argjson size \"$COMPATIBILITY_SITE_ARCHIVE_BYTES\"",
-    ".tag_name != $tag or .name != $title",
-    ".draft != false or .prerelease != false",
-    "[.assets[] | select(.name == $name)]",
-    "if length == 1 then .[0]",
-    ".state == \"uploaded\"",
-    ".size == $size",
-    ".digest == $digest",
-    "repos/$COMPATIBILITY_SITE_RELEASE_REPOSITORY/releases/assets/$asset_id",
-    "sha256sum \"$archive\"",
-    "stat -c %s \"$archive\"",
-];
-
-const PYTHON_VERIFICATION: &[&str] = &[
-    "hashlib.sha256(build_bytes).hexdigest() != BUILD_SHA256",
-    "manifest[\"counts\"] != EXPECTED_COUNTS",
-    "manifest[\"freshness_sha256\"] != IDENTITY or TARGET.name != IDENTITY",
-    "manifest[\"tree_sha256\"] != MANIFEST_TREE_SHA256",
-    "manifest[\"artifacts_sha256\"] != ARTIFACTS_SHA256",
-    "digest(artifacts) != ARTIFACTS_SHA256",
-    "set(by_name) != expected_names",
-    "observed[path] != (row[\"bytes\"], row[\"sha256\"])",
-    "content.hexdigest() != CONTENT_TREE_SHA256",
-    "hashlib.sha256(\"\".join(sorted(mode_rows)).encode()).hexdigest() != MODE_SHA256",
-    "hashlib.sha256(\"\".join(identity_rows).encode()).hexdigest() != RECURSIVE_IDENTITY_SHA256",
-];
-
-const LATEST_COPY_CONTRACT: &[&str] = &[
-    "LATEST = TARGET.parent / \"latest\"",
-    "def tree_inventory(root: Path)",
-    "inventory.append((relative, \"d\", mode, 0, \"\"))",
-    "inventory.append((relative, \"f\", mode, size, sha256.hexdigest()))",
-    "def copy_regular_tree(source_root: Path, destination_root: Path)",
-    "destination_root.exists() or destination_root.is_symlink()",
-    "stat.S_ISDIR(metadata.st_mode)",
-    "stat.S_ISREG(metadata.st_mode)",
-    "os.O_RDONLY | os.O_NOFOLLOW",
-    "os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW",
-    "os.chmod(destination, source_mode, follow_symlinks=False)",
-    "pinned_inventory = tree_inventory(TARGET)",
-    "copy_regular_tree(TARGET, LATEST)",
-    "latest_inventory = tree_inventory(LATEST)",
-    "if latest_inventory != pinned_inventory:",
-    "latest copy differs from the pinned tree in path, type, size, content, or mode",
-];
 
 fn repository_root() -> PathBuf {
     let script = Path::new(file!());
@@ -226,22 +108,6 @@ fn literal_block(step: &str, key: &str) -> Result<String, String> {
         .join("\n"))
 }
 
-fn heredoc(source: &str, delimiter: &str) -> Result<String, String> {
-    let quoted_marker = format!("<<'{delimiter}'");
-    let lines = source.lines().collect::<Vec<_>>();
-    let start = lines
-        .iter()
-        .position(|line| line.contains(&quoted_marker))
-        .ok_or_else(|| format!("missing quoted {delimiter} heredoc"))?
-        + 1;
-    let end = lines[start..]
-        .iter()
-        .position(|line| *line == delimiter)
-        .map(|offset| start + offset)
-        .ok_or_else(|| format!("unterminated {delimiter} heredoc"))?;
-    Ok(lines[start..end].join("\n"))
-}
-
 fn require_once(errors: &mut Vec<String>, scope: &str, source: &str, needle: &str) {
     let count = source.matches(needle).count();
     if count != 1 {
@@ -251,51 +117,12 @@ fn require_once(errors: &mut Vec<String>, scope: &str, source: &str, needle: &st
     }
 }
 
-fn require_all(errors: &mut Vec<String>, scope: &str, source: &str, needles: &[&str]) {
-    for needle in needles {
-        if !source.contains(needle) {
-            errors.push(format!("{scope} is missing required contract `{needle}`"));
-        }
-    }
-}
-
-fn env_value<'a>(source: &'a str, key: &str) -> Option<&'a str> {
-    let prefix = format!("{key}:");
-    source.lines().find_map(|line| {
-        let trimmed = line.trim();
-        trimmed
-            .strip_prefix(&prefix)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    })
-}
-
 fn validate_contract(workflow: &str, landing: &str) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
-    for (key, expected) in PIN_VALUES {
-        let marker = format!("\n  {key}:");
-        require_once(&mut errors, "workflow top-level pin set", workflow, &marker);
-        match env_value(workflow, key) {
-            Some(actual) if actual != *expected => errors.push(format!(
-                "workflow pin `{key}` must equal `{expected}`, found `{actual}`"
-            )),
-            None => errors.push(format!("cannot read workflow pin `{key}`")),
-            Some(_) => {}
-        }
-    }
-
-    if env_value(workflow, "COMPATIBILITY_SITE_RELEASE_TITLE")
-        .is_some_and(|title| title.contains("Historical"))
-    {
-        errors.push("release title must not use Historical wording".into());
-    }
-
+    require_once(&mut errors, "checkout history", workflow, "fetch-depth: 0");
     let step = match named_step(workflow, PUBLICATION_STEP) {
         Ok(step) => step,
-        Err(error) => {
-            errors.push(error);
-            return Err(errors);
-        }
+        Err(error) => return Err(vec![error]),
     };
     require_once(
         &mut errors,
@@ -310,76 +137,108 @@ fn validate_contract(workflow: &str, landing: &str) -> Result<(), Vec<String>> {
             return Err(errors);
         }
     };
-    require_all(
+
+    require_once(
         &mut errors,
-        "release/archive verification",
+        "publication orchestration",
         &shell,
-        SHELL_VERIFICATION,
+        "pins=.github/compatibility-site-releases.json",
     );
-    let python = match heredoc(&shell, "PY") {
-        Ok(python) => python,
-        Err(error) => {
-            errors.push(error);
-            return Err(errors);
-        }
-    };
-    require_all(
+    require_once(
         &mut errors,
-        "extracted artifact verification",
-        &python,
-        PYTHON_VERIFICATION,
+        "publication orchestration",
+        &shell,
+        "python3 .github/scripts/publish-compatibility-site.py validate \"$pins\" .",
     );
-    for value in REVIEWED_ARTIFACT_VALUES {
-        require_once(&mut errors, "reviewed artifact values", &python, value);
+    require_once(
+        &mut errors,
+        "publication orchestration",
+        &shell,
+        "python3 .github/scripts/publish-compatibility-site.py extract \"$archive\"",
+    );
+    require_once(
+        &mut errors,
+        "publication orchestration",
+        &shell,
+        "python3 .github/scripts/publish-compatibility-site.py \\\n  finalize \"$pins\" target/doc/compatibility",
+    );
+    require_once(
+        &mut errors,
+        "release iteration",
+        &shell,
+        "release_count=$(jq -er '.releases | length' \"$pins\")",
+    );
+    require_once(
+        &mut errors,
+        "release iteration",
+        &shell,
+        "while (( index < release_count )); do",
+    );
+    require_once(
+        &mut errors,
+        "release metadata",
+        &shell,
+        ".tag_name != $tag or .name != $title",
+    );
+    require_once(
+        &mut errors,
+        "release metadata",
+        &shell,
+        ".draft != false or .prerelease != false",
+    );
+    require_once(
+        &mut errors,
+        "release metadata",
+        &shell,
+        ".state == \"uploaded\"",
+    );
+    require_once(
+        &mut errors,
+        "release metadata",
+        &shell,
+        ".digest == $digest",
+    );
+    let validate = shell.find("publish-compatibility-site.py validate");
+    let network = shell.find("gh api");
+    let extract = shell.find("publish-compatibility-site.py extract");
+    let finalize = shell.find("publish-compatibility-site.py \\\n  finalize");
+    if !matches!((validate, network), (Some(left), Some(right)) if left < right) {
+        errors.push("registry validation must run before any release API request".into());
     }
-    require_all(
-        &mut errors,
-        "latest full-copy verification",
-        &python,
-        LATEST_COPY_CONTRACT,
-    );
-    require_once(
-        &mut errors,
-        "workflow landing assertion",
-        &python,
-        LANDING_ALIAS,
-    );
-    require_once(
-        &mut errors,
-        "workflow landing assertion",
-        &python,
-        LANDING_WORDING,
-    );
-    for forbidden in ["os.symlink(", ".symlink_to(", "os.link("] {
-        if python.contains(forbidden) {
+    if !matches!((extract, finalize), (Some(left), Some(right)) if left < right) {
+        errors.push("all pinned archives must be extracted before finalization".into());
+    }
+
+    for forbidden in [
+        "keep_files:",
+        "git fetch origin gh-pages",
+        "git checkout gh-pages",
+        "refs/heads/gh-pages",
+        "cat > \"$publisher\"",
+        "<<'PY'",
+        "jq -e '",
+    ] {
+        if workflow.contains(forbidden) {
             errors.push(format!(
-                "latest publication must be a copied regular-file tree, found `{forbidden}`"
+                "workflow must delegate publication semantics to {PUBLISHER}; found `{forbidden}`"
             ));
         }
     }
 
     require_once(&mut errors, "landing page", landing, LANDING_ALIAS);
     require_once(&mut errors, "landing page", landing, LANDING_WORDING);
-    for source in [python.as_str(), landing] {
-        if source.contains("Historical snapshot &mdash; not current:") {
-            errors.push("landing wording must not claim the snapshot is not current".into());
-        }
-    }
-    if let Some(identity) = env_value(workflow, "COMPATIBILITY_SITE_IDENTITY") {
-        let pinned_href = format!("href=\"compatibility/{identity}/\"");
-        if landing.contains(&pinned_href) {
-            errors.push("landing page still links the content-addressed snapshot directly".into());
-        }
-    } else {
-        errors.push("cannot read COMPATIBILITY_SITE_IDENTITY value".into());
-    }
     require_once(
         &mut errors,
         "deployment step",
         workflow,
         "publish_dir: ./target/doc",
     );
-
+    require_once(
+        &mut errors,
+        "deployment step",
+        workflow,
+        "force_orphan: true",
+    );
     if errors.is_empty() {
         Ok(())
     } else {
@@ -392,19 +251,46 @@ fn read_inputs(root: &Path) -> Result<(String, String), String> {
         .map_err(|error| format!("cannot read {WORKFLOW}: {error}"))?;
     let landing = fs::read_to_string(root.join(LANDING_PAGE))
         .map_err(|error| format!("cannot read {LANDING_PAGE}: {error}"))?;
+    for path in [RELEASE_PINS, PUBLISHER] {
+        let metadata = fs::symlink_metadata(root.join(path))
+            .map_err(|error| format!("cannot inspect {path}: {error}"))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!("{path} must be a regular file"));
+        }
+    }
     Ok((workflow, landing))
+}
+
+fn validate_registry(root: &Path) -> Result<String, String> {
+    let output = Command::new("python3")
+        .arg(root.join(PUBLISHER))
+        .arg("validate")
+        .arg(root.join(RELEASE_PINS))
+        .arg(root)
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("cannot execute {PUBLISHER}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "publisher rejected current registry: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn main() {
     rust_script_prelude::init();
     let root = repository_root();
     let result = read_inputs(&root).and_then(|(workflow, landing)| {
-        validate_contract(&workflow, &landing).map_err(|errors| errors.join("\n"))
+        validate_contract(&workflow, &landing)
+            .map_err(|errors| errors.join("\n"))
+            .and_then(|()| validate_registry(&root))
     });
     match result {
-        Ok(()) => println!(
-            "docs Pages contract OK: pinned snapshot plus byte/mode-identical compatibility/latest"
-        ),
+        Ok(registry) => {
+            println!("docs Pages contract OK: release-pinned paths are reconstructed; {registry}")
+        }
         Err(error) => {
             eprintln!("docs-pages-contract: {error}");
             std::process::exit(1);
@@ -414,62 +300,343 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
-
     use super::*;
 
-    const COPY_FIXTURE: &str = r#"
-import ast
+    const BLACK_BOX_FIXTURE: &str = r#"
+import copy
+import hashlib
+import io
+import json
 import os
 import pathlib
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
 import tempfile
 
-module = ast.parse(os.environ["DOCS_PAGES_EMBEDDED_PYTHON"])
-wanted = {"refuse", "tree_inventory", "copy_regular_tree"}
-nodes = [
-    node for node in module.body
-    if isinstance(node, (ast.Import, ast.ImportFrom))
-    or isinstance(node, ast.FunctionDef) and node.name in wanted
-]
-namespace = {}
-exec(compile(ast.Module(body=nodes, type_ignores=[]), "docs.yml:copy-functions", "exec"), namespace)
+helper = pathlib.Path(sys.argv[1]).resolve()
+checked_in_registry = pathlib.Path(sys.argv[2]).resolve()
 
-with tempfile.TemporaryDirectory(prefix="docs-pages-copy-", dir="/tmp") as temporary:
-    base = pathlib.Path(temporary)
-    pinned = base / "identity"
-    latest = base / "latest"
-    (pinned / "assets").mkdir(parents=True)
-    (pinned / "cells" / "deep").mkdir(parents=True)
-    (pinned / "index.html").write_bytes(b"index\x00bytes")
-    (pinned / "assets" / "site.js").write_bytes(b"console.log(1)\n")
-    (pinned / "cells" / "deep" / "index.html").write_bytes(b"deep")
-    os.chmod(pinned, 0o750)
-    os.chmod(pinned / "assets", 0o710)
-    os.chmod(pinned / "cells", 0o755)
-    os.chmod(pinned / "cells" / "deep", 0o711)
-    os.chmod(pinned / "index.html", 0o440)
-    os.chmod(pinned / "assets" / "site.js", 0o640)
-    os.chmod(pinned / "cells" / "deep" / "index.html", 0o444)
+def run_helper(arguments, *, cwd=None, expected=None):
+    result = subprocess.run(
+        [sys.executable, str(helper), *map(str, arguments)],
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    text = (result.stdout + result.stderr).decode(errors="replace")
+    if expected is None:
+        assert result.returncode == 0, text
+    else:
+        assert result.returncode != 0, text
+        assert expected in text, text
+    return text
 
-    expected = namespace["tree_inventory"](pinned)
-    namespace["copy_regular_tree"](pinned, latest)
-    observed = namespace["tree_inventory"](latest)
-    assert observed == expected
-    assert all(
-        not path.is_symlink() and (path.is_file() or path.is_dir())
-        for path in [latest, *latest.rglob("*")]
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+def digest(value):
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+def inventory(root):
+    rows = []
+    for path in [root, *sorted(root.rglob("*"))]:
+        relative = "" if path == root else path.relative_to(root).as_posix()
+        metadata = path.stat(follow_symlinks=False)
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISDIR(metadata.st_mode):
+            rows.append((relative, "d", mode, 0, ""))
+        elif stat.S_ISREG(metadata.st_mode):
+            data = path.read_bytes()
+            rows.append((relative, "f", mode, len(data), hashlib.sha256(data).hexdigest()))
+        else:
+            rows.append((relative, "o", mode, 0, ""))
+    return tuple(rows)
+
+def measurements(root):
+    rows = inventory(root)
+    files = [row for row in rows if row[1] == "f"]
+    content = hashlib.sha256()
+    for relative, _, _, _, file_sha256 in files:
+        content.update(file_sha256.encode())
+        content.update(b"  ./")
+        content.update(relative.encode())
+        content.update(b"\n")
+    mode_rows = [f"{relative}\t{kind}\t{mode:o}\n" for relative, kind, mode, _, _ in rows]
+    identity_rows = [
+        f"{relative}\t{kind}\t{mode:o}\t{file_sha256}\n"
+        for relative, kind, mode, _, file_sha256 in rows
+    ]
+    return {
+        "content_tree_sha256": content.hexdigest(),
+        "file_bytes": sum(row[3] for row in files),
+        "file_count": len(files),
+        "mode_sha256": hashlib.sha256("".join(sorted(mode_rows)).encode()).hexdigest(),
+        "recursive_identity_sha256": hashlib.sha256("".join(identity_rows).encode()).hexdigest(),
+    }
+
+def make_archive(base, identity, marker):
+    source = base / f"source-{marker}"
+    (source / "assets").mkdir(parents=True)
+    artifact_bytes = {
+        "assets/site.css": f"body {{{marker}}}\n".encode(),
+        "index.html": f"<h1>{marker}</h1>\n".encode(),
+    }
+    artifacts = [
+        {
+            "bytes": len(data),
+            "content_encoding": None,
+            "content_type": "text/plain; charset=utf-8",
+            "path": path,
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        for path, data in sorted(artifact_bytes.items())
+    ]
+    grouped = {".": [artifacts[1]], "assets": [artifacts[0]]}
+    directories = [
+        {"artifacts_sha256": digest(grouped[path]), "file_count": len(grouped[path]), "path": path}
+        for path in sorted(grouped)
+    ]
+    artifacts_sha256 = digest(artifacts)
+    directories_sha256 = digest(directories)
+    tree_sha256 = digest(
+        {"artifacts_sha256": artifacts_sha256, "directories_sha256": directories_sha256}
+    )
+    manifest = {
+        "artifacts": artifacts,
+        "artifacts_sha256": artifacts_sha256,
+        "counts": {"test_count": 1},
+        "directories": directories,
+        "directories_sha256": directories_sha256,
+        "freshness_sha256": identity,
+        "generator": {"fixture": True},
+        "inputs": {"fixture": marker},
+        "provenance": {"fixture": marker},
+        "schema_version": 1,
+        "tree_sha256": tree_sha256,
+    }
+    files = {"build.json": canonical(manifest) + b"\n", **artifact_bytes}
+    for relative, data in files.items():
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        os.chmod(path, 0o444)
+    for directory in (source / "assets", source):
+        os.chmod(directory, 0o555)
+
+    archive = base / f"compatibility-website-{identity}.tar.gz"
+    with tarfile.open(archive, "w:gz") as output:
+        for name in (".", "./assets"):
+            member = tarfile.TarInfo(name)
+            member.type = tarfile.DIRTYPE
+            member.mode = 0o555
+            output.addfile(member)
+        for relative, data in sorted(files.items()):
+            member = tarfile.TarInfo(f"./{relative}")
+            member.size = len(data)
+            member.mode = 0o444
+            output.addfile(member, io.BytesIO(data))
+
+    observed = measurements(source)
+    pin = {
+        "archive_bytes": archive.stat().st_size,
+        "archive_member_count": 5,
+        "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        "artifacts_sha256": artifacts_sha256,
+        "asset": archive.name,
+        "build_sha256": hashlib.sha256(files["build.json"]).hexdigest(),
+        "content_tree_sha256": observed["content_tree_sha256"],
+        "counts": manifest["counts"],
+        "directories": ["assets"],
+        "file_bytes": observed["file_bytes"],
+        "file_count": observed["file_count"],
+        "identity": identity,
+        "manifest_tree_sha256": tree_sha256,
+        "mode_sha256": observed["mode_sha256"],
+        "recursive_identity_sha256": observed["recursive_identity_sha256"],
+        "release_title": f"Compatibility website snapshot {identity}",
+        "tag": f"compatibility-website-{identity}",
+    }
+    return archive, pin
+
+def write_registry(path, releases, latest, repository="fixture/repo"):
+    value = {
+        "latest_identity": latest,
+        "release_repository": repository,
+        "releases": sorted(releases, key=lambda pin: pin["identity"]),
+        "schema_version": 1,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
+    return value
+
+def install_landing(document_root):
+    document_root.mkdir(parents=True)
+    (document_root / "index.html").write_text(
+        "<strong>Compatibility snapshot:</strong>\n"
+        '        <a href="compatibility/latest/">Open the real-ledger compatibility website</a>'
     )
 
-    (latest / "assets" / "site.js").write_bytes(b"changed")
-    assert namespace["tree_inventory"](latest) != expected
+def git(repository, *arguments):
+    subprocess.run(["git", *arguments], cwd=repository, check=True, stdout=subprocess.DEVNULL)
 
-    os.symlink("index.html", pinned / "alias")
-    try:
-        namespace["copy_regular_tree"](pinned, base / "refused")
-    except SystemExit as error:
-        assert "link or special" in str(error)
-    else:
-        raise AssertionError("symlinked source was accepted")
+with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as temporary:
+    base = pathlib.Path(temporary)
+
+    # Two independent publications: retained b sorts after new/latest a.
+    retained_identity = "b" * 64
+    latest_identity = "a" * 64
+    retained_archive, retained_pin = make_archive(base, retained_identity, "retained")
+    latest_archive, latest_pin = make_archive(base, latest_identity, "latest")
+
+    first_registry_path = base / "first-registry.json"
+    write_registry(first_registry_path, [retained_pin], retained_identity)
+    first_document = base / "first-document"
+    install_landing(first_document)
+    run_helper(["extract", retained_archive, first_document / "compatibility" / retained_identity,
+                first_registry_path, 0])
+    run_helper(["finalize", first_registry_path, first_document / "compatibility"])
+    retained_before = inventory(first_document / "compatibility" / retained_identity)
+    assert inventory(first_document / "compatibility" / "latest") == retained_before
+
+    second_registry_path = base / "second-registry.json"
+    write_registry(second_registry_path, [retained_pin, latest_pin], latest_identity)
+    second_document = base / "second-document"
+    install_landing(second_document)
+    sorted_archives = {latest_identity: latest_archive, retained_identity: retained_archive}
+    for index, identity in enumerate((latest_identity, retained_identity)):
+        run_helper(["extract", sorted_archives[identity], second_document / "compatibility" / identity,
+                    second_registry_path, index])
+    run_helper(["finalize", second_registry_path, second_document / "compatibility"])
+    assert inventory(second_document / "compatibility" / retained_identity) == retained_before
+    assert inventory(second_document / "compatibility" / latest_identity) == inventory(
+        second_document / "compatibility" / "latest"
+    )
+
+    missing_document = base / "missing-document"
+    install_landing(missing_document)
+    run_helper(["extract", latest_archive, missing_document / "compatibility" / latest_identity,
+                second_registry_path, 0])
+    run_helper(["finalize", second_registry_path, missing_document / "compatibility"],
+               expected="do not exactly match")
+
+    unsafe_document = base / "unsafe-document"
+    install_landing(unsafe_document)
+    shutil.copytree(
+        first_document / "compatibility" / retained_identity,
+        unsafe_document / "compatibility" / retained_identity,
+    )
+    os.chmod(unsafe_document / "compatibility" / retained_identity, 0o755)
+    os.symlink("index.html", unsafe_document / "compatibility" / retained_identity / "alias")
+    run_helper(["finalize", first_registry_path, unsafe_document / "compatibility"],
+               expected="link or special")
+
+    # Validation reads first-parent history, with the first registry allowed to
+    # have no predecessor and every committed row retained thereafter.
+    checked = json.loads(checked_in_registry.read_text())
+    added = copy.deepcopy(checked["releases"][-1])
+    added_identity = "f" * 64
+    added["identity"] = added_identity
+    added["tag"] = f"compatibility-website-{added_identity}"
+    added["asset"] = f"{added['tag']}.tar.gz"
+    added["release_title"] = f"Compatibility website snapshot {added_identity}"
+    expanded = copy.deepcopy(checked)
+    expanded["latest_identity"] = added_identity
+    expanded["releases"].append(added)
+
+    repository = base / "history"
+    repository.mkdir()
+    git(repository, "init", "--quiet")
+    git(repository, "config", "user.name", "Fixture")
+    git(repository, "config", "user.email", "fixture@example.invalid")
+    git(repository, "commit", "--quiet", "--allow-empty", "-m", "base")
+    history_registry = repository / ".github" / "compatibility-site-releases.json"
+    history_registry.parent.mkdir()
+    history_registry.write_text(json.dumps(checked, sort_keys=True, indent=2) + "\n")
+    git(repository, "add", ".github/compatibility-site-releases.json")
+    git(repository, "commit", "--quiet", "-m", "first registry")
+    run_helper(["validate", history_registry, repository], cwd=repository)
+
+    history_registry.write_text(json.dumps(expanded, sort_keys=True, indent=2) + "\n")
+    git(repository, "add", ".github/compatibility-site-releases.json")
+    git(repository, "commit", "--quiet", "-m", "expanded registry")
+    expanded_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository).decode().strip()
+    run_helper(["validate", history_registry, repository], cwd=repository)
+
+    shallow = base / "shallow"
+    subprocess.run(["git", "clone", "--quiet", "--depth", "1", repository.as_uri(), str(shallow)], check=True)
+    run_helper(["validate", shallow / ".github" / "compatibility-site-releases.json", shallow],
+               cwd=shallow, expected="full git history is required")
+
+    removed = copy.deepcopy(expanded)
+    removed["releases"] = [pin for pin in removed["releases"] if pin["identity"] != checked["latest_identity"]]
+    history_registry.write_text(json.dumps(removed, sort_keys=True, indent=2) + "\n")
+    git(repository, "add", ".github/compatibility-site-releases.json")
+    git(repository, "commit", "--quiet", "-m", "removed row")
+    run_helper(["validate", history_registry, repository], cwd=repository,
+               expected="removed published identity")
+
+    git(repository, "checkout", "--quiet", "-B", "mutation", expanded_commit)
+    mutated = copy.deepcopy(expanded)
+    mutated["releases"][1]["archive_bytes"] += 1
+    history_registry.write_text(json.dumps(mutated, sort_keys=True, indent=2) + "\n")
+    git(repository, "add", ".github/compatibility-site-releases.json")
+    git(repository, "commit", "--quiet", "-m", "mutated row")
+    run_helper(["validate", history_registry, repository], cwd=repository,
+               expected="changed published pin")
+
+    duplicate = base / "duplicate" / ".github" / "compatibility-site-releases.json"
+    duplicate.parent.mkdir(parents=True)
+    duplicate.write_text('{"schema_version":1,"schema_version":1}')
+    duplicate_repository = duplicate.parents[1]
+    git(duplicate_repository, "init", "--quiet")
+    run_helper(["validate", duplicate, duplicate_repository], cwd=duplicate_repository,
+               expected="duplicate object key")
+
+    invalid_values = (
+        ("repository-whitespace", "release_repository", "fixture repo/release",
+         "release repository is invalid"),
+        ("repository-control", "release_repository", "fixture/repo\tname",
+         "release repository is invalid"),
+        ("repository-unicode", "release_repository", "fixture/r\u00e9po",
+         "release repository is invalid"),
+        ("directory-whitespace", "directories", "asset files",
+         "release directory inventory is invalid"),
+        ("directory-control", "directories", "assets\nfiles",
+         "release directory inventory is invalid"),
+        ("directory-unicode", "directories", "d\u00e1ta",
+         "release directory inventory is invalid"),
+    )
+    for label, field, value, expected in invalid_values:
+        invalid = copy.deepcopy(checked)
+        if field == "release_repository":
+            invalid[field] = value
+        else:
+            invalid["releases"][0][field] = [value]
+            invalid["releases"][0]["archive_member_count"] = (
+                invalid["releases"][0]["file_count"] + 2
+            )
+        invalid_registry = base / label / ".github" / "compatibility-site-releases.json"
+        invalid_registry.parent.mkdir(parents=True)
+        invalid_registry.write_text(json.dumps(invalid, sort_keys=True, indent=2) + "\n")
+        invalid_repository = invalid_registry.parents[1]
+        git(invalid_repository, "init", "--quiet")
+        run_helper(["validate", invalid_registry, invalid_repository],
+                   cwd=invalid_repository, expected=expected)
+
+    wording = copy.deepcopy(checked)
+    wording["releases"][-1]["release_title"] = "Historical compatibility website snapshot"
+    history_registry.write_text(json.dumps(wording, sort_keys=True, indent=2) + "\n")
+    run_helper(["validate", history_registry, repository], cwd=repository,
+               expected="must not use Historical wording")
+
+    bootstrap = copy.deepcopy(checked)
+    bootstrap["releases"][0]["archive_bytes"] += 1
+    history_registry.write_text(json.dumps(bootstrap, sort_keys=True, indent=2) + "\n")
+    run_helper(["validate", history_registry, repository], cwd=repository,
+               expected="changed bootstrap pin")
 "#;
 
     fn actual() -> (String, String) {
@@ -484,113 +651,73 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-copy-", dir="/tmp") as tempo
     }
 
     #[test]
-    fn current_workflow_and_landing_page_satisfy_contract() {
+    fn current_workflow_and_landing_satisfy_orchestration_contract() {
         let (workflow, landing) = actual();
-        validate_contract(&workflow, &landing).expect("current Pages contract should pass");
+        validate_contract(&workflow, &landing).expect("current Pages orchestration should pass");
     }
 
     #[test]
-    fn changing_any_pin_or_pinned_verification_is_rejected() {
-        let (workflow, landing) = actual();
-        for (key, expected) in PIN_VALUES {
-            let declaration = format!("\n  {key}:");
-            let weakened = workflow.replacen(&declaration, "\n  REMOVED_PIN:", 1);
-            assert_rejected(&weakened, &landing, &declaration);
-
-            let declaration = format!("\n  {key}: {expected}");
-            let changed = format!("\n  {key}: MUTATED_PIN");
-            let weakened = workflow.replacen(&declaration, &changed, 1);
-            assert_rejected(&weakened, &landing, &format!("workflow pin `{key}`"));
-        }
-        for required in SHELL_VERIFICATION.iter().chain(PYTHON_VERIFICATION) {
-            let weakened = workflow.replacen(required, "REMOVED_VERIFICATION", 1);
-            assert_rejected(&weakened, &landing, required);
-        }
-        for value in REVIEWED_ARTIFACT_VALUES {
-            let weakened = workflow.replacen(value, "MUTATED_ARTIFACT_VALUE", 1);
-            assert_rejected(&weakened, &landing, value);
-        }
-
-        let identity = env_value(&workflow, "COMPATIBILITY_SITE_IDENTITY").unwrap();
-        let current_title = format!("Compatibility website snapshot {identity}");
-        let historical_title = format!("Historical compatibility website snapshot {identity}");
-        let weakened = workflow.replacen(&current_title, &historical_title, 1);
-        assert_rejected(
-            &weakened,
-            &landing,
-            "release title must not use Historical wording",
-        );
-    }
-
-    #[test]
-    fn redirect_or_missing_full_copy_is_rejected() {
-        let (workflow, landing) = actual();
-        let redirected = workflow.replacen(
-            "copy_regular_tree(TARGET, LATEST)",
-            "LATEST.symlink_to(TARGET, target_is_directory=True)",
-            1,
-        );
-        assert_rejected(&redirected, &landing, "copy_regular_tree(TARGET, LATEST)");
-        assert_rejected(&redirected, &landing, ".symlink_to(");
-    }
-
-    #[test]
-    fn embedded_copy_is_byte_and_mode_identical_and_refuses_symlinks() {
-        let (workflow, _) = actual();
-        let step = named_step(&workflow, PUBLICATION_STEP).unwrap();
-        let shell = literal_block(&step, "run").unwrap();
-        let python = heredoc(&shell, "PY").unwrap();
+    fn publisher_passes_black_box_publication_and_history_cases() {
+        let root = repository_root();
         let output = Command::new("python3")
-            .args(["-c", COPY_FIXTURE])
-            .env("DOCS_PAGES_EMBEDDED_PYTHON", python)
+            .args([
+                "-c",
+                BLACK_BOX_FIXTURE,
+                root.join(PUBLISHER).to_str().unwrap(),
+                root.join(RELEASE_PINS).to_str().unwrap(),
+            ])
             .output()
-            .expect("python3 should execute the embedded copy fixture");
+            .expect("python3 should run black-box publisher fixtures");
         assert!(
             output.status.success(),
-            "copy fixture failed: {}",
+            "black-box publisher fixture failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
 
     #[test]
-    fn omitting_full_inventory_equality_is_rejected() {
+    fn malformed_literal_block_indentation_is_rejected() {
+        assert!(literal_block("- name: fixture\n  run: |\nbody\n", "run").is_err());
+    }
+
+    #[test]
+    fn mutable_pages_inheritance_and_shallow_checkout_are_rejected() {
         let (workflow, landing) = actual();
-        let weakened =
-            workflow.replacen("if latest_inventory != pinned_inventory:", "if False:", 1);
+        for forbidden in ["keep_files:", "git fetch origin gh-pages"] {
+            assert_rejected(
+                &format!("{workflow}\n{forbidden}\n"),
+                &landing,
+                "delegate publication semantics",
+            );
+        }
         assert_rejected(
-            &weakened,
+            &workflow.replacen("fetch-depth: 0", "fetch-depth: 1", 1),
             &landing,
-            "if latest_inventory != pinned_inventory:",
+            "fetch-depth: 0",
         );
     }
 
     #[test]
-    fn landing_page_must_use_the_stable_alias() {
+    fn workflow_must_validate_before_network_and_finalize_after_extract() {
         let (workflow, landing) = actual();
-        let identity = env_value(&workflow, "COMPATIBILITY_SITE_IDENTITY").unwrap();
-        let pinned = landing.replacen(
-            "href=\"compatibility/latest/\"",
-            &format!("href=\"compatibility/{identity}/\""),
+        let moved_validation = workflow.replacen(
+            "python3 .github/scripts/publish-compatibility-site.py validate \"$pins\" .",
+            "true",
             1,
         );
-        assert_rejected(&workflow, &pinned, "href=\"compatibility/latest/\"");
-        assert_rejected(
-            &workflow,
-            &pinned,
-            "landing page still links the content-addressed snapshot directly",
+        assert_rejected(&moved_validation, &landing, "validate");
+        let removed_extract = workflow.replacen(
+            "python3 .github/scripts/publish-compatibility-site.py extract \"$archive\"",
+            "true",
+            1,
         );
+        assert_rejected(&removed_extract, &landing, "extract");
     }
 
     #[test]
-    fn workflow_landing_assertion_must_use_the_stable_alias() {
+    fn landing_page_must_use_stable_alias() {
         let (workflow, landing) = actual();
-        let identity = env_value(&workflow, "COMPATIBILITY_SITE_IDENTITY").unwrap();
-        let weakened = workflow.replacen(
-            LANDING_ALIAS,
-            &format!("href=\"compatibility/{identity}/\""),
-            1,
-        );
-        assert_rejected(&weakened, &landing, "workflow landing assertion");
-        assert_rejected(&weakened, &landing, LANDING_ALIAS);
+        let weakened = landing.replacen(LANDING_ALIAS, "href=\"compatibility/missing/\"", 1);
+        assert_rejected(&workflow, &weakened, LANDING_ALIAS);
     }
 }
