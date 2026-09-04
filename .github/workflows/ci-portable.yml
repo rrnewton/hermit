@@ -173,7 +173,7 @@ jobs:
           run_dbg=$(jq -e '.include|length>0' <<<"$dbg" >/dev/null 2>&1 && echo true || echo false)
           run_rel=$(jq -e '.include|length>0' <<<"$rel" >/dev/null 2>&1 && echo true || echo false)
           run_strict=$(jq -r \
-            'if (.nodes | index("test.strict_compat")) == null then "false" else "true" end' \
+            'if any(.nodes[]; startswith("compat.")) then "true" else "false" end' \
             <<<"$sel_json")
           if [[ "$run_strict" == "true" ]]; then
             dbg=$(jq -c '{include: [ .debug_shards[] | {slug, nodes: (.nodes|join(","))} ]}' ci/portable-shards.json)
