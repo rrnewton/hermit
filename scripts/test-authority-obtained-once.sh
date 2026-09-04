@@ -120,6 +120,17 @@ for checker in $GUARDED; do
         failures=$((failures + 1))
         continue
     fi
+    # ⚠️ THE ORACLE MUST SEE A CHECKER THAT EVALUATED NOTHING. rc=0 and a low
+    # fetch count are also what a checker that skipped every case looks like,
+    # and a skip is CHEAPER than the behaviour under test -- it makes zero
+    # fetches. Without this arm the test passes hardest exactly when the checker
+    # did least. The authority is obtainable here, so a marker means the checker
+    # declined to evaluate and the property was never exercised.
+    if grep -q '^NO-RESULT-CASE:' "$work/out"; then
+        echo "FAIL: ${checker} skipped its cases while the authority WAS obtainable; this test proved nothing about it" >&2
+        failures=$((failures + 1))
+        continue
+    fi
     n=$(wc -c < "$calls")
     if [ "$n" -gt 1 ]; then
         echo "FAIL: ${checker} made ${n} authority fetches; anything past the first is a window a 504 can land in" >&2
