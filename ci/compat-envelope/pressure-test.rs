@@ -1658,13 +1658,14 @@ fn result_options(
         if selection.test.is_some() && selection.mode.is_none() {
             return Err("--probe-disabled with --test also requires --mode".into());
         }
-    } else if !selection.green {
+    } else {
         let exact_fields = [
             selection.test.is_some(),
             selection.mode.is_some() && (selection.test.is_some() || selection.backend.is_some()),
             selection.backend.is_some(),
         ];
-        if exact_fields.iter().any(|present| *present)
+        if (selection.test.is_some() || !selection.green)
+            && exact_fields.iter().any(|present| *present)
             && !exact_fields.iter().all(|present| *present)
         {
             return Err(
@@ -6235,6 +6236,23 @@ fn self_test(root: &Path) -> Result<(), String> {
         let mut arguments = arguments.into_iter().map(str::to_string);
         if result_options(root, &mut arguments, false, true).is_ok() {
             return Err("invalid disabled-backend selection was accepted".into());
+        }
+    }
+    for arguments in [
+        vec!["--green", "--repetitions", "3", "--test", "fixture/test"],
+        vec![
+            "--green",
+            "--repetitions",
+            "3",
+            "--test",
+            "fixture/test",
+            "--backend",
+            "kvm",
+        ],
+    ] {
+        let mut arguments = arguments.into_iter().map(str::to_string);
+        if result_options(root, &mut arguments, false, true).is_ok() {
+            return Err("incomplete exact green selection was accepted".into());
         }
     }
     let exact_id = unfiltered
