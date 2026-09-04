@@ -4625,6 +4625,111 @@
         "cpuid-faulting"
       ],
       "test": "backend-parity-c/cpuid-probe"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/syslog-deterministic"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sysv-sem-enosys"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/sysv-shm-enosys"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/tcp-info-accept4"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/tcp-info-accept6"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/tcp-info-client4"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/tee-enosys"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/timer-create-determinism"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/uname"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/unix-autobind-dgram"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/unix-autobind-seqpacket"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/unix-autobind-stream"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/ustat-enosys"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/vforkexec"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/vmsplice-enosys"
     }
   ],
   "schema": 1

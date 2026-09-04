@@ -9433,12 +9433,13 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
@@ -9499,12 +9500,13 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
@@ -9565,12 +9567,13 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
@@ -9631,9 +9634,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
@@ -9689,9 +9692,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
@@ -9747,9 +9750,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
@@ -9805,12 +9808,13 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
@@ -10140,9 +10144,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
@@ -10198,9 +10202,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
@@ -10257,9 +10261,9 @@ test:
           - ptrace
           - sabre
           - liteinst
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
       naked:
         ci: false
         backends_enabled: []
@@ -10315,9 +10319,9 @@ test:
           - ptrace
           - sabre
           - liteinst
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
       naked:
         ci: false
         backends_enabled: []
@@ -10373,9 +10377,9 @@ test:
           - ptrace
           - sabre
           - liteinst
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
       naked:
         ci: false
         backends_enabled: []
@@ -10430,12 +10434,13 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
@@ -10505,9 +10510,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -10564,12 +10569,13 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - kvm
         backends_disabled:
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
