@@ -2722,7 +2722,7 @@ cleared-caps refusal names {} starved step(s)",
             );
         }
         for consumer in manifest_consumers {
-            let DagManifest { lane, category: _, .. } = consumer.manifest.as_ref().ok_or_else(|| {
+            let DagManifest { lane, .. } = consumer.manifest.as_ref().ok_or_else(|| {
                 format!(
                     "full-plan bracket: {} manifest consumer lacks typed manifest selection",
                     consumer.tag()
