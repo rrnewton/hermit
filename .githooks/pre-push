@@ -55,6 +55,61 @@ if "$checker" --quiet; then
     exit 0
 fi
 
+# ⚠️ "COULD NOT CHECK" IS NOT "DOES NOT COMPILE", AND THIS HOOK USED TO SAY THE
+# SECOND FOR BOTH. In a fresh worktree the submodules are not populated, so a
+# path dependency such as agent-utils/rs/dagrun is simply absent and Cargo fails
+# to resolve the workspace before it lints anything. The tree was never checked,
+# but the message below announced a compile failure and pointed at
+# `cargo clippy`, which cannot reproduce it and does not mention the submodule.
+#
+# Measured 2026-09-04 on devbig014: this fired on a diff touching NO RUST AT ALL
+# -- a Python CI helper plus a Makefile line -- with
+# "error: no matching package named `dagrun` found". The remedy was
+# `git submodule update --init agent-utils`, which the message never named.
+#
+# ⚠️ IT IS THE DOCUMENTED LANDING PROCEDURE THAT PRODUCES THIS. CLAUDE.md tells
+# every agent to land from a clean detached worktree, and a clean detached
+# worktree is exactly where submodules are unpopulated. So the safe procedure
+# reliably produced a misleading failure and each agent paid to rediagnose it.
+#
+# The discriminator is Git's own submodule state, NOT the text of Cargo's error.
+# `git submodule status` prefixes an uninitialised submodule with `-`. Matching
+# on git state rather than on an error string means a reworded Cargo message
+# cannot silently turn this back into the misleading branch.
+#
+# ⚠️ CHECKED ONLY AFTER THE CHECKER HAS ALREADY FAILED, DELIBERATELY. Some
+# submodules are optional (see the parent's checkout-optional-submodules
+# target), so an unpopulated one does not imply a broken build. Testing this
+# first would refuse pushes from trees that lint perfectly well.
+unpopulated=$(git -C "$root" submodule status 2>/dev/null | awk '/^-/ {print $2}')
+if [[ -n "$unpopulated" ]]; then
+    {
+        echo
+        echo "pre-push REFUSED: the working tree COULD NOT BE CHECKED, because"
+        echo "these submodules are not populated:"
+        echo
+        while read -r submodule; do
+            [[ -n "$submodule" ]] && echo "    $submodule"
+        done <<<"$unpopulated"
+        echo
+        echo "state: NOT LINTED -- this is not a compile failure and says nothing"
+        echo "about whether your change compiles. Cargo cannot resolve a path"
+        echo "dependency whose directory is absent, so it stops before linting."
+        echo
+        echo "remedy:"
+        while read -r submodule; do
+            [[ -n "$submodule" ]] && echo "    git submodule update --init $submodule"
+        done <<<"$unpopulated"
+        echo
+        echo "then push again. A fresh detached worktree -- the landing procedure"
+        echo "CLAUDE.md prescribes -- always starts in this state."
+        echo
+        echo "To push anyway: git push --no-verify"
+        echo
+    } >&2
+    exit 1
+fi
+
 cat >&2 <<'MESSAGE'
 
 pre-push REFUSED: the working tree does not compile in the default feature
