@@ -101,9 +101,9 @@ Commands:
   --help
       Show this text.
 
-Green means that the cell is selected by ci/expected-e2e-plan.json. Everything
-else in the manifest is red until it is measured, promoted into the selected
-plan, and passes validate.
+Green means that the cell is selected by full in ci/expected-e2e-plan.json.
+Red means that the cell is in the manifest but is not selected by full; red
+does not mean failed. Manifest-disabled combinations are Not applicable.
 "#;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2532,26 +2532,20 @@ fn render_scorecard(derived: &Derived) -> String {
         .iter()
         .filter(|id| !derived.enabled.contains(*id))
         .count();
+    let status_green_total = derived.green.len();
+    let status_red_total = derived.enabled.difference(&derived.green).count();
 
     let mut out = format!(
         "# Compatibility scorecard\n\n\
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. \
 `./ci/compat-envelope/scorecard.rs check` verifies it.\n\n\
-**Green** means the cell is SELECTED: it is listed in `ci/expected-e2e-plan.json` and is therefore \
-required to pass by ordinary validation. **Red** means an enabled cell is not selected: measured \
-failure, unavailable, or not yet run all remain red until the cell is promoted into the regression \
-plan and passes. The summary table below classifies the current **{na_total}** manifest-disabled \
-combinations as **Not applicable**, not red or omitted: a cell that cannot run cannot pass or fail.\n\n\
-**Green does not mean measured, and it does not mean passing.** Selection, measurement, and result \
-are three separate facts, and the Green column below reports only the first of them. Green is a \
-statement about what the plan REQUIRES, not about what has been OBSERVED. Whether a result was ever \
-seen is a per-cell `measurement` field in `ci/compat-envelope/cells.json`, independent of colour \
-and reading `never-measured`, `measured-and-passed`, or `diverged`; a cell can be green and \
-`never-measured`, or red and `measured-and-passed`. The generated Status and measurement section \
-below states whether those combinations are present today and quotes their exact current counts. \
-To count what has actually run, count that field -- do not count this table. Conflating the three \
-has repeatedly produced project-status reports that quoted the Green total as a number of passing \
-tests, which it has never been.\n\n\
+**Green** means this manifest cell is selected by full in `ci/expected-e2e-plan.json`; ordinary \
+validation therefore requires it to pass. **Red** means the cell is in the manifest but is not \
+selected by full. **Red does not mean failed:** a red cell may have passed, failed, produced no \
+verdict, or never run. Manifest-disabled combinations are **Not applicable**; they are neither red \
+nor omitted. The current generated data counts Green as **{status_green_total}** and Red as \
+**{status_red_total}**. The generator classifies the current **{na_total}** manifest-disabled \
+combinations as **Not applicable**.\n\n\
 Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend \
 twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and \
 accepts a result only when the typed report says `verified=true`, `verdict=matched`, \
@@ -2813,20 +2807,33 @@ fn render_measurement_section(tracked: &TrackedCells) -> String {
     // own count so another import changes both together.
     let green_never_measured = count(CellStatus::Green, MeasurementState::NeverMeasured);
     let red_measured_and_passed = count(CellStatus::Red, MeasurementState::MeasuredAndPassed);
+    let green_never_measured_claim = match green_never_measured {
+        0 => "zero Green cells are `never-measured`".to_owned(),
+        1 => "1 Green cell is `never-measured`".to_owned(),
+        count => format!("{count} Green cells are `never-measured`"),
+    };
+    let red_measured_and_passed_claim = match red_measured_and_passed {
+        1 => "1 Red cell that is `measured-and-passed`".to_owned(),
+        count => format!("{count} Red cells that are `measured-and-passed`"),
+    };
 
-    let mut out = String::from(
+    let mut out = format!(
         "\n## Status and measurement\n\n\
-The table above reports status. This table reports the separate `measurement` field derived from \
-observations stored in `ci/compat-envelope/cells.json`; it does not change status or which cells \
-ordinary validation selects. Retained history that has not been imported is not counted here. A \
-stored measurement does not establish that it describes current code; `show` reports whether the \
-recorded last test still matches `HEAD:detcore`.\n\n",
+Selection and observation answer different questions. The Green/Red table says what full validation \
+selects. The per-cell `measurement` value says what retained evidence observed: `never-measured`, \
+`measured-and-passed`, `measured-no-verdict`, `diverged-unlocated`, or `diverged`. In the current \
+generated data, **{green_never_measured_claim}**. Read the generated Status and measurement section \
+for the complete current cross-tab; do not use Red as a failed-test count.\n\n\
+The current green/`never-measured` count is **{green_never_measured}**, and the current \
+red/`measured-and-passed` count is **{red_measured_and_passed}**.\n\n\
+Retained history that has not been imported is not counted here. A stored measurement does not \
+establish that it describes current code; `show` reports whether the recorded last test still \
+matches `HEAD:detcore`.\n\n",
     );
     out.push_str(&format!(
-        "The count table includes all **{}** tracked cells; no row is omitted. The current \
-green/`never-measured` count is **{green_never_measured}**, and the current \
-red/`measured-and-passed` count is **{red_measured_and_passed}**. These values use the same counts \
-printed in the table below.\n\n",
+        "The cross-tab includes all **{}** tracked cells; no row is omitted. The current generated \
+data contains **{red_measured_and_passed_claim}**. These claims \
+use the same counts printed in the table below.\n\n",
         tracked.cells.len(),
     ));
     out.push_str(
@@ -7554,6 +7561,43 @@ fn self_test() -> Result<(), String> {
         selected_custom: selected_custom.clone(),
     };
     let rendered = render_scorecard(&selected_fixture);
+    let status_prose = rendered
+        .split("Every selected")
+        .next()
+        .ok_or("scorecard omitted its status explanation")?;
+    for required in [
+        "**Green** means this manifest cell is selected by full in `ci/expected-e2e-plan.json`; ordinary validation therefore requires it to pass.",
+        "**Red** means the cell is in the manifest but is not selected by full.",
+        "**Red does not mean failed:**",
+        "Manifest-disabled combinations are **Not applicable**; they are neither red nor omitted.",
+    ] {
+        if !status_prose.contains(required) {
+            return Err(format!(
+                "scorecard omitted declarative status prose: {required}"
+            ));
+        }
+    }
+    for forbidden in ["enabled", "Green means passing", "Red means failed"] {
+        if status_prose.contains(forbidden) {
+            return Err(format!(
+                "scorecard status prose retained forbidden wording: {forbidden}"
+            ));
+        }
+    }
+    if !status_prose.contains("counts Green as **1** and Red as **0**")
+        || !status_prose
+            .contains("the current **0** manifest-disabled combinations as **Not applicable**")
+    {
+        return Err("scorecard status prose did not derive its three status counts".into());
+    }
+    if !USAGE.contains("selected by full in ci/expected-e2e-plan.json")
+        || !USAGE.contains(
+            "Red means that the cell is in the manifest but is not selected by full; red\ndoes not mean failed",
+        )
+        || USAGE.contains("until it is measured, promoted")
+    {
+        return Err("scorecard help contradicted the declarative status prose".into());
+    }
     for id in &selected_custom {
         let row = format!(
             "| `{}` | `{}` | `{}` | `custom` | `{}` |",
@@ -7601,6 +7645,9 @@ fn self_test() -> Result<(), String> {
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
     };
+    if !render_scorecard(&visible_red).contains("counts Green as **0** and Red as **1**") {
+        return Err("scorecard status prose did not derive its Red count".into());
+    }
     let visible_tracked = tracked_from(&visible_red, None, Some("self-test"), false)?;
     if visible_tracked.cells[0].ci_disabled_reason.as_ref() != Some(&visible_reason)
         || !encoded_cells(&visible_tracked)?.contains("ci_disabled_reason")
@@ -7610,9 +7657,13 @@ fn self_test() -> Result<(), String> {
     let mut measured_red = visible_tracked.clone();
     measured_red.cells[0].measurement = MeasurementState::MeasuredAndPassed;
     let measured_section = render_measurement_section(&measured_red);
-    let current_counts = "The current green/`never-measured` count is **0**, and the current \
+    let current_counts = "In the current generated data, **zero Green cells are \
+`never-measured`**.";
+    let parser_counts = "The current green/`never-measured` count is **0**, and the current \
 red/`measured-and-passed` count is **1**.";
     if !measured_section.contains(current_counts)
+        || !measured_section.contains(parser_counts)
+        || !measured_section.contains("**1 Red cell that is `measured-and-passed`**")
         || !measured_section.contains("| `red` | 0 | 1 | 0 | 0 | 0 | 1 |")
     {
         return Err(
@@ -7633,11 +7684,74 @@ red/`measured-and-passed` count is **1**.";
             "measurement display showed measured-and-passed without that measurement".into(),
         );
     }
-    if !unmeasured_section.contains(
-        "The current green/`never-measured` count is **0**, and the current \
+    if !unmeasured_section.contains("**zero Green cells are `never-measured`**")
+        || !unmeasured_section.contains(
+            "The current green/`never-measured` count is **0**, and the current \
 red/`measured-and-passed` count is **0**.",
-    ) {
+        )
+        || !unmeasured_section.contains("**0 Red cells that are `measured-and-passed`**")
+    {
         return Err("measurement prose kept a stale cross-combination count".into());
+    }
+    let mut unmeasured_green = visible_tracked.clone();
+    unmeasured_green.cells[0].status = CellStatus::Green;
+    let unmeasured_green_section = render_measurement_section(&unmeasured_green);
+    if !unmeasured_green_section.contains("**1 Green cell is `never-measured`**")
+        || !unmeasured_green_section.contains(
+            "The current green/`never-measured` count is **1**, and the current \
+red/`measured-and-passed` count is **0**.",
+        )
+    {
+        return Err("measurement prose hard-coded the current zero Green count".into());
+    }
+
+    let cross_tab_cells = [
+        (CellStatus::Red, MeasurementState::NeverMeasured),
+        (CellStatus::Red, MeasurementState::MeasuredAndPassed),
+        (CellStatus::Green, MeasurementState::MeasuredNoVerdict),
+        (CellStatus::Green, MeasurementState::DivergedUnlocated),
+        (CellStatus::NotApplicable, MeasurementState::Diverged),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (status, measurement))| {
+        let mut cell = visible_tracked.cells[0].clone();
+        cell.id.test = format!("cross-tab-{index}");
+        cell.status = status;
+        cell.measurement = measurement;
+        cell.ci_disabled_reason = None;
+        cell.not_applicable_reason = (status == CellStatus::NotApplicable)
+            .then(|| "fixture backend is disabled for this mode".into());
+        cell
+    })
+    .collect();
+    let cross_tab = render_measurement_section(&TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: cross_tab_cells,
+    });
+    for spelling in [
+        "`never-measured`",
+        "`measured-and-passed`",
+        "`measured-no-verdict`",
+        "`diverged-unlocated`",
+        "`diverged`",
+    ] {
+        if !cross_tab.contains(spelling) {
+            return Err(format!("measurement cross-tab omitted state {spelling}"));
+        }
+    }
+    for row in [
+        "| `green` | 0 | 0 | 1 | 1 | 0 | 2 |",
+        "| `red` | 1 | 1 | 0 | 0 | 0 | 2 |",
+        "| `not-applicable` | 0 | 0 | 0 | 0 | 1 | 1 |",
+        "| **Total** | **1** | **1** | **1** | **1** | **1** | **5** |",
+    ] {
+        if !cross_tab.contains(row) {
+            return Err(format!(
+                "measurement cross-tab did not conserve its five-cell fixture: {row}"
+            ));
+        }
     }
     let not_applicable = Derived {
         population: BTreeSet::from([id.clone()]),
@@ -7652,9 +7766,9 @@ red/`measured-and-passed` count is **0**.",
         selected_custom: BTreeSet::new(),
     };
     let status_section = render_scorecard(&not_applicable);
-    if !status_section.contains(
-        "current **1** manifest-disabled combinations as **Not applicable**, not red or omitted",
-    ) || !status_section.contains("| `ptrace` | 0 | 0 | 1 | 1 |")
+    if !status_section
+        .contains("the current **1** manifest-disabled combinations as **Not applicable**")
+        || !status_section.contains("| `ptrace` | 0 | 0 | 1 | 1 |")
         || !status_section.contains("| `verify` | 0 / 1 | 0 | 0 | 1 | 1 |")
     {
         return Err("status prose and tables did not use the same manifest-disabled count".into());
