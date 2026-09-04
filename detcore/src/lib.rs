@@ -1306,10 +1306,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 )
                 .await;
             }
-            intercepted.cpuid(eax).unwrap_or_else(|| {
+            intercepted.cpuid(eax, ecx).unwrap_or_else(|| {
                 warn!(
-                    "[dtid {}] cpuid leaf 0x{:x} not in deterministic table; returning zero result",
-                    dettid, eax
+                    "[dtid {}] cpuid leaf 0x{:x} subleaf 0x{:x} not in deterministic table; returning zero result",
+                    dettid, eax, ecx
                 );
                 CpuIdResult {
                     eax: 0,

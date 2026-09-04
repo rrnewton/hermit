@@ -309,8 +309,9 @@ filing (include the diagnostic block below).
   `virtual CPU should expose basic feature information`, or the post-mask
   `assert!(!feature.has_rdrand())` fails — the environment prevented CPUID
   faulting from taking effect or exposed an unexpected feature combination.
-- `cpuid leaf 0x... not in deterministic table; returning zero result` — a guest
-  probed a CPUID leaf with no deterministic table entry.
+- `cpuid leaf 0x... subleaf 0x... not in deterministic table; returning zero
+  result` — a guest probed a CPUID leaf with no deterministic table entry; the
+  reported subleaf is the guest's ECX input.
 
 **Action:** on a VM this is usually an **environment** limitation (no CPUID
 faulting). On bare metal with faulting support, a reproducible mismatch may be a
