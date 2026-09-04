@@ -8,7 +8,27 @@ from __future__ import annotations
 
 import unittest
 
+import check_outcome_adapter
 import pr_status
+
+
+def _authority_reachable() -> bool:
+    """Whether the pinned check-status authority can be consulted at all.
+
+    ⚠️ IMPORTING pr_status DOES NOT TOUCH THE AUTHORITY; the adapter loads it
+    lazily on first classification, so this file only fails when a test actually
+    classifies something. That is why the guard probes rather than relying on
+    import succeeding.
+
+    Only AuthorityUnavailable takes this path. AuthorityIntegrityError -- the
+    authority reached and the digest wrong -- is a refusal and is deliberately
+    NOT caught, so a tampered authority still fails loudly here.
+    """
+    try:
+        check_outcome_adapter.classify_check("completed", "success")
+    except check_outcome_adapter.AuthorityUnavailable:
+        return False
+    return True
 
 
 class ClassifyCiRollupTest(unittest.TestCase):
@@ -391,4 +411,16 @@ class ParseArgsMainCiTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    # See scripts/authority-available.sh and the shell checkers for the same
+    # rule. Exit 0 with the marker so `make lint-checks` still passes and
+    # ci/lint-checks-node.sh can classify the run no_result; a nonzero exit
+    # could never be reported as no_result, because classify_run lets a real
+    # failure outrank any marker.
+    if not _authority_reachable():
+        print(
+            "NO-RESULT-CASE: test_pr_status.py: the pinned check-status "
+            "authority could not be consulted; no case in this checker was "
+            "evaluated"
+        )
+        raise SystemExit(0)
     unittest.main()

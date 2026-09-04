@@ -124,5 +124,70 @@ class AReachableAuthorityStillSaysNo(unittest.TestCase):
         self.assertEqual(cancelled.stdout.strip(), "NO_RESULT")
 
 
+
+
+class TheSecondPinnedAuthorityAdapterUsesTheSameSpelling(unittest.TestCase):
+    """review_contract_adapter.py fetches a different pinned contract and had
+    the identical defect. One spelling across both, so a caller learns it once.
+    """
+
+    def test_review_contract_adapter_declares_the_same_two_kinds(self) -> None:
+        import review_contract_adapter as review
+
+        self.assertEqual(
+            review.EXIT_AUTHORITY_UNAVAILABLE, adapter.EXIT_AUTHORITY_UNAVAILABLE
+        )
+        self.assertFalse(
+            issubclass(review.AuthorityIntegrityError, review.AuthorityUnavailable)
+        )
+
+    def test_review_contract_adapter_reports_unreachable_as_exit_three(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS / "review_contract_adapter.py")],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=dict(os.environ, DEV_HERMIT_PARENT=tmp, PATH=""),
+            )
+        self.assertEqual(result.returncode, adapter.EXIT_AUTHORITY_UNAVAILABLE)
+        self.assertIn("COULD-NOT-DETERMINE", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+
+class TheProbeHelperReportsOnlyTheOutage(unittest.TestCase):
+    """⚠️ The probe is what lets five checkers skip. If it ever returned 3 for
+    anything other than an outage, those checkers would skip real failures."""
+
+    def test_probe_says_reachable_when_it_is(self) -> None:
+        result = subprocess.run(
+            [str(SCRIPTS / "authority-available.sh")],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode == 3:
+            self.skipTest("authority genuinely unreachable here")
+        self.assertEqual(result.returncode, 0)
+
+    def test_probe_says_unreachable_only_on_exit_three(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # An adapter that exits 1 is an ordinary error, NOT an outage, and
+            # the probe must not report it as one -- otherwise a broken adapter
+            # would make every guarded checker skip silently.
+            stub = Path(tmp) / "stub.py"
+            stub.write_text("import sys\nsys.exit(1)\n")
+            result = subprocess.run(
+                [str(SCRIPTS / "authority-available.sh"), sys.executable, str(stub)],
+                capture_output=True, text=True, check=False,
+            )
+        self.assertEqual(
+            result.returncode, 0,
+            "only exit 3 may be reported as unreachable; exit 1 must not skip",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
