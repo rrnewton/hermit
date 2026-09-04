@@ -580,7 +580,11 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
 
     git(repository, "checkout", "--quiet", "-B", "mutation", expanded_commit)
     mutated = copy.deepcopy(expanded)
-    mutated["releases"][1]["archive_bytes"] += 1
+    mutated_pin = next(
+        pin for pin in mutated["releases"]
+        if pin["identity"] == checked["latest_identity"]
+    )
+    mutated_pin["archive_bytes"] += 1
     history_registry.write_text(json.dumps(mutated, sort_keys=True, indent=2) + "\n")
     git(repository, "add", ".github/compatibility-site-releases.json")
     git(repository, "commit", "--quiet", "-m", "mutated row")
@@ -627,13 +631,21 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
                    cwd=invalid_repository, expected=expected)
 
     wording = copy.deepcopy(checked)
-    wording["releases"][-1]["release_title"] = "Historical compatibility website snapshot"
+    latest = next(
+        pin for pin in wording["releases"]
+        if pin["identity"] == wording["latest_identity"]
+    )
+    latest["release_title"] = "Historical compatibility website snapshot"
     history_registry.write_text(json.dumps(wording, sort_keys=True, indent=2) + "\n")
     run_helper(["validate", history_registry, repository], cwd=repository,
                expected="must not use Historical wording")
 
     bootstrap = copy.deepcopy(checked)
-    bootstrap["releases"][0]["archive_bytes"] += 1
+    bootstrap_pin = next(
+        pin for pin in bootstrap["releases"]
+        if pin["identity"] == "8feef179bed2bb48c81dd0bc8186d81df47c255d8c015dc4b0eb139eab439edc"
+    )
+    bootstrap_pin["archive_bytes"] += 1
     history_registry.write_text(json.dumps(bootstrap, sort_keys=True, indent=2) + "\n")
     run_helper(["validate", history_registry, repository], cwd=repository,
                expected="changed bootstrap pin")
