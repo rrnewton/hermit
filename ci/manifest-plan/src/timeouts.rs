@@ -19,12 +19,14 @@ pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MUL
 pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
 pub const CALIBRATED_CI_CELL_COUNT: usize = 492;
 pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
-pub const UNSAMPLED_NON_CI_CELL_COUNT: usize = 188;
+pub const NON_CI_CELL_COUNT: usize = 198;
 /// Additional selected cells covered by the KVM qualification evidence.
 pub const KVM_RATCHET_CALIBRATION_SHA: &str = "92bacf12deba6a717f77cfcbd6afefc5ffb383f2";
 pub const KVM_RATCHET_CALIBRATION_COMPLETED_UTC: &str = "2026-09-04T04:39:00Z";
 pub const KVM_RATCHET_CI_CELL_COUNT: usize = 183;
 pub const KVM_RATCHET_DEFAULT_COVERED_CI_CELL_COUNT: usize = 182;
+/// Cells removed from full selection after RUN1709 did not pass on the first attempt.
+pub const KVM_RUN_1709_CI_REMOVAL_COUNT: usize = 10;
 /// Among the 182 KVM ratchet cells covered by the ordinary defaults, retained
 /// passing evidence has one to three samples per cell. These are the largest
 /// bounds produced by the owner-approved formula.
@@ -325,7 +327,7 @@ mod tests {
             DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
             KVM_RATCHET_DEFAULT_COVERED_MAX_REQUIRED_WALL_SECONDS,
         );
-        assert_eq!(UNSAMPLED_NON_CI_CELL_COUNT, 188);
+        assert_eq!(NON_CI_CELL_COUNT, 198);
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)

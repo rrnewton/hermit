@@ -52,11 +52,13 @@ use crate::timeouts::EXPLICIT_TIMEOUT_CALIBRATIONS;
 use crate::timeouts::KVM_RATCHET_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::KVM_RATCHET_TIMEOUT_CALIBRATIONS;
+#[cfg(test)]
+use crate::timeouts::KVM_RUN_1709_CI_REMOVAL_COUNT;
 use crate::timeouts::MANIFEST_SCHEMA;
+#[cfg(test)]
+use crate::timeouts::NON_CI_CELL_COUNT;
 use crate::timeouts::ResolvedTestTimeouts;
 use crate::timeouts::TimeoutMultipliers;
-#[cfg(test)]
-use crate::timeouts::UNSAMPLED_NON_CI_CELL_COUNT;
 use crate::timeouts::resolve_test_timeouts;
 use crate::timeouts::resolve_timeout_seconds;
 use crate::timeouts::timeout_multipliers_from_env;
@@ -4497,7 +4499,7 @@ mod tests {
     }
 
     #[test]
-    fn shipped_kvm_python_examples_uses_its_measured_timeout() {
+    fn enabled_kvm_python_examples_keeps_its_measured_timeout() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let defaults: ManifestDefaults = serde_yaml::from_str(
             &fs::read_to_string(root.join("tests/e2e/manifests/defaults.yaml")).unwrap(),
@@ -4512,7 +4514,7 @@ mod tests {
         let cells = ManifestSet::load(&root)
             .unwrap()
             .select(&Selection {
-                population: Some(Population::Required),
+                population: Some(Population::Enabled),
                 test: Some("applications/kvm-python-examples".into()),
                 mode: Some("verify".into()),
                 backend: Some("kvm".into()),
@@ -4563,15 +4565,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             required.len(),
-            CALIBRATED_CI_CELL_COUNT + KVM_RATCHET_CI_CELL_COUNT
+            CALIBRATED_CI_CELL_COUNT + KVM_RATCHET_CI_CELL_COUNT - KVM_RUN_1709_CI_REMOVAL_COUNT
         );
         assert_eq!(
             enabled.len() - required.len(),
-            UNSAMPLED_NON_CI_CELL_COUNT,
-            "the frozen census records no samples for exactly the enabled ci:false cells"
+            NON_CI_CELL_COUNT,
+            "the current manifest census records every enabled ci:false cell"
         );
 
-        let observed = required
+        let observed = enabled
             .iter()
             .filter(|cell| {
                 cell.cpu_timeout_seconds != DEFAULT_TEST_CPU_TIMEOUT_SECONDS
