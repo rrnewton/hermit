@@ -10271,7 +10271,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
 
     // THE CHECKED-IN ACCOUNTING — the required plan itself carries the host
     // capability metadata generated from the live YAML manifests. This must be
-    // enough to withhold the one current privileged bucket without compiling or
+    // enough to withhold the current privileged bucket without compiling or
     // invoking another validation driver before dagrun starts.
     let absent = BTreeMap::from([(
         validate_plan::HostCapability::CpuidFaulting,
@@ -10282,7 +10282,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|bucket| bucket.lane == "privileged" && bucket.category == "backend-parity-c")
         .ok_or("node vacuity: required plan lost the privileged backend-parity-c bucket")?;
-    if privileged.selected != 1
+    if privileged.selected != 2
         || !bucket_runs_nothing(privileged)
         || privileged.capabilities != vec!["cpuid-faulting".to_string()]
     {
