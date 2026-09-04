@@ -28,10 +28,13 @@ test:
         ci: true
         timeout_seconds:
           ptrace: 91
+          kvm: 80
         cpu_timeout_seconds:
           ptrace: 32
+          kvm: 24
         slow_reason:
           ptrace: Across 60 retained typed passing rows, nearest-rank p90 was 22.531 wall seconds and 20.710660 CPU seconds; ceil(4x wall)=91 and ceil(1.5x CPU)=32.
+          kvm: Across 3 clean qualification repetitions at Hermit 92bacf12deba6a717f77cfcbd6afefc5ffb383f2, nearest-rank p90 was 19.937 wall seconds and 15.647292 CPU seconds; ceil(4x wall)=80 and ceil(1.5x CPU)=24.
         backends_enabled:
           - ptrace
           - kvm
