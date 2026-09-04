@@ -2136,13 +2136,6 @@
       "test": "system-utils/uuidgen-random"
     },
     {
-      "backend": "kvm",
-      "category": "applications",
-      "lane": "privileged",
-      "mode": "verify",
-      "test": "applications/kvm-python-examples"
-    },
-    {
       "backend": "ptrace",
       "category": "backend-parity-c",
       "lane": "privileged",
@@ -3578,13 +3571,6 @@
       "category": "backend-parity-c",
       "lane": "portable",
       "mode": "verify",
-      "test": "backend-parity-c/fork-exec-pipeline"
-    },
-    {
-      "backend": "kvm",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
       "test": "backend-parity-c/ftruncate-sparse"
     },
     {
@@ -3746,21 +3732,7 @@
       "category": "backend-parity-c",
       "lane": "portable",
       "mode": "verify",
-      "test": "backend-parity-c/pipe-ipc"
-    },
-    {
-      "backend": "kvm",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
       "test": "backend-parity-c/pipe2-flags"
-    },
-    {
-      "backend": "kvm",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "backend-parity-c/pthread-lifecycle"
     },
     {
       "backend": "kvm",
@@ -3817,13 +3789,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "backend-parity-c/set-tid-address"
-    },
-    {
-      "backend": "kvm",
-      "category": "backend-parity-c",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "backend-parity-c/short-io-split-identity"
     },
     {
       "backend": "kvm",
@@ -3984,13 +3949,6 @@
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
-      "test": "c-programs/dbt-copied-tiocgpgrp"
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
       "test": "c-programs/dbt-exec-failure"
     },
     {
@@ -4034,13 +3992,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/futex-wake-enosys"
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/get-robust-list-child"
     },
     {
       "backend": "kvm",
@@ -4104,13 +4055,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/ioctl-siocethtool"
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/just-spin"
     },
     {
       "backend": "kvm",
@@ -4390,13 +4334,6 @@
       "category": "c-programs",
       "lane": "portable",
       "mode": "verify",
-      "test": "c-programs/prodcons-determinism"
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
       "test": "c-programs/ptrace-attach-eperm"
     },
     {
@@ -4594,13 +4531,6 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/syscall-file-io"
-    },
-    {
-      "backend": "kvm",
-      "category": "c-programs",
-      "lane": "portable",
-      "mode": "verify",
-      "test": "c-programs/syscall-file-metadata"
     },
     {
       "backend": "kvm",

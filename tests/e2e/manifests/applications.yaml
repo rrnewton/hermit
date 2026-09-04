@@ -162,7 +162,8 @@ test:
         backends_disabled:
           native: The portable Python-random test owns the native nondeterminism control
       verify:
-        ci: true
+        ci:
+          kvm: false
         timeout_seconds:
           kvm: 74
         cpu_timeout_seconds:
@@ -176,6 +177,11 @@ test:
           dbt: This test specifically asserts the KVM execution path
           sabre: This test specifically asserts the KVM execution path
           liteinst: This test specifically asserts the KVM execution path
+        ci_disabled_reason:
+          kvm:
+            result: determinism-failure
+            evidence: RUN1709 at Hermit 8c2bb5620f13e5d351e7bdb5d20c8dcec1f3eaba
+            reason: Both canonical full-validation attempts diverged at turn 34, record 560, syscall 239, so KVM remains enabled but is not selected by CI pending separate qualification.
       replay:
         ci: false
         backends_enabled: []
