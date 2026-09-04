@@ -10,6 +10,19 @@
 
 set -euo pipefail
 
+# Same rule as the check-status checkers: if the pinned review-label contract
+# cannot be consulted, no case here is evaluable. Declare it and exit 0 so
+# `make lint-checks` still passes and ci/lint-checks-node.sh classifies the run
+# no_result (exit 75) instead of fail. A nonzero exit could never be reported as
+# no_result -- classify_run lets a real failure outrank any marker.
+_probe_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+if ! "$_probe_root/scripts/authority-available.sh" \
+        "$_probe_root/scripts/review_contract_adapter.py" --format lint-records; then
+    echo "NO-RESULT-CASE: core-review-protocol-lint-test.sh: the pinned review-label contract could not be consulted; no case in this checker was evaluated"
+    exit 0
+fi
+
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly LINT="$SCRIPT_DIR/core-review-protocol-lint.sh"
 readonly CONTRACT_ADAPTER="$SCRIPT_DIR/review_contract_adapter.py"

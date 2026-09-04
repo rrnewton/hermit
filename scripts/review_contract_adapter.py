@@ -34,6 +34,26 @@ def _candidate_authorities() -> list[Path]:
     return candidates
 
 
+#: Exit status for "could not consult the contract at all". Mirrors
+#: check_outcome_adapter.EXIT_AUTHORITY_UNAVAILABLE deliberately: one spelling
+#: across both pinned-authority adapters, so a caller learns the rule once.
+EXIT_AUTHORITY_UNAVAILABLE = 3
+
+
+class AuthorityUnavailable(RuntimeError):
+    """The contract could not be OBTAINED. Says nothing about any pull request.
+
+    ⚠️ NOT A VERDICT. Measured 2026-09-04 on devbig014: with `gh` unreachable
+    this raised an ordinary RuntimeError, `make lint-checks` exited 1, and the
+    validation DAG recorded check.lint_checks as FAILED -- an outage reported as
+    a code defect.
+    """
+
+
+class AuthorityIntegrityError(RuntimeError):
+    """Obtained and does NOT match the pin. A refusal; still fails closed."""
+
+
 def _fetch_pinned_source() -> bytes:
     """Fetch the private parent file through authenticated GitHub tooling."""
     proxy = shutil.which("with-proxy")
@@ -43,7 +63,7 @@ def _fetch_pinned_source() -> bytes:
     elif gh:
         command = [gh]
     else:
-        raise RuntimeError(
+        raise AuthorityUnavailable(
             "cannot fetch the pinned review-label contract: gh is unavailable; "
             "set DEV_HERMIT_PARENT to a dev-hermit checkout"
         )
@@ -58,7 +78,7 @@ def _fetch_pinned_source() -> bytes:
     result = subprocess.run(command, capture_output=True, check=False)
     if result.returncode != 0:
         detail = result.stderr.decode(errors="replace").strip() or "no error output"
-        raise RuntimeError(
+        raise AuthorityUnavailable(
             "cannot fetch the pinned review-label contract with gh api: "
             f"{detail}"
         )
@@ -75,7 +95,7 @@ def _verified_source() -> bytes:
     source = _fetch_pinned_source()
     digest = hashlib.sha256(source).hexdigest()
     if digest != AUTHORITY_SHA256:
-        raise RuntimeError(
+        raise AuthorityIntegrityError(
             "canonical review-label contract digest mismatch: "
             f"expected {AUTHORITY_SHA256}, got {digest}"
         )
@@ -117,7 +137,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--format", choices=("lint-records",), default="lint-records")
     parser.parse_args(argv)
-    print("\n".join(lint_records()))
+    # Nothing on stdout when the contract cannot be consulted: callers read
+    # stdout as the records. The distinction rides the exit status.
+    try:
+        records = lint_records()
+    except AuthorityUnavailable as unavailable:
+        print(
+            f"COULD-NOT-DETERMINE: {unavailable}. state: NO SIGNAL -- the "
+            "review-label contract was not consulted, so this says nothing "
+            "about any pull request and is not a failing verdict.",
+            file=sys.stderr,
+        )
+        return EXIT_AUTHORITY_UNAVAILABLE
+    print("\n".join(records))
     return 0
 
 
