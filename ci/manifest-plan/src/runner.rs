@@ -48,6 +48,10 @@ use crate::timeouts::DEFAULT_TEST_WALL_TIMEOUT_SECONDS;
 use crate::timeouts::DEFAULTS_FILE;
 #[cfg(test)]
 use crate::timeouts::EXPLICIT_TIMEOUT_CALIBRATIONS;
+#[cfg(test)]
+use crate::timeouts::KVM_RATCHET_CI_CELL_COUNT;
+#[cfg(test)]
+use crate::timeouts::KVM_RATCHET_TIMEOUT_CALIBRATIONS;
 use crate::timeouts::MANIFEST_SCHEMA;
 use crate::timeouts::ResolvedTestTimeouts;
 use crate::timeouts::TimeoutMultipliers;
@@ -4557,7 +4561,10 @@ mod tests {
                 ..Selection::default()
             })
             .unwrap();
-        assert_eq!(required.len(), CALIBRATED_CI_CELL_COUNT);
+        assert_eq!(
+            required.len(),
+            CALIBRATED_CI_CELL_COUNT + KVM_RATCHET_CI_CELL_COUNT
+        );
         assert_eq!(
             enabled.len() - required.len(),
             UNSAMPLED_NON_CI_CELL_COUNT,
@@ -4583,6 +4590,7 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let expected = EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
+            .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)
             .map(|calibration| {
                 (
                     (calibration.test, calibration.mode, calibration.backend),
