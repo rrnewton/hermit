@@ -1985,6 +1985,359 @@ struct Derived {
     selected_custom: BTreeSet<CellId>,
 }
 
+const BACKEND_PARITY_POPULATION_SCHEMA: &str = "backend-ptrace-parity-population/v1";
+const NO_CURRENT_PARITY_RESULT: &str =
+    "no current canonical backend-to-ptrace parity result";
+
+/// The fixed denominator for one backend's comparison with ptrace.
+///
+/// Candidate status is deliberately absent. The population starts with every
+/// Green ptrace verify cell and maps that identity to the candidate backend.
+/// A candidate result, or whether that candidate is currently selected, cannot
+/// therefore move the denominator it is scored against.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BackendParityPopulation {
+    schema: &'static str,
+    backend: String,
+    eligible_cells: BTreeSet<CellId>,
+    excluded_references: Vec<BackendParityExclusion>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct BackendParityExclusion {
+    reference: CellId,
+    reason: String,
+}
+
+impl BackendParityPopulation {
+    fn denominator(&self) -> usize {
+        self.eligible_cells.len()
+    }
+
+    /// Content identity for the complete typed population, including every
+    /// exclusion and its reason. This is intentionally independent of any
+    /// candidate observation.
+    fn sha256(&self) -> String {
+        let encoded = serde_json::to_vec(self)
+            .expect("serializing a typed backend parity population cannot fail");
+        format!("{:x}", Sha256::digest(encoded))
+    }
+}
+
+fn backend_parity_populations(derived: &Derived) -> Vec<BackendParityPopulation> {
+    let candidate_backends = derived
+        .population
+        .iter()
+        .filter(|id| id.mode == "verify" && !matches!(id.backend.as_str(), "ptrace" | "native"))
+        .map(|id| id.backend.clone())
+        .collect::<BTreeSet<_>>();
+    let references = derived
+        .green
+        .iter()
+        .filter(|id| id.mode == "verify" && id.backend == "ptrace")
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    candidate_backends
+        .into_iter()
+        .map(|backend| {
+            let mut eligible_cells = BTreeSet::new();
+            let mut excluded_references = Vec::new();
+            for reference in &references {
+                let mut candidate = reference.clone();
+                candidate.backend.clone_from(&backend);
+                if derived.enabled.contains(&candidate) {
+                    eligible_cells.insert(candidate);
+                } else {
+                    let reason = derived
+                        .not_applicable_reasons
+                        .get(&candidate)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            format!(
+                                "the manifest has no {backend} candidate cell for this ptrace-Green verify cell"
+                            )
+                        });
+                    excluded_references.push(BackendParityExclusion {
+                        reference: reference.clone(),
+                        reason,
+                    });
+                }
+            }
+            BackendParityPopulation {
+                schema: BACKEND_PARITY_POPULATION_SCHEMA,
+                backend,
+                eligible_cells,
+                excluded_references,
+            }
+        })
+        .collect()
+}
+
+/// Private scoring input used while the producer-owned wire type is being
+/// introduced in detcore-model. The eventual adapter must validate retained
+/// log roles, hashes, and CellId binding before constructing one of these.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PartialCreditResult {
+    Matched {
+        selected_equal_info_prefix: u64,
+        ptrace_selected_info_total: u64,
+    },
+    Diverged {
+        selected_equal_info_prefix: u64,
+        ptrace_selected_info_total: u64,
+    },
+    NoResult {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PartialCreditEventOrder {
+    emitted_at: String,
+    run_id: String,
+    run_index: u64,
+    attempt: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PartialCreditEvent {
+    event_id: String,
+    cell: CellId,
+    order: PartialCreditEventOrder,
+    result: PartialCreditResult,
+}
+
+/// Incremental current value per CellId. Replaying an identical event is a
+/// no-op; a newer event replaces the contribution; an older event cannot roll
+/// it back. Equal ordering with different evidence refuses instead of choosing
+/// by input order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CurrentPartialCredit {
+    events: BTreeMap<String, PartialCreditEvent>,
+    current: BTreeMap<CellId, String>,
+}
+
+impl CurrentPartialCredit {
+    fn record(&mut self, event: PartialCreditEvent) -> Result<bool, String> {
+        if event.event_id.trim().is_empty() {
+            return Err("partial-credit event_id must be nonempty".into());
+        }
+        if event.order.emitted_at.trim().is_empty() || event.order.run_id.trim().is_empty() {
+            return Err("partial-credit event order must name emitted_at and run_id".into());
+        }
+        if event.order.attempt == 0 {
+            return Err("partial-credit event attempt must be positive".into());
+        }
+        if let Some(previous) = self.events.get(&event.event_id) {
+            if previous == &event {
+                return Ok(false);
+            }
+            return Err(format!(
+                "partial-credit event_id {:?} was replayed with different evidence",
+                event.event_id
+            ));
+        }
+
+        let replace = match self.current.get(&event.cell) {
+            None => true,
+            Some(current_id) => {
+                let current = self
+                    .events
+                    .get(current_id)
+                    .expect("current partial-credit event must exist");
+                match event.order.cmp(&current.order) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Less => false,
+                    std::cmp::Ordering::Equal => {
+                        return Err(format!(
+                            "{} has two different partial-credit events with the same order",
+                            display_id(&event.cell)
+                        ));
+                    }
+                }
+            }
+        };
+        let event_id = event.event_id.clone();
+        let cell = event.cell.clone();
+        self.events.insert(event_id.clone(), event);
+        if replace {
+            self.current.insert(cell, event_id);
+        }
+        Ok(replace)
+    }
+
+    fn get(&self, cell: &CellId) -> Option<&PartialCreditEvent> {
+        self.current
+            .get(cell)
+            .and_then(|event_id| self.events.get(event_id))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct BackendParityScore {
+    fully_passing_cells: usize,
+    diverged_cells: usize,
+    partial_credit: f64,
+    denominator: usize,
+    no_result: usize,
+    no_result_reasons: BTreeMap<String, usize>,
+}
+
+fn record_parity_no_result(score: &mut BackendParityScore, reason: &str) {
+    score.no_result += 1;
+    *score
+        .no_result_reasons
+        .entry(reason.to_string())
+        .or_default() += 1;
+}
+
+fn backend_parity_score(
+    population: &BackendParityPopulation,
+    current: &CurrentPartialCredit,
+) -> BackendParityScore {
+    let mut score = BackendParityScore {
+        fully_passing_cells: 0,
+        diverged_cells: 0,
+        partial_credit: 0.0,
+        denominator: population.denominator(),
+        no_result: 0,
+        no_result_reasons: BTreeMap::new(),
+    };
+    for cell in &population.eligible_cells {
+        let Some(event) = current.get(cell) else {
+            record_parity_no_result(&mut score, NO_CURRENT_PARITY_RESULT);
+            continue;
+        };
+        match &event.result {
+            PartialCreditResult::Matched {
+                selected_equal_info_prefix,
+                ptrace_selected_info_total,
+            } if *ptrace_selected_info_total > 0
+                && selected_equal_info_prefix == ptrace_selected_info_total =>
+            {
+                score.fully_passing_cells += 1;
+            }
+            PartialCreditResult::Diverged {
+                selected_equal_info_prefix,
+                ptrace_selected_info_total,
+            } if *ptrace_selected_info_total > 0
+                && selected_equal_info_prefix <= ptrace_selected_info_total =>
+            {
+                score.diverged_cells += 1;
+                score.partial_credit +=
+                    *selected_equal_info_prefix as f64 / *ptrace_selected_info_total as f64;
+            }
+            PartialCreditResult::NoResult { reason } if !reason.trim().is_empty() => {
+                record_parity_no_result(&mut score, reason);
+            }
+            PartialCreditResult::Matched { .. } => {
+                record_parity_no_result(
+                    &mut score,
+                    "matched parity evidence has invalid selected canonical INFO bounds",
+                );
+            }
+            PartialCreditResult::Diverged { .. } => {
+                record_parity_no_result(
+                    &mut score,
+                    "diverged parity evidence has invalid selected canonical INFO bounds",
+                );
+            }
+            PartialCreditResult::NoResult { .. } => {
+                record_parity_no_result(&mut score, "no_result parity evidence has no reason");
+            }
+        }
+    }
+    score
+}
+
+fn format_fractional_cells(value: f64) -> String {
+    let mut rendered = format!("{value:.12}");
+    while rendered.contains('.') && rendered.ends_with('0') {
+        rendered.pop();
+    }
+    if rendered.ends_with('.') {
+        rendered.push('0');
+    }
+    rendered
+}
+
+fn render_backend_parity_account(
+    populations: &[BackendParityPopulation],
+    current: &CurrentPartialCredit,
+) -> String {
+    let mut out = String::from(
+        "\n## Backend-to-ptrace parity and partial credit\n\n\
+The score unit is selected canonical INFO records. `P` is the integer number of current canonical \
+backend-to-ptrace matches. `F` is the sum of `selected equal INFO prefix / ptrace selected INFO \
+total` only for current nonpassing parity cells. A divergence may contribute 1.0 to `F` when the \
+ptrace log is a strict prefix, but it never increments `P`. Missing or unusable evidence is \
+`no_result`, remains inside `D`, and contributes zero. `F` and the percentage are displayed to at \
+most twelve decimal places; the source counts remain exact.\n\n\
+| Backend | Fully passing cells `P` | Nonpassing cells contributing to `F` | Partial credit `F` | `P + F` / eligible cells `D` | Percentage | `no_result` |\n\
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+    );
+    let mut scores = Vec::new();
+    for population in populations {
+        let score = backend_parity_score(population, current);
+        let combined = score.fully_passing_cells as f64 + score.partial_credit;
+        let percentage = if score.denominator == 0 {
+            "—".to_string()
+        } else {
+            format!(
+                "{}%",
+                format_fractional_cells(100.0 * combined / score.denominator as f64)
+            )
+        };
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} | {} / {} | {} | {} |\n",
+            population.backend,
+            score.fully_passing_cells,
+            score.diverged_cells,
+            format_fractional_cells(score.partial_credit),
+            format_fractional_cells(combined),
+            score.denominator,
+            percentage,
+            score.no_result,
+        ));
+        scores.push((population, score));
+    }
+
+    out.push_str("\nEach denominator is bound to the complete typed population, including exclusions:\n\n");
+    for (population, _) in &scores {
+        out.push_str(&format!(
+            "- `{}`: schema `{}`, SHA-256 `{}`, `D={}`, excluded ptrace references={}\n",
+            population.backend,
+            population.schema,
+            population.sha256(),
+            population.denominator(),
+            population.excluded_references.len(),
+        ));
+        for exclusion in &population.excluded_references {
+            out.push_str(&format!(
+                "  - `{}`: {}\n",
+                display_id(&exclusion.reference),
+                exclusion.reason
+            ));
+        }
+    }
+
+    out.push_str("\n`no_result` reasons (counts are cells in `D`):\n\n");
+    for (population, score) in scores {
+        if score.no_result_reasons.is_empty() {
+            out.push_str(&format!("- `{}`: none\n", population.backend));
+            continue;
+        }
+        for (reason, count) in score.no_result_reasons {
+            out.push_str(&format!(
+                "- `{}`: {} — {} cell(s)\n",
+                population.backend, reason, count
+            ));
+        }
+    }
+    out
+}
+
 fn retained_import_cells(derived: &Derived) -> BTreeSet<CellId> {
     derived.enabled.clone()
 }
@@ -7185,6 +7538,324 @@ fn recorded_shell_quote(value: &str) -> String {
 }
 
 fn self_test() -> Result<(), String> {
+    let parity_cell = |test: &str, backend: &str| CellId {
+        lane: "portable".into(),
+        category: "fixture".into(),
+        test: format!("fixture/{test}"),
+        mode: "verify".into(),
+        backend: backend.into(),
+    };
+    let ptrace_references = (1..=6)
+        .map(|index| parity_cell(&format!("parity-{index}"), "ptrace"))
+        .collect::<BTreeSet<_>>();
+    let kvm_candidates = (1..=6)
+        .map(|index| parity_cell(&format!("parity-{index}"), "kvm"))
+        .collect::<BTreeSet<_>>();
+    let kvm_applicable = (1..=5)
+        .map(|index| parity_cell(&format!("parity-{index}"), "kvm"))
+        .collect::<BTreeSet<_>>();
+    let kvm_not_applicable = parity_cell("parity-6", "kvm");
+    let dbt_candidate = parity_cell("parity-1", "dbt");
+    let ptrace_not_green = parity_cell("ptrace-not-green", "ptrace");
+    let kvm_without_green_reference = parity_cell("ptrace-not-green", "kvm");
+    let kvm_without_ptrace_coordinate = parity_cell("candidate-only", "kvm");
+    let mut parity_population_cells = ptrace_references.clone();
+    parity_population_cells.extend(kvm_candidates.iter().cloned());
+    parity_population_cells.insert(dbt_candidate.clone());
+    parity_population_cells.insert(ptrace_not_green);
+    parity_population_cells.insert(kvm_without_green_reference);
+    parity_population_cells.insert(kvm_without_ptrace_coordinate);
+    let mut parity_derived = Derived {
+        population: parity_population_cells,
+        enabled: ptrace_references
+            .iter()
+            .cloned()
+            .chain(kvm_applicable.iter().cloned())
+            .chain(std::iter::once(dbt_candidate.clone()))
+            .collect(),
+        ci_disabled_reasons: BTreeMap::new(),
+        not_applicable_reasons: BTreeMap::from([(
+            kvm_not_applicable,
+            "KVM is not applicable to this fixture".into(),
+        )]),
+        selected: ptrace_references.clone(),
+        green: ptrace_references,
+        selected_custom: BTreeSet::new(),
+    };
+    let populations = backend_parity_populations(&parity_derived);
+    let kvm_population = populations
+        .iter()
+        .find(|population| population.backend == "kvm")
+        .ok_or("partial-credit population omitted kvm")?;
+    let dbt_population = populations
+        .iter()
+        .find(|population| population.backend == "dbt")
+        .ok_or("partial-credit population omitted dbt")?;
+    if kvm_population.denominator() != 5
+        || kvm_population.excluded_references.len() != 1
+        || kvm_population.excluded_references[0].reference
+            != parity_cell("parity-6", "ptrace")
+        || kvm_population.excluded_references[0].reason
+            != "KVM is not applicable to this fixture"
+        || dbt_population.denominator() != 1
+        || dbt_population.excluded_references.len() != 5
+        || kvm_population.sha256().len() != 64
+        || kvm_population.sha256() != kvm_population.clone().sha256()
+    {
+        return Err(format!(
+            "typed ptrace-Green populations did not retain their fixed denominator/exclusions: kvm={kvm_population:?} dbt={dbt_population:?}"
+        ));
+    }
+    let fixed_kvm_population_id = kvm_population.sha256();
+    // Green/Red status and current selection do not move D. Applicability is
+    // already fixed by `enabled` above.
+    parity_derived
+        .green
+        .extend(kvm_applicable.iter().cloned());
+    parity_derived
+        .selected
+        .extend(kvm_applicable.iter().cloned());
+    let status_changed_kvm_population = backend_parity_populations(&parity_derived)
+        .into_iter()
+        .find(|population| population.backend == "kvm")
+        .ok_or("candidate status change removed the kvm parity population")?;
+    if status_changed_kvm_population.denominator() != 5
+        || status_changed_kvm_population.sha256() != fixed_kvm_population_id
+    {
+        return Err(
+            "candidate selection/status changed the fixed ptrace-Green denominator or identity"
+                .into(),
+        );
+    }
+
+    let event = |event_id: &str,
+                 cell: CellId,
+                 emitted_at: &str,
+                 run_index: u64,
+                 result: PartialCreditResult| PartialCreditEvent {
+        event_id: event_id.into(),
+        cell,
+        order: PartialCreditEventOrder {
+            emitted_at: emitted_at.into(),
+            run_id: "fixture-parity-run".into(),
+            run_index,
+            attempt: 1,
+        },
+        result,
+    };
+    let mut current = CurrentPartialCredit::default();
+    let matched = event(
+        "parity-match",
+        parity_cell("parity-1", "kvm"),
+        "2026-09-04T20:00:00Z",
+        1,
+        PartialCreditResult::Matched {
+            selected_equal_info_prefix: 10,
+            ptrace_selected_info_total: 10,
+        },
+    );
+    if !current.record(matched.clone())? || current.record(matched)? {
+        return Err("replaying one partial-credit event was not idempotent".into());
+    }
+    current.record(event(
+        "parity-quarter",
+        parity_cell("parity-2", "kvm"),
+        "2026-09-04T20:00:01Z",
+        1,
+        PartialCreditResult::Diverged {
+            selected_equal_info_prefix: 1,
+            ptrace_selected_info_total: 4,
+        },
+    ))?;
+    current.record(event(
+        "parity-strict-prefix",
+        parity_cell("parity-3", "kvm"),
+        "2026-09-04T20:00:02Z",
+        1,
+        PartialCreditResult::Diverged {
+            selected_equal_info_prefix: 4,
+            ptrace_selected_info_total: 4,
+        },
+    ))?;
+    current.record(event(
+        "parity-no-result",
+        parity_cell("parity-4", "kvm"),
+        "2026-09-04T20:00:03Z",
+        1,
+        PartialCreditResult::NoResult {
+            reason: "retained-log content SHA-256 does not match".into(),
+        },
+    ))?;
+    let score = backend_parity_score(kvm_population, &current);
+    if score.fully_passing_cells != 1
+        || score.diverged_cells != 2
+        || score.partial_credit != 1.25
+        || score.denominator != 5
+        || score.no_result != 2
+        || score.no_result_reasons.get(NO_CURRENT_PARITY_RESULT) != Some(&1)
+        || score
+            .no_result_reasons
+            .get("retained-log content SHA-256 does not match")
+            != Some(&1)
+    {
+        return Err(format!(
+            "partial-credit aggregate folded pass, divergence, strict-prefix, or no_result incorrectly: {score:?}"
+        ));
+    }
+    let rendered = render_backend_parity_account(&[kvm_population.clone()], &current);
+    if !rendered.contains("| `kvm` | 1 | 2 | 1.25 | 2.25 / 5 | 45.0% | 2 |")
+        || !rendered.contains("retained-log content SHA-256 does not match — 1 cell(s)")
+        || !rendered.contains(&format!("SHA-256 `{}`", kvm_population.sha256()))
+    {
+        return Err(format!(
+            "partial-credit human report did not expose P, F, P+F/D, percentage, population identity, and no_result reasons:\n{rendered}"
+        ));
+    }
+    if format_fractional_cells(1.0 / 20_000_000.0) == "0.0" {
+        return Err(
+            "partial-credit rendering rounded a one-record advance in a bounded log back to zero"
+                .into(),
+        );
+    }
+
+    let replacement_cell = parity_cell("parity-2", "kvm");
+    let newer = event(
+        "parity-quarter-newer",
+        replacement_cell.clone(),
+        "2026-09-04T20:01:00Z",
+        2,
+        PartialCreditResult::Matched {
+            selected_equal_info_prefix: 4,
+            ptrace_selected_info_total: 4,
+        },
+    );
+    if !current.record(newer.clone())? {
+        return Err("a newer partial-credit event did not replace the CellId value".into());
+    }
+    let replacement_score = backend_parity_score(kvm_population, &current);
+    if replacement_score.fully_passing_cells != 2
+        || replacement_score.diverged_cells != 1
+        || replacement_score.partial_credit != 1.0
+        || replacement_score.denominator != 5
+        || replacement_score.no_result != 2
+    {
+        return Err(format!(
+            "a newer event did not replace exactly one CellId contribution: {replacement_score:?}"
+        ));
+    }
+    let older = event(
+        "parity-quarter-older",
+        replacement_cell.clone(),
+        "2026-09-04T19:59:00Z",
+        9,
+        PartialCreditResult::NoResult {
+            reason: "older evidence".into(),
+        },
+    );
+    if current.record(older)? || current.get(&replacement_cell) != Some(&newer) {
+        return Err("an older partial-credit event rolled back the current CellId value".into());
+    }
+    let mut changed_replay = newer.clone();
+    changed_replay.result = PartialCreditResult::NoResult {
+        reason: "changed replay".into(),
+    };
+    if !current
+        .record(changed_replay)
+        .expect_err("a changed replay of one event_id was accepted")
+        .contains("replayed with different evidence")
+    {
+        return Err("changed partial-credit replay lost its exact refusal".into());
+    }
+    let same_order = event(
+        "parity-quarter-same-order",
+        replacement_cell,
+        "2026-09-04T20:01:00Z",
+        2,
+        PartialCreditResult::Matched {
+            selected_equal_info_prefix: 4,
+            ptrace_selected_info_total: 4,
+        },
+    );
+    if !current
+        .record(same_order)
+        .expect_err("ambiguous same-order partial-credit events were accepted")
+        .contains("same order")
+    {
+        return Err("same-order partial-credit refusal lost its exact reason".into());
+    }
+
+    let invalid_population = BackendParityPopulation {
+        schema: BACKEND_PARITY_POPULATION_SCHEMA,
+        backend: "kvm".into(),
+        eligible_cells: BTreeSet::from([
+            parity_cell("invalid-match", "kvm"),
+            parity_cell("invalid-divergence", "kvm"),
+            parity_cell("zero-total", "kvm"),
+            parity_cell("missing-reason", "kvm"),
+        ]),
+        excluded_references: Vec::new(),
+    };
+    let mut invalid = CurrentPartialCredit::default();
+    invalid.record(event(
+        "invalid-match",
+        parity_cell("invalid-match", "kvm"),
+        "2026-09-04T20:02:00Z",
+        1,
+        PartialCreditResult::Matched {
+            selected_equal_info_prefix: 3,
+            ptrace_selected_info_total: 4,
+        },
+    ))?;
+    invalid.record(event(
+        "invalid-divergence",
+        parity_cell("invalid-divergence", "kvm"),
+        "2026-09-04T20:02:01Z",
+        1,
+        PartialCreditResult::Diverged {
+            selected_equal_info_prefix: 5,
+            ptrace_selected_info_total: 4,
+        },
+    ))?;
+    invalid.record(event(
+        "zero-total",
+        parity_cell("zero-total", "kvm"),
+        "2026-09-04T20:02:02Z",
+        1,
+        PartialCreditResult::Diverged {
+            selected_equal_info_prefix: 0,
+            ptrace_selected_info_total: 0,
+        },
+    ))?;
+    invalid.record(event(
+        "missing-reason",
+        parity_cell("missing-reason", "kvm"),
+        "2026-09-04T20:02:03Z",
+        1,
+        PartialCreditResult::NoResult {
+            reason: String::new(),
+        },
+    ))?;
+    let invalid_score = backend_parity_score(&invalid_population, &invalid);
+    if invalid_score.fully_passing_cells != 0
+        || invalid_score.diverged_cells != 0
+        || invalid_score.partial_credit != 0.0
+        || invalid_score.denominator != 4
+        || invalid_score.no_result != 4
+        || invalid_score.no_result_reasons.len() != 3
+        || invalid_score
+            .no_result_reasons
+            .get("diverged parity evidence has invalid selected canonical INFO bounds")
+            != Some(&2)
+        || invalid_score
+            .no_result_reasons
+            .get("no_result parity evidence has no reason")
+            != Some(&1)
+    {
+        return Err(format!(
+            "invalid selected canonical INFO bounds produced credit instead of no_result: {invalid_score:?}"
+        ));
+    }
+
     for error_kind in [
         "incomplete-verification-evidence",
         "cpu-timeout",
