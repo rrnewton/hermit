@@ -166,9 +166,6 @@ const INTEGRATION_ARTIFACT_WRAPPER: &str =
 /// placeholder tag. The committed DAG contains the real `compat.*` population;
 /// this name is never a node and never triggers runtime graph generation.
 const STRICT_COMPAT_SELECTION_ALIAS: &str = "test.strict_compat";
-const REQUALIFICATION_PLACEHOLDER_TAG: &str = "requalify.cell";
-const REQUALIFICATION_RESULT_ROOT_PLACEHOLDER: &str = "validate-requalification-results";
-const REQUALIFICATION_RUN_ID_PLACEHOLDER: &str = "validate-requalification-run-id";
 const QUICK_E2E_VERIFY_TIMEOUT_S: i64 = 1800;
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
@@ -177,17 +174,14 @@ const HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND: &str = "CARGO_BUILD_JOBS=8 cargo 
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"if [ ! -s target/ci/tests-misc.path ]; then printf 'privileged build: Cargo-reported tests_misc path is missing\n' >&2; exit 1; fi; mapfile -t tests_misc_paths < target/ci/tests-misc.path; if ((${#tests_misc_paths[@]} != 1)); then printf 'privileged build: Cargo-reported tests_misc path must contain exactly one line, found %d\n' "${#tests_misc_paths[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_paths[0]}"; case "$tests_misc" in "$PWD"/target/*) ;; *) printf 'privileged build: Cargo-reported tests_misc path is outside this target directory: %s\n' "$tests_misc" >&2; exit 1 ;; esac; case "${tests_misc##*/}" in tests_misc-*) ;; *) printf 'privileged build: Cargo-reported path does not name tests_misc: %s\n' "$tests_misc" >&2; exit 1 ;; esac; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi"#;
 
 fn hermit_integration_uses_published_artifact(step: &Step) -> bool {
-    step.cmd.starts_with(INTEGRATION_ARTIFACT_WRAPPER)
+    step
+        .cmd
+        .strip_prefix(RUST_SCRIPT_COMMAND_PREFIX)
+        .is_some_and(|command| command.starts_with(INTEGRATION_ARTIFACT_WRAPPER))
         && step
             .deps
             .iter()
             .any(|dependency| dependency == "build.e2e_artifact")
-}
-
-fn fused_privileged_test_build_command() -> String {
-    format!(
-        "./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; {DETCORE_MISC_TEST_PREBUILD_COMMAND}; {HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND} || exit 1; {TESTS_MISC_EXECUTABLE_READ_COMMAND}"
-    )
 }
 
 const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
@@ -432,7 +426,7 @@ fn usage() -> &'static str {
      \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
      \x20 --portable-only               No PMU/CPUID hardware required.\n\
      \x20 --privileged-only             PMU/CPUID-dependent tests only.\n\
-     \x20 --requalify-cell TEST MODE BACKEND  Run one selected cell for schema-7 requalification.\n\
+     \x20 --requalify-cell TEST MODE BACKEND  Run the committed DAG step owning that exact cell.\n\
      \x20 --only <lane> <group.job>[,...]  Run those lane node(s) with their own\n\
      \x20                  declared caps; outside deps are dropped; preflight tags\n\
      \x20                  reuse validate's canonical preflight nodes.\n\
@@ -465,16 +459,15 @@ fn usage() -> &'static str {
      \x20                  systemd-scope backstop. Env: HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS.\n\
      \x20 -k, --keep-going Do not eager-exit on the first failure.\n\
      \x20 --allow-cgroup-failure  Downgrade to an UNBOXED run instead of failing closed.\n\
-     \x20 --merge-lanes    Fuse the portable and privileged lanes (the full default).\n\
-     \x20 --sequential-lanes  Diagnostic fallback: run full lanes back to back.\n\
+     \x20 --merge-lanes    Compatibility spelling for the committed full label.\n\
      \x20 --show-plan      Print the outer boxed DAG nodes, caps, and dependencies and exit.\n\
      \x20                  It does not enumerate Rust test IDs or E2E cells.\n\
-     \x20 --show-plan-json Print the constructed plan before environment wrapping as JSON.\n\
+     \x20 --show-plan-json Print the selected committed plan as JSON.\n\
      \x20 --write-constructed-dag FILE\n\
-     \x20                  Write one complete constructed DagConfig JSON for ci/run-dag.sh.\n\
+     \x20                  Write the selected committed DagConfig JSON for ci/run-dag.sh.\n\
      \x20 --write-generated-plan FILE\n\
      \x20                  Generator-only: write corpus-derived compat/stress nodes.\n\
-     \x20 --selected <group.job>[,...]  Keep these steps from the constructed plan.\n\
+     \x20 --selected <group.job>[,...]  Select these IDs from the committed profile.\n\
      \x20 --ignore-selected-deps       Omit predecessors supplied by an external harness.\n\
      \x20 --self-test      Run inert policy/data brackets plus one bounded disposable\n\
      \x20                  nested-cgroup check, then exit.\n\
@@ -1442,7 +1435,6 @@ fn self_test() -> Result<(), String> {
     println!("  {}", committed_validation_execution_bracket(&repo_root())?);
     println!("  {}", raw_run_dag_strict_compat_bracket(&repo_root())?);
     shard_coverage_resource_policy_bracket(&repo_root())?;
-    println!("  {}", structured_result_declaration_bracket()?);
     println!(
         "  {}",
         submodule_failure_service_result_bracket(&repo_root())?
@@ -2572,7 +2564,7 @@ fn self_test() -> Result<(), String> {
             base.default_jobs_env =
                 format!("VALIDATE_CARRY_{}_JOBS", lane.to_ascii_uppercase());
             // POSITIVE: a real lane's own config must carry, and must be grantable.
-            let steps = validate_plan::lane_nodes(&root, lane, "", "gate.manifest")?;
+            let steps = base.steps.clone();
             let carried = validate_plan::config_from_base(&base, steps, "bracket");
             validate_plan::assert_config_carried(&base, &carried)
                 .map_err(|e| format!("carry bracket: lane {lane} did not carry its config: {e}"))?;
@@ -2608,11 +2600,17 @@ fn self_test() -> Result<(), String> {
                 }
             }
             let mut cleared_cap_starvation = 0;
-            if !base.resource_caps.is_empty() {
+            let demanded_resources = base
+                .steps
+                .iter()
+                .flat_map(|step| step.hint.resources.keys())
+                .collect::<BTreeSet<_>>();
+            if !demanded_resources.is_empty() {
                 // NEGATIVE: drop declared caps exactly as the historical bug did
                 // -> every remaining demand must be REFUSED and named rather
-                // than sleeping forever. A lane with neither caps nor demands
-                // is valid and has no negative cap-removal case to construct.
+                // than sleeping forever. A selected label may retain global
+                // caps that none of its own nodes demand; that is valid and has
+                // no negative cap-removal case to construct.
                 let mut stripped = carried.clone();
                 stripped.resource_caps.clear();
                 let starved = validate_plan::ungrantable_resources(&stripped);
@@ -2645,10 +2643,9 @@ cleared-caps refusal names {} starved step(s)",
                      base.resource_caps.len(), base.default_step_timeout, cleared_cap_starvation);
         }
     }
-    // The full hot path is one fused DAG and pays the exact-tree manifest audit
-    // once. Bracket the positive shape and both diagnostic escape hatches: a
-    // sequential plan still exists, while the nested audit reuse is accepted
-    // only for the no-label portable-strict payload.
+    // The full hot path selects the committed full-labelled graph and pays the
+    // exact-tree manifest audit once. Bracket that immutable scheduler input
+    // and the explicit refusal of the removed sequential-lanes spelling.
     {
         let root = repo_root();
         let tmp = std::env::temp_dir().join(format!("validate-plan-selftest-{}", std::process::id()));
@@ -2728,12 +2725,16 @@ cleared-caps refusal names {} starved step(s)",
             .iter()
             .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
             .ok_or("full-plan bracket: manifest-plan producer disappeared")?;
-        if manifest_producer.cmd != validate_plan::MANIFEST_PLAN_BUILD_COMMAND
-            || manifest_producer.deps != [PIN_GATE_TAG.to_string()]
+        if manifest_producer.cmd
+            != format!(
+                "{RUST_SCRIPT_COMMAND_PREFIX}{}",
+                validate_plan::MANIFEST_PLAN_BUILD_COMMAND
+            )
+            || manifest_producer.deps != [RUST_SCRIPT_PRODUCER_TAG.to_string()]
             || manifest_producer.deps.iter().any(|dependency| dependency == "gate.manifest")
         {
             return Err(format!(
-                "full-plan bracket: manifest-plan producer is not directly after the pin gate: cmd={} deps={:?}",
+                "full-plan bracket: committed manifest-plan producer is not directly after the rust-script producer: cmd={} deps={:?}",
                 manifest_producer.cmd, manifest_producer.deps
             ));
         }
@@ -2832,11 +2833,14 @@ cleared-caps refusal names {} starved step(s)",
             ));
         }
         let mut missing_wrapper = integration.clone();
-        missing_wrapper.cmd = missing_wrapper
+        let after_rust_script_prefix = missing_wrapper
             .cmd
+            .strip_prefix(RUST_SCRIPT_COMMAND_PREFIX)
+            .ok_or("full-plan bracket: integration node lost its rust-script prefix")?;
+        let without_wrapper = after_rust_script_prefix
             .strip_prefix(INTEGRATION_ARTIFACT_WRAPPER)
-            .ok_or("full-plan bracket: cannot plant missing integration artifact wrapper")?
-            .to_owned();
+            .ok_or("full-plan bracket: cannot plant missing integration artifact wrapper")?;
+        missing_wrapper.cmd = format!("{RUST_SCRIPT_COMMAND_PREFIX}{without_wrapper}");
         if hermit_integration_uses_published_artifact(&missing_wrapper) {
             return Err(
                 "full-plan bracket: removing the integration artifact wrapper was accepted"
@@ -2870,7 +2874,7 @@ cleared-caps refusal names {} starved step(s)",
             .cfg
             .steps
             .iter()
-            .find(|step| step.tag() == "scorecard.compatibility")
+            .find(|step| step.tag() == "full-scorecard.compatibility")
             .ok_or("full-plan bracket: compatibility scorecard disappeared")?
             .deps
             .iter()
@@ -3038,17 +3042,15 @@ cleared-caps refusal names {} starved step(s)",
         {
             return Err("full-plan bracket: missing shared-test resource demand/cap was accepted".into());
         }
-        let mut selected = Plan {
-            cfg: full.cfg.clone(),
-            profile: "full".into(),
-            ..Default::default()
-        };
-        select_constructed_steps(
-            &mut selected,
-            "privileged-test.cli_kvm,privileged-test.pmu_buck_chaos_cases",
+        let selected = dagrun::select_steps_by_tags(
+            &full.cfg,
+            &[
+                "privileged-test.cli_kvm".into(),
+                "privileged-test.pmu_buck_chaos_cases".into(),
+            ],
             false,
         )?;
-        let tags: BTreeSet<String> = selected.cfg.steps.iter().map(Step::tag).collect();
+        let tags: BTreeSet<String> = selected.steps.iter().map(Step::tag).collect();
         if ["test.cli", "test.hermit_modes"].iter().any(|tag| tags.contains(*tag)) {
             return Err(format!(
                 "full-plan bracket: selected privileged tests acquired a portable-test dependency: {tags:?}"
@@ -3157,6 +3159,14 @@ cleared-caps refusal names {} starved step(s)",
             full.cfg.steps.len()
         );
     }
+
+    // This bracket clones the committed tree and therefore must exercise the
+    // recorded submodule API rather than any locally materialized dependency.
+    // Keep it last so all Hermit-only policy brackets report independently.
+    println!(
+        "  {}",
+        submodule_failure_service_result_bracket(&repo_root())?
+    );
 
     Ok(())
 }
@@ -3724,530 +3734,240 @@ fn checkout_attribution_bracket() -> Result<(), String> {
 /// itself rather than a fixture, because a fixture would not notice the lane
 /// file changing shape underneath the selector.
 fn selective_subset_bracket(root: &Path) -> Result<(), String> {
-    let all = validate_plan::lane_nodes(root, "portable", "", "gate.manifest")?;
-    let all_tags: BTreeSet<String> = all.iter().map(|s| s.tag()).collect();
-    // Pick a node that has at least one intra-lane dependency, plus that
-    // dependency, so the "keep both" and "prune the rest" behaviours are both
-    // exercised on real data.
-    let (child, parent) = all
-        .iter()
-        .find_map(|s| {
-            s.deps.iter().find(|d| all_tags.contains(*d)).map(|d| (s.tag(), d.clone()))
-        })
-        .ok_or("selective bracket: portable label has no intra-lane dependency to test")?;
-    let keep: BTreeSet<String> = [child.clone(), parent.clone()].into_iter().collect();
-    let sel = validate_plan::select_lane_nodes(all.clone(), &keep);
-    // Positive: exactly the two named nodes survive, the kept edge survives, and
-    // the manifest-gate edge (outside the lane) is NOT pruned.
-    if sel.steps.len() != 2 {
-        return Err(format!("selective bracket: kept {} node(s), expected 2", sel.steps.len()));
-    }
-    let kept_child = sel
+    let source_path = validate_plan::validation_dag_path(root);
+    let source_before = std::fs::read(&source_path)
+        .map_err(|error| format!("selective bracket: cannot read source DAG: {error}"))?;
+    let committed = validate_plan::validation_config(root)?;
+    let portable = dagrun::select_steps_by_labels(&committed, &["portable".into()])?;
+    let all_tags: BTreeSet<String> = portable.steps.iter().map(Step::tag).collect();
+    let (child, parent) = portable
         .steps
-        .iter()
-        .find(|s| s.tag() == child)
-        .ok_or("selective bracket: the selected child node was dropped")?;
-    if !kept_child.deps.contains(&parent) {
-        return Err("selective bracket: a dependency inside the selected set must survive".into());
-    }
-    if sel.unknown_tags != Vec::<String>::new() {
-        return Err(format!("selective bracket: unexpected unknown tags {:?}", sel.unknown_tags));
-    }
-    let root_node = sel.steps.iter().find(|s| s.tag() == parent).unwrap();
-    if !root_node.deps.iter().all(|d| !all_tags.contains(d)) {
-        return Err("selective bracket: an unselected lane dependency was left dangling".into());
-    }
-    // Negative: a tag the lane does not contain must be REPORTED, because that
-    // means the selector and the DAG disagree and the subset is untrustworthy.
-    let bogus: BTreeSet<String> =
-        [parent.clone(), "no.such_node".to_string()].into_iter().collect();
-    let sel2 = validate_plan::select_lane_nodes(all, &bogus);
-    if sel2.unknown_tags != vec!["no.such_node".to_string()] {
-        return Err(format!(
-            "selective bracket: an unknown tag MUST be reported; got {:?}",
-            sel2.unknown_tags
-        ));
-    }
-
-    // Exercise the real selector, not a hand-written keep set. A flaky-tests
-    // change reaches the chaos manifest cell through e2e.metadata and the
-    // shipped setup.manifest_plan producer. The producer is valid selector
-    // vocabulary even though plan composition satisfies it from preflight.
-    let selector = Command::new(root.join("ci").join("select-tests.rs"))
-        .args(["--files", "flaky-tests/Cargo.toml", "--format", "json"])
-        .output()
-        .map_err(|error| format!("selective bracket: cannot run real selector: {error}"))?;
-    if !selector.status.success() {
-        return Err(format!(
-            "selective bracket: real selector failed: {}",
-            String::from_utf8_lossy(&selector.stderr)
-        ));
-    }
-    let selected_json: serde_json::Value = serde_json::from_slice(&selector.stdout)
-        .map_err(|error| format!("selective bracket: real selector emitted invalid JSON: {error}"))?;
-    let selected: BTreeSet<String> = selected_json["nodes"]
-        .as_array()
-        .ok_or("selective bracket: real selector JSON has no nodes array")?
-        .iter()
-        .filter_map(|node| node.as_str().map(str::to_string))
-        .collect();
-    for required in [
-        validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
-        "e2e.metadata",
-        "e2e.manifest_chaos_c",
-    ] {
-        if !selected.contains(required) {
-            return Err(format!(
-                "selective bracket: flaky-tests/Cargo.toml did not select required node {required}: {selected:?}"
-            ));
-        }
-    }
-    let raw = validate_plan::lane_nodes(root, "portable", "", "gate.manifest")?;
-    let mut real = validate_plan::select_lane_nodes(raw, &selected);
-    if !real.unknown_tags.is_empty() {
-        return Err(format!(
-            "selective bracket: real selector named unknown shipped tags before producer reuse: {:?}",
-            real.unknown_tags
-        ));
-    }
-    if !validate_plan::reuse_preflight_manifest_producer(
-        &mut real.steps,
-        "real selective result",
-    )? {
-        return Err(
-            "selective bracket: real selector omitted its manifest-plan producer dependency"
-                .into(),
-        );
-    }
-    if real
-        .steps
-        .iter()
-        .any(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
-    {
-        return Err("selective bracket: lane retained a duplicate manifest-plan producer".into());
-    }
-    let metadata = real
-        .steps
-        .iter()
-        .find(|step| step.tag() == "e2e.metadata")
-        .ok_or("selective bracket: real selector lost e2e.metadata")?;
-    if !metadata
-        .deps
-        .iter()
-        .any(|dependency| dependency == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
-    {
-        return Err(
-            "selective bracket: e2e.metadata was not bound to the preflight manifest producer"
-            .into(),
-        );
-    }
-
-    // Exercise the same SelectDecision::Full branch used when no trustworthy
-    // baseline exists. The complete shipped lane must also reuse preflight's
-    // producer; otherwise composition creates two setup.manifest_plan nodes and
-    // the lane copy still points back at gate.manifest.
-    let full_lane = validate_plan::lane_nodes(root, "portable", "", "gate.manifest")?;
-    let full_total = full_lane.len();
-    let full_steps = apply_selective_decision(
-        full_lane,
-        full_total,
-        SelectDecision::Full("no trustworthy green baseline (self-test)".into()),
-    )?;
-    let mut full_nodes = validate_plan::preflight_nodes(root)?;
-    full_nodes.extend(full_steps);
-    let submodules = full_nodes
-        .iter()
-        .find(|step| step.tag() == "pre.submodules")
-        .ok_or("selective bracket: full/no-baseline fallback lost pre.submodules")?;
-    if submodules.cmd
-        != "./ci/verify-submodules.sh --self-test && ./ci/verify-submodules.sh"
-        || submodules.cmd.contains("submodule update")
-        || !submodules.deps.is_empty()
-    {
-        return Err(format!(
-            "selective bracket: pre.submodules must self-test and verify before any repair: {submodules:?}"
-        ));
-    }
-    let producer_count = full_nodes
-        .iter()
-        .filter(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
-        .count();
-    if producer_count != 1 {
-        return Err(format!(
-            "selective bracket: full/no-baseline fallback has {producer_count} manifest-plan producers, expected 1"
-        ));
-    }
-    let producer = full_nodes
-        .iter()
-        .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
-        .expect("exactly one producer exists");
-    let gate = full_nodes
-        .iter()
-        .find(|step| step.tag() == "gate.manifest")
-        .ok_or("selective bracket: full/no-baseline fallback lost gate.manifest")?;
-    if producer.deps != [PIN_GATE_TAG.to_string()]
-        || gate.deps != [validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string()]
-    {
-        return Err(format!(
-            "selective bracket: full/no-baseline producer ordering is wrong: producer={:?} gate={:?}",
-            producer.deps, gate.deps
-        ));
-    }
-    let tags: BTreeSet<String> = full_nodes.iter().map(|step| step.tag()).collect();
-    if tags.len() != full_nodes.len() {
-        return Err("selective bracket: full/no-baseline fallback contains duplicate tags".into());
-    }
-    let mut completed = BTreeSet::new();
-    loop {
-        let ready: Vec<String> = full_nodes
-            .iter()
-            .filter(|step| !completed.contains(&step.tag()))
-            .filter(|step| step.deps.iter().all(|dependency| completed.contains(dependency)))
-            .map(|step| step.tag())
-            .collect();
-        if ready.is_empty() {
-            break;
-        }
-        completed.extend(ready);
-    }
-    if completed.len() != full_nodes.len() {
-        let blocked: Vec<String> = full_nodes
-            .iter()
-            .filter(|step| !completed.contains(&step.tag()))
-            .map(|step| step.tag())
-            .collect();
-        return Err(format!(
-            "selective bracket: full/no-baseline fallback contains a dependency cycle or missing dependency: {blocked:?}"
-        ));
-    }
-    println!(
-        "  selective subset: kept {child} + its dep {parent} from the real portable lane \
-         ({} edge(s) pruned); flaky-tests selector reused its manifest producer; \
-         full/no-baseline fallback has one acyclic producer; 1 unknown-tag refusal",
-        sel.pruned_edges
-    );
-    Ok(())
-}
-
-/// Bracket `--only` against the real portable lane and the real plan builder.
-///
-/// This specifically guards against the historical implementation: a synthetic
-/// `shard.*` step that nested `ci/run-node.sh`, discarded the selected node's
-/// resource contract, and duplicated the lane's manifest producer.
-fn only_plan_bracket(root: &Path) -> Result<(), String> {
-    let lane = "portable";
-    let all = validate_plan::lane_nodes(root, lane, "", "gate.manifest")?;
-    let all_tags: BTreeSet<String> = all.iter().map(|step| step.tag()).collect();
-    let (child, parent) = all
         .iter()
         .find_map(|step| {
             step.deps
                 .iter()
                 .find(|dependency| all_tags.contains(*dependency))
-                .map(|dependency| (step.clone(), dependency.clone()))
+                .map(|dependency| (step.tag(), dependency.clone()))
         })
-        .ok_or("only bracket: portable lane has no intra-lane dependency")?;
-    let parent_step = all
-        .iter()
-        .find(|step| step.tag() == parent)
-        .cloned()
-        .ok_or_else(|| format!("only bracket: selected parent {parent} is absent"))?;
-    let selected_tags: BTreeSet<String> = [child.tag(), parent.clone()].into_iter().collect();
-    let args = parse_argv(&[
-        "--only".into(),
-        lane.into(),
-        format!("{parent},{}", child.tag()),
-        "--no-label-pr".into(),
-    ])
-    .map_err(|code| format!("only bracket: CLI refused a valid selection with exit {code}"))?;
-    let plan = build_plan(root, &args, &std::env::temp_dir().join("validate-only-plan"))?;
-    if plan.selection_mode != "only" || plan.suite_complete || plan.second.is_some() {
-        return Err(format!(
-            "only bracket: focused plan authority changed: mode={} complete={} second={}",
-            plan.selection_mode,
-            plan.suite_complete,
-            plan.second.is_some()
-        ));
-    }
-    let tags: Vec<String> = plan.cfg.steps.iter().map(|step| step.tag()).collect();
-    let actual_tags: BTreeSet<String> = tags.iter().cloned().collect();
-    if actual_tags.len() != tags.len() {
-        return Err(format!("only bracket: plan contains duplicate tags: {tags:?}"));
-    }
-    let mut expected_tags: BTreeSet<String> =
-        validate_plan::preflight_nodes(root)?
-            .iter()
-            .map(|step| step.tag())
-            .collect();
-    expected_tags.extend(selected_tags.iter().cloned());
-    if actual_tags != expected_tags {
-        return Err(format!(
-            "only bracket: plan did not contain exactly preflight plus requested nodes: expected={expected_tags:?} actual={actual_tags:?}"
-        ));
-    }
-    if plan.cfg.steps.iter().any(|step| {
-        step.group == "shard" || step.cmd.contains("ci/run-node.sh")
-    }) {
-        return Err("only bracket: selected node was wrapped in a nested runner".into());
-    }
-    for expected in [&parent_step, &child] {
-        let actual = plan
-            .cfg
-            .steps
-            .iter()
-            .find(|step| step.tag() == expected.tag())
-            .ok_or_else(|| format!("only bracket: selected node {} was dropped", expected.tag()))?;
-        let mut expected_deps: Vec<String> = expected
-            .deps
-            .iter()
-            .filter(|dependency| selected_tags.contains(*dependency))
-            .cloned()
-            .collect();
-        if expected_deps.is_empty() {
-            expected_deps.push("gate.manifest".into());
-        }
-        if actual.deps != expected_deps {
-            return Err(format!(
-                "only bracket: selected node {} has wrong transformed deps: expected={expected_deps:?} actual={:?}",
-                actual.tag(),
-                actual.deps
-            ));
-        }
-        let mut normalized_expected = expected.clone();
-        normalized_expected.deps = expected_deps;
-        if format!("{actual:?}") != format!("{normalized_expected:?}") {
-            return Err(format!(
-                "only bracket: selected node {} did not retain its command/caps: expected={normalized_expected:?} actual={actual:?}",
-                expected.tag()
-            ));
-        }
-    }
-    let actual_child = plan
-        .cfg
-        .steps
-        .iter()
-        .find(|step| step.tag() == child.tag())
-        .expect("checked above");
-    if !actual_child.deps.contains(&parent) {
-        return Err("only bracket: dependency inside the selection was dropped".into());
-    }
-    let base = validate_plan::lane_config(root, lane)?;
-    validate_plan::assert_config_carried(&base, &plan.cfg)
-        .map_err(|error| format!("only bracket: lane config was not carried: {error}"))?;
+        .ok_or("selective bracket: portable label has no dependency edge")?;
 
-    let producer_args = parse_argv(&[
-        "--only".into(),
-        lane.into(),
-        validate_plan::MANIFEST_PLAN_PRODUCER_TAG.into(),
-        "--no-label-pr".into(),
-    ])
-    .map_err(|code| format!("only bracket: CLI refused producer selection with exit {code}"))?;
-    let producer_plan = build_plan(
-        root,
-        &producer_args,
-        &std::env::temp_dir().join("validate-only-producer-plan"),
+    let requested = [child.clone()].into_iter().collect::<BTreeSet<_>>();
+    let selected = select_from_committed_decision(
+        &portable,
+        portable.steps.len(),
+        SelectDecision::Nodes(requested),
     )?;
-    let producer_count = producer_plan
-        .cfg
-        .steps
-        .iter()
-        .filter(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
-        .count();
-    if producer_count != 1 {
-        return Err(format!(
-            "only bracket: manifest producer appeared {producer_count} times, expected once"
-        ));
+    let expected =
+        dagrun::select_steps_by_tags(&portable, std::slice::from_ref(&child), false)?;
+    if dag_to_json(&selected) != dag_to_json(&expected) {
+        return Err(
+            "selective bracket: since-green selection differs from dagrun's typed ID selection"
+                .into(),
+        );
     }
-    let producer_tags: BTreeSet<String> = producer_plan
-        .cfg
-        .steps
-        .iter()
-        .map(|step| step.tag())
-        .collect();
-    let canonical_preflight = validate_plan::preflight_nodes(root)?;
-    let preflight_tags: BTreeSet<String> = canonical_preflight
-        .iter()
-        .map(|step| step.tag())
-        .collect();
-    if producer_tags != preflight_tags {
+    let selected_tags = selected.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    if !selected_tags.contains(&child) || !selected_tags.contains(&parent) {
         return Err(format!(
-            "only bracket: selecting the shared producer admitted non-preflight nodes: {producer_tags:?}"
+            "selective bracket: dependency-closed selection lost child={child} or parent={parent}: {selected_tags:?}"
         ));
-    }
-    let canonical_producer = canonical_preflight
-        .iter()
-        .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
-        .ok_or("only bracket: canonical preflight omitted its manifest producer")?;
-    let planned_producer = producer_plan
-        .cfg
-        .steps
-        .iter()
-        .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
-        .expect("counted exactly once above");
-    if format!("{planned_producer:?}") != format!("{canonical_producer:?}") {
-        return Err("only bracket: selected producer is not the canonical validate preflight node".into());
     }
 
-    let unknown_args = parse_argv(&[
-        "--only".into(),
-        lane.into(),
-        "no.such_node".into(),
-        "--no-label-pr".into(),
-    ])
-    .map_err(|code| format!("only bracket: parser refused unknown-tag bracket with exit {code}"))?;
-    let error = build_plan(
-        root,
-        &unknown_args,
-        &std::env::temp_dir().join("validate-only-unknown-plan"),
+    let unknown = ["no.such_node".to_string()]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let error = select_from_committed_decision(
+        &portable,
+        portable.steps.len(),
+        SelectDecision::Nodes(unknown),
     )
     .err()
-    .ok_or("only bracket: unknown node tag was accepted")?;
-    if !error.contains("unknown node tag") || !error.contains("Selectable tags") {
+    .ok_or("selective bracket: an unknown selected ID was accepted")?;
+    if !error.contains("unknown step tag") {
         return Err(format!(
-            "only bracket: unknown-tag refusal omitted its diagnosis or choices: {error}"
+            "selective bracket: unknown-ID refusal lost its diagnosis: {error}"
         ));
     }
 
-    let unrelated_args = parse_argv(&[
-        ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
-        "--only".into(),
-        lane.into(),
-        "test.detcore_unit".into(),
-        "--no-label-pr".into(),
-    ])
-    .map_err(|code| format!("only bracket: unrelated selection was refused with exit {code}"))?;
-    let mut unrelated_plan = build_plan(
-        root,
-        &unrelated_args,
-        &std::env::temp_dir().join("validate-only-unrelated-plan"),
+    let skip = select_from_committed_decision(
+        &portable,
+        portable.steps.len(),
+        SelectDecision::Skip,
     )?;
-    apply_pinned_root(&mut unrelated_plan, root, false)?;
-    if unrelated_plan
-        .cfg
-        .steps
-        .iter()
-        .any(|step| step.job.starts_with("manifest_plan"))
-    {
-        return Err(
-            "only bracket: unrelated test.detcore_unit selection admitted a manifest-plan producer"
-                .into(),
-        );
+    let expected_skip = [
+        "pre.submodules",
+        PIN_GATE_TAG,
+        RUST_SCRIPT_PRODUCER_TAG,
+        validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+        "gate.manifest",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<BTreeSet<_>>();
+    let actual_skip = skip.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    if actual_skip != expected_skip {
+        return Err(format!(
+            "selective bracket: no-change selection did not retain exactly committed preflight: expected={expected_skip:?} actual={actual_skip:?}"
+        ));
     }
 
-    // Reproduce the focused manifest selection that used to reach dagrun with a
-    // dangling pinned-root edge. `--only` intentionally drops unrelated build
-    // dependencies, but both the host and pinned-root manifest commands invoke
-    // target/debug/test-harness. A fresh checkout must therefore retain the
-    // canonical host producer and add its in-image twin without restoring
-    // gate.manifest.
-    let manifest_args = parse_argv(&[
-        ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
-        "--only".into(),
-        lane.into(),
-        "build.manifest_guests,e2e.manifest_applications,e2e.manifest_c_programs,e2e.manifest_system_utils"
-            .into(),
-        "--no-label-pr".into(),
-    ])
-    .map_err(|code| format!("only bracket: manifest selection was refused with exit {code}"))?;
-    let mut manifest_plan = build_plan(
-        root,
-        &manifest_args,
-        &std::env::temp_dir().join("validate-only-manifest-plan"),
-    )?;
-    apply_pinned_root(&mut manifest_plan, root, false)?;
-    let manifest_tags: BTreeSet<String> =
-        manifest_plan.cfg.steps.iter().map(|step| step.tag()).collect();
-    for required in [
-        "build.manifest_guests",
-        "setup.manifest_plan",
-        "setup.manifest_plan_in_pinned_root",
-        "build.manifest_guests_in_pinned_root",
-        "e2e.manifest_applications",
-        "e2e.manifest_c_programs",
-        "e2e.manifest_system_utils",
-    ] {
-        if !manifest_tags.contains(required) {
-            return Err(format!(
-                "only bracket: focused manifest selection omitted required node {required}: {manifest_tags:?}"
-            ));
-        }
-    }
-    if manifest_tags.contains("gate.manifest") || manifest_tags.contains("lint.clippy") {
-        return Err(format!(
-            "only bracket: focused manifest selection broadened into unrelated validation: {manifest_tags:?}"
-        ));
-    }
-    let manifest_build = manifest_plan
-        .cfg
-        .steps
-        .iter()
-        .find(|step| step.tag() == "build.manifest_guests")
-        .ok_or("only bracket: focused manifest selection lost build.manifest_guests")?;
-    if !manifest_build
-        .deps
-        .iter()
-        .any(|dependency| dependency == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
-    {
-        return Err(
-            "only bracket: host manifest build does not wait for setup.manifest_plan".into(),
-        );
-    }
-    let pinned_manifest_build = manifest_plan
-        .cfg
-        .steps
-        .iter()
-        .find(|step| step.tag() == "build.manifest_guests_in_pinned_root")
-        .ok_or("only bracket: focused manifest selection lost pinned-root manifest build")?;
-    if !pinned_manifest_build
-        .deps
-        .iter()
-        .any(|dependency| dependency == "setup.manifest_plan_in_pinned_root")
-    {
-        return Err(
-            "only bracket: pinned-root manifest build does not wait for its manifest-plan producer"
-                .into(),
-        );
-    }
-    for selected_cell in [
-        "e2e.manifest_applications",
-        "e2e.manifest_c_programs",
-        "e2e.manifest_system_utils",
-    ] {
-        let step = manifest_plan
-            .cfg
-            .steps
-            .iter()
-            .find(|step| step.tag() == selected_cell)
-            .ok_or_else(|| format!("only bracket: focused manifest selection lost {selected_cell}"))?;
-        if !step
-            .deps
-            .iter()
-            .any(|dependency| dependency == "build.manifest_guests_in_pinned_root")
-        {
-            return Err(format!(
-                "only bracket: {selected_cell} does not wait for the pinned-root manifest build"
-            ));
-        }
-    }
-    let violations = dagrun::model::graph_structure_violations(&manifest_plan.cfg);
-    if !violations.is_empty() {
-        return Err(format!(
-            "only bracket: focused manifest selection is not dependency-closed and schedulable: {violations:?}"
-        ));
+    let source_after = std::fs::read(&source_path)
+        .map_err(|error| format!("selective bracket: cannot re-read source DAG: {error}"))?;
+    if source_after != source_before {
+        return Err("selective bracket: selecting IDs changed ci/dag/validate.json".into());
     }
     println!(
-        "  only plan: real node commands/caps retained, selected edge kept, outside edges dropped, producer unique; focused manifest selection has both required producers and is dependency-closed"
+        "  selective subset: typed ID selection retained {child} and dependency {parent}; unknown IDs refused; no-change retained exact preflight; source bytes unchanged"
     );
     Ok(())
 }
 
-/// Assert that `super` plans a complete, fully-boxed suite — and that the audit
-/// which guarantees that would actually REFUSE an unboxed node.
-///
-/// The caps audit is the driver's own load-bearing guard: it is what makes
-/// "boxing ACTIVE" true for every node rather than for the ones someone
-/// remembered. A guard that never fires is indistinguishable from no guard, so
-/// this brackets it on both sides with an inert synthetic node.
+fn only_plan_bracket(root: &Path) -> Result<(), String> {
+    let source_path = validate_plan::validation_dag_path(root);
+    let source_before = std::fs::read(&source_path)
+        .map_err(|error| format!("only bracket: cannot read source DAG: {error}"))?;
+    let committed = validate_plan::validation_config(root)?;
+    let portable = dagrun::select_steps_by_labels(&committed, &["portable".into()])?;
+    let all_tags = portable.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    let (child, parent) = portable
+        .steps
+        .iter()
+        .find_map(|step| {
+            step.deps
+                .iter()
+                .find(|dependency| all_tags.contains(*dependency))
+                .map(|dependency| (step.tag(), dependency.clone()))
+        })
+        .ok_or("only bracket: portable label has no dependency edge")?;
+
+    let args = parse_argv(&[
+        "--only".into(),
+        "portable".into(),
+        format!("{parent},{child}"),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("only bracket: CLI refused a valid selection with exit {code}"))?;
+    let mut plan = build_plan(root, &args, &std::env::temp_dir())?;
+    let mut expected_tags = [child.clone(), parent.clone()]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    expected_tags.extend(
+        [
+            "pre.submodules",
+            PIN_GATE_TAG,
+            RUST_SCRIPT_PRODUCER_TAG,
+            validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+            "gate.manifest",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    let expected = dagrun::select_steps_by_tags(
+        &portable,
+        &expected_tags.iter().cloned().collect::<Vec<_>>(),
+        true,
+    )?;
+    if dag_to_json(&plan.cfg) != dag_to_json(&expected)
+        || plan.selection_mode != "only"
+        || plan.suite_complete
+        || plan.second.is_some()
+    {
+        return Err(
+            "only bracket: runtime selection differs from exact committed IDs plus preflight"
+                .into(),
+        );
+    }
+    let selected_tags = plan.cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    if selected_tags != expected_tags {
+        return Err(format!(
+            "only bracket: selected IDs changed: expected={expected_tags:?} actual={selected_tags:?}"
+        ));
+    }
+    let selected_child = plan
+        .cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == child)
+        .ok_or("only bracket: selected child disappeared")?;
+    if !selected_child.deps.contains(&parent) {
+        return Err("only bracket: an edge among requested IDs was dropped".into());
+    }
+    if plan.cfg.steps.iter().any(|step| {
+        step.group == "shard"
+            || step.cmd.contains("ci/run-node.sh")
+            || step.cmd.contains("dagrun run")
+    }) {
+        return Err("only bracket: selected committed IDs introduced a nested scheduler".into());
+    }
+    require_committed_scheduler_input(&plan)?;
+
+    let original_command = plan.cfg.steps[0].cmd.clone();
+    plan.cfg.steps[0].cmd.push_str(" --planted-runtime-remix");
+    let mutation_error = require_committed_scheduler_input(&plan)
+        .err()
+        .ok_or("only bracket: planted selected-step mutation reached the scheduler boundary")?;
+    if !mutation_error.contains("changed after selection") {
+        return Err(format!(
+            "only bracket: selected-step mutation refusal was not specific: {mutation_error}"
+        ));
+    }
+    plan.cfg.steps[0].cmd = original_command;
+    require_committed_scheduler_input(&plan)?;
+
+    let off_record_args = parse_argv(&[
+        ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+        "--only".into(),
+        "portable".into(),
+        "test.detcore_unit".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("only bracket: off-record selection failed with exit {code}"))?;
+    let off_record = build_plan(root, &off_record_args, &std::env::temp_dir())?;
+    let off_record_tags = off_record
+        .cfg
+        .steps
+        .iter()
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
+    let expected_off_record = [
+        "pre.submodules".to_string(),
+        PIN_GATE_TAG.to_string(),
+        "test.detcore_unit".to_string(),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if off_record_tags != expected_off_record {
+        return Err(format!(
+            "only bracket: off-record selection did not retain exactly requested ID plus minimal preflight: expected={expected_off_record:?} actual={off_record_tags:?}"
+        ));
+    }
+
+    let unknown_args = parse_argv(&[
+        "--only".into(),
+        "portable".into(),
+        "no.such_node".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("only bracket: parser refused unknown-ID bracket with exit {code}"))?;
+    let unknown = build_plan(root, &unknown_args, &std::env::temp_dir())
+        .err()
+        .ok_or("only bracket: unknown selected ID was accepted")?;
+    if !unknown.contains("unknown step tag") || !unknown.contains("Known tags") {
+        return Err(format!(
+            "only bracket: unknown-ID refusal omitted its diagnosis or choices: {unknown}"
+        ));
+    }
+
+    let source_after = std::fs::read(&source_path)
+        .map_err(|error| format!("only bracket: cannot re-read source DAG: {error}"))?;
+    if source_after != source_before {
+        return Err("only bracket: selecting IDs changed ci/dag/validate.json".into());
+    }
+    println!(
+        "  only plan: requested IDs plus committed preflight selected through dagrun; outside dependencies dropped, selected edge retained, nested scheduler absent; source and selected-step bytes guarded both ways"
+    );
+    Ok(())
+}
+
 fn super_plan_bracket() -> Result<(), String> {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("validate-super-plan-{}", std::process::id()));
@@ -4274,7 +3994,7 @@ fn super_plan_bracket() -> Result<(), String> {
         "super.pmu_analyze_hello_race_stress_calibrated_skid",
         "superstress.ptrace_strict_verify_01",
         "superstress.kvm_available",
-        "compatprep.fixtures",
+        "super-compatprep.fixtures",
         "compat.rustc",
     ] {
         if !tags.contains(want) {
@@ -6467,6 +6187,11 @@ struct Plan {
     /// validation DAG. The scheduler boundary must still match these bytes;
     /// any validate-side command/dependency/resource rewrite is a refusal.
     committed_selection: Option<String>,
+    /// Exact bytes read from the sole committed validation DAG when the
+    /// selection was made. The scheduler boundary re-reads this path and
+    /// refuses if another path changed the source underneath the selected
+    /// in-memory graph.
+    committed_source: Option<(PathBuf, Vec<u8>)>,
     /// Second DAG run for a two-lane profile when lanes are NOT fused. Keeping
     /// them sequential is the faithful reproduction of `run_full_suite`, which
     /// runs `run_ci_manifest_lane portable` then `... privileged`.
@@ -6532,6 +6257,7 @@ impl Default for Plan {
         Plan {
             cfg: DagConfig::default(),
             committed_selection: None,
+            committed_source: None,
             second: None,
             profile: String::new(),
             selection_mode: "full",
@@ -6552,10 +6278,28 @@ impl Default for Plan {
 
 fn require_committed_scheduler_input(plan: &Plan) -> Result<(), String> {
     let Some(expected) = plan.committed_selection.as_deref() else {
+        if plan.committed_source.is_some() {
+            return Err("committed DAG source was recorded without a selected scheduler input".into());
+        }
         return Ok(());
+    };
+    let Some((source_path, source_bytes)) = plan.committed_source.as_ref() else {
+        return Err("selected scheduler input has no committed DAG source bytes".into());
     };
     if plan.second.is_some() {
         return Err("a committed selection unexpectedly became multiple scheduler DAGs".into());
+    }
+    let current_source = std::fs::read(source_path).map_err(|error| {
+        format!(
+            "cannot re-read committed validation DAG {} at the scheduler boundary: {error}",
+            source_path.display()
+        )
+    })?;
+    if current_source != *source_bytes {
+        return Err(format!(
+            "committed validation DAG {} changed after selection; validate refuses to run against a moving source",
+            source_path.display()
+        ));
     }
     let actual = dag_to_json(&plan.cfg);
     if actual != expected {
@@ -6862,111 +6606,6 @@ fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
     Ok("rust-script build: one producer follows checkout verification and precedes graph consumers; prepared binaries are read-only and duplicate producers refuse".into())
 }
 
-/// Keep a subgraph of the plan that validate has already constructed.
-///
-/// This deliberately knows nothing about lane files, lane fusion, deduplication,
-/// or the predecessor edges those transformations add. It sees only the
-/// `DagConfig` returned by plan construction. With dependencies
-/// enabled it closes over predecessors; with `--ignore-selected-deps` it keeps
-/// only edges whose endpoints are both selected because an external harness is
-/// responsible for supplying the omitted predecessors' artifacts.
-fn select_constructed_steps(
-    plan: &mut Plan,
-    selected: &str,
-    ignore_selected_deps: bool,
-) -> Result<(), String> {
-    if plan.second.is_some() {
-        return Err(
-            "--selected requires one constructed DAG; use the merged full plan or one lane"
-                .into(),
-        );
-    }
-    let mut requested: BTreeSet<String> = selected
-        .split(',')
-        .map(str::trim)
-        .filter(|tag| !tag.is_empty())
-        .map(str::to_string)
-        .collect();
-    if requested.is_empty() {
-        return Err("--selected needs at least one group.job tag".into());
-    }
-    let dependencies: BTreeMap<String, Vec<String>> = plan
-        .cfg
-        .steps
-        .iter()
-        .map(|step| (step.tag(), step.deps.clone()))
-        .collect();
-    let available: BTreeSet<String> = dependencies.keys().cloned().collect();
-    if requested.contains(STRICT_COMPAT_SELECTION_ALIAS) {
-        let compat: Vec<String> = available
-            .iter()
-            .filter(|tag| tag.starts_with("compat."))
-            .cloned()
-            .collect();
-        if !compat.is_empty() {
-            requested.remove(STRICT_COMPAT_SELECTION_ALIAS);
-            requested.extend(compat);
-            if available.contains("compatprep.fixtures") {
-                requested.insert("compatprep.fixtures".into());
-            }
-        }
-    }
-    let unknown: Vec<String> = requested.difference(&available).cloned().collect();
-    if !unknown.is_empty() {
-        return Err(format!(
-            "--selected named step(s) absent from the constructed {} plan: {}. Selectable tags: {}",
-            plan.profile,
-            unknown.join(", "),
-            available.iter().cloned().collect::<Vec<_>>().join(", ")
-        ));
-    }
-
-    let mut keep = requested;
-    if !ignore_selected_deps {
-        let mut pending: Vec<String> = keep.iter().cloned().collect();
-        while let Some(tag) = pending.pop() {
-            for dependency in dependencies.get(&tag).into_iter().flatten() {
-                if available.contains(dependency) && keep.insert(dependency.clone()) {
-                    pending.push(dependency.clone());
-                }
-            }
-        }
-    }
-    let before = plan.cfg.steps.len();
-    let mut pruned_edges = 0usize;
-    plan.cfg.steps.retain_mut(|step| {
-        if !keep.contains(&step.tag()) {
-            return false;
-        }
-        let before = step.deps.len();
-        step.deps.retain(|dependency| keep.contains(dependency));
-        pruned_edges += before - step.deps.len();
-        true
-    });
-    plan.planned_test_nodes.retain(|tag| keep.contains(tag));
-    plan.nonblocking.retain(|tag| keep.contains(tag));
-    plan.selection_mode = "selected";
-    plan.suite_complete = false;
-    plan.cacheable = false;
-    eprintln!(
-        "validate: selected {}/{} constructed step(s); omitted {} predecessor edge(s){}",
-        plan.cfg.steps.len(),
-        before,
-        pruned_edges,
-        if ignore_selected_deps {
-            " because their artifacts are supplied externally"
-        } else {
-            ""
-        }
-    );
-    Ok(())
-}
-
-/// Require every host capability named by the selected committed graph.
-///
-/// A committed profile is immutable at runtime: absence refuses the requested
-/// profile before the scheduler starts instead of deleting nodes and silently
-/// changing its denominator.
 fn require_host_capabilities(root: &Path, plan: &Plan) -> Result<(), String> {
     let requirements = validate_plan::host_capability_requirements(root)?;
     let mut needed = BTreeMap::<validate_plan::HostCapability, Vec<String>>::new();
@@ -7522,27 +7161,6 @@ fn assert_fused_shared_integration_test_consumers(steps: &[Step]) -> Result<(), 
     Ok(())
 }
 
-fn add_fused_shared_integration_test_resources(
-    steps: &mut [Step],
-) -> Result<BTreeMap<String, i64>, String> {
-    assert_fused_shared_integration_test_consumers(steps)?;
-    let mut caps = BTreeMap::new();
-    for (binary, portable, privileged) in EXPECTED_FUSED_SHARED_INTEGRATION_TESTS {
-        let resource = format!("{FUSED_INTEGRATION_TEST_RESOURCE_PREFIX}{binary}");
-        caps.insert(resource.clone(), 1);
-        for tag in [portable, privileged, FUSED_INTEGRATION_TEST_BUILDER] {
-            let step = steps
-                .iter_mut()
-                .find(|step| step.tag() == tag)
-                .ok_or_else(|| format!("fused shared-test resource lost {tag}"))?;
-            if step.hint.resources.insert(resource.clone(), 1).is_some() {
-                return Err(format!("fused shared-test resource already declared by {tag}"));
-            }
-        }
-    }
-    Ok(caps)
-}
-
 fn assert_fused_shared_integration_test_resources(
     steps: &[Step],
     caps: &BTreeMap<String, i64>,
@@ -7614,43 +7232,64 @@ fn attach_compatibility_scorecard(
     Ok(())
 }
 
-/// Replace a prefix inside pressure-test's single-quoted path/value words with
-/// one runtime environment expression. Pressure owns the exact commands and
-/// their quoting; validate changes only the two invocation-scoped values that
-/// cannot exist until the outer run is admitted.
-fn replace_pressure_quoted_prefix(
-    command: &str,
-    prefix: &str,
-    runtime_expression: &str,
-) -> Result<(String, usize), String> {
-    if prefix.contains('\'') {
+/// Read the sole committed validation graph and retain its exact source bytes
+/// so the scheduler boundary can reject any intervening file mutation.
+fn load_committed_validation_dag(root: &Path) -> Result<(DagConfig, PathBuf, Vec<u8>), String> {
+    let path = validate_plan::validation_dag_path(root);
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("{} is not UTF-8: {error}", path.display()))?;
+    let cfg = dag_from_json(text)
+        .map_err(|error| format!("invalid validation DAG {}: {error}", path.display()))?;
+    Ok((cfg, path, bytes))
+}
+
+fn finish_committed_selection(
+    mut plan: Plan,
+    source_path: PathBuf,
+    source_bytes: Vec<u8>,
+) -> Plan {
+    plan.committed_selection = Some(dag_to_json(&plan.cfg));
+    plan.committed_source = Some((source_path, source_bytes));
+    plan
+}
+
+fn requested_step_ids(raw: &str, option: &str) -> Result<BTreeSet<String>, String> {
+    let tags = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if tags.is_empty() {
+        Err(format!("{option} needs at least one group.job tag"))
+    } else {
+        Ok(tags)
+    }
+}
+
+fn expand_strict_compat_alias(
+    cfg: &DagConfig,
+    tags: &mut BTreeSet<String>,
+    profile: &str,
+) -> Result<(), String> {
+    if !tags.remove(STRICT_COMPAT_SELECTION_ALIAS) {
+        return Ok(());
+    }
+    let compat = cfg
+        .steps
+        .iter()
+        .filter(|step| step.tag() == "compatprep.fixtures" || step.group == "compat")
+        .map(Step::tag)
+        .collect::<Vec<_>>();
+    if compat.is_empty() {
         return Err(format!(
-            "requalification pressure-plan placeholder contains a quote: {prefix:?}"
+            "{STRICT_COMPAT_SELECTION_ALIAS} is not part of the committed {profile} profile"
         ));
     }
-    let needle = format!("'{prefix}");
-    let mut rest = command;
-    let mut rewritten = String::with_capacity(command.len());
-    let mut replacements = 0usize;
-    while let Some(start) = rest.find(&needle) {
-        rewritten.push_str(&rest[..start]);
-        let suffix_start = start + needle.len();
-        let after_prefix = &rest[suffix_start..];
-        let end = after_prefix.find('\'').ok_or_else(|| {
-            format!(
-                "requalification pressure-plan command has an unterminated quoted placeholder: {command}"
-            )
-        })?;
-        let suffix = &after_prefix[..end];
-        rewritten.push('"');
-        rewritten.push_str(runtime_expression);
-        rewritten.push_str(suffix);
-        rewritten.push('"');
-        rest = &after_prefix[end + 1..];
-        replacements += 1;
-    }
-    rewritten.push_str(rest);
-    Ok((rewritten, replacements))
+    tags.extend(compat);
+    Ok(())
 }
 
 fn requalification_identity_field<'a>(
@@ -7664,470 +7303,120 @@ fn requalification_identity_field<'a>(
         .ok_or_else(|| format!("selected requalification cell has no {field}: {identity}"))
 }
 
-/// Ask pressure-test for its canonical exact-cell steps without running them.
-/// The returned commands are templates: the outer validate supplies its own
-/// retained result root and run ID when the ONE outer scheduler executes them.
-fn pressure_requalification_config(
-    root: &Path,
-    tmp: &Path,
-    test: &str,
-    mode: &str,
-    backend: &str,
+fn exact_manifest_value(manifest: &DagManifest) -> Result<serde_json::Value, String> {
+    if manifest.lane.is_empty() || manifest.category.is_empty() {
+        return Err("selected result manifest has an empty lane or category".into());
+    }
+    let test = manifest
+        .test
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or("selected result manifest has no exact test")?;
+    let mode = manifest
+        .mode
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or("selected result manifest has no exact mode")?;
+    let backend = manifest
+        .backend
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or("selected result manifest has no exact backend")?;
+    Ok(serde_json::json!({
+        "lane": &manifest.lane,
+        "category": &manifest.category,
+        "test": test,
+        "mode": mode,
+        "backend": backend,
+    }))
+}
+
+fn select_from_committed_decision(
+    base: &DagConfig,
+    total: usize,
+    decision: SelectDecision,
 ) -> Result<DagConfig, String> {
-    let staging = tempfile::Builder::new()
-        .prefix(REQUALIFICATION_RESULT_ROOT_PLACEHOLDER)
-        .tempdir_in(tmp)
-        .map_err(|error| {
-            format!(
-                "cannot create pressure-plan staging directory under {}: {error}",
-                tmp.display()
-            )
-        })?;
-    let results = staging.path().join("results");
-    let output = Command::new(root.join("ci/compat-envelope/pressure-test.rs"))
-        .args([
-            "plan",
-            "--results",
-            &results.to_string_lossy(),
-            "--test",
-            test,
-            "--mode",
-            mode,
-            "--backend",
-            backend,
-            "--green",
-            "--repetitions",
-            "1",
-            "--run-id-prefix",
-            REQUALIFICATION_RUN_ID_PLACEHOLDER,
-            "--jobs",
-            "1",
-        ])
-        // A plan cannot publish anything, but removing the parent here keeps
-        // pressure-test's standalone publisher unreachable if that command's
-        // implementation ever grows another post-plan path.
-        .env_remove(PARENT_ENV)
-        .current_dir(root)
-        .output()
-        .map_err(|error| format!("cannot construct the exact pressure plan: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "pressure-test could not construct the exact green-cell plan ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    let metadata_path = results.join("run.json");
-    let metadata: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&metadata_path)
-            .map_err(|error| format!("cannot read {}: {error}", metadata_path.display()))?,
-    )
-    .map_err(|error| format!("invalid pressure metadata {}: {error}", metadata_path.display()))?;
-    let cells = metadata["cells"]
-        .as_array()
-        .ok_or_else(|| format!("pressure metadata has no selected cells: {metadata}"))?;
-    if metadata["green"] != true
-        || metadata["repetitions"] != 1
-        || metadata["run_id_prefix"] != REQUALIFICATION_RUN_ID_PLACEHOLDER
-        || cells.len() != 1
-        || cells[0]["test"] != test
-        || cells[0]["mode"] != mode
-        || cells[0]["backend"] != backend
-    {
-        return Err(format!(
-            "pressure-test returned a different requalification selection: {metadata}"
-        ));
-    }
-
-    let dag_path = results.join("dag.json");
-    let mut cfg = dag_from_json(
-        &std::fs::read_to_string(&dag_path)
-            .map_err(|error| format!("cannot read {}: {error}", dag_path.display()))?,
-    )
-    .map_err(|error| format!("invalid pressure DAG {}: {error}", dag_path.display()))?;
-    let result_prefix = results
-        .to_str()
-        .ok_or_else(|| format!("pressure result path is not UTF-8: {}", results.display()))?;
-    let result_expression =
-        "${E2E_RESULT_ROOT:?E2E_RESULT_ROOT is required for --requalify-cell}";
-    let run_id_expression =
-        "${E2E_RUN_ID:?E2E_RUN_ID is required for --requalify-cell}-pid$$";
-    let mut result_replacements = 0usize;
-    let mut run_id_replacements = 0usize;
-    for step in &mut cfg.steps {
-        let (rewritten, replaced_results) =
-            replace_pressure_quoted_prefix(&step.cmd, result_prefix, result_expression)?;
-        let (rewritten, replaced_run_ids) = replace_pressure_quoted_prefix(
-            &rewritten,
-            REQUALIFICATION_RUN_ID_PLACEHOLDER,
-            run_id_expression,
-        )?;
-        step.cmd = rewritten;
-        result_replacements += replaced_results;
-        run_id_replacements += replaced_run_ids;
-    }
-    if result_replacements == 0
-        || run_id_replacements != 1
-        || cfg.steps.iter().any(|step| {
-            step.cmd.contains(result_prefix)
-                || step.cmd.contains(REQUALIFICATION_RUN_ID_PLACEHOLDER)
-        })
-    {
-        return Err(format!(
-            "pressure DAG handoff was incomplete: result replacements={result_replacements}, run-id replacements={run_id_replacements}"
-        ));
-    }
-    Ok(cfg)
-}
-
-/// Replace the fail-closed placeholder with pressure-test's selected build,
-/// preparation, cell, and terminal steps. Nothing here executes a DAG: the
-/// resulting steps are consumed by validate's one outer scheduler invocation.
-fn attach_pressure_requalification_config(
-    plan: &mut Plan,
-    mut pressure: DagConfig,
-    identity: &serde_json::Value,
-) -> Result<(), String> {
-    let placeholders = plan
-        .cfg
-        .steps
-        .iter()
-        .filter(|step| step.tag() == REQUALIFICATION_PLACEHOLDER_TAG)
-        .count();
-    if placeholders != 1 {
-        return Err(format!(
-            "requalification plan expected one {REQUALIFICATION_PLACEHOLDER_TAG} placeholder, found {placeholders}"
-        ));
-    }
-    plan.cfg.steps.retain(|step| {
-        !matches!(
-            step.tag().as_str(),
-            REQUALIFICATION_PLACEHOLDER_TAG | validate_plan::MANIFEST_PLAN_PRODUCER_TAG
-        )
-    });
-
-    let cells = pressure
-        .steps
-        .iter()
-        .filter(|step| step.group == "cell")
-        .count();
-    let summaries = pressure
-        .steps
-        .iter()
-        .filter(|step| step.tag() == "pressure.summarize")
-        .count();
-    if cells != 1 || summaries != 1 {
-        return Err(format!(
-            "pressure requalification handoff must contain one cell and one pressure.summarize step; found cells={cells}, summaries={summaries}"
-        ));
-    }
-    if pressure.steps.iter().any(|step| {
-        step.cmd.contains("pressure-test.rs")
-            || step.cmd.contains("run_dag_boxed_deadline")
-            || step.cmd.contains("dagrun run")
-    }) {
-        return Err(
-            "pressure requalification handoff contains the standalone pressure runner or another nested scheduler command"
-                .into(),
-        );
-    }
-
-    let test = requalification_identity_field(identity, "test")?;
-    let mode = requalification_identity_field(identity, "mode")?;
-    let backend = requalification_identity_field(identity, "backend")?;
-    let pressure_quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
-    let mut saw_exact_cell = false;
-    for step in &mut pressure.steps {
-        if step.group != "cell" {
-            continue;
-        }
-        for token in [
-            format!("--test {}", pressure_quote(test)),
-            format!("--mode {}", pressure_quote(mode)),
-            format!("--backend {}", pressure_quote(backend)),
-        ] {
-            if !step.cmd.contains(&token) {
-                return Err(format!(
-                    "pressure cell {} lost selected identity token {token}",
-                    step.tag()
-                ));
-            }
-        }
-        step.cmd = format!(
-            "case \"${{E2E_RUN_ID:?E2E_RUN_ID is required for --requalify-cell}}\" in \
-             *[!A-Za-z0-9._@:-]*) echo 'validate: E2E_RUN_ID contains a path or shell-unsafe character' >&2; exit 2;; esac; {}",
-            step.cmd
-        );
-        saw_exact_cell = true;
-    }
-    if !saw_exact_cell {
-        return Err("pressure requalification handoff contains no selected cell".into());
-    }
-
-    // Retain pressure-test's selected steps, including its manifest-plan build,
-    // byte-for-byte apart from invocation-scoped values and the outer preflight
-    // edge. The placeholder plan's producer is removed above so there is still
-    // exactly one producer with this tag.
-    let existing_tags: BTreeSet<String> = plan.cfg.steps.iter().map(Step::tag).collect();
-    let pressure_tags: BTreeSet<String> = pressure.steps.iter().map(Step::tag).collect();
-    for step in &mut pressure.steps {
-        if step.deps.is_empty() && existing_tags.contains(PIN_GATE_TAG) {
-            step.deps.push(PIN_GATE_TAG.into());
-        }
-        if step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG {
-            step.hint.resources.insert("cargo_writer".into(), 1);
-        }
-        for dependency in &step.deps {
-            if !existing_tags.contains(dependency) && !pressure_tags.contains(dependency) {
-                return Err(format!(
-                    "pressure requalification step {} depends on absent {dependency}",
-                    step.tag()
-                ));
-            }
-        }
-    }
-    let duplicate = pressure_tags
-        .iter()
-        .find(|tag| existing_tags.contains(*tag));
-    if let Some(tag) = duplicate {
-        return Err(format!(
-            "pressure requalification handoff duplicates outer step {tag}"
-        ));
-    }
-
-    for (resource, capacity) in pressure.resource_caps {
-        plan.cfg
-            .resource_caps
-            .entry(resource)
-            .and_modify(|current| *current = (*current).max(capacity))
-            .or_insert(capacity);
-    }
-    plan.cfg.steps.extend(pressure.steps);
-    plan.cfg.description = "targeted cell requalification".into();
-    Ok(())
-}
-
-fn materialize_requalification_plan(
-    plan: &mut Plan,
-    root: &Path,
-    tmp: &Path,
-    test: &str,
-    mode: &str,
-    backend: &str,
-) -> Result<(), String> {
-    let identity = plan
-        .cell_evidence_expected
-        .as_ref()
-        .and_then(|expected| expected.first())
-        .cloned()
-        .ok_or("requalification plan lost its exact expected cell")?;
-    let pressure = pressure_requalification_config(root, tmp, test, mode, backend)?;
-    attach_pressure_requalification_config(plan, pressure, &identity)
-}
-
-/// Build the execution plan for the selected level/mode.
-fn build_source_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
-    let pre = validate_plan::preflight_nodes(root)?;
-    let gate = "gate.manifest";
-
-    // Focused single-node mode: run the SELECTED lane node(s) as ordinary steps
-    // of THIS run's own boxed DAG.
-    //
-    // This used to synthesise one `shard.<lane>_<node>` wrapper whose command was
-    // `./ci/run-node.sh <lane> <nodes>`, i.e. a SECOND `dagrun`
-    // underneath the one already driving this run. That nesting broke `--only`
-    // outright, in two separate ways:
-    //
-    //   * The inner runner establishes and then reads back its OWN outer systemd
-    //     scope. Inside validate's scope it does not own one, so the readback of
-    //     MemoryMax/MemorySwapMax/memory.oom.group failed and it refused with
-    //     "the run is not safely contained" — 0s, exit 3, before any work ran.
-    //   * The wrapper invented caps (7200s wall / 7200s CPU / 16 GiB) in place of
-    //     whatever the selected node actually declares, so a node budgeted at 900s
-    //     in the full plan got eight hours here and `--run-timeout` below 7200 was
-    //     refused outright.
-    //
-    // Selecting the real node directly cures both and STRENGTHENS containment:
-    // the node now runs under this run's two-level boxing with per-step cgroups,
-    // carrying its own declared wall/CPU/memory caps, exactly as it does in a full
-    // run. That identity is the whole point of a reproducer — a focused rerun must
-    // reproduce what the full run did to that node, budgets included.
-    if let Some(Focused::Only { lane, nodes }) = &args.focused {
-        let manifest_plan_producer = pre
-            .iter()
-            .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
-            .cloned();
-        let mut steps = pre;
-        let selected_gate = if args.allow_local_off_the_record_run {
-            // Iteration must not be blocked by an unrelated red manifest audit:
-            // that would make reproducing one failing node require first making
-            // the whole validation spine green. Keep the cheap source/pin checks
-            // that anchor the checkout, then run the selected node against the
-            // already-built tree exactly as --only already promises.
-            steps.retain(|step| matches!(step.tag().as_str(), "pre.submodules" | PIN_GATE_TAG));
-            PIN_GATE_TAG
-        } else {
-            gate
-        };
-        // CARRY the lane's top-level config. `config_from` would substitute
-        // DagConfig::default(), dropping resource_caps and default_step_timeout;
-        // see config_from_base's note on the 14-minute 0%-CPU hang that caused.
-        let base = validate_plan::lane_config(root, lane)?;
-        let mut requested: BTreeSet<String> = nodes
-            .split(',')
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
+    match decision {
+        SelectDecision::Skip => {
+            println!(
+                "Selective validation: no CI-relevant changes since baseline — nothing beyond \
+                 committed preflight runs (0/{total} lane nodes). The ledger's coverage record \
+                 will show zero planned test nodes, so this cannot be misread as a full pass."
+            );
+            let tags = [
+                "pre.submodules",
+                PIN_GATE_TAG,
+                RUST_SCRIPT_PRODUCER_TAG,
+                validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+                "gate.manifest",
+            ]
+            .into_iter()
             .map(str::to_string)
-            .collect();
-        if requested.is_empty() {
-            return Err("--only needs at least one <group.job> node tag".into());
+            .collect::<Vec<_>>();
+            dagrun::select_steps_by_tags(base, &tags, true)
         }
-        let mut lane_steps = validate_plan::lane_nodes(root, lane, "", gate)?;
-        // The lane is independently runnable, so it carries its own manifest-plan
-        // producer. Validate's canonical preflight already carries the same tag
-        // and deliberately owns that producer's validation-time cap. Reuse the
-        // preflight node before filtering; otherwise `--only setup.manifest_plan`
-        // creates a duplicate tag and a consumer selected with the producer keeps
-        // an ambiguous edge. Every non-preflight selected node retains its lane cap.
-        validate_plan::reuse_preflight_manifest_producer(
-            &mut lane_steps,
-            &format!("--only lane {lane}"),
-        )?;
-        let manifest_plan_consumers: BTreeSet<String> = base
-            .steps
-            .iter()
-            // This does not infer a manifest lane or category. It answers the
-            // narrower build question: does this selected command invoke the
-            // binary supplied by setup.manifest_plan?
-            .filter(|step| step.cmd.contains("target/debug/test-harness"))
-            .map(|step| step.tag())
-            .collect();
+        SelectDecision::Nodes(keep) => {
+            let requested = keep.into_iter().collect::<Vec<_>>();
+            let selected = dagrun::select_steps_by_tags(base, &requested, false)?;
+            println!(
+                "Selective validation: selected {} requested portable DAG node(s); committed \
+                 dependency closure contains {}/{} node(s):\n  {}",
+                requested.len(),
+                selected.steps.len(),
+                total,
+                requested.join(" ")
+            );
+            Ok(selected)
+        }
+        SelectDecision::Full(why) => {
+            println!("Selective validation: {why} — running the FULL portable label.");
+            Ok(base.clone())
+        }
+    }
+}
 
-        if requested.remove(STRICT_COMPAT_SELECTION_ALIAS) {
-            requested.insert("compatprep.fixtures".into());
-            requested.extend(
-                lane_steps
-                    .iter()
-                    .filter(|step| step.group == "compat")
-                    .map(Step::tag),
-            );
-        }
-        // Local iteration removes the manifest gate, but a fresh checkout still
-        // needs the canonical producer for target/debug/test-harness. Preserve
-        // that producer only when a requested node reaches it through the shipped
-        // lane graph. This keeps unrelated focused checks cheap while making a
-        // selected manifest build/run executable without a stale binary.
-        let needs_manifest_plan = args.allow_local_off_the_record_run
-            && requested.iter().any(|tag| {
-                tag == validate_plan::MANIFEST_PLAN_PRODUCER_TAG
-                    || manifest_plan_consumers.contains(tag)
-            });
-        if needs_manifest_plan {
-            steps.push(manifest_plan_producer.ok_or(
-                "--only: canonical preflight lost setup.manifest_plan",
-            )?);
-        }
-        // Preflight tags already in the plan; naming one is satisfied by the
-        // preflight itself and must not be looked up in the lane file.
-        let preflight: BTreeSet<String> = steps.iter().map(|s| s.tag()).collect();
-        let available: BTreeSet<String> = lane_steps.iter().map(|s| s.tag()).collect();
-        // Refuse an unknown tag HERE, naming what is selectable, instead of
-        // letting it travel into a child process that reports it 90s later.
-        let unknown: Vec<&String> = requested
-            .iter()
-            .filter(|t| !available.contains(*t) && !preflight.contains(*t))
-            .collect();
-        if !unknown.is_empty() {
-            let mut known: Vec<&str> = available.iter().map(String::as_str).collect();
-            known.extend(preflight.iter().map(String::as_str));
-            known.sort_unstable();
-            return Err(format!(
-                "--only: unknown node tag(s) in lane {lane}: {}. Selectable tags: {}",
-                unknown.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", "),
-                known.join(", ")
-            ));
-        }
-        let selected: BTreeSet<String> =
-            requested.iter().filter(|t| available.contains(*t)).cloned().collect();
-        let compat = lane == "portable"
-            && selected
-                .iter()
-                .any(|tag| tag == "compatprep.fixtures" || tag.starts_with("compat."));
-        let mut dropped: BTreeSet<String> = BTreeSet::new();
-        for mut step in lane_steps.into_iter().filter(|s| selected.contains(&s.tag())) {
-            // Same selection semantics run-node.sh documented for `run --only`:
-            // edges to steps OUTSIDE the selection are dropped (their outputs are
-            // assumed already built), edges AMONG the selection are preserved so a
-            // selected sub-graph still runs in order.
-            dropped.extend(
-                step.deps
-                    .iter()
-                    .filter(|d| {
-                        !selected.contains(*d)
-                            && !(needs_manifest_plan
-                                && d.as_str()
-                                    == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
-                    })
-                    .cloned(),
-            );
-            step.deps.retain(|d| selected.contains(d));
-            if needs_manifest_plan
-                && manifest_plan_consumers.contains(&step.tag())
-                && !step
-                    .deps
-                    .iter()
-                    .any(|dependency| dependency == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
-            {
-                step.deps.push(validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string());
-            }
-            if step.deps.is_empty() {
-                step.deps.push(selected_gate.to_string());
-            }
-            step.deps.sort();
-            step.deps.dedup();
-            steps.push(step);
-        }
-        // SAY that this mode assumes an already-built tree, and name the build
-        // edges it just dropped. Without this the mode is silent about its own
-        // precondition. A fast exit 127 may mean one of those artifacts is absent,
-        // but it can also mean a missing host tool or a command typo, so both the
-        // pre-run and post-run diagnostics keep that distinction explicit.
-        dropped.remove(selected_gate);
-        if dropped.is_empty() {
-            eprintln!(
-                "validate: --only runs the selected node(s) against the CURRENT tree; \
-                 nothing they depend on is rebuilt first."
-            );
+/// Runtime plan boundary: every executable path is a selection from the one
+/// committed `ci/dag/validate.json`. The maintenance generator is separate and
+/// never reaches this function.
+fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
+    let (committed, source_path, source_bytes) = load_committed_validation_dag(root)?;
+
+    if let Some(Focused::Only { lane, nodes }) = &args.focused {
+        let lane_cfg = dagrun::select_steps_by_labels(&committed, std::slice::from_ref(lane))?;
+        let mut tags = requested_step_ids(nodes, "--only")?;
+        expand_strict_compat_alias(&lane_cfg, &mut tags, lane)?;
+        let preflight: &[&str] = if args.allow_local_off_the_record_run {
+            &["pre.submodules", PIN_GATE_TAG]
         } else {
-            eprintln!(
-                "validate: --only assumes an already-built tree. Dropped {} dependency edge(s) \
-                 whose outputs must ALREADY exist: {}. Build them first (or name them in the \
-                 selection). A selected node exiting 127 in ~0s MAY indicate one is absent; \
-                 inspect the node command too, because a missing host tool or typo is also 127.",
-                dropped.len(),
-                dropped.iter().cloned().collect::<Vec<_>>().join(", ")
-            );
-        }
-        let cfg = validate_plan::config_from_base(&base, steps, "selected DAG node(s)");
-        return Ok(Plan {
+            &[
+                "pre.submodules",
+                PIN_GATE_TAG,
+                RUST_SCRIPT_PRODUCER_TAG,
+                validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+                "gate.manifest",
+            ]
+        };
+        tags.extend(preflight.iter().map(|tag| (*tag).to_string()));
+        let cfg = dagrun::select_steps_by_tags(
+            &lane_cfg,
+            &tags.into_iter().collect::<Vec<_>>(),
+            true,
+        )?;
+        let compat = (lane == "portable" && cfg.steps.iter().any(|step| step.group == "compat"))
+            .then_some(CompatMode::PortableStrict);
+        let plan = Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
-            second: None,
-            profile: args.focused.as_ref().unwrap().profile(),
+            profile: args.focused.as_ref().expect("matched focused mode").profile(),
             selection_mode: "only",
-            compat: compat.then_some(CompatMode::PortableStrict),
+            compat,
+            compat_prefix: compat.map(|_| "compat."),
+            cacheable: false,
             ..Default::default()
-        });
+        };
+        return Ok(finish_committed_selection(plan, source_path, source_bytes));
     }
 
-    // One-cell canonical requalification. Pressure-test owns the exact-cell
-    // selection and step construction, but validate owns execution: after the
-    // ordinary plan transformations, `materialize_requalification_plan`
-    // replaces this fail-closed placeholder with pressure's typed build,
-    // preparation, cell, and terminal steps. The result is one outer DAG and
-    // one scheduler. This plan is never suite-complete and therefore cannot
-    // grant whole-run authority.
     if let Some(Focused::RequalifyCell { test, mode, backend }) = &args.focused {
         let matches = validate_cell_results::expected_plan(root)?
             .into_iter()
@@ -8141,276 +7430,97 @@ fn build_source_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, Strin
                 matches.len()
             ));
         };
-        let mut steps = pre;
-        // Pressure plan construction performs its exact manifest/scorecard
-        // selection before these steps reach the scheduler. Retain validate's
-        // canonical manifest-plan producer for the generated cell, but omit the
-        // ordinary whole-manifest audit: this path measures one named cell.
-        steps.retain(|step| step.tag() != gate);
-        steps.push(step_with_caps(
-            "requalify",
-            "cell",
-            "Fail closed if the targeted cell plan was not materialized",
-            "echo 'validate: internal error: requalification plan was not materialized' >&2; exit 125"
-                .into(),
-            vec![PIN_GATE_TAG.into()],
-            30,
-            30,
-            256 * 1024 * 1024,
-        ));
-        let cfg = validate_plan::config_from(steps, "targeted cell requalification");
-        return Ok(Plan {
-            planned_test_nodes: BTreeSet::new(),
+        let exact = DagManifest {
+            lane: requalification_identity_field(identity, "lane")?.into(),
+            category: requalification_identity_field(identity, "category")?.into(),
+            test: Some(test.clone()),
+            mode: Some(mode.clone()),
+            backend: Some(backend.clone()),
+        };
+        let lane_cfg = dagrun::select_steps_by_labels(
+            &committed,
+            std::slice::from_ref(&exact.lane),
+        )?;
+        let owner = dagrun::result_manifest_owner(&lane_cfg.steps, &exact)?;
+        let owner_tag = owner.tag();
+        let selected_population = owner
+            .effective_result_manifests()
+            .iter()
+            .map(exact_manifest_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        if !selected_population.contains(identity) {
+            return Err(format!(
+                "result owner {owner_tag} does not retain the requested exact identity {identity}"
+            ));
+        }
+        let cfg = dagrun::select_steps_by_tags(&lane_cfg, std::slice::from_ref(&owner_tag), false)?;
+        let plan = Plan {
+            planned_test_nodes: test_nodes_of(&cfg),
             cfg,
-            second: None,
             profile: "cell-requalification".into(),
             selection_mode: "targeted",
             cacheable: false,
-            cell_evidence_expected: Some(vec![identity.clone()]),
+            cell_evidence_expected: Some(selected_population),
             ..Default::default()
-        });
-    }
-
-    // Node-level `--selective` / `--since-green` (validate.sh:4421).
-    if let Some(Focused::Selective { shallow }) = &args.focused {
-        return selective_plan(root, args, tmp, pre, gate, *shallow);
-    }
-
-    // Lane-based profiles.
-    let lanes: Vec<&str> = match (&args.focused, args.level) {
-        (Some(Focused::PrivilegedOnly), _) => vec!["privileged"],
-        (None, Level::PortableOnly) => vec!["portable"],
-        (None, Level::Full) => vec!["portable", "privileged"],
-        (_, _) => {
-            return Err(format!(
-                "no plan is defined for level={:?} focused={:?}; refusing to substitute another profile",
-                args.level, args.focused
-            ))
-        }
-    };
-    let profile = match &args.focused {
-        Some(f) => f.profile(),
-        None => args.level.name().to_string(),
-    };
-    let selection_mode = match &args.focused {
-        Some(Focused::Selective { .. }) => "selective",
-        Some(Focused::Only { .. }) => "only",
-        _ => "full",
-    };
-
-    if lanes.len() == 2 && !args.merge_lanes {
-        // Faithful reproduction of run_full_suite: portable lane, then privileged.
-        let mut a = pre.clone();
-        a.extend(validate_plan::lane_nodes_reusing_manifest_producer(
-            root, lanes[0], "", gate,
-        )?);
-        // The second lane is a separate scheduler invocation, but its node
-        // identities still enter one ledger row and one coverage artifact.
-        // Use the same lane prefix as the fused plan so those serialized
-        // populations cannot collapse two executions into one set member.
-        let second_prefix = format!("{}-", lanes[1]);
-        let mut b = validate_plan::lane_nodes(root, lanes[1], &second_prefix, gate)?;
-        // The second run repeats preflight-free; its nodes hang off nothing.
-        for s in b.iter_mut() {
-            s.deps.retain(|d| d != gate);
-        }
-        attach_compatibility_scorecard(&mut a, &["portable"], "")?;
-        // The runs are sequential, so when this node runs the portable rows
-        // already exist. Emit the same whole-scorecard answer as the fused
-        // default rather than a second disconnected per-lane claim.
-        attach_compatibility_scorecard(
-            &mut b,
-            &["portable", "privileged"],
-            "privileged-",
-        )?;
-        // Each lane carries ITS OWN loaded config. They genuinely differ --
-        // portable default_step_timeout=600 vs privileged=120, and disjoint
-        // resource_caps -- so there is no correct single merged value; running
-        // them as two sequential DAGs lets each keep its own exactly.
-        let base_a = validate_plan::lane_config(root, lanes[0])?;
-        let base_b = validate_plan::lane_config(root, lanes[1])?;
-        let cfg_a = validate_plan::config_from_base(&base_a, a, "portable lane");
-        let cfg_b = validate_plan::config_from_base(&base_b, b, "privileged lane");
-        for (base, derived, lane) in [(&base_a, &cfg_a, lanes[0]), (&base_b, &cfg_b, lanes[1])] {
-            validate_plan::assert_config_carried(base, derived)
-                .map_err(|e| format!("lane {lane}: DAG config was not carried: {e}"))?;
-        }
-        let compat = cfg_a.steps.iter().any(|step| step.group == "compat");
-        let mut planned = test_nodes_of(&cfg_a);
-        planned.extend(test_nodes_of(&cfg_b));
-        return Ok(Plan {
-            cfg: cfg_a,
-            second: Some(cfg_b),
-            profile,
-            selection_mode,
-            planned_test_nodes: planned,
-            suite_complete: args.level == Level::Full && args.focused.is_none(),
-            // Validation is also the live compatibility measurement. Reusing
-            // an older tree-keyed receipt would print no fresh per-cell table.
-            cacheable: false,
-            compat: compat.then_some(CompatMode::PortableStrict),
-            ..Default::default()
-        });
-    }
-
-    let mut steps = pre;
-    for lane in &lanes {
-        // Keep the portable lane's shipped tags byte-identical: the
-        // main-reachable receipt finalizer derives its coverage denominator
-        // from those manifest tags. Prefix only the additional lane, which is
-        // sufficient to disambiguate every collision in the fused graph.
-        let prefix = if lanes.len() > 1 && *lane != "portable" {
-            format!("{lane}-")
-        } else {
-            String::new()
         };
-        steps.extend(validate_plan::lane_nodes_reusing_manifest_producer(
-            root, lane, &prefix, gate,
-        )?);
+        return Ok(finish_committed_selection(plan, source_path, source_bytes));
     }
-    // Fusing lanes can duplicate identical work. In particular, the always-on
-    // gate.manifest and both lane e2e.metadata nodes run the exact same
-    // `test-harness validate` tree audit. Drop later duplicates and repoint
-    // their dependents, so one full run pays that ~75 s audit exactly once. The
-    // dedup is keyed by typed manifest-audit identity; an unexpected command is
-    // refused explicitly instead of silently ceasing to match.
-    let removed = dedupe_identical(&mut steps, gate)?;
-    if !removed.is_empty() {
-        eprintln!("validate: fused lanes; deduped {} identical node(s): {}", removed.len(), removed.join(", "));
-    }
-    let mut shared_test_resource_caps = BTreeMap::new();
-    if lanes.len() == 2 {
-        // The artifact barrier waits for both initial Cargo producers, verifies
-        // binary and resource identities, then publishes a content-addressed
-        // bundle. Every later Cargo writer and manifest consumer runs only after
-        // that barrier, so no writer can mutate either source during publication
-        // and no consumer reads a mutable Cargo path afterward.
-        let producer = "build.e2e_artifact";
-        let debug_producer = "build.workspace";
-        let consumer = "privileged-build.privileged_tests";
-        let portable_build = steps
-            .iter()
-            .find(|s| s.tag() == debug_producer)
-            .ok_or_else(|| format!("fused debug producer disappeared: {debug_producer}"))?;
-        let expected_fat_build = "./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit";
-        if portable_build.cmd != expected_fat_build {
-            return Err(format!(
-                "fused debug producer command drifted; re-prove the artifact barrier: {}",
-                portable_build.cmd
-            ));
-        }
-        let artifact = steps
-            .iter()
-            .find(|s| s.tag() == producer)
-            .ok_or_else(|| format!("fused artifact producer disappeared: {producer}"))?;
-        let expected_artifact = "./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg";
-        if artifact.cmd != expected_artifact
-            || ![debug_producer, "build.runtime_release"]
-                .iter()
-                .all(|dep| artifact.deps.iter().any(|actual| actual == dep))
-        {
-            return Err(format!(
-                "fused artifact barrier drifted; re-prove binary+resource publication: {} deps={:?}",
-                artifact.cmd, artifact.deps
-            ));
-        }
-        shared_test_resource_caps = add_fused_shared_integration_test_resources(&mut steps)?;
-        let privileged_build = steps
-            .iter_mut()
-            .find(|s| s.tag() == consumer)
-            .ok_or_else(|| format!("fused artifact consumer disappeared: {consumer}"))?;
-        let expected_build = "CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run && CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run";
-        if privileged_build.cmd != expected_build {
-            return Err(format!(
-                "fused privileged build command drifted; re-prove that build.workspace is a superset: {}",
-                privileged_build.cmd
-            ));
-        }
-        for dependency in [producer, "build.liteinst_runtime_release"] {
-            if !privileged_build.deps.iter().any(|d| d == dependency) {
-                privileged_build.deps.push(dependency.into());
-            }
-        }
-        privileged_build.deps.sort();
-        // Cargo owns the executable layout. Capture the exact compiler-artifact
-        // path from this build instead of reconstructing it from target/debug:
-        // current nightly Cargo places this generated test under
-        // build/hermit-detcore/<hash>/out, while older layouts used deps/.
-        // The pointer is overwritten by this producer and every consumer below
-        // validates that it names one regular executable in this checkout's
-        // target directory, so a stale or ambiguous artifact fails closed.
-        privileged_build.cmd = fused_privileged_test_build_command();
-        let cpuid = steps
-            .iter_mut()
-            .find(|s| s.tag() == "privileged-cpuid.faulting")
-            .ok_or("fused prebuilt CPUID consumer disappeared")?;
-        let expected_cpuid = "status=0; timeout --kill-after=5s 30s cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact || status=$?; if [ \"$status\" -eq 124 ] || [ \"$status\" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact Cargo timeout: exit %s)\\n' \"$status\" >&2; fi; exit \"$status\"";
-        if cpuid.cmd != expected_cpuid {
-            return Err(format!(
-                "fused CPUID command drifted; re-prove direct prebuilt invocation: {}",
-                cpuid.cmd
-            ));
-        }
-        cpuid.cmd = format!(
-            "{TESTS_MISC_EXECUTABLE_READ_COMMAND}; timeout 30 \"$tests_misc\" rdrand_rdseed_is_masked --exact"
-        );
-    }
-    attach_compatibility_scorecard(&mut steps, &lanes, "")?;
-    // Fusing lanes means one config for both. Their default wall timeouts differ,
-    // but every shipped/synthesized node has an explicit wall timeout and the
-    // fail-closed undeclared-node audit below enforces that invariant. Therefore
-    // the default is unreachable; retain the stricter value as defense in depth.
-    // Resource caps are disjoint and merge cleanly.
-    let bases: Vec<DagConfig> = lanes
-        .iter()
-        .map(|l| validate_plan::lane_config(root, l))
-        .collect::<Result<_, _>>()?;
-    let mut fused = bases[0].clone();
-    for b in bases.iter().skip(1) {
-        fused.default_step_timeout = fused.default_step_timeout.min(b.default_step_timeout);
-        for (r, n) in &b.resource_caps {
-            if let Some(prev) = fused.resource_caps.get(r) {
-                if prev != n {
-                    return Err(format!(
-                        "--merge-lanes refused: resource {r} capped at {prev} and {n} by different lanes"
-                    ));
-                }
-            }
-            fused.resource_caps.insert(r.clone(), *n);
-        }
-    }
-    for (resource, capacity) in shared_test_resource_caps {
-        if fused.resource_caps.insert(resource.clone(), capacity).is_some() {
-            return Err(format!("fused shared-test resource cap already exists: {resource}"));
-        }
-    }
-    if lanes.len() == 2 {
-        assert_fused_shared_integration_test_resources(&steps, &fused.resource_caps)?;
-    }
-    let cfg = validate_plan::config_from_base(&fused, steps, "fused lanes");
-    let compat = lanes.contains(&"portable")
-        && cfg.steps.iter().any(|step| step.group == "compat");
-    Ok(Plan {
-        planned_test_nodes: test_nodes_of(&cfg),
-        cfg,
-        second: None,
-        profile,
-        selection_mode,
-        suite_complete: args.level == Level::Full && args.focused.is_none(),
-        // Every ordinary lane validation must produce fresh per-cell results;
-        // a cache hit is valid landing evidence but is not a new measurement.
-        cacheable: false,
-        compat: compat.then_some(CompatMode::PortableStrict),
-        ..Default::default()
-    })
-}
 
-/// Runtime plan construction boundary.
-///
-/// Standard profiles select the single committed superset by label. Focused
-/// diagnostic modes still construct their deliberately narrower plans here;
-/// they do not remix any of the standard validation profiles.
-fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
+    if let Some(Focused::Selective { shallow }) = &args.focused {
+        let base = dagrun::select_steps_by_labels(&committed, &["portable".into()])?;
+        let commit_exists = |sha: &str| {
+            sh("git", &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_some()
+                || Command::new("git")
+                    .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+                    .status()
+                    .map(|status| status.success())
+                    .unwrap_or(false)
+        };
+        let baseline = if *shallow {
+            sh("git", &["rev-parse", "--verify", "HEAD~1"])
+        } else {
+            let rows = validate_history::read_rows(&ledger_path(root));
+            let parent = find_parent(root);
+            let slot = slot_name(root, parent.as_deref());
+            validate_history::selective_baseline(
+                &rows,
+                args.baseline.as_deref(),
+                &slot,
+                &commit_exists,
+            )
+        };
+        match &baseline {
+            Some(value) => println!(
+                "Selective validation: last-known-green baseline = {value}"
+            ),
+            None => println!(
+                "Selective validation: no trustworthy green baseline; running the FULL portable label."
+            ),
+        }
+        let decision = baseline
+            .as_deref()
+            .map(|value| ask_selector(root, Some(value)))
+            .unwrap_or_else(|| SelectDecision::Full("no trustworthy green baseline".into()));
+        let total = base.steps.len();
+        let cfg = select_from_committed_decision(&base, total, decision)?;
+        let compat = cfg
+            .steps
+            .iter()
+            .any(|step| step.group == "compat")
+            .then_some(CompatMode::PortableStrict);
+        let plan = Plan {
+            planned_test_nodes: test_nodes_of(&cfg),
+            cfg,
+            profile: "selective".into(),
+            selection_mode: "selective",
+            compat,
+            compat_prefix: compat.map(|_| "compat."),
+            cacheable: false,
+            ..Default::default()
+        };
+        return Ok(finish_committed_selection(plan, source_path, source_bytes));
+    }
+
     let committed_label = match (&args.focused, args.level) {
         (Some(Focused::PrivilegedOnly), _) => Some("privileged"),
         (Some(Focused::StrictCompat), _) => Some("strict-compat-only"),
@@ -8443,34 +7553,11 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
                 validate_envelope::L4_REPS_DEFAULT
             ));
         }
-        let mut cfg = validate_plan::lane_config(root, label)?;
+        let mut cfg = dagrun::select_steps_by_labels(&committed, &[label.into()])?;
         let mut selection_mode = "label";
         if let Some(selected) = args.selected.as_deref() {
-            let mut tags = selected
-                .split(',')
-                .map(str::trim)
-                .filter(|tag| !tag.is_empty())
-                .map(str::to_string)
-                .collect::<BTreeSet<_>>();
-            if tags.is_empty() {
-                return Err("--selected needs at least one group.job tag".into());
-            }
-            if tags.remove(STRICT_COMPAT_SELECTION_ALIAS) {
-                let compat = cfg
-                    .steps
-                    .iter()
-                    .filter(|step| {
-                        step.tag() == "compatprep.fixtures" || step.group == "compat"
-                    })
-                    .map(Step::tag)
-                    .collect::<Vec<_>>();
-                if compat.is_empty() {
-                    return Err(format!(
-                        "{STRICT_COMPAT_SELECTION_ALIAS} is not part of the committed {label} profile"
-                    ));
-                }
-                tags.extend(compat);
-            }
+            let mut tags = requested_step_ids(selected, "--selected")?;
+            expand_strict_compat_alias(&cfg, &mut tags, label)?;
             cfg = dagrun::select_steps_by_tags(
                 &cfg,
                 &tags.into_iter().collect::<Vec<_>>(),
@@ -8509,13 +7596,16 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         } else {
             BTreeSet::new()
         };
-        let committed_selection = Some(dag_to_json(&cfg));
-        return Ok(Plan {
+        let profile = args
+            .focused
+            .as_ref()
+            .map(Focused::profile)
+            .unwrap_or_else(|| args.level.name().to_string());
+        let plan = Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
-            committed_selection,
             second: None,
-            profile: label.to_string(),
+            profile,
             selection_mode,
             compat,
             compat_prefix,
@@ -8530,11 +7620,16 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             },
             nonblocking,
             force_keep_going: label == "envelope-only",
-            cacheable: args.selected.is_none() && !matches!(label, "portable" | "full"),
+            cacheable: args.selected.is_none()
+                && !matches!(label, "portable" | "full" | "envelope-only"),
             ..Default::default()
-        });
+        };
+        return Ok(finish_committed_selection(plan, source_path, source_bytes));
     }
-    build_source_plan(root, args, tmp)
+    Err(format!(
+        "no committed validation selection is defined for level={:?} focused={:?}",
+        args.level, args.focused
+    ))
 }
 
 /// Make every inherited CPU budget explicit before a source plan crosses the
@@ -8778,62 +7873,6 @@ enum SelectDecision {
 /// Apply one selector result while preserving the shipped lane as the tag
 /// authority. Producer reuse happens once, after unknown-tag validation, so it
 /// covers both dependency-closed subsets and fail-safe full-lane fallbacks.
-fn apply_selective_decision(
-    all: Vec<dagrun::model::Step>,
-    total: usize,
-    decision: SelectDecision,
-) -> Result<Vec<dagrun::model::Step>, String> {
-    let mut steps = match decision {
-        SelectDecision::Skip => {
-            println!(
-                "Selective validation: no CI-relevant changes since baseline — nothing to run \
-                 (0/{total} nodes). Preflight still ran; the ledger's coverage record will show \
-                 zero planned test nodes, so this cannot be misread as a full pass."
-            );
-            Vec::new()
-        }
-        SelectDecision::Nodes(keep) => {
-            let sel = validate_plan::select_lane_nodes(all, &keep);
-            if !sel.unknown_tags.is_empty() {
-                return Err(format!(
-                    "select-tests.rs named {} node(s) absent from the portable validate label ({}); the \
-                     selector and the DAG disagree, so refusing to run a subset derived from a \
-                     stale mapping",
-                    sel.unknown_tags.len(),
-                    sel.unknown_tags.join(", ")
-                ));
-            }
-            println!(
-                "Selective validation: running {}/{total} portable DAG nodes ({} intra-lane \
-                 dependency edge(s) pruned to the selected set):\n  {}",
-                sel.steps.len(),
-                sel.pruned_edges,
-                keep.iter().cloned().collect::<Vec<_>>().join(" ")
-            );
-            sel.steps
-        }
-        SelectDecision::Full(why) => {
-            println!("Selective validation: {why} — running the FULL portable lane.");
-            all
-        }
-    };
-    if validate_plan::reuse_preflight_manifest_producer(
-        &mut steps,
-        "selective portable lane",
-    )? {
-        println!("Selective validation: setup.manifest_plan is supplied by preflight.");
-    }
-    Ok(steps)
-}
-
-/// Ask `ci/select-tests.rs` what to run.
-///
-/// This is PLAN CONSTRUCTION, not a gate: the selector produces no verdict about
-/// the tree, and its output is only used to choose which already-declared nodes
-/// to schedule. Every failure mode — a nonzero exit, unparseable JSON, an empty
-/// node set, or an unproducible coverage report — resolves to
-/// [`SelectDecision::Full`], so the driver can only ever err toward running MORE
-/// than the selector proved safe to omit (validate.sh:4416-4420).
 fn ask_selector(root: &Path, baseline: Option<&str>) -> SelectDecision {
     let run = |format: &str| -> Option<String> {
         let mut c = Command::new(root.join("ci").join("select-tests.rs"));
@@ -8882,80 +7921,6 @@ fn ask_selector(root: &Path, baseline: Option<&str>) -> SelectDecision {
 }
 
 /// Build the `--selective` plan (validate.sh:4421).
-fn selective_plan(
-    root: &Path,
-    args: &Args,
-    _tmp: &Path,
-    pre: Vec<dagrun::model::Step>,
-    gate: &str,
-    shallow: bool,
-) -> Result<Plan, String> {
-    let commit_exists =
-        |sha: &str| sh("git", &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_some()
-            || Command::new("git")
-                .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-    let baseline: Option<String> = if shallow {
-        // --shallow-select pins the baseline to HEAD~1. A root commit has no
-        // parent, so selection fails safe to the full lane (validate.sh:4369).
-        sh("git", &["rev-parse", "--verify", "HEAD~1"])
-    } else {
-        let ledger = ledger_path(root);
-        let rows = validate_history::read_rows(&ledger);
-        let parent = find_parent(root);
-        let slot = slot_name(root, parent.as_deref());
-        validate_history::selective_baseline(&rows, args.baseline.as_deref(), &slot, &commit_exists)
-    };
-    match &baseline {
-        Some(b) => println!("Selective validation: last-known-green baseline = {b}"),
-        None => println!(
-            "Selective validation: no trustworthy green baseline; running the FULL portable lane."
-        ),
-    }
-
-    // Keep the shipped lane's complete tag vocabulary through selection. In
-    // particular, the selector may return setup.manifest_plan as part of a
-    // dependency-closed result; it is replaced by the preflight producer only
-    // after unknown-tag validation below.
-    let base = validate_plan::lane_config(root, "portable")?;
-    let all = validate_plan::lane_nodes(root, "portable", "", gate)?;
-    let total = all.len();
-    let decision = match &baseline {
-        Some(b) => ask_selector(root, Some(b)),
-        None => SelectDecision::Full("no trustworthy green baseline".into()),
-    };
-    let steps = apply_selective_decision(all, total, decision)?;
-    let mut nodes = pre;
-    nodes.extend(steps);
-    let cfg = validate_plan::config_from_base(&base, nodes, "selective portable subset");
-    validate_plan::assert_config_carried(&base, &cfg)
-        .map_err(|error| format!("selective portable DAG config was not carried: {error}"))?;
-    let compat = cfg.steps.iter().any(|step| step.group == "compat");
-    Ok(Plan {
-        planned_test_nodes: test_nodes_of(&cfg),
-        cfg,
-        profile: "selective".into(),
-        selection_mode: "selective",
-        compat: compat.then_some(CompatMode::PortableStrict),
-        ..Default::default()
-    })
-}
-
-/// Remove later steps whose semantic work exactly matches an earlier step's,
-/// and repoint every dependency onto the survivor. Returns the removed tags.
-///
-/// Most nodes require both job and command to match. Deliberate exceptions are
-/// the manifest audit (different tags, byte-identical command/tree) and the
-/// Reverie-pin authority (preflight passes `--repo`, lane nodes rely on the same
-/// root cwd). The observed preflight node survives in both cases.
-/// `gate_dep` is the tag `validate_plan::lane_nodes` injects onto every
-/// dependency-less lane node to reproduce the fail-fast ordering. It is a
-/// scheduling artifact rather than a data dependency, so a removed duplicate
-/// never passes it on to its survivor: doing so would make `pre.reverie_pin`
-/// inherit an edge to `gate.manifest` from the deduped `check.reverie_pin` and
-/// invert the preflight.
 fn dedupe_identical(steps: &mut Vec<Step>, gate_dep: &str) -> Result<Vec<String>, String> {
     let mut seen: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut remap: BTreeMap<String, String> = BTreeMap::new();
@@ -9456,7 +8421,6 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
 
 /// Exercise the public labelled-DAG entrypoint used by `.github/workflows/ci-dag.yml`.
 ///
-/// The first arm invokes its default `run` verb with a capture runner, proving
 /// A capture runner proves the workflow passes the committed bytes plus the
 /// requested label to dagrun. It executes no workload.
 fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
@@ -10291,7 +9255,7 @@ fn manifest_node_vacuity_profile_bracket(
     withheld_tag: &str,
     committed_scorecard_tag: &str,
 ) -> Result<(), String> {
-    let mut steps = validate_plan::lane_nodes(root, label, "", "gate.manifest")?;
+    let mut steps = validate_plan::lane_config(root, label)?.steps;
     let shipped = steps
         .iter()
         .find(|step| step.tag() == withheld_tag)
@@ -10423,7 +9387,7 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
             "privileged-only-e2e.manifest_backend_parity_c",
         ),
     ] {
-        let steps = validate_plan::lane_nodes(root, label, "", "gate.manifest")?;
+        let steps = validate_plan::lane_config(root, label)?.steps;
         let shipped = steps
             .iter()
             .find(|step| step.tag() == tag)
@@ -12557,8 +11521,8 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .map(|(_, cfg)| cfg)
         .ok_or("retry bounds: privileged lane is absent")?;
     for (tag, expected) in [
-        ("test.pmu_buck_chaos_cases", 6usize),
-        ("test.cli_kvm", 24usize),
+        ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
+        ("privileged-only-test.cli_kvm", 24usize),
     ] {
         let step = privileged
             .steps
@@ -12635,7 +11599,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
                 ..
             } = step.manifest.as_ref().ok_or_else(|| {
                 format!(
-                    "retry bounds: manifest node {} lacks typed manifest selection",
+                    "retry bounds: manifest node {} lacks its broad execution selector",
                     step.tag()
                 )
             })?;
@@ -15885,6 +14849,9 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
 }
 
 fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
+    let source_path = validate_plan::validation_dag_path(root);
+    let source_before = std::fs::read(&source_path)
+        .map_err(|error| format!("requalification plan: cannot read source DAG: {error}"))?;
     let args = parse_argv(&[
         "--requalify-cell".into(),
         "applications/timed-progress-bar".into(),
@@ -15893,301 +14860,146 @@ fn requalification_plan_bracket(root: &Path) -> Result<(), String> {
         "--no-label-pr".into(),
     ])
     .map_err(|code| format!("requalification plan: CLI refused with exit {code}"))?;
-    let fixture = tempfile::Builder::new()
-        .prefix("validate-requalification-plan-")
-        .tempdir()
-        .map_err(|error| format!("requalification plan: cannot create fixture: {error}"))?;
-    let mut plan = build_plan(root, &args, fixture.path())?;
+    let mut plan = build_plan(root, &args, &std::env::temp_dir())?;
     if plan.suite_complete
         || plan.selection_mode != "targeted"
-        || plan.cell_evidence_expected.as_ref().map(Vec::len) != Some(1)
+        || plan.second.is_some()
+        || plan.cell_evidence_expected.as_ref().is_none_or(Vec::is_empty)
     {
-        return Err("requalification plan: targeted evidence was mistaken for a full suite".into());
-    }
-    let placeholder = plan
-        .cfg
-        .steps
-        .iter()
-        .find(|step| step.tag() == REQUALIFICATION_PLACEHOLDER_TAG)
-        .ok_or("requalification plan: fail-closed placeholder is absent")?;
-    if !placeholder.cmd.contains("was not materialized") {
-        return Err("requalification plan: placeholder is not fail-closed".into());
+        return Err("requalification plan: owning-step selection gained full-suite authority".into());
     }
 
-    let pressure = pressure_requalification_config(
-        root,
-        fixture.path(),
-        "applications/timed-progress-bar",
-        "verify",
-        "ptrace",
+    let target = validate_cell_results::expected_plan(root)?
+        .into_iter()
+        .find(|cell| {
+            cell["test"] == "applications/timed-progress-bar"
+                && cell["mode"] == "verify"
+                && cell["backend"] == "ptrace"
+        })
+        .ok_or("requalification plan: exact target disappeared from expected plan")?;
+    let exact = DagManifest {
+        lane: requalification_identity_field(&target, "lane")?.into(),
+        category: requalification_identity_field(&target, "category")?.into(),
+        test: Some(requalification_identity_field(&target, "test")?.into()),
+        mode: Some(requalification_identity_field(&target, "mode")?.into()),
+        backend: Some(requalification_identity_field(&target, "backend")?.into()),
+    };
+    let committed = validate_plan::validation_config(root)?;
+    let lane = dagrun::select_steps_by_labels(
+        &committed,
+        std::slice::from_ref(&exact.lane),
     )?;
-    let identity = plan
-        .cell_evidence_expected
-        .as_ref()
-        .and_then(|expected| expected.first())
-        .cloned()
-        .ok_or("requalification plan: exact expected cell disappeared")?;
-
-    // The handoff is structural and fail-closed: if pressure's selected cell
-    // disappears, validate refuses instead of running only builds and calling
-    // that a requalification.
-    let mut missing_cell = pressure.clone();
-    missing_cell.steps.retain(|step| step.group != "cell");
-    let mut broken_plan = build_plan(root, &args, fixture.path())?;
-    let broken = attach_pressure_requalification_config(
-        &mut broken_plan,
-        missing_cell,
-        &identity,
-    )
-    .err()
-    .ok_or("requalification plan: missing pressure cell was accepted")?;
-    if !broken.contains("one cell") {
+    let owner = dagrun::result_manifest_owner(&lane.steps, &exact)?;
+    let owner_tag = owner.tag();
+    let expected_cfg =
+        dagrun::select_steps_by_tags(&lane, std::slice::from_ref(&owner_tag), false)?;
+    if dag_to_json(&plan.cfg) != dag_to_json(&expected_cfg) {
         return Err(format!(
-            "requalification plan: missing-cell refusal was not specific: {broken}"
+            "requalification plan: {owner_tag} and its committed dependency closure changed before scheduling"
         ));
     }
-
-    attach_pressure_requalification_config(&mut plan, pressure, &identity)?;
-    if plan
+    let selected_owner = plan
         .cfg
         .steps
         .iter()
-        .any(|step| step.tag() == REQUALIFICATION_PLACEHOLDER_TAG)
+        .find(|step| step.tag() == owner_tag)
+        .ok_or_else(|| format!("requalification plan: selected owner {owner_tag} disappeared"))?;
+    if selected_owner.effective_result_manifests() != owner.effective_result_manifests() {
+        return Err(format!(
+            "requalification plan: selected owner {owner_tag} changed its declared cell outcomes"
+        ));
+    }
+    let declared_population = owner
+        .effective_result_manifests()
+        .iter()
+        .map(exact_manifest_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    if plan.cell_evidence_expected.as_ref() != Some(&declared_population)
+        || !declared_population.contains(&target)
     {
-        return Err("requalification plan: fail-closed placeholder survived materialization".into());
+        return Err(format!(
+            "requalification plan: retained population does not equal {owner_tag}'s declared results or omits the requested cell"
+        ));
     }
     if plan.cfg.steps.iter().any(|step| {
-        step.cmd.contains("pressure-test.rs run")
+        step.group == "cell"
+            || step.cmd.contains("pressure-test.rs")
             || step.cmd.contains("run_dag_boxed_deadline")
             || step.cmd.contains("dagrun run")
     }) {
-        return Err("requalification plan: a generated node still starts a second scheduler".into());
+        return Err("requalification plan: exact-result selection synthesized a node or nested scheduler".into());
     }
-    let cell = plan
+    require_committed_scheduler_input(&plan)?;
+
+    let selected_owner = plan
         .cfg
         .steps
-        .iter()
-        .find(|step| step.group == "cell")
-        .ok_or("requalification plan: exact pressure cell is absent")?;
-    if cell.manifest.is_some()
-        || !cell.cmd.contains("--test 'applications/timed-progress-bar'")
-        || !cell.cmd.contains("--mode 'verify'")
-        || !cell.cmd.contains("--backend 'ptrace'")
-        || !cell.cmd.contains("${E2E_RESULT_ROOT:?")
-        || !cell.cmd.contains("${E2E_RUN_ID:?")
-        || cell
-            .env
-            .get("HERMIT_E2E_EMPTY_WORKDIR")
-            .map(String::as_str)
-            != Some("/test")
-    {
+        .iter_mut()
+        .find(|step| step.tag() == owner_tag)
+        .expect("owner checked above");
+    let original_results = selected_owner.result_manifests.clone();
+    selected_owner.result_manifests = Some(Vec::new());
+    let mutation_error = require_committed_scheduler_input(&plan)
+        .err()
+        .ok_or("requalification plan: planted result-ownership mutation reached the scheduler")?;
+    if !mutation_error.contains("changed after selection") {
         return Err(format!(
-            "requalification plan: selected pressure cell lost its pressure-owned identity, runtime handoff, or canonical /test workdir: {cell:?}"
+            "requalification plan: ownership-mutation refusal was not specific: {mutation_error}"
+        ));
+    }
+    plan.cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == owner_tag)
+        .expect("owner checked above")
+        .result_manifests = original_results;
+    require_committed_scheduler_input(&plan)?;
+
+    let moving_source = tempfile::Builder::new()
+        .prefix("validate-moving-dag-")
+        .tempdir()
+        .map_err(|error| format!("requalification plan: cannot create source fixture: {error}"))?;
+    let moving_path = moving_source.path().join("validate.json");
+    std::fs::write(&moving_path, &source_before)
+        .map_err(|error| format!("requalification plan: cannot seed source fixture: {error}"))?;
+    plan.committed_source = Some((moving_path.clone(), source_before.clone()));
+    let mut changed = source_before.clone();
+    changed.push(b'\n');
+    std::fs::write(&moving_path, changed)
+        .map_err(|error| format!("requalification plan: cannot mutate source fixture: {error}"))?;
+    let source_error = require_committed_scheduler_input(&plan)
+        .err()
+        .ok_or("requalification plan: moving committed source reached the scheduler")?;
+    if !source_error.contains("changed after selection") {
+        return Err(format!(
+            "requalification plan: moving-source refusal was not specific: {source_error}"
         ));
     }
 
-    // Execute the actual pressure-generated cell command through validate's
-    // outer scheduler. The test double replaces only test-harness itself; the
-    // pressure-owned shell wrapper, result paths, run ID, status transition,
-    // and terminal dependency are the production command.
-    let execution_root = fixture.path().join("execution");
-    let result_root = execution_root.join("results");
-    let calls = execution_root.join("harness-calls");
-    let run_ids = execution_root.join("run-ids");
-    let workdirs = execution_root.join("workdirs");
-    let harness = execution_root.join("test-harness");
-    std::fs::create_dir_all(result_root.join("prepare/applications-timed-progress-bar"))
-        .map_err(|error| format!("requalification plan: cannot prepare execution fixture: {error}"))?;
-    std::fs::write(
-        result_root.join("prepare/applications-timed-progress-bar/status"),
-        "0\n",
-    )
-    .map_err(|error| format!("requalification plan: cannot seed preparation status: {error}"))?;
-    std::fs::write(
-        &harness,
-        r#"#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$*" >> "$PRESSURE_PROBE_CALLS"
-printf '%s\n' "${E2E_RUN_ID:?}" >> "$PRESSURE_PROBE_RUN_IDS"
-printf '%s\n' "${HERMIT_E2E_EMPTY_WORKDIR:?}" >> "$PRESSURE_PROBE_WORKDIRS"
-result= junit=
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --results) result=$2; shift 2 ;;
-        --junit) junit=$2; shift 2 ;;
-        *) shift ;;
-    esac
-done
-[[ -n $result ]] || { echo "probe saw no --results" >&2; exit 92; }
-mkdir -p "$(dirname -- "$result")"
-printf '%s\n' '{"probe":true}' > "$result"
-if [[ -n $junit ]]; then
-    mkdir -p "$(dirname -- "$junit")"
-    printf '%s\n' '<testsuite tests="1" failures="0"/>' > "$junit"
-fi
-if [[ -n ${DAGRUN_TEST_COUNTS_PATH:-} ]]; then
-    printf '%s\n' '{"schema":2,"executed_tests":1,"filtered_tests":0,"results":[{"id":"requalification-probe","result":"pass","attempts":1}]}' > "$DAGRUN_TEST_COUNTS_PATH"
-fi
-"#,
-    )
-    .and_then(|()| {
-        std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o755))
-    })
-    .map_err(|error| format!("requalification plan: cannot create harness probe: {error}"))?;
-
-    let cell_tag = cell.tag();
-    let mut execution = plan.cfg.clone();
-    execution.steps.retain(|step| {
-        step.tag() == cell_tag || step.tag() == "pressure.summarize"
-    });
-    let execution_tags: BTreeSet<String> = execution.steps.iter().map(Step::tag).collect();
-    for step in &mut execution.steps {
-        step.deps.retain(|dependency| execution_tags.contains(dependency));
-        if step.tag() == cell_tag {
-            let replacement = validate_plan::shell_quote(&harness.to_string_lossy());
-            let replaced = step.cmd.replacen("target/debug/test-harness", &replacement, 1);
-            if replaced == step.cmd {
-                return Err(
-                    "requalification plan: selected pressure command lost test-harness"
-                        .into(),
-                );
-            }
-            step.cmd = replaced;
-        }
-    }
-
-    let prior_result_root = std::env::var_os("E2E_RESULT_ROOT");
-    let prior_run_id = std::env::var_os("E2E_RUN_ID");
-    let prior_calls = std::env::var_os("PRESSURE_PROBE_CALLS");
-    let prior_run_ids = std::env::var_os("PRESSURE_PROBE_RUN_IDS");
-    let prior_workdirs = std::env::var_os("PRESSURE_PROBE_WORKDIRS");
-    let restore_environment = || {
-        for (name, prior) in [
-            ("E2E_RESULT_ROOT", prior_result_root.as_ref()),
-            ("E2E_RUN_ID", prior_run_id.as_ref()),
-            ("PRESSURE_PROBE_CALLS", prior_calls.as_ref()),
-            ("PRESSURE_PROBE_RUN_IDS", prior_run_ids.as_ref()),
-            ("PRESSURE_PROBE_WORKDIRS", prior_workdirs.as_ref()),
-        ] {
-            match prior {
-                Some(value) => unsafe { std::env::set_var(name, value) },
-                None => unsafe { std::env::remove_var(name) },
-            }
-        }
-    };
-
-    // SAFETY: validate's self-test is single-threaded here and restores every
-    // value immediately after each scheduler execution.
-    unsafe {
-        std::env::set_var("E2E_RESULT_ROOT", &result_root);
-        std::env::set_var("E2E_RUN_ID", "validate-self-test@machine:1");
-        std::env::set_var("PRESSURE_PROBE_CALLS", &calls);
-        std::env::set_var("PRESSURE_PROBE_RUN_IDS", &run_ids);
-        std::env::set_var("PRESSURE_PROBE_WORKDIRS", &workdirs);
-    }
-    let positive = run_lane_once(
-        &execution,
-        1,
-        true,
-        0,
-        None,
-        &execution_root.join("positive.log"),
-        None,
-        false,
-    );
-    restore_environment();
-    let retained = result_root
-        .join("cells")
-        .join(cell_tag.trim_start_matches("cell."))
-        .join("results.jsonl");
-    let observed_run_id = std::fs::read_to_string(&run_ids).unwrap_or_default();
-    let observed_workdir = std::fs::read_to_string(&workdirs).unwrap_or_default();
-    if !positive.ok
-        || !positive.complete
-        || !positive.skipped.is_empty()
-        || positive.outcomes.len() != 2
-        || !retained.is_file()
-        || !observed_run_id
-            .trim()
-            .starts_with("validate-self-test@machine:1-pid")
-        || !observed_run_id.trim().ends_with(cell_tag.trim_start_matches("cell."))
-        || observed_workdir.trim() != "/test"
-    {
+    let missing_args = parse_argv(&[
+        "--requalify-cell".into(),
+        "applications/no-such-test".into(),
+        "verify".into(),
+        "ptrace".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("requalification plan: missing-cell CLI failed with exit {code}"))?;
+    let missing = build_plan(root, &missing_args, &std::env::temp_dir())
+        .err()
+        .ok_or("requalification plan: unknown exact cell was accepted")?;
+    if !missing.contains("exactly one currently selected cell") {
         return Err(format!(
-            "requalification plan: outer scheduler did not execute the selected pressure cell exactly once under the canonical /test workdir: ok={} complete={} outcomes={:?} skipped={:?} retained={} run_id={observed_run_id:?} workdir={observed_workdir:?}",
-            positive.ok,
-            positive.complete,
-            positive
-                .outcomes
-                .iter()
-                .map(|outcome| outcome.tag.as_str())
-                .collect::<Vec<_>>(),
-            positive.skipped,
-            retained.display(),
+            "requalification plan: missing-cell refusal was not specific: {missing}"
         ));
     }
 
-    let broken_root = execution_root.join("missing-run-id-results");
-    std::fs::create_dir_all(broken_root.join("prepare/applications-timed-progress-bar"))
-        .and_then(|()| {
-            std::fs::write(
-                broken_root.join("prepare/applications-timed-progress-bar/status"),
-                "0\n",
-            )
-        })
-        .map_err(|error| {
-            format!("requalification plan: cannot prepare broken execution fixture: {error}")
-        })?;
-    let broken_calls = execution_root.join("broken-harness-calls");
-    let broken_run_ids = execution_root.join("broken-run-ids");
-    // SAFETY: same single-threaded bracket and restoration as the positive run.
-    unsafe {
-        std::env::set_var("E2E_RESULT_ROOT", &broken_root);
-        std::env::remove_var("E2E_RUN_ID");
-        std::env::set_var("PRESSURE_PROBE_CALLS", &broken_calls);
-        std::env::set_var("PRESSURE_PROBE_RUN_IDS", &broken_run_ids);
-        std::env::set_var("PRESSURE_PROBE_WORKDIRS", execution_root.join("broken-workdirs"));
+    let source_after = std::fs::read(&source_path)
+        .map_err(|error| format!("requalification plan: cannot re-read source DAG: {error}"))?;
+    if source_after != source_before {
+        return Err("requalification plan: exact-result selection changed ci/dag/validate.json".into());
     }
-    let negative = run_lane_once(
-        &execution,
-        1,
-        true,
-        0,
-        None,
-        &execution_root.join("negative.log"),
-        None,
-        false,
-    );
-    restore_environment();
-    if negative.ok
-        || negative.complete
-        || negative
-            .outcomes
-            .iter()
-            .find(|outcome| outcome.tag == cell_tag)
-            .is_none_or(|outcome| outcome.ok)
-        || !negative
-            .skipped
-            .iter()
-            .any(|tag| tag == "pressure.summarize")
-        || broken_calls.exists()
-    {
-        return Err(format!(
-            "requalification plan: missing E2E_RUN_ID did not fail the selected outer cell before the harness: ok={} complete={} outcomes={:?} skipped={:?} harness_ran={}",
-            negative.ok,
-            negative.complete,
-            negative
-                .outcomes
-                .iter()
-                .map(|outcome| (outcome.tag.as_str(), outcome.ok))
-                .collect::<Vec<_>>(),
-            negative.skipped,
-            broken_calls.exists(),
-        ));
-    }
-
     println!(
-        "  requalification plan: pressure selected one exact green cell; validate's outer scheduler executed it under the same /test workdir as full validation, no nested runner remained, and a missing run ID refused before the harness; schema-7 eligible, never full authority"
+        "  requalification plan: exact five-field identity resolved to committed owner {owner_tag}; its dependency closure and declared result population stayed unchanged; graph and source mutations both refused"
     );
     Ok(())
 }
@@ -19057,25 +17869,6 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         }
     };
 
-    // Ask the plan constructor for a subgraph before execution-environment
-    // wrapping adds host-specific setup. This is the stable boundary shared by
-    // local and hosted execution: both start with the same constructed commands,
-    // caps, and edges; the hosted harness supplies omitted predecessors.
-    if plan.committed_selection.is_none() {
-        if let Some(selected) = &args.selected {
-            if let Err(error) =
-                select_constructed_steps(&mut plan, selected, args.ignore_selected_deps)
-            {
-                return RunSummary::refused(
-                    2,
-                    &plan.profile,
-                    "constructed-plan selection",
-                    vec![error],
-                );
-            }
-        }
-    }
-
     if plan.committed_selection.is_none() {
         if let Err(error) =
             configure_prebuilt_rust_scripts(&root, &mut plan, args.ignore_selected_deps)
@@ -19107,28 +17900,6 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
                     vec![error],
                 );
             }
-        }
-    }
-
-    if let Some(Focused::RequalifyCell {
-        test,
-        mode,
-        backend,
-    }) = &args.focused
-    {
-        if let Err(error) =
-            materialize_requalification_plan(&mut plan, &root, &tmp, test, mode, backend)
-        {
-            return RunSummary::refused(
-                2,
-                &plan.profile,
-                "targeted pressure-plan construction",
-                vec![
-                    error,
-                    "no cell ran: validate refused rather than invoking a second scheduler or substituting a different selection"
-                        .into(),
-                ],
-            );
         }
     }
 
