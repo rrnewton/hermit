@@ -2682,6 +2682,7 @@ fn write_plan_after_scorecard_check(
             cmdtype: CmdType::Unknown,
             manifest: None,
             integration_test_binaries: None,
+            result_manifests: None,
             labels: Vec::new(),
             deps: preparation_deps,
             env: BTreeMap::new(),
@@ -2867,6 +2868,7 @@ fn write_plan_after_scorecard_check(
                 cmdtype: CmdType::Unknown,
                 manifest: None,
                 integration_test_binaries: None,
+                result_manifests: None,
                 labels: Vec::new(),
                 deps,
                 // Requalification evidence must exercise the same hermetic
@@ -2919,6 +2921,7 @@ fn write_plan_after_scorecard_check(
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
+        result_manifests: None,
         labels: Vec::new(),
         deps: cell_tags,
         env: BTreeMap::new(),
