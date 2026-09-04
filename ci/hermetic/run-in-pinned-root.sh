@@ -58,6 +58,16 @@ done
 [[ -n "$out" ]] || { echo "run-in-pinned-root: --out is required" >&2; exit 2; }
 [[ $# -gt 0 ]] || { echo "run-in-pinned-root: a command is required after --" >&2; exit 2; }
 
+# Committed DAG commands are checkout-portable and therefore pass paths relative
+# to the scheduler's repository working directory. Podman bind sources must be
+# absolute; resolve them here at the execution boundary without rewriting the
+# DAG in validate.
+src=$(realpath -m -- "$src")
+out=$(realpath -m -- "$out")
+if [[ -n "$cargo_home" ]]; then
+    cargo_home=$(realpath -m -- "$cargo_home")
+fi
+
 if [[ -z "$digest" ]]; then
     [[ -f "$DIGEST_FILE" ]] || {
         echo "run-in-pinned-root: no --digest and no $DIGEST_FILE." >&2

@@ -27,8 +27,9 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR" || exit 2
 
 RUN_NODE="$ROOT_DIR/ci/run-node.sh"
+RUN_DAG="$ROOT_DIR/ci/run-dag.sh"
 LANE=portable
-DAG="$ROOT_DIR/ci/dag/$LANE.json"
+DAG="$ROOT_DIR/ci/dag/validate.json"
 # Any node with a stable tag works; this one is chosen because its command is
 # short, so an assertion failure prints something readable.
 NODE=check.dagrun_naming
@@ -223,15 +224,8 @@ else
     printf 'run-node-args-test: ok — edited-node handoff uses --selected --ignore-selected-deps\n'
 fi
 
-# ...and nothing else in the DAG moved. The scratch DAG carries TWO edits and the
-# guard has to tell them apart: the lane CPU budget stamped onto every step that
-# declared none, and the appended command on exactly one step. "Some steps
-# changed" would pass for either edit going wrong, so each is checked by name.
-lane_budget=$(sed -n 's/^const LANE_DEFAULT_CPU_TIMEOUT_S: i64 = \([0-9]\{1,\}\);$/\1/p' \
-    "$ROOT_DIR/scripts/lib/validate_plan.rs")
-if [[ ! $lane_budget =~ ^[0-9]+$ ]]; then
-    fail "could not read LANE_DEFAULT_CPU_TIMEOUT_S from scripts/lib/validate_plan.rs"
-fi
+# ...and nothing else in the DAG moved. Every CPU budget is already committed;
+# this local iteration path may edit exactly one command and no policy.
 
 scratch="$ROOT_DIR/ignored/ci/run-node/$LANE.$NODE.effective.json"
 if [[ ! -f $scratch ]]; then
@@ -240,7 +234,7 @@ else
     python3 -c '
 import json, sys
 
-source, scratch, tag, budget = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+source, scratch, tag = sys.argv[1], sys.argv[2], sys.argv[3]
 
 def steps(path):
     return {
@@ -253,24 +247,15 @@ if before.keys() != after.keys():
     sys.exit("scratch DAG changed the node set: {} vs {}".format(
         sorted(before), sorted(after)))
 
-cmd_drift, budget_drift, unexplained = [], [], []
+cmd_drift, unexplained = [], []
 for key, was in before.items():
     now = after[key]
     if was == now:
         continue
-    probe = dict(now)
-    # A step that declared its own cpu_timeout must keep it untouched; only an
-    # undeclared one may take the lane default.
-    if not was.get("cpu_timeout") and probe.get("cpu_timeout") == budget:
-        del probe["cpu_timeout"]
-        stripped = {k: v for k, v in was.items() if k != "cpu_timeout"}
-        budget_drift.append(key)
-    else:
-        stripped = was
-    if probe != stripped:
-        if probe.get("cmd") != stripped.get("cmd") and {
-            k: v for k, v in probe.items() if k != "cmd"
-        } == {k: v for k, v in stripped.items() if k != "cmd"}:
+    if now != was:
+        if now.get("cmd") != was.get("cmd") and {
+            k: v for k, v in now.items() if k != "cmd"
+        } == {k: v for k, v in was.items() if k != "cmd"}:
             cmd_drift.append(key)
         else:
             unexplained.append(key)
@@ -280,22 +265,15 @@ if unexplained:
 if cmd_drift != [tag]:
     sys.exit("expected exactly {} to take an edited command, got {}".format(
         tag, sorted(cmd_drift)))
-undeclared = [k for k, s in before.items() if not s.get("cpu_timeout")]
-if sorted(budget_drift) != sorted(undeclared):
-    sys.exit("lane CPU budget not carried onto every undeclared step: stamped {} of {}".format(
-        len(budget_drift), len(undeclared)))
-declared = [k for k, s in before.items() if s.get("cpu_timeout")]
-for key in declared:
-    if before[key].get("cpu_timeout") != after[key].get("cpu_timeout"):
-        sys.exit("a step that DECLARED its own cpu_timeout was overwritten: {}".format(key))
-print("  {} undeclared step(s) stamped {}s; {} declared step(s) left alone".format(
-    len(budget_drift), budget, len(declared)))
-' "$DAG" "$scratch" "$NODE" "$lane_budget" || fail "scratch DAG differs from the tracked DAG in an unexplained way"
-    printf 'run-node-args-test: ok — one edited command, lane budget carried, nothing else moved\n'
+missing_cpu = [k for k, s in before.items() if not s.get("cpu_timeout")]
+if missing_cpu:
+    sys.exit("committed DAG has steps without cpu_timeout: {}".format(missing_cpu))
+' "$DAG" "$scratch" "$NODE" || fail "scratch DAG differs from the tracked DAG in an unexplained way"
+    printf 'run-node-args-test: ok — one edited command, no resource policy changed\n'
 fi
 
 if ((failures > 0)); then
     printf 'run-node-args-test: %d check(s) FAILED\n' "$failures" >&2
     exit 1
 fi
-printf 'run-node-args-test: OK — 5 reasoned refusals, 1 usage check, 1 real CI selection, scheduler-width default and override, 1 single-node edit, current runner selector, lane CPU budget carried, no unexplained drift\n'
+printf 'run-node-args-test: OK — 5 reasoned refusals, 1 usage check, 1 real CI selection, scheduler-width default and override, 1 single-node edit, current runner selector, no resource-policy drift\n'

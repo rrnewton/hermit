@@ -34,7 +34,7 @@ mkdir -p "$scratch/ci/dag"
 printf '[workspace]\nmembers = ["detcore"]\nresolver = "2"\n' > "$scratch/Cargo.toml"
 
 write_dag() {
-    python3 - "$scratch/ci/dag/portable.json" "$1" <<'PYEOF'
+    python3 - "$scratch/ci/dag/validate.json" "$1" <<'PYEOF'
 import json
 import sys
 

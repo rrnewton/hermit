@@ -162,9 +162,10 @@ const PIN_GATE_TAG: &str = "pre.reverie_pin";
 const MANIFEST_AUDIT_COMMAND: &str = validate_plan::MANIFEST_AUDIT_COMMAND;
 const INTEGRATION_ARTIFACT_WRAPPER: &str =
     "./ci/run-with-hermit-e2e-artifact.sh --require-install ";
-const STRICT_COMPAT_PLACEHOLDER_TAG: &str = "test.strict_compat";
-const STRICT_COMPAT_PLACEHOLDER_COMMAND: &str =
-    "echo 'test.strict_compat is expanded by scripts/validate.rs into direct compat.* nodes; run this lane through validate or ci/run-node.sh' >&2; exit 125";
+/// Compatibility-selection alias retained for CLI callers that used the old
+/// placeholder tag. The committed DAG contains the real `compat.*` population;
+/// this name is never a node and never triggers runtime graph generation.
+const STRICT_COMPAT_SELECTION_ALIAS: &str = "test.strict_compat";
 const REQUALIFICATION_PLACEHOLDER_TAG: &str = "requalify.cell";
 const REQUALIFICATION_RESULT_ROOT_PLACEHOLDER: &str = "validate-requalification-results";
 const REQUALIFICATION_RUN_ID_PLACEHOLDER: &str = "validate-requalification-run-id";
@@ -394,9 +395,8 @@ struct Args {
     show_plan: bool,
     show_plan_json: bool,
     write_constructed_dag: Option<PathBuf>,
-    /// Generator-only escape hatch: render the pre-cutover source builders even
-    /// after ordinary profiles consume the committed labelled DAG.
-    write_source_plan: Option<PathBuf>,
+    /// Generator-only output containing the corpus-derived DAG partition.
+    write_generated_plan: Option<PathBuf>,
     selected: Option<String>,
     ignore_selected_deps: bool,
 }
@@ -472,8 +472,8 @@ fn usage() -> &'static str {
      \x20 --show-plan-json Print the constructed plan before environment wrapping as JSON.\n\
      \x20 --write-constructed-dag FILE\n\
      \x20                  Write one complete constructed DagConfig JSON for ci/run-dag.sh.\n\
-     \x20 --write-source-plan FILE\n\
-     \x20                  Generator-only: write the declarative source plan before cutover.\n\
+     \x20 --write-generated-plan FILE\n\
+     \x20                  Generator-only: write corpus-derived compat/stress nodes.\n\
      \x20 --selected <group.job>[,...]  Keep these steps from the constructed plan.\n\
      \x20 --ignore-selected-deps       Omit predecessors supplied by an external harness.\n\
      \x20 --self-test      Run inert policy/data brackets plus one bounded disposable\n\
@@ -488,7 +488,7 @@ fn usage() -> &'static str {
      post-verdict scorecard write-back failure preserves that line and exits 75;\n\
      current readers distinguish the two through ValidationServiceResult. No line\n\
      means validate died before reporting.\n\
-     Help, --show-plan, --write-constructed-dag, --write-source-plan, and\n\
+     Help, --show-plan, --write-constructed-dag, --write-generated-plan, and\n\
      --probe-host-capability do\n\
      not attempt validation and therefore do not emit a final validate status.\n\
      \n\
@@ -586,7 +586,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         show_plan: false,
         show_plan_json: false,
         write_constructed_dag: None,
-        write_source_plan: None,
+        write_generated_plan: None,
         selected: None,
         ignore_selected_deps: false,
     };
@@ -670,15 +670,15 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                     }
                 }
             }
-            "--write-source-plan" => {
+            "--write-generated-plan" => {
                 i += 1;
                 match argv.get(i) {
                     Some(v) if !v.is_empty() => {
                         show_plan = true;
-                        args.write_source_plan = Some(PathBuf::from(v));
+                        args.write_generated_plan = Some(PathBuf::from(v));
                     }
                     _ => {
-                        eprintln!("validate: --write-source-plan needs a FILE");
+                        eprintln!("validate: --write-generated-plan needs a FILE");
                         return Err(2);
                     }
                 }
@@ -728,7 +728,13 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 };
             }
             "--merge-lanes" => args.merge_lanes = true,
-            "--sequential-lanes" => args.merge_lanes = false,
+            "--sequential-lanes" => {
+                eprintln!(
+                    "validate: --sequential-lanes was removed when validation moved to one labelled DAG; \
+                     select the committed full graph instead"
+                );
+                return Err(2);
+            }
             "--self-test" => args.self_test = true,
             "-k" | "--keep-going" => args.keep_going = true,
             "--allow-cgroup-failure" => args.allow_cgroup_failure = true,
@@ -803,7 +809,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
     args.focused = focused.pop();
     let output_forms = usize::from(args.show_plan_json)
         + usize::from(args.write_constructed_dag.is_some())
-        + usize::from(args.write_source_plan.is_some());
+        + usize::from(args.write_generated_plan.is_some());
     if output_forms > 1 {
         eprintln!("validate: choose only one constructed-plan output form");
         return Err(2);
@@ -1219,8 +1225,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     for relative in [
         ".config/nextest.toml",
         "Makefile",
-        "ci/dag/portable.json",
-        "ci/dag/privileged.json",
+        "ci/dag/validate.json",
         "ci/manifest-plan/src/runner.rs",
         "ci/manifest-plan/src/service_result.rs",
         "ci/manifest-plan/src/timeouts.rs",
@@ -1231,6 +1236,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         "scripts/validate.rs",
         "scripts/lib/validate_history.rs",
         "scripts/lib/validate_plan.rs",
+        "scripts/lib/validate_super.rs",
         "tests/e2e/manifests/applications.yaml",
         "tests/e2e/manifests/backend-parity-c.yaml",
         "tests/e2e/manifests/c-programs.yaml",
@@ -1248,8 +1254,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "--",
                 ".config/nextest.toml",
                 "Makefile",
-                "ci/dag/portable.json",
-                "ci/dag/privileged.json",
+                "ci/dag/validate.json",
                 "ci/manifest-plan/src/runner.rs",
                 "ci/manifest-plan/src/service_result.rs",
                 "ci/manifest-plan/src/timeouts.rs",
@@ -1260,6 +1265,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "scripts/validate.rs",
                 "scripts/lib/validate_history.rs",
                 "scripts/lib/validate_plan.rs",
+                "scripts/lib/validate_super.rs",
                 "tests/e2e/manifests/applications.yaml",
                 "tests/e2e/manifests/backend-parity-c.yaml",
                 "tests/e2e/manifests/c-programs.yaml",
@@ -1382,11 +1388,10 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
 /// warm-cache scheduling estimate; it is not the hard safety ceiling.
 fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
     const MIB: i64 = 1024 * 1024;
-    const EXPECTED: (&str, i64, Option<i64>, Option<i64>) =
-        ("./ci/check-shard-coverage.sh", 600, Some(64 * MIB), Some(1024 * MIB));
-    fn policy(step: &Step) -> (&str, i64, Option<i64>, Option<i64>) {
+    const EXPECTED: (i64, Option<i64>, Option<i64>) =
+        (600, Some(64 * MIB), Some(1024 * MIB));
+    fn policy(step: &Step) -> (i64, Option<i64>, Option<i64>) {
         (
-            step.cmd.as_str(),
             step.timeout,
             step.hint.rss_baseline_bytes,
             step.hint.hard_mem_max_bytes,
@@ -1400,10 +1405,11 @@ fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
     if matches.next().is_some() {
         return Err("shard-coverage resource policy: duplicate check.shard_coverage nodes".into());
     }
-    if policy(shipped) != EXPECTED {
+    if !shipped.cmd.ends_with("./ci/check-shard-coverage.sh") || policy(shipped) != EXPECTED {
         return Err(format!(
-            "shard-coverage resource policy changed: got {:?}, expected {EXPECTED:?}",
-            policy(shipped)
+            "shard-coverage resource policy changed: got cmd={:?} policy={:?}, expected the canonical suffix and {EXPECTED:?}",
+            shipped.cmd,
+            policy(shipped),
         ));
     }
 
@@ -1433,7 +1439,7 @@ fn shard_coverage_resource_policy_bracket(root: &Path) -> Result<(), String> {
 fn self_test() -> Result<(), String> {
     inner_freshness_skip_cli_bracket()?;
     run_owned_cache_bracket()?;
-    println!("  {}", portable_strict_compat_outer_dag_bracket(&repo_root())?);
+    println!("  {}", committed_validation_execution_bracket(&repo_root())?);
     println!("  {}", raw_run_dag_strict_compat_bracket(&repo_root())?);
     shard_coverage_resource_policy_bracket(&repo_root())?;
     println!("  {}", structured_result_declaration_bracket()?);
@@ -1580,6 +1586,7 @@ fn self_test() -> Result<(), String> {
         ];
         let (passed, measured, blocking, nonblocking) = compat_summary_with_tables(
             CompatMode::PortableStrict,
+            "compat.",
             &outcomes,
             &planted_known,
             &planted_diag,
@@ -1631,6 +1638,7 @@ fn self_test() -> Result<(), String> {
         let (unknown_passed, unknown_measured, unknown_blocking, unknown_nonblocking) =
             compat_summary_with_tables(
                 CompatMode::PortableStrict,
+                "compat.",
                 &with_unknown,
                 &planted_known,
                 &planted_diag,
@@ -1648,6 +1656,7 @@ fn self_test() -> Result<(), String> {
         // bracket also pins that the two modes still differ.
         let (_, _, strict_blocking, strict_nonblocking) = compat_summary_with_tables(
             CompatMode::Strict,
+            "compat.",
             &outcomes,
             &planted_known,
             &planted_diag,
@@ -2387,17 +2396,17 @@ fn self_test() -> Result<(), String> {
     }
     let source = parse_argv(&[
         "full".into(),
-        "--write-source-plan".into(),
+        "--write-generated-plan".into(),
         "/tmp/source.json".into(),
     ])
     .map_err(|code| format!("source DAG export: valid argv refused with exit {code}"))?;
     if !source.show_plan
-        || source.write_source_plan.as_deref() != Some(Path::new("/tmp/source.json"))
+        || source.write_generated_plan.as_deref() != Some(Path::new("/tmp/source.json"))
     {
         return Err("source DAG export: parser lost the output path or inert-plan mode".into());
     }
     if parse_argv(&["--write-constructed-dag".into()]).is_ok()
-        || parse_argv(&["--write-source-plan".into()]).is_ok()
+        || parse_argv(&["--write-generated-plan".into()]).is_ok()
         || parse_argv(&[
             "--write-constructed-dag".into(),
             "/tmp/constructed.json".into(),
@@ -2407,7 +2416,7 @@ fn self_test() -> Result<(), String> {
         || parse_argv(&[
             "--write-constructed-dag".into(),
             "/tmp/constructed.json".into(),
-            "--write-source-plan".into(),
+            "--write-generated-plan".into(),
             "/tmp/source.json".into(),
         ])
         .is_ok()
@@ -2515,12 +2524,12 @@ fn self_test() -> Result<(), String> {
         scheduler_accounting_bracket()?,
         budget_reason_bracket()?,
         summary_listing_bracket()?,
-        validate_super::self_test(&root)?,
+        validate_super::self_test()?,
         validate_envelope::self_test()?,
         validate_history::self_test()?,
         validate_receipt::self_test()?,
         validate_runtime::self_test()?,
-        prebuilt_rust_script_plan_bracket()?,
+        prebuilt_rust_script_plan_bracket(&root)?,
         pinned_root_plan_bracket()?,
     ] {
         println!("  {line}");
@@ -2645,7 +2654,8 @@ cleared-caps refusal names {} starved step(s)",
         let tmp = std::env::temp_dir().join(format!("validate-plan-selftest-{}", std::process::id()));
         let full_args = parse_argv(&["full".into(), "--no-label-pr".into()])
             .map_err(|rc| format!("full-plan bracket: parser refused positive form rc={rc}"))?;
-        let full = build_plan(&root, &full_args, &tmp)?;
+        let mut full = build_plan(&root, &full_args, &tmp)?;
+        require_committed_scheduler_input(&full)?;
         let inherited_timeout_violations = steps_violating_run_timeout(&full.cfg, 1619);
         if !inherited_timeout_violations
             .iter()
@@ -2919,9 +2929,13 @@ cleared-caps refusal names {} starved step(s)",
                     consumer.tag(), consumer.cmd
                 ));
             }
-            if !consumer.cmd.starts_with("./ci/run-with-hermit-e2e-artifact.sh ") {
+            if !consumer
+                .cmd
+                .starts_with("./ci/hermetic/run-in-pinned-root.sh ")
+                || !consumer.cmd.contains("run-with-hermit-e2e-artifact.sh")
+            {
                 return Err(format!(
-                    "full-plan bracket: {} still consumes a mutable Hermit path: {}",
+                    "full-plan bracket: {} is not a committed pinned-root consumer of the published Hermit artifact: {}",
                     consumer.tag(), consumer.cmd
                 ));
             }
@@ -2932,7 +2946,7 @@ cleared-caps refusal names {} starved step(s)",
                         consumer.tag()
                     ));
                 }
-                "build.e2e_artifact"
+                "build.e2e_artifact_in_pinned_root"
             } else {
                 "privileged-build.privileged_tests"
             };
@@ -3061,13 +3075,8 @@ cleared-caps refusal names {} starved step(s)",
                 "full-plan bracket: CPUID consumer can run before tests_misc is built".into(),
             );
         }
-        // Exercise the actual full plan after lane fusion, then apply the
-        // pinned-root transformation. A synthetic producer graph cannot catch
-        // the dependency that fusion rewrites through gate.manifest.
-        let mut pinned_full = build_plan(&root, &full_args, &tmp)?;
-        apply_pinned_root(&mut pinned_full, &root, false)?;
         let deps_of = |tag: &str| {
-            pinned_full
+            full
                 .cfg
                 .steps
                 .iter()
@@ -3091,7 +3100,7 @@ cleared-caps refusal names {} starved step(s)",
                 ));
             }
         }
-        for step in pinned_full.cfg.steps.iter().filter(|step| {
+        for step in full.cfg.steps.iter().filter(|step| {
             step.tag().ends_with("_in_pinned_root")
                 || validation_step_identity(step) == ValidationStepIdentity::ManifestRun
         }) {
@@ -3123,66 +3132,28 @@ cleared-caps refusal names {} starved step(s)",
                 }
             }
         }
-        let sequential_args = parse_argv(&[
+        let original_command = full.cfg.steps[0].cmd.clone();
+        full.cfg.steps[0].cmd.push_str(" --planted-runtime-remix");
+        if require_committed_scheduler_input(&full).is_ok() {
+            return Err(
+                "full-plan bracket: a planted post-selection command rewrite reached the scheduler boundary"
+                    .into(),
+            );
+        }
+        full.cfg.steps[0].cmd = original_command;
+        require_committed_scheduler_input(&full)?;
+        let sequential = parse_argv(&[
             "full".into(),
             "--sequential-lanes".into(),
             "--no-label-pr".into(),
-        ])
-        .map_err(|rc| format!("full-plan bracket: sequential diagnostic refused rc={rc}"))?;
-        let sequential = build_plan(&root, &sequential_args, &tmp)?;
-        if sequential.second.is_none() {
-            return Err("full-plan bracket: --sequential-lanes did not preserve the fallback".into());
-        }
-        let sequential_has_shared_resource = std::iter::once(&sequential.cfg)
-            .chain(sequential.second.iter())
-            .any(|cfg| {
-                cfg.resource_caps
-                    .keys()
-                    .chain(cfg.steps.iter().flat_map(|step| step.hint.resources.keys()))
-                    .any(|resource| resource.starts_with(FUSED_INTEGRATION_TEST_RESOURCE_PREFIX))
-            });
-        if sequential_has_shared_resource {
-            return Err("full-plan bracket: fused shared-test resources leaked into the sequential plan".into());
-        }
-        let mut portable_tests = test_nodes_of(&validate_plan::lane_config(&root, "portable")?);
-        portable_tests.remove(STRICT_COMPAT_PLACEHOLDER_TAG);
-        let privileged_tests = test_nodes_of(&validate_plan::lane_config(&root, "privileged")?);
-        let mut sequential_expected = portable_tests.clone();
-        sequential_expected.extend(
-            privileged_tests
-                .iter()
-                .map(|tag| format!("privileged-{tag}")),
-        );
-        let mut fused_expected = portable_tests;
-        fused_expected.extend(
-            privileged_tests
-                .into_iter()
-                .map(|tag| format!("privileged-{tag}")),
-        );
-        if full.planned_test_nodes != fused_expected
-            || sequential.planned_test_nodes != sequential_expected
-        {
-            return Err(format!(
-                "full-plan bracket: fused/sequential planned-test sets differ from their lane configs: fused={:?} sequential={:?}",
-                full.planned_test_nodes, sequential.planned_test_nodes,
-            ));
-        }
-        let sequential_tags: Vec<String> = std::iter::once(&sequential.cfg)
-            .chain(sequential.second.iter())
-            .flat_map(|cfg| cfg.steps.iter().map(|step| step.tag()))
-            .collect();
-        let sequential_unique: BTreeSet<&str> =
-            sequential_tags.iter().map(String::as_str).collect();
-        if sequential_tags.len() != sequential_unique.len() {
-            return Err(format!(
-                "full-plan bracket: sequential lanes contain duplicate node identities, so \
-                 planned_node_count would collapse {} executions to {} names: {sequential_tags:?}",
-                sequential_tags.len(),
-                sequential_unique.len()
-            ));
+        ]);
+        if !matches!(sequential, Err(2)) {
+            return Err(
+                "full-plan bracket: removed --sequential-lanes was not explicitly refused".into(),
+            );
         }
         println!(
-            "  full plan: {} fused node(s), 1 manifest-plan producer -> 1 exact-tree manifest audit + 1 pin authority; sequential fallback bracketed",
+            "  full plan: {} committed labelled node(s), 1 manifest-plan producer -> 1 exact-tree manifest audit + 1 pin authority; removed sequential-lanes spelling refused",
             full.cfg.steps.len()
         );
     }
@@ -3525,7 +3496,7 @@ fn self_output_bracket() -> Result<(), String> {
         ("scripts/lib/validate_plan.rs", "bare path, real source"),
         ("R  detcore/src/a.rs -> ci/validate-ledger/a.rs", "a source file MOVED into the ledger dir"),
         ("R  ci/validate-ledger/a.jsonl -> detcore/src/a.rs", "a ledger file moved OUT into source"),
-        (" M ci/dag/portable.json", "a lane change under ci/, but not the ledger"),
+        (" M ci/dag/validate.json", "a DAG change under ci/, but not the ledger"),
         (" M ci/validate-ledger-notes.md", "a sibling whose name merely starts the same way"),
     ];
     for (line, why) in foreign {
@@ -3748,7 +3719,8 @@ fn checkout_attribution_bracket() -> Result<(), String> {
 ///
 /// The dangerous failure here is silent under-running: a subset that drops a
 /// node the selector asked for, or keeps a dangling dependency that makes the
-/// runner skip a selected node. Both are checked against `ci/dag/portable.json`
+/// runner skip a selected node. Both are checked against the portable label in
+/// `ci/dag/validate.json`
 /// itself rather than a fixture, because a fixture would not notice the lane
 /// file changing shape underneath the selector.
 fn selective_subset_bracket(root: &Path) -> Result<(), String> {
@@ -3762,7 +3734,7 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         .find_map(|s| {
             s.deps.iter().find(|d| all_tags.contains(*d)).map(|d| (s.tag(), d.clone()))
         })
-        .ok_or("selective bracket: ci/dag/portable.json has no intra-lane dependency to test")?;
+        .ok_or("selective bracket: portable label has no intra-lane dependency to test")?;
     let keep: BTreeSet<String> = [child.clone(), parent.clone()].into_iter().collect();
     let sel = validate_plan::select_lane_nodes(all.clone(), &keep);
     // Positive: exactly the two named nodes survive, the kept edge survives, and
@@ -3881,7 +3853,7 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
         full_total,
         SelectDecision::Full("no trustworthy green baseline (self-test)".into()),
     )?;
-    let mut full_nodes = validate_plan::preflight_nodes(root, false);
+    let mut full_nodes = validate_plan::preflight_nodes(root)?;
     full_nodes.extend(full_steps);
     let submodules = full_nodes
         .iter()
@@ -4003,7 +3975,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         return Err(format!("only bracket: plan contains duplicate tags: {tags:?}"));
     }
     let mut expected_tags: BTreeSet<String> =
-        validate_plan::preflight_nodes(root, has_cmd("with-proxy"))
+        validate_plan::preflight_nodes(root)?
             .iter()
             .map(|step| step.tag())
             .collect();
@@ -4092,7 +4064,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .map(|step| step.tag())
         .collect();
-    let canonical_preflight = validate_plan::preflight_nodes(root, has_cmd("with-proxy"));
+    let canonical_preflight = validate_plan::preflight_nodes(root)?;
     let preflight_tags: BTreeSet<String> = canonical_preflight
         .iter()
         .map(|step| step.tag())
@@ -5433,14 +5405,6 @@ fn epoch_now() -> i64 {
     sh("date", &["+%s"]).and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
-fn has_cmd(name: &str) -> bool {
-    Command::new("sh")
-        .args(["-c", &format!("command -v {name} >/dev/null 2>&1")])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 /// Locate the dev-hermit parent by walking up for a `.gitmodules` whose `hermit`
 /// submodule path is `hermit` (validate.sh:19).
 fn find_parent(root: &Path) -> Option<PathBuf> {
@@ -6499,6 +6463,10 @@ fn rebase_freshness_message_bracket() -> Result<(), String> {
 /// What the driver will execute, plus the accounting the ledger needs.
 struct Plan {
     cfg: DagConfig,
+    /// Canonical serialization of a selection made from the sole committed
+    /// validation DAG. The scheduler boundary must still match these bytes;
+    /// any validate-side command/dependency/resource rewrite is a refusal.
+    committed_selection: Option<String>,
     /// Second DAG run for a two-lane profile when lanes are NOT fused. Keeping
     /// them sequential is the faithful reproduction of `run_full_suite`, which
     /// runs `run_ci_manifest_lane portable` then `... privileged`.
@@ -6511,6 +6479,8 @@ struct Plan {
     /// Set when this profile is a compatibility matrix, so the ratchet and the
     /// per-program summary are evaluated afterwards.
     compat: Option<CompatMode>,
+    /// Tag prefix for the selected committed compatibility population.
+    compat_prefix: Option<&'static str>,
     /// True only for a complete `full` plan, authorizing `gates_expected` to be
     /// derived from what ran (validate.sh:718).
     suite_complete: bool,
@@ -6561,11 +6531,13 @@ impl Default for Plan {
     fn default() -> Self {
         Plan {
             cfg: DagConfig::default(),
+            committed_selection: None,
             second: None,
             profile: String::new(),
             selection_mode: "full",
             planned_test_nodes: BTreeSet::new(),
             compat: None,
+            compat_prefix: None,
             suite_complete: false,
             super_mode: false,
             envelope: None,
@@ -6578,325 +6550,61 @@ impl Default for Plan {
     }
 }
 
+fn require_committed_scheduler_input(plan: &Plan) -> Result<(), String> {
+    let Some(expected) = plan.committed_selection.as_deref() else {
+        return Ok(());
+    };
+    if plan.second.is_some() {
+        return Err("a committed selection unexpectedly became multiple scheduler DAGs".into());
+    }
+    let actual = dag_to_json(&plan.cfg);
+    if actual != expected {
+        return Err(
+            "the selected ci/dag/validate.json graph changed after selection; validate refuses to run remixed nodes"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 const RUST_SCRIPT_PRODUCER_TAG: &str = "build.rust_scripts";
 const RUST_SCRIPT_COMMAND_PREFIX: &str = "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; \
     export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; \
     export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ";
 
-/// The controlled writer a validation step invokes.
-///
-/// This is authored metadata, not command-string inference. The independent
-/// command audit below makes a newly added or removed writer fail closed until
-/// this registry changes with it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StructuredResultProducerKind {
-    Nextest,
-    TestHarness,
-    BackendParity,
-    Envelope,
-    Applications,
-}
-
-impl StructuredResultProducerKind {
-    const ALL: [Self; 5] = [
-        Self::Nextest,
-        Self::TestHarness,
-        Self::BackendParity,
-        Self::Envelope,
-        Self::Applications,
-    ];
-
-    const fn command_marker(self) -> &'static str {
-        match self {
-            Self::Nextest => "run-nextest-counted.sh",
-            Self::TestHarness => "target/debug/test-harness run",
-            Self::BackendParity => "tests/backend-parity/run_matrix.py",
-            Self::Envelope => "write-structured-test-counts.sh",
-            Self::Applications => "tests/e2e/lib/applications/run_all.sh",
-        }
-    }
-
-    const fn tags(self) -> &'static [&'static str] {
-        match self {
-            Self::Nextest => NEXTEST_RESULT_PRODUCERS,
-            Self::TestHarness => TEST_HARNESS_RESULT_PRODUCERS,
-            Self::BackendParity => BACKEND_PARITY_RESULT_PRODUCERS,
-            Self::Envelope => ENVELOPE_RESULT_PRODUCERS,
-            Self::Applications => APPLICATION_RESULT_PRODUCERS,
-        }
-    }
-}
-
-const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
-    "liteinst.strict",
-    "privileged-only-test.cli_kvm",
-    "privileged-only-test.cli_kvm_on_host",
-    "privileged-only-test.pmu_buck_chaos_cases",
-    "privileged-only-test.pmu_buck_chaos_cases_on_host",
-    "privileged-test.cli_kvm",
-    "privileged-test.pmu_buck_chaos_cases",
-    "quick.detcore_unit",
-    "super.chaos_hello_race_verification_diagnostic",
-    "super.dbt_failed_exec_recovery_diagnostic",
-    "super.dbt_guest_stderr_isolation_diagnostic",
-    "super.dbt_pipe_backpressure_diagnostic",
-    "super.dbt_strict_blocked_stdin_teardown_diagnostic",
-    "super.dbt_unsupported_syscall_aggregation_diagnostic",
-    "super.full_leveldb_strict_determinism",
-    "super.ipc_determinism_diagnostic",
-    "super.liteinst_python3_verify_diagnostics",
-    "super.managed_jvm_strict_verify_diagnostics",
-    "super.network_syscall_determinism_diagnostic",
-    "super.pmu_analyze_hello_race_stress_calibrated_skid",
-    "super.pmu_buck_chaos_cases",
-    "super.post_fork_scheduling_diagnostics",
-    "super.pselect_signal_interruption_diagnostic",
-    "super.random_source_determinism_diagnostic",
-    "super.record_replay_matrix_diagnostic",
-    "super.relaxed_hermit_flag_matrix",
-    "super.sqlite_veryquick_strict_determinism",
-    "super.threaded_integration_matrix_diagnostic",
-    "super.weekly_ignored_portable_chaos_cases",
-    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore",
-    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore",
-    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore",
-    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore",
-    "super.weekly_portable_chaos_cases",
-    "super.weekly_relaxed_default_mode_cases",
-    "test.app_strict_verify",
-    "test.arbitrary_binaries",
-    "test.cli",
-    "test.cli_kvm",
-    "test.cli_on_host",
-    "test.command_strict_verify",
-    "test.detcore_misc",
-    "test.detcore_parallel",
-    "test.detcore_unit",
-    "test.hermit_integration",
-    "test.hermit_modes",
-    "test.hermit_modes_on_host",
-    "test.hermit_unit",
-    "test.ignored_syscall_regressions",
-    "test.liteinst_strict",
-    "test.pmu_buck_chaos_cases",
-    "test.regular_crates",
-    "test.rr_suite_contract",
-    "test.sabre_examples",
-];
-
-const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
-    "e2e.manifest_applications",
-    "e2e.manifest_applications_on_host",
-    "e2e.manifest_backend_parity_c",
-    "e2e.manifest_backend_parity_c_on_host",
-    "e2e.manifest_bin_c",
-    "e2e.manifest_bin_c_on_host",
-    "e2e.manifest_c_programs",
-    "e2e.manifest_c_programs_on_host",
-    "e2e.manifest_chaos_c",
-    "e2e.manifest_chaos_c_on_host",
-    "e2e.manifest_data_handling",
-    "e2e.manifest_data_handling_on_host",
-    "e2e.manifest_debugger_c",
-    "e2e.manifest_debugger_c_on_host",
-    "e2e.manifest_determinism_stress",
-    "e2e.manifest_determinism_stress_c",
-    "e2e.manifest_determinism_stress_c_on_host",
-    "e2e.manifest_determinism_stress_on_host",
-    "e2e.manifest_language_runtimes",
-    "e2e.manifest_language_runtimes_on_host",
-    "e2e.manifest_shared_futex_c",
-    "e2e.manifest_shared_futex_c_on_host",
-    "e2e.manifest_system_utils",
-    "e2e.manifest_system_utils_on_host",
-    "e2e.manifest_util_c",
-    "e2e.manifest_util_c_on_host",
-    "privileged-e2e.manifest_applications",
-    "privileged-e2e.manifest_backend_parity_c",
-    "privileged-only-e2e.manifest_applications",
-    "privileged-only-e2e.manifest_applications_on_host",
-    "privileged-only-e2e.manifest_backend_parity_c",
-    "privileged-only-e2e.manifest_backend_parity_c_on_host",
-    "quick.e2e_verify",
-];
-
-const BACKEND_PARITY_RESULT_PRODUCERS: &[&str] = &["test.dbt_parity"];
-const ENVELOPE_RESULT_PRODUCERS: &[&str] = &["test.envelope_levels"];
-const APPLICATION_RESULT_PRODUCERS: &[&str] = &["test.applications_e2e"];
-
-fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
-    StructuredResultProducerKind::ALL
-        .into_iter()
-        .find(|kind| kind.tags().contains(&tag))
-}
-
-/// Bind every structured-count writer to dagrun's typed path channel and make
-/// absence authoritative for every other step. Existing manifest-cell result
-/// ownership is retained in the multi-manifest declaration.
-fn declare_structured_result_producers(plan: &mut Plan) -> Result<(), String> {
-    for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
-        for step in &mut cfg.steps {
-            let tag = step.tag();
-            let command_kinds = StructuredResultProducerKind::ALL
-                .into_iter()
-                .filter_map(|kind| {
-                    let occurrences = step.cmd.matches(kind.command_marker()).count();
-                    (occurrences != 0).then_some((kind, occurrences))
-                })
-                .collect::<Vec<_>>();
-            let command_kind = match command_kinds.as_slice() {
-                [] => None,
-                [(kind, 1)] => Some(*kind),
-                [(kind, occurrences)] => {
-                    return Err(format!(
-                        "{tag} invokes the {kind:?} structured result producer {occurrences} times; expected exactly once"
-                    ));
-                }
-                _ => {
-                    return Err(format!(
-                        "{tag} invokes more than one structured result producer: {command_kinds:?}"
-                    ));
-                }
-            };
-            let registered = structured_result_producer_kind(&tag);
-            let existing = step
-                .structured_test_results_manifest()
-                .map_err(|error| format!("{tag}: {error}"))?
-                .cloned();
-
-            let dynamic_pressure_cell = step.group == "cell"
-                && existing.is_some()
-                && command_kind == Some(StructuredResultProducerKind::TestHarness);
-            match (registered, command_kind, existing.as_ref()) {
-                (Some(expected), Some(actual), _) if expected == actual => {}
-                (Some(expected), Some(actual), _) => {
-                    return Err(format!(
-                        "{tag} is registered as {expected:?} but invokes {actual:?}"
-                    ));
-                }
-                (Some(expected), None, _) => {
-                    return Err(format!(
-                        "{tag} is registered as {expected:?} but no longer invokes that writer"
-                    ));
-                }
-                (None, Some(_), Some(_)) if dynamic_pressure_cell => {}
-                (None, Some(actual), _) => {
-                    return Err(format!(
-                        "{tag} invokes unregistered structured result producer {actual:?}"
-                    ));
-                }
-                (None, None, Some(_)) => {
-                    return Err(format!(
-                        "{tag} declares structured results but invokes no registered writer"
-                    ));
-                }
-                (None, None, None) => {}
-            }
-
-            let mut declarations = step
-                .effective_result_manifests()
-                .iter()
-                .cloned()
-                .map(ResultManifest::ManifestCell)
-                .collect::<Vec<_>>();
-            if registered.is_some() {
-                declarations.push(ResultManifest::StructuredTestResults(
-                    StructuredTestResultsManifest::current(tag.clone()),
-                ));
-            } else if let Some(existing) = existing {
-                declarations.push(ResultManifest::StructuredTestResults(existing));
-            }
-            step.result_manifests = Some(declarations);
-        }
-    }
-    Ok(())
-}
-
-fn structured_result_declaration_bracket() -> Result<String, String> {
-    let make_step = |job: &str, cmd: &str| {
-        step_with_caps(
-            "fixture",
-            job,
-            "structured result declaration fixture",
-            cmd.into(),
-            Vec::new(),
-            30,
-            30,
-            1024 * 1024,
-        )
-    };
-    let selector = DagManifest {
-        lane: "portable".into(),
-        category: "applications".into(),
-        test: None,
-        mode: None,
-        backend: None,
-    };
-    let mut producer = make_step(
-        "manifest_applications",
-        "target/debug/test-harness run --lane portable --category applications",
-    );
-    producer.group = "e2e".into();
-    producer.job = "manifest_applications".into();
-    producer.manifest = Some(selector.clone());
-    let ordinary = make_step("ordinary", "true");
-    let mut plan = Plan {
-        cfg: validate_plan::config_from(
-            vec![producer, ordinary],
-            "structured result declaration bracket",
-        ),
-        ..Default::default()
-    };
-    declare_structured_result_producers(&mut plan)?;
-    let producer = &plan.cfg.steps[0];
-    let manifest = producer
-        .structured_test_results_manifest()
-        .map_err(|error| format!("structured result declaration: {error}"))?
-        .ok_or("structured result declaration: registered producer has no declaration")?;
-    if manifest.owner != producer.tag()
-        || producer.effective_result_manifests().as_ref() != [selector]
-        || plan.cfg.steps[1].result_manifests.as_deref() != Some(&[])
-    {
+fn committed_rust_script_producer(root: &Path) -> Result<Step, String> {
+    let cfg = validate_plan::validation_config(root)?;
+    let producers = cfg
+        .steps
+        .iter()
+        .filter(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
+        .collect::<Vec<_>>();
+    if producers.len() != 1 {
         return Err(format!(
-            "structured result declaration: typed ownership or explicit absence changed: {:?}",
-            plan.cfg.steps
+            "committed validation DAG contains {} {RUST_SCRIPT_PRODUCER_TAG} definitions; expected exactly one",
+            producers.len()
         ));
     }
+    Ok(producers[0].clone())
+}
 
-    let mut unknown_writer = Plan {
-        cfg: validate_plan::config_from(
-            vec![make_step(
-                "unknown_writer",
-                "./ci/run-nextest-counted.sh -p fixture",
-            )],
-            "unregistered structured writer bracket",
-        ),
-        ..Default::default()
-    };
-    if !declare_structured_result_producers(&mut unknown_writer)
-        .is_err_and(|error| error.contains("unregistered structured result producer"))
-    {
-        return Err("structured result declaration: unregistered writer did not refuse".into());
+fn serialized_step(step: &Step) -> String {
+    let mut cfg = DagConfig::default();
+    cfg.steps.push(step.clone());
+    dag_to_json(&cfg)
+}
+
+fn assert_exact_rust_script_producer(
+    actual: &Step,
+    committed: &Step,
+    context: &str,
+) -> Result<(), String> {
+    if serialized_step(actual) != serialized_step(committed) {
+        return Err(format!(
+            "{context} changed the committed {RUST_SCRIPT_PRODUCER_TAG} definition"
+        ));
     }
-
-    let mut stale_registration = Plan {
-        cfg: validate_plan::config_from(
-            vec![{
-                let mut step = make_step("manifest_applications", "true");
-                step.group = "e2e".into();
-                step
-            }],
-            "stale structured writer bracket",
-        ),
-        ..Default::default()
-    };
-    if !declare_structured_result_producers(&mut stale_registration)
-        .is_err_and(|error| error.contains("no longer invokes that writer"))
-    {
-        return Err("structured result declaration: stale registration did not refuse".into());
-    }
-
-    Ok("structured results: registered writer and manifest ownership declared; non-producer absence authoritative; unregistered and stale writers refused".into())
+    Ok(())
 }
 
 fn rust_script_producer_step() -> Step {
@@ -6930,9 +6638,11 @@ fn rust_script_producer_step() -> Step {
 /// omit predecessors supplied by earlier jobs, so those plans require and check
 /// the transported producer output instead of synthesizing another writer.
 fn configure_prebuilt_rust_scripts(
+    root: &Path,
     plan: &mut Plan,
     require_external_output: bool,
 ) -> Result<(), String> {
+    let committed_producer = committed_rust_script_producer(root)?;
     for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
         if cfg.steps.is_empty() {
             continue;
@@ -6940,21 +6650,63 @@ fn configure_prebuilt_rust_scripts(
         let producer_tags: Vec<String> = cfg
             .steps
             .iter()
-            .filter(|step| {
-                step.job == "rust_scripts" && step.cmd == "./ci/prepare-rust-scripts.sh"
-            })
+            .filter(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
             .map(Step::tag)
             .collect();
+        if producer_tags.len() == 1
+            && cfg
+                .steps
+                .iter()
+                .all(|step| step.cmd.starts_with(RUST_SCRIPT_COMMAND_PREFIX))
+        {
+            let producer = cfg
+                .steps
+                .iter()
+                .find(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
+                .expect("counted exactly once");
+            assert_exact_rust_script_producer(
+                producer,
+                &committed_producer,
+                "prebuilt rust-script plan",
+            )?;
+            if !producer.cmd.ends_with("./ci/prepare-rust-scripts.sh") {
+                return Err(format!(
+                    "committed rust-script producer command drifted: {}",
+                    producer.cmd
+                ));
+            }
+            continue;
+        }
         let producer_tag = match producer_tags.as_slice() {
             [] => {
                 if require_external_output {
                     String::new()
                 } else {
-                    cfg.steps.push(rust_script_producer_step());
+                    cfg.steps.push(committed_producer.clone());
                     RUST_SCRIPT_PRODUCER_TAG.to_string()
                 }
             }
-            [tag] => tag.clone(),
+            [tag] => {
+                let producer = cfg
+                    .steps
+                    .iter()
+                    .find(|step| step.tag() == *tag)
+                    .expect("counted exactly once");
+                assert_exact_rust_script_producer(
+                    producer,
+                    &committed_producer,
+                    "prebuilt rust-script plan",
+                )?;
+                if producer.cmd != "./ci/prepare-rust-scripts.sh"
+                    && !producer.cmd.ends_with("./ci/prepare-rust-scripts.sh")
+                {
+                    return Err(format!(
+                        "rust-script producer command drifted: {}",
+                        producer.cmd
+                    ));
+                }
+                tag.clone()
+            }
             tags => {
                 return Err(format!(
                     "execution plan contains {} rust-script producer nodes ({}); exactly one may publish the script binaries",
@@ -7005,7 +6757,7 @@ fn configure_prebuilt_rust_scripts(
     Ok(())
 }
 
-fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
+fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
     let step = |job: &str, deps: Vec<String>| {
         step_with_caps("fixture", job, "fixture", "true".into(), deps, 30, 30, 1024 * 1024)
     };
@@ -7019,14 +6771,14 @@ fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
         ),
         ..Default::default()
     };
-    configure_prebuilt_rust_scripts(&mut plan, false)?;
+    configure_prebuilt_rust_scripts(root, &mut plan, false)?;
     let producer = plan
         .cfg
         .steps
         .iter()
         .find(|step| step.tag() == RUST_SCRIPT_PRODUCER_TAG)
         .ok_or("rust-script producer bracket did not add the producer")?;
-    let root = plan
+    let root_step = plan
         .cfg
         .steps
         .iter()
@@ -7039,13 +6791,13 @@ fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
         .find(|step| step.tag() == "fixture.child")
         .ok_or("rust-script producer bracket lost the child fixture")?;
     if producer.cmd != format!("{RUST_SCRIPT_COMMAND_PREFIX}./ci/prepare-rust-scripts.sh")
-        || root.deps != [RUST_SCRIPT_PRODUCER_TAG.to_string()]
+        || root_step.deps != [RUST_SCRIPT_PRODUCER_TAG.to_string()]
         || child.deps != ["fixture.root".to_string()]
-        || !root.cmd.starts_with(RUST_SCRIPT_COMMAND_PREFIX)
+        || !root_step.cmd.starts_with(RUST_SCRIPT_COMMAND_PREFIX)
         || !child.cmd.starts_with(RUST_SCRIPT_COMMAND_PREFIX)
     {
         return Err(format!(
-            "rust-script producer bracket lost its single-producer ordering or command wrapper: producer={producer:?} root={root:?} child={child:?}"
+            "rust-script producer bracket lost its single-producer ordering or command wrapper: producer={producer:?} root={root_step:?} child={child:?}"
         ));
     }
     let mut duplicated = Plan {
@@ -7055,7 +6807,7 @@ fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
         ),
         ..Default::default()
     };
-    if configure_prebuilt_rust_scripts(&mut duplicated, false).is_ok() {
+    if configure_prebuilt_rust_scripts(root, &mut duplicated, false).is_ok() {
         return Err("rust-script producer bracket accepted duplicate writers".into());
     }
     let mut transported = Plan {
@@ -7065,7 +6817,7 @@ fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
         ),
         ..Default::default()
     };
-    configure_prebuilt_rust_scripts(&mut transported, true)?;
+    configure_prebuilt_rust_scripts(root, &mut transported, true)?;
     if transported
         .cfg
         .steps
@@ -7082,12 +6834,12 @@ fn prebuilt_rust_script_plan_bracket() -> Result<String, String> {
     }
     let mut preflight = Plan {
         cfg: validate_plan::config_from(
-            validate_plan::preflight_nodes(Path::new("/repo"), false),
+            validate_plan::preflight_nodes(root)?,
             "rust-script preflight bracket",
         ),
         ..Default::default()
     };
-    configure_prebuilt_rust_scripts(&mut preflight, false)?;
+    configure_prebuilt_rust_scripts(root, &mut preflight, false)?;
     let producer = preflight
         .cfg
         .steps
@@ -7145,14 +6897,14 @@ fn select_constructed_steps(
         .map(|step| (step.tag(), step.deps.clone()))
         .collect();
     let available: BTreeSet<String> = dependencies.keys().cloned().collect();
-    if requested.contains(STRICT_COMPAT_PLACEHOLDER_TAG) {
+    if requested.contains(STRICT_COMPAT_SELECTION_ALIAS) {
         let compat: Vec<String> = available
             .iter()
             .filter(|tag| tag.starts_with("compat."))
             .cloned()
             .collect();
         if !compat.is_empty() {
-            requested.remove(STRICT_COMPAT_PLACEHOLDER_TAG);
+            requested.remove(STRICT_COMPAT_SELECTION_ALIAS);
             requested.extend(compat);
             if available.contains("compatprep.fixtures") {
                 requested.insert("compatprep.fixtures".into());
@@ -7208,6 +6960,48 @@ fn select_constructed_steps(
         }
     );
     Ok(())
+}
+
+/// Require every host capability named by the selected committed graph.
+///
+/// A committed profile is immutable at runtime: absence refuses the requested
+/// profile before the scheduler starts instead of deleting nodes and silently
+/// changing its denominator.
+fn require_host_capabilities(root: &Path, plan: &Plan) -> Result<(), String> {
+    let requirements = validate_plan::host_capability_requirements(root)?;
+    let mut needed = BTreeMap::<validate_plan::HostCapability, Vec<String>>::new();
+    for step in &plan.cfg.steps {
+        if let Some(capability) = requirements.get(&step.tag()) {
+            needed.entry(*capability).or_default().push(step.tag());
+        }
+    }
+    let mut absent = Vec::new();
+    for (capability, mut steps) in needed {
+        steps.sort();
+        let verdict = validate_plan::probe_host_capability(capability);
+        println!(
+            "Host capability {}: {} — {}",
+            capability.value(),
+            if verdict.present { "PRESENT" } else { "ABSENT" },
+            verdict.evidence
+        );
+        if !verdict.present {
+            absent.push(format!(
+                "{} required by {}: {}",
+                capability.value(),
+                steps.join(", "),
+                verdict.evidence
+            ));
+        }
+    }
+    if absent.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "requested committed profile requires unavailable host capability/capabilities; no nodes were removed: {}",
+            absent.join("; ")
+        ))
+    }
 }
 
 /// Withhold every planned node this MACHINE provably cannot run, and say so.
@@ -7820,18 +7614,6 @@ fn attach_compatibility_scorecard(
     Ok(())
 }
 
-/// Reuse the versioned nextest installer verbatim in focused plans instead of
-/// copying its pinned version or network fallback into a second source.
-fn nextest_setup_node(
-    root: &Path,
-    gate: &str,
-) -> Result<dagrun::model::Step, String> {
-    validate_plan::lane_nodes(root, "portable", "", gate)?
-        .into_iter()
-        .find(|step| step.tag() == "setup.nextest")
-        .ok_or_else(|| "portable DAG lost setup.nextest".to_string())
-}
-
 /// Replace a prefix inside pressure-test's single-quoted path/value words with
 /// one runtime environment expression. Pressure owns the exact commands and
 /// their quoting; validate changes only the two invocation-scoped values that
@@ -8146,59 +7928,8 @@ fn materialize_requalification_plan(
 
 /// Build the execution plan for the selected level/mode.
 fn build_source_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
-    let with_proxy = has_cmd("with-proxy");
-    let pre = validate_plan::preflight_nodes(root, with_proxy);
+    let pre = validate_plan::preflight_nodes(root)?;
     let gate = "gate.manifest";
-
-    // Focused compatibility matrices.
-    let compat_mode = match &args.focused {
-        Some(Focused::StrictCompat) => Some(CompatMode::Strict),
-        Some(Focused::PortableStrictCompat) => Some(CompatMode::PortableStrict),
-        Some(Focused::SabreCompat) => Some(CompatMode::Sabre),
-        Some(Focused::E9patchCompat) => Some(CompatMode::E9patch),
-        Some(Focused::RrCompat) => Some(CompatMode::Rr),
-        _ => None,
-    };
-    if let Some(mode) = compat_mode {
-        let hermit_bin = std::env::var("STRICT_COMPAT_HERMIT_BIN")
-            .unwrap_or_else(|_| root.join("target/release/hermit").to_string_lossy().into());
-        let fixtures = root.join(format!("target/real-compat-fixtures-{}", std::process::id()));
-        let nsswitch = tmp.join("e9patch-nsswitch.conf");
-        let shell_build = tmp.join("shell-build");
-        let paths = validate_corpus::CorpusPaths {
-            root_dir: &root.to_string_lossy(),
-            real_compat_fixtures: &fixtures.to_string_lossy(),
-            validation_tmp_dir: &tmp.to_string_lossy(),
-            shell_build_dir: &shell_build.to_string_lossy(),
-        };
-        let mut steps = pre;
-        // The corpus needs a release Hermit and the functional fixtures; both are
-        // DAG nodes so they are boxed and timed like everything else.
-        steps.push(build_release_hermit_node(gate, &hermit_bin));
-        steps.push(prepare_fixtures_node("compatprep.fixtures", &fixtures));
-        if mode == CompatMode::E9patch {
-            steps.push(nsswitch_fixture_node(&nsswitch));
-        }
-        steps.extend(validate_plan::compat_nodes(
-            root,
-            mode,
-            &hermit_bin,
-            &nsswitch.to_string_lossy(),
-            &paths,
-            Some("compatprep.fixtures"),
-        )?);
-        let profile = args.focused.as_ref().unwrap().profile();
-        let cfg = validate_plan::config_from(steps, &format!("compatibility matrix: {mode:?}"));
-        return Ok(Plan {
-            planned_test_nodes: test_nodes_of(&cfg),
-            cfg,
-            second: None,
-            profile,
-            selection_mode: "full",
-            compat: Some(mode),
-            ..Default::default()
-        });
-    }
 
     // Focused single-node mode: run the SELECTED lane node(s) as ordinary steps
     // of THIS run's own boxed DAG.
@@ -8242,7 +7973,7 @@ fn build_source_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, Strin
         // CARRY the lane's top-level config. `config_from` would substitute
         // DagConfig::default(), dropping resource_caps and default_step_timeout;
         // see config_from_base's note on the 14-minute 0%-CPU hang that caused.
-        let mut base = validate_plan::lane_config(root, lane)?;
+        let base = validate_plan::lane_config(root, lane)?;
         let mut requested: BTreeSet<String> = nodes
             .split(',')
             .map(str::trim)
@@ -8252,9 +7983,6 @@ fn build_source_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, Strin
         if requested.is_empty() {
             return Err("--only needs at least one <group.job> node tag".into());
         }
-        let wants_compat = requested.contains(STRICT_COMPAT_PLACEHOLDER_TAG)
-            || requested.contains("compatprep.fixtures")
-            || requested.iter().any(|tag| tag.starts_with("compat."));
         let mut lane_steps = validate_plan::lane_nodes(root, lane, "", gate)?;
         // The lane is independently runnable, so it carries its own manifest-plan
         // producer. Validate's canonical preflight already carries the same tag
@@ -8266,18 +7994,6 @@ fn build_source_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, Strin
             &mut lane_steps,
             &format!("--only lane {lane}"),
         )?;
-        let mut expanded = validate_plan::config_from_base(
-            &base,
-            lane_steps,
-            "selected lane before filtering",
-        );
-        let compat = if lane == "portable" && wants_compat {
-            expand_portable_strict_compat(root, tmp, &mut expanded)?
-        } else {
-            false
-        };
-        base.resource_caps = expanded.resource_caps.clone();
-        let lane_steps = expanded.steps;
         let manifest_plan_consumers: BTreeSet<String> = base
             .steps
             .iter()
@@ -8288,7 +8004,7 @@ fn build_source_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, Strin
             .map(|step| step.tag())
             .collect();
 
-        if requested.remove(STRICT_COMPAT_PLACEHOLDER_TAG) {
+        if requested.remove(STRICT_COMPAT_SELECTION_ALIAS) {
             requested.insert("compatprep.fixtures".into());
             requested.extend(
                 lane_steps
@@ -8334,6 +8050,10 @@ fn build_source_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, Strin
         }
         let selected: BTreeSet<String> =
             requested.iter().filter(|t| available.contains(*t)).cloned().collect();
+        let compat = lane == "portable"
+            && selected
+                .iter()
+                .any(|tag| tag == "compatprep.fixtures" || tag.starts_with("compat."));
         let mut dropped: BTreeSet<String> = BTreeSet::new();
         for mut step in lane_steps.into_iter().filter(|s| selected.contains(&s.tag())) {
             // Same selection semantics run-node.sh documented for `run --only`:
@@ -8451,99 +8171,6 @@ fn build_source_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, Strin
         });
     }
 
-    // Focused liteinst matrix (validate.sh:4815): three ordered gates.
-    if matches!(args.focused, Some(Focused::LiteinstCompat)) {
-        let mut steps = pre;
-        steps.push(nextest_setup_node(root, gate)?);
-        steps.push(step_with_caps("liteinst", "hermit_release", "Release Hermit for LiteInst compatibility",
-            "cargo build --release --locked -p hermit --features third-party-backends".into(),
-            vec![gate.to_string()], 1200, 3600, 16 * 1024 * 1024 * 1024));
-        steps.push(step_with_caps("liteinst", "runtime", "Release LiteInst runtime",
-            "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build".into(),
-            vec!["liteinst.hermit_release".into()], 900, 1800, 8 * 1024 * 1024 * 1024));
-        steps.push(step_with_caps("liteinst", "strict", "Portable CI liteinst_strict",
-            "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test liteinst_advanced -j 1".into(),
-            vec!["liteinst.runtime".into(), "setup.nextest".into()], 900, 1800, 8 * 1024 * 1024 * 1024));
-        let cfg = validate_plan::config_from(steps, "liteinst compatibility");
-        return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
-            profile: args.focused.as_ref().unwrap().profile(), selection_mode: "full",
-            ..Default::default() });
-    }
-
-    // Focused QEMU L2 boot (validate.sh:4860). Heavyweight; two ordered gates.
-    if matches!(args.focused, Some(Focused::QemuL2)) {
-        let mut steps = pre;
-        steps.push(step_with_caps("qemu", "hermit_release", "Release Hermit for QEMU L2",
-            "cargo build --release -p hermit --features third-party-backends".into(),
-            vec![gate.to_string()], 3600, 7200, 16 * 1024 * 1024 * 1024));
-        steps.push(step_with_caps("qemu", "strict_l2_boot", "QEMU strict L2 boot (heavyweight)",
-            "./tests/qemu-boot/strict_l2_test.sh".into(),
-            vec!["qemu.hermit_release".into()], 1500, 3000, 16 * 1024 * 1024 * 1024));
-        let cfg = validate_plan::config_from(steps, "QEMU L2 boot");
-        return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
-            profile: args.focused.as_ref().unwrap().profile(), selection_mode: "full",
-            ..Default::default() });
-    }
-
-    // `quick` is NOT "the portable lane" — it is seven specific smoke gates
-    // (validate.sh:4583). Mapping it onto a lane would run a different, much
-    // larger thing under the same name.
-    if args.level == Level::Quick && args.focused.is_none() {
-        let hermit = "target/debug/hermit";
-        let marker = "hermit-validation-smoke";
-        let run_args = "run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled";
-        let mut steps = pre;
-        steps.push(nextest_setup_node(root, gate)?);
-        let mut add = |job: &str, desc: &str, cmd: String, deps: Vec<String>, t: i64, mem: i64| {
-            steps.push(step_with_caps("quick", job, desc, cmd, deps, t, t * 2, mem));
-        };
-        add("build", "Build workspace", "cargo build --workspace --features third-party-backends".into(), vec![gate.into()], 3600, 16 * 1024 * 1024 * 1024);
-        add("e2e_metadata", "Portable E2E metadata", MANIFEST_AUDIT_COMMAND.into(), vec!["quick.build".into()], 600, 4 * 1024 * 1024 * 1024);
-        add("e2e_verify", "Portable ptrace E2E verification", "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], QUICK_E2E_VERIFY_TIMEOUT_S, 8 * 1024 * 1024 * 1024);
-        add("detcore_unit", "Detcore core unit tests", "./ci/run-nextest-counted.sh -p hermit-detcore --lib".into(), vec!["quick.build".into(), "setup.nextest".into()], 1800, 8 * 1024 * 1024 * 1024);
-        add("run_smoke", "Hermit run smoke test",
-            format!("out=$(timeout 30s {hermit} {run_args} -- /bin/echo {marker}) && test \"$out\" = {marker}"),
-            vec!["quick.build".into()], 120, 4 * 1024 * 1024 * 1024);
-        add("verify_smoke", "Hermit verify-mode smoke test",
-            format!("timeout 30s {hermit} {run_args} --verify -- /bin/echo {marker}"),
-            vec!["quick.build".into()], 120, 4 * 1024 * 1024 * 1024);
-        add("record_replay_smoke", "Hermit record/replay smoke test",
-            format!("timeout 30s {hermit} record start --verify -- /bin/echo {marker}"),
-            vec!["quick.build".into()], 180, 4 * 1024 * 1024 * 1024);
-        let cfg = validate_plan::config_from(steps, "quick smoke suite");
-        return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
-            profile: "quick".into(), selection_mode: "full", ..Default::default() });
-    }
-
-    // The `super` stress/diagnostic suite (validate.sh:4702).
-    if args.level == Level::Super && args.focused.is_none() {
-        return super_plan(root, tmp, pre, gate);
-    }
-
-    // Working-envelope measurement (validate.sh:4173). A MEASUREMENT, not a
-    // gate: probe failures lower a count and never abort, so keep-going is
-    // forced and every probe node is nonblocking.
-    if let Some(Focused::Envelope { baseline }) = &args.focused {
-        let reps = validate_envelope::l4_reps();
-        let hermit_bin = root.join("target/debug/hermit").to_string_lossy().into_owned();
-        let mut steps = pre;
-        steps.push(validate_envelope::build_node(gate));
-        let probes = validate_envelope::nodes(&hermit_bin, reps, "envelope.build");
-        let nonblocking: BTreeSet<String> = probes.iter().map(|s| s.tag()).collect();
-        steps.extend(probes);
-        let cfg = validate_plan::config_from(steps, "working-envelope measurement");
-        return Ok(Plan {
-            planned_test_nodes: test_nodes_of(&cfg),
-            cfg,
-            profile: "envelope-only".into(),
-            envelope: Some(EnvelopePlan { reps, baseline: baseline.clone() }),
-            nonblocking,
-            force_keep_going: true,
-            cacheable: false,
-            ..Default::default()
-        });
-    }
-
     // Node-level `--selective` / `--since-green` (validate.sh:4421).
     if let Some(Focused::Selective { shallow }) = &args.focused {
         return selective_plan(root, args, tmp, pre, gate, *shallow);
@@ -8602,13 +8229,13 @@ fn build_source_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, Strin
         // them as two sequential DAGs lets each keep its own exactly.
         let base_a = validate_plan::lane_config(root, lanes[0])?;
         let base_b = validate_plan::lane_config(root, lanes[1])?;
-        let mut cfg_a = validate_plan::config_from_base(&base_a, a, "portable lane");
+        let cfg_a = validate_plan::config_from_base(&base_a, a, "portable lane");
         let cfg_b = validate_plan::config_from_base(&base_b, b, "privileged lane");
         for (base, derived, lane) in [(&base_a, &cfg_a, lanes[0]), (&base_b, &cfg_b, lanes[1])] {
             validate_plan::assert_config_carried(base, derived)
                 .map_err(|e| format!("lane {lane}: DAG config was not carried: {e}"))?;
         }
-        let compat = expand_portable_strict_compat(root, tmp, &mut cfg_a)?;
+        let compat = cfg_a.steps.iter().any(|step| step.group == "compat");
         let mut planned = test_nodes_of(&cfg_a);
         planned.extend(test_nodes_of(&cfg_b));
         return Ok(Plan {
@@ -8760,9 +8387,9 @@ fn build_source_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, Strin
     if lanes.len() == 2 {
         assert_fused_shared_integration_test_resources(&steps, &fused.resource_caps)?;
     }
-    let mut cfg = validate_plan::config_from_base(&fused, steps, "fused lanes");
+    let cfg = validate_plan::config_from_base(&fused, steps, "fused lanes");
     let compat = lanes.contains(&"portable")
-        && expand_portable_strict_compat(root, tmp, &mut cfg)?;
+        && cfg.steps.iter().any(|step| step.group == "compat");
     Ok(Plan {
         planned_test_nodes: test_nodes_of(&cfg),
         cfg,
@@ -8780,11 +8407,133 @@ fn build_source_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, Strin
 
 /// Runtime plan construction boundary.
 ///
-/// Commit 1 keeps this delegation byte-for-byte equivalent while the generated
-/// superset and freshness checks land. Commit 2 changes only this boundary for
-/// standard profiles to select the committed DAG by label; the source builder
-/// remains reachable solely through `--write-source-plan` for regeneration.
+/// Standard profiles select the single committed superset by label. Focused
+/// diagnostic modes still construct their deliberately narrower plans here;
+/// they do not remix any of the standard validation profiles.
 fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
+    let committed_label = match (&args.focused, args.level) {
+        (Some(Focused::PrivilegedOnly), _) => Some("privileged"),
+        (Some(Focused::StrictCompat), _) => Some("strict-compat-only"),
+        (Some(Focused::PortableStrictCompat), _) => Some("portable-strict-compat-only"),
+        (Some(Focused::RrCompat), _) => Some("rr-compat-only"),
+        (Some(Focused::SabreCompat), _) => Some("sabre-compat-only"),
+        (Some(Focused::E9patchCompat), _) => Some("e9patch-compat-only"),
+        (Some(Focused::LiteinstCompat), _) => Some("liteinst-compat-only"),
+        (Some(Focused::QemuL2), _) => Some("qemu-l2-only"),
+        (Some(Focused::Envelope { .. }), _) => Some("envelope-only"),
+        (None, Level::Quick) => Some("quick"),
+        (None, Level::PortableOnly) => Some("portable"),
+        (None, Level::Full) => Some("full"),
+        (None, Level::Super) => Some("super"),
+        _ => None,
+    };
+    if let Some(label) = committed_label {
+        if label == "super" && validate_super::repetitions() != validate_super::SUPER_REPETITIONS_DEFAULT
+        {
+            return Err(format!(
+                "SUPER_REPETITIONS cannot change the committed super graph; regenerate ci/dag/validate.json to change its {} repetitions",
+                validate_super::SUPER_REPETITIONS_DEFAULT
+            ));
+        }
+        if label == "envelope-only"
+            && validate_envelope::l4_reps() != validate_envelope::L4_REPS_DEFAULT
+        {
+            return Err(format!(
+                "L4_REPS cannot change the committed envelope graph; regenerate ci/dag/validate.json to change its {} repetitions",
+                validate_envelope::L4_REPS_DEFAULT
+            ));
+        }
+        let mut cfg = validate_plan::lane_config(root, label)?;
+        let mut selection_mode = "label";
+        if let Some(selected) = args.selected.as_deref() {
+            let mut tags = selected
+                .split(',')
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>();
+            if tags.is_empty() {
+                return Err("--selected needs at least one group.job tag".into());
+            }
+            if tags.remove(STRICT_COMPAT_SELECTION_ALIAS) {
+                let compat = cfg
+                    .steps
+                    .iter()
+                    .filter(|step| {
+                        step.tag() == "compatprep.fixtures" || step.group == "compat"
+                    })
+                    .map(Step::tag)
+                    .collect::<Vec<_>>();
+                if compat.is_empty() {
+                    return Err(format!(
+                        "{STRICT_COMPAT_SELECTION_ALIAS} is not part of the committed {label} profile"
+                    ));
+                }
+                tags.extend(compat);
+            }
+            cfg = dagrun::select_steps_by_tags(
+                &cfg,
+                &tags.into_iter().collect::<Vec<_>>(),
+                args.ignore_selected_deps,
+            )?;
+            selection_mode = "selected";
+        }
+        let (compat, compat_prefix) = match label {
+            "portable" | "full" if cfg.steps.iter().any(|step| step.group == "compat") => {
+                (Some(CompatMode::PortableStrict), Some("compat."))
+            }
+            "strict-compat-only" => (Some(CompatMode::Strict), Some("strictcompat.")),
+            "portable-strict-compat-only" => {
+                (Some(CompatMode::PortableStrict), Some("portablecompat."))
+            }
+            "rr-compat-only" => (Some(CompatMode::Rr), Some("rrcompat.")),
+            "sabre-compat-only" => (Some(CompatMode::Sabre), Some("sabrecompat.")),
+            "e9patch-compat-only" => (Some(CompatMode::E9patch), Some("e9patchcompat.")),
+            _ => (None, None),
+        };
+        let nonblocking = if label == "super" {
+            cfg.steps
+                .iter()
+                .filter(|step| {
+                    step.tag().starts_with("superstress.kvm_")
+                        || step.tag().starts_with("superstress.dbt_")
+                })
+                .map(Step::tag)
+                .collect()
+        } else if label == "envelope-only" {
+            cfg.steps
+                .iter()
+                .filter(|step| step.group == "envelope" && step.job != "build")
+                .map(Step::tag)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let committed_selection = Some(dag_to_json(&cfg));
+        return Ok(Plan {
+            planned_test_nodes: test_nodes_of(&cfg),
+            cfg,
+            committed_selection,
+            second: None,
+            profile: label.to_string(),
+            selection_mode,
+            compat,
+            compat_prefix,
+            suite_complete: label == "full" && args.selected.is_none(),
+            super_mode: label == "super",
+            envelope: match &args.focused {
+                Some(Focused::Envelope { baseline }) => Some(EnvelopePlan {
+                    reps: validate_envelope::L4_REPS_DEFAULT,
+                    baseline: baseline.clone(),
+                }),
+                _ => None,
+            },
+            nonblocking,
+            force_keep_going: label == "envelope-only",
+            cacheable: args.selected.is_none() && !matches!(label, "portable" | "full"),
+            ..Default::default()
+        });
+    }
     build_source_plan(root, args, tmp)
 }
 
@@ -8807,128 +8556,211 @@ fn materialize_source_cpu_timeouts(cfg: &mut DagConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// Build the `super` plan from the mechanically extracted gate table.
-///
-/// Dependency policy — the bash ran all 32 rows strictly sequentially through
-/// `run_check`, so ANY edge set that preserves the real prerequisites is a
-/// faithful port and a strictly better schedule. The prerequisites are:
-///   * the two build rows gate everything that needs a binary;
-///   * `run_exact_detcore_cases` is FAIL-FAST within its group
-///     (validate.sh:4514), reproduced by chaining those rows so a failure SKIPS
-///     the rest instead of running them;
-///   * the LevelDB test needs its fixture built first.
-/// Everything else is independent and is allowed to overlap.
-fn super_plan(
+fn generated_focused_compat_partition(
     root: &Path,
     tmp: &Path,
-    pre: Vec<dagrun::model::Step>,
-    gate: &str,
-) -> Result<Plan, String> {
-    let gates = validate_super::load_gates(root)?;
-    let reps = validate_super::repetitions();
-    let build_ws = "super.build_workspace".to_string();
-    let build_rel = "super.build_release_hermit".to_string();
-    let debug_bin = root.join("target/debug/hermit").to_string_lossy().into_owned();
-    let release_bin = std::env::var("STRICT_COMPAT_HERMIT_BIN")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| root.join("target/release/hermit").to_string_lossy().into_owned());
+    mode: CompatMode,
+    namespace: &str,
+    label: &str,
+) -> Result<Vec<Step>, String> {
+    let run_root = tmp.join(namespace);
+    let fixtures = run_root.join("real-compat-fixtures");
+    let shell_build = run_root.join("shell-build");
+    let nsswitch = run_root.join("nsswitch.conf");
+    let paths = validate_corpus::CorpusPaths {
+        root_dir: &root.to_string_lossy(),
+        real_compat_fixtures: &fixtures.to_string_lossy(),
+        validation_tmp_dir: &run_root.to_string_lossy(),
+        shell_build_dir: &shell_build.to_string_lossy(),
+    };
+    let prep_tag = format!("{namespace}prep.fixtures");
+    let mut prep = prepare_fixtures_node_dep(&prep_tag, &fixtures, "build.runtime_release");
+    prep.group = format!("{namespace}prep");
+    prep.labels = vec![label.into()];
 
-    let mut steps = pre;
-    steps.push(nextest_setup_node(root, gate)?);
-    let mut nonblocking: BTreeSet<String> = BTreeSet::new();
-    // `run_exact_detcore_cases` labels its rows "<group>: <case>"; consecutive
-    // rows sharing a group prefix are one fail-fast family. Deriving the chain
-    // from the label SHAPE keeps it correct if a case is added or removed.
-    let family = |label: &str| label.split_once(": ").map(|(g, _)| g.to_string());
-    let mut prev_family: Option<(String, String)> = None; // (family, previous tag)
-
-    for g in &gates {
-        let mut deps = match g.job.as_str() {
-            "build_workspace" | "build_release_hermit" => vec![gate.to_string()],
-            "full_leveldb_strict_determinism" => {
-                vec!["super.build_pinned_leveldb_super_fixture".to_string()]
-            }
-            _ => vec![build_ws.clone()],
-        };
-        if g.argv.windows(3).any(|w| w == ["cargo", "nextest", "run"]) {
-            deps.push("setup.nextest".to_string());
-        }
-        match g.synthetic.as_deref() {
-            Some("portable_slow_strict_diagnostics") => {
-                // The four PORTABLE_STRICT_SUPER_ONLY workloads, run with the
-                // portable-strict flags after the shared functional fixtures are
-                // prepared (validate.sh:4603).
-                let fixtures = root.join(format!("target/real-compat-fixtures-{}", std::process::id()));
-                steps.push(prepare_fixtures_node_dep("compatprep.fixtures", &fixtures, &build_rel));
-                let only: BTreeSet<String> =
-                    validate_corpus::portable_super_only().keys().map(|k| k.to_string()).collect();
-                let shell_build = tmp.join("shell-build");
-                let paths = validate_corpus::CorpusPaths {
-                    root_dir: &root.to_string_lossy(),
-                    real_compat_fixtures: &fixtures.to_string_lossy(),
-                    validation_tmp_dir: &tmp.to_string_lossy(),
-                    shell_build_dir: &shell_build.to_string_lossy(),
-                };
-                steps.extend(validate_plan::compat_nodes_for(
-                    root,
-                    CompatMode::PortableStrict,
-                    &release_bin,
-                    "",
-                    &paths,
-                    Some("compatprep.fixtures"),
-                    Some(&only),
-                    Some(g.wall()),
-                )?);
-            }
-            Some("super_stress_suite") => {
-                let stress =
-                    validate_super::stress_nodes(&release_bin, &debug_bin, tmp, reps, &build_rel, &build_ws);
-                steps.extend(stress);
-                nonblocking.extend(validate_super::nonblocking_tags(reps));
-            }
-            Some("calibrated_analyze_tests") => {
-                let mut deps = deps;
-                deps.push("setup.nextest".to_string());
-                steps.push(validate_super::calibrated_analyze_node(g, deps));
-            }
-            Some(other) => {
-                return Err(format!(
-                    "ci/super/gates.json row {} names an unknown synthetic expansion `{other}`; \
-                     refusing to skip it silently",
-                    g.job
-                ))
-            }
-            None => {
-                // Fail-fast chaining inside a `run_exact_detcore_cases` family. The edge
-                // preserves the established serial order; the explicit family also preserves
-                // eager cancellation if a later plan transformation makes two members runnable.
-                let mut deps = deps;
-                let declared_family = family(&g.label);
-                if let Some(f) = declared_family.as_ref() {
-                    if let Some((pf, ptag)) = &prev_family {
-                        if pf == f {
-                            deps = vec![ptag.clone()];
-                        }
-                    }
-                    prev_family = Some((f.clone(), format!("super.{}", g.job)));
-                } else {
-                    prev_family = None;
-                }
-                let mut step = validate_super::gate_node(g, deps);
-                step.fail_fast_family =
-                    declared_family.map(|family| format!("super.{family}"));
-                steps.push(step);
-            }
-        }
+    let mut steps = Vec::new();
+    if mode == CompatMode::E9patch {
+        let mut nss = nsswitch_fixture_node(&nsswitch);
+        nss.group = format!("{namespace}prep");
+        nss.labels = vec![label.into()];
+        nss.deps = vec!["build.runtime_release".into()];
+        prep.deps.push(nss.tag());
+        steps.push(nss);
     }
-    let cfg = validate_plan::config_from(steps, "super stress + diagnostic suite");
+    steps.push(prep);
+    let mut probes = validate_plan::compat_nodes(
+        root,
+        mode,
+        &root.join("target/release/hermit").to_string_lossy(),
+        &nsswitch.to_string_lossy(),
+        &paths,
+        Some(&prep_tag),
+    )?;
+    for step in &mut probes {
+        step.group = namespace.into();
+        step.labels = vec![label.into()];
+    }
+    steps.extend(probes);
+    Ok(steps)
+}
+
+/// Rebuild only the mechanically derived partition of the committed DAG.
+///
+/// Static nodes are authored directly in `ci/dag/validate.json`. Compatibility
+/// rows come from the checked-in corpus, while stress repetitions come from the
+/// typed probe definitions below. Keeping this output separate lets the
+/// maintenance generator replace generated rows without treating a valid edit
+/// to an authoritative static node as stale.
+fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, String> {
+    let committed_path = root.join("ci/dag/validate.json");
+    let committed_text = std::fs::read_to_string(&committed_path)
+        .map_err(|error| format!("cannot read {}: {error}", committed_path.display()))?;
+    let committed = dag_from_json(&committed_text)
+        .map_err(|error| format!("invalid {}: {error}", committed_path.display()))?;
+    let anchor_tags = [
+        "build.runtime_release",
+        "gate.manifest",
+        "setup.nextest",
+        "doc.doctests",
+        "doc.rustdoc",
+        "lint.clippy",
+        "test.detcore_unit",
+        "test.hermit_unit",
+        "test.regular_crates",
+        "test.rr_suite_contract",
+        "super.build_release_hermit",
+        "super.build_workspace",
+    ];
+    let mut steps = anchor_tags
+        .iter()
+        .map(|tag| {
+            committed
+                .steps
+                .iter()
+                .find(|step| step.tag() == *tag)
+                .cloned()
+                .ok_or_else(|| format!("committed DAG lost generated-node dependency {tag}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for step in &mut steps {
+        step.deps.clear();
+        step.labels = vec!["generator-dependency-anchor".into()];
+    }
+
+    let portable_root = tmp.join("strict-compat");
+    let portable_fixtures = portable_root.join("real-compat-fixtures");
+    let portable_shell_build = portable_root.join("shell-build");
+    let portable_paths = validate_corpus::CorpusPaths {
+        root_dir: &root.to_string_lossy(),
+        real_compat_fixtures: &portable_fixtures.to_string_lossy(),
+        validation_tmp_dir: &portable_root.to_string_lossy(),
+        shell_build_dir: &portable_shell_build.to_string_lossy(),
+    };
+    let mut portable_prep = prepare_fixtures_node("compatprep.fixtures", &portable_fixtures);
+    portable_prep.deps = [
+        "build.runtime_release",
+        "doc.doctests",
+        "doc.rustdoc",
+        "lint.clippy",
+        "test.detcore_unit",
+        "test.hermit_unit",
+        "test.regular_crates",
+        "test.rr_suite_contract",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    portable_prep.desc = "Functional compatibility fixtures for direct outer-DAG probes".into();
+    portable_prep.description = format!(
+        "Generated for this validation under {}; the former nested scheduler is not invoked.",
+        portable_root.display()
+    );
+    portable_prep.labels = vec!["full".into(), "portable".into()];
+    steps.push(portable_prep);
+    let mut portable = validate_plan::compat_nodes(
+        root,
+        CompatMode::PortableStrict,
+        &root.join("target/ci/hermit-strict").to_string_lossy(),
+        "",
+        &portable_paths,
+        Some("compatprep.fixtures"),
+    )?;
+    for step in &mut portable {
+        step.labels = vec!["full".into(), "portable".into()];
+    }
+    steps.extend(portable);
+
+    for (mode, namespace, label) in [
+        (
+            CompatMode::PortableStrict,
+            "portablecompat",
+            "portable-strict-compat-only",
+        ),
+        (CompatMode::Strict, "strictcompat", "strict-compat-only"),
+        (CompatMode::Sabre, "sabrecompat", "sabre-compat-only"),
+        (CompatMode::E9patch, "e9patchcompat", "e9patch-compat-only"),
+        (CompatMode::Rr, "rrcompat", "rr-compat-only"),
+    ] {
+        steps.extend(generated_focused_compat_partition(
+            root, tmp, mode, namespace, label,
+        )?);
+    }
+
+    let super_fixtures = tmp.join("super-compat-fixtures");
+    let super_shell_build = tmp.join("super-compat-shell-build");
+    let super_paths = validate_corpus::CorpusPaths {
+        root_dir: &root.to_string_lossy(),
+        real_compat_fixtures: &super_fixtures.to_string_lossy(),
+        validation_tmp_dir: &tmp.to_string_lossy(),
+        shell_build_dir: &super_shell_build.to_string_lossy(),
+    };
+    let mut super_prep = prepare_fixtures_node_dep(
+        "super-compatprep.fixtures",
+        &super_fixtures,
+        "super.build_release_hermit",
+    );
+    super_prep.group = "super-compatprep".into();
+    super_prep.labels = vec!["super".into()];
+    steps.push(super_prep);
+    let only = validate_corpus::portable_super_only()
+        .keys()
+        .map(|label| label.to_string())
+        .collect::<BTreeSet<_>>();
+    let mut super_compat = validate_plan::compat_nodes_for(
+        root,
+        CompatMode::PortableStrict,
+        &root.join("target/release/hermit").to_string_lossy(),
+        "",
+        &super_paths,
+        Some("super-compatprep.fixtures"),
+        Some(&only),
+        Some(validate_super::DEFAULT_GATE_TIMEOUT_S),
+    )?;
+    for step in &mut super_compat {
+        step.labels = vec!["super".into()];
+    }
+    steps.extend(super_compat);
+
+    let mut stress = validate_super::stress_nodes(
+        &root.join("target/release/hermit").to_string_lossy(),
+        &root.join("target/debug/hermit").to_string_lossy(),
+        tmp,
+        validate_super::repetitions(),
+        "super.build_release_hermit",
+        "super.build_workspace",
+    );
+    for step in &mut stress {
+        step.labels = vec!["super".into()];
+    }
+    steps.extend(stress);
+
+    let cfg = validate_plan::config_from(steps, "generated validation DAG partition");
     Ok(Plan {
         planned_test_nodes: test_nodes_of(&cfg),
         cfg,
-        profile: "super".into(),
-        super_mode: true,
-        nonblocking,
+        profile: "generated-validation-dag".into(),
+        selection_mode: "generator".into(),
+        cacheable: false,
         ..Default::default()
     })
 }
@@ -8964,7 +8796,7 @@ fn apply_selective_decision(
             let sel = validate_plan::select_lane_nodes(all, &keep);
             if !sel.unknown_tags.is_empty() {
                 return Err(format!(
-                    "select-tests.rs named {} node(s) absent from ci/dag/portable.json ({}); the \
+                    "select-tests.rs named {} node(s) absent from the portable validate label ({}); the \
                      selector and the DAG disagree, so refusing to run a subset derived from a \
                      stale mapping",
                     sel.unknown_tags.len(),
@@ -9053,7 +8885,7 @@ fn ask_selector(root: &Path, baseline: Option<&str>) -> SelectDecision {
 fn selective_plan(
     root: &Path,
     args: &Args,
-    tmp: &Path,
+    _tmp: &Path,
     pre: Vec<dagrun::model::Step>,
     gate: &str,
     shallow: bool,
@@ -9097,10 +8929,10 @@ fn selective_plan(
     let steps = apply_selective_decision(all, total, decision)?;
     let mut nodes = pre;
     nodes.extend(steps);
-    let mut cfg = validate_plan::config_from_base(&base, nodes, "selective portable subset");
+    let cfg = validate_plan::config_from_base(&base, nodes, "selective portable subset");
     validate_plan::assert_config_carried(&base, &cfg)
         .map_err(|error| format!("selective portable DAG config was not carried: {error}"))?;
-    let compat = expand_portable_strict_compat(root, tmp, &mut cfg)?;
+    let compat = cfg.steps.iter().any(|step| step.group == "compat");
     Ok(Plan {
         planned_test_nodes: test_nodes_of(&cfg),
         cfg,
@@ -9340,130 +9172,22 @@ fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> dagrun::model::Step {
     prepare_fixtures_node_dep(_tag, fixtures, "compatprep.hermit_release")
 }
 
-/// Replace the portable lane's reviewed expansion marker with the actual
-/// strict-compatibility work in this run's ONE outer graph.
-///
-/// The corpus remains data in `ci/compat/corpus-strict.json`; committing 189
-/// copies of its rendered shell commands made the old flattening patch exceed
-/// five thousand lines and created a second source of truth.  Expanding at plan
-/// construction keeps the shipped lane small while still giving dagrun one
-/// typed, independently boxed `compat.*` step per probe.
-///
-/// Every host-visible scratch path is below `tmp`, which is already unique to
-/// this validate process (`target/validation/run-<pid>` in production).  The
-/// guest working directory is a fresh tmpfs at `/test`, selected by
-/// [`CompatMode::PortableStrict::run_args`], so neither concurrent validations
-/// nor the two runs inside `--verify` share mutable working-directory state.
-fn expand_portable_strict_compat(
-    root: &Path,
-    tmp: &Path,
-    cfg: &mut DagConfig,
-) -> Result<bool, String> {
-    let matches: Vec<usize> = cfg
-        .steps
-        .iter()
-        .enumerate()
-        .filter_map(|(index, step)| (step.tag() == STRICT_COMPAT_PLACEHOLDER_TAG).then_some(index))
-        .collect();
-    let Some(index) = matches.first().copied() else {
-        return Ok(false);
-    };
-    if matches.len() != 1 {
-        return Err(format!(
-            "portable strict compatibility has {} {STRICT_COMPAT_PLACEHOLDER_TAG} markers; expected exactly one",
-            matches.len()
-        ));
-    }
-    if cfg
-        .steps
-        .iter()
-        .any(|step| step.group == "compat" || step.tag() == "compatprep.fixtures")
-    {
-        return Err(
-            "portable strict compatibility marker coexists with already-expanded compat nodes"
-                .into(),
-        );
-    }
-
-    let placeholder = cfg.steps.remove(index);
-    if placeholder.cmd != STRICT_COMPAT_PLACEHOLDER_COMMAND {
-        return Err(format!(
-            "{STRICT_COMPAT_PLACEHOLDER_TAG} is not the reviewed expansion marker: {:?}",
-            placeholder.cmd
-        ));
-    }
-
-    let run_root = tmp.join("strict-compat");
-    let fixtures = run_root.join("real-compat-fixtures");
-    let shell_build = run_root.join("shell-build");
-    let hermit_bin = root.join("target/ci/hermit-strict");
-    let paths = validate_corpus::CorpusPaths {
-        root_dir: &root.to_string_lossy(),
-        real_compat_fixtures: &fixtures.to_string_lossy(),
-        validation_tmp_dir: &run_root.to_string_lossy(),
-        shell_build_dir: &shell_build.to_string_lossy(),
-    };
-
-    let mut prep = prepare_fixtures_node("compatprep.fixtures", &fixtures);
-    prep.deps = placeholder.deps;
-    prep.desc = "Functional compatibility fixtures for direct outer-DAG probes".into();
-    prep.description = format!(
-        "Generated for this validation under {}; the former nested scheduler is not invoked.",
-        run_root.display()
-    );
-
-    let probes = validate_plan::compat_nodes(
-        root,
-        CompatMode::PortableStrict,
-        &hermit_bin.to_string_lossy(),
-        "",
-        &paths,
-        Some("compatprep.fixtures"),
-    )?;
-    let expected = validate_corpus::STRICT_COMPAT_TOTAL
-        - validate_corpus::portable_super_only().len();
-    if probes.len() != expected {
-        return Err(format!(
-            "portable strict compatibility expanded {} probes, expected {expected}",
-            probes.len()
-        ));
-    }
-    if probes.iter().any(|probe| {
-        probe.cmd.contains("scripts/validate.rs")
-            || probe.cmd.contains("pressure-test.rs")
-            || probe.cmd.contains("dagrun run")
-            || probe.cmd.contains("run_dag_boxed")
-    }) {
-        return Err(
-            "portable strict compatibility expansion contains a nested validate, pressure, or dagrun invocation"
-                .into(),
-        );
-    }
-
-    cfg.steps.splice(index..index, std::iter::once(prep).chain(probes));
-    Ok(true)
-}
-
-/// Exercise the flattened strict-compatibility handoff through the real outer
-/// scheduler without running the 189-program corpus.
+/// Exercise committed strict-compatibility nodes through the real outer
+/// scheduler without running the corpus.
 ///
 /// The production plan is inspected first. The execution half replaces two
 /// guest commands and one ordinary Hermit command with a barrier: all three
 /// must be admitted concurrently and must observe dagrun's one outer-step
 /// identity. A hidden serial/nested scheduler or restored guest-exclusion
 /// resource cannot satisfy that barrier.
-fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, String> {
+fn committed_validation_execution_bracket(root: &Path) -> Result<String, String> {
     let fixture = tempfile::Builder::new()
         .prefix("validate-strict-compat-flat-")
         .tempdir()
         .map_err(|error| format!("strict-compat flatten: cannot create fixture: {error}"))?;
-    let run_a = fixture.path().join("run-a");
-    let run_b = fixture.path().join("run-b");
-
-    let mut coexistence = validate_plan::lane_config(root, "portable")?;
-    expand_portable_strict_compat(root, &run_a, &mut coexistence)?;
-    if coexistence.resource_caps.contains_key("hermit_guest")
-        || coexistence
+    let first = validate_plan::lane_config(root, "portable")?;
+    if first.resource_caps.contains_key("hermit_guest")
+        || first
             .steps
             .iter()
             .any(|step| step.hint.resources.contains_key("hermit_guest"))
@@ -9473,7 +9197,7 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
                 .into(),
         );
     }
-    let regular_crates = coexistence
+    let regular_crates = first
         .steps
         .iter()
         .find(|step| step.tag() == "test.regular_crates")
@@ -9486,31 +9210,13 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
             regular_crates.hint.preferred_inner_jobs, regular_crates.jobs_flag
         ));
     }
-    let ordinary = coexistence
+    let ordinary = first
         .steps
         .iter()
         .find(|step| step.tag() == "test.hermit_modes")
         .cloned()
         .ok_or("strict-compat flatten: coexistence fixture lost test.hermit_modes")?;
 
-    let marker_config = || -> Result<DagConfig, String> {
-        let mut cfg = validate_plan::lane_config(root, "portable")?;
-        cfg.steps
-            .retain(|step| step.tag() == STRICT_COMPAT_PLACEHOLDER_TAG);
-        if cfg.steps.len() != 1 {
-            return Err(format!(
-                "strict-compat flatten: portable DAG has {} expansion markers",
-                cfg.steps.len()
-            ));
-        }
-        Ok(cfg)
-    };
-
-    let mut first = marker_config()?;
-    let original_deps = first.steps[0].deps.clone();
-    if !expand_portable_strict_compat(root, &run_a, &mut first)? {
-        return Err("strict-compat flatten: production marker was not expanded".into());
-    }
     let expected = validate_corpus::STRICT_COMPAT_TOTAL
         - validate_corpus::portable_super_only().len();
     let probes: Vec<&Step> = first
@@ -9524,14 +9230,13 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
         .find(|step| step.tag() == "compatprep.fixtures")
         .ok_or("strict-compat flatten: fixture-preparation node is absent")?;
     if probes.len() != expected
-        || prep.deps != original_deps
         || first
             .steps
             .iter()
-            .any(|step| step.tag() == STRICT_COMPAT_PLACEHOLDER_TAG)
+            .any(|step| step.tag() == STRICT_COMPAT_SELECTION_ALIAS)
     {
         return Err(format!(
-            "strict-compat flatten: wrong direct shape probes={} expected={expected} prep_deps={:?} original_deps={original_deps:?}",
+            "strict-compat flatten: wrong committed shape probes={} expected={expected} prep_deps={:?}",
             probes.len(), prep.deps
         ));
     }
@@ -9552,8 +9257,7 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
                 .into(),
         );
     }
-    let fixture_readme = run_a.join("strict-compat/real-compat-fixtures/README.md");
-    let fixture_readme = fixture_readme.to_string_lossy();
+    let fixture_readme = "$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md";
     let readme_labels = probes
         .iter()
         .filter(|probe| probe.cmd.contains("README.md"))
@@ -9591,7 +9295,7 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
         || probes
             .iter()
             .filter(|probe| probe.cmd.contains("README.md"))
-            .any(|probe| !probe.cmd.contains(&*fixture_readme))
+            .any(|probe| !probe.cmd.contains(fixture_readme))
     {
         return Err(format!(
             "strict-compat flatten: README consumers are not bound to the run-owned fixture: labels={readme_labels:?} fixture={fixture_readme}"
@@ -9624,11 +9328,16 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
         );
     }
 
-    let run_a_text = run_a.to_string_lossy();
     let path_cases = [
-        ("compat.seq", run_a.join("strict-compat/real-compat-fixtures")),
-        ("compat.shell-build", run_a.join("strict-compat/shell-build")),
-        ("compat.top", run_a.join("strict-compat/top-home")),
+        (
+            "compat.seq",
+            "$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures",
+        ),
+        (
+            "compat.shell-build",
+            "$VALIDATE_RUN_STATE/strict-compat/shell-build",
+        ),
+        ("compat.top", "$VALIDATE_RUN_STATE/strict-compat/top-home"),
     ];
     for (tag, path) in &path_cases {
         let command = first
@@ -9638,21 +9347,9 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
             .ok_or_else(|| format!("strict-compat flatten: path probe {tag} is absent"))?
             .cmd
             .as_str();
-        if !command.contains(&*path.to_string_lossy()) || !command.contains(&*run_a_text) {
+        if !command.contains(path) {
             return Err(format!(
-                "strict-compat flatten: {tag} does not use its run-owned path {}: {command}",
-                path.display()
-            ));
-        }
-    }
-    let mut second = marker_config()?;
-    expand_portable_strict_compat(root, &run_b, &mut second)?;
-    for tag in ["compat.seq", "compat.shell-build", "compat.top"] {
-        let a = first.steps.iter().find(|step| step.tag() == tag).unwrap();
-        let b = second.steps.iter().find(|step| step.tag() == tag).unwrap();
-        if a.cmd == b.cmd || b.cmd.contains(&*run_a_text) {
-            return Err(format!(
-                "strict-compat flatten: {tag} reused another validation's host-visible path"
+                "strict-compat flatten: {tag} does not use its run-owned path {path}: {command}"
             ));
         }
     }
@@ -9660,10 +9357,11 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
     let barrier = fixture.path().join("barrier");
     std::fs::create_dir_all(&barrier)
         .map_err(|error| format!("strict-compat flatten: cannot create barrier: {error}"))?;
-    let mut execution = DagConfig {
-        description: "strict compatibility one-scheduler execution bracket".into(),
-        ..Default::default()
-    };
+    let mut execution = validate_plan::config_from_base(
+        &first,
+        Vec::new(),
+        "strict compatibility one-scheduler execution bracket",
+    );
     let mut execution_prep = prep.clone();
     execution_prep.deps.clear();
     execution_prep.cmd = "true".into();
@@ -9756,13 +9454,11 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
     ))
 }
 
-/// Exercise the public raw-lane entrypoint used by `.github/workflows/ci-dag.yml`.
+/// Exercise the public labelled-DAG entrypoint used by `.github/workflows/ci-dag.yml`.
 ///
 /// The first arm invokes its default `run` verb with a capture runner, proving
-/// the workflow path receives the constructed DAG rather than portable.json's
-/// exit-125 marker. The second uses the real pinned runner's `json` verb, proving
-/// that same generated document is accepted by dagrun. Neither arm runs a test
-/// workload or creates a second scheduler.
+/// A capture runner proves the workflow passes the committed bytes plus the
+/// requested label to dagrun. It executes no workload.
 fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
     let fixture = tempfile::Builder::new()
         .prefix("validate-run-dag-flat-")
@@ -9772,7 +9468,7 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
     let runner = fixture.path().join("capture-runner");
     std::fs::write(
         &runner,
-        "#!/bin/sh\nset -eu\ntest \"$1\" = run\ntest \"$2\" = --dag\ntest \"$#\" -eq 3\ncp -- \"$3\" \"$RUN_DAG_CAPTURE\"\n",
+        "#!/bin/sh\nset -eu\ntest \"$1\" = run\ntest \"$2\" = --dag\ncp -- \"$3\" \"$RUN_DAG_CAPTURE\"\ntest \"$4\" = --labels\ntest \"$5\" = portable\ntest \"$#\" -eq 5\n",
     )
     .map_err(|error| format!("raw run-dag: cannot write capture runner: {error}"))?;
     std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
@@ -9795,149 +9491,30 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
         ));
     }
 
-    let inspect = |label: &str, bytes: &[u8]| -> Result<(), String> {
-        let text = std::str::from_utf8(bytes)
-            .map_err(|error| format!("raw run-dag: {label} output is not UTF-8: {error}"))?;
-        let cfg = dag_from_json(text)
-            .map_err(|error| format!("raw run-dag: {label} is not a valid DAG: {error}"))?;
-        let compat = cfg
-            .steps
-            .iter()
-            .filter(|step| step.group == "compat")
-            .collect::<Vec<_>>();
-        let ordinary_present = cfg
-            .steps
-            .iter()
-            .any(|step| step.tag() == "test.hermit_modes");
-        let has_guest_exclusion = cfg.resource_caps.contains_key("hermit_guest")
-            || cfg
-                .steps
-                .iter()
-                .any(|step| step.hint.resources.contains_key("hermit_guest"));
-        let expected = validate_corpus::STRICT_COMPAT_TOTAL
-            - validate_corpus::portable_super_only().len();
-        if compat.len() != expected
-            || cfg
-                .steps
-                .iter()
-                .filter(|step| step.tag() == "compatprep.fixtures")
-                .count()
-                != 1
-            || cfg
-                .steps
-                .iter()
-                .any(|step| step.tag() == STRICT_COMPAT_PLACEHOLDER_TAG)
-            || cfg
-                .steps
-                .iter()
-                .any(|step| step.cmd == STRICT_COMPAT_PLACEHOLDER_COMMAND)
-            || has_guest_exclusion
-            || !ordinary_present
-        {
-            return Err(format!(
-                "raw run-dag: {label} did not receive the reviewed cap-free expansion: compat={} prep={} marker={} ordinary_present={} hermit_guest_present={has_guest_exclusion}",
-                compat.len(),
-                cfg.steps
-                    .iter()
-                    .filter(|step| step.tag() == "compatprep.fixtures")
-                    .count(),
-                cfg.steps
-                    .iter()
-                    .filter(|step| step.tag() == STRICT_COMPAT_PLACEHOLDER_TAG)
-                    .count(),
-                ordinary_present,
-            ));
-        }
-        Ok(())
-    };
-
     let captured_bytes = std::fs::read(&captured)
         .map_err(|error| format!("raw run-dag: capture runner received no DAG: {error}"))?;
-    inspect("default run input", &captured_bytes)?;
-
-    let output = Command::new(root.join("ci/run-dag.sh"))
-        .args(["portable", "json"])
-        .current_dir(root)
-        .env_remove("DAGRUN_BIN")
-        .env_remove("RUN_DAG_FILE_OVERRIDE")
-        .output()
-        .map_err(|error| format!("raw run-dag: cannot launch real json entrypoint: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "raw run-dag: real runner rejected constructed portable DAG with {}: {}{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
+    let committed = std::fs::read(validate_plan::validation_dag_path(root))
+        .map_err(|error| format!("raw run-dag: cannot read committed DAG: {error}"))?;
+    if captured_bytes != committed {
+        return Err("raw run-dag: launcher did not hand dagrun the committed bytes".into());
     }
-    inspect("real runner json output", &output.stdout)?;
-    let real_stderr = String::from_utf8_lossy(&output.stderr);
-    if !real_stderr.contains("[dagrun] engine=rust") {
-        return Err(format!(
-            "raw run-dag: default entrypoint did not select the structured-capable Rust engine: {real_stderr}"
-        ));
-    }
-
-    let python_marker = fixture.path().join("python-run-marker");
-    let mut structured_step = step_with_caps(
-        "fixture",
-        "structured",
-        "structured result engine fixture",
-        format!("touch {}", validate_plan::shell_quote(&python_marker.to_string_lossy())),
-        Vec::new(),
-        30,
-        30,
-        1024 * 1024,
-    );
-    structured_step.result_manifests = Some(vec![ResultManifest::StructuredTestResults(
-        StructuredTestResultsManifest::current("fixture.structured"),
-    )]);
-    let structured_dag = fixture.path().join("structured.json");
-    std::fs::write(
-        &structured_dag,
-        format!(
-            "{}\n",
-            dag_to_json(&validate_plan::config_from(
-                vec![structured_step],
-                "structured result engine fixture",
-            ))
-        ),
+    let cfg = dag_from_json(
+        std::str::from_utf8(&committed)
+            .map_err(|error| format!("raw run-dag: committed DAG is not UTF-8: {error}"))?,
     )
-    .map_err(|error| format!("raw run-dag: cannot write structured fixture: {error}"))?;
-    // This deliberately exercises a second runner from inside validate's own
-    // self-test DAG. Permit that nesting only for this inert marker fixture so
-    // the Python engine reaches its structured-result preflight refusal.
-    let python = Command::new(root.join("ci/run-dag.sh"))
-        .args([
-            "portable",
-            "--allow-cgroup-failure",
-            "--allow-unwise-nest-dagruns",
-            "-q",
-        ])
-        .current_dir(root)
-        .env_remove("DAGRUN_BIN")
-        .env("DAGRUN_ENGINE", "python")
-        .env("RUN_DAG_FILE_OVERRIDE", &structured_dag)
-        .output()
-        .map_err(|error| format!("raw run-dag: cannot launch Python refusal fixture: {error}"))?;
-    let python_stderr = String::from_utf8_lossy(&python.stderr);
-    if python.status.success()
-        || !python_stderr.contains("[dagrun] engine=python")
-        || !python_stderr.contains("REFUSING to run before any node starts")
-        || !python_stderr.contains("Python runner does not implement structured test-result capture")
-        || python_marker.exists()
+    .map_err(|error| format!("raw run-dag: committed DAG is invalid: {error}"))?;
+    let portable = dagrun::select_steps_by_labels(&cfg, &["portable".into()])?;
+    if portable
+        .steps
+        .iter()
+        .any(|step| step.cmd.contains("dagrun run") || step.cmd.contains("scripts/validate.rs"))
     {
-        return Err(format!(
-            "raw run-dag: explicit Python engine did not refuse structured results before execution: status={} marker={} stderr={python_stderr}",
-            python.status,
-            python_marker.exists(),
-        ));
+        return Err("raw run-dag: portable label contains a nested scheduler command".into());
     }
 
     Ok(format!(
-        "raw run-dag: default Rust workflow and real json parser received {}/{} direct strict-compat nodes; explicit Python refused structured results before execution; marker exit 125 absent",
-        validate_corpus::STRICT_COMPAT_TOTAL - validate_corpus::portable_super_only().len(),
-        validate_corpus::STRICT_COMPAT_TOTAL - validate_corpus::portable_super_only().len() + 1,
+        "raw run-dag: public launcher passed the {}-node committed superset plus portable label; no nested scheduler command",
+        cfg.steps.len(),
     ))
 }
 
@@ -10462,10 +10039,12 @@ fn print_cost_table(
 /// a scraped TSV. Reproduces `print_compatibility_summary`'s category table.
 fn print_compat_summary(
     mode: CompatMode,
+    prefix: &str,
     outcomes: &[StepOutcome],
 ) -> (usize, usize, Vec<String>, BTreeSet<String>) {
     compat_summary_with_tables(
         mode,
+        prefix,
         outcomes,
         &validate_corpus::known_failclosed(),
         &validate_corpus::portable_diagnostic(),
@@ -10481,6 +10060,7 @@ fn print_compat_summary(
 /// exempt" in one run -- and the fix for that must not be to add a fake row to production.
 fn compat_summary_with_tables(
     mode: CompatMode,
+    prefix: &str,
     outcomes: &[StepOutcome],
     known: &BTreeMap<&'static str, &'static str>,
     diag: &BTreeMap<&'static str, &'static str>,
@@ -10492,7 +10072,7 @@ fn compat_summary_with_tables(
     let mut nonblocking_failure_tags: BTreeSet<String> = BTreeSet::new();
     let mut measured_labels: BTreeSet<String> = BTreeSet::new();
     for o in outcomes {
-        let Some(label) = o.tag.strip_prefix("compat.") else { continue };
+        let Some(label) = o.tag.strip_prefix(prefix) else { continue };
         if outcome_execution(o) == AttemptExecution::Unknown {
             println!(
                 "  NO_RESULT {label} produced no completed child execution; excluded from the measured denominator"
@@ -10704,6 +10284,76 @@ fn possible_missing_artifact_nodes<'a>(
 /// must run again, with no code change anywhere. That is the
 /// difference between a computed decision and a hard-coded list of nodes that
 /// would silently swallow a cell added later.
+fn manifest_node_vacuity_profile_bracket(
+    root: &Path,
+    absent: &BTreeMap<validate_plan::HostCapability, String>,
+    label: &str,
+    withheld_tag: &str,
+    committed_scorecard_tag: &str,
+) -> Result<(), String> {
+    let mut steps = validate_plan::lane_nodes(root, label, "", "gate.manifest")?;
+    let shipped = steps
+        .iter()
+        .find(|step| step.tag() == withheld_tag)
+        .ok_or_else(|| format!("node vacuity: {label} selection lost bucket {withheld_tag}"))?;
+    if manifest_bucket_of(shipped)
+        != Some(("privileged".to_string(), "backend-parity-c".to_string()))
+    {
+        return Err(format!(
+            "node vacuity: {withheld_tag} must bind to privileged/backend-parity-c; got {:?}",
+            manifest_bucket_of(shipped)
+        ));
+    }
+
+    attach_compatibility_scorecard(&mut steps, &["privileged"], "")?;
+    let generated_scorecard_tag = "scorecard.compatibility";
+    let before = steps
+        .iter()
+        .map(|step| (step.tag(), step.deps.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for consumer in [generated_scorecard_tag, committed_scorecard_tag] {
+        if !before
+            .get(consumer)
+            .is_some_and(|deps| deps.iter().any(|dep| dep == withheld_tag))
+        {
+            return Err(format!(
+                "node vacuity: {label} result consumer {consumer} does not depend on {withheld_tag}"
+            ));
+        }
+    }
+    let mut expected = before.clone();
+    expected.remove(withheld_tag);
+    for consumer in [generated_scorecard_tag, committed_scorecard_tag] {
+        let deps = expected
+            .get_mut(consumer)
+            .ok_or_else(|| format!("node vacuity: {label} lost result consumer {consumer}"))?;
+        deps.retain(|dep| dep != withheld_tag);
+    }
+    let mut actual = Plan {
+        cfg: DagConfig {
+            steps,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    withhold_vacuous_manifest_nodes(root, &mut actual, absent)?;
+    let after = actual
+        .cfg
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step.deps.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if after != expected
+        || actual.host_inapplicable.len() != 1
+        || actual.host_inapplicable[0].tag != withheld_tag
+    {
+        return Err(format!(
+            "node vacuity: {label} withholding changed the wrong graph state: {after:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     let bucket = |selected: usize, withheld: usize| BucketCells {
         lane: "privileged".into(),
@@ -10765,21 +10415,31 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     // the command is checked only to prove that execution selects the same
     // population. A command with any selection token this function does not
     // model must NOT be matched against the bucket accounting.
-    let mut transformed =
-        validate_plan::lane_nodes(root, "privileged", "privileged-", "gate.manifest")?;
-    let withheld_tag = "privileged-e2e.manifest_backend_parity_c";
-    let shipped = transformed
-        .iter()
-        .find(|step| step.tag() == withheld_tag)
-        .ok_or("node vacuity: transformed lane lost privileged backend-parity-c bucket")?
-        .clone();
-    if manifest_bucket_of(&shipped)
-        != Some(("privileged".to_string(), "backend-parity-c".to_string()))
-    {
-        return Err(format!(
-            "node vacuity: the shipped bucket command must bind to its bucket; got {:?}",
-            manifest_bucket_of(&shipped)
-        ));
+    let mut shipped_buckets = Vec::new();
+    for (label, tag) in [
+        ("full", "privileged-e2e.manifest_backend_parity_c"),
+        (
+            "privileged",
+            "privileged-only-e2e.manifest_backend_parity_c",
+        ),
+    ] {
+        let steps = validate_plan::lane_nodes(root, label, "", "gate.manifest")?;
+        let shipped = steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| {
+                format!("node vacuity: {label} selection lost privileged bucket {tag}")
+            })?
+            .clone();
+        if manifest_bucket_of(&shipped)
+            != Some(("privileged".to_string(), "backend-parity-c".to_string()))
+        {
+            return Err(format!(
+                "node vacuity: shipped bucket {tag} must bind to privileged/backend-parity-c; got {:?}",
+                manifest_bucket_of(&shipped)
+            ));
+        }
+        shipped_buckets.push(shipped);
     }
     let unmodelled = [
         // A narrower selection than the accounting was taken with.
@@ -10803,36 +10463,38 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         "target/debug/test-harness build --lane privileged --ci-only --allow-empty",
         "cargo test -p hermit-detcore",
     ];
-    for cmd in unmodelled {
-        let mut step = shipped.clone();
-        step.cmd = cmd.to_string();
-        if manifest_bucket_of(&step).is_some() {
-            return Err(format!(
-                "node vacuity: {cmd:?} selects a cell population this function cannot prove \
-                 equal to the bucket accounting and must NOT be a withholding candidate"
-            ));
+    for shipped in &shipped_buckets {
+        for cmd in unmodelled {
+            let mut step = shipped.clone();
+            step.cmd = cmd.to_string();
+            if manifest_bucket_of(&step).is_some() {
+                return Err(format!(
+                    "node vacuity: {cmd:?} selects a cell population this function cannot prove \
+                     equal to the bucket accounting and must NOT be a withholding candidate"
+                ));
+            }
         }
-    }
-    let mut mismatched = shipped.clone();
-    mismatched.manifest = Some(DagManifest {
-        lane: "portable".into(),
-        category: "backend-parity-c".into(),
-        test: None,
-        mode: None,
-        backend: None,
-    });
-    if manifest_bucket_of(&mismatched).is_some() {
-        return Err(
-            "node vacuity: a command and typed manifest that name different lanes must refuse"
-                .into(),
-        );
-    }
-    let mut untyped = shipped;
-    untyped.manifest = None;
-    if manifest_bucket_of(&untyped).is_some() {
-        return Err(
-            "node vacuity: command text alone must not supply manifest lane/category".into(),
-        );
+        let mut mismatched = shipped.clone();
+        mismatched.manifest = Some(DagManifest {
+            lane: "portable".into(),
+            category: "backend-parity-c".into(),
+            test: None,
+            mode: None,
+            backend: None,
+        });
+        if manifest_bucket_of(&mismatched).is_some() {
+            return Err(
+                "node vacuity: a command and typed manifest that name different lanes must refuse"
+                    .into(),
+            );
+        }
+        let mut untyped = shipped.clone();
+        untyped.manifest = None;
+        if manifest_bucket_of(&untyped).is_some() {
+            return Err(
+                "node vacuity: command text alone must not supply manifest lane/category".into(),
+            );
+        }
     }
 
     // THE CHECKED-IN ACCOUNTING — the required plan itself carries the host
@@ -10863,66 +10525,27 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         );
     }
 
-    // INTEGRATION: exercise the production transformed command, checked-in
-    // bucket accounting, withholding mutation, and scorecard edge handling
-    // together. This catches drift between the command producer and parser.
-    attach_compatibility_scorecard(&mut transformed, &["privileged"], "")?;
-    let scorecard_tag = "scorecard.compatibility";
-    let before: BTreeMap<String, Vec<String>> = transformed
-        .iter()
-        .map(|step| (step.tag(), step.deps.clone()))
-        .collect();
-    if !before
-        .get(scorecard_tag)
-        .is_some_and(|deps| deps.iter().any(|dep| dep == withheld_tag))
-    {
-        return Err(
-            "node vacuity: actual compatibility scorecard did not depend on the transformed \
-             host-inapplicable bucket"
-                .into(),
-        );
-    }
-    let mut expected = before.clone();
-    if expected.remove(withheld_tag).is_none() {
-        return Err("node vacuity: transformed plan lost the expected bucket".into());
-    }
-    let scorecard_deps = expected
-        .get_mut(scorecard_tag)
-        .ok_or("node vacuity: transformed plan lost the compatibility scorecard")?;
-    let scorecard_deps_before = scorecard_deps.len();
-    scorecard_deps.retain(|dep| dep != withheld_tag);
-    if scorecard_deps.len() + 1 != scorecard_deps_before {
-        return Err("node vacuity: expected exactly one scorecard edge to the bucket".into());
-    }
-    let mut actual_plan = Plan {
-        cfg: DagConfig {
-            steps: transformed,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    withhold_vacuous_manifest_nodes(root, &mut actual_plan, &absent)?;
-    let after: BTreeMap<String, Vec<String>> = actual_plan
-        .cfg
-        .steps
-        .iter()
-        .map(|step| (step.tag(), step.deps.clone()))
-        .collect();
-    if after != expected {
-        return Err(format!(
-            "node vacuity: actual withholding changed more than the bucket and its scorecard \
-             edge: expected={expected:?} actual={after:?}"
-        ));
-    }
-    if actual_plan.host_inapplicable.len() != 1
-        || actual_plan.host_inapplicable[0].tag != withheld_tag
-        || actual_plan.host_inapplicable[0].capability
-            != validate_plan::HostCapability::CpuidFaulting
-    {
-        return Err(format!(
-            "node vacuity: actual transformed plan did not withhold exactly {withheld_tag}: {:?}",
-            actual_plan.host_inapplicable
-        ));
+    // INTEGRATION: exercise both committed tag families through production
+    // accounting, withholding, and scorecard-edge handling.
+    for (label, withheld_tag, scorecard_tag) in [
+        (
+            "full",
+            "privileged-e2e.manifest_backend_parity_c",
+            "full-scorecard.compatibility",
+        ),
+        (
+            "privileged",
+            "privileged-only-e2e.manifest_backend_parity_c",
+            "privileged-scorecard.compatibility",
+        ),
+    ] {
+        manifest_node_vacuity_profile_bracket(
+            root,
+            &absent,
+            label,
+            withheld_tag,
+            scorecard_tag,
+        )?;
     }
 
     // THE RETAINED DEPENDENT. A result consumer keeps running with the edge
@@ -11096,11 +10719,11 @@ fn host_capability_bracket(root: &Path) -> Result<(), String> {
     // that passed against an empty declaration set would prove nothing.
     let shipped = validate_plan::host_capability_requirements(root)?;
     if shipped.get("privileged-cpuid.faulting") != Some(&HostCapability::CpuidFaulting)
-        || shipped.get("cpuid.faulting") != Some(&HostCapability::CpuidFaulting)
+        || shipped.get("privileged-only-cpuid.faulting") != Some(&HostCapability::CpuidFaulting)
     {
         return Err(format!(
-            "host capability: ci/dag/privileged.json must declare cpuid.faulting as requiring \
-             cpuid-faulting under both the bare and fused tag; got {shipped:?}"
+            "host capability: ci/dag/validate.json must label both full and privileged \
+             CPUID nodes as requiring cpuid-faulting; got {shipped:?}"
         ));
     }
 
@@ -11508,7 +11131,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 .iter()
                 .any(|producer| producer.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
         {
-            let manifest_plan = validate_plan::preflight_nodes(root, has_cmd("with-proxy"))
+            let manifest_plan = validate_plan::preflight_nodes(root)?
                 .into_iter()
                 .find(|step| step.tag() == validate_plan::MANIFEST_PLAN_PRODUCER_TAG)
                 .ok_or("pinned-root plan lost its canonical manifest-plan producer")?;
@@ -11635,12 +11258,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
                 // the host. gate.manifest is named explicitly because it is the one
                 // measured to fail in the container.
                 step("gate", "manifest", "target/debug/test-harness validate", vec![]),
-                step(
-                    "test",
-                    "strict_compat",
-                    STRICT_COMPAT_PLACEHOLDER_COMMAND,
-                    vec![],
-                ),
+                step("test", "regular", "echo regular", vec![]),
                 step("lint", "clippy", "cargo clippy --workspace", vec![]),
                 step("test", "hermit_integration", "./ci/run-nextest-counted.sh -p hermit", vec![]),
                 // A producer whose output the cells execute: wrapped by the rule.
@@ -11672,7 +11290,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
     // grown back past the scheduled cells and that failure returns with it.
     for tag in [
         "gate.manifest",
-        "test.strict_compat",
+        "test.regular",
         "lint.clippy",
         "test.hermit_integration",
         "pre.submodules",
@@ -15540,16 +15158,17 @@ fn libtest_counts(outcomes: &[StepOutcome]) -> (Option<i64>, Option<i64>, Option
 fn compat_test_results(
     outcomes: &[StepOutcome],
     attempts: &[NodeAttempt],
+    prefix: &str,
 ) -> Result<TestResults, String> {
     let compat_outcomes = outcomes
         .iter()
-        .filter(|outcome| outcome.tag.starts_with("compat."))
+        .filter(|outcome| outcome.tag.starts_with(prefix))
         .map(|outcome| (outcome.tag.as_str(), outcome))
         .collect::<BTreeMap<_, _>>();
     let mut latest_attempts = BTreeMap::<&str, &NodeAttempt>::new();
     for attempt in attempts
         .iter()
-        .filter(|attempt| attempt.tag.starts_with("compat."))
+        .filter(|attempt| attempt.tag.starts_with(prefix))
     {
         let latest = latest_attempts
             .entry(attempt.tag.as_str())
@@ -15569,7 +15188,7 @@ fn compat_test_results(
 
     let mut results = Vec::new();
     for outcome in outcomes {
-        let Some(label) = outcome.tag.strip_prefix("compat.") else {
+        let Some(label) = outcome.tag.strip_prefix(prefix) else {
             continue;
         };
         let tag = outcome.tag.as_str();
@@ -15630,13 +15249,15 @@ fn run_test_counts(
     outcomes: &[StepOutcome],
     attempts: &[NodeAttempt],
     compat: Option<CompatMode>,
+    compat_prefix: Option<&str>,
 ) -> Result<(Option<i64>, Option<i64>, Option<i64>), String> {
     let (base_executed, base_passed, base_filtered) = libtest_counts(outcomes);
     if compat.is_none() {
         return Ok((base_executed, base_passed, base_filtered));
     }
 
-    let compatibility = compat_test_results(outcomes, attempts)?;
+    let prefix = compat_prefix.ok_or("compatibility mode has no committed tag prefix")?;
+    let compatibility = compat_test_results(outcomes, attempts, prefix)?;
     let compat_executed = i64::try_from(compatibility.executed_tests)
         .map_err(|_| "structured compatibility executed count does not fit i64".to_string())?;
     let compat_filtered = i64::try_from(compatibility.filtered_tests)
@@ -15838,7 +15459,11 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         reported_attempt(&compat_fail, 1),
         reported_attempt(&compat_fail, 2),
     ];
-    let compat = compat_test_results(&[compat_pass.clone(), compat_fail.clone()], &compat_attempts)?;
+    let compat = compat_test_results(
+        &[compat_pass.clone(), compat_fail.clone()],
+        &compat_attempts,
+        "compat.",
+    )?;
     let compat_rows = compat
         .results
         .as_ref()
@@ -15864,6 +15489,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         ],
         &compat_attempts,
         Some(CompatMode::PortableStrict),
+        Some("compat."),
     )? != (Some(875), Some(874), Some(350))
     {
         return Err(
@@ -15875,6 +15501,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         &[compat_pass.clone(), compat_fail.clone()],
         &compat_attempts,
         Some(CompatMode::PortableStrict),
+        Some("compat."),
     )? != (Some(2), Some(1), Some(0))
     {
         return Err(
@@ -15885,6 +15512,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         &[failed, compat_pass.clone(), compat_fail.clone()],
         &compat_attempts,
         Some(CompatMode::PortableStrict),
+        Some("compat."),
     )? != (Some(25), None, Some(5))
     {
         return Err(
@@ -15892,7 +15520,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
                 .into(),
         );
     }
-    let missing_attempt = compat_test_results(&[compat_pass], &[])
+    let missing_attempt = compat_test_results(&[compat_pass], &[], "compat.")
         .expect_err("compatibility result without an attempt must refuse");
     if !missing_attempt.contains("pass-case") || !missing_attempt.contains("no recorded attempt")
     {
@@ -15906,7 +15534,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         reported_attempt(&stale_fail, 1),
         unreported_attempt(stale_fail.tag.clone(), 2),
     ];
-    let stale_error = compat_test_results(&[stale_fail], &stale_attempts)
+    let stale_error = compat_test_results(&[stale_fail], &stale_attempts, "compat.")
         .expect_err("a fail followed by an unreported retry must refuse");
     if !stale_error.contains("stale-fail")
         || !stale_error.contains("latest attempt 2")
@@ -19274,7 +18902,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     let dirty_at_admission = tree_dirty();
     let wt_dirty = worktree_dirty();
     if args.write_constructed_dag.is_none()
-        && args.write_source_plan.is_none()
+        && args.write_generated_plan.is_none()
         && dirty_worktree_requires_refusal(
             nesting.nested,
             wt_dirty,
@@ -19314,7 +18942,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         args.skip_inner_dirty_working_tree_and_rebase_freshness_checks
             || nesting.nested
             || args.write_constructed_dag.is_some()
-            || args.write_source_plan.is_some(),
+            || args.write_generated_plan.is_some(),
     ) {
         Ok(msg) => eprintln!("validate: {msg}"),
         Err(msg) => {
@@ -19370,7 +18998,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     let tmp = args
         .write_constructed_dag
         .as_ref()
-        .or(args.write_source_plan.as_ref())
+        .or(args.write_generated_plan.as_ref())
         .and_then(|path| path.parent())
         .map(|parent| parent.join("run-state"))
         .unwrap_or_else(|| {
@@ -19407,8 +19035,8 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         }
     }
 
-    let mut plan = match if args.write_source_plan.is_some() {
-        build_source_plan(&root, &args, &tmp)
+    let mut plan = match if args.write_generated_plan.is_some() {
+        build_generated_validation_plan(&root, &tmp)
     } else {
         build_plan(&root, &args, &tmp)
     } {
@@ -19433,44 +19061,52 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // wrapping adds host-specific setup. This is the stable boundary shared by
     // local and hosted execution: both start with the same constructed commands,
     // caps, and edges; the hosted harness supplies omitted predecessors.
-    if let Some(selected) = &args.selected {
+    if plan.committed_selection.is_none() {
+        if let Some(selected) = &args.selected {
+            if let Err(error) =
+                select_constructed_steps(&mut plan, selected, args.ignore_selected_deps)
+            {
+                return RunSummary::refused(
+                    2,
+                    &plan.profile,
+                    "constructed-plan selection",
+                    vec![error],
+                );
+            }
+        }
+    }
+
+    if plan.committed_selection.is_none() {
         if let Err(error) =
-            select_constructed_steps(&mut plan, selected, args.ignore_selected_deps)
+            configure_prebuilt_rust_scripts(&root, &mut plan, args.ignore_selected_deps)
         {
             return RunSummary::refused(
                 2,
                 &plan.profile,
-                "constructed-plan selection",
+                "rust-script build-plan construction",
                 vec![error],
             );
         }
-    }
-
-    if let Err(error) = configure_prebuilt_rust_scripts(&mut plan, args.ignore_selected_deps) {
-        return RunSummary::refused(
-            2,
-            &plan.profile,
-            "rust-script build-plan construction",
-            vec![error],
-        );
     }
 
     // The public environment variable is the per-cell gate, not proof that the
     // validate driver itself is already inside the pinned root. An
     // operator-supplied variable must not bypass the base image for an entire
     // top-level validation.
-    if args.selected.is_none()
-        && !args.show_plan_json
-        && args.write_constructed_dag.is_none()
-        && args.write_source_plan.is_none()
-    {
-        if let Err(error) = apply_pinned_root(&mut plan, &root, false) {
-            return RunSummary::refused(
-                3,
-                &plan.profile,
-                "pinned-root plan construction",
-                vec![error],
-            );
+    if plan.committed_selection.is_none() {
+        if args.selected.is_none()
+            && !args.show_plan_json
+            && args.write_constructed_dag.is_none()
+            && args.write_generated_plan.is_none()
+        {
+            if let Err(error) = apply_pinned_root(&mut plan, &root, false) {
+                return RunSummary::refused(
+                    3,
+                    &plan.profile,
+                    "pinned-root plan construction",
+                    vec![error],
+                );
+            }
         }
     }
 
@@ -19496,26 +19132,24 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         }
     }
 
-    if let Err(error) = declare_structured_result_producers(&mut plan) {
-        return RunSummary::refused(
-            2,
-            &plan.profile,
-            "structured result declaration",
-            vec![error],
-        );
+    if plan.committed_selection.is_none() {
+        assign_fail_fast_families(&mut plan);
+        propagate_verbosity(&mut plan, args.verbosity);
+    } else {
+        // Verbosity is execution policy, not graph topology. Children inherit
+        // this value without validate rewriting every committed step's env.
+        std::env::set_var("VALIDATE_VERBOSITY", args.verbosity.to_string());
     }
-
-    assign_fail_fast_families(&mut plan);
-
-    // Nested validate payloads are ordinary DAG children. Carry the selected
-    // level through the plan so `--verbosity 5` does not become level 1 at the
-    // nested strict-compat boundary (and default level 1 stays bounded there).
-    propagate_verbosity(&mut plan, args.verbosity);
 
     // A node this machine provably cannot run is withheld here, BEFORE anything
     // spawns, and recorded as host-inapplicable. Nothing a node DOES can reach
     // this decision, so a node that is merely broken still runs and still fails.
-    if let Err(e) = withhold_host_inapplicable(&root, &mut plan) {
+    let capability_result = if plan.committed_selection.is_some() {
+        require_host_capabilities(&root, &plan)
+    } else {
+        withhold_host_inapplicable(&root, &mut plan)
+    };
+    if let Err(e) = capability_result {
         eprintln!("validate: cannot resolve host-capability requirements: {e}");
         return RunSummary::refused(
             2,
@@ -19551,16 +19185,43 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // nothing. Deriving the ceiling here makes the inversion unreachable instead of
     // making it fit for one particular preparation time -- the same fixed-versus-
     // derived defect as a node pinned at 120s losing to a 120.03s measurement.
-    if let Some(remaining) = remaining_budget_s(deadline_ns) {
-        clamp_wall(&mut plan, derived_wall_ceiling(remaining));
+    if plan.committed_selection.is_none() {
+        if let Some(remaining) = remaining_budget_s(deadline_ns) {
+            clamp_wall(&mut plan, derived_wall_ceiling(remaining));
+        }
+        if let Some(cap) = env_positive("VALIDATE_GATE_TIMEOUT_SECONDS") {
+            clamp_wall(&mut plan, cap);
+            eprintln!("validate: VALIDATE_GATE_TIMEOUT_SECONDS={cap}: every gate's wall ceiling lowered to at most {cap}s");
+        }
+        if let Some(cap) = env_positive("VALIDATE_GATE_CPU_TIMEOUT_SECONDS") {
+            clamp_cpu(&mut plan, cap);
+            eprintln!("validate: VALIDATE_GATE_CPU_TIMEOUT_SECONDS={cap}: every gate's CPU budget lowered to at most {cap}s");
+        }
+    } else if [
+        "VALIDATE_GATE_TIMEOUT_SECONDS",
+        "VALIDATE_GATE_CPU_TIMEOUT_SECONDS",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+    {
+        return RunSummary::refused(
+            2,
+            &plan.profile,
+            "committed-DAG timeout policy",
+            vec![
+                "VALIDATE_GATE_TIMEOUT_SECONDS and VALIDATE_GATE_CPU_TIMEOUT_SECONDS would rewrite committed node budgets; edit/regenerate ci/dag/validate.json or use dagrun's CPU-timeout multiplier"
+                    .into(),
+            ],
+        );
     }
-    if let Some(cap) = env_positive("VALIDATE_GATE_TIMEOUT_SECONDS") {
-        clamp_wall(&mut plan, cap);
-        eprintln!("validate: VALIDATE_GATE_TIMEOUT_SECONDS={cap}: every gate's wall ceiling lowered to at most {cap}s");
-    }
-    if let Some(cap) = env_positive("VALIDATE_GATE_CPU_TIMEOUT_SECONDS") {
-        clamp_cpu(&mut plan, cap);
-        eprintln!("validate: VALIDATE_GATE_CPU_TIMEOUT_SECONDS={cap}: every gate's CPU budget lowered to at most {cap}s");
+
+    if let Err(error) = require_committed_scheduler_input(&plan) {
+        return RunSummary::refused(
+            2,
+            &plan.profile,
+            "committed-DAG scheduler boundary",
+            vec![error],
+        );
     }
 
     // Fail-closed caps audit. A node without declared caps would run UNBOXED
@@ -19666,7 +19327,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     if let Some(path) = args
         .write_constructed_dag
         .as_ref()
-        .or(args.write_source_plan.as_ref())
+        .or(args.write_generated_plan.as_ref())
     {
         if plan.second.is_some() {
             return RunSummary::refused(
@@ -19680,7 +19341,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             );
         }
         let mut exported = plan.cfg.clone();
-        if args.write_source_plan.is_some() {
+        if args.write_generated_plan.is_some() {
             if let Err(error) = materialize_source_cpu_timeouts(&mut exported) {
                 return RunSummary::refused(
                     2,
@@ -20188,7 +19849,12 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // its own accounting, exactly as a bash subshell's `times` would).
     let (cpu_user, cpu_sys) = validate_runtime::process_cpu_seconds();
     let (executed_tests, passed_tests, filtered_tests, compatibility_count_error) =
-        match run_test_counts(&outcomes, &attempts, plan.compat) {
+        match run_test_counts(
+            &outcomes,
+            &attempts,
+            plan.compat,
+            plan.compat_prefix,
+        ) {
             Ok((executed, passed, filtered)) => (executed, passed, filtered, None),
             Err(error) => {
                 eprintln!("validate: ERROR: {error}");
@@ -20371,7 +20037,11 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // able to reach PASS through an empty set of failing rows.
     let mut compat_measured: Option<usize> = None;
     if let Some(mode) = plan.compat {
-        let (passed, measured, blocking, nonblocking) = print_compat_summary(mode, &outcomes);
+        let prefix = plan
+            .compat_prefix
+            .expect("compatibility plans carry their committed tag prefix");
+        let (passed, measured, blocking, nonblocking) =
+            print_compat_summary(mode, prefix, &outcomes);
         compat_blocking = blocking.len();
         compat_nonblocking = nonblocking;
         compat_measured = Some(measured);
