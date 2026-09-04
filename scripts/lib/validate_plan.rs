@@ -96,6 +96,8 @@ const MANIFEST_AUDIT_MEM_BYTES: i64 = 5 * 1024 * 1024 * 1024;
 /// the always-on preflight spine rather than an incidental lane root.
 pub const MANIFEST_PLAN_PRODUCER_TAG: &str = "setup.manifest_plan";
 pub const MANIFEST_PLAN_BUILD_COMMAND: &str = "cargo build -p hermit-manifest-plan --bins";
+pub const MANIFEST_AUDIT_COMMAND: &str =
+    "target/debug/generate-validation-dag --check && target/debug/test-harness validate";
 const MANIFEST_PLAN_BUILD_TIMEOUT_S: i64 = 180;
 const MANIFEST_PLAN_BUILD_MEM_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 
@@ -424,7 +426,7 @@ pub fn preflight_nodes(root: &Path, with_proxy: bool) -> Vec<Step> {
             "gate",
             "manifest",
             "Centralized test manifest and inventory",
-            "target/debug/test-harness validate".to_string(),
+            MANIFEST_AUDIT_COMMAND.to_string(),
             vec![MANIFEST_PLAN_PRODUCER_TAG.to_string()],
             PREFLIGHT_TIMEOUT_S,
             MANIFEST_AUDIT_CPU_TIMEOUT_S,
