@@ -18,9 +18,10 @@ it is.
 the outer validate scope. This is the same idea widened to every rung,
 including the ones that script does not cover.
 
-The individual-test values below were calibrated from retained results through
-2026-09-03 02:18:30 UTC. Re-measure before quoting them; the point of this file
-is the *structure*, and the numbers move.
+The individual-test values below retain the prior selected-cell census through
+2026-09-03 02:18:30 UTC and add the reviewed three-repetition LiteInst
+qualification for the newly selected cells. Re-measure before quoting them; the
+point of this file is the *structure*, and the numbers move.
 
 ## What each rung bounds
 
@@ -41,10 +42,10 @@ agreeing with each other.
 | validate systemd scope | the same outer run plus teardown grace | validate's safe-ci scope | systemd stops the whole process tree | outer-scope timeout |
 | `safehermit --sh-deadline` | **the whole wrapped process tree** | `bin/safehermit`, default 3600s | `systemd-run --user RuntimeMaxSec`, a **cgroup kill** | exit 124, `safehermit: bound.wall=` |
 
-Distribution of the selected CI-cell values calibrated at that cutoff:
+Distribution of the selected CI-cell values calibrated from that combined evidence:
 
-- manifest CPU: 22s ×488, 25s ×1, 32s ×1, 46s ×1, 56s ×1.
-- manifest wall: 57s ×487, 58s ×1, 74s ×1, 91s ×1, 105s ×1, 118s ×1.
+- manifest CPU: 22s ×722, 25s ×1, 32s ×1, 46s ×1, 56s ×1.
+- manifest wall: 57s ×721, 58s ×1, 74s ×1, 91s ×1, 105s ×1, 118s ×1.
 - dagrun step `timeout`: 600s ×15, 900s ×15, 120s ×11, 180s ×6, 60s ×6, 720s ×5,
   1200s ×4, 300s ×3, 2400s ×1, 40s ×1, 30s ×1.
 
@@ -61,7 +62,7 @@ completing `data-handling/dd-partial-transfers` sample that prompted the policy
 requires five explicit pairs: `kvm-python-examples` 25/74,
 `timed-progress-bar` 32/91, `fp-reduction-nondeterminism` chaos 46/105,
 `dd-partial-transfers` 22/58, and `zstd-multithread` 56/118 (CPU/wall seconds).
-The other 487 selected cells require at most 12/49. The 188 runnable but
+The other 721 selected cells require at most 13/49. The 166 runnable but
 `ci:false` cells had no retained passing samples and are reported as unsampled,
 not treated as calibrated.
 

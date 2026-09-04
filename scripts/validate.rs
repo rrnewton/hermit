@@ -10277,12 +10277,69 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         validate_plan::HostCapability::CpuidFaulting,
         "planted absence".to_string(),
     )]);
+    let plan_path = root.join("ci/expected-e2e-plan.json");
+    let plan: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&plan_path)
+            .map_err(|e| format!("cannot read {}: {e}", plan_path.display()))?,
+    )
+    .map_err(|e| format!("invalid JSON in {}: {e}", plan_path.display()))?;
+    let privileged_rows = plan
+        .get("cells")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{} has no cells array", plan_path.display()))?
+        .iter()
+        .filter(|cell| {
+            cell.get("lane").and_then(serde_json::Value::as_str) == Some("privileged")
+                && cell.get("category").and_then(serde_json::Value::as_str)
+                    == Some("backend-parity-c")
+        })
+        .map(|cell| {
+            let test = cell
+                .get("test")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "privileged backend-parity-c row has no test".to_string())?;
+            let mode = cell
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "privileged backend-parity-c row has no mode".to_string())?;
+            let backend = cell
+                .get("backend")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "privileged backend-parity-c row has no backend".to_string())?;
+            if cell.get("requires_host_capabilities")
+                != Some(&serde_json::json!(["cpuid-faulting"]))
+            {
+                return Err(format!(
+                    "privileged backend-parity-c row {test}/{mode}/{backend} does not require exactly cpuid-faulting"
+                ));
+            }
+            Ok((test.to_string(), mode.to_string(), backend.to_string()))
+        })
+        .collect::<Result<BTreeSet<_>, String>>()?;
+    let expected_privileged_rows = BTreeSet::from([
+        (
+            "backend-parity-c/cpuid-probe".to_string(),
+            "verify".to_string(),
+            "liteinst".to_string(),
+        ),
+        (
+            "backend-parity-c/cpuid-probe".to_string(),
+            "verify".to_string(),
+            "ptrace".to_string(),
+        ),
+    ]);
+    if privileged_rows != expected_privileged_rows {
+        return Err(format!(
+            "node vacuity: privileged backend-parity-c selected rows are wrong: {privileged_rows:?}"
+        ));
+    }
     let parsed = read_bucket_cells(root, &absent)?;
     let privileged = parsed
         .iter()
         .find(|bucket| bucket.lane == "privileged" && bucket.category == "backend-parity-c")
         .ok_or("node vacuity: required plan lost the privileged backend-parity-c bucket")?;
-    if privileged.selected != 1
+    if privileged.selected != 2
+        || privileged.withheld != 2
         || !bucket_runs_nothing(privileged)
         || privileged.capabilities != vec!["cpuid-faulting".to_string()]
     {

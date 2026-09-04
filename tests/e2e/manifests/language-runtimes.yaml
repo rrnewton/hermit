@@ -708,11 +708,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: DBT Rust qualification is tracked by backend compatibility
           kvm: KVM interpreter coverage requires separate privileged qualification
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst Rust qualification is tracked by backend compatibility
       replay:
         ci: false
         backends_enabled: []

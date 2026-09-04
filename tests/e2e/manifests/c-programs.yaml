@@ -23,9 +23,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: "Not yet qualified for this memfd-backed procfs identity check"
-          liteinst: "Not yet qualified for this memfd-backed procfs identity check"
           kvm: "Initial C-corpus migration preserves the established ptrace and SaBRe baseline; qualify KVM separately"
       naked:
         ci: false
@@ -85,13 +85,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -151,15 +152,16 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         ci_disabled_reason:
           dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -214,13 +216,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -338,13 +341,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -404,15 +408,16 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         ci_disabled_reason:
           dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -467,13 +472,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -542,11 +548,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -601,13 +607,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -666,13 +673,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre:
             result: infrastructure-error
@@ -742,10 +750,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -867,10 +875,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -996,10 +1004,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -1054,13 +1062,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
       naked:
@@ -1187,13 +1196,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre:
             result: infrastructure-error
@@ -1349,11 +1359,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -1467,13 +1477,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -1533,15 +1544,16 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         ci_disabled_reason:
           dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -1596,13 +1608,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -1661,13 +1674,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre:
             result: infrastructure-error
@@ -1727,15 +1741,16 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         ci_disabled_reason:
           dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -1789,13 +1804,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       naked:
@@ -1862,10 +1878,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -1920,10 +1936,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -1978,10 +1994,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -2046,10 +2062,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -2188,10 +2204,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -2256,10 +2272,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -2324,10 +2340,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -2382,10 +2398,9 @@ test:
           ptrace: true
           dbt: false
           sabre: true
-          liteinst: false
+          liteinst: true
         ci_disabled_reason:
           dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - dbt
@@ -2457,10 +2472,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -2643,13 +2658,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       naked:
@@ -2706,15 +2722,16 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         ci_disabled_reason:
           dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -2769,15 +2786,16 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         ci_disabled_reason:
           dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -2832,10 +2850,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -2890,15 +2908,16 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         ci_disabled_reason:
           dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -3014,13 +3033,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -3080,13 +3100,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -3146,13 +3167,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -3212,16 +3234,17 @@ test:
           ptrace: true
           kvm: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
+          - liteinst
         guest_args:
           kvm:
             - --kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           kvm:
             result: infrastructure-error
@@ -3281,13 +3304,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -3347,13 +3371,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -3413,10 +3438,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -3471,10 +3496,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -3529,10 +3554,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -3587,10 +3612,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -3731,10 +3756,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -4441,10 +4466,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -4499,10 +4524,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -4557,10 +4582,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -4613,9 +4638,7 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
+          liteinst: true
         backends_enabled:
           - ptrace
           - liteinst
@@ -4679,13 +4702,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -4745,13 +4769,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -4811,13 +4836,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -4877,13 +4903,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -4943,10 +4970,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -5001,10 +5028,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -5059,10 +5086,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -5116,13 +5143,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre:
             result: infrastructure-error
@@ -5182,12 +5210,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         ci_disabled_reason:
           dbt: {"result": "parity-failure", "evidence": "637b0b19d63facb4cc77174334ed325132b83516; task drain_hermit_2059_to", "reason": "Exact-head structured verification preserved EFAULT/EINVAL precedence but exposed the host pipe capacity 65536 instead of Detcore's fixed 8192-byte capacity, so Run1 exited status 1 before comparison; this is an exact backend-parity failure, not absent DBT support."}
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         guest_args:
           ptrace:
             - "8192"
@@ -5199,7 +5229,6 @@ test:
           bitwise_parity: true
         backends_disabled:
           kvm: KVM qualification is separate from this ptrace and SaBRe errno-precedence regression
-          liteinst: LiteInst canonical verification remains blocked by guest-visible startup mapping identity
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (by design): this probe asserts Linux errno precedence and Detcore pipe policy, not native nondeterminism.'
@@ -5258,10 +5287,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -5315,13 +5344,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure, crash-error at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 118, 198.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
       naked:
@@ -5378,10 +5408,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -5435,11 +5465,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Only ptrace was qualified when this cell was added; qualify DBT separately rather than asserting it untested
           kvm: Only ptrace was qualified when this cell was added; qualify KVM separately rather than asserting it untested
           sabre: Only ptrace was qualified when this cell was added; qualify SaBRe separately rather than asserting it untested
-          liteinst: Only ptrace was qualified when this cell was added; qualify LiteInst separately rather than asserting it untested
       naked:
         ci: false
         backends_enabled: []
@@ -5581,11 +5611,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -5649,13 +5679,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
@@ -5779,11 +5810,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: SaBRe reaches L2, but backend-visible loader file opens shift virtual inode allocation
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -5848,10 +5879,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -5906,13 +5937,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -5972,13 +6004,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -6038,13 +6071,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -6104,10 +6138,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -6161,13 +6195,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
@@ -6223,11 +6258,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -6281,13 +6316,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre:
             result: infrastructure-error
@@ -6347,13 +6383,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -6412,13 +6449,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre:
             result: infrastructure-error
@@ -6478,13 +6516,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -6544,10 +6583,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -6685,11 +6724,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -6744,10 +6783,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -6988,10 +7027,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -7046,10 +7085,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -7104,13 +7143,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -7170,13 +7210,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -7236,13 +7277,14 @@ test:
           ptrace: true
           dbt: false
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a timeout; this cell did not pass every repetition cleanly. Retained detail: cell exceeded 15 s before attempt 1 started", "result": "timeout"}
@@ -7300,13 +7342,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -7437,10 +7480,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -7495,10 +7538,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -7553,10 +7596,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -7620,13 +7663,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
@@ -7683,10 +7727,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -7750,11 +7794,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -7820,13 +7864,14 @@ test:
       verify:
         ci:
           ptrace: true
+          liteinst: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Session and process-group identity is unmodelled on every backend; qualify DBT separately rather than pinning a second passthrough
           kvm: Session and process-group identity is unmodelled on every backend; qualify KVM separately rather than pinning a second passthrough
           sabre: Session and process-group identity is unmodelled on every backend; qualify SaBRe separately rather than pinning a second passthrough
-          liteinst: Session and process-group identity is unmodelled on every backend; qualify LiteInst separately rather than pinning a second passthrough
       naked:
         ci: false
         ci_disabled_reason: This cell pins the container's session and process-group values; it makes no claim about native variation, so naked is not selected.
@@ -7884,13 +7929,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
@@ -8026,11 +8072,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -8162,13 +8208,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       naked:
@@ -8234,11 +8281,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -8888,13 +8935,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -8954,13 +9002,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -9020,10 +9069,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -9078,10 +9127,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -9136,10 +9185,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -9194,13 +9243,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -9259,11 +9309,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -9327,11 +9377,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -9386,13 +9436,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -9452,13 +9503,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -9518,13 +9570,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -9584,10 +9637,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -9642,10 +9695,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -9700,10 +9753,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -9758,13 +9811,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -9823,13 +9877,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
@@ -10020,13 +10075,14 @@ test:
         ci:
           ptrace: true
           sabre: false
+          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
@@ -10093,10 +10149,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -10151,10 +10207,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
@@ -10383,13 +10439,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -10517,13 +10574,14 @@ test:
           ptrace: true
           dbt: false
           sabre: true
+          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
+          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -10582,11 +10640,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
-          liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []
