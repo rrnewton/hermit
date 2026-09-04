@@ -50,6 +50,16 @@ class AuthorityUnavailable(RuntimeError):
     """
 
 
+class AuthorityRefused(RuntimeError):
+    """Reached and answered no. Not an outage; see check_outcome_adapter."""
+
+
+# ⚠️ IMPORTED, NOT COPIED. Two lists of transport signatures is exactly where one
+# gets a new entry and the other does not, and the consequence of the stale copy
+# is a silent skip.
+from check_outcome_adapter import _is_transport_failure  # noqa: E402
+
+
 class AuthorityIntegrityError(RuntimeError):
     """Obtained and does NOT match the pin. A refusal; still fails closed."""
 
@@ -78,9 +88,13 @@ def _fetch_pinned_source() -> bytes:
     result = subprocess.run(command, capture_output=True, check=False)
     if result.returncode != 0:
         detail = result.stderr.decode(errors="replace").strip() or "no error output"
-        raise AuthorityUnavailable(
-            "cannot fetch the pinned review-label contract with gh api: "
-            f"{detail}"
+        if _is_transport_failure(detail):
+            raise AuthorityUnavailable(
+                "cannot fetch the pinned review-label contract: " f"{detail}"
+            )
+        raise AuthorityRefused(
+            "the pinned review-label contract was reached and refused: "
+            f"{detail}. This is not an outage and is not being skipped"
         )
     return result.stdout
 
