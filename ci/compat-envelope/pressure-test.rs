@@ -167,6 +167,7 @@ Usage: ci/compat-envelope/pressure-test.rs COMMAND [OPTIONS]
 Commands:
   run [--results DIR] [--mode MODE] [--sample COUNT] [--seed SEED]
       [--green --repetitions COUNT] [--jobs COUNT]
+      [--probe-disabled --backend BACKEND]
       Run bounded probes for the selected red cells. An exact-cell run uses the
       current working tree for fast fix/test iteration; a dirty result is
       labelled exploratory and cannot promote the scorecard. Batch runs require
@@ -188,6 +189,7 @@ Commands:
       cell, --mode, or --sample is partial evidence.
   plan --results DIR [--mode MODE] [--sample COUNT] [--seed SEED]
       [--green --repetitions COUNT] [--jobs COUNT]
+      [--probe-disabled --backend BACKEND]
       Generate the same safe-ci execution plan without running it. The default
       output is DIR/dag.json.
   summarize --results DIR
@@ -204,7 +206,11 @@ Exact-cell options (run and plan):
   --test TEST-ID           Exact manifest test ID, such as
                            applications/example-timed-progress-bar
   --mode MODE              verify, replay, chaos, or naked
-  --backend BACKEND        ptrace, dbt, kvm, sabre, liteinst, or native
+  --backend BACKEND        Backend for one exact cell, or for a
+                           --probe-disabled batch
+  --probe-disabled         Probe disabled cells for one backend. With --test,
+                           also requires --mode; without --test, --mode may
+                           narrow the disabled-backend population.
   --cell-timeout SECONDS   Tighter cap for each selected cell; requires either
                            an exact cell, --sample, or a repeated batch
   --repetitions COUNT      Repeat each selected red cell in independent boxed
@@ -358,6 +364,8 @@ struct CellSelection {
     #[serde(default)]
     green: bool,
     #[serde(default)]
+    probe_disabled: bool,
+    #[serde(default)]
     jobs: Option<i64>,
 }
 
@@ -440,18 +448,16 @@ fn validate_repetition_selection(selection: &CellSelection) -> Result<(), String
     // stability question needs. Reaching it meant one invocation per cell, an
     // ad-hoc loop around a tool that already knew how to schedule and bound the
     // work itself.
-    // ⚠️ KEEP THIS EVEN THOUGH THE CLI CANNOT REACH IT. Through the command line
-    // an earlier check refuses any selection naming some of
-    // --test/--mode/--backend but not all, so every partial shape is rejected
-    // before arriving here -- measured on all four of them. That made this look
-    // like dead code and it was briefly removed; `self-test` immediately failed
-    // with "repeated selection accepted partial exact cell", because it
-    // exercises this validation DIRECTLY. The function carries its own contract
-    // and must refuse on its own terms rather than relying on a caller that
-    // happens to check first.
-    if selection.test.is_some() || selection.backend.is_some() {
+    // A backend filter is otherwise an incomplete exact-cell selector. The one
+    // batch exception is explicit disabled-cell probing, where the backend is
+    // required so a broad run cannot accidentally exercise every unsupported
+    // implementation.
+    if selection.test.is_some()
+        || (selection.backend.is_some() && !selection.probe_disabled)
+    {
         return Err(
-            "a repeated batch accepts only an optional --mode filter; name a full \
+            "a repeated batch accepts only an optional --mode filter, unless \
+             --probe-disabled names one --backend; name a full \
              --test/--mode/--backend cell to repeat exactly one"
                 .into(),
         );
@@ -997,6 +1003,8 @@ struct RunMetadata {
     run_id_prefix: Option<String>,
     #[serde(default)]
     green: bool,
+    #[serde(default)]
+    probe_disabled: bool,
     #[serde(default = "default_pressure_jobs")]
     jobs: i64,
     #[serde(default)]
@@ -1617,6 +1625,12 @@ fn result_options(
                 }
                 selection.green = true;
             }
+            "--probe-disabled" if allow_selection => {
+                if selection.probe_disabled {
+                    return Err("--probe-disabled may be specified only once".into());
+                }
+                selection.probe_disabled = true;
+            }
             "--jobs" if allow_selection => {
                 let raw = args.next().ok_or("--jobs requires a count")?;
                 let value = raw
@@ -1632,15 +1646,29 @@ fn result_options(
             _ => return Err(format!("unknown option `{arg}`\n\n{USAGE}")),
         }
     }
-    let exact_fields = [
-        selection.test.is_some(),
-        selection.mode.is_some() && (selection.test.is_some() || selection.backend.is_some()),
-        selection.backend.is_some(),
-    ];
-    if exact_fields.iter().any(|present| *present) && !exact_fields.iter().all(|present| *present) {
-        return Err(
-            "an exact-cell selection requires --test, --mode, and --backend together".into(),
-        );
+    if selection.probe_disabled {
+        if selection.backend.is_none() {
+            return Err("--probe-disabled requires --backend".into());
+        }
+        if selection.green {
+            return Err("--probe-disabled and --green are mutually exclusive".into());
+        }
+        if selection.test.is_some() && selection.mode.is_none() {
+            return Err("--probe-disabled with --test also requires --mode".into());
+        }
+    } else {
+        let exact_fields = [
+            selection.test.is_some(),
+            selection.mode.is_some() && (selection.test.is_some() || selection.backend.is_some()),
+            selection.backend.is_some(),
+        ];
+        if exact_fields.iter().any(|present| *present)
+            && !exact_fields.iter().all(|present| *present)
+        {
+            return Err(
+                "an exact-cell selection requires --test, --mode, and --backend together".into(),
+            );
+        }
     }
     // A REPEATED BATCH MAY CARRY IT TOO. The per-cell cap is the bound that
     // actually stops a hung repetition -- the whole-run bound is a wall-clock
@@ -2046,7 +2074,11 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 && selection.mode.is_none()
                 && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"));
         match cell.status.as_str() {
-            "red" if selected && !selection.selects_green_population() => {
+            "red"
+                if selected
+                    && !selection.selects_green_population()
+                    && !selection.probe_disabled =>
+            {
                 let budget = budgets
                     .get(&(
                         cell.id.test.clone(),
@@ -2093,12 +2125,32 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 selected_cells.push(cell);
             }
             "green" => {}
-            // NOT APPLICABLE IS NOT A CANDIDATE, AND SAYING SO IS THE POINT. The
-            // backend is not enabled for this mode, so there is nothing to
-            // pressure-test: repeating a cell that was never asked to run
-            // measures the harness, not the cell. Before the scorecard could say
-            // `not-applicable` these 4,940 cells were `red`, and an unfiltered
-            // run offered to pressure-test every one of them.
+            "not-applicable" if selected && selection.probe_disabled => {
+                let budget = budgets
+                    .get(&(
+                        cell.id.test.clone(),
+                        cell.id.mode.clone(),
+                        cell.id.backend.clone(),
+                    ))
+                    .ok_or_else(|| {
+                        format!(
+                            "no manifest execution budget for {}/{}/{}",
+                            cell.id.test, cell.id.mode, cell.id.backend
+                        )
+                    })?;
+                if budget.attempts.is_some() {
+                    selected_cells.push(cell);
+                } else if selection.is_exact() {
+                    return Err(format!(
+                        "{}/{}/{} is disabled and unavailable: its manifest declares no executable attempts",
+                        cell.id.test, cell.id.mode, cell.id.backend
+                    ));
+                } else {
+                    unavailable.push(cell);
+                }
+            }
+            // Without explicit probing, a disabled cell stays out of the
+            // executable population and an exact request explains why.
             "not-applicable" if selected && selection.is_exact() => {
                 return Err(format!(
                     "{}/{}/{} is NOT APPLICABLE, not red: {}",
@@ -3000,6 +3052,7 @@ fn write_plan_after_scorecard_check(
         repetitions: selection.repetitions,
         run_id_prefix: selection.run_id_prefix.clone(),
         green: selection.green,
+        probe_disabled: selection.probe_disabled,
         jobs: selection.scheduler_jobs(),
         eligible_cells,
         cells: cells.into_iter().map(|cell| cell.id).collect(),
@@ -3198,6 +3251,7 @@ fn validate_run_contract(
         repetitions: metadata.repetitions,
         run_id_prefix: metadata.run_id_prefix.clone(),
         green: metadata.green,
+        probe_disabled: metadata.probe_disabled,
         jobs: Some(metadata.jobs),
     };
     let pressure_cells = pressure_cells(root, &selection)?;
@@ -6058,8 +6112,12 @@ fn self_test(root: &Path) -> Result<(), String> {
     let not_applicable = tracked
         .cells
         .iter()
-        .find(|cell| cell.status == "not-applicable")
-        .ok_or("self-test needs at least one not-applicable cell")?
+        .find(|cell| {
+            cell.status == "not-applicable"
+                && cell.id.mode == "verify"
+                && cell.id.backend == "kvm"
+        })
+        .ok_or("self-test needs at least one disabled KVM verify cell")?
         .clone();
     if not_applicable.not_applicable_reason.is_none() {
         return Err(format!(
@@ -6088,6 +6146,73 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err(format!(
             "exact not-applicable refusal lost its actionable explanation: {unavailable_error}"
         ));
+    }
+    let disabled_exact_selection = CellSelection {
+        probe_disabled: true,
+        ..unavailable_selection.clone()
+    };
+    let disabled_exact = pressure_cells(root, &disabled_exact_selection)?;
+    if disabled_exact.selected.len() != 1
+        || disabled_exact.selected[0].id != not_applicable.id
+        || disabled_exact.selected[0].enabled
+    {
+        return Err("explicit disabled-cell probing lost its exact requested cell".into());
+    }
+    let disabled_batch_selection = CellSelection {
+        mode: Some("verify".into()),
+        backend: Some("kvm".into()),
+        probe_disabled: true,
+        repetitions: Some(1),
+        run_timeout_seconds: Some(1_000_000),
+        ..CellSelection::default()
+    };
+    let disabled_batch = pressure_cells(root, &disabled_batch_selection)?;
+    if disabled_batch.selected.is_empty()
+        || disabled_batch.selected.iter().any(|cell| {
+            cell.enabled
+                || cell.status != "not-applicable"
+                || cell.id.mode != "verify"
+                || cell.id.backend != "kvm"
+        })
+    {
+        return Err("disabled-backend batch selected an enabled or mismatched cell".into());
+    }
+    let mut disabled_batch_args = vec![
+        "--results".to_string(),
+        "ignored/compat-envelope/disabled-batch-self-test".to_string(),
+        "--probe-disabled".to_string(),
+        "--backend".to_string(),
+        "kvm".to_string(),
+        "--mode".to_string(),
+        "verify".to_string(),
+        "--repetitions".to_string(),
+        "1".to_string(),
+    ]
+    .into_iter();
+    let (_, _, parsed_disabled_batch) =
+        result_options(root, &mut disabled_batch_args, false, true)?;
+    if !parsed_disabled_batch.probe_disabled
+        || parsed_disabled_batch.backend.as_deref() != Some("kvm")
+        || parsed_disabled_batch.mode.as_deref() != Some("verify")
+        || parsed_disabled_batch.is_exact()
+    {
+        return Err("disabled-backend batch options did not retain their selection".into());
+    }
+    for arguments in [
+        vec!["--probe-disabled"],
+        vec!["--probe-disabled", "--backend", "kvm", "--green"],
+        vec![
+            "--probe-disabled",
+            "--backend",
+            "kvm",
+            "--test",
+            "fixture/test",
+        ],
+    ] {
+        let mut arguments = arguments.into_iter().map(str::to_string);
+        if result_options(root, &mut arguments, false, true).is_ok() {
+            return Err("invalid disabled-backend selection was accepted".into());
+        }
     }
     let exact_id = unfiltered
         .selected
@@ -7235,6 +7360,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         repetitions: None,
         run_id_prefix: None,
         green: false,
+        probe_disabled: false,
         jobs: default_jobs(),
         eligible_cells: 1,
         cells: vec![sample_a.clone()],
