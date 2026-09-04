@@ -22,16 +22,17 @@ test:
         ci:
           ptrace: true
           liteinst: false
+          kvm: true
         ci_disabled_reason:
           liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -90,16 +91,17 @@ test:
         ci:
           ptrace: true
           liteinst: false
+          kvm: true
         ci_disabled_reason:
           liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -229,9 +231,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -291,9 +293,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -353,9 +355,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: KVM ElfExecutor personality returns deterministic ENOSYS for close_range; ptrace and DBT forward the fd-table syscall
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -415,9 +417,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -478,9 +480,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: SaBRe does not virtualize CPUID; this oracle requires Hermit's synthetic CPU identity
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -602,9 +604,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -664,9 +666,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -729,11 +731,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -793,9 +795,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -855,9 +857,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -917,9 +919,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -979,9 +981,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -1295,9 +1297,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -1357,9 +1359,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -1419,9 +1421,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -1481,9 +1483,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: KVM ElfExecutor personality returns deterministic ENOSYS for memfd_create; ptrace and DBT forward the anonymous-memfd syscall
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -1543,9 +1545,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -1605,11 +1607,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -1669,16 +1671,17 @@ test:
         ci:
           ptrace: true
           liteinst: false
+          kvm: true
         ci_disabled_reason:
           liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -1737,9 +1740,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -1799,11 +1802,12 @@ test:
         ci:
           ptrace: true
           dbt: false
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
+          - kvm
         backends_disabled:
-          kvm: Fresh shared-manifest L2 revalidation timed out at the 90-second contract on current main; requalify KVM before enabling this cell
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
         ci_disabled_reason:
@@ -1868,9 +1872,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -1930,9 +1934,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -1992,9 +1996,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -2054,9 +2058,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -2118,9 +2122,9 @@ test:
           - ptrace
           - sabre
           - liteinst
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -2178,9 +2182,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -2364,14 +2368,15 @@ test:
         ci:
           ptrace: true
           sabre: false
+          kvm: true
         ci_disabled_reason:
           sabre: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 26, 26, 26.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
@@ -2430,9 +2435,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -2492,9 +2497,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -2554,9 +2559,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -2616,9 +2621,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -2678,9 +2683,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -2740,9 +2745,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -2802,9 +2807,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Never measured for this cell; the original .toml cited a missing toolchain on the authoring host, which is not evidence about the backend
-          kvm: Never measured for this cell; the original .toml cited a missing toolchain on the authoring host, which is not evidence about the backend
           sabre: Never measured for this cell; the original .toml cited a missing toolchain on the authoring host, which is not evidence about the backend
           liteinst: Never measured for this cell; the original .toml cited a missing toolchain on the authoring host, which is not evidence about the backend
       naked:
@@ -2864,9 +2869,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -2926,9 +2931,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -2988,16 +2993,17 @@ test:
         ci:
           ptrace: true
           liteinst: false
+          kvm: true
         ci_disabled_reason:
           liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -3056,9 +3062,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -3118,9 +3124,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -3242,16 +3248,17 @@ test:
         ci:
           ptrace: true
           liteinst: false
+          kvm: true
         ci_disabled_reason:
           liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -3310,9 +3317,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT forwards the host uname(2) nodename instead of pinning it; ptrace and KVM determinize the hostname, DBT leaks the real host name
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -3372,9 +3379,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -3496,9 +3503,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -3620,9 +3627,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -3820,14 +3827,15 @@ test:
         ci:
           ptrace: true
           liteinst: false
+          kvm: true
         ci_disabled_reason:
           liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: KVM ElfExecutor personality returns deterministic ENOSYS for sendfile(2); the in-kernel copy path is not yet emulated
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -3951,9 +3959,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -4159,9 +4167,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: KVM's child-process personality does not synchronize cross-process pipe I/O with the coordinator, so the parent's blocking read returns EAGAIN instead of the child's bytes
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -4221,14 +4229,15 @@ test:
         ci:
           ptrace: true
           liteinst: false
+          kvm: true
         ci_disabled_reason:
           liteinst: {"result": "determinism-failure", "evidence": "17107307a33b6f6383c1b7bc2acb364b162b6c8c", "reason": "LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; a 12-RCB (120ns) initial drift accumulates to 672 RCBs (6,720ns), causing guest-visible virtual-time divergence under canonical verification at scheduler turn 10."}
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -4287,14 +4296,15 @@ test:
         ci:
           ptrace: true
           liteinst: false
+          kvm: true
         ci_disabled_reason:
           liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -4353,9 +4363,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -4477,9 +4487,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
           liteinst: Not evaluated in the source backend-parity matrix; qualify LiteInst separately
       naked:
@@ -5178,16 +5188,17 @@ test:
         ci:
           ptrace: true
           liteinst: false
+          kvm: true
         ci_disabled_reason:
           liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: KVM ElfExecutor does not implement the F_GETPIPE_SZ/F_SETPIPE_SZ pipe-capacity fcntl commands and returns a deterministic error
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -5249,11 +5260,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: Canonical DBT verification has not been qualified for this environment-control fixture
-          kvm: KVM verification does not yet compare canonical non-vacuous INFO evidence
           sabre: Canonical SaBRe verification has not been qualified for this environment-control fixture
           liteinst: LiteInst canonical verification remains blocked by guest-visible startup mapping identity
       naked:
@@ -5387,16 +5398,17 @@ test:
         ci:
           ptrace: true
           liteinst: false
+          kvm: true
         ci_disabled_reason:
           liteinst: {"result": "determinism-failure", "evidence": "e73e7ba0bf56fbbfefffa304f7622c67aac6ea88", "reason": "LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; the resulting 672-RCB (6,720ns) virtual-time divergence caused canonical verification to fail at scheduler turn 10."}
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -5532,16 +5544,17 @@ test:
         ci:
           ptrace: true
           liteinst: false
+          kvm: true
         ci_disabled_reason:
           liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -5674,16 +5687,17 @@ test:
         ci:
           ptrace: true
           liteinst: false
+          kvm: true
         ci_disabled_reason:
           liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
@@ -5742,12 +5756,13 @@ test:
         ci:
           ptrace: true
           liteinst: true
+          kvm: true
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         backends_disabled:
           dbt: Not buildable on the authoring host (cmake absent); qualify DBT separately
-          kvm: KVM does not complete a guest on the authoring host; qualify KVM separately
           sabre: Not buildable on the authoring host (cmake absent); qualify SaBRe separately
       naked:
         ci: false
@@ -5809,12 +5824,13 @@ test:
         ci:
           ptrace: true
           liteinst: true
+          kvm: true
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         backends_disabled:
           dbt: DBI is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBI separately -- this guest is a PRIORITY for DBI once it builds, since layout divergence is exactly what it detects
-          kvm: KVM livelocks at guest startup on the current host; qualify KVM separately -- also a priority for this guest
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
       naked:
         ci: false
@@ -6084,11 +6100,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: 'Measured: the guest produces NO stdout and hermit exits 1 under --backend dbi, so the fixture does not complete there. Recorded as an observed gap, not diagnosed by this change'
-          kvm: KVM times out before guest start on the validation host, so no split-pattern verdict is available
           sabre: Not yet qualified for the partial-transfer split contract
           liteinst: Not yet qualified for the partial-transfer split contract
       custom:
@@ -6219,9 +6235,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
-          kvm: New top-of-funnel coverage is established on the ptrace reference first; KVM ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
           liteinst: New top-of-funnel coverage is established on the ptrace reference first; LiteInst ratchets against it separately
       naked:
@@ -6347,14 +6363,15 @@ test:
         ci:
           ptrace: true
           liteinst: false
+          kvm: true
         ci_disabled_reason:
           liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         backends_disabled:
           dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
-          kvm: New top-of-funnel coverage is established on the ptrace reference first; KVM ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
       naked:
         ci: false
@@ -6475,9 +6492,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Not yet qualified for this guest; ratchet separately
-          kvm: KVM livelocks at guest startup on the current host; qualify separately
           sabre: Not yet qualified for this guest; ratchet separately
           liteinst: LiteInst preload runtime is not built beside the binary on this host
       naked:
@@ -6537,9 +6554,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Not yet qualified for this guest; ratchet separately
-          kvm: KVM livelocks at guest startup on the current host; qualify separately
           sabre: Not yet qualified for this guest; ratchet separately
           liteinst: LiteInst preload runtime is not built beside the binary on this host
       naked:
@@ -6599,12 +6616,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         guest_args:
           ptrace:
             - --require-small-determinized
         backends_disabled:
           dbt: DBT is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBT separately
-          kvm: KVM livelocks at guest startup on the current host; qualify KVM separately
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
           liteinst: LiteInst preload runtime libreverie_liteinst.so is not built beside the binary; qualify LiteInst separately
       naked:
@@ -6669,9 +6686,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: Not yet qualified for this guest; ratchet separately
-          kvm: KVM livelocks at guest startup on the current host; qualify separately
           sabre: Not yet qualified for this guest; ratchet separately
           liteinst: LiteInst preload runtime is not built beside the binary on this host
       naked:
