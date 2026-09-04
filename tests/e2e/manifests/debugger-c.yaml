@@ -22,11 +22,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
           - sabre
           - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
       naked:
         ci: false
         backends_enabled: []
