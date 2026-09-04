@@ -77,9 +77,9 @@ These rows are part of the selected regression denominator even though they are 
 
 ## Status and measurement
 
-Selection and observation answer different questions. The Green/Red table says what full validation selects. The per-cell `measurement` value says what retained evidence observed: `never-measured`, `measured-and-passed`, `measured-no-verdict`, `diverged-unlocated`, or `diverged`. In the current generated data, **15 Green cells are `never-measured`**. Read the generated Status and measurement section for the complete current cross-tab; do not use Red as a failed-test count.
+Selection and observation answer different questions. The Green/Red table says what full validation selects. The per-cell `measurement` value says what retained evidence observed: `never-measured`, `measured-and-passed`, `measured-no-verdict`, `diverged-unlocated`, or `diverged`. In the current generated data, **zero Green cells are `never-measured`**. Read the generated Status and measurement section for the complete current cross-tab; do not use Red as a failed-test count.
 
-The current green/`never-measured` count is **15**, and the current red/`measured-and-passed` count is **102**.
+The current green/`never-measured` count is **0**, and the current red/`measured-and-passed` count is **102**.
 
 Retained history that has not been imported is not counted here. A stored measurement does not establish that it describes current code; `show` reports whether the recorded last test still matches `HEAD:detcore`.
 
@@ -87,10 +87,10 @@ The cross-tab includes all **5744** tracked cells; no row is omitted. The curren
 
 | Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `green` | 15 | 640 | 0 | 6 | 11 | 672 |
+| `green` | 0 | 654 | 0 | 6 | 12 | 672 |
 | `red` | 60 | 102 | 0 | 0 | 25 | 187 |
 | `not-applicable` | 4884 | 0 | 0 | 0 | 1 | 4885 |
-| **Total** | **4959** | **742** | **0** | **6** | **37** | **5744** |
+| **Total** | **4944** | **756** | **0** | **6** | **38** | **5744** |
 
 Cells whose stored `measurement` is not `never-measured` are shown individually so status and measurement remain visible together.
 
@@ -156,7 +156,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `backend-parity-c/file-io-roundtrip` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/flock-lifecycle` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/flock-lifecycle` | `verify` | `ptrace` | `green` | `measured-and-passed` |
-| `backend-parity-c/fork-exec-pipeline` | `verify` | `kvm` | `green` | `measured-and-passed` |
+| `backend-parity-c/fork-exec-pipeline` | `verify` | `kvm` | `green` | `diverged` |
 | `backend-parity-c/fork-exec-pipeline` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/fsync-durability` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/ftruncate-sparse` | `verify` | `kvm` | `green` | `measured-and-passed` |
@@ -733,21 +733,28 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/sysinfo` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/sysinfo-uptime` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/syslog-deterministic` | `verify` | `dbt` | `red` | `measured-and-passed` |
+| `c-programs/syslog-deterministic` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/syslog-deterministic` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/syslog-deterministic` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/sysv-sem-enosys` | `verify` | `dbt` | `red` | `measured-and-passed` |
+| `c-programs/sysv-sem-enosys` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/sysv-sem-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/sysv-sem-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/sysv-shm-enosys` | `verify` | `dbt` | `red` | `measured-and-passed` |
+| `c-programs/sysv-shm-enosys` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/sysv-shm-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/sysv-shm-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/tcp-info-accept4` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/tcp-info-accept4` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/tcp-info-accept4` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/tcp-info-accept6` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/tcp-info-accept6` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/tcp-info-accept6` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/tcp-info-client4` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/tcp-info-client4` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/tcp-info-client4` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/tee-enosys` | `verify` | `dbt` | `red` | `measured-and-passed` |
+| `c-programs/tee-enosys` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/tee-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/tee-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/thread-self-procfs-handoff` | `verify` | `ptrace` | `green` | `measured-and-passed` |
@@ -757,24 +764,32 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/thread-sync-determinism` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/threadexhaustion` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/threadexhaustion` | `verify` | `sabre` | `red` | `diverged` |
+| `c-programs/timer-create-determinism` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/timer-create-determinism` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/timer-create-determinism` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/uname` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/uname` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/uname` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/unix-autobind-dgram` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/unix-autobind-dgram` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/unix-autobind-dgram` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/unix-autobind-dgram` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/unix-autobind-seqpacket` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/unix-autobind-seqpacket` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/unix-autobind-seqpacket` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/unix-autobind-seqpacket` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/unix-autobind-stream` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/unix-autobind-stream` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `c-programs/unix-autobind-stream` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/unix-autobind-stream` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/ustat-enosys` | `verify` | `dbt` | `red` | `measured-and-passed` |
+| `c-programs/ustat-enosys` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/ustat-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/ustat-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/vforkexec` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/vforkexec` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/vmsplice-enosys` | `verify` | `dbt` | `red` | `measured-and-passed` |
+| `c-programs/vmsplice-enosys` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/vmsplice-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/vmsplice-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/wait-on-child` | `verify` | `ptrace` | `green` | `measured-and-passed` |
