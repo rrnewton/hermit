@@ -23,14 +23,21 @@ test:
         backends_disabled:
           native: Native ordering can vary but is not guaranteed to diverge in a bounded run
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: false
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT coverage is owned by its backend parity partition
-          kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
+        ci_disabled_reason:
+          kvm:
+            result: determinism-failure
+            evidence: RUN1726 at Hermit 160217da2e5782ff03cc8ebb3bccf34bdf5d1d96
+            reason: The first canonical full-validation attempt diverged at turn 52, record 902, syscall 389 in scheduler COMMIT virtual time and passed only on retry, so it does not meet the zero-retry qualification bar.
       replay:
         ci: false
         backends_enabled: []
