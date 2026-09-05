@@ -983,6 +983,7 @@ dependencies = [
  "reverie-rpc-transport",
  "serde",
  "serde_json",
+ "sha2",
  "shell-words",
  "tempfile",
  "tokio",
@@ -1046,11 +1047,14 @@ version = "0.2.0"
 dependencies = [
  "dagrun",
  "detcore-model",
+ "flate2",
+ "hermit-detcore",
  "libc",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
+ "tempfile",
  "toml",
 ]
 

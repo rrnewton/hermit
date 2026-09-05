@@ -58,6 +58,7 @@ reverie-liteinst = { version = "0.2.0", git = "https://github.com/rrnewton/rever
 reverie-rpc-transport = { version = "0.2.0", git = "https://github.com/rrnewton/reverie.git", rev = "37e7b727a7f921d9c49bad4db6969297fc20f78a" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
+sha2 = "0.10.6"
 shell-words = "1.1.1"
 tempfile = "3.27.0"
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }

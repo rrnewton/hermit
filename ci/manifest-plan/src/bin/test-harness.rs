@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -8,6 +9,8 @@ use std::process::Command;
 use std::process::ExitCode;
 use std::process::Output;
 use std::process::Stdio;
+use std::sync::Condvar;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -1676,6 +1679,123 @@ fn for_each_parallel<T: Send>(
     });
 }
 
+/// Result of one separately scheduled process execution.
+///
+/// A continuation is ready work for the same cell (run 2 after run 1). A
+/// completion is published on the calling thread before its optional retry is
+/// allowed back into the ready queue.
+// This remains compiled and unit-tested while the harness-managed verify path
+// is blocked on authoritative ordinary-run artifacts from every backend.
+#[allow(dead_code)]
+enum ScheduledWorkResult<W, T> {
+    Continue(W),
+    Complete { value: T, retry: Option<W> },
+}
+
+// See `ScheduledWorkResult`: this is production scheduling code staged for the
+// same atomic cutover, not a test-only implementation.
+#[allow(dead_code)]
+struct ReadyWork<W> {
+    continuations: VecDeque<(usize, W)>,
+    initial: VecDeque<(usize, W)>,
+    active: usize,
+}
+
+/// Execute process-sized work items at one global width.
+///
+/// Continuations always leave the queue before another cell's initial item.
+/// This is the scheduling property verify pairs need: run 2 becomes runnable
+/// only after its run 1 completes, then takes priority while never increasing
+/// the number of active Hermit processes above `capacity`.
+// See `ScheduledWorkResult`: callers switch to this function only at the
+// atomic verify-mechanism cutover.
+#[allow(dead_code)]
+fn for_each_parallel_with_continuations<W: Send, T: Send>(
+    initial: Vec<W>,
+    capacity: ScheduledWorkerCapacity,
+    execute: impl Fn(usize, W) -> ScheduledWorkResult<W, T> + Sync,
+    mut consume: impl FnMut(usize, T, bool) -> bool,
+) {
+    if initial.is_empty() {
+        return;
+    }
+    let workers = capacity.workers_for(initial.len());
+    let queue = (
+        Mutex::new(ReadyWork {
+            continuations: VecDeque::new(),
+            initial: initial.into_iter().enumerate().collect(),
+            active: 0,
+        }),
+        Condvar::new(),
+    );
+    let (sender, receiver) = mpsc::channel::<(usize, T, bool, mpsc::SyncSender<bool>)>();
+
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let execute = &execute;
+            let queue = &queue;
+            scope.spawn(move || {
+                loop {
+                    let Some((index, work)) = ({
+                        let (lock, available) = queue;
+                        let mut ready = lock.lock().expect("ready-work queue poisoned");
+                        loop {
+                            let next = ready
+                                .continuations
+                                .pop_front()
+                                .or_else(|| ready.initial.pop_front());
+                            if let Some(next) = next {
+                                ready.active += 1;
+                                break Some(next);
+                            }
+                            if ready.active == 0 {
+                                break None;
+                            }
+                            ready = available
+                                .wait(ready)
+                                .expect("ready-work queue poisoned while waiting");
+                        }
+                    }) else {
+                        break;
+                    };
+
+                    match execute(index, work) {
+                        ScheduledWorkResult::Continue(next) => {
+                            let (lock, available) = queue;
+                            let mut ready = lock.lock().expect("ready-work queue poisoned");
+                            ready.active -= 1;
+                            ready.continuations.push_back((index, next));
+                            available.notify_all();
+                        }
+                        ScheduledWorkResult::Complete { value, retry } => {
+                            let will_retry = retry.is_some();
+                            let (ack_sender, ack_receiver) = mpsc::sync_channel(0);
+                            let acknowledged =
+                                sender.send((index, value, will_retry, ack_sender)).is_ok()
+                                    && ack_receiver.recv().unwrap_or(false);
+                            let (lock, available) = queue;
+                            let mut ready = lock.lock().expect("ready-work queue poisoned");
+                            ready.active -= 1;
+                            if acknowledged {
+                                if let Some(retry) = retry {
+                                    ready.continuations.push_back((index, retry));
+                                }
+                            }
+                            available.notify_all();
+                        }
+                    }
+                }
+            });
+        }
+        drop(sender);
+        for (index, value, will_retry, ack_sender) in receiver {
+            let acknowledged = consume(index, value, will_retry);
+            let _ = ack_sender.send(acknowledged);
+        }
+    });
+}
+
 fn run_with_retry<T>(
     first_attempt: u64,
     mut execute: impl FnMut(u64) -> T,
@@ -1955,6 +2075,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::sync::Barrier;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -1967,12 +2088,14 @@ mod tests {
     use super::EXPECTED_PLAN_SCHEMA;
     use super::HostCapability;
     use super::HostCapabilityVerdict;
+    use super::ScheduledWorkResult;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
     use super::build_worker_capacity;
     use super::command_jobs;
     use super::expected_plan_document;
     use super::for_each_parallel;
+    use super::for_each_parallel_with_continuations;
     use super::host_inapplicable_reason;
     use super::parse;
     use super::run_with_retry;
@@ -2191,6 +2314,120 @@ mod tests {
         rows.sort_unstable();
         assert_eq!(rows, (0..8).map(|index| (index, index)).collect::<Vec<_>>());
         assert!(maximum.load(Ordering::SeqCst) > 1);
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PairStep {
+        Run1 { attempt: u64 },
+        Run2 { attempt: u64 },
+    }
+
+    #[test]
+    fn continuation_queue_runs_twice_as_many_processes_at_the_requested_width() {
+        let active = AtomicUsize::new(0);
+        let maximum = AtomicUsize::new(0);
+        let executions = Mutex::new(Vec::new());
+        let completed = Mutex::new(Vec::new());
+        let first_wave = Barrier::new(4);
+
+        for_each_parallel_with_continuations(
+            vec![PairStep::Run1 { attempt: 1 }; 10],
+            ScheduledWorkerCapacity::new(4),
+            |index, step| {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(now, Ordering::SeqCst);
+                executions.lock().unwrap().push((index, step));
+                if matches!(step, PairStep::Run1 { .. }) && index < 4 {
+                    first_wave.wait();
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                match step {
+                    PairStep::Run1 { attempt } => {
+                        ScheduledWorkResult::Continue(PairStep::Run2 { attempt })
+                    }
+                    PairStep::Run2 { attempt } => ScheduledWorkResult::Complete {
+                        value: attempt,
+                        retry: None,
+                    },
+                }
+            },
+            |index, attempt, will_retry| {
+                assert!(!will_retry);
+                completed.lock().unwrap().push((index, attempt));
+                true
+            },
+        );
+
+        let executions = executions.into_inner().unwrap();
+        assert_eq!(
+            executions.len(),
+            20,
+            "10 verify cells must schedule 20 runs"
+        );
+        assert_eq!(maximum.load(Ordering::SeqCst), 4);
+        for index in 0..10 {
+            let run1 = executions
+                .iter()
+                .position(|entry| *entry == (index, PairStep::Run1 { attempt: 1 }))
+                .unwrap();
+            let run2 = executions
+                .iter()
+                .position(|entry| *entry == (index, PairStep::Run2 { attempt: 1 }))
+                .unwrap();
+            assert!(run1 < run2, "cell {index} ran run 2 before run 1");
+        }
+        assert_eq!(completed.into_inner().unwrap().len(), 10);
+    }
+
+    #[test]
+    fn run2_and_whole_pair_retry_have_priority_over_new_run1_work() {
+        let executions = Mutex::new(Vec::new());
+        let publications = Mutex::new(Vec::new());
+        for_each_parallel_with_continuations(
+            vec![PairStep::Run1 { attempt: 1 }; 2],
+            ScheduledWorkerCapacity::new(1),
+            |index, step| {
+                executions.lock().unwrap().push((index, step));
+                match step {
+                    PairStep::Run1 { attempt } => {
+                        ScheduledWorkResult::Continue(PairStep::Run2 { attempt })
+                    }
+                    PairStep::Run2 { attempt: 1 } => ScheduledWorkResult::Complete {
+                        value: 1,
+                        retry: Some(PairStep::Run1 { attempt: 2 }),
+                    },
+                    PairStep::Run2 { attempt } => ScheduledWorkResult::Complete {
+                        value: attempt,
+                        retry: None,
+                    },
+                }
+            },
+            |index, attempt, will_retry| {
+                publications
+                    .lock()
+                    .unwrap()
+                    .push((index, attempt, will_retry));
+                true
+            },
+        );
+
+        assert_eq!(
+            executions.into_inner().unwrap(),
+            [
+                (0, PairStep::Run1 { attempt: 1 }),
+                (0, PairStep::Run2 { attempt: 1 }),
+                (0, PairStep::Run1 { attempt: 2 }),
+                (0, PairStep::Run2 { attempt: 2 }),
+                (1, PairStep::Run1 { attempt: 1 }),
+                (1, PairStep::Run2 { attempt: 1 }),
+                (1, PairStep::Run1 { attempt: 2 }),
+                (1, PairStep::Run2 { attempt: 2 }),
+            ]
+        );
+        assert_eq!(
+            publications.into_inner().unwrap(),
+            [(0, 1, true), (0, 2, false), (1, 1, true), (1, 2, false)]
+        );
     }
 
     #[test]

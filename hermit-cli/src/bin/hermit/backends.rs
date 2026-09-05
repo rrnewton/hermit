@@ -1002,10 +1002,10 @@ pub(super) fn run_dbt(
         if let Some(capture) = ordinary_log {
             capture.finish()?;
         }
-        write_output(&output)?;
         if let Some(capture) = single_run_stats {
             finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?;
         }
+        write_output(&output)?;
         return Ok(output_status(&output));
     }
 

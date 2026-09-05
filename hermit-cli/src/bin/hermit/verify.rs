@@ -88,15 +88,10 @@ pub(crate) struct ComparisonOptions {
     pub virtualize_time: bool,
 }
 
-/// Versioned policy token: the only strippable datum is the real wall-clock
-/// timestamp PREFIX. Recorded in [`ComparisonSpec::stripped_prefixes`] so a
-/// consumer sees exactly which prefixes were removed, not a bare boolean.
-pub const STRIP_WALL_CLOCK_PREFIX_V1: &str = "real-wall-clock-prefix/v1";
-
-/// Versioned policy token: host memory addresses are canonicalized to an ordinal
-/// by first appearance (identity/order/aliasing preserved). Recorded in
-/// [`ComparisonSpec::canonicalizations`].
-pub const CANON_ADDRESS_ORDINAL_V1: &str = "host-address-to-first-appearance-ordinal/v1";
+/// Compatibility exports for callers that used the verification module before
+/// the canonical policy moved beside the shared comparator.
+pub use detcore::logdiff::CANON_ADDRESS_ORDINAL_V1;
+pub use detcore::logdiff::STRIP_WALL_CLOCK_PREFIX_V1;
 
 /// Versioned policy token marking the lossy wholesale normalization the
 /// [`LogCompareStrictness::Stripped`] mode applies (numbers, addresses, tmp
@@ -335,6 +330,26 @@ impl ComparisonSpec {
         }
     }
 
+    /// Whether the log engine and serialized policy are exactly the shared
+    /// `BitwiseInfoV1` comparison. Observation properties such as output-buffer
+    /// hashing and virtual time are recorded by that policy but do not select a
+    /// different parser or normalization.
+    fn uses_bitwise_info_v1(&self) -> bool {
+        self.strictness == LogCompareStrictness::Canonical
+            && self.compare_logs
+            && self.log_scope == ComparedLogScope::Info
+            && self.record_envelope == RecordEnvelopePolicy::AllRecordsV1
+            && !self.strip_lines
+            && self.canonicalize_addresses
+            && self.full_trace
+            && self.exact_remainder
+            && self.stripped_prefixes == PARITY_STRIPPED_PREFIXES
+            && self.canonicalizations == PARITY_CANONICALIZATIONS
+            && !self.ignore_lines
+            && !self.skip_commit
+            && !self.skip_detlog
+    }
+
     /// Does this comparison satisfy the `BitwiseInfoV1` parity contract a
     /// determinism / record-replay ratchet must require before it may read a
     /// `Matched` verdict as *true parity*? A bare `verified` is not enough:
@@ -515,6 +530,12 @@ impl VerificationOutcome {
 }
 
 fn comparison_report(comparison: &ComparisonSpec) -> ComparisonReport {
+    if comparison.uses_bitwise_info_v1() {
+        return logdiff::bitwise_info_v1_comparison_report(
+            comparison.compare_io_buffers,
+            comparison.virtualize_time,
+        );
+    }
     ComparisonReport {
         strictness: comparison.strictness,
         display_name: Some(comparison.display_name.to_string()),
@@ -953,12 +974,24 @@ fn compare_two_runs_with_unsupported_scan(
                 "ComparisonSpec.ignore_lines must match the diff engine's ignore_lines"
             );
 
-            let summary = logdiff::try_log_diff_detailed_with_filter(
-                log1.as_ref(),
-                log2.as_ref(),
-                &diff_options,
-                options.record_envelope.predicate(),
-            )?;
+            let summary = if spec.uses_bitwise_info_v1() {
+                // The canonical INFO path is shared with standalone log-diff
+                // and the validation harness. No caller-supplied option can
+                // weaken this comparison while the report still names
+                // BitwiseInfoV1.
+                logdiff::try_compare_bitwise_info_v1(
+                    log1.as_ref(),
+                    log2.as_ref(),
+                    compared_labels.clone(),
+                )?
+            } else {
+                logdiff::try_log_diff_detailed_with_filter(
+                    log1.as_ref(),
+                    log2.as_ref(),
+                    &diff_options,
+                    options.record_envelope.predicate(),
+                )?
+            };
             compared_log_messages = Some(ComparedLogCounts {
                 left: summary.compared_left,
                 right: summary.compared_right,
