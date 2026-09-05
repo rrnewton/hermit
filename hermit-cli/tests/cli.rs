@@ -882,6 +882,149 @@ fn run_dbt_executes_integrated_backend() {
 }
 
 #[test]
+fn run_dbt_writes_an_authoritative_ordinary_log_after_the_guest_reaps_children() {
+    if dbt_unavailable(
+        "run_dbt_writes_an_authoritative_ordinary_log_after_the_guest_reaps_children",
+    ) {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBT ordinary-log test directory");
+    let log = directory.path().join("ordinary.log");
+    let log_arg = log.to_str().expect("DBT log path should be UTF-8");
+    let program = dbt_wait_guest()
+        .to_str()
+        .expect("DBT wait guest path should be UTF-8");
+    let args = [
+        "--backend",
+        "dbt",
+        "--log",
+        "info",
+        "--log-file",
+        log_arg,
+        "run",
+        "--strict",
+        "--",
+        program,
+    ];
+
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        "the CLI must preserve the guest's reaped-child result"
+    );
+    let bytes = fs::read(&log).expect("ordinary DBT log must exist when the CLI returns");
+    assert!(!bytes.is_empty(), "ordinary DBT log must be nonempty");
+    assert_eq!(
+        bytes.last(),
+        Some(&b'\n'),
+        "ordinary DBT log must be framed"
+    );
+
+    let compare_args = [
+        "log-diff",
+        "--canonical-info",
+        "--record-envelope",
+        "dbt-evidence-transport-v1",
+        log_arg,
+    ];
+    let canonical = hermit(&compare_args);
+    assert_success(&canonical, &compare_args);
+    assert!(
+        stdout(&canonical).contains("INFO detcore"),
+        "ordinary DBT log had no canonical INFO records:\n{}",
+        stdout(&canonical)
+    );
+}
+
+#[test]
+fn run_dbt_delayed_orphan_either_finishes_evidence_or_leaves_no_partial_log() {
+    if dbt_unavailable("run_dbt_delayed_orphan_either_finishes_evidence_or_leaves_no_partial_log") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBT delayed-orphan test directory");
+    let log = directory.path().join("ordinary.log");
+    let log_arg = log.to_str().expect("DBT log path should be UTF-8");
+    let args = [
+        "--backend",
+        "dbt",
+        "--log",
+        "info",
+        "--log-file",
+        log_arg,
+        "run",
+        "--strict",
+        "--",
+        "/bin/sh",
+        "-c",
+        "(sleep 0.2; echo orphan-child-finished) & exit 0",
+    ];
+
+    let output = hermit(&args);
+    let bytes = fs::read(&log).expect("DBT must create the requested host log");
+    if output.status.success() {
+        assert_eq!(stdout(&output), "orphan-child-finished\n");
+        assert!(!bytes.is_empty(), "successful evidence must be published");
+        let contents = String::from_utf8_lossy(&bytes);
+        assert!(
+            contents.contains("clock_nanosleep") || contents.contains("nanosleep"),
+            "successful evidence omitted the delayed child:\n{contents}"
+        );
+    } else {
+        assert_eq!(output.status.code(), Some(HERMIT_INTERNAL_FAILURE_EXIT));
+        assert!(
+            stderr(&output).contains("protected evidence failed"),
+            "delayed-child refusal did not name evidence finalization:\n{}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("missing FINAL frames"),
+            "delayed-child refusal did not preserve the transport cause:\n{}",
+            stderr(&output)
+        );
+        assert!(
+            bytes.is_empty(),
+            "a refused delayed-child run left a partial log: {} bytes",
+            bytes.len()
+        );
+    }
+}
+
+#[test]
+fn run_dbt_refuses_a_log_that_would_change_relaxed_process_group_semantics() {
+    if dbt_unavailable("run_dbt_refuses_a_log_that_would_change_relaxed_process_group_semantics") {
+        return;
+    }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBT log-policy test directory");
+    let log = directory.path().join("ordinary.log");
+    let log_arg = log.to_str().expect("DBT log path should be UTF-8");
+    let args = [
+        "--backend",
+        "dbt",
+        "--log-file",
+        log_arg,
+        "run",
+        "--allow-unsupported-syscalls",
+        "--",
+        "/bin/true",
+    ];
+
+    let output = hermit(&args);
+
+    assert_eq!(output.status.code(), Some(HERMIT_INTERNAL_FAILURE_EXIT));
+    let stderr = stderr(&output);
+    assert!(stderr.contains("--allow-unsupported-syscalls"), "{stderr}");
+    assert!(stderr.contains("setsid/setpgid"), "{stderr}");
+}
+
+#[test]
 fn run_dbt_uses_the_requested_guest_environment() {
     if dbt_unavailable("run_dbt_uses_the_requested_guest_environment") {
         return;

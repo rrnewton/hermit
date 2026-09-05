@@ -2806,6 +2806,7 @@ impl RunOpts {
                     self.backend_engagement_json.as_deref(),
                     global.log,
                     global.log_file.as_deref(),
+                    global.log_file_handle.as_deref(),
                     &config,
                     environment,
                     dbt_verification_stdin,
