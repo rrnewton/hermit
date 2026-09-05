@@ -129,6 +129,7 @@ use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
 use hermit_manifest_plan::ledger::HistoryRow;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
+use hermit_manifest_plan::runner::resolved_cell_timeouts;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::E2E_KERNEL_VERSION_ENV;
@@ -137,9 +138,15 @@ use hermit_manifest_plan::service_result::FinalValidateStatus;
 use hermit_manifest_plan::service_result::ScorecardWriteback;
 use hermit_manifest_plan::service_result::ValidationServiceResult;
 use hermit_manifest_plan::timeouts::DEFAULT_TEST_WALL_TIMEOUT_SECONDS;
+use hermit_manifest_plan::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV;
 use hermit_manifest_plan::timeouts::scale_timeout_seconds;
-use hermit_manifest_plan::timeouts::timeout_multiplier_from_env;
+use hermit_manifest_plan::timeouts::timeout_multipliers_from_env;
+use hermit_manifest_plan::timeouts::TimeoutMultipliers;
 use hermit_manifest_plan::timeouts::TEST_WALL_TIMEOUT_MULTIPLIER_ENV;
+#[cfg(test)]
+use hermit_manifest_plan::timeouts::{
+    DEFAULT_TEST_CPU_TIMEOUT_SECONDS, parse_timeout_multiplier, resolve_test_timeouts,
+};
 
 use validate_plan::CompatMode;
 use validate_plan::CompatDisposition;
@@ -167,6 +174,8 @@ const REQUALIFICATION_PLACEHOLDER_TAG: &str = "requalify.cell";
 const REQUALIFICATION_RESULT_ROOT_PLACEHOLDER: &str = "validate-requalification-results";
 const REQUALIFICATION_RUN_ID_PLACEHOLDER: &str = "validate-requalification-run-id";
 const QUICK_E2E_VERIFY_TIMEOUT_S: i64 = 1800;
+const QUICK_E2E_VERIFY_COMMAND: &str =
+    "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only";
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
 const DETCORE_MISC_TEST_PREBUILD_COMMAND: &str = r#"mkdir -p target/ci; tests_misc_json="target/ci/tests-misc.cargo.jsonl.tmp.$$"; tests_misc_pointer_tmp="target/ci/tests-misc.path.tmp.$$"; if ! CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run --message-format=json > "$tests_misc_json"; then exit 1; fi; mapfile -t tests_misc_bins < <(jq -er 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "tests_misc" and .executable != null) | .executable' "$tests_misc_json" | sort -u); if ((${#tests_misc_bins[@]} != 1)); then printf 'privileged build: expected one Cargo-reported tests_misc executable, found %d\n' "${#tests_misc_bins[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_bins[0]}"; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi; printf '%s\n' "$tests_misc" > "$tests_misc_pointer_tmp"; mv -f "$tests_misc_pointer_tmp" target/ci/tests-misc.path; mv -f "$tests_misc_json" target/ci/tests-misc.cargo.jsonl"#;
@@ -196,6 +205,8 @@ const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     "E2E_RESULT_ROOT",
     "E2E_RUN_ID",
     "HERMIT_E2E_EMPTY_WORKDIR",
+    TEST_CPU_TIMEOUT_MULTIPLIER_ENV,
+    TEST_WALL_TIMEOUT_MULTIPLIER_ENV,
     "HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT",
     "L4_REPS",
     "PR_NUMBER",
@@ -8024,7 +8035,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
         };
         add("build", "Build workspace", "cargo build --workspace --features third-party-backends".into(), vec![gate.into()], 3600, 16 * 1024 * 1024 * 1024);
         add("e2e_metadata", "Portable E2E metadata", "target/debug/test-harness validate".into(), vec!["quick.build".into()], 600, 4 * 1024 * 1024 * 1024);
-        add("e2e_verify", "Portable ptrace E2E verification", "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only".into(), vec!["quick.build".into()], QUICK_E2E_VERIFY_TIMEOUT_S, 8 * 1024 * 1024 * 1024);
+        add("e2e_verify", "Portable ptrace E2E verification", QUICK_E2E_VERIFY_COMMAND.into(), vec!["quick.build".into()], QUICK_E2E_VERIFY_TIMEOUT_S, 8 * 1024 * 1024 * 1024);
         add("detcore_unit", "Detcore core unit tests", "./ci/run-nextest-counted.sh -p hermit-detcore --lib".into(), vec!["quick.build".into(), "setup.nextest".into()], 1800, 8 * 1024 * 1024 * 1024);
         add("run_smoke", "Hermit run smoke test",
             format!("out=$(timeout 30s {hermit} {run_args} -- /bin/echo {marker}) && test \"$out\" = {marker}"),
@@ -11118,6 +11129,12 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
         if host.cmd.contains("run-in-pinned-root.sh")
             || host.env.contains_key("HERMIT_E2E_EMPTY_WORKDIR")
             || host.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG)
+            || [
+                TEST_CPU_TIMEOUT_MULTIPLIER_ENV,
+                TEST_WALL_TIMEOUT_MULTIPLIER_ENV,
+            ]
+            .iter()
+            .any(|name| host.cmd.contains(&format!("--env {name}")))
         {
             return Err(format!(
                 "pinned-root bracket: {tag} is not a scheduled manifest cell and must stay on the host, but it was wrapped: cmd={:?} env={:?} deps={:?}",
@@ -11190,6 +11207,18 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
             "pinned-root bracket: the scheduled cell lost its image wrapper, /test gate, per-step environment or fetch edge: cmd={:?} env={:?} deps={:?}",
             wrapped.cmd, wrapped.env, wrapped.deps
         ));
+    }
+    for name in [
+        TEST_CPU_TIMEOUT_MULTIPLIER_ENV,
+        TEST_WALL_TIMEOUT_MULTIPLIER_ENV,
+    ] {
+        let argument = format!("--env {name}");
+        if wrapped.cmd.matches(&argument).count() != 1 {
+            return Err(format!(
+                "pinned-root bracket: the scheduled cell must forward {name} exactly once: cmd={:?}",
+                wrapped.cmd
+            ));
+        }
     }
     // ⚠️ SEPARATE ASSERTION WITH ITS OWN MESSAGE, because the combined check above
     // would report a dependency fault as "lost its image wrapper" and send the reader
@@ -12116,14 +12145,42 @@ fn require_outer_timeout_headroom(
     attempts: u64,
     wall_multiplier: f64,
 ) -> Result<i64, String> {
-    let node_timeout_seconds = u64::try_from(node_timeout_seconds)
-        .map_err(|_| format!("retry bounds: {tag} has a nonpositive node timeout"))?;
     let scaled_inner_seconds = scale_timeout_seconds(
         base_inner_seconds,
         wall_multiplier,
         &format!("{tag} wall multiplier"),
     )?;
-    let one_attempt_seconds = scaled_inner_seconds
+    require_resolved_outer_timeout_headroom(
+        tag,
+        node_timeout_seconds,
+        scaled_inner_seconds,
+        1,
+        termination_grace_seconds,
+        attempts,
+        &format!("at wall multiplier {wall_multiplier}"),
+    )
+}
+
+fn require_resolved_outer_timeout_headroom(
+    tag: &str,
+    node_timeout_seconds: i64,
+    resolved_inner_seconds: u64,
+    wall_windows_per_attempt: u64,
+    termination_grace_seconds: u64,
+    attempts: u64,
+    resolved_context: &str,
+) -> Result<i64, String> {
+    let node_timeout_seconds = u64::try_from(node_timeout_seconds)
+        .map_err(|_| format!("retry bounds: {tag} has a nonpositive node timeout"))?;
+    if wall_windows_per_attempt == 0 {
+        return Err(format!(
+            "retry bounds: {tag} has no inner wall-time window per attempt"
+        ));
+    }
+    let bounded_wall_seconds = resolved_inner_seconds
+        .checked_mul(wall_windows_per_attempt)
+        .ok_or_else(|| format!("retry bounds: {tag} inner wall windows overflowed"))?;
+    let one_attempt_seconds = bounded_wall_seconds
         .checked_add(termination_grace_seconds)
         .ok_or_else(|| format!("retry bounds: {tag} timeout plus grace overflowed"))?;
     let required_seconds = attempts
@@ -12131,11 +12188,80 @@ fn require_outer_timeout_headroom(
         .ok_or_else(|| format!("retry bounds: {tag} attempt allowance overflowed"))?;
     if node_timeout_seconds <= required_seconds {
         return Err(format!(
-            "retry bounds: {tag} has a {node_timeout_seconds}s node timeout but {attempts} inner attempt(s) at wall multiplier {wall_multiplier} can consume {required_seconds}s ({scaled_inner_seconds}s plus {termination_grace_seconds}s termination grace each)"
+            "retry bounds: {tag} has a {node_timeout_seconds}s node timeout but {attempts} inner attempt(s) {resolved_context} can consume {required_seconds}s ({wall_windows_per_attempt} x {resolved_inner_seconds}s wall windows plus {termination_grace_seconds}s termination grace each)"
         ));
     }
     i64::try_from(node_timeout_seconds - required_seconds)
         .map_err(|error| format!("retry bounds: {tag} headroom is too large: {error}"))
+}
+
+fn manifest_command_is_prebuilt(tag: &str, command: &str) -> Result<bool, String> {
+    let tail = command
+        .split_once("target/debug/test-harness run ")
+        .map(|(_, tail)| tail)
+        .ok_or_else(|| {
+            format!(
+                "retry bounds: manifest node {tag} does not invoke target/debug/test-harness run"
+            )
+        })?;
+    let prebuilt_count = tail
+        .split_whitespace()
+        .filter(|token| *token == "--prebuilt")
+        .count();
+    match prebuilt_count {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(format!(
+            "retry bounds: manifest node {tag} supplies --prebuilt {prebuilt_count} times"
+        )),
+    }
+}
+
+fn require_manifest_selection_headroom(
+    manifests: &ManifestSet,
+    tag: &str,
+    node_timeout_seconds: i64,
+    selection: &Selection,
+    timeout_multipliers: TimeoutMultipliers,
+    prebuilt: bool,
+    attempts: u64,
+    termination_grace_seconds: u64,
+) -> Result<Option<i64>, String> {
+    let cells = manifests
+        .select(selection)
+        .map_err(|error| format!("retry bounds: cannot select cells for {tag}: {error}"))?;
+    let mut largest_wall_seconds = None;
+    for cell in &cells {
+        let resolved = resolved_cell_timeouts(cell, timeout_multipliers).map_err(|error| {
+            format!(
+                "retry bounds: cannot resolve effective timeouts for {tag} cell {:?}: {error}",
+                cell.id
+            )
+        })?;
+        largest_wall_seconds = Some(
+            largest_wall_seconds.map_or(resolved.wall_seconds, |current: u64| {
+                current.max(resolved.wall_seconds)
+            }),
+        );
+    }
+    let Some(largest_wall_seconds) = largest_wall_seconds else {
+        return Ok(None);
+    };
+    require_resolved_outer_timeout_headroom(
+        tag,
+        node_timeout_seconds,
+        largest_wall_seconds,
+        if prebuilt { 1 } else { 2 },
+        termination_grace_seconds,
+        attempts,
+        &format!(
+            "after CPU multiplier {} and wall multiplier {} in {} mode",
+            timeout_multipliers.cpu,
+            timeout_multipliers.wall,
+            if prebuilt { "prebuilt" } else { "non-prebuilt" }
+        ),
+    )
+    .map(Some)
 }
 
 #[cfg(test)]
@@ -12203,6 +12329,265 @@ mod nextest_timeout_tests {
             .expect_err("an oversized wall multiplier must not outgrow the outer backup");
         assert!(error.contains("wall multiplier 10"), "{error}");
         assert!(error.contains("can consume 2380s"), "{error}");
+    }
+
+    #[test]
+    fn production_manifest_headroom_uses_effective_bounds_and_refuses_invalid() {
+        let root = Path::new(file!())
+            .parent()
+            .and_then(Path::parent)
+            .expect("validate.rs has a repository parent")
+            .to_path_buf();
+        let manifests = ManifestSet::load(&root).unwrap();
+        assert_eq!(
+            manifests
+                .select(&Selection {
+                    population: Some(Population::Required),
+                    ..Default::default()
+                })
+                .unwrap()
+                .len(),
+            710,
+            "timeout accounting must not change the shipped required-cell population"
+        );
+        let selection = Selection {
+            population: Some(Population::Required),
+            lane: Some("portable".into()),
+            test: Some("backend-parity-c/readdir-order-identity".into()),
+            mode: Some("verify".into()),
+            backend: Some("ptrace".into()),
+            ..Default::default()
+        };
+        let cells = manifests.select(&selection).unwrap();
+        assert_eq!(cells.len(), 1, "the shipped production cell must stay selected");
+        let cell = &cells[0];
+        let multipliers = TimeoutMultipliers {
+            cpu: 1.25,
+            wall: 1.5,
+        };
+        let resolved = resolved_cell_timeouts(cell, multipliers).unwrap();
+        assert_eq!(resolved.cpu_seconds, 28);
+        assert_eq!(resolved.wall_seconds, 86);
+        assert!(!manifest_command_is_prebuilt("quick.e2e_verify", QUICK_E2E_VERIFY_COMMAND).unwrap());
+        assert_eq!(
+            require_manifest_selection_headroom(
+                &manifests,
+                "quick.e2e_verify",
+                QUICK_E2E_VERIFY_TIMEOUT_S,
+                &selection,
+                multipliers,
+                false,
+                validate_runtime::MAX_ATTEMPTS_PER_CELL as u64,
+                10,
+            )
+            .unwrap(),
+            Some(1436)
+        );
+        assert_eq!(
+            require_manifest_selection_headroom(
+                &manifests,
+                "prebuilt-control",
+                QUICK_E2E_VERIFY_TIMEOUT_S,
+                &selection,
+                multipliers,
+                true,
+                validate_runtime::MAX_ATTEMPTS_PER_CELL as u64,
+                10,
+            )
+            .unwrap(),
+            Some(1608),
+            "prebuilt cells have no separate fixture-preparation wall window"
+        );
+
+        for (invalid, expected) in [
+            (
+                TimeoutMultipliers {
+                    cpu: f64::NAN,
+                    wall: 1.0,
+                },
+                "must be finite and greater than zero",
+            ),
+            (
+                TimeoutMultipliers {
+                    cpu: 3.0,
+                    wall: 1.0,
+                },
+                "scaled wall timeout must remain greater",
+            ),
+        ] {
+            let error = require_manifest_selection_headroom(
+                &manifests,
+                "quick.e2e_verify",
+                QUICK_E2E_VERIFY_TIMEOUT_S,
+                &selection,
+                invalid,
+                false,
+                validate_runtime::MAX_ATTEMPTS_PER_CELL as u64,
+                10,
+            )
+            .expect_err("invalid effective timeout policy must be refused");
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let zstd = Selection {
+            population: Some(Population::Required),
+            lane: Some("portable".into()),
+            test: Some("data-handling/zstd-multithread".into()),
+            mode: Some("verify".into()),
+            backend: Some("ptrace".into()),
+            ..Default::default()
+        };
+        let slow_host = TimeoutMultipliers {
+            cpu: 1.0,
+            wall: 4.0,
+        };
+        let error = require_manifest_selection_headroom(
+            &manifests,
+            "quick.e2e_verify",
+            QUICK_E2E_VERIFY_TIMEOUT_S,
+            &zstd,
+            slow_host,
+            false,
+            validate_runtime::MAX_ATTEMPTS_PER_CELL as u64,
+            10,
+        )
+        .expect_err("non-prebuilt zstd can outgrow the quick node at wall 4x");
+        assert!(error.contains("can consume 1908s"), "{error}");
+        assert_eq!(
+            require_manifest_selection_headroom(
+                &manifests,
+                "prebuilt-zstd-control",
+                QUICK_E2E_VERIFY_TIMEOUT_S,
+                &zstd,
+                slow_host,
+                true,
+                validate_runtime::MAX_ATTEMPTS_PER_CELL as u64,
+                10,
+            )
+            .unwrap(),
+            Some(836),
+            "prebuilt zstd must not be charged for fixture preparation it skips"
+        );
+        assert!(manifest_command_is_prebuilt(
+            "prebuilt-control",
+            &format!("{QUICK_E2E_VERIFY_COMMAND} --prebuilt")
+        )
+        .unwrap());
+        assert!(manifest_command_is_prebuilt(
+            "duplicate-control",
+            &format!("{QUICK_E2E_VERIFY_COMMAND} --prebuilt --prebuilt")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn split_validate_forwards_distinct_timeout_settings_to_the_shared_policy() {
+        let root = Path::new(file!())
+            .parent()
+            .and_then(Path::parent)
+            .expect("validate.rs has a repository parent")
+            .to_path_buf();
+        let scratch = tempfile::tempdir().unwrap();
+        let bin = scratch.path().join("bin");
+        let out = scratch.path().join("out");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(out.join("cargo/registry")).unwrap();
+        let podman = bin.join("podman");
+        std::fs::write(
+            &podman,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == image && ${2:-} == exists ]]; then
+    exit 0
+fi
+[[ ${1:-} == run ]] || exit 90
+cpu_seen=0
+wall_seen=0
+cpu_value=
+wall_value=
+while (($#)); do
+    if [[ $1 == --env ]]; then
+        name=$2
+        case "$name" in
+            HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER)
+                cpu_seen=$((cpu_seen + 1))
+                cpu_value=${!name}
+                ;;
+            HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER)
+                wall_seen=$((wall_seen + 1))
+                wall_value=${!name}
+                ;;
+        esac
+        shift 2
+    else
+        shift
+    fi
+done
+[[ $cpu_seen -eq 1 && $wall_seen -eq 1 ]] || exit 91
+printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&podman).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&podman, permissions).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var_os("PATH")
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+        let output = Command::new(root.join("ci/hermetic/run-split-validate.sh"))
+            .args([
+                "--offline-only",
+                "--shards",
+                "unit",
+                "--out",
+                out.to_str().unwrap(),
+            ])
+            .env("PATH", path)
+            .env(TEST_CPU_TIMEOUT_MULTIPLIER_ENV, "1.25")
+            .env(TEST_WALL_TIMEOUT_MULTIPLIER_ENV, "1.75")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "split wrapper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("FORWARDED_CPU=1.25"), "{stdout}");
+        assert!(stdout.contains("FORWARDED_WALL=1.75"), "{stdout}");
+
+        let multipliers = TimeoutMultipliers {
+            cpu: parse_timeout_multiplier(Some("1.25"), TEST_CPU_TIMEOUT_MULTIPLIER_ENV)
+                .unwrap(),
+            wall: parse_timeout_multiplier(Some("1.75"), TEST_WALL_TIMEOUT_MULTIPLIER_ENV)
+                .unwrap(),
+        };
+        assert_eq!(multipliers.cpu, 1.25);
+        assert_eq!(multipliers.wall, 1.75);
+        assert_eq!(
+            resolve_test_timeouts(
+                DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+                DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
+                multipliers,
+            )
+            .unwrap(),
+            hermit_manifest_plan::timeouts::ResolvedTestTimeouts {
+                cpu_seconds: 28,
+                wall_seconds: 100,
+            }
+        );
+        for (name, value) in [
+            (TEST_CPU_TIMEOUT_MULTIPLIER_ENV, "malformed"),
+            (TEST_WALL_TIMEOUT_MULTIPLIER_ENV, "0"),
+        ] {
+            let error = parse_timeout_multiplier(Some(value), name)
+                .expect_err("the shared timeout policy must refuse malformed input");
+            assert!(error.contains(name), "{error}");
+        }
     }
 }
 
@@ -12296,10 +12681,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .map(|cap| cap.period_seconds)
         .max()
         .ok_or("retry bounds: no declared base nextest cap")?;
-    // Validate the exact machine setting consumed by both the manifest runner
-    // and nextest wrapper, not a second default that can drift from execution.
-    let validated_wall_multiplier =
-        timeout_multiplier_from_env(TEST_WALL_TIMEOUT_MULTIPLIER_ENV)?;
+    // Validate both exact machine settings consumed by the manifest runner.
+    // Nextest currently consumes only the wall member of this same pair.
+    let timeout_multipliers = timeout_multipliers_from_env()?;
+    let validated_wall_multiplier = timeout_multipliers.wall;
     let scaled_nextest = render_scaled_nextest_config(root, validated_wall_multiplier)?;
     let scaled_nextest_caps = parse_nextest_timeout_caps(&scaled_nextest)?;
     require_matching_scaled_default(
@@ -12414,30 +12799,9 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .map_err(|e| format!("retry bounds: cannot load E2E manifests: {e}"))?;
     let mut checked_manifest_nodes = 0usize;
     let mut tightest_manifest_headroom_s = i64::MAX;
-    let check_manifest_selection = |tag: &str,
-                                    node_timeout_s: i64,
-                                    selection: &Selection,
-                                    wall_multiplier: f64|
-     -> Result<Option<i64>, String> {
-        let cells = manifests
-            .select(selection)
-            .map_err(|e| format!("retry bounds: cannot select cells for {tag}: {e}"))?;
-        let Some(largest_cell_cap_s) = cells
-            .iter()
-            .map(|cell| cell.timeout_seconds)
-            .max()
-        else {
-            return Ok(None);
-        };
-        require_outer_timeout_headroom(
-            tag,
-            node_timeout_s,
-            largest_cell_cap_s,
-            MANIFEST_TERMINATION_GRACE_S as u64,
-            attempts,
-            wall_multiplier,
-        )
-        .map(Some)
+    let representative_multipliers = TimeoutMultipliers {
+        cpu: 1.25,
+        wall: 1.5,
     };
     for (lane, cfg) in &lane_configs {
         for step in cfg
@@ -12463,19 +12827,36 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
                 ));
             }
             let tag = format!("{lane}:{}", step.tag());
+            let prebuilt = manifest_command_is_prebuilt(&tag, &step.cmd)?;
             let selection = Selection {
                 population: Some(Population::Required),
                 lane: Some((*lane).into()),
                 category: Some(category.clone()),
                 ..Default::default()
             };
-            if let Some(headroom_s) =
-                check_manifest_selection(&tag, step.timeout, &selection, validated_wall_multiplier)?
-            {
+            if let Some(headroom_s) = require_manifest_selection_headroom(
+                &manifests,
+                &tag,
+                step.timeout,
+                &selection,
+                timeout_multipliers,
+                prebuilt,
+                attempts,
+                MANIFEST_TERMINATION_GRACE_S as u64,
+            )? {
                 checked_manifest_nodes += 1;
                 tightest_manifest_headroom_s = tightest_manifest_headroom_s.min(headroom_s);
             }
-            check_manifest_selection(&tag, step.timeout, &selection, 1.5)?;
+            require_manifest_selection_headroom(
+                &manifests,
+                &tag,
+                step.timeout,
+                &selection,
+                representative_multipliers,
+                prebuilt,
+                attempts,
+                MANIFEST_TERMINATION_GRACE_S as u64,
+            )?;
         }
     }
     let quick_selection = Selection {
@@ -12485,28 +12866,81 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         backend: Some("ptrace".into()),
         ..Default::default()
     };
-    if let Some(headroom_s) = check_manifest_selection(
+    let quick_prebuilt =
+        manifest_command_is_prebuilt("quick.e2e_verify", QUICK_E2E_VERIFY_COMMAND)?;
+    if let Some(headroom_s) = require_manifest_selection_headroom(
+        &manifests,
         "quick.e2e_verify",
         QUICK_E2E_VERIFY_TIMEOUT_S,
         &quick_selection,
-        validated_wall_multiplier,
+        timeout_multipliers,
+        quick_prebuilt,
+        attempts,
+        MANIFEST_TERMINATION_GRACE_S as u64,
     )? {
         checked_manifest_nodes += 1;
         tightest_manifest_headroom_s = tightest_manifest_headroom_s.min(headroom_s);
     }
-    check_manifest_selection(
+    require_manifest_selection_headroom(
+        &manifests,
         "quick.e2e_verify",
         QUICK_E2E_VERIFY_TIMEOUT_S,
         &quick_selection,
-        1.5,
-    )?;
-    let oversized_error = require_outer_timeout_headroom(
-        "oversized-multiplier-control",
-        600,
-        118,
-        MANIFEST_TERMINATION_GRACE_S as u64,
+        representative_multipliers,
+        quick_prebuilt,
         attempts,
-        10.0,
+        MANIFEST_TERMINATION_GRACE_S as u64,
+    )?;
+    let invalid_multiplier_error = require_manifest_selection_headroom(
+        &manifests,
+        "invalid-multiplier-control",
+        QUICK_E2E_VERIFY_TIMEOUT_S,
+        &quick_selection,
+        TimeoutMultipliers {
+            cpu: f64::NAN,
+            wall: 1.0,
+        },
+        quick_prebuilt,
+        attempts,
+        MANIFEST_TERMINATION_GRACE_S as u64,
+    )
+    .expect_err("a non-finite CPU multiplier must be refused by the production adapter");
+    if !invalid_multiplier_error.contains("must be finite and greater than zero") {
+        return Err(format!(
+            "retry bounds: invalid-multiplier control failed for the wrong reason: {invalid_multiplier_error}"
+        ));
+    }
+    let inverted_policy_error = require_manifest_selection_headroom(
+        &manifests,
+        "inverted-policy-control",
+        QUICK_E2E_VERIFY_TIMEOUT_S,
+        &quick_selection,
+        TimeoutMultipliers {
+            cpu: 3.0,
+            wall: 1.0,
+        },
+        quick_prebuilt,
+        attempts,
+        MANIFEST_TERMINATION_GRACE_S as u64,
+    )
+    .expect_err("scaled CPU >= wall must be refused by the production adapter");
+    if !inverted_policy_error.contains("scaled wall timeout must remain greater") {
+        return Err(format!(
+            "retry bounds: inverted-policy control failed for the wrong reason: {inverted_policy_error}"
+        ));
+    }
+    let oversized_error = require_manifest_selection_headroom(
+        &manifests,
+        "oversized-multiplier-control",
+        QUICK_E2E_VERIFY_TIMEOUT_S,
+        &quick_selection,
+        TimeoutMultipliers {
+            cpu: 1.0,
+            wall: 10.0,
+        },
+        quick_prebuilt,
+        attempts,
+        MANIFEST_TERMINATION_GRACE_S as u64,
     )
     .expect_err("an oversized multiplier must be refused by the enclosing bound gate");
     if !oversized_error.contains("wall multiplier 10") {
@@ -12514,11 +12948,37 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             "retry bounds: oversized-multiplier control failed for the wrong reason: {oversized_error}"
         ));
     }
+    let zstd_selection = Selection {
+        test: Some("data-handling/zstd-multithread".into()),
+        ..quick_selection.clone()
+    };
+    let nonprebuilt_zstd_error = require_manifest_selection_headroom(
+        &manifests,
+        "nonprebuilt-zstd-control",
+        QUICK_E2E_VERIFY_TIMEOUT_S,
+        &zstd_selection,
+        TimeoutMultipliers {
+            cpu: 1.0,
+            wall: 4.0,
+        },
+        quick_prebuilt,
+        attempts,
+        MANIFEST_TERMINATION_GRACE_S as u64,
+    )
+    .expect_err("non-prebuilt zstd at wall 4x must exceed the enclosing node bound");
+    if !nonprebuilt_zstd_error.contains("wall multiplier 4")
+        || !nonprebuilt_zstd_error.contains("can consume 1908s")
+    {
+        return Err(format!(
+            "retry bounds: non-prebuilt zstd control failed for the wrong reason: {nonprebuilt_zstd_error}"
+        ));
+    }
 
     // Non-manifest DAG nodes get one outer execution, with their test framework
-    // enforcing its own per-test cap. Manifest retries happen inside one node,
-    // so both bounded cell attempts and both cleanup grace periods must fit that
-    // node's declared timeout.
+    // enforcing its own per-test cap. Manifest retries happen inside one node.
+    // Each prebuilt attempt gets one execution wall window; each non-prebuilt
+    // attempt first gets a separate fixture-preparation wall window. Every
+    // attempt's applicable windows and cleanup grace must fit the node timeout.
     if attempts != 2
         || nextest_caps.first().copied() != Some(default_with_grace_s - NEXTEST_TERMINATION_GRACE_S)
         || tightest_nextest_headroom_s == i64::MAX
@@ -12538,9 +12998,14 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
          {default_with_grace_s}s and largest nextest cap including grace=\
          {largest_nextest_with_grace_s}s leave at least {tightest_nextest_headroom_s}s in every \
          enclosing nextest node; {checked_manifest_nodes} manifest node(s) fit both cell attempts \
-         at {validated_wall_multiplier}x and 1.5x with at least \
-         {tightest_manifest_headroom_s}s left at {validated_wall_multiplier}x; an oversized factor \
-         is refused"
+         with their production prebuilt/non-prebuilt preparation and execution windows at CPU \
+         {}x/wall {}x and representative CPU {}x/wall {}x, leaving at least \
+         {tightest_manifest_headroom_s}s at the configured multipliers; invalid, inverted, and \
+         oversized policies are refused",
+        timeout_multipliers.cpu,
+        timeout_multipliers.wall,
+        representative_multipliers.cpu,
+        representative_multipliers.wall,
     ))
 }
 

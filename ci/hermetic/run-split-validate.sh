@@ -340,8 +340,14 @@ if [[ $do_offline -eq 1 ]]; then
     # The assertion runs INSIDE the container as its first act, and a reachable
     # network aborts the phase before anything is built or tested. Checking from
     # out here would prove nothing about in there.
+    # Keep the two machine timeout settings independent across this boundary.
+    # run-in-pinned-root omits an unset name and otherwise preserves its value;
+    # the manifest runner remains the single parser and policy authority, so a
+    # malformed setting is refused there rather than reinterpreted in shell.
     exec "$HERE/run-in-pinned-root.sh" \
         --src "$ROOT" --out "$out" --src-rw --cargo-home "$cargo_home" \
+        --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER \
+        --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER \
         -- bash -c '
             set -euo pipefail
             /src/ci/hermetic/assert-no-network.sh
