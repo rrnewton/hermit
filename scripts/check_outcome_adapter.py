@@ -28,11 +28,13 @@ class AuthorityUnavailable(RuntimeError):
     """The authority could not be OBTAINED. Says nothing about any check.
 
     ⚠️ THIS IS NOT A VERDICT AND MUST NEVER BE RENDERED AS ONE. Measured
-    2026-09-04 on devbig014: a GitHub ``HTTP 504`` while fetching the pinned
-    authority made ``make lint-checks`` exit 2, which the validation DAG
-    recorded as gate ``check.lint_checks`` FAILED. Two gates went red on four
-    consecutive hourly runs of a tree that had passed 267/267 earlier the same
-    day, so an outage was reported as a code defect on every lane at once.
+    2026-09-04 on the host recorded for this measurement in
+    ``docs/TESTING_ENVIRONMENTS.md`` under "Named measurement hosts": a GitHub
+    ``HTTP 504`` while fetching the pinned authority made ``make lint-checks``
+    exit 2, which the validation DAG recorded as gate ``check.lint_checks``
+    FAILED. Two gates went red on four consecutive hourly runs of a tree that
+    had passed 267/267 earlier the same day, so an outage was reported as a code
+    defect on every lane at once.
 
     In particular this is NOT ``NO_RESULT``. ``NO_RESULT`` is the authority's
     own statement ABOUT a check -- cancelled, skipped, neutral, stale, pending,
