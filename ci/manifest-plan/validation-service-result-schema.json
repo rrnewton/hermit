@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "fields": [
     "schema_version",
     "commit",
@@ -9,6 +9,7 @@
     "exit_code",
     "executed_nodes",
     "executed_tests",
+    "passed_tests",
     "scorecard_writeback"
   ],
   "outcomes": {
