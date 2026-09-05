@@ -12750,11 +12750,12 @@ backends_disabled:
         let run1 = load_verify_run(&run1_spec).unwrap();
         let run2 = load_verify_run(&run2_spec).unwrap();
         let compared = compare_verify_runs(&run1_spec, run1, &run2_spec, run2).unwrap();
-        fs::write(
-            &run2_spec.paths.log,
-            structured_info_record("DETLOG changed"),
-        )
-        .unwrap();
+        let before = FileIdentity::from_metadata(&fs::metadata(&run2_spec.paths.log).unwrap());
+        let replacement = structured_info_record("DETLOG changed!");
+        assert_eq!(replacement.len(), body.len());
+        fs::write(&run2_spec.paths.log, &replacement).unwrap();
+        let after = FileIdentity::from_metadata(&fs::metadata(&run2_spec.paths.log).unwrap());
+        assert_eq!(before, after, "the mutation must preserve the inode");
         let retention_budget = verify_log_retention_budget(directory.path(), u64::MAX);
         let mut result = verify_cell_result(&run1_spec);
         let error = retain_verify_log_with_limit(
@@ -12768,6 +12769,7 @@ backends_disabled:
         .unwrap_err();
         assert!(error.contains("changed after comparison"), "{error}");
         assert!(!mutated.join("retained").exists());
+        assert!(result.attempts[0].retained_verify_log.is_none());
 
         let oversized = directory.path().join("oversized");
         let (run1_spec, run2_spec) = verify_pair_fixture(&oversized, &body, &body, true);

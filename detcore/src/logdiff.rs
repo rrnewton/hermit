@@ -559,6 +559,42 @@ pub fn write_canonical_info(file: &Path, writer: &mut impl Write) -> std::io::Re
     write_canonical_info_with_filter(file, writer, |_| true)
 }
 
+/// Print the canonical INFO messages that `BitwiseInfoV1` would compare from
+/// bytes already captured by the caller.
+///
+/// Unlike [`write_canonical_info`], this fixed-policy form requires UTF-8 and
+/// current structured DETLOG events and refuses a bounded-writer truncation.
+/// A harness can therefore render retained comparison records from the exact
+/// immutable bytes it compared without reopening a mutable pathname.
+pub fn write_bitwise_info_v1_bytes(
+    bytes: &[u8],
+    side_label: &str,
+    writer: &mut impl Write,
+) -> std::io::Result<usize> {
+    let contents = std::str::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{side_label} is not UTF-8: {error}"),
+        )
+    })?;
+    if log_was_truncated(contents) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{side_label} was truncated at the configured size bound"),
+        ));
+    }
+    let records = extract_log_messages(contents)
+        .map_err(|error| std::io::Error::new(error.kind(), format!("{side_label} {error}")))?;
+    validate_structured_events(side_label, &records, true)?;
+    let info = filter_infos(&records);
+    let options = bitwise_info_v1_options(ComparisonSideLabels::new(side_label, side_label));
+    let messages = messages_for_comparison(&info, LogComparisonPolicy::from_options(&options));
+    for message in &messages {
+        writeln!(writer, "{message}")?;
+    }
+    Ok(messages.len())
+}
+
 /// Print canonical INFO messages after applying a caller-supplied record filter.
 ///
 /// Every record is parsed and its level tag validated before `keep_record` is
@@ -1587,6 +1623,57 @@ pub fn try_compare_bitwise_info_v1_bytes_with_records(
     bytes_b: &[u8],
     side_labels: ComparisonSideLabels,
 ) -> std::io::Result<(LogDiffSummary, usize, usize)> {
+    try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+        bytes_a,
+        bytes_b,
+        side_labels,
+        BitwiseInfoV1Diagnostics::default(),
+        &mut std::io::stderr(),
+    )
+}
+
+/// Output-only settings for a canonical [`BitwiseInfoV1`] comparison.
+///
+/// These settings control how much diagnostic detail is written after a
+/// difference. They cannot change which records are selected, how records are
+/// normalized, or the returned verdict and counts.
+///
+/// [`BitwiseInfoV1`]: bitwise_info_v1_comparison_report
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BitwiseInfoV1Diagnostics {
+    /// Maximum number of differing messages to render. Zero means unlimited.
+    pub difference_limit: u64,
+    /// Number of completed syscalls to render before each divergent syscall.
+    pub syscall_history: u64,
+    /// Disable terminal color in rendered differences.
+    pub no_color: bool,
+}
+
+impl Default for BitwiseInfoV1Diagnostics {
+    fn default() -> Self {
+        Self {
+            difference_limit: 20,
+            syscall_history: 5,
+            no_color: false,
+        }
+    }
+}
+
+/// Canonical comparison over captured bytes with caller-selected diagnostic
+/// verbosity.
+///
+/// This is the same fixed comparison as
+/// [`try_compare_bitwise_info_v1_bytes_with_records`]. The caller controls only
+/// rendered difference count and syscall history, and supplies the destination
+/// for that diagnostic text. The comparison policy remains private to this
+/// module so another caller cannot accidentally weaken `BitwiseInfoV1`.
+pub fn try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+    bytes_a: &[u8],
+    bytes_b: &[u8],
+    side_labels: ComparisonSideLabels,
+    diagnostics: BitwiseInfoV1Diagnostics,
+    writer: &mut impl Write,
+) -> std::io::Result<(LogDiffSummary, usize, usize)> {
     let str_a = std::str::from_utf8(bytes_a).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1599,16 +1686,13 @@ pub fn try_compare_bitwise_info_v1_bytes_with_records(
             format!("{} is not UTF-8: {error}", side_labels.right),
         )
     })?;
-    let opts = bitwise_info_v1_options(side_labels);
+    let mut opts = bitwise_info_v1_options(side_labels);
+    opts.limit = diagnostics.difference_limit;
+    opts.syscall_history = diagnostics.syscall_history;
+    opts.no_color = diagnostics.no_color;
     let records_a = record_count(str_a);
     let records_b = record_count(str_b);
-    let summary = log_diff_summary_from_strs_with_filter(
-        str_a,
-        str_b,
-        &opts,
-        &mut std::io::stderr(),
-        |_| true,
-    )?;
+    let summary = log_diff_summary_from_strs_with_filter(str_a, str_b, &opts, writer, |_| true)?;
     Ok((summary, records_a, records_b))
 }
 
@@ -2366,6 +2450,83 @@ mod test {
         assert!(summary.matched_with_evidence());
         assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
         assert!(!summary.refused);
+        Ok(())
+    }
+
+    #[test]
+    fn bitwise_info_v1_diagnostics_change_output_not_comparison() -> std::io::Result<()> {
+        let common = format!(
+            "{}{}",
+            structured_record(
+                1,
+                "DETLOG [syscall] finish syscall #1: read = Ok(1)",
+                DetLogEvent::SyscallResult {
+                    finished_syscall_number: 1,
+                },
+            ),
+            structured_record(
+                2,
+                "DETLOG [syscall] finish syscall #2: write = Ok(1)",
+                DetLogEvent::SyscallResult {
+                    finished_syscall_number: 2,
+                },
+            ),
+        );
+        let left = format!(
+            "{common}Apr 09 06:08:03.100  INFO guest_observer: payload=A\n\
+             Apr 09 06:08:04.100  INFO guest_observer: tail=C\n"
+        );
+        let right = format!(
+            "{common}Apr 09 06:08:03.100  INFO guest_observer: payload=B\n\
+             Apr 09 06:08:04.100  INFO guest_observer: tail=D\n"
+        );
+        let labels = super::ComparisonSideLabels::new("ptrace", "candidate");
+        let mut terse_output = Vec::new();
+        let terse = super::try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+            left.as_bytes(),
+            right.as_bytes(),
+            labels.clone(),
+            super::BitwiseInfoV1Diagnostics {
+                difference_limit: 1,
+                syscall_history: 0,
+                no_color: true,
+            },
+            &mut terse_output,
+        )?;
+        let mut contextual_output = Vec::new();
+        let contextual = super::try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+            left.as_bytes(),
+            right.as_bytes(),
+            labels,
+            super::BitwiseInfoV1Diagnostics {
+                difference_limit: 2,
+                syscall_history: 1,
+                no_color: true,
+            },
+            &mut contextual_output,
+        )?;
+
+        assert_eq!(terse, contextual);
+        let (terse, total_left, total_right) = terse;
+        assert!(terse.diff_found);
+        assert_eq!((terse.compared_left, terse.compared_right), (4, 4));
+        assert_eq!((total_left, total_right), (4, 4));
+        assert_eq!(terse.first_divergent_record, Some(3));
+
+        let terse_output = String::from_utf8(terse_output).unwrap();
+        let contextual_output = String::from_utf8(contextual_output).unwrap();
+        assert!(!terse_output.contains("Divergent syscall context:"));
+        assert!(terse_output.contains("More than 1 differences, eliding the rest"));
+        assert!(contextual_output.contains("Divergent syscall context:"));
+        assert!(contextual_output.contains("Prior completed syscalls for ptrace:"));
+        assert!(contextual_output.contains("Prior completed syscalls for candidate:"));
+        assert!(!contextual_output.contains("More than 2 differences, eliding the rest"));
+        for output in [&terse_output, &contextual_output] {
+            assert!(output.contains("Comparing INFO messages"));
+            assert!(output.contains(
+                "Canonicalizing host addresses (ordinal by first appearance); comparing everything else exactly"
+            ));
+        }
         Ok(())
     }
 
