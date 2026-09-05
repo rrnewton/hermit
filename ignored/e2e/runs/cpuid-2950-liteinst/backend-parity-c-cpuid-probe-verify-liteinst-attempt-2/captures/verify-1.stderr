@@ -1,0 +1,2 @@
+HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=liteinst
+Error: backend `liteinst` is unavailable: the LiteInst preload runtime is unavailable: libreverie_liteinst.so was not built beside /home/newton/work/dev-hermit/worktrees/slots/hermit-ecx-complete/target/debug/hermit or staged as an installed resource; build the locked liteinst-runtime-build manifest and stage its constructor-enabled DSO beside hermit

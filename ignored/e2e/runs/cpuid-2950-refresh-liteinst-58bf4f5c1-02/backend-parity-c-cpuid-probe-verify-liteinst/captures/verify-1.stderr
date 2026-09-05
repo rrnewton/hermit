@@ -1,0 +1,17 @@
+hermit: [liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host
+:: Run1...
+:: Run2...
+:: Comparing captured verification logs...
+Logs contain 1148 | 1148 messages total
+Logs contain 1147 | 1147 detcore-specific messages
+Logs contain 1147 | 1147 INFO messages
+Logs contain 1089 | 1089 DETLOG & scheduler COMMIT messages
+Canonicalizing host addresses (ordinal by first appearance); comparing everything else exactly...
+  Comparing INFO messages...
+
+Done processing logs, no substantive differences found (1147 | 1147 INFO messages compared).
+Logs contain 1 | 1 scheduler empty-run-queue kick messages
+Logs contain 24 | 24 scheduler COMMIT records reading /proc/self/maps (run 1 first at turn 6, committed virtual time 1767225600004291570ns, run 2 first at turn 6, committed virtual time 1767225600004291570ns)
+:: comparison=BitwiseInfoV1 relaxations=none
+:: Success: deterministic. Determinism verified.
+:: Backend: LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)

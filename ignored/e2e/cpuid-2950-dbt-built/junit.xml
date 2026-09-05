@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="hermit-e2e" tests="1" failures="0" errors="0" skipped="0">
+  <testcase classname="backend-parity-c" name="backend-parity-c/cpuid-probe/verify/dbt" time="2.310"></testcase>
+</testsuite>

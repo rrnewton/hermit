@@ -1,0 +1,16 @@
+:: Run1...
+:: Run2...
+:: Comparing captured verification logs...
+Logs contain 104 | 104 messages total
+Logs contain 103 | 103 detcore-specific messages
+Logs contain 104 | 104 INFO messages
+Logs contain 92 | 92 DETLOG & scheduler COMMIT messages
+Canonicalizing host addresses (ordinal by first appearance); comparing everything else exactly...
+  Comparing INFO messages...
+
+Done processing logs, no substantive differences found (104 | 104 INFO messages compared).
+Logs contain 1 | 1 scheduler empty-run-queue kick messages
+Logs contain 0 | 0 scheduler COMMIT records reading /proc/self/maps
+:: comparison=BitwiseInfoV1 relaxations=none
+:: Success: deterministic. Determinism verified.
+:: Backend: KVM (reverie-kvm KvmGuest<Detcore>)

@@ -1,0 +1,2 @@
+HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=dbt
+Error: backend `dbt` is unavailable: the Detcore DBT runtime is unavailable: Hermit DBT runtime was not built beside /home/newton/work/dev-hermit/worktrees/slots/hermit-ecx-complete/target/debug/hermit or in its deps directory; build the hermit binary and cdylib in the same target directory

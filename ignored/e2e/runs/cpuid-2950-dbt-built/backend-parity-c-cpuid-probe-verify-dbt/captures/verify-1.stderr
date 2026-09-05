@@ -1,0 +1,32 @@
+hermit: [dbt backend] Detcore Tool active; running "/home/newton/work/dev-hermit/worktrees/slots/hermit-ecx-complete/ignored/e2e/runs/cpuid-2950-dbt-built/backend-parity-c-cpuid-probe-verify-dbt/fixtures/program" under DynamoRIO (/home/newton/work/dev-hermit/worktrees/slots/hermit-ecx-complete/target/debug/reverie-dbt-native-cache/dynamorio-install-c9c1ee55257cbb0635b56f494a75ee1dc6af839ca8e289231f533b0208340463/bin64/drrun)
+:: DBT Run1...
+:: DBT Run2...
+:: Comparing captured verification logs...
+Logs contain 90 | 90 messages total
+Logs contain 89 | 89 detcore-specific messages
+Logs contain 90 | 90 INFO messages
+Logs contain 86 | 86 DETLOG & scheduler COMMIT messages
+Canonicalizing host addresses (ordinal by first appearance); comparing everything else exactly...
+  Comparing INFO messages...
+
+Done processing logs, no substantive differences found (90 | 90 INFO messages compared).
+Logs contain 0 | 0 scheduler empty-run-queue kick messages
+Logs contain 0 | 0 scheduler COMMIT records reading /proc/self/maps
+:: DBT path confirmed: DynamoRIO client reported tool=Detcore
+:: comparison=BitwiseInfoV1 relaxations=none
+:: Success: deterministic. Determinism verified.
+detcore-dbt: background client thread entered
+detcore-dbt: constructing Detcore Config
+detcore-dbt: using CLI-provided Detcore Config
+detcore-dbt: initializing Detcore GlobalState
+detcore-dbt: GlobalState initialized
+detcore-dbt: background scheduler ready
+detcore-dbt: entered Rust syscall callback
+detcore-dbt: initializing Detcore thread state
+detcore-dbt: constructing Detcore thread state
+detcore-dbt: Detcore thread state constructed
+detcore-dbt: running Detcore thread-start hook
+detcore-dbt: thread-start hook completed; running post-exec
+detcore-dbt: post-exec hook completed
+detcore-dbt: dispatching first syscall through Detcore
+detcore-dbt: background scheduler completed
