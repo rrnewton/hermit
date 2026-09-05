@@ -200,8 +200,16 @@ fi
 # The intervening Reverie changes include the KVM CPUID correction, but do not
 # change the native DBT build recipe. The measured native-build budget carries
 # unchanged; fresh Hermit validation is still required for the new pin.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 320412c5967790939ebe405c73e394ffd9c41459 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 320412c5967790939ebe405c73e394ffd9c41459 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 37e7b727 (2026-09-04): every input to the DynamoRIO content-key miss
+# is byte-identical to 320412c5 by git object id:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# The two intervening commits change indexed CPUID behavior in the KVM and DBT
+# runtime paths, not the native DBT build recipe. The measured native-build
+# budget carries unchanged; fresh Hermit validation is still required.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 37e7b727a7f921d9c49bad4db6969297fc20f78a ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 37e7b727a7f921d9c49bad4db6969297fc20f78a (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
