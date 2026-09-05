@@ -1,0 +1,19 @@
+safehermit: run_id=20260905T192956Z-2527799
+safehermit: binary=/bin/true
+safehermit: binary_source=argv:positional-path
+safehermit: binary_sha256=b9b6ec37ac996b4152caca5a87e5ae23abb649bbc82dc6e1ca1d423d7bf4c171
+safehermit: log_dir=/home/newton/work/dev-hermit/ignored/safehermit/20260905T192956Z-2527799
+safehermit: log_file=/home/newton/work/dev-hermit/ignored/safehermit/20260905T192956Z-2527799/hermit.log
+safehermit: unit=safehermit-20260905T192956Z-2527799
+safehermit: bound.wall=APPLIED:3600s
+safehermit: bound.cgroup=APPLIED:MemoryMax=16G MemorySwapMax=0
+safehermit: bound.disk=NOT_APPLIED:scripts/bounded-run-space not present (branch runner-bounded-run-space_20260819 is unlanded)
+safehermit: bound.bytes=APPLIED:67108864 (LETHAL: the run is cgroup-killed at the cap)
+safehermit: bound.logfilter=NOT_APPLIED:by owner ruling -- the emitter is left loud so a stuck run stays visible; the low byte cap is the mechanism that fires
+safehermit: env.forwarded=APPLIED:163 variables forwarded; 5 SKIPPED (name not a plain shell identifier, e.g. an exported function)
+safehermit: note.run_record=/home/newton/work/dev-hermit/ignored/safehermit/registry/20260905T192956Z-2527799.json (best-effort; nothing depends on it)
+safehermit: elapsed_secs=1
+safehermit: bytes_written=0
+safehermit: truncated=false
+safehermit: exit_code=0
+safehermit: unit_result=success
