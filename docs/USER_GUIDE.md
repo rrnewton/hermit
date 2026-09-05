@@ -305,15 +305,10 @@ durable directory. `--print-verify-logs` instead copies the first run's captured
 log to stderr; it does not retain either file.
 
 `hermit log-diff LOG` prints the canonical INFO stream from one retained log.
-The default `--record-envelope=all-records-v1` preserves every parsed record.
-For a DBT evidence log, select
-`--record-envelope=dbt-evidence-transport-v1` explicitly to exclude only the
-transport's self-description records. This is an offline inspection option;
-live `--backend=dbt run --verify` goes through its dedicated DBT adapter,
-which compares its two runs with `all-records-v1` and publishes its own verdict
-when `--verify-json` is requested. Selecting this envelope there would exclude
-records that adapter compares today, so it is offered here for offline
-inspection rather than applied to a live run.
+The default `--record-envelope=all-records-v1` preserves every comparable
+record. Current DBT evidence decoding validates transport initialization before
+producing comparable records, so DBT logs use the same policy and need no
+separate envelope option.
 `hermit log-diff LEFT RIGHT --json REPORT.json` compares
 the same canonical INFO stream and atomically records a one-line result. Its
 `comparison.record_envelope` field names that versioned policy, alongside the

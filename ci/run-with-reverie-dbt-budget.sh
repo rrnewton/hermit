@@ -181,7 +181,19 @@ fi
 # enum dispatch, and the common Backend output API, but no native DBT recipe
 # input. The measured native-build budget therefore carries unchanged; the Rust
 # API change still requires a fresh Hermit build and validation.
-expected_pin=37e7b727a7f921d9c49bad4db6969297fc20f78a
+# CARRY TO 4b18ecf0 (2026-09-05): all three repository inputs relevant to the
+# native DBT build remain byte-identical to 320412c5 by git object id:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+#     third-party/                  fb49c0ba7a9a -> fb49c0ba7a9a
+# With CMAKE and CMAKE_GENERATOR unset, a cold `cargo check -p hermit --features
+# dbt --all-targets --locked` at 4b18ecf0 reported both MISS and PUBLISHED for
+# key sha256:c9c1ee55257cbb0635b56f494a75ee1dc6af839ca8e289231f533b0208340463;
+# the DynamoRIO source build took 11.84s at jobs=16. The measured native-build
+# budget therefore carries unchanged. The DBT evidence changes remain
+# build-relevant and require fresh Hermit validation; this carry reuses no
+# earlier receipt.
+expected_pin=4b18ecf0a865e2b895e7889d3bf8939a4ac6223e
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

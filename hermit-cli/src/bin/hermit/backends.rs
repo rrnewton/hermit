@@ -674,6 +674,29 @@ impl DbtOrdinaryLogCapture {
     }
 }
 
+/// Complete every other fallible ordinary-run output before publishing the log.
+///
+/// The host-opened log destination starts empty. Keeping log publication last
+/// prevents a later statistics or output failure from leaving bytes that a
+/// caller could mistake for an authoritative completed run.
+#[cfg(feature = "dbt")]
+fn finish_dbt_ordinary_run(
+    ordinary_log: Option<DbtOrdinaryLogCapture>,
+    single_run_stats: Option<DbtStatsCapture>,
+    summary: bool,
+    backend_engagement_json: Option<&Path>,
+    finish_output: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
+    if let Some(capture) = single_run_stats {
+        finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?;
+    }
+    finish_output()?;
+    if let Some(capture) = ordinary_log {
+        capture.finish()?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "dbt")]
 fn validate_dbt_ordinary_log_configuration(
     log_requested: bool,
@@ -697,13 +720,17 @@ fn decode_dbt_evidence(file: &mut std::fs::File) -> Result<Vec<Vec<u8>>, Error> 
     if encoded.is_empty() {
         return Err(Error::msg("DBT canonical evidence was empty"));
     }
-    reverie_dbt::decode_evidence(&encoded)
-        .map(reverie_dbt::DbtEvidence::into_records)
-        .map_err(|error| {
-            Error::msg(format!(
-                "DBT canonical evidence was malformed or truncated: {error}"
-            ))
-        })
+    let evidence = reverie_dbt::decode_evidence(&encoded).map_err(|error| {
+        Error::msg(format!(
+            "DBT canonical evidence was malformed or truncated: {error}"
+        ))
+    })?;
+    if evidence.initialization_records() == 0 {
+        return Err(Error::msg(
+            "DBT canonical evidence contained no validated process image initialization",
+        ));
+    }
+    Ok(evidence.into_records())
 }
 
 #[cfg(feature = "dbt")]
@@ -990,22 +1017,23 @@ pub(super) fn run_dbt(
     if !verify {
         if stdin_is_terminal {
             let status = run_status(&runtime, &runner, &guest, &drrun, config)?;
-            if let Some(capture) = ordinary_log {
-                capture.finish()?;
-            }
-            if let Some(capture) = single_run_stats {
-                finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?;
-            }
+            finish_dbt_ordinary_run(
+                ordinary_log,
+                single_run_stats,
+                summary,
+                backend_engagement_json,
+                || Ok(()),
+            )?;
             return Ok(process_status(status));
         }
         let output = run_once(&runtime, &runner, &guest, &drrun, config, std::io::stdin())?;
-        if let Some(capture) = ordinary_log {
-            capture.finish()?;
-        }
-        if let Some(capture) = single_run_stats {
-            finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?;
-        }
-        write_output(&output)?;
+        finish_dbt_ordinary_run(
+            ordinary_log,
+            single_run_stats,
+            summary,
+            backend_engagement_json,
+            || write_output(&output),
+        )?;
         return Ok(output_status(&output));
     }
 
@@ -1232,24 +1260,9 @@ pub(super) fn run_dbt(
             // A backend-observed divergence needs the same retained evidence
             // as a divergence found by the ordinary comparator.
             keep_logs: keep_logs || branch_clock_diverged || summary_failure.is_some(),
-            // Every decoded evidence record is compared, which is what this
-            // adapter already did before the envelope was disclosed. Naming it
-            // changes no record selection; it states the selection in the
-            // verdict rather than leaving it implicit.
-            //
-            // The transport does put records about itself in this stream:
-            // `evidence_emit_image_initialization` (reverie-dbt
-            // native/client.c:863) emits
-            // `INFO reverie_dbt::evidence: protected evidence initialized`
-            // once per sender -- the sender is keyed on (pid, start_time) and
-            // latched by `initialization_record_sent`, so it is once per
-            // process, not per image -- and its `evidence_log_level < 3` guard
-            // is open at the verification default of INFO. The record is a
-            // compile-time constant string, so two runs of a single-process
-            // guest compare equal. Excluding them is
-            // therefore a separable change, not a prerequisite: it would alter
-            // which records this adapter compares, and it needs its own
-            // evidence about multi-process arrival order, which is host order.
+            // Reverie's typed decoder authenticates transport initialization
+            // separately and returns only comparable tracing records here, so
+            // no backend-specific filter is needed or permitted downstream.
             record_envelope: RecordEnvelope::all_records_v1(),
         },
     )?;
@@ -1580,36 +1593,26 @@ pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, E
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "dbt")]
-    /// A behavioural pin, not a text match: drive the real materialization with
-    /// a transport self-record present and require every decoded record to
-    /// reach the log. Filtering anywhere in this function -- at the write loop,
-    /// at the decoder, or through a filtered canonical writer -- makes the
-    /// materialized count disagree with the decoded count and fails here, while
-    /// the verdict still names `all_records_v1`.
+    /// Every record returned by the typed decoder is comparable and must reach
+    /// the materialized all-records log unchanged.
     #[test]
-    fn materialization_keeps_every_decoded_record_including_transport_self_records() {
+    fn materialization_keeps_every_decoded_comparable_record() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("evidence.log");
         let file = std::fs::File::create(&path).expect("create log");
         let records: Vec<Vec<u8>> = vec![
-            b"1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized\n".to_vec(),
             b"1970-01-01T00:00:00.000000Z  INFO detcore: DETLOG first\n".to_vec(),
             b"1970-01-01T00:00:00.000000Z  INFO detcore: DETLOG second\n".to_vec(),
         ];
 
         super::materialize_dbt_comparison_log(&records, file, &path)
-            .expect("materialization must accept a stream containing transport self-records");
+            .expect("materialization must accept decoded comparable records");
 
         let written = std::fs::read_to_string(&path).expect("read back");
         assert_eq!(
             written.lines().count(),
             records.len(),
             "every decoded record must reach the compared log"
-        );
-        assert!(
-            written.contains("reverie_dbt::evidence: protected evidence initialized"),
-            "the transport self-record is part of what all_records_v1 compares; dropping it \
-             here would publish an envelope that was not applied:\n{written}"
         );
     }
     use super::*;
@@ -2425,6 +2428,56 @@ mod tests {
             fs::read(destination.path()).unwrap(),
             b"original contents",
             "unverified evidence must not replace the host log"
+        );
+    }
+
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn dbt_ordinary_log_is_published_only_after_other_outputs_succeed() {
+        let destination = tempfile::NamedTempFile::new().unwrap();
+        let capture =
+            DbtOrdinaryLogCapture::new(Some(destination.path()), Some(destination.as_file()))
+                .unwrap()
+                .unwrap();
+        let stats = DbtStatsCapture::new().unwrap();
+        let engagement = tempfile::NamedTempFile::new().unwrap();
+        let error = finish_dbt_ordinary_run(
+            Some(capture),
+            Some(stats),
+            false,
+            Some(engagement.path()),
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("typed whole-process statistics were missing"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(destination.path()).unwrap(),
+            b"",
+            "a failed statistics artifact must not leave an authoritative log"
+        );
+
+        let destination = tempfile::NamedTempFile::new().unwrap();
+        let capture =
+            DbtOrdinaryLogCapture::new(Some(destination.path()), Some(destination.as_file()))
+                .unwrap()
+                .unwrap();
+        let error = finish_dbt_ordinary_run(Some(capture), None, false, None, || {
+            Err(Error::msg("injected output publication failure"))
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("output publication failure"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(destination.path()).unwrap(),
+            b"",
+            "a failed output publication must not leave an authoritative log"
         );
     }
 
