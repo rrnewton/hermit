@@ -74,6 +74,13 @@ def _is_transport_failure(detail: str) -> bool:
             "temporary failure in name resolution",
             "connection refused",
             "connection reset",
+            # Go's net/http client prefixes both connect failures and DNS
+            # lookup failures with this spelling. This is the form `gh api`
+            # actually emits, rather than the libc-style messages above.
+            "dial tcp",
+            # gh prints this before its explicit internet/status-page advice
+            # when its API client cannot establish the connection.
+            "error connecting to api.github.com",
             "network is unreachable",
             "no route to host",
             "operation timed out",

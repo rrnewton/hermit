@@ -188,8 +188,21 @@ node_out=$(mktemp) || exit 1
 trap 'rm -f "$node_out"' EXIT
 set +e
 make lint-checks 2>&1 | tee "$node_out"
-make_rc=${PIPESTATUS[0]}
+pipeline_status=("${PIPESTATUS[@]}")
 set -e
+make_rc=${pipeline_status[0]}
+tee_rc=${pipeline_status[1]}
+
+# The capture file is the input to classify_run. A tee failure can leave it
+# empty or partial even though marker text reached the terminal, which would
+# otherwise turn an unevaluable run into pass. Any capture failure is a real
+# node failure; preserve make's status when both commands fail.
+if [ "$tee_rc" -ne 0 ]; then
+    echo "lint-checks: output capture failed with exit ${tee_rc}" >&2
+    if [ "$make_rc" -eq 0 ]; then
+        make_rc=$tee_rc
+    fi
+fi
 verdict="$(classify_run "$make_rc" "$node_out")"
 case "$verdict" in
     fail*)
