@@ -15,6 +15,8 @@ use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::num::NonZeroU64;
 use std::os::unix::ffi::OsStrExt;
@@ -29,6 +31,10 @@ use clap::Parser;
 use colored::Colorize;
 use detcore_model::backend_engagement::BackendEngagement;
 use detcore_model::backend_engagement::BackendEngagementReport;
+use detcore_model::canonical_verdict::CapturedGuestStream;
+use detcore_model::canonical_verdict::GuestDisposition;
+use detcore_model::canonical_verdict::GuestRunDeterminism;
+use detcore_model::canonical_verdict::GuestRunResult;
 use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::Strength;
 use detcore_model::summary::RunSummary;
@@ -51,6 +57,8 @@ use reverie::process::Mount;
 use reverie::process::MountFlags;
 use reverie::process::Namespace;
 use reverie::process::Output;
+use sha2::Digest as _;
+use sha2::Sha256;
 
 use super::container::IdentityGuard;
 use super::container::PolicyRefusal;
@@ -141,6 +149,284 @@ fn private_backend_engagement_summary() -> Result<tempfile::NamedTempFile, Error
         // to the run container, and the temporary file is removed on drop.
         .tempfile_in(std::env::current_dir()?)
         .context("creating private backend-engagement run summary")
+}
+
+#[derive(Clone, Debug)]
+struct GuestRunCapturePaths {
+    result: PathBuf,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GuestRunCaptureLimits {
+    result: u64,
+    stdout: u64,
+    stderr: u64,
+}
+
+const GUEST_RUN_CAPTURE_LIMITS: GuestRunCaptureLimits = GuestRunCaptureLimits {
+    result: 1024 * 1024,
+    stdout: 1024 * 1024 * 1024,
+    stderr: 1024 * 1024 * 1024,
+};
+const GUEST_RUN_SUMMARY_MAX_BYTES: u64 = 1024 * 1024;
+
+fn output_directory(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+fn require_regular_output_or_absent(path: &Path, description: &str) -> Result<(), Error> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("{description} {} is a symlink", path.display())
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            anyhow::bail!("{description} {} is not a regular file", path.display())
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspecting {description} {}", path.display()))
+        }
+    }
+}
+
+fn prepare_output_destination(path: &Path, description: &str) -> Result<(), Error> {
+    let directory = output_directory(path);
+    fs::create_dir_all(directory).with_context(|| format!("creating {}", directory.display()))?;
+    require_regular_output_or_absent(path, description)
+}
+
+fn checked_output_size(bytes: &[u8], maximum_bytes: u64, description: &str) -> Result<u64, Error> {
+    let bytes = u64::try_from(bytes.len())
+        .with_context(|| format!("{description} length does not fit u64"))?;
+    if bytes > maximum_bytes {
+        anyhow::bail!("{description} exceeds the {maximum_bytes}-byte limit")
+    }
+    Ok(bytes)
+}
+
+#[derive(Debug)]
+struct StagedRunSummary {
+    destination: PathBuf,
+    temporary: tempfile::NamedTempFile,
+}
+
+impl StagedRunSummary {
+    fn prepare(destination: &Path) -> Result<Self, Error> {
+        prepare_output_destination(destination, "run summary")?;
+        atomic_write(destination, b"", u64::MAX, "stale run summary")?;
+        let temporary = tempfile::NamedTempFile::new_in(output_directory(destination))
+            .with_context(|| {
+                format!(
+                    "creating temporary run summary beside {}",
+                    destination.display()
+                )
+            })?;
+        Ok(Self {
+            destination: destination.to_owned(),
+            temporary,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        self.temporary.path()
+    }
+
+    fn publish(mut self, maximum_bytes: u64) -> Result<(), Error> {
+        self.temporary
+            .as_file_mut()
+            .flush()
+            .and_then(|()| self.temporary.as_file().sync_all())
+            .with_context(|| {
+                format!(
+                    "flushing temporary run summary for {}",
+                    self.destination.display()
+                )
+            })?;
+        self.temporary
+            .as_file_mut()
+            .seek(SeekFrom::Start(0))
+            .with_context(|| {
+                format!(
+                    "rewinding temporary run summary for {}",
+                    self.destination.display()
+                )
+            })?;
+        let mut bytes = Vec::new();
+        self.temporary
+            .as_file_mut()
+            .take(maximum_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .with_context(|| {
+                format!(
+                    "reading temporary run summary for {}",
+                    self.destination.display()
+                )
+            })?;
+        checked_output_size(&bytes, maximum_bytes, "run summary")?;
+        atomic_write(&self.destination, &bytes, maximum_bytes, "run summary")
+    }
+}
+
+impl GuestRunCapturePaths {
+    fn new(result: &Path, stdout: &Path, stderr: &Path) -> Self {
+        Self {
+            result: result.to_owned(),
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+        }
+    }
+
+    fn require_mutually_distinct(&self) -> Result<(), Error> {
+        let result = &self.result;
+        let stdout = &self.stdout;
+        let stderr = &self.stderr;
+        if result == stdout || result == stderr || stdout == stderr {
+            anyhow::bail!(
+                "--run-result-json, --guest-stdout, and --guest-stderr must name three distinct paths"
+            );
+        }
+        Ok(())
+    }
+
+    fn prepare(&self) -> Result<(), Error> {
+        for (path, description) in [
+            (&self.result, "guest run result"),
+            (&self.stdout, "captured guest stdout"),
+            (&self.stderr, "captured guest stderr"),
+        ] {
+            prepare_output_destination(path, description)?;
+        }
+        for path in [&self.result, &self.stdout, &self.stderr] {
+            atomic_write(path, b"", u64::MAX, "stale run artifact")?;
+        }
+        Ok(())
+    }
+
+    fn require_distinct_from(&self, other: Option<&Path>, other_name: &str) -> Result<(), Error> {
+        let Some(other) = other else {
+            return Ok(());
+        };
+        if [&self.result, &self.stdout, &self.stderr]
+            .into_iter()
+            .any(|path| path == other)
+        {
+            anyhow::bail!(
+                "--run-result-json, --guest-stdout, and --guest-stderr must not reuse the {other_name} path {}",
+                other.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn atomic_write(
+    path: &Path,
+    bytes: &[u8],
+    maximum_bytes: u64,
+    description: &str,
+) -> Result<(), Error> {
+    checked_output_size(bytes, maximum_bytes, description)?;
+    require_regular_output_or_absent(path, description)?;
+    let directory = output_directory(path);
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)
+        .with_context(|| format!("creating temporary {description} beside {}", path.display()))?;
+    temporary
+        .write_all(bytes)
+        .with_context(|| format!("writing {description} for {}", path.display()))?;
+    temporary
+        .flush()
+        .with_context(|| format!("flushing {description} for {}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("syncing {description} for {}", path.display()))?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publishing {description} to {}", path.display()))?;
+    Ok(())
+}
+
+fn publish_guest_run_capture(
+    paths: &GuestRunCapturePaths,
+    disposition: GuestDisposition,
+    determinism: GuestRunDeterminism,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<(), Error> {
+    publish_guest_run_capture_with_limits(
+        paths,
+        disposition,
+        determinism,
+        stdout,
+        stderr,
+        GUEST_RUN_CAPTURE_LIMITS,
+    )
+}
+
+fn publish_guest_run_capture_with_limits(
+    paths: &GuestRunCapturePaths,
+    disposition: GuestDisposition,
+    determinism: GuestRunDeterminism,
+    stdout: &[u8],
+    stderr: &[u8],
+    limits: GuestRunCaptureLimits,
+) -> Result<(), Error> {
+    let stdout_bytes = checked_output_size(stdout, limits.stdout, "captured guest stdout")?;
+    let stderr_bytes = checked_output_size(stderr, limits.stderr, "captured guest stderr")?;
+    let result = GuestRunResult {
+        schema: GuestRunResult::SCHEMA,
+        disposition,
+        determinism,
+        stdout: CapturedGuestStream {
+            bytes: stdout_bytes,
+            sha256: format!("{:x}", Sha256::digest(stdout)),
+        },
+        stderr: CapturedGuestStream {
+            bytes: stderr_bytes,
+            sha256: format!("{:x}", Sha256::digest(stderr)),
+        },
+    };
+    let mut json = serde_json::to_vec(&result)?;
+    json.push(b'\n');
+    checked_output_size(&json, limits.result, "guest run result")?;
+    atomic_write(
+        &paths.stdout,
+        stdout,
+        limits.stdout,
+        "captured guest stdout",
+    )?;
+    atomic_write(
+        &paths.stderr,
+        stderr,
+        limits.stderr,
+        "captured guest stderr",
+    )?;
+    // Publish the sidecar last. Its presence means both byte streams above are
+    // complete and bound to their digests.
+    atomic_write(&paths.result, &json, limits.result, "guest run result")
+}
+
+fn guest_disposition(status: &ExitStatus) -> Result<GuestDisposition, Error> {
+    match (status.code(), status.signal()) {
+        (Some(code), None) => Ok(GuestDisposition::Exited { code }),
+        (None, Some(signal)) => Ok(GuestDisposition::Signaled { signal }),
+        (code, signal) => Err(Error::msg(format!(
+            "guest completed without one terminal disposition (exit_code={code:?}, signal={signal:?})"
+        ))),
+    }
+}
+
+fn write_captured_guest_output(output: &Output) -> Result<(), Error> {
+    std::io::stdout().write_all(&output.stdout)?;
+    std::io::stderr().write_all(&output.stderr)?;
+    Ok(())
 }
 
 fn clear_machine_record(path: &Path, description: &str) -> Result<(), Error> {
@@ -522,6 +808,35 @@ pub struct RunOpts {
     #[clap(long)]
     pub(crate) summary_json: Option<PathBuf>,
 
+    /// Write one typed ordinary-run result after the guest and its captured
+    /// stdout/stderr files have been published. Intended for the validation
+    /// harness; absence or an empty file means this run did not complete.
+    #[clap(
+        long,
+        value_name = "PATH",
+        requires_all = ["guest_stdout", "guest_stderr"],
+        conflicts_with_all = ["verify", "namespace_only"]
+    )]
+    run_result_json: Option<PathBuf>,
+
+    /// Write the exact guest stdout bytes named by --run-result-json.
+    #[clap(
+        long,
+        value_name = "PATH",
+        requires = "run_result_json",
+        conflicts_with_all = ["verify", "namespace_only"]
+    )]
+    guest_stdout: Option<PathBuf>,
+
+    /// Write the exact guest stderr bytes named by --run-result-json.
+    #[clap(
+        long,
+        value_name = "PATH",
+        requires = "run_result_json",
+        conflicts_with_all = ["verify", "namespace_only"]
+    )]
+    guest_stderr: Option<PathBuf>,
+
     /// Write the selected backend's own engagement evidence as JSON.
     ///
     /// This is a single-run record. Verification has separate per-attempt
@@ -810,6 +1125,16 @@ impl fmt::Display for RunOpts {
         if let Some(p) = &self.summary_json {
             let s = p.to_str().expect("valid unicode path");
             write!(f, " --summary-json={}", shell_words::quote(s))?;
+        }
+        for (name, path) in [
+            ("run-result-json", self.run_result_json.as_ref()),
+            ("guest-stdout", self.guest_stdout.as_ref()),
+            ("guest-stderr", self.guest_stderr.as_ref()),
+        ] {
+            if let Some(path) = path {
+                let path = path.to_str().expect("valid unicode path");
+                write!(f, " --{name}={}", shell_words::quote(path))?;
+            }
         }
         if let Some(p) = &self.backend_engagement_json {
             let s = p.to_str().expect("valid unicode path");
@@ -2543,6 +2868,22 @@ impl RunOpts {
         self.image.as_deref()
     }
 
+    fn guest_run_capture_paths(&self) -> Result<Option<GuestRunCapturePaths>, Error> {
+        match (
+            self.run_result_json.as_deref(),
+            self.guest_stdout.as_deref(),
+            self.guest_stderr.as_deref(),
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(result), Some(stdout), Some(stderr)) => {
+                Ok(Some(GuestRunCapturePaths::new(result, stdout, stderr)))
+            }
+            _ => Err(Error::msg(
+                "--run-result-json, --guest-stdout, and --guest-stderr must be supplied together",
+            )),
+        }
+    }
+
     fn selected_backend(&self) -> Backend {
         self.backend.unwrap_or_default()
     }
@@ -2682,6 +3023,41 @@ impl RunOpts {
         // subcommand (`hermit run --backend X ...`). An explicit subcommand-level
         // value wins; otherwise fall back to the global one.
         self.backend = self.backend.or(global.backend);
+        let guest_run_capture = self.guest_run_capture_paths()?;
+        if let Some(capture) = &guest_run_capture {
+            capture.require_mutually_distinct()?;
+            capture.require_distinct_from(global.log_file.as_deref(), "--log-file")?;
+            capture.require_distinct_from(self.summary_json.as_deref(), "--summary-json")?;
+            capture.require_distinct_from(
+                self.backend_engagement_json.as_deref(),
+                "--backend-engagement-json",
+            )?;
+            // Clear every destination before any backend preparation or guest
+            // launch. A failed invocation must never leave a previous complete
+            // sidecar available to the harness.
+            capture.prepare()?;
+        }
+        let selected_backend = self.selected_backend();
+        let staged_run_summary = if guest_run_capture.is_some() || selected_backend == Backend::Dbt
+        {
+            self.summary_json
+                .clone()
+                .map(|destination| {
+                    let staged = StagedRunSummary::prepare(&destination)?;
+                    self.summary_json = Some(staged.path().to_owned());
+                    Ok::<_, Error>(staged)
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        if guest_run_capture.is_some() && selected_backend == Backend::Dbt {
+            anyhow::bail!(
+                "DBT ordinary-run result capture is unavailable because drrun, DynamoRIO core, \
+                 and the guest structurally share file descriptors 1 and 2; refusing to publish \
+                 those mixed streams as exact guest stdout and stderr"
+            );
+        }
         if let Some(path) = &self.backend_engagement_json {
             clear_machine_record(path, "backend engagement")?;
         }
@@ -2718,7 +3094,7 @@ impl RunOpts {
                  host; a successful exit does not establish complete deterministic execution."
             );
         }
-        let backend = self.selected_backend();
+        let backend = selected_backend;
         if backend == Backend::E9patch && self.no_namespace {
             anyhow::bail!(
                 "--backend=e9patch requires mount namespaces to overlay the rewritten ELF at its \
@@ -2806,6 +3182,7 @@ impl RunOpts {
                     self.backend_engagement_json.as_deref(),
                     global.log,
                     global.log_file.as_deref(),
+                    global.log_file_handle.as_deref(),
                     &config,
                     environment,
                     dbt_verification_stdin,
@@ -2833,6 +3210,32 @@ impl RunOpts {
             self.run_with_namespace_only(global)
         } else if self.verify {
             self.verify(global)
+        } else if let Some(capture) = &guest_run_capture {
+            let (status, output) = self.run(global, true)?;
+            let output = output.ok_or_else(|| {
+                Error::msg("ordinary run result capture completed without captured guest output")
+            })?;
+            if let Some(staged) = staged_run_summary {
+                let destination = staged.destination.clone();
+                staged.publish(GUEST_RUN_SUMMARY_MAX_BYTES)?;
+                self.summary_json = Some(destination);
+            }
+            let config =
+                hermit::prepare_backend_config(self.effective_det_config(), self.runtime_backend());
+            publish_guest_run_capture(
+                capture,
+                guest_disposition(&output.status)?,
+                GuestRunDeterminism {
+                    detlog_io_buffers: config.detlog_io_buffers,
+                    virtualize_time: config.virtualize_time,
+                },
+                &output.stdout,
+                &output.stderr,
+            )?;
+            write_captured_guest_output(&output)?;
+            self.write_backend_engagement_after_run()?;
+            drop(private_engagement_summary);
+            Ok(status)
         } else {
             let (status, _) = self.run(global, false)?;
             self.write_backend_engagement_after_run()?;
@@ -4723,6 +5126,274 @@ mod tests {
                 true,
             )),
             "terminated by signal 11 (SIGSEGV) (core dumped)"
+        );
+    }
+
+    #[test]
+    fn ordinary_run_capture_publishes_streams_before_the_typed_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = GuestRunCapturePaths::new(
+            &directory.path().join("result.json"),
+            &directory.path().join("stdout"),
+            &directory.path().join("stderr"),
+        );
+        fs::write(&paths.result, b"stale result").unwrap();
+        fs::write(&paths.stdout, b"stale stdout").unwrap();
+        fs::write(&paths.stderr, b"stale stderr").unwrap();
+        paths.prepare().unwrap();
+        assert_eq!(fs::read(&paths.result).unwrap(), b"");
+        assert_eq!(fs::read(&paths.stdout).unwrap(), b"");
+        assert_eq!(fs::read(&paths.stderr).unwrap(), b"");
+
+        publish_guest_run_capture(
+            &paths,
+            GuestDisposition::Exited { code: 23 },
+            GuestRunDeterminism {
+                detlog_io_buffers: true,
+                virtualize_time: true,
+            },
+            b"exact stdout\0bytes",
+            b"exact stderr\nbytes",
+        )
+        .unwrap();
+        let report = GuestRunResult::from_current_json_slice(&fs::read(&paths.result).unwrap())
+            .expect("typed result must be published last and remain readable");
+        assert_eq!(report.disposition, GuestDisposition::Exited { code: 23 });
+        assert_eq!(
+            report.determinism,
+            GuestRunDeterminism {
+                detlog_io_buffers: true,
+                virtualize_time: true,
+            }
+        );
+        assert_eq!(report.stdout.bytes, 18);
+        assert_eq!(report.stderr.bytes, 18);
+        assert_eq!(fs::read(&paths.stdout).unwrap(), b"exact stdout\0bytes");
+        assert_eq!(fs::read(&paths.stderr).unwrap(), b"exact stderr\nbytes");
+        assert_eq!(
+            report.stdout.sha256,
+            format!("{:x}", Sha256::digest(b"exact stdout\0bytes"))
+        );
+        assert_eq!(
+            report.stderr.sha256,
+            format!("{:x}", Sha256::digest(b"exact stderr\nbytes"))
+        );
+    }
+
+    #[test]
+    fn ordinary_run_capture_refuses_symlinks_and_non_regular_destinations() {
+        for selected in ["result", "stdout", "stderr"] {
+            let directory = tempfile::tempdir().unwrap();
+            let target = directory.path().join("target");
+            fs::write(&target, b"preserve me").unwrap();
+            let paths = GuestRunCapturePaths::new(
+                &directory.path().join("result.json"),
+                &directory.path().join("stdout"),
+                &directory.path().join("stderr"),
+            );
+            let selected_path = match selected {
+                "result" => &paths.result,
+                "stdout" => &paths.stdout,
+                "stderr" => &paths.stderr,
+                _ => unreachable!(),
+            };
+            std::os::unix::fs::symlink(&target, selected_path).unwrap();
+
+            let error = paths.prepare().unwrap_err().to_string();
+            assert!(error.contains("is a symlink"), "{error}");
+            assert_eq!(fs::read(&target).unwrap(), b"preserve me");
+            assert!(
+                fs::symlink_metadata(selected_path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let paths = GuestRunCapturePaths::new(
+            &directory.path().join("result.json"),
+            &directory.path().join("stdout"),
+            &directory.path().join("stderr"),
+        );
+        fs::create_dir(&paths.stderr).unwrap();
+        let error = paths.prepare().unwrap_err().to_string();
+        assert!(error.contains("is not a regular file"), "{error}");
+
+        let target = directory.path().join("summary-target");
+        let summary = directory.path().join("summary.json");
+        fs::write(&target, b"preserve summary target").unwrap();
+        std::os::unix::fs::symlink(&target, &summary).unwrap();
+        let error = StagedRunSummary::prepare(&summary).unwrap_err().to_string();
+        assert!(error.contains("run summary") && error.contains("is a symlink"));
+        assert_eq!(fs::read(&target).unwrap(), b"preserve summary target");
+
+        fs::remove_file(&summary).unwrap();
+        let staged = StagedRunSummary::prepare(&summary).unwrap();
+        fs::write(staged.path(), b"valid summary bytes").unwrap();
+        fs::remove_file(&summary).unwrap();
+        std::os::unix::fs::symlink(&target, &summary).unwrap();
+        let error = staged
+            .publish(GUEST_RUN_SUMMARY_MAX_BYTES)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("run summary") && error.contains("is a symlink"));
+        assert_eq!(fs::read(&target).unwrap(), b"preserve summary target");
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        fs::write(&target, b"preserve capture target").unwrap();
+        let paths = GuestRunCapturePaths::new(
+            &directory.path().join("result.json"),
+            &directory.path().join("stdout"),
+            &directory.path().join("stderr"),
+        );
+        paths.prepare().unwrap();
+        fs::remove_file(&paths.stdout).unwrap();
+        std::os::unix::fs::symlink(&target, &paths.stdout).unwrap();
+        let error = publish_guest_run_capture(
+            &paths,
+            GuestDisposition::Exited { code: 0 },
+            GuestRunDeterminism {
+                detlog_io_buffers: true,
+                virtualize_time: true,
+            },
+            b"out",
+            b"err",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("captured guest stdout") && error.contains("is a symlink"));
+        assert_eq!(fs::read(target).unwrap(), b"preserve capture target");
+    }
+
+    #[test]
+    fn ordinary_run_capture_and_summary_refuse_oversize_publication() {
+        let disposition = GuestDisposition::Exited { code: 0 };
+        let determinism = GuestRunDeterminism {
+            detlog_io_buffers: true,
+            virtualize_time: true,
+        };
+        for (name, limits, stdout, stderr) in [
+            (
+                "stdout",
+                GuestRunCaptureLimits {
+                    stdout: 4,
+                    ..GUEST_RUN_CAPTURE_LIMITS
+                },
+                b"12345".as_slice(),
+                b"err".as_slice(),
+            ),
+            (
+                "stderr",
+                GuestRunCaptureLimits {
+                    stderr: 4,
+                    ..GUEST_RUN_CAPTURE_LIMITS
+                },
+                b"out".as_slice(),
+                b"12345".as_slice(),
+            ),
+            (
+                "result",
+                GuestRunCaptureLimits {
+                    result: 1,
+                    ..GUEST_RUN_CAPTURE_LIMITS
+                },
+                b"out".as_slice(),
+                b"err".as_slice(),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let paths = GuestRunCapturePaths::new(
+                &directory.path().join("result.json"),
+                &directory.path().join("stdout"),
+                &directory.path().join("stderr"),
+            );
+            paths.prepare().unwrap();
+            let error = publish_guest_run_capture_with_limits(
+                &paths,
+                disposition,
+                determinism,
+                stdout,
+                stderr,
+                limits,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("exceeds the") && error.contains(name),
+                "{error}"
+            );
+            assert_eq!(fs::read(&paths.result).unwrap(), b"");
+            assert_eq!(fs::read(&paths.stdout).unwrap(), b"");
+            assert_eq!(fs::read(&paths.stderr).unwrap(), b"");
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let summary = directory.path().join("summary.json");
+        let staged = StagedRunSummary::prepare(&summary).unwrap();
+        fs::write(staged.path(), b"12345").unwrap();
+        let error = staged.publish(4).unwrap_err().to_string();
+        assert!(
+            error.contains("run summary exceeds the 4-byte limit"),
+            "{error}"
+        );
+        assert_eq!(fs::read(summary).unwrap(), b"");
+    }
+
+    #[test]
+    fn ordinary_run_capture_requires_three_distinct_paths_and_no_internal_verify() {
+        let complete = RunOpts::try_parse_from([
+            "run",
+            "--run-result-json",
+            "/artifacts/result.json",
+            "--guest-stdout",
+            "/artifacts/stdout",
+            "--guest-stderr",
+            "/artifacts/stderr",
+            "/bin/true",
+        ])
+        .unwrap();
+        assert!(complete.guest_run_capture_paths().unwrap().is_some());
+
+        for incomplete in [
+            vec!["run", "--run-result-json", "/result", "/bin/true"],
+            vec!["run", "--guest-stdout", "/stdout", "/bin/true"],
+            vec!["run", "--guest-stderr", "/stderr", "/bin/true"],
+        ] {
+            assert!(RunOpts::try_parse_from(incomplete).is_err());
+        }
+        assert!(
+            RunOpts::try_parse_from([
+                "run",
+                "--verify",
+                "--run-result-json",
+                "/result",
+                "--guest-stdout",
+                "/stdout",
+                "--guest-stderr",
+                "/stderr",
+                "/bin/true",
+            ])
+            .is_err()
+        );
+        assert!(
+            GuestRunCapturePaths::new(Path::new("/same"), Path::new("/same"), Path::new("/stderr"))
+                .require_mutually_distinct()
+                .is_err()
+        );
+
+        let paths = GuestRunCapturePaths::new(
+            Path::new("/result"),
+            Path::new("/stdout"),
+            Path::new("/stderr"),
+        );
+        assert!(
+            paths
+                .require_distinct_from(Some(Path::new("/stdout")), "--summary-json")
+                .unwrap_err()
+                .to_string()
+                .contains("must not reuse the --summary-json path")
         );
     }
 

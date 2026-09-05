@@ -4,7 +4,12 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::{self};
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
@@ -14,20 +19,32 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitStatus;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use detcore::logdiff::BitwiseInfoV1Comparison;
+use detcore::logdiff::BitwiseInfoV1RunObservation;
+use detcore::logdiff::ComparisonSideLabels;
 use detcore_model::summary::PathEvidence;
+use detcore_model::summary::RunSummary;
+use flate2::Compression;
+use flate2::GzBuilder;
+use flate2::read::MultiGzDecoder;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
 
+use crate::canonical_verdict::GuestRunDeterminism;
+use crate::canonical_verdict::GuestRunResult;
 use crate::canonical_verdict::InfrastructureError;
+use crate::canonical_verdict::RuntimeStats;
 use crate::canonical_verdict::Verdict;
 pub use crate::canonical_verdict::VerificationReport;
 pub use crate::canonical_verdict::VerificationRuntime;
@@ -249,7 +266,7 @@ pub struct ManifestSet {
     tests: BTreeMap<String, (String, u64, u64, TestRecipe)>,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct CellId {
     pub test: String,
     pub mode: String,
@@ -930,6 +947,30 @@ pub struct CellRunSpec {
     fixed_workdir_source: PathBuf,
 }
 
+mod retained_verify_log;
+pub use retained_verify_log::ComparedVerifyPair;
+pub use retained_verify_log::RetainedVerifyLog;
+pub use retained_verify_log::RetainedVerifyLogPublication;
+pub use retained_verify_log::RetainedVerifyLogRole;
+pub use retained_verify_log::VerifyLogRetentionBudget;
+pub use retained_verify_log::VerifyLogRetentionPolicy;
+pub use retained_verify_log::VerifyRun;
+pub use retained_verify_log::VerifyRunObservation;
+pub use retained_verify_log::VerifyRunPaths;
+pub use retained_verify_log::VerifyRunSpec;
+pub use retained_verify_log::build_verify_run_spec;
+pub use retained_verify_log::cleanup_verify_log_sources;
+pub use retained_verify_log::compare_verify_runs;
+pub use retained_verify_log::load_verify_run;
+pub use retained_verify_log::publish_retained_verify_log;
+pub use retained_verify_log::reopen_retained_verify_log_publication;
+use retained_verify_log::require_plain_directory;
+use retained_verify_log::retained_verify_log_relative_path;
+use retained_verify_log::sync_plain_directory;
+use retained_verify_log::sync_relative_directory_chain_with_failure;
+pub use retained_verify_log::verify_retained_verify_log;
+pub use retained_verify_log::verify_run_paths;
+
 /// The existing pressure-test result vocabulary for one executed cell.
 ///
 /// This is separate from [`FailureClass`]: two product failures can have
@@ -1073,6 +1114,12 @@ pub struct AttemptResult {
     pub stderr: String,
     pub verification_report: Option<String>,
     pub verification_report_sha256: Option<String>,
+    /// The retained run-1 log and its binding to the compared run-2 log.
+    ///
+    /// Older result rows predate retained harness-managed logs and therefore
+    /// deserialize this field as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_verify_log: Option<RetainedVerifyLog>,
     /// Runtime totals for the two executions compared by this attempt.
     pub runtime: Option<VerificationRuntime>,
     /// The divergence position, LIFTED OUT of `verification_report` so it is a
@@ -1255,6 +1302,61 @@ pub struct CellResult {
 }
 
 impl CellResult {
+    fn validate_retained_verify_log_binding(&self) -> Result<Option<&RetainedVerifyLog>, String> {
+        let expected_id = CellId {
+            test: self.test.clone(),
+            mode: self.mode.clone(),
+            backend: self.backend.clone(),
+        };
+        let retained_attempts = self
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.retained_verify_log.is_some())
+            .collect::<Vec<_>>();
+        if retained_attempts.len() > 1 {
+            return Err("one result row carries more than one retained verify log".into());
+        }
+        let Some(attempt_row) = retained_attempts.first() else {
+            return Ok(None);
+        };
+        let retained = attempt_row
+            .retained_verify_log
+            .as_ref()
+            .expect("the attempt was selected for carrying a descriptor");
+        if self.mode != "verify" {
+            return Err("a non-verify result row carries a retained verify log".into());
+        }
+        if retained.cell_id != expected_id || retained.attempt != self.attempt {
+            return Err("retained verify log does not match its result-row identity".into());
+        }
+        let expected_relative = retained_verify_log_relative_path(self.attempt)?;
+        if Path::new(&retained.relative_path) != expected_relative {
+            return Err(format!(
+                "retained verify log path must be exactly {}, got {}",
+                expected_relative.display(),
+                retained.relative_path
+            ));
+        }
+        Ok(Some(retained))
+    }
+
+    fn validate_retained_verify_logs(&self) -> Result<(), String> {
+        let Some(retained) = self.validate_retained_verify_log_binding()? else {
+            return Ok(());
+        };
+        let expected_id = CellId {
+            test: self.test.clone(),
+            mode: self.mode.clone(),
+            backend: self.backend.clone(),
+        };
+        verify_retained_verify_log(
+            Path::new(&self.artifact_dir),
+            retained,
+            &expected_id,
+            self.attempt,
+        )
+    }
+
     /// Validate the additive timeout fields while keeping earlier schema-4 rows
     /// readable. `timeout_seconds` retains its original wall-bound meaning;
     /// only rows carrying both new fields claim the execution CPU/backstop
@@ -2496,6 +2598,7 @@ fn execute_spec_until(
         stderr,
         verification_report: report_json,
         verification_report_sha256: report_sha,
+        retained_verify_log: None,
         runtime,
         first_divergent_scheduler_turn,
         first_divergent_virtual_nanoseconds,
@@ -2812,6 +2915,7 @@ fn cell_timeout_attempt(
         stderr: String::new(),
         verification_report: Some(report),
         verification_report_sha256: Some(report_sha256),
+        retained_verify_log: None,
         runtime: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
@@ -3617,21 +3721,256 @@ fn diversity_evidence(
     })
 }
 
-pub fn prepare_result_path(path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+fn nearest_existing_directory(path: &Path) -> Result<PathBuf, String> {
+    let mut candidate = path.to_owned();
+    loop {
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(format!(
+                    "stable result root {} is not a non-symlink directory",
+                    candidate.display()
+                ));
+            }
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                candidate = candidate
+                    .parent()
+                    .ok_or_else(|| {
+                        format!(
+                            "cannot find an existing directory above result path {}",
+                            path.display()
+                        )
+                    })?
+                    .to_owned();
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect prospective result directory {}: {error}",
+                    candidate.display()
+                ));
+            }
+        }
     }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
 }
 
-pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
-    result.require_current_classification()?;
-    result.require_current_timeout_policy()?;
+fn prepare_result_path_from_root_with_failure(
+    stable_root: &Path,
+    path: &Path,
+    directory_sync_failure_at: Option<usize>,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    require_plain_directory(stable_root, "stable result root")?;
+    let relative_parent = parent.strip_prefix(stable_root).map_err(|_| {
+        format!(
+            "result path {} is outside stable result root {}",
+            path.display(),
+            stable_root.display()
+        )
+    })?;
+    if relative_parent
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!(
+            "result directory {} is not a normal path below stable root {}",
+            parent.display(),
+            stable_root.display()
+        ));
+    }
+    let mut current = stable_root.to_owned();
+    for component in relative_parent.components() {
+        let Component::Normal(component) = component else {
+            unreachable!("result parent components were checked above")
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(format!(
+                    "result directory {} is not a non-symlink directory",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current).map_err(|error| {
+                    format!(
+                        "cannot create result directory {}: {error}",
+                        current.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect result directory {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    sync_relative_directory_chain_with_failure(
+        stable_root,
+        parent,
+        "result directory",
+        directory_sync_failure_at,
+    )?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err(format!(
+            "result path {} is not a regular file",
+            path.display()
+        ));
+    }
+    file.sync_all().map_err(|e| e.to_string())?;
+    sync_plain_directory(parent, "result directory after result-file creation")
+}
+
+/// Create and durably sync a result file from a caller-established directory.
+pub fn prepare_result_path_from_root(stable_root: &Path, path: &Path) -> Result<(), String> {
+    prepare_result_path_from_root_with_failure(stable_root, path, None)
+}
+
+pub fn prepare_result_path(path: &Path) -> Result<(), String> {
+    let absolute_path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("cannot resolve relative result path: {error}"))?
+            .join(path)
+    };
+    let parent = absolute_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stable_root = nearest_existing_directory(parent)?;
+    prepare_result_path_from_root(&stable_root, &absolute_path)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResultPublicationFailurePoint {
+    TemporaryWrite,
+    TemporaryFileSync,
+    BeforeRename,
+    ParentDirectorySync,
+}
+
+#[derive(Debug)]
+struct ResultPublicationFailure {
+    message: String,
+    descriptor_visible: bool,
+}
+
+fn read_existing_result(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot open result file {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if !file
+        .metadata()
+        .map_err(|error| format!("cannot inspect result file {}: {error}", path.display()))?
+        .is_file()
+    {
+        return Err(format!(
+            "result path {} is not a regular file",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read result file {}: {error}", path.display()))?;
+    Ok(Some(bytes))
+}
+
+fn write_atomic_file(path: &Path, bytes: &[u8], description: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".result-publication.")
+        .suffix(".staging")
+        .tempfile_in(parent)
+        .map_err(|error| {
+            format!(
+                "cannot create temporary {description} in {}: {error}",
+                parent.display()
+            )
+        })?;
+    temporary
+        .write_all(bytes)
+        .and_then(|()| temporary.flush())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| format!("cannot write temporary {description}: {error}"))?;
+    temporary.persist(path).map_err(|error| {
+        format!(
+            "cannot atomically publish {description} {}: {}",
+            path.display(),
+            error.error
+        )
+    })?;
+    sync_plain_directory(parent, &format!("{description} parent directory"))
+}
+
+fn restore_previous_result(path: &Path, previous: Option<&[u8]>) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match previous {
+        Some(bytes) => write_atomic_file(path, bytes, "previous result file"),
+        None => match fs::remove_file(path) {
+            Ok(()) => sync_plain_directory(parent, "result directory after rollback"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "cannot remove new result file {} during rollback: {error}",
+                path.display()
+            )),
+        },
+    }
+}
+
+fn append_result_with_failure(
+    path: &Path,
+    result: &CellResult,
+    failure: Option<ResultPublicationFailurePoint>,
+    retained_file_already_verified: bool,
+) -> Result<(), ResultPublicationFailure> {
+    let unpublished = |message| ResultPublicationFailure {
+        message,
+        descriptor_visible: false,
+    };
+    result
+        .require_current_classification()
+        .map_err(unpublished)?;
+    result
+        .require_current_timeout_policy()
+        .map_err(unpublished)?;
+    if retained_file_already_verified {
+        result
+            .validate_retained_verify_log_binding()
+            .map_err(unpublished)?;
+    } else {
+        result
+            .validate_retained_verify_logs()
+            .map_err(unpublished)?;
+    }
     // A missing prerequisite means the cell did not execute. Keep the typed
     // value for the harness summary and JUnit skip, but do not publish a cell
     // row that downstream readers could count as an observation. The validate
@@ -3639,20 +3978,103 @@ pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
     if result.outcome == "HOST-INAPPLICABLE" {
         return Ok(());
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    require_plain_directory(parent, "prepared result directory").map_err(|message| {
+        ResultPublicationFailure {
+            message,
+            descriptor_visible: false,
+        }
+    })?;
+    let previous = read_existing_result(path).map_err(|message| ResultPublicationFailure {
+        message,
+        descriptor_visible: false,
+    })?;
+    let mut next = previous.clone().unwrap_or_default();
+    serde_json::to_writer(&mut next, result).map_err(|error| ResultPublicationFailure {
+        message: error.to_string(),
+        descriptor_visible: false,
+    })?;
+    next.push(b'\n');
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".results.jsonl.")
+        .suffix(".staging")
+        .tempfile_in(parent)
+        .map_err(|error| ResultPublicationFailure {
+            message: format!(
+                "cannot create temporary result file in {}: {error}",
+                parent.display()
+            ),
+            descriptor_visible: false,
+        })?;
+    if failure == Some(ResultPublicationFailurePoint::TemporaryWrite) {
+        return Err(ResultPublicationFailure {
+            message: "injected failure writing the temporary result file".into(),
+            descriptor_visible: false,
+        });
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut file, result).map_err(|e| e.to_string())?;
-    file.write_all(b"\n").map_err(|e| e.to_string())?;
-    // The bucket runner publishes each completed cell before printing its
-    // PASS/FAIL/ERROR line. Flush the row now rather than waiting for the
-    // bucket's JUnit/summary epilogue, which an outer node timeout may kill.
-    file.flush().map_err(|e| e.to_string())
+    temporary
+        .write_all(&next)
+        .and_then(|()| temporary.flush())
+        .map_err(|error| ResultPublicationFailure {
+            message: format!("cannot write temporary result file: {error}"),
+            descriptor_visible: false,
+        })?;
+    if failure == Some(ResultPublicationFailurePoint::TemporaryFileSync) {
+        return Err(ResultPublicationFailure {
+            message: "injected failure syncing the temporary result file".into(),
+            descriptor_visible: false,
+        });
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| ResultPublicationFailure {
+            message: format!("cannot sync temporary result file: {error}"),
+            descriptor_visible: false,
+        })?;
+    if failure == Some(ResultPublicationFailurePoint::BeforeRename) {
+        return Err(ResultPublicationFailure {
+            message: "injected failure at result-row publication boundary".into(),
+            descriptor_visible: false,
+        });
+    }
+    temporary
+        .persist(path)
+        .map_err(|error| ResultPublicationFailure {
+            message: format!(
+                "cannot atomically publish result file {}: {}",
+                path.display(),
+                error.error
+            ),
+            descriptor_visible: false,
+        })?;
+    let durable = if failure == Some(ResultPublicationFailurePoint::ParentDirectorySync) {
+        Err("injected failure syncing the result directory after result-row rename".to_string())
+    } else {
+        sync_plain_directory(parent, "result directory")
+    };
+    if let Err(error) = durable {
+        return match restore_previous_result(path, previous.as_deref()) {
+            Ok(()) => Err(ResultPublicationFailure {
+                message: error,
+                descriptor_visible: false,
+            }),
+            Err(rollback_error) => Err(ResultPublicationFailure {
+                message: format!(
+                    "{error}; result-row rollback also failed and the new row may remain visible: {rollback_error}"
+                ),
+                descriptor_visible: true,
+            }),
+        };
+    }
+    Ok(())
+}
+
+pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
+    append_result_with_failure(path, result, None, false).map_err(|error| error.message)
 }
 
 pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
@@ -4262,7 +4684,7 @@ mod tests {
             .collect()
     }
 
-    fn assert_minimal_guest_env(argv: &[String], dir: &str, tmp: &str, jobs: &str) {
+    pub(super) fn assert_minimal_guest_env(argv: &[String], dir: &str, tmp: &str, jobs: &str) {
         let mut base_env = Vec::new();
         let mut index = 0;
         while index < argv.len() {
@@ -4294,7 +4716,7 @@ mod tests {
         );
     }
 
-    fn ptrace_cell(mode: &str) -> SelectedCell {
+    pub(super) fn ptrace_cell(mode: &str) -> SelectedCell {
         let mut test = recipe(true);
         if mode != "verify" {
             let mode_recipe = test.modes.remove("verify").unwrap();
@@ -4333,7 +4755,7 @@ mod tests {
         ])
     }
 
-    fn run_context(root: &Path) -> RunContext {
+    pub(super) fn run_context(root: &Path) -> RunContext {
         RunContext {
             root: root.into(),
             hermit_bin: root.join("hermit"),
@@ -6237,7 +6659,7 @@ backends_disabled:
     /// `CellResult` coordinates and the whole package stayed GREEN, 126 tests, 0
     /// failures, INCLUDING this test. A check that stays green while the hazard it
     /// names is open is the failure this file is full of warnings about.
-    fn cell_result_that_located_nothing() -> CellResult {
+    pub(super) fn cell_result_that_located_nothing() -> CellResult {
         CellResult {
             schema: CELL_RESULT_SCHEMA,
             run_id: "fixture".into(),
@@ -6370,6 +6792,56 @@ backends_disabled:
     }
 
     #[test]
+    fn retained_verify_log_is_additive_attempt_evidence() {
+        let mut attempt = attempt_with_sabre_evidence("");
+        let historical = serde_json::to_value(&attempt).unwrap();
+        assert!(historical.get("retained_verify_log").is_none());
+        let decoded: AttemptResult = serde_json::from_value(historical).unwrap();
+        assert!(decoded.retained_verify_log.is_none());
+
+        attempt.retained_verify_log = Some(RetainedVerifyLog {
+            relative_path: "retained/verify/1/run-1.log.gz".into(),
+            role: RetainedVerifyLogRole::Run1,
+            cell_id: CellId {
+                test: "fixture/test".into(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            attempt: 1,
+            uncompressed_sha256: "a".repeat(64),
+            uncompressed_bytes: 11,
+            compressed_sha256: "b".repeat(64),
+            compressed_bytes: 12,
+            peer_uncompressed_sha256: "c".repeat(64),
+            peer_uncompressed_bytes: 13,
+            compared_info_messages: 14,
+        });
+        let rendered = serde_json::to_value(&attempt).unwrap();
+        let descriptor = rendered["retained_verify_log"].as_object().unwrap();
+        assert_eq!(
+            descriptor
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "attempt",
+                "cell_id",
+                "compared_info_messages",
+                "compressed_bytes",
+                "compressed_sha256",
+                "peer_uncompressed_bytes",
+                "peer_uncompressed_sha256",
+                "relative_path",
+                "role",
+                "uncompressed_bytes",
+                "uncompressed_sha256",
+            ])
+        );
+        let decoded: AttemptResult = serde_json::from_value(rendered).unwrap();
+        assert_eq!(decoded.retained_verify_log, attempt.retained_verify_log);
+    }
+
+    #[test]
     fn schema4_keeps_its_wall_field_and_adds_explicit_execution_bounds() {
         let row = cell_result_that_located_nothing();
         let mut rendered = serde_json::to_value(&row).expect("cell result serializes");
@@ -6441,6 +6913,7 @@ backends_disabled:
             stderr: String::new(),
             verification_report: None,
             verification_report_sha256: None,
+            retained_verify_log: None,
             runtime: None,
             sabre_path_evidence: Some(evidence.into()),
             sabre_path_evidence_sha256: Some("b".into()),

@@ -88,15 +88,10 @@ pub(crate) struct ComparisonOptions {
     pub virtualize_time: bool,
 }
 
-/// Versioned policy token: the only strippable datum is the real wall-clock
-/// timestamp PREFIX. Recorded in [`ComparisonSpec::stripped_prefixes`] so a
-/// consumer sees exactly which prefixes were removed, not a bare boolean.
-pub const STRIP_WALL_CLOCK_PREFIX_V1: &str = "real-wall-clock-prefix/v1";
-
-/// Versioned policy token: host memory addresses are canonicalized to an ordinal
-/// by first appearance (identity/order/aliasing preserved). Recorded in
-/// [`ComparisonSpec::canonicalizations`].
-pub const CANON_ADDRESS_ORDINAL_V1: &str = "host-address-to-first-appearance-ordinal/v1";
+/// Compatibility exports for callers that used the verification module before
+/// the canonical policy moved beside the shared comparator.
+pub use detcore::logdiff::CANON_ADDRESS_ORDINAL_V1;
+pub use detcore::logdiff::STRIP_WALL_CLOCK_PREFIX_V1;
 
 /// Versioned policy token marking the lossy wholesale normalization the
 /// [`LogCompareStrictness::Stripped`] mode applies (numbers, addresses, tmp
@@ -335,6 +330,26 @@ impl ComparisonSpec {
         }
     }
 
+    /// Whether the log engine and serialized policy are exactly the shared
+    /// `BitwiseInfoV1` comparison. Observation properties such as output-buffer
+    /// hashing and virtual time are recorded by that policy but do not select a
+    /// different parser or normalization.
+    fn uses_bitwise_info_v1(&self) -> bool {
+        self.strictness == LogCompareStrictness::Canonical
+            && self.compare_logs
+            && self.log_scope == ComparedLogScope::Info
+            && self.record_envelope == RecordEnvelopePolicy::AllRecordsV1
+            && !self.strip_lines
+            && self.canonicalize_addresses
+            && self.full_trace
+            && self.exact_remainder
+            && self.stripped_prefixes == PARITY_STRIPPED_PREFIXES
+            && self.canonicalizations == PARITY_CANONICALIZATIONS
+            && !self.ignore_lines
+            && !self.skip_commit
+            && !self.skip_detlog
+    }
+
     /// Does this comparison satisfy the `BitwiseInfoV1` parity contract a
     /// determinism / record-replay ratchet must require before it may read a
     /// `Matched` verdict as *true parity*? A bare `verified` is not enough:
@@ -515,6 +530,12 @@ impl VerificationOutcome {
 }
 
 fn comparison_report(comparison: &ComparisonSpec) -> ComparisonReport {
+    if comparison.uses_bitwise_info_v1() {
+        return logdiff::bitwise_info_v1_comparison_report(
+            comparison.compare_io_buffers,
+            comparison.virtualize_time,
+        );
+    }
     ComparisonReport {
         strictness: comparison.strictness,
         display_name: Some(comparison.display_name.to_string()),
@@ -523,9 +544,6 @@ fn comparison_report(comparison: &ComparisonSpec) -> ComparisonReport {
         log_scope: Some(comparison.log_scope),
         record_envelope: match comparison.record_envelope {
             RecordEnvelopePolicy::AllRecordsV1 => RecordEnvelopeReport::AllRecordsV1,
-            RecordEnvelopePolicy::DbtEvidenceTransportV1 => {
-                RecordEnvelopeReport::DbtEvidenceTransportV1
-            }
             RecordEnvelopePolicy::CallerDefined => RecordEnvelopeReport::CallerDefined,
         },
         virtualize_time: Some(comparison.virtualize_time),
@@ -953,12 +971,24 @@ fn compare_two_runs_with_unsupported_scan(
                 "ComparisonSpec.ignore_lines must match the diff engine's ignore_lines"
             );
 
-            let summary = logdiff::try_log_diff_detailed_with_filter(
-                log1.as_ref(),
-                log2.as_ref(),
-                &diff_options,
-                options.record_envelope.predicate(),
-            )?;
+            let summary = if spec.uses_bitwise_info_v1() {
+                // The canonical INFO path is shared with standalone log-diff
+                // and the validation harness. No caller-supplied option can
+                // weaken this comparison while the report still names
+                // BitwiseInfoV1.
+                logdiff::try_compare_bitwise_info_v1(
+                    log1.as_ref(),
+                    log2.as_ref(),
+                    compared_labels.clone(),
+                )?
+            } else {
+                logdiff::try_log_diff_detailed_with_filter(
+                    log1.as_ref(),
+                    log2.as_ref(),
+                    &diff_options,
+                    options.record_envelope.predicate(),
+                )?
+            };
             compared_log_messages = Some(ComparedLogCounts {
                 left: summary.compared_left,
                 right: summary.compared_right,
@@ -2577,15 +2607,6 @@ mod tests {
             full.is_bitwise_parity(),
             "a full-INFO unstripped all-records comparison must qualify"
         );
-        assert!(
-            ComparisonSpec {
-                record_envelope: RecordEnvelopePolicy::DbtEvidenceTransportV1,
-                ..full
-            }
-            .is_bitwise_parity(),
-            "the named DBT transport envelope is a disclosed canonical policy"
-        );
-
         // Negatives: each independent weakening of the qualifying spec must be
         // refused, so no single relaxed dimension can pass as bitwise parity.
         let stripped = ComparisonSpec::new(
@@ -2696,72 +2717,6 @@ mod tests {
         assert_eq!(json["verdict"], "no_result");
         assert_eq!(json["runtime"]["run1"]["virtual_nanoseconds"], 34);
         assert_eq!(json["runtime"]["run2"]["syscalls"], 6);
-    }
-
-    #[test]
-    fn dbt_transport_only_is_disclosed_and_cannot_qualify_as_parity() {
-        let output = output(0, b"hello\n", b"");
-        let (left, right) = empty_logs();
-        let transport = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized\n";
-        fs::write(&left, transport).unwrap();
-        fs::write(&right, transport).unwrap();
-
-        let outcome = compare_with_envelope(
-            &output,
-            left,
-            &output,
-            right,
-            LogCompareStrictness::Canonical,
-            RecordEnvelope::dbt_evidence_transport_v1(),
-        )
-        .unwrap();
-        let report = verification_report(&outcome);
-
-        assert_eq!(outcome.verdict, Verdict::Matched);
-        assert_eq!(
-            outcome.compared_log_messages,
-            Some(ComparedLogCounts { left: 0, right: 0 })
-        );
-        assert_eq!(
-            outcome.comparison.record_envelope,
-            RecordEnvelopePolicy::DbtEvidenceTransportV1
-        );
-        assert!(!report.bitwise_parity);
-    }
-
-    #[test]
-    fn dbt_real_detcore_record_matches_under_the_disclosed_envelope() {
-        let output = output(0, b"hello\n", b"");
-        let (left, right) = empty_logs();
-        let record = detcore::detlog::record_suffix(detcore::detlog::DetLogEvent::Syscall);
-        let log = format!(
-            "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized\n\
-             2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall] getpid() = Ok(3){record}\n"
-        );
-        fs::write(&left, &log).unwrap();
-        fs::write(&right, &log).unwrap();
-
-        let outcome = compare_with_envelope(
-            &output,
-            left,
-            &output,
-            right,
-            LogCompareStrictness::Canonical,
-            RecordEnvelope::dbt_evidence_transport_v1(),
-        )
-        .unwrap();
-        let report = verification_report(&outcome);
-        let json = serde_json::to_value(&report).unwrap();
-
-        assert_eq!(
-            outcome.compared_log_messages,
-            Some(ComparedLogCounts { left: 1, right: 1 })
-        );
-        assert!(report.bitwise_parity);
-        assert_eq!(
-            json["comparison"]["record_envelope"],
-            "dbt_evidence_transport_v1"
-        );
     }
 
     #[test]

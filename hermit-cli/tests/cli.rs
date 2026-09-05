@@ -35,6 +35,8 @@ use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
 use hermit::GUEST_PROGRAM_NOT_EXECUTABLE_EXIT;
 use hermit::GUEST_PROGRAM_NOT_FOUND_EXIT;
 use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
+use hermit::canonical_verdict::GuestDisposition;
+use hermit::canonical_verdict::GuestRunResult;
 use hermit::canonical_verdict::InfrastructureError;
 use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
@@ -834,6 +836,41 @@ fn run_rejects_unknown_backends_during_argument_parsing() {
     }
 }
 
+#[test]
+fn ordinary_run_writes_a_typed_guest_result_and_exact_streams() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create ordinary-run result test directory");
+    let result = directory.path().join("run-result.json");
+    let guest_stdout = directory.path().join("guest.stdout");
+    let guest_stderr = directory.path().join("guest.stderr");
+    let args = [
+        "run",
+        "--run-result-json",
+        result.to_str().unwrap(),
+        "--guest-stdout",
+        guest_stdout.to_str().unwrap(),
+        "--guest-stderr",
+        guest_stderr.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf exact-stdout; printf exact-stderr >&2; exit 7",
+    ];
+
+    let output = hermit(&args);
+
+    assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "exact-stdout");
+    assert!(stderr(&output).contains("exact-stderr"));
+    assert_eq!(fs::read(&guest_stdout).unwrap(), b"exact-stdout");
+    assert_eq!(fs::read(&guest_stderr).unwrap(), b"exact-stderr");
+    let sidecar = GuestRunResult::from_current_json_slice(&fs::read(result).unwrap()).unwrap();
+    assert_eq!(sidecar.disposition, GuestDisposition::Exited { code: 7 });
+    assert_eq!(sidecar.stdout.bytes, 12);
+    assert_eq!(sidecar.stderr.bytes, 12);
+}
+
 /// True when this binary cannot exercise the DBT backend, having said so.
 ///
 /// ⚠️ KEYED ON THE COMPILE-TIME FEATURE, NEVER ON THE RUN'S OUTCOME. Skipping
@@ -879,6 +916,290 @@ fn run_dbt_executes_integrated_backend() {
     let args = ["run", "--backend", "dbt", "--", "/bin/true"];
     let output = hermit(&args);
     assert_success(&output, &args);
+}
+
+#[test]
+fn run_dbt_writes_an_authoritative_ordinary_log_after_the_guest_reaps_children() {
+    if dbt_unavailable(
+        "run_dbt_writes_an_authoritative_ordinary_log_after_the_guest_reaps_children",
+    ) {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBT ordinary-log test directory");
+    let log = directory.path().join("ordinary.log");
+    let log_arg = log.to_str().expect("DBT log path should be UTF-8");
+    let program = dbt_wait_guest()
+        .to_str()
+        .expect("DBT wait guest path should be UTF-8");
+    let args = [
+        "--backend",
+        "dbt",
+        "--log",
+        "info",
+        "--log-file",
+        log_arg,
+        "run",
+        "--strict",
+        "--",
+        program,
+    ];
+
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n",
+        "the CLI must preserve the guest's reaped-child result"
+    );
+    let bytes = fs::read(&log).expect("ordinary DBT log must exist when the CLI returns");
+    assert!(!bytes.is_empty(), "ordinary DBT log must be nonempty");
+    assert_eq!(
+        bytes.last(),
+        Some(&b'\n'),
+        "ordinary DBT log must be framed"
+    );
+    assert!(
+        !bytes
+            .windows(b"reverie_dbt::evidence:".len())
+            .any(|window| window == b"reverie_dbt::evidence:"),
+        "typed decoding must not materialize DBT transport records"
+    );
+
+    let compare_args = ["log-diff", "--canonical-info", log_arg];
+    let canonical = hermit(&compare_args);
+    assert_success(&canonical, &compare_args);
+    assert!(
+        stdout(&canonical).contains("INFO detcore"),
+        "ordinary DBT log had no canonical INFO records:\n{}",
+        stdout(&canonical)
+    );
+}
+
+#[test]
+fn run_dbt_refuses_to_publish_shared_dynamo_streams_as_exact_guest_output() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBT ordinary-run result test directory");
+    let result = directory.path().join("run-result.json");
+    let guest_stdout = directory.path().join("guest.stdout");
+    let guest_stderr = directory.path().join("guest.stderr");
+    let summary = directory.path().join("summary.json");
+    let log = directory.path().join("ordinary.log");
+    for path in [&log, &summary, &result, &guest_stdout, &guest_stderr] {
+        fs::write(path, b"stale completed artifact\n")
+            .unwrap_or_else(|error| panic!("failed to seed {}: {error}", path.display()));
+    }
+    let args = [
+        "--backend",
+        "dbt",
+        "--log",
+        "info",
+        "--log-file",
+        log.to_str().unwrap(),
+        "run",
+        "--strict",
+        "--summary-json",
+        summary.to_str().unwrap(),
+        "--run-result-json",
+        result.to_str().unwrap(),
+        "--guest-stdout",
+        guest_stdout.to_str().unwrap(),
+        "--guest-stderr",
+        guest_stderr.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        "exit 101",
+    ];
+
+    let output = hermit(&args);
+
+    assert_eq!(output.status.code(), Some(HERMIT_INTERNAL_FAILURE_EXIT));
+    let error = stderr(&output);
+    assert!(
+        error.contains(
+            "drrun, DynamoRIO core, and the guest structurally share file descriptors 1 and 2"
+        ) && error
+            .contains("refusing to publish those mixed streams as exact guest stdout and stderr"),
+        "unexpected refusal:\n{error}"
+    );
+    for path in [&log, &summary, &result, &guest_stdout, &guest_stderr] {
+        match fs::read(path) {
+            Ok(bytes) => assert!(
+                bytes.is_empty(),
+                "DBT capture refusal left a completed artifact at {}",
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("failed to inspect {}: {error}", path.display()),
+        }
+    }
+}
+
+#[test]
+fn run_dbt_preserves_a_legitimate_guest_exit_101_without_exact_capture() {
+    if dbt_unavailable("run_dbt_preserves_a_legitimate_guest_exit_101_without_exact_capture") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let args = ["run", "--backend", "dbt", "--", "/bin/sh", "-c", "exit 101"];
+    let output = hermit(&args);
+
+    assert_eq!(output.status.code(), Some(101), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("HERMIT_INTERNAL_FAILURE"),
+        "a legitimate guest exit 101 was reported as a Hermit failure:\n{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn two_separate_dbt_ordinary_runs_produce_matching_nonempty_logs() {
+    if dbt_unavailable("two_separate_dbt_ordinary_runs_produce_matching_nonempty_logs") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create two-run DBT capture directory");
+    let program = dbt_stderr_guest();
+
+    let run_one = |name: &str| {
+        let log = directory.path().join(format!("{name}.log"));
+        let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--backend", "dbt", "--log", "info", "--log-file"])
+            .arg(&log)
+            .args(["run", "--strict"])
+            .arg("--")
+            .arg(program)
+            .output()
+            .expect("failed to run an ordinary DBT capture");
+        assert!(
+            output.status.success(),
+            "{name} ordinary DBT run failed:\n{}",
+            stderr(&output)
+        );
+        log
+    };
+
+    let left_log = run_one("run1");
+    let right_log = run_one("run2");
+
+    let report = directory.path().join("comparison.json");
+    let comparison = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .arg("log-diff")
+        .arg(&left_log)
+        .arg(&right_log)
+        .arg("--json")
+        .arg(&report)
+        .output()
+        .expect("failed to compare ordinary DBT logs");
+    assert!(
+        comparison.status.success(),
+        "ordinary DBT logs did not match:\n{}",
+        stderr(&comparison)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
+    assert_eq!(report["verdict"], "matched");
+    assert_eq!(report["comparison"]["stream"], "info");
+    assert_eq!(report["comparison"]["record_envelope"], "all_records_v1");
+    for side in ["left", "right"] {
+        assert!(
+            report["selected_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "ordinary DBT comparison selected no {side} INFO records: {report}"
+        );
+    }
+    assert_eq!(
+        report["selected_messages"]["left"],
+        report["selected_messages"]["right"]
+    );
+    assert!(report["first_divergent_record"].is_null());
+}
+
+#[test]
+fn run_dbt_delayed_orphan_either_finishes_evidence_or_leaves_no_partial_log() {
+    if dbt_unavailable("run_dbt_delayed_orphan_either_finishes_evidence_or_leaves_no_partial_log") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBT delayed-orphan test directory");
+    let log = directory.path().join("ordinary.log");
+    let log_arg = log.to_str().expect("DBT log path should be UTF-8");
+    let args = [
+        "--backend",
+        "dbt",
+        "--log",
+        "info",
+        "--log-file",
+        log_arg,
+        "run",
+        "--strict",
+        "--",
+        "/bin/sh",
+        "-c",
+        "(sleep 0.2; echo orphan-child-finished) & exit 0",
+    ];
+
+    let output = hermit(&args);
+    let bytes = fs::read(&log).expect("DBT must create the requested host log");
+    if output.status.success() {
+        assert_eq!(stdout(&output), "orphan-child-finished\n");
+        assert!(!bytes.is_empty(), "successful evidence must be published");
+        let contents = String::from_utf8_lossy(&bytes);
+        assert!(
+            contents.contains("clock_nanosleep") || contents.contains("nanosleep"),
+            "successful evidence omitted the delayed child:\n{contents}"
+        );
+    } else {
+        assert_eq!(output.status.code(), Some(HERMIT_INTERNAL_FAILURE_EXIT));
+        assert!(
+            stderr(&output).contains("protected evidence failed"),
+            "delayed-child refusal did not name evidence finalization:\n{}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("missing FINAL frames"),
+            "delayed-child refusal did not preserve the transport cause:\n{}",
+            stderr(&output)
+        );
+        assert!(
+            bytes.is_empty(),
+            "a refused delayed-child run left a partial log: {} bytes",
+            bytes.len()
+        );
+    }
+}
+
+#[test]
+fn run_dbt_refuses_a_log_that_would_change_relaxed_process_group_semantics() {
+    if dbt_unavailable("run_dbt_refuses_a_log_that_would_change_relaxed_process_group_semantics") {
+        return;
+    }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBT log-policy test directory");
+    let log = directory.path().join("ordinary.log");
+    let log_arg = log.to_str().expect("DBT log path should be UTF-8");
+    let args = [
+        "--backend",
+        "dbt",
+        "--log-file",
+        log_arg,
+        "run",
+        "--allow-unsupported-syscalls",
+        "--",
+        "/bin/true",
+    ];
+
+    let output = hermit(&args);
+
+    assert_eq!(output.status.code(), Some(HERMIT_INTERNAL_FAILURE_EXIT));
+    let stderr = stderr(&output);
+    assert!(stderr.contains("--allow-unsupported-syscalls"), "{stderr}");
+    assert!(stderr.contains("setsid/setpgid"), "{stderr}");
 }
 
 #[test]
@@ -1381,6 +1702,57 @@ fn run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls()
             "strict DBT {mode} omitted unsupported-syscall diagnostic:\n{}",
             stderr(&output)
         );
+    }
+}
+
+#[test]
+fn run_dbt_strict_unsupported_outcome_leaves_no_ordinary_artifacts() {
+    if dbt_unavailable("run_dbt_strict_unsupported_outcome_leaves_no_ordinary_artifacts") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create strict DBT refusal directory");
+    let log = directory.path().join("ordinary.log");
+    let summary = directory.path().join("summary.json");
+    for path in [&log, &summary] {
+        fs::write(path, b"stale completed artifact\n")
+            .unwrap_or_else(|error| panic!("failed to seed {}: {error}", path.display()));
+    }
+    let program = dbt_unsupported_syscall_guest();
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--backend", "dbt", "--log", "info", "--log-file"])
+        .arg(&log)
+        .args(["run", "--strict", "--summary-json"])
+        .arg(&summary)
+        .arg("--")
+        .arg(program)
+        .output()
+        .expect("failed to run the strict DBT unsupported-syscall case");
+
+    assert_eq!(output.status.code(), Some(HERMIT_INTERNAL_FAILURE_EXIT));
+    let error = stderr(&output);
+    assert!(
+        error.contains("HERMIT_INTERNAL_FAILURE")
+            && error.contains("DBT guest exited with status Some(101)")
+            && error.contains("DBT backend or Tool reported an internal failure"),
+        "strict DBT run did not authenticate its internal failure:\n{error}"
+    );
+    assert_eq!(
+        stdout(&output),
+        "",
+        "the refused guest published its success marker"
+    );
+    for path in [&log, &summary] {
+        match fs::read(path) {
+            Ok(bytes) => assert!(
+                bytes.is_empty(),
+                "strict DBT refusal left a completed artifact at {}",
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("failed to inspect {}: {error}", path.display()),
+        }
     }
 }
 
