@@ -1203,6 +1203,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         "ci/run-nextest-counted.sh",
         "ci/verify-submodules.sh",
         "scripts/validate.rs",
+        "scripts/lib/validate_history.rs",
         "scripts/lib/validate_plan.rs",
         "tests/e2e/manifests/applications.yaml",
         "tests/e2e/manifests/backend-parity-c.yaml",
@@ -1231,6 +1232,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "ci/run-nextest-counted.sh",
                 "ci/verify-submodules.sh",
                 "scripts/validate.rs",
+                "scripts/lib/validate_history.rs",
                 "scripts/lib/validate_plan.rs",
                 "tests/e2e/manifests/applications.yaml",
                 "tests/e2e/manifests/backend-parity-c.yaml",
@@ -1856,6 +1858,99 @@ fn self_test() -> Result<(), String> {
             "summary: framework service result lost typed status or counts: {service_result:?}"
         ));
     }
+
+    let cache_tree = "b".repeat(40);
+    let cache_key = validate_history::CacheKey {
+        tree: &cache_tree,
+        profile: "full",
+        host: "fixture-host",
+        toolchain: "fixture-toolchain",
+    };
+    let cache_row = serde_json::json!({
+        "schema_version": validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION,
+        "tree": cache_tree,
+        "profile": "full",
+        "host": "fixture-host",
+        "toolchain": "fixture-toolchain",
+        "selection_mode": "full",
+        "result": "pass",
+        "commit_anchored": true,
+        "tree_dirty": false,
+        "failures": 0,
+        "commit": "b".repeat(40),
+        "finished_at": "2026-09-05T00:00:00Z",
+        "real_seconds": 100.0,
+        "user_seconds": 30.0,
+        "sys_seconds": 2.0,
+        "producer": "hermit-validate-rs",
+        "executed_nodes": 76,
+        "executed_tests": 2129,
+        "passed_tests": 2129,
+        "gates_expected": 76,
+        "gates_run": 76,
+        "coverage": {
+            "planned_test_nodes": 20,
+            "executed_test_nodes": 20,
+            "absent_nodes": [],
+        },
+    });
+    let cache_summary = |row: &serde_json::Value| -> Result<RunSummary, String> {
+        let hit = validate_history::cache_lookup(
+            std::slice::from_ref(row),
+            "pass",
+            &cache_key,
+        )
+        .ok_or_else(|| "summary: planted cache row did not produce a cache hit".to_string())?;
+        cache_hit_run_summary(
+            &hit,
+            "full",
+            "full",
+            &cache_tree,
+            Path::new("fixture-ledger"),
+            true,
+        )
+    };
+    let cached_result_path = service_result_dir.path().join("cache-hit.json");
+    write_validation_service_result(&cached_result_path, &cache_summary(&cache_row)?)?;
+    let cached_result = ValidationServiceResult::from_json_slice(
+        &std::fs::read(&cached_result_path)
+            .map_err(|error| format!("summary: cannot read cache-hit result: {error}"))?,
+    )?;
+    if cached_result.final_validate_status != FinalValidateStatus::Passed
+        || cached_result.executed_nodes != 76
+        || cached_result.executed_tests != Some(2129)
+        || cached_result.passed_tests != Some(2129)
+    {
+        return Err(format!(
+            "summary: exact cache hit did not survive the production service-result writer: {cached_result:?}"
+        ));
+    }
+    for (label, replacement) in [
+        ("missing", serde_json::Value::Null),
+        ("negative", serde_json::json!(-1)),
+        ("contradictory", serde_json::json!(2128)),
+    ] {
+        let mut row = cache_row.clone();
+        if label == "missing" {
+            row.as_object_mut().unwrap().remove("passed_tests");
+        } else {
+            row["passed_tests"] = replacement;
+        }
+        let refusal = cache_summary(&row).err().ok_or_else(|| {
+            format!("summary: {label} cached passed_tests produced a service-result PASS")
+        })?;
+        if !refusal.contains("cannot publish a current validation service result") {
+            return Err(format!("summary: {label} cached count refusal was unclear: {refusal}"));
+        }
+    }
+    let mut legacy_cache_row = cache_row.clone();
+    legacy_cache_row["schema_version"] = serde_json::json!(
+        validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION - 1
+    );
+    if cache_summary(&legacy_cache_row).is_ok() {
+        return Err("summary: a legacy cache row produced a current service-result PASS".into());
+    }
+
     service_summary.passed_tests = Some(2128);
     let mismatch_path = service_result_dir.path().join("mismatch.json");
     let mismatch_error = write_validation_service_result(&mismatch_path, &service_summary)
@@ -17372,6 +17467,54 @@ impl RunSummary {
     }
 }
 
+fn cache_hit_run_summary(
+    hit: &validate_history::CacheHit,
+    profile: &str,
+    selection_mode: &str,
+    tree: &str,
+    ledger: &Path,
+    service_result_requested: bool,
+) -> Result<RunSummary, String> {
+    let exact_counts = hit.exact_current_pass_counts();
+    if service_result_requested && exact_counts.is_none() {
+        return Err(format!(
+            "cached row cannot publish a current validation service result: requires current-schema Rust producer evidence with positive executed_nodes and exact positive executed_tests == passed_tests; got schema_version={:?}, producer={:?}, executed_nodes={:?}, executed_tests={:?}, passed_tests={:?}",
+            hit.schema_version,
+            hit.producer,
+            hit.executed_nodes,
+            hit.executed_tests,
+            hit.passed_tests,
+        ));
+    }
+
+    let mut summary = RunSummary::new(
+        Verdict::CacheHit,
+        0,
+        profile,
+        vec![
+            format!(
+                "reused the passing record from {} (commit {}, producer {}), keyed on tree {tree}",
+                hit.finished_at, hit.commit, hit.producer
+            ),
+            format!(
+                "that run recorded {} {} executed with satisfied gate coverage; --ignore-cache forces a real run",
+                hit.executed, hit.executed_unit
+            ),
+        ],
+    );
+    summary.selection_mode = Some(selection_mode.into());
+    summary.ledger = Some(ledger.to_path_buf());
+    if service_result_requested {
+        let (nodes, executed, passed) = exact_counts.expect("checked above");
+        summary.nodes_executed = usize::try_from(nodes).map_err(|_| {
+            format!("cached executed_nodes {nodes} does not fit this platform")
+        })?;
+        summary.executed_tests = Some(executed);
+        summary.passed_tests = Some(passed);
+    }
+    Ok(summary)
+}
+
 fn unavailable_invocation_lock_summary(profile: &str, error: String) -> RunSummary {
     RunSummary::refused(
         3,
@@ -19170,46 +19313,49 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         && plan.selection_mode == "full"
     {
         if let Some(hit) = validate_history::cache_lookup(&ledger_rows, "pass", &cache_key) {
-            println!("# ============================================================");
-            println!("# validate CACHE HIT for tree {tree}");
-            println!("#   (commit {})", git_sha());
-            println!(
-                "#   passed {} (wall {}, CPU {}, {} {} executed)",
-                hit.finished_at,
-                human_duration(hit.real_seconds),
-                human_duration(hit.cpu_seconds),
-                hit.executed,
-                hit.executed_unit
-            );
-            println!(
-                "#   from a run of commit {} by {} -- use --ignore-cache to force a real run",
-                hit.commit, hit.producer
-            );
-            println!("#   profile={} host={host} toolchain={toolchain}", plan.profile);
-            println!("#   NO gates ran this invocation; reused a clean, commit-anchored passing");
-            println!("#   record (nonzero executed count, satisfied gate coverage) from the");
-            println!("#   run-ledger ({}).", ledger.display());
-            println!("# ============================================================");
-            let _ = std::fs::remove_dir_all(&tmp);
-            let mut s = RunSummary::new(
-                Verdict::CacheHit,
-                0,
+            match cache_hit_run_summary(
+                &hit,
                 &plan.profile,
-                vec![
-                    format!(
-                        "reused the passing record from {} (commit {}, producer {}), keyed on tree {tree}",
-                        hit.finished_at, hit.commit, hit.producer
-                    ),
-                    format!(
-                        "that run recorded {} {} executed with satisfied gate coverage; \
-                         --ignore-cache forces a real run",
-                        hit.executed, hit.executed_unit
-                    ),
-                ],
-            );
-            s.selection_mode = Some(plan.selection_mode.into());
-            s.ledger = Some(ledger.clone());
-            return s;
+                plan.selection_mode,
+                &tree,
+                &ledger,
+                service_result_path.is_some(),
+            ) {
+                Ok(summary) => {
+                    println!("# ============================================================");
+                    println!("# validate CACHE HIT for tree {tree}");
+                    println!("#   (commit {})", git_sha());
+                    println!(
+                        "#   passed {} (wall {}, CPU {}, {} {} executed)",
+                        hit.finished_at,
+                        human_duration(hit.real_seconds),
+                        human_duration(hit.cpu_seconds),
+                        hit.executed,
+                        hit.executed_unit
+                    );
+                    println!(
+                        "#   from a run of commit {} by {} -- use --ignore-cache to force a real run",
+                        hit.commit, hit.producer
+                    );
+                    println!(
+                        "#   profile={} host={host} toolchain={toolchain}",
+                        plan.profile
+                    );
+                    println!(
+                        "#   NO gates ran this invocation; reused a clean, commit-anchored passing"
+                    );
+                    println!(
+                        "#   record (nonzero executed count, satisfied gate coverage) from the"
+                    );
+                    println!("#   run-ledger ({}).", ledger.display());
+                    println!("# ============================================================");
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    return summary;
+                }
+                Err(reason) => eprintln!(
+                    "# validate: {reason}; ignoring this cache row and running validation"
+                ),
+            }
         }
         // A prior genuine FAIL prevents the PASS cache lookup above from
         // succeeding. Note it and run so targeted requalification evidence can
