@@ -35,6 +35,8 @@ use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
 use hermit::GUEST_PROGRAM_NOT_EXECUTABLE_EXIT;
 use hermit::GUEST_PROGRAM_NOT_FOUND_EXIT;
 use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
+use hermit::canonical_verdict::GuestDisposition;
+use hermit::canonical_verdict::GuestRunResult;
 use hermit::canonical_verdict::InfrastructureError;
 use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
@@ -834,6 +836,41 @@ fn run_rejects_unknown_backends_during_argument_parsing() {
     }
 }
 
+#[test]
+fn ordinary_run_writes_a_typed_guest_result_and_exact_streams() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create ordinary-run result test directory");
+    let result = directory.path().join("run-result.json");
+    let guest_stdout = directory.path().join("guest.stdout");
+    let guest_stderr = directory.path().join("guest.stderr");
+    let args = [
+        "run",
+        "--run-result-json",
+        result.to_str().unwrap(),
+        "--guest-stdout",
+        guest_stdout.to_str().unwrap(),
+        "--guest-stderr",
+        guest_stderr.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf exact-stdout; printf exact-stderr >&2; exit 7",
+    ];
+
+    let output = hermit(&args);
+
+    assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "exact-stdout");
+    assert!(stderr(&output).contains("exact-stderr"));
+    assert_eq!(fs::read(&guest_stdout).unwrap(), b"exact-stdout");
+    assert_eq!(fs::read(&guest_stderr).unwrap(), b"exact-stderr");
+    let sidecar = GuestRunResult::from_current_json_slice(&fs::read(result).unwrap()).unwrap();
+    assert_eq!(sidecar.disposition, GuestDisposition::Exited { code: 7 });
+    assert_eq!(sidecar.stdout.bytes, 12);
+    assert_eq!(sidecar.stderr.bytes, 12);
+}
+
 /// True when this binary cannot exercise the DBT backend, having said so.
 ///
 /// ⚠️ KEYED ON THE COMPILE-TIME FEATURE, NEVER ON THE RUN'S OUTCOME. Skipping
@@ -939,6 +976,43 @@ fn run_dbt_writes_an_authoritative_ordinary_log_after_the_guest_reaps_children()
         "ordinary DBT log had no canonical INFO records:\n{}",
         stdout(&canonical)
     );
+}
+
+#[test]
+fn run_dbt_refuses_to_label_mixed_diagnostics_as_exact_guest_stderr() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create DBT ordinary-run result test directory");
+    let result = directory.path().join("run-result.json");
+    let guest_stdout = directory.path().join("guest.stdout");
+    let guest_stderr = directory.path().join("guest.stderr");
+    let args = [
+        "run",
+        "--backend",
+        "dbt",
+        "--run-result-json",
+        result.to_str().unwrap(),
+        "--guest-stdout",
+        guest_stdout.to_str().unwrap(),
+        "--guest-stderr",
+        guest_stderr.to_str().unwrap(),
+        "--",
+        "/bin/true",
+    ];
+
+    let output = hermit(&args);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains(
+            "DBT ordinary-run result capture is unavailable because the launcher currently \
+             combines guest stderr with controller diagnostics"
+        ),
+        "unexpected refusal:\n{}",
+        stderr(&output)
+    );
+    assert_eq!(fs::read(result).unwrap(), b"");
+    assert_eq!(fs::read(guest_stdout).unwrap(), b"");
+    assert_eq!(fs::read(guest_stderr).unwrap(), b"");
 }
 
 #[test]

@@ -205,12 +205,18 @@ impl LogDiffCLIOpts {
             return self.follow_two_runs(file_b, &options, record_envelope);
         }
 
-        let (summary, records_left, records_right) = match try_log_diff_with_records(
-            &self.file_a,
-            file_b,
-            &options,
-            record_envelope,
-        ) {
+        let comparison = if (self.canonical_info || self.json.is_some())
+            && record_envelope.policy() == RecordEnvelopePolicy::AllRecordsV1
+        {
+            logdiff::try_compare_bitwise_info_v1_with_records(
+                &self.file_a,
+                file_b,
+                options.side_labels.clone(),
+            )
+        } else {
+            try_log_diff_with_records(&self.file_a, file_b, &options, record_envelope)
+        };
+        let (summary, records_left, records_right) = match comparison {
             Ok(result) => result,
             Err(error) => {
                 eprintln!(
