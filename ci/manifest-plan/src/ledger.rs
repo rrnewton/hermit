@@ -134,10 +134,11 @@ pub struct HistoryRow {
     /// typed shape applies; supported schemas still require a complete value.
     #[serde(default)]
     pub cell_results: Option<CellResultsValue>,
-    /// Schema-9 producer-owned terminal test results. Keep the raw value until
-    /// the enclosing row version is known so schemas 6, 7, 8, and future rows
-    /// retain their established serialization and receive no accidental
-    /// authority from a shape that happens to parse.
+    /// Schema-9 producer-owned terminal test results, carried forward by the
+    /// cumulative schema 10. Keep the raw value until the enclosing row version
+    /// is known so schemas 6, 7, 8, and future rows retain their established
+    /// serialization and receive no accidental authority from a shape that
+    /// happens to parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_results: Option<TestResultsValue>,
     #[serde(default)]
@@ -153,6 +154,22 @@ pub struct HistoryRow {
 }
 
 impl HistoryRow {
+    fn schema10_evidence(&self) -> Result<(CellResultsEvidenceV10, TestResultsEvidenceV9), String> {
+        let cell_results = self
+            .cell_results
+            .as_ref()
+            .ok_or_else(|| "schema 10 row omitted cell_results".to_string())?
+            .schema10()?;
+        cell_results.validate_for_row(self)?;
+        let test_results = self
+            .test_results
+            .as_ref()
+            .ok_or_else(|| "schema 10 row omitted test_results".to_string())?
+            .schema9()?;
+        test_results.validate_for_row(self)?;
+        Ok((cell_results, test_results))
+    }
+
     /// Return the Git tree recorded for this validation row.
     ///
     /// Absence is valid for historical rows. A present value is either one
@@ -192,8 +209,9 @@ impl HistoryRow {
     /// Decode cell-results evidence only after the enclosing schema version is
     /// known. Schema 6 and 7 retain their historical type; schema 8 introduced
     /// the exact versioned shape that schema 9 carries forward unchanged while
-    /// adding separate test-results evidence. Newer schemas remain readable but
-    /// receive no typed evidence authority.
+    /// adding separate test-results evidence. Schema 10 adds a receipt-bound
+    /// retained verify-log index. Newer schemas remain readable but receive no
+    /// typed evidence authority.
     pub fn cell_results_evidence(&self) -> Option<Cow<'_, CellResultsEvidence>> {
         let value = self.cell_results.as_ref()?;
         match self.schema_version? {
@@ -201,29 +219,59 @@ impl HistoryRow {
             8 | 9 => value
                 .schema8()
                 .map(|evidence| Cow::Owned(evidence.into_evidence())),
+            10 => self
+                .schema10_evidence()
+                .ok()
+                .map(|(evidence, _)| Cow::Owned(evidence.into_evidence())),
             _ => None,
         }
     }
 
-    /// Return the recorded validation path for schema 8 or its schema-9
-    /// extension, both of which use the same cell-results shape.
+    /// Return the recorded validation path for schemas 8 through 10.
     pub fn cell_results_validate_path(&self) -> Option<ValidatePath> {
-        if !matches!(self.schema_version, Some(8) | Some(9)) {
-            return None;
+        let value = self.cell_results.as_ref()?;
+        match self.schema_version? {
+            8 | 9 => value.schema8().map(|evidence| evidence.path),
+            10 => self
+                .schema10_evidence()
+                .ok()
+                .map(|(evidence, _)| evidence.path),
+            _ => None,
         }
-        self.cell_results
-            .as_ref()?
-            .schema8()
-            .map(|evidence| evidence.path)
     }
 
-    /// Decode and validate producer-owned per-test evidence only for schema 9.
+    /// Return the receipt-bound retained verify-log index for schema 10.
+    pub fn retained_verify_logs_artifact(
+        &self,
+    ) -> Result<Option<RetainedVerifyLogsArtifact>, String> {
+        if self.schema_version != Some(10) {
+            return Ok(None);
+        }
+        let (evidence, _) = self.schema10_evidence()?;
+        Ok(Some(evidence.retained_verify_logs))
+    }
+
+    /// Return the exact pinned-root image digest carried with schema-10
+    /// retained verify logs.
+    pub fn retained_verify_logs_hermetic_image_digest(&self) -> Result<Option<String>, String> {
+        if self.schema_version != Some(10) {
+            return Ok(None);
+        }
+        let (evidence, _) = self.schema10_evidence()?;
+        Ok(Some(evidence.hermetic_image_digest))
+    }
+
+    /// Decode and validate producer-owned per-test evidence for schema 9 and
+    /// its cumulative schema-10 extension.
     ///
     /// Artifact bytes are verified by the receipt consumer. This reader proves
     /// everything available from the ledger row itself: exact row identity,
     /// validation path, selected producer population, canonical summaries,
     /// checked totals, and the content-addressed artifact reference.
     pub fn test_results_evidence(&self) -> Result<Option<TestResultsEvidenceV9>, String> {
+        if self.schema_version == Some(10) {
+            return self.schema10_evidence().map(|(_, evidence)| Some(evidence));
+        }
         if self.schema_version != Some(9) {
             return Ok(None);
         }
@@ -521,6 +569,39 @@ pub struct CellResultsArtifact {
     pub row_count: u64,
 }
 
+/// One gzip copied out of the harness result tree into retained validation
+/// artifacts. The path is relative to the dev-hermit state root, matching the
+/// existing [`CellResultsArtifact`] contract.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedVerifyLogArtifact {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+/// One row in the retained verify-log index.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedVerifyLogIndexRow {
+    pub cell: CellIdentity,
+    pub attempt: u64,
+    pub retained_verify_log: crate::runner::RetainedVerifyLog,
+    pub artifact: RetainedVerifyLogArtifact,
+}
+
+/// Receipt binding for the retained verify-log index and all gzip bytes it
+/// names. The index rows carry each gzip's own digest and size; this aggregate
+/// records the bounded total copied for the validation run.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedVerifyLogsArtifact {
+    pub path: String,
+    pub sha256: String,
+    pub row_count: u64,
+    pub compressed_bytes: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CellResultsEvidence {
@@ -566,6 +647,30 @@ pub struct CellResultsEvidenceV8 {
     /// SHA-256 over canonical JSON of the sorted `selected` identities.
     pub population_sha256: String,
     pub artifact: CellResultsArtifact,
+    pub selected: Vec<CellIdentity>,
+    pub cells: Vec<CellResult>,
+}
+
+/// Schema-10 cell-result evidence. Schemas 8 and 9 already have exact reader
+/// contracts, so retained verify-log publication uses the next unclaimed outer
+/// version rather than changing either historical shape. The enclosing
+/// schema-10 row also requires schema-9 `test_results`; schema 10 is cumulative,
+/// not an alternative to that evidence.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CellResultsEvidenceV10 {
+    pub path: ValidatePath,
+    pub run_id: String,
+    pub hermit_sha: String,
+    pub source_tree_dirty: bool,
+    /// Exact image reference captured before the pinned-root validation run.
+    pub hermetic_image_digest: String,
+    pub selected_count: u64,
+    pub recorded_count: u64,
+    /// SHA-256 over canonical JSON of the sorted `selected` identities.
+    pub population_sha256: String,
+    pub artifact: CellResultsArtifact,
+    pub retained_verify_logs: RetainedVerifyLogsArtifact,
     pub selected: Vec<CellIdentity>,
     pub cells: Vec<CellResult>,
 }
@@ -765,6 +870,150 @@ impl CellResultsEvidenceV8 {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CellResultsEvidenceV10Wire {
+    path: ValidatePath,
+    run_id: String,
+    hermit_sha: String,
+    source_tree_dirty: bool,
+    hermetic_image_digest: String,
+    selected_count: u64,
+    recorded_count: u64,
+    population_sha256: String,
+    artifact: CellResultsArtifact,
+    retained_verify_logs: RetainedVerifyLogsArtifact,
+    selected: Vec<CellIdentity>,
+    cells: Vec<CellResultV8>,
+}
+
+impl<'de> Deserialize<'de> for CellResultsEvidenceV10 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = CellResultsEvidenceV10Wire::deserialize(deserializer)?;
+        Ok(Self {
+            path: value.path,
+            run_id: value.run_id,
+            hermit_sha: value.hermit_sha,
+            source_tree_dirty: value.source_tree_dirty,
+            hermetic_image_digest: value.hermetic_image_digest,
+            selected_count: value.selected_count,
+            recorded_count: value.recorded_count,
+            population_sha256: value.population_sha256,
+            artifact: value.artifact,
+            retained_verify_logs: value.retained_verify_logs,
+            selected: value.selected,
+            cells: value.cells.into_iter().map(CellResult::from).collect(),
+        })
+    }
+}
+
+impl CellResultsEvidenceV10 {
+    fn into_evidence(self) -> CellResultsEvidence {
+        CellResultsEvidence {
+            run_id: self.run_id,
+            hermit_sha: self.hermit_sha,
+            source_tree_dirty: self.source_tree_dirty,
+            selected_count: self.selected_count,
+            recorded_count: self.recorded_count,
+            population_sha256: self.population_sha256,
+            artifact: self.artifact,
+            selected: self.selected,
+            cells: self.cells,
+        }
+    }
+
+    fn validate_for_row(&self, row: &HistoryRow) -> Result<(), String> {
+        if row.repo.as_deref() != Some("hermit") {
+            return Err("schema 10 cell_results is not attached to a hermit row".into());
+        }
+        if self.run_id.is_empty()
+            || self.run_id == "."
+            || self.run_id == ".."
+            || self.run_id.contains('/')
+            || self.run_id.contains('\\')
+        {
+            return Err("schema 10 cell_results has a malformed run_id".into());
+        }
+        if row.profile.as_deref() != Some(self.path.as_str()) {
+            return Err("schema 10 cell_results path differs from row profile".into());
+        }
+        if row.run_id.as_deref() != Some(self.run_id.as_str()) {
+            return Err("schema 10 cell_results run_id differs from row run_id".into());
+        }
+        if !is_lower_hex(&self.hermit_sha, 40)
+            || row.commit.as_deref() != Some(self.hermit_sha.as_str())
+        {
+            return Err("schema 10 cell_results hermit_sha differs from row commit".into());
+        }
+        if self.source_tree_dirty
+            || row.tree_dirty != Some(false)
+            || row.commit_anchored != Some(true)
+            || row.tree().map_err(str::to_string)?.is_none()
+        {
+            return Err("schema 10 cell_results source is not the exact clean row tree".into());
+        }
+        if !is_canonical_hermetic_image_digest(&self.hermetic_image_digest) {
+            return Err("schema 10 cell_results hermetic_image_digest is malformed".into());
+        }
+        let selected_count = u64::try_from(self.selected.len())
+            .map_err(|_| "schema 10 selected cell count does not fit u64")?;
+        let recorded_count = u64::try_from(self.cells.len())
+            .map_err(|_| "schema 10 recorded cell count does not fit u64")?;
+        if selected_count == 0
+            || self.selected_count != selected_count
+            || self.recorded_count != recorded_count
+            || !self.selected.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return Err("schema 10 cell_results counts or selected ordering mismatch".into());
+        }
+        let cell_identities = self
+            .cells
+            .iter()
+            .map(|cell| CellIdentity {
+                lane: cell.lane.clone(),
+                category: cell.category.clone(),
+                test: cell.test.clone(),
+                mode: cell.mode.clone(),
+                backend: cell.backend.clone(),
+            })
+            .collect::<Vec<_>>();
+        if cell_identities != self.selected {
+            return Err("schema 10 cell_results cells differ from selected population".into());
+        }
+        let population_bytes = serde_json::to_vec(&self.selected)
+            .map_err(|error| format!("cannot encode schema 10 selected population: {error}"))?;
+        let population_sha256 = format!("{:x}", Sha256::digest(population_bytes));
+        if self.population_sha256 != population_sha256 {
+            return Err("schema 10 cell_results population_sha256 mismatch".into());
+        }
+        let expected_cell_path = format!(
+            "ignored/validate/artifacts/{}/cell-results.jsonl",
+            self.run_id
+        );
+        if self.artifact.path != expected_cell_path
+            || !is_lower_hex(&self.artifact.sha256, 64)
+            || self.artifact.row_count != self.recorded_count
+        {
+            return Err("schema 10 cell_results artifact binding is malformed".into());
+        }
+        let expected_path = format!(
+            "ignored/validate/artifacts/{}/verify-logs/index.jsonl",
+            self.run_id
+        );
+        if self.retained_verify_logs.path != expected_path
+            || !is_lower_hex(&self.retained_verify_logs.sha256, 64)
+            || self.retained_verify_logs.row_count == 0
+            || self.retained_verify_logs.compressed_bytes == 0
+        {
+            return Err("schema 10 retained verify-log index binding is malformed".into());
+        }
+        Ok(())
+    }
+}
+
 /// A supported cell-results shape, or the exact JSON from a newer shape that
 /// this reader does not understand yet. Exact versioned shapes precede the raw
 /// fallback so supported rows retain typed access while unknown extensions stay
@@ -795,6 +1044,16 @@ impl CellResultsValue {
         match self {
             Self::Other(value) => serde_json::from_value(value.clone()).ok(),
             Self::Typed(_) => None,
+        }
+    }
+
+    fn schema10(&self) -> Result<CellResultsEvidenceV10, String> {
+        match self {
+            Self::Other(value) => serde_json::from_value(value.clone())
+                .map_err(|error| format!("schema 10 cell_results is malformed: {error}")),
+            Self::Typed(_) => {
+                Err("schema 10 cell_results used the historical schema-7 shape".into())
+            }
         }
     }
 }
@@ -959,6 +1218,14 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Whether a pinned-root image reference has the exact form written by
+/// `ci/hermetic/build-image.sh` and consumed by `run-in-pinned-root.sh`.
+pub fn is_canonical_hermetic_image_digest(value: &str) -> bool {
+    value
+        .strip_prefix("localhost/hermit-hermetic-validate@sha256:")
+        .is_some_and(|digest| is_lower_hex(digest, 64))
 }
 
 fn nonblank_component(value: &str) -> bool {
@@ -1537,6 +1804,229 @@ mod tests {
         assert!(extension.cell_results_evidence().is_none());
     }
 
+    fn schema10_cell_results() -> Value {
+        let selected = vec![CellIdentity {
+            lane: "portable".into(),
+            category: "c-programs".into(),
+            test: "hello".into(),
+            mode: "verify".into(),
+            backend: "ptrace".into(),
+        }];
+        let population_sha256 = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&selected).unwrap())
+        );
+        serde_json::json!({
+            "path": "full",
+            "run_id": "run-10",
+            "hermit_sha": "a".repeat(40),
+            "source_tree_dirty": false,
+            "hermetic_image_digest": format!(
+                "localhost/hermit-hermetic-validate@sha256:{}",
+                "e".repeat(64)
+            ),
+            "selected_count": 1,
+            "recorded_count": 1,
+            "population_sha256": population_sha256,
+            "artifact": {
+                "path": "ignored/validate/artifacts/run-10/cell-results.jsonl",
+                "sha256": "c".repeat(64),
+                "row_count": 1
+            },
+            "retained_verify_logs": {
+                "path": "ignored/validate/artifacts/run-10/verify-logs/index.jsonl",
+                "sha256": "d".repeat(64),
+                "row_count": 1,
+                "compressed_bytes": 23
+            },
+            "selected": selected,
+            "cells": [{
+                "lane": "portable",
+                "category": "c-programs",
+                "test": "hello",
+                "mode": "verify",
+                "backend": "ptrace",
+                "cell_verdict": {
+                    "state": "unavailable-with-reason",
+                    "comparison_tier": "declared-but-unverifiable",
+                    "reason": "fixture"
+                }
+            }]
+        })
+    }
+
+    fn schema10_row() -> HistoryRow {
+        let mut test_results = schema9_row()["test_results"].clone();
+        test_results["run_id"] = serde_json::json!("run-10");
+        test_results["artifact"]["path"] =
+            serde_json::json!("ignored/validate/artifacts/run-10/test-results.jsonl");
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 10,
+            "repo": "hermit",
+            "run_id": "run-10",
+            "profile": "full",
+            "commit": "a".repeat(40),
+            "commit_anchored": true,
+            "tree_dirty": false,
+            "tree": "f".repeat(40),
+            "executed_tests": 4,
+            "passed_tests": 3,
+            "filtered_tests": 7,
+            "cell_results": schema10_cell_results(),
+            "test_results": test_results
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn schema10_binds_the_retained_verify_log_index_without_reinterpreting_old_rows() {
+        let row = schema10_row();
+        assert_eq!(row.cell_results_validate_path(), Some(ValidatePath::Full));
+        assert!(row.cell_results_evidence().is_some());
+        assert!(row.test_results_evidence().unwrap().is_some());
+        assert_eq!(
+            row.retained_verify_logs_hermetic_image_digest()
+                .unwrap()
+                .as_deref(),
+            Some(concat!(
+                "localhost/hermit-hermetic-validate@sha256:",
+                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            ))
+        );
+        assert_eq!(
+            row.retained_verify_logs_artifact().unwrap().unwrap(),
+            RetainedVerifyLogsArtifact {
+                path: "ignored/validate/artifacts/run-10/verify-logs/index.jsonl".into(),
+                sha256: "d".repeat(64),
+                row_count: 1,
+                compressed_bytes: 23,
+            }
+        );
+
+        for schema in [6, 7, 8, 9] {
+            let mut historical = serde_json::to_value(&row).unwrap();
+            historical["schema_version"] = serde_json::json!(schema);
+            let historical: HistoryRow = serde_json::from_value(historical).unwrap();
+            assert!(
+                historical
+                    .retained_verify_logs_artifact()
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn schema10_refuses_malformed_retained_verify_log_bindings() {
+        for (field, value, expected) in [
+            (
+                "path",
+                serde_json::json!("ignored/validate/artifacts/../index.jsonl"),
+                "index binding is malformed",
+            ),
+            (
+                "sha256",
+                serde_json::json!("NOT-A-DIGEST"),
+                "index binding is malformed",
+            ),
+            (
+                "row_count",
+                serde_json::json!(0),
+                "index binding is malformed",
+            ),
+            (
+                "compressed_bytes",
+                serde_json::json!(0),
+                "index binding is malformed",
+            ),
+        ] {
+            let mut row = serde_json::to_value(schema10_row()).unwrap();
+            row["cell_results"]["retained_verify_logs"][field] = value;
+            let row: HistoryRow = serde_json::from_value(row).unwrap();
+            let error = row.retained_verify_logs_artifact().unwrap_err();
+            assert!(error.contains(expected), "{field}: {error}");
+            assert!(row.cell_results_evidence().is_none());
+        }
+
+        let mut unknown = schema10_cell_results();
+        unknown["retained_verify_logs"]["future"] = serde_json::json!(true);
+        let row: HistoryRow = serde_json::from_value(serde_json::json!({
+            "schema_version": 10,
+            "repo": "hermit",
+            "run_id": "run-10",
+            "profile": "full",
+            "commit": "a".repeat(40),
+            "commit_anchored": true,
+            "tree_dirty": false,
+            "tree": "f".repeat(40),
+            "executed_tests": 4,
+            "passed_tests": 3,
+            "filtered_tests": 7,
+            "cell_results": unknown,
+            "test_results": schema9_row()["test_results"].clone()
+        }))
+        .unwrap();
+        assert!(
+            row.retained_verify_logs_artifact()
+                .unwrap_err()
+                .contains("unknown field")
+        );
+    }
+
+    #[test]
+    fn schema10_recomputes_population_and_requires_exact_source_and_image_identity() {
+        let assert_refused = |mutated: Value, expected: &str| {
+            let row: HistoryRow = serde_json::from_value(mutated).unwrap();
+            let error = row.retained_verify_logs_artifact().unwrap_err();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error}"
+            );
+            assert!(row.cell_results_evidence().is_none());
+        };
+
+        let mut digest = serde_json::to_value(schema10_row()).unwrap();
+        digest["cell_results"]["hermetic_image_digest"] = serde_json::json!(
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        );
+        assert_refused(digest, "hermetic_image_digest is malformed");
+
+        let mut count = serde_json::to_value(schema10_row()).unwrap();
+        count["cell_results"]["selected_count"] = serde_json::json!(2);
+        assert_refused(count, "counts or selected ordering mismatch");
+
+        let mut population = serde_json::to_value(schema10_row()).unwrap();
+        population["cell_results"]["population_sha256"] = serde_json::json!("b".repeat(64));
+        assert_refused(population, "population_sha256 mismatch");
+
+        let mut cells = serde_json::to_value(schema10_row()).unwrap();
+        cells["cell_results"]["cells"][0]["test"] = serde_json::json!("different");
+        assert_refused(cells, "cells differ from selected population");
+
+        let mut unanchored = serde_json::to_value(schema10_row()).unwrap();
+        unanchored["commit_anchored"] = serde_json::json!(false);
+        assert_refused(unanchored, "not the exact clean row tree");
+
+        let mut no_tree = serde_json::to_value(schema10_row()).unwrap();
+        no_tree.as_object_mut().unwrap().remove("tree");
+        assert_refused(no_tree, "not the exact clean row tree");
+
+        let mut wrong_repo = serde_json::to_value(schema10_row()).unwrap();
+        wrong_repo["repo"] = serde_json::json!("reverie");
+        assert_refused(wrong_repo, "not attached to a hermit row");
+
+        let mut missing_test_results = serde_json::to_value(schema10_row()).unwrap();
+        missing_test_results
+            .as_object_mut()
+            .unwrap()
+            .remove("test_results");
+        assert_refused(missing_test_results, "omitted test_results");
+
+        let mut mismatched_test_results = serde_json::to_value(schema10_row()).unwrap();
+        mismatched_test_results["test_results"]["run_id"] = serde_json::json!("other-run");
+        assert_refused(mismatched_test_results, "test_results run_id differs");
+    }
+
     #[test]
     fn schema8_compared_verdict_requires_every_current_comparison_key() {
         let comparison = serde_json::json!({
@@ -1745,7 +2235,7 @@ mod tests {
         assert!(serde_json::to_value(older).unwrap()["test_results"].is_object());
 
         let mut future = schema9_row();
-        future["schema_version"] = serde_json::json!(10);
+        future["schema_version"] = serde_json::json!(11);
         future["test_results"]["future_field"] = serde_json::json!(true);
         let expected_test_results = future["test_results"].clone();
         let future: HistoryRow = serde_json::from_value(future).unwrap();
