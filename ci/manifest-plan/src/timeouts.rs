@@ -25,6 +25,9 @@ pub const KVM_RATCHET_CALIBRATION_SHA: &str = "92bacf12deba6a717f77cfcbd6afefc5f
 pub const KVM_RATCHET_CALIBRATION_COMPLETED_UTC: &str = "2026-09-04T04:39:00Z";
 pub const KVM_RATCHET_CI_CELL_COUNT: usize = 183;
 pub const KVM_RATCHET_DEFAULT_COVERED_CI_CELL_COUNT: usize = 182;
+pub const KVM_TIMED_PROGRESS_BAR_REQUALIFICATION_SHA: &str =
+    "f190205a7b3e65e7ebf347ba0875b668fd72d9a7";
+pub const KVM_TIMED_PROGRESS_BAR_REQUALIFICATION_COMPLETED_UTC: &str = "2026-09-05T03:43:05Z";
 /// Cells removed from full selection after RUN1709 did not pass on the first attempt.
 pub const KVM_RUN_1709_CI_REMOVAL_COUNT: usize = 10;
 /// Cells selected after each passed three first-attempt canonical KVM L2 runs
@@ -127,10 +130,10 @@ pub const KVM_RATCHET_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [TimeoutCa
     mode: "verify",
     backend: "kvm",
     samples: 3,
-    p90_cpu_usec: 15_647_292,
-    p90_wall_millis: 19_937,
-    required_cpu_seconds: 24,
-    required_wall_seconds: 80,
+    p90_cpu_usec: 12_809_181,
+    p90_wall_millis: 13_753,
+    required_cpu_seconds: 20,
+    required_wall_seconds: 56,
     configured_cpu_seconds: 24,
     configured_wall_seconds: 80,
 }];
@@ -309,6 +312,14 @@ mod tests {
         assert_eq!(
             KVM_RATCHET_CALIBRATION_COMPLETED_UTC,
             "2026-09-04T04:39:00Z"
+        );
+        assert_eq!(
+            KVM_TIMED_PROGRESS_BAR_REQUALIFICATION_SHA,
+            "f190205a7b3e65e7ebf347ba0875b668fd72d9a7"
+        );
+        assert_eq!(
+            KVM_TIMED_PROGRESS_BAR_REQUALIFICATION_COMPLETED_UTC,
+            "2026-09-05T03:43:05Z"
         );
         assert_eq!(
             KVM_RATCHET_CI_CELL_COUNT,
