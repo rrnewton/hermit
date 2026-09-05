@@ -1110,7 +1110,7 @@ fn strict_flag_missing_from(argv: &[String]) -> bool {
 /// Exercise the real bootstrap boundary around the first DAG node.
 ///
 /// With agent-utils populated, the Rust driver can start and a missing rr
-/// checkout must become a schema-3 FAILED result from `pre.submodules`, even
+/// checkout must become a schema-4 FAILED result from `pre.submodules`, even
 /// though cgroup setup replaces the process first. With agent-utils absent,
 /// rust-script cannot build the driver; that remains a pre-driver bootstrap
 /// failure and must not manufacture a typed result.
@@ -1196,7 +1196,9 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         "ci/dag/portable.json",
         "ci/dag/privileged.json",
         "ci/manifest-plan/src/runner.rs",
+        "ci/manifest-plan/src/service_result.rs",
         "ci/manifest-plan/src/timeouts.rs",
+        "ci/manifest-plan/validation-service-result-schema.json",
         "ci/nextest-timeout-config.rs",
         "ci/run-nextest-counted.sh",
         "ci/verify-submodules.sh",
@@ -1222,7 +1224,9 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "ci/dag/portable.json",
                 "ci/dag/privileged.json",
                 "ci/manifest-plan/src/runner.rs",
+                "ci/manifest-plan/src/service_result.rs",
                 "ci/manifest-plan/src/timeouts.rs",
+                "ci/manifest-plan/validation-service-result-schema.json",
                 "ci/nextest-timeout-config.rs",
                 "ci/run-nextest-counted.sh",
                 "ci/verify-submodules.sh",
@@ -1772,6 +1776,8 @@ fn self_test() -> Result<(), String> {
         }
     }
     let mut writeback_failed = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
+    writeback_failed.executed_tests = Some(1);
+    writeback_failed.passed_tests = Some(1);
     record_scorecard_writeback(&mut writeback_failed, Some(Err("fixture refusal".into())));
     let lines = run_summary_lines(&writeback_failed, std::time::Instant::now());
     if (writeback_failed.verdict, writeback_failed.exit_code)
@@ -1833,6 +1839,7 @@ fn self_test() -> Result<(), String> {
     let mut service_summary = RunSummary::new(Verdict::Pass, 0, "full", Vec::new());
     service_summary.nodes_executed = 76;
     service_summary.executed_tests = Some(2129);
+    service_summary.passed_tests = Some(2129);
     write_validation_service_result(&service_result_path, &service_summary)?;
     let service_result = ValidationServiceResult::from_json_slice(
         &std::fs::read(&service_result_path)
@@ -1842,12 +1849,23 @@ fn self_test() -> Result<(), String> {
         || service_result.exit_code != 0
         || service_result.executed_nodes != 76
         || service_result.executed_tests != Some(2129)
+        || service_result.passed_tests != Some(2129)
         || service_result.scorecard_writeback.is_some()
     {
         return Err(format!(
             "summary: framework service result lost typed status or counts: {service_result:?}"
         ));
     }
+    service_summary.passed_tests = Some(2128);
+    let mismatch_path = service_result_dir.path().join("mismatch.json");
+    let mismatch_error = write_validation_service_result(&mismatch_path, &service_summary)
+        .expect_err("a successful service result must reject a mismatched passed count");
+    if !mismatch_error.contains("requires passed_tests == executed_tests") {
+        return Err(format!(
+            "summary: service result did not refuse a mismatched passed count: {mismatch_error}"
+        ));
+    }
+    service_summary.passed_tests = Some(2129);
     let overwrite_error = write_validation_service_result(&service_result_path, &service_summary)
         .expect_err("a second writer must not replace the first service result");
     if !overwrite_error.contains("without replacing an existing result") {
@@ -17275,6 +17293,9 @@ struct RunSummary {
     nodes_host_inapplicable: usize,
     /// Aggregate from typed step outcomes. `None` is unknown, never zero.
     executed_tests: Option<i64>,
+    /// Exact terminal passes from those same typed framework outcomes. This is
+    /// never reconstructed from the validation verdict or executed-test count.
+    passed_tests: Option<i64>,
     /// Individual test ids that failed and then passed, with the retry grants
     /// that followed their failed attempts. Rendered even on a green run.
     flaky: Vec<TestIdRetry>,
@@ -17324,6 +17345,7 @@ impl RunSummary {
             nodes_skipped: 0,
             nodes_host_inapplicable: 0,
             executed_tests: None,
+            passed_tests: None,
             flaky: Vec::new(),
             failed_ids: Vec::new(),
             failed_nodes_without_test_ids: Vec::new(),
@@ -17916,6 +17938,7 @@ fn write_validation_service_result(path: &Path, summary: &RunSummary) -> Result<
         executed_nodes: u64::try_from(summary.nodes_executed)
             .map_err(|_| "validation-service-result-executed_nodes exceeds u64".to_string())?,
         executed_tests: summary.executed_tests,
+        passed_tests: summary.passed_tests,
         scorecard_writeback: summary.scorecard_writeback.clone(),
     }
     .validated()?;
@@ -19691,6 +19714,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         s.nodes_skipped = skipped.len();
         s.nodes_host_inapplicable = plan.host_inapplicable.len();
         s.executed_tests = executed_tests;
+        s.passed_tests = passed_tests;
         s.selection_mode = Some(plan.selection_mode.into());
         s.wall_s = Some(wall);
         s.jobs = Some(jobs);
@@ -20230,6 +20254,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     s.nodes_skipped = skipped.len();
     s.nodes_host_inapplicable = plan.host_inapplicable.len();
     s.executed_tests = executed_tests;
+    s.passed_tests = passed_tests;
     s.selection_mode = Some(plan.selection_mode.into());
     s.wall_s = Some(wall);
     s.jobs = Some(jobs);
