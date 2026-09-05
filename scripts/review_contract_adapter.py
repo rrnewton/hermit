@@ -43,10 +43,11 @@ EXIT_AUTHORITY_UNAVAILABLE = 3
 class AuthorityUnavailable(RuntimeError):
     """The contract could not be OBTAINED. Says nothing about any pull request.
 
-    ⚠️ NOT A VERDICT. Measured 2026-09-04 on devbig014: with `gh` unreachable
-    this raised an ordinary RuntimeError, `make lint-checks` exited 1, and the
-    validation DAG recorded check.lint_checks as FAILED -- an outage reported as
-    a code defect.
+    ⚠️ NOT A VERDICT. Measured 2026-09-04 on the host recorded for this
+    measurement in ``docs/TESTING_ENVIRONMENTS.md`` under "Named measurement
+    hosts": with `gh` unreachable this raised an ordinary RuntimeError, `make
+    lint-checks` exited 1, and the validation DAG recorded check.lint_checks as
+    FAILED -- an outage reported as a code defect.
     """
 
 

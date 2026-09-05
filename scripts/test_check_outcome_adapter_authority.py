@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Both directions of the transport-versus-verdict distinction in the adapter.
 
-The defect this covers, measured 2026-09-04 on devbig014: a GitHub ``HTTP 504``
-while fetching the pinned check-status authority made ``make lint-checks`` exit
-2, which the validation DAG recorded as ``check.lint_checks`` FAILED. An outage
-was reported as a code defect on every lane consulting that authority.
+The defect this covers was measured 2026-09-04 on the host recorded for this
+measurement in ``docs/TESTING_ENVIRONMENTS.md`` under "Named measurement
+hosts": a GitHub ``HTTP 504`` while fetching the pinned check-status authority
+made ``make lint-checks`` exit 2, which the validation DAG recorded as
+``check.lint_checks`` FAILED. An outage was reported as a code defect on every
+lane consulting that authority.
 
 ⚠️ BOTH DIRECTIONS ARE REQUIRED AND THE SECOND IS THE ONE THAT GETS SKIPPED. A
 checker that stops saying no is worse than one that says no wrongly, because the
