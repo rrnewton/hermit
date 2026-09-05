@@ -124,6 +124,61 @@ fn dbt_branch_clock_mismatch(first: u64, second: u64) -> Option<String> {
     })
 }
 
+/// Compare the authenticated number of DBT process images separately from the
+/// log records whose arrival order is deterministic.
+#[cfg(feature = "dbt")]
+fn dbt_initialization_record_mismatch(first: usize, second: usize) -> Option<String> {
+    (first != second).then(|| {
+        format!(
+            "DBT verification failed: authenticated process-image initialization counts differed between runs ({first} != {second})"
+        )
+    })
+}
+
+#[cfg(feature = "dbt")]
+#[derive(Debug)]
+struct DbtSummaryComparison {
+    failure: Option<String>,
+}
+
+#[cfg(feature = "dbt")]
+impl DbtSummaryComparison {
+    fn compare(
+        first_stats: &DbtBackendStatsSnapshot,
+        second_stats: &DbtBackendStatsSnapshot,
+        first_initialization_records: usize,
+        second_initialization_records: usize,
+    ) -> Self {
+        let mut failures = Vec::new();
+        if !same_dbt_observable_behavior(first_stats, second_stats) {
+            failures.push(format!(
+                "DBT verification failed: typed native Detcore statistics differed \
+                 ({first_stats:?} != {second_stats:?})"
+            ));
+        }
+        if let Some(failure) = dbt_initialization_record_mismatch(
+            first_initialization_records,
+            second_initialization_records,
+        ) {
+            failures.push(failure);
+        }
+        Self {
+            failure: (!failures.is_empty()).then(|| failures.join("; ")),
+        }
+    }
+
+    fn requires_log_retention(&self) -> bool {
+        self.failure.is_some()
+    }
+
+    fn apply(self, outcome: &mut VerificationOutcome) -> Option<String> {
+        if self.failure.is_some() {
+            outcome.verdict = Verdict::Diverged;
+        }
+        self.failure
+    }
+}
+
 /// Add a backend-observed divergence to the typed verification verdict.
 ///
 /// The canonical comparator may have matched its stdout, stderr, status, and
@@ -595,20 +650,30 @@ fn dbt_evidence_log_level(
 }
 
 #[cfg(feature = "dbt")]
-fn decode_dbt_evidence(file: &mut std::fs::File) -> Result<Vec<Vec<u8>>, Error> {
+#[derive(Debug)]
+struct DecodedDbtEvidence {
+    records: Vec<Vec<u8>>,
+    initialization_records: usize,
+}
+
+#[cfg(feature = "dbt")]
+fn decode_dbt_evidence(file: &mut std::fs::File) -> Result<DecodedDbtEvidence, Error> {
     file.seek(SeekFrom::Start(0))?;
     let mut encoded = Vec::new();
     file.read_to_end(&mut encoded)?;
     if encoded.is_empty() {
         return Err(Error::msg("DBT canonical evidence was empty"));
     }
-    reverie_dbt::decode_evidence(&encoded)
-        .map(reverie_dbt::DbtEvidence::into_records)
-        .map_err(|error| {
-            Error::msg(format!(
-                "DBT canonical evidence was malformed or truncated: {error}"
-            ))
-        })
+    let evidence = reverie_dbt::decode_evidence(&encoded).map_err(|error| {
+        Error::msg(format!(
+            "DBT canonical evidence was malformed or truncated: {error}"
+        ))
+    })?;
+    let initialization_records = evidence.initialization_records();
+    Ok(DecodedDbtEvidence {
+        records: evidence.into_records(),
+        initialization_records,
+    })
 }
 
 #[cfg(feature = "dbt")]
@@ -637,13 +702,13 @@ fn materialize_dbt_comparison_log(
     }
     log.flush()?;
 
-    // The verdict this comparison publishes names `all_records_v1`, so every
-    // decoded record must reach the log. Filtering here instead of at the
-    // envelope would report a policy that was not applied, which is the exact
-    // failure the envelope exists to prevent -- and it would be invisible,
-    // because the envelope name lives in a different file. Each record was
-    // checked above to hold no embedded line boundary, so one record is one
-    // line and this count is exact.
+    // The verdict publishes `dbt_evidence_transport_v1`: Reverie's authenticated
+    // decoder has already represented exact initialization records by their
+    // count, and the comparison envelope excludes any other transport-target
+    // record. Every comparable decoded record must still reach this log;
+    // filtering here would be an undisclosed second selection. Each record was
+    // checked above to hold no embedded line boundary, so one record is one line
+    // and this count is exact.
     let materialized = std::fs::read(path)
         .map_err(|error| Error::msg(format!("DBT canonical evidence log unreadable: {error}")))?
         .iter()
@@ -652,7 +717,7 @@ fn materialize_dbt_comparison_log(
     if materialized != records.len() {
         return Err(Error::msg(format!(
             "DBT canonical evidence log holds {materialized} records but {} were decoded; the \
-             comparison publishes the all_records_v1 envelope and must not drop any",
+             comparison publishes the dbt_evidence_transport_v1 envelope and must not drop any",
             records.len()
         )));
     }
@@ -922,8 +987,8 @@ pub(super) fn run_dbt(
             return Err(error);
         }
     };
-    let first_records = match decode_dbt_evidence(&mut evidence1) {
-        Ok(records) => records,
+    let first_evidence = match decode_dbt_evidence(&mut evidence1) {
+        Ok(evidence) => evidence,
         Err(error) => {
             if keep_logs {
                 retain_verification_logs([("run 1", log1_path)])?;
@@ -931,7 +996,9 @@ pub(super) fn run_dbt(
             return Err(error);
         }
     };
-    if let Err(error) = materialize_dbt_comparison_log(&first_records, log1_file, &log1_path) {
+    if let Err(error) =
+        materialize_dbt_comparison_log(&first_evidence.records, log1_file, &log1_path)
+    {
         if keep_logs {
             retain_verification_logs([("run 1", log1_path)])?;
         }
@@ -997,8 +1064,8 @@ pub(super) fn run_dbt(
             return Err(error);
         }
     };
-    let second_records = match decode_dbt_evidence(&mut evidence2) {
-        Ok(records) => records,
+    let second_evidence = match decode_dbt_evidence(&mut evidence2) {
+        Ok(evidence) => evidence,
         Err(error) => {
             if keep_logs {
                 retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
@@ -1006,7 +1073,9 @@ pub(super) fn run_dbt(
             return Err(error);
         }
     };
-    if let Err(error) = materialize_dbt_comparison_log(&second_records, log2_file, &log2_path) {
+    if let Err(error) =
+        materialize_dbt_comparison_log(&second_evidence.records, log2_file, &log2_path)
+    {
         if keep_logs {
             retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
         }
@@ -1028,12 +1097,12 @@ pub(super) fn run_dbt(
         right: second_stats.counted_branches(),
     };
     let branch_clock_diverged = !branch_clock_comparison.matched();
-    let summary_failure = (!same_dbt_observable_behavior(&first_stats, &second_stats)).then(|| {
-        format!(
-            "DBT verification failed: typed native Detcore statistics differed \
-             ({first_stats:?} != {second_stats:?})"
-        )
-    });
+    let summary_comparison = DbtSummaryComparison::compare(
+        &first_stats,
+        &second_stats,
+        first_evidence.initialization_records,
+        second_evidence.initialization_records,
+    );
     let mut outcome = compare_two_runs(
         ComparedRun {
             output: &first,
@@ -1057,31 +1126,18 @@ pub(super) fn run_dbt(
             virtualize_time: config.virtualize_time,
             // A backend-observed divergence needs the same retained evidence
             // as a divergence found by the ordinary comparator.
-            keep_logs: keep_logs || branch_clock_diverged || summary_failure.is_some(),
-            // Every decoded evidence record is compared, which is what this
-            // adapter already did before the envelope was disclosed. Naming it
-            // changes no record selection; it states the selection in the
-            // verdict rather than leaving it implicit.
-            //
-            // The transport does put records about itself in this stream:
-            // `evidence_emit_image_initialization` (reverie-dbt
-            // native/client.c:863) emits
-            // `INFO reverie_dbt::evidence: protected evidence initialized`
-            // once per sender -- the sender is keyed on (pid, start_time) and
-            // latched by `initialization_record_sent`, so it is once per
-            // process, not per image -- and its `evidence_log_level < 3` guard
-            // is open at the verification default of INFO. The record is a
-            // compile-time constant string, so two runs of a single-process
-            // guest compare equal. Excluding them is
-            // therefore a separable change, not a prerequisite: it would alter
-            // which records this adapter compares, and it needs its own
-            // evidence about multi-process arrival order, which is host order.
-            record_envelope: RecordEnvelope::all_records_v1(),
+            keep_logs: keep_logs
+                || branch_clock_diverged
+                || summary_comparison.requires_log_retention(),
+            // Reverie's authenticated decoder represents each process-image
+            // initialization record by a count instead of preserving its
+            // host-arrival position in the comparable stream. The counts are
+            // checked above; this named envelope states that transport records
+            // are excluded while every remaining record is compared.
+            record_envelope: RecordEnvelope::dbt_evidence_transport_v1(),
         },
     )?;
-    if summary_failure.is_some() {
-        outcome.verdict = Verdict::Diverged;
-    }
+    let summary_failure = summary_comparison.apply(&mut outcome);
     let (outcome, branch_clock_failure) =
         finalize_dbt_verification(outcome, branch_clock_comparison, verify_json)?;
     // Publish the typed record before announcing any terminal verdict. If the
@@ -1405,37 +1461,56 @@ pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, E
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "dbt")]
-    /// A behavioural pin, not a text match: drive the real materialization with
-    /// a transport self-record present and require every decoded record to
-    /// reach the log. Filtering anywhere in this function -- at the write loop,
-    /// at the decoder, or through a filtered canonical writer -- makes the
-    /// materialized count disagree with the decoded count and fails here, while
-    /// the verdict still names `all_records_v1`.
+    /// A behavioural pin, not a text match: require every record returned by
+    /// Reverie's authenticated decoder to reach the comparison log. The decoder
+    /// represents transport initialization records separately by count, so this
+    /// input is exactly the comparable-record side of that boundary.
     #[test]
-    fn materialization_keeps_every_decoded_record_including_transport_self_records() {
+    fn materialization_keeps_every_decoded_comparable_record() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("evidence.log");
         let file = std::fs::File::create(&path).expect("create log");
         let records: Vec<Vec<u8>> = vec![
-            b"1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized\n".to_vec(),
             b"1970-01-01T00:00:00.000000Z  INFO detcore: DETLOG first\n".to_vec(),
             b"1970-01-01T00:00:00.000000Z  INFO detcore: DETLOG second\n".to_vec(),
         ];
 
         super::materialize_dbt_comparison_log(&records, file, &path)
-            .expect("materialization must accept a stream containing transport self-records");
+            .expect("materialization must accept comparable records");
 
-        let written = std::fs::read_to_string(&path).expect("read back");
-        assert_eq!(
-            written.lines().count(),
-            records.len(),
-            "every decoded record must reach the compared log"
+        assert_eq!(std::fs::read(&path).expect("read back"), records.concat());
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_initialization_record_counts_control_the_terminal_outcome() {
+        let stats = dbt_stats(10, 20, 5, 2, 99);
+        let equal = DbtSummaryComparison::compare(&stats, &stats, 2, 2);
+        assert!(!equal.requires_log_retention());
+        let mut matched = typed_outcome(Verdict::Matched, 0);
+        assert!(equal.apply(&mut matched).is_none());
+        assert_eq!(matched.verdict, Verdict::Matched);
+
+        let unequal = DbtSummaryComparison::compare(&stats, &stats, 2, 3);
+        assert!(
+            unequal.requires_log_retention(),
+            "an initialization mismatch must retain both evidence logs"
+        );
+        let mut outcome = typed_outcome(Verdict::Matched, 0);
+        let failure = unequal.apply(&mut outcome).unwrap();
+        assert_eq!(outcome.verdict, Verdict::Diverged);
+        assert!(!outcome.verified());
+        assert!(
+            !outcome
+                .into_exit_status()
+                .expect("divergence has a terminal status")
+                .success()
         );
         assert!(
-            written.contains("reverie_dbt::evidence: protected evidence initialized"),
-            "the transport self-record is part of what all_records_v1 compares; dropping it \
-             here would publish an envelope that was not applied:\n{written}"
+            failure.contains("initialization counts differed"),
+            "{failure}"
         );
+        assert!(failure.contains("2 != 3"), "{failure}");
     }
     use super::*;
 
@@ -1549,9 +1624,18 @@ mod tests {
         let comparison = canonical
             .find("let branch_clock_comparison = DbtCountedBranchComparison")
             .expect("typed branch-clock comparison");
-        let force_logs = canonical
-            .find("keep_logs: keep_logs || branch_clock_diverged")
+        let summary_comparison = canonical
+            .find("let summary_comparison = DbtSummaryComparison::compare(")
+            .expect("typed summary and initialization comparison");
+        let force_branch_logs = canonical
+            .find("|| branch_clock_diverged")
             .expect("branch divergence forces log retention");
+        let force_summary_logs = canonical
+            .find("|| summary_comparison.requires_log_retention()")
+            .expect("summary divergence forces log retention");
+        let apply_summary = canonical
+            .find("let summary_failure = summary_comparison.apply(&mut outcome)")
+            .expect("summary divergence updates the terminal outcome");
         let finalize = canonical
             .find("finalize_dbt_verification(outcome, branch_clock_comparison, verify_json)")
             .expect("terminal typed finalization");
@@ -1564,12 +1648,16 @@ mod tests {
         assert!(
             first_stats < second_stats
                 && second_stats < comparison
-                && comparison < force_logs
-                && force_logs < finalize
+                && comparison < summary_comparison
+                && summary_comparison < force_branch_logs
+                && force_branch_logs < force_summary_logs
+                && force_summary_logs < apply_summary
+                && apply_summary < finalize
                 && finalize < announce
                 && announce < exit,
-            "canonical verification must collect both stats, compute the comparison, force logs, \
-             publish through the finalizer, and only then announce or convert the terminal status"
+            "canonical verification must collect both stats and authenticated initialization \
+             counts, compute both comparisons, force logs, apply summary divergence, publish \
+             through the finalizer, and only then announce or convert the terminal status"
         );
 
         for (stats, next) in [
