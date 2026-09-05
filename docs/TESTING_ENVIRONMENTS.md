@@ -207,6 +207,7 @@ erasing the host; this table is where the erased identities go back.
 | `privileged` lane, cell `applications/kvm-python-examples` | `devbig014`, `devbig030` | Retained passing validations measured 14.87-56.51 seconds; the same SHA measured 16.29 and 39.85 seconds respectively, so 15-second and 30-second bounds both cut valid L2 work |
 | `scripts/check-reverie-pin.rs` git-env lock | `devbig014` | 30x no-guard run failed 0 times; mutation of `under_git_env` failed 9 of 10 at load average ~39 |
 | `scripts/bisect-probe.rs` cost split | `devbig014` | BUILD 36.33s (hermit binary 36.21 + guest 0.12/id) vs TEST 3.53s per cell, range 1.6-10.9; `run --prebuilt` 6 cells 21.76s serial vs 11.55s at `--jobs 6`; 237 portable test ids expand to 304 required cells |
+| pinned authority outage, validation DAG node `check.lint_checks` | `devbig014` | On 2026-09-04, an HTTP 504 fetching the check-status authority made `make lint-checks` exit 2 and the node report FAILED; an unreachable review-label contract raised `RuntimeError` and made `make lint-checks` exit 1. Two gates went red on four consecutive hourly runs of a tree that had passed 267/267 earlier that day. |
 | `portable` lane, node `test.hermit_unit` | `devbig030` | Warm repeats at `a6b0c37648df`: nextest `-j1` 27.0s and 27.3s; `-j16` 14.4s and 13.7s; `CARGO_BUILD_JOBS=8` unchanged |
 
 ## Hardware-sensitive Cargo tests
