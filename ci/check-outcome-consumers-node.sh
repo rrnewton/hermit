@@ -28,8 +28,22 @@ trap 'rm -f "$node_out"' EXIT
 
 set +e
 { "$root/scripts/test-check-status-outcome.sh" && "$root/scripts/check-merge-gate-policy.sh"; } 2>&1 | tee "$node_out"
-run_rc=${PIPESTATUS[0]}
+pipeline_status=("${PIPESTATUS[@]}")
 set -e
+run_rc=${pipeline_status[0]}
+tee_rc=${pipeline_status[1]}
+
+# The capture is part of the classification input, not incidental logging. If
+# tee cannot write it, an empty or partial file could turn a marker-bearing
+# no-result into pass. Preserve the checker failure when there is one; otherwise
+# make tee's failure the node failure. Either way, never classify incomplete
+# evidence.
+if [ "$tee_rc" -ne 0 ]; then
+    echo "check-outcome-consumers: output capture failed with exit ${tee_rc}" >&2
+    if [ "$run_rc" -eq 0 ]; then
+        run_rc=$tee_rc
+    fi
+fi
 
 verdict="$(classify_run "$run_rc" "$node_out")"
 case "$verdict" in
