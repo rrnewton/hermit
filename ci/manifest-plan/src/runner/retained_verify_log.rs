@@ -112,6 +112,16 @@ pub struct RetainedVerifyLog {
     pub compared_info_messages: u64,
 }
 
+/// Digests and sizes checked while copying one retained gzip from a single
+/// held source descriptor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedRetainedLogCopy {
+    pub compressed_sha256: String,
+    pub compressed_bytes: u64,
+    pub uncompressed_sha256: String,
+    pub uncompressed_bytes: u64,
+}
+
 /// A verified compressed log plus the two raw inputs that may be removed only
 /// after its descriptor has been durably published with the cell result.
 #[derive(Clone, Debug)]
@@ -1022,6 +1032,20 @@ struct OpenedPlainFileEvidence {
     digest: ContentDigest,
 }
 
+fn require_single_link(file: &File, path: &Path, description: &str) -> Result<(), String> {
+    let links = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {description} {}: {error}", path.display()))?
+        .nlink();
+    if links != 1 {
+        return Err(format!(
+            "{description} {} has {links} hard links; expected exactly one",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn open_and_inspect_plain_file_bounded(
     root: &Path,
     path: &Path,
@@ -1662,13 +1686,14 @@ impl Write for VerifyLogStagingWriter<'_> {
     }
 }
 
-fn verify_retained_verify_log_with_limit(
+fn open_verified_retained_verify_log_with_limits(
     artifact_dir: &Path,
     retained: &RetainedVerifyLog,
     expected_cell_id: &CellId,
     expected_attempt: u64,
+    maximum_compressed_bytes: u64,
     maximum_uncompressed_bytes: u64,
-) -> Result<(), String> {
+) -> Result<OpenedGzipEvidence, String> {
     if retained.role != RetainedVerifyLogRole::Run1 {
         return Err("retained verify log has an unsupported role".into());
     }
@@ -1684,14 +1709,39 @@ fn verify_retained_verify_log_with_limit(
         ));
     }
     let path = artifact_dir.join(&expected_relative);
-    let inspected = inspect_gzip_file(
+    let opened = open_and_inspect_gzip_file(
         artifact_dir,
         &path,
-        VERIFY_LOG_MAX_COMPRESSED_BYTES,
+        maximum_compressed_bytes,
         maximum_uncompressed_bytes,
         "retained compressed verify log",
     )?;
-    validate_retained_verify_log_inspection(retained, &inspected)
+    require_single_link(&opened.file, &path, "retained compressed verify log")?;
+    validate_retained_verify_log_inspection(retained, &opened.inspection)?;
+    require_path_identity(
+        &path,
+        opened.inspection.identity,
+        "retained compressed verify log",
+    )?;
+    Ok(opened)
+}
+
+fn verify_retained_verify_log_with_limit(
+    artifact_dir: &Path,
+    retained: &RetainedVerifyLog,
+    expected_cell_id: &CellId,
+    expected_attempt: u64,
+    maximum_uncompressed_bytes: u64,
+) -> Result<(), String> {
+    open_verified_retained_verify_log_with_limits(
+        artifact_dir,
+        retained,
+        expected_cell_id,
+        expected_attempt,
+        VERIFY_LOG_MAX_COMPRESSED_BYTES,
+        maximum_uncompressed_bytes,
+    )?;
+    Ok(())
 }
 
 fn validate_retained_verify_log_inspection(
@@ -1737,6 +1787,99 @@ pub fn verify_retained_verify_log(
         expected_attempt,
         VERIFY_LOG_MAX_UNCOMPRESSED_BYTES,
     )
+}
+
+/// Read the exact uncompressed bytes named by a retained-log descriptor.
+///
+/// Descriptor validation, gzip decoding, and path-identity checks all use one
+/// held `O_NOFOLLOW` file descriptor. This is the scoring/read path; callers
+/// retaining the gzip itself should use [`copy_verified_retained_verify_log`].
+pub fn read_verified_retained_verify_log(
+    artifact_dir: &Path,
+    retained: &RetainedVerifyLog,
+    expected_cell_id: &CellId,
+    expected_attempt: u64,
+) -> Result<Vec<u8>, String> {
+    let mut opened = open_verified_retained_verify_log_with_limits(
+        artifact_dir,
+        retained,
+        expected_cell_id,
+        expected_attempt,
+        VERIFY_LOG_MAX_COMPRESSED_BYTES,
+        VERIFY_LOG_MAX_UNCOMPRESSED_BYTES,
+    )?;
+    opened
+        .file
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("cannot seek retained compressed verify log: {error}"))?;
+    let mut bytes = Vec::new();
+    let digest = {
+        let mut decoder = MultiGzDecoder::new(&mut opened.file);
+        copy_and_hash_bounded(
+            &mut decoder,
+            &mut bytes,
+            VERIFY_LOG_MAX_UNCOMPRESSED_BYTES,
+            "retained uncompressed verify log",
+        )?
+    };
+    if digest != opened.inspection.uncompressed {
+        return Err("retained verify log changed while reading its uncompressed bytes".into());
+    }
+    let path = artifact_dir.join(&retained.relative_path);
+    require_single_link(&opened.file, &path, "retained compressed verify log")?;
+    require_path_identity(
+        &path,
+        opened.inspection.identity,
+        "retained compressed verify log",
+    )?;
+    Ok(bytes)
+}
+
+/// Copy the exact gzip bytes named by a retained-log descriptor from one held
+/// source descriptor into a caller-owned destination.
+pub fn copy_verified_retained_verify_log(
+    artifact_dir: &Path,
+    retained: &RetainedVerifyLog,
+    expected_cell_id: &CellId,
+    expected_attempt: u64,
+    destination: &mut impl Write,
+    maximum_compressed_bytes: u64,
+) -> Result<VerifiedRetainedLogCopy, String> {
+    let maximum_compressed_bytes = maximum_compressed_bytes.min(VERIFY_LOG_MAX_COMPRESSED_BYTES);
+    let mut opened = open_verified_retained_verify_log_with_limits(
+        artifact_dir,
+        retained,
+        expected_cell_id,
+        expected_attempt,
+        maximum_compressed_bytes,
+        VERIFY_LOG_MAX_UNCOMPRESSED_BYTES,
+    )?;
+    opened
+        .file
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("cannot seek retained compressed verify log: {error}"))?;
+    let copied = copy_and_hash_bounded(
+        &mut opened.file,
+        destination,
+        maximum_compressed_bytes,
+        "retained compressed verify log copy",
+    )?;
+    if copied != opened.inspection.compressed {
+        return Err("retained verify log changed while copying its compressed bytes".into());
+    }
+    let path = artifact_dir.join(&retained.relative_path);
+    require_single_link(&opened.file, &path, "retained compressed verify log")?;
+    require_path_identity(
+        &path,
+        opened.inspection.identity,
+        "retained compressed verify log",
+    )?;
+    Ok(VerifiedRetainedLogCopy {
+        compressed_sha256: copied.sha256,
+        compressed_bytes: copied.bytes,
+        uncompressed_sha256: opened.inspection.uncompressed.sha256,
+        uncompressed_bytes: opened.inspection.uncompressed.bytes,
+    })
 }
 
 /// Reconstruct cleanup authority from one durable result row after restart.
@@ -1989,8 +2132,7 @@ fn retain_verify_log_with_limit(
     retention_budget.require_artifact_dir(&pair.artifact_dir)?;
     let retained_relative = retained_verify_log_relative_path(pair.attempt)?;
     let retained_path = pair.artifact_dir.join(&retained_relative);
-    let attempt_index =
-        retained_verify_log_attempt_index(result, &pair.cell_id, pair.attempt, &pair.artifact_dir)?;
+    retained_verify_log_attempt_index(result, &pair.cell_id, pair.attempt, &pair.artifact_dir)?;
     verify_retention_paths_do_not_alias(&pair, retention_budget, results_path, &retained_path)?;
     retention_budget.require_results_path(results_path)?;
     let (current_run1_identity, current_run1) = inspect_plain_file_bounded(
@@ -2399,13 +2541,26 @@ fn retain_verify_log_with_limit(
             );
         }
     };
-    result.attempts[attempt_index].retained_verify_log = Some(retained.clone());
+    let previous_result = result.clone();
+    if let Err(error) =
+        result.prepare_retained_verify_log_publication(&comparison.report, retained.clone())
+    {
+        drop(result_publication);
+        *result = previous_result;
+        return abort_retained_verify_log(
+            &retained_path,
+            &retained_directory,
+            reservation,
+            error,
+            hooks.fail_final_removal,
+        );
+    }
     if let Err(error) =
         append_result_with_failure(results_path, result, hooks.result_publication_failure, true)
     {
         drop(result_publication);
         if !error.descriptor_visible {
-            result.attempts[attempt_index].retained_verify_log = None;
+            *result = previous_result;
             return abort_retained_verify_log(
                 &retained_path,
                 &retained_directory,
@@ -3069,6 +3224,24 @@ mod tests {
         let published_result: CellResult =
             serde_json::from_str(fs::read_to_string(&results_path).unwrap().trim_end()).unwrap();
         assert_eq!(
+            published_result.schema,
+            RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA
+        );
+        assert_eq!(published_result.outcome, "PASS");
+        assert_eq!(published_result.result, Some(ObservedResult::Pass));
+        let report_json = published_result.attempts[0]
+            .verification_report
+            .as_deref()
+            .expect("the exact pair report is published with the attempt");
+        assert_eq!(
+            published_result.attempts[0]
+                .verification_report_sha256
+                .as_deref(),
+            Some(hex_digest(report_json.as_bytes()).as_str())
+        );
+        let report = VerificationReport::from_json_slice(report_json.as_bytes()).unwrap();
+        assert_eq!(report.verdict, Verdict::Matched);
+        assert_eq!(
             published_result.attempts[0].retained_verify_log,
             Some(publication.retained.clone())
         );
@@ -3470,6 +3643,129 @@ mod tests {
             assert!(!run2_spec.paths.log.exists());
         }
         assert_eq!(compressed[0], compressed[1]);
+    }
+
+    #[test]
+    fn retained_verify_log_single_open_read_and_copy_return_the_descriptor_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_dir = directory.path().join("cell");
+        let body = structured_info_record("DETLOG retained reader");
+        let (run1_spec, run2_spec) = verify_pair_fixture(&artifact_dir, &body, &body, true);
+        let pair = compare_verify_runs(
+            &run1_spec,
+            load_verify_run(&run1_spec).unwrap(),
+            &run2_spec,
+            load_verify_run(&run2_spec).unwrap(),
+        )
+        .unwrap();
+        let budget = verify_log_retention_budget(directory.path(), u64::MAX);
+        let mut result = verify_cell_result(&run1_spec);
+        let publication =
+            publish_retained_verify_log(pair, &budget, &budget.results_path, &mut result).unwrap();
+        let retained = &publication.retained;
+
+        assert_eq!(
+            read_verified_retained_verify_log(&artifact_dir, retained, &run1_spec.execution.id, 1,)
+                .unwrap(),
+            body.as_bytes()
+        );
+        let expected_compressed = fs::read(artifact_dir.join(&retained.relative_path)).unwrap();
+        let mut copied = Vec::new();
+        let verified = copy_verified_retained_verify_log(
+            &artifact_dir,
+            retained,
+            &run1_spec.execution.id,
+            1,
+            &mut copied,
+            retained.compressed_bytes,
+        )
+        .unwrap();
+        assert_eq!(copied, expected_compressed);
+        assert_eq!(verified.compressed_sha256, retained.compressed_sha256);
+        assert_eq!(verified.compressed_bytes, retained.compressed_bytes);
+        assert_eq!(verified.uncompressed_sha256, retained.uncompressed_sha256);
+        assert_eq!(verified.uncompressed_bytes, retained.uncompressed_bytes);
+    }
+
+    #[test]
+    fn retained_verify_log_single_open_copy_refuses_cap_hardlink_and_path_swap() {
+        struct SwapWriter {
+            bytes: Vec<u8>,
+            source: PathBuf,
+            moved: PathBuf,
+            swapped: bool,
+        }
+
+        impl Write for SwapWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if !self.swapped {
+                    fs::rename(&self.source, &self.moved)?;
+                    fs::write(&self.source, b"replacement")?;
+                    self.swapped = true;
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_dir = directory.path().join("cell");
+        let body = structured_info_record("DETLOG retained copy refusal");
+        let (run1_spec, run2_spec) = verify_pair_fixture(&artifact_dir, &body, &body, true);
+        let pair = compare_verify_runs(
+            &run1_spec,
+            load_verify_run(&run1_spec).unwrap(),
+            &run2_spec,
+            load_verify_run(&run2_spec).unwrap(),
+        )
+        .unwrap();
+        let budget = verify_log_retention_budget(directory.path(), u64::MAX);
+        let mut result = verify_cell_result(&run1_spec);
+        let publication =
+            publish_retained_verify_log(pair, &budget, &budget.results_path, &mut result).unwrap();
+        let retained = &publication.retained;
+        let source = artifact_dir.join(&retained.relative_path);
+
+        let error = copy_verified_retained_verify_log(
+            &artifact_dir,
+            retained,
+            &run1_spec.execution.id,
+            1,
+            &mut Vec::new(),
+            retained.compressed_bytes - 1,
+        )
+        .unwrap_err();
+        assert!(error.contains("exceeds the"), "{error}");
+
+        let link = artifact_dir.join("retained-copy-hardlink.log.gz");
+        fs::hard_link(&source, &link).unwrap();
+        let error =
+            read_verified_retained_verify_log(&artifact_dir, retained, &run1_spec.execution.id, 1)
+                .unwrap_err();
+        assert!(error.contains("hard links"), "{error}");
+        fs::remove_file(link).unwrap();
+
+        let moved = artifact_dir.join("retained-copy-original.log.gz");
+        let mut writer = SwapWriter {
+            bytes: Vec::new(),
+            source: source.clone(),
+            moved,
+            swapped: false,
+        };
+        let error = copy_verified_retained_verify_log(
+            &artifact_dir,
+            retained,
+            &run1_spec.execution.id,
+            1,
+            &mut writer,
+            retained.compressed_bytes,
+        )
+        .unwrap_err();
+        assert!(error.contains("changed identity"), "{error}");
     }
 
     #[test]
@@ -4734,6 +5030,29 @@ mod tests {
         .unwrap();
         assert_eq!(publication.retained.compared_info_messages, 0);
         assert_eq!(publication.retained.uncompressed_bytes, 0);
+        assert_eq!(result.schema, RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA);
+        assert_eq!(result.outcome, "ERROR");
+        assert_eq!(result.result, None);
+        assert_eq!(result.failure_class, Some(FailureClass::NoResult));
+        assert_eq!(
+            result.error_kind.as_deref(),
+            Some("incomplete-verification-evidence")
+        );
+        assert_eq!(result.attempts[0].outcome, "ERROR");
+        let report_json = result.attempts[0]
+            .verification_report
+            .as_deref()
+            .expect("the no-result report is retained");
+        assert_eq!(
+            result.attempts[0].verification_report_sha256.as_deref(),
+            Some(hex_digest(report_json.as_bytes()).as_str())
+        );
+        assert_eq!(
+            VerificationReport::from_json_slice(report_json.as_bytes())
+                .unwrap()
+                .verdict,
+            Verdict::NoResult
+        );
         verify_retained_verify_log_with_limit(
             &artifact_dir,
             &publication.retained,
@@ -4767,6 +5086,109 @@ mod tests {
         assert!(!run2_spec.paths.log.exists());
         cleanup_verify_log_sources(&artifact_dir, &publication)
             .expect("repeating completed raw-log cleanup must be harmless");
+    }
+
+    #[test]
+    fn divergent_pair_publishes_the_exact_report_and_first_divergence() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_dir = directory.path().join("diverged");
+        let left = structured_info_record("DETLOG left");
+        let right = structured_info_record("DETLOG right");
+        let (run1_spec, run2_spec) = verify_pair_fixture(&artifact_dir, &left, &right, true);
+        let compared = compare_verify_runs(
+            &run1_spec,
+            load_verify_run(&run1_spec).unwrap(),
+            &run2_spec,
+            load_verify_run(&run2_spec).unwrap(),
+        )
+        .unwrap();
+        let expected_report = compared.comparison.report.clone();
+        assert_eq!(expected_report.verdict, Verdict::Diverged);
+        assert_eq!(expected_report.first_divergent_record, Some(1));
+        let budget = verify_log_retention_budget(directory.path(), u64::MAX);
+        let mut result = verify_cell_result(&run1_spec);
+        publish_retained_verify_log(compared, &budget, &budget.results_path, &mut result).unwrap();
+
+        assert_eq!(result.outcome, "FAIL");
+        assert_eq!(result.result, Some(ObservedResult::DeterminismFailure));
+        assert_eq!(result.failure_class, Some(FailureClass::ProductFailure));
+        assert_eq!(result.first_divergent_record, Some(1));
+        assert_eq!(result.attempts[0].first_divergent_record, Some(1));
+        let report_json = result.attempts[0]
+            .verification_report
+            .as_deref()
+            .expect("diverged comparison report must be retained");
+        assert_eq!(
+            result.attempts[0].verification_report_sha256.as_deref(),
+            Some(hex_digest(report_json.as_bytes()).as_str())
+        );
+        assert_eq!(
+            VerificationReport::from_json_slice(report_json.as_bytes()).unwrap(),
+            expected_report
+        );
+    }
+
+    #[test]
+    fn matching_nonzero_and_signaled_pairs_remain_product_failures() {
+        use crate::canonical_verdict::GuestDisposition;
+
+        for (name, disposition, expected_status, expected_signal, expected_reason) in [
+            (
+                "nonzero",
+                GuestDisposition::Exited { code: 7 },
+                Some(7),
+                None,
+                "verify exited with status 7",
+            ),
+            (
+                "signal",
+                GuestDisposition::Signaled { signal: 11 },
+                None,
+                Some(11),
+                "verify was killed by signal 11",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let artifact_dir = directory.path().join(name);
+            let body = structured_info_record("DETLOG identical failure");
+            let (run1_spec, run2_spec) = verify_pair_fixture(&artifact_dir, &body, &body, true);
+            write_verify_run_fixture(&run1_spec, disposition, b"", b"", &body);
+            write_verify_run_fixture(&run2_spec, disposition, b"", b"", &body);
+            let compared = compare_verify_runs(
+                &run1_spec,
+                load_verify_run(&run1_spec).unwrap(),
+                &run2_spec,
+                load_verify_run(&run2_spec).unwrap(),
+            )
+            .unwrap();
+            let expected_report = compared.comparison.report.clone();
+            assert_eq!(expected_report.verdict, Verdict::Matched);
+            assert!(expected_report.bitwise_parity);
+
+            let budget = verify_log_retention_budget(directory.path(), u64::MAX);
+            let mut result = verify_cell_result(&run1_spec);
+            publish_retained_verify_log(compared, &budget, &budget.results_path, &mut result)
+                .unwrap();
+
+            assert_eq!(result.outcome, "FAIL");
+            assert_eq!(result.result, Some(ObservedResult::CrashError));
+            assert_eq!(result.failure_class, Some(FailureClass::ProductFailure));
+            assert_eq!(result.error_kind, None);
+            assert_eq!(result.reason.as_deref(), Some(expected_reason));
+            assert_eq!(result.attempts[0].outcome, "FAIL");
+            assert_eq!(result.attempts[0].status, expected_status);
+            assert_eq!(result.attempts[0].signal, expected_signal);
+            assert_eq!(result.attempts[0].reason.as_deref(), Some(expected_reason));
+            let report_json = result.attempts[0]
+                .verification_report
+                .as_deref()
+                .expect("the matching failure report must be retained");
+            assert_eq!(
+                VerificationReport::from_json_slice(report_json.as_bytes()).unwrap(),
+                expected_report,
+                "classification must not rewrite the comparator report"
+            );
+        }
     }
 
     #[test]

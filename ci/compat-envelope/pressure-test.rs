@@ -5280,6 +5280,7 @@ fn fixture_attempt(outcome: &str, status: i32) -> AttemptResult {
         stderr: String::new(),
         verification_report: None,
         verification_report_sha256: None,
+        retained_verify_log: None,
         runtime: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,

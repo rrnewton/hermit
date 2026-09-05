@@ -1539,6 +1539,27 @@ impl LogDiffSummary {
     }
 }
 
+/// Fixed-policy result for canonical `BitwiseInfoV1` log bytes.
+///
+/// The equal-prefix count lives on this type rather than [`LogDiffSummary`],
+/// because a generic INFO comparison may enable unsafe stripping or accept
+/// historical records. Constructing this result requires the fixed canonical
+/// policy and current structured records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitwiseInfoV1LogComparison {
+    /// Canonical selected-log verdict, counts, and first-divergence context.
+    pub summary: LogDiffSummary,
+    /// Total complete records parsed from the left input before INFO selection.
+    pub records_left: usize,
+    /// Total complete records parsed from the right input before INFO selection.
+    pub records_right: usize,
+    /// Number of canonical selected INFO records equal from the start of both
+    /// streams. A content difference at selected index `n` yields `Some(n)`; a
+    /// strict prefix yields the shorter selected count; a full match yields the
+    /// full selected count. Refused or empty comparisons yield `None`.
+    pub selected_equal_info_prefix: Option<u64>,
+}
+
 /// Process log messages from two files.  Log messages look like this:
 ///     "Apr 09 06:08:03.100  INFO detcore: [detcore, dtid 2]  finish syscall: close(2) = Ok(0)"
 ///
@@ -1597,7 +1618,7 @@ pub fn try_compare_bitwise_info_v1(
     side_labels: ComparisonSideLabels,
 ) -> std::io::Result<LogDiffSummary> {
     try_compare_bitwise_info_v1_with_records(file_a, file_b, side_labels)
-        .map(|(summary, _, _)| summary)
+        .map(|compared| compared.summary)
 }
 
 /// Canonical comparison plus the total complete-record counts read from both
@@ -1607,7 +1628,7 @@ pub fn try_compare_bitwise_info_v1_with_records(
     file_a: &Path,
     file_b: &Path,
     side_labels: ComparisonSideLabels,
-) -> std::io::Result<(LogDiffSummary, usize, usize)> {
+) -> std::io::Result<BitwiseInfoV1LogComparison> {
     let bytes_a = std::fs::read(file_a)?;
     let bytes_b = std::fs::read(file_b)?;
     try_compare_bitwise_info_v1_bytes_with_records(&bytes_a, &bytes_b, side_labels)
@@ -1622,7 +1643,7 @@ pub fn try_compare_bitwise_info_v1_bytes_with_records(
     bytes_a: &[u8],
     bytes_b: &[u8],
     side_labels: ComparisonSideLabels,
-) -> std::io::Result<(LogDiffSummary, usize, usize)> {
+) -> std::io::Result<BitwiseInfoV1LogComparison> {
     try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
         bytes_a,
         bytes_b,
@@ -1673,7 +1694,7 @@ pub fn try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
     side_labels: ComparisonSideLabels,
     diagnostics: BitwiseInfoV1Diagnostics,
     writer: &mut impl Write,
-) -> std::io::Result<(LogDiffSummary, usize, usize)> {
+) -> std::io::Result<BitwiseInfoV1LogComparison> {
     let str_a = std::str::from_utf8(bytes_a).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1692,8 +1713,26 @@ pub fn try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
     opts.no_color = diagnostics.no_color;
     let records_a = record_count(str_a);
     let records_b = record_count(str_b);
-    let summary = log_diff_summary_from_strs_with_filter(str_a, str_b, &opts, writer, |_| true)?;
-    Ok((summary, records_a, records_b))
+    let (summary, selected_equal_info_prefix) =
+        log_diff_summary_and_selected_prefix_from_strs_with_filter(
+            str_a,
+            str_b,
+            &opts,
+            writer,
+            |_| true,
+        )?;
+    let selected_equal_info_prefix =
+        if summary.refused || summary.compared_left == 0 || summary.compared_right == 0 {
+            None
+        } else {
+            selected_equal_info_prefix
+        };
+    Ok(BitwiseInfoV1LogComparison {
+        summary,
+        records_left: records_a,
+        records_right: records_b,
+        selected_equal_info_prefix,
+    })
 }
 
 /// Exact guest-visible observation accompanying one ordinary-run log.
@@ -1770,8 +1809,9 @@ pub fn try_compare_bitwise_info_v1_run_bytes(
     compare_io_buffers: bool,
     virtualize_time: bool,
 ) -> std::io::Result<BitwiseInfoV1Comparison> {
-    let (summary, _, _) =
+    let log_comparison =
         try_compare_bitwise_info_v1_bytes_with_records(bytes_a, bytes_b, side_labels)?;
+    let summary = log_comparison.summary;
     let stdout_equal = left.stdout == right.stdout;
     let stderr_equal = left.stderr == right.stderr;
     let disposition_equal = left.disposition == right.disposition;
@@ -2064,6 +2104,23 @@ pub fn log_diff_summary_from_strs_with_filter(
     w: &mut impl std::io::Write,
     keep_record: impl Fn(&str) -> bool,
 ) -> std::io::Result<LogDiffSummary> {
+    log_diff_summary_and_selected_prefix_from_strs_with_filter(
+        file_a_str,
+        file_b_str,
+        opts,
+        w,
+        keep_record,
+    )
+    .map(|(summary, _)| summary)
+}
+
+fn log_diff_summary_and_selected_prefix_from_strs_with_filter(
+    file_a_str: impl AsRef<str>,
+    file_b_str: impl AsRef<str>,
+    opts: &LogDiffOpts,
+    w: &mut impl std::io::Write,
+    keep_record: impl Fn(&str) -> bool,
+) -> std::io::Result<(LogDiffSummary, Option<u64>)> {
     // A log that reached its size bound stops early and says so in-band. The
     // comparison below walks the two selected lists in lockstep, so it speaks
     // only for the retained prefix: two runs both cut at the bound with equal
@@ -2090,18 +2147,21 @@ pub fn log_diff_summary_from_strs_with_filter(
              past that point. This is a NO-RESULT, not a difference and not a match. Re-run with \
              a larger HERMIT_LOG_MAX_BYTES, or 0 to disable the bound."
         )?;
-        return Ok(LogDiffSummary {
-            diff_found: true,
-            compared_left: 0,
-            compared_right: 0,
-            first_divergent_scheduler_turn: None,
-            first_divergent_virtual_nanoseconds: None,
-            first_divergent_record: None,
-            first_divergent_syscall: None,
-            first_divergent_left_message: None,
-            first_divergent_right_message: None,
-            refused: true,
-        });
+        return Ok((
+            LogDiffSummary {
+                diff_found: true,
+                compared_left: 0,
+                compared_right: 0,
+                first_divergent_scheduler_turn: None,
+                first_divergent_virtual_nanoseconds: None,
+                first_divergent_record: None,
+                first_divergent_syscall: None,
+                first_divergent_left_message: None,
+                first_divergent_right_message: None,
+                refused: true,
+            },
+            None,
+        ));
     }
 
     let extracted_a = extract_log_messages(file_a_str.as_ref())?;
@@ -2198,6 +2258,17 @@ pub fn log_diff_summary_from_strs_with_filter(
 
     let first_different =
         first_different_message_indices(compared_a, &prepared_a, compared_b, &prepared_b);
+    let selected_equal_info_prefix = (policy.comparison == LogComparisonMode::Info
+        && !prepared_a.is_empty()
+        && !prepared_b.is_empty())
+    .then(|| {
+        let count = prepared_a
+            .iter()
+            .zip(&prepared_b)
+            .take_while(|(left, right)| left == right)
+            .count();
+        u64::try_from(count).expect("selected INFO prefix count fits u64")
+    });
     let first_position_candidate = first_different.and_then(|(left_index, right_index)| {
         left_index
             .and_then(|index| commit_position_at_or_before(&all_a, index))
@@ -2333,7 +2404,7 @@ pub fn log_diff_summary_from_strs_with_filter(
             "Logs contain {maps_left} | {maps_right} scheduler COMMIT records reading /proc/self/maps{positions}",
         )?;
     }
-    Ok(summary)
+    Ok((summary, selected_equal_info_prefix))
 }
 
 #[cfg(test)]
@@ -2441,16 +2512,108 @@ mod test {
             DetLogEvent::Other,
         ));
 
-        let summary = super::try_compare_bitwise_info_v1(
+        let compared = super::try_compare_bitwise_info_v1_with_records(
             left.path(),
             right.path(),
             super::ComparisonSideLabels::new("ptrace reference", "candidate run"),
         )?;
+        let summary = &compared.summary;
 
         assert!(summary.matched_with_evidence());
         assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+        assert_eq!(compared.selected_equal_info_prefix, Some(1));
         assert!(!summary.refused);
         Ok(())
+    }
+
+    #[test]
+    fn bitwise_info_v1_counts_the_canonical_selected_equal_prefix() -> std::io::Result<()> {
+        let log = |messages: &[&str]| {
+            messages
+                .iter()
+                .enumerate()
+                .map(|(index, message)| structured_record(index + 1, message, DetLogEvent::Other))
+                .collect::<String>()
+        };
+        let compare = |left: &str, right: &str| {
+            super::try_compare_bitwise_info_v1_bytes_with_records(
+                left.as_bytes(),
+                right.as_bytes(),
+                super::ComparisonSideLabels::default(),
+            )
+        };
+
+        let content_left = format!(
+            "{}Apr 09 06:08:02.100  DEBUG detcore: unselected diagnostic\n{}{}",
+            structured_record(1, "DETLOG shared 0", DetLogEvent::Other),
+            structured_record(3, "DETLOG shared 1", DetLogEvent::Other),
+            structured_record(4, "DETLOG left", DetLogEvent::Other),
+        );
+        let content_right = format!(
+            "{}Apr 09 06:08:02.100  DEBUG detcore: unselected diagnostic\n{}{}",
+            structured_record(1, "DETLOG shared 0", DetLogEvent::Other),
+            structured_record(3, "DETLOG shared 1", DetLogEvent::Other),
+            structured_record(4, "DETLOG right", DetLogEvent::Other),
+        );
+        let content = compare(&content_left, &content_right)?;
+        assert_eq!(
+            content.selected_equal_info_prefix,
+            Some(2),
+            "a content difference at selected index n must count exactly n equal records"
+        );
+        assert_eq!(content.summary.first_divergent_record, Some(4));
+
+        let short = log(&["DETLOG shared 0", "DETLOG shared 1"]);
+        let long = log(&["DETLOG shared 0", "DETLOG shared 1", "DETLOG longer tail"]);
+        assert_eq!(
+            compare(&short, &long)?.selected_equal_info_prefix,
+            Some(2),
+            "left strict prefix must count the shorter selected stream"
+        );
+        assert_eq!(
+            compare(&long, &short)?.selected_equal_info_prefix,
+            Some(2),
+            "right strict prefix must count the shorter selected stream"
+        );
+        assert_eq!(
+            compare(&long, &long)?.selected_equal_info_prefix,
+            Some(3),
+            "a full match must count the full selected stream"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bitwise_info_v1_equal_prefix_is_absent_when_comparison_is_unusable() {
+        let complete = structured_record(1, "DETLOG complete", DetLogEvent::Other);
+        let truncated = format!("{}\n", super::TRUNCATION_MARKER);
+        let refused = super::try_compare_bitwise_info_v1_bytes_with_records(
+            truncated.as_bytes(),
+            complete.as_bytes(),
+            super::ComparisonSideLabels::default(),
+        )
+        .unwrap();
+        assert!(refused.summary.refused);
+        assert_eq!(refused.selected_equal_info_prefix, None);
+
+        let empty = super::try_compare_bitwise_info_v1_bytes_with_records(
+            b"",
+            complete.as_bytes(),
+            super::ComparisonSideLabels::default(),
+        )
+        .unwrap();
+        assert_eq!(empty.selected_equal_info_prefix, None);
+
+        let malformed = record(1, "DETLOG historical without typed event");
+        assert!(
+            super::try_compare_bitwise_info_v1_bytes_with_records(
+                malformed.as_bytes(),
+                complete.as_bytes(),
+                super::ComparisonSideLabels::default(),
+            )
+            .is_err(),
+            "malformed current input must return no comparison result"
+        );
     }
 
     #[test]
@@ -2506,12 +2669,21 @@ mod test {
             &mut contextual_output,
         )?;
 
+        let default = super::try_compare_bitwise_info_v1_bytes_with_records(
+            left.as_bytes(),
+            right.as_bytes(),
+            super::ComparisonSideLabels::new("ptrace", "candidate"),
+        )?;
+        assert_eq!(default, terse);
         assert_eq!(terse, contextual);
-        let (terse, total_left, total_right) = terse;
-        assert!(terse.diff_found);
-        assert_eq!((terse.compared_left, terse.compared_right), (4, 4));
-        assert_eq!((total_left, total_right), (4, 4));
-        assert_eq!(terse.first_divergent_record, Some(3));
+        assert!(terse.summary.diff_found);
+        assert_eq!(
+            (terse.summary.compared_left, terse.summary.compared_right),
+            (4, 4)
+        );
+        assert_eq!((terse.records_left, terse.records_right), (4, 4));
+        assert_eq!(terse.selected_equal_info_prefix, Some(2));
+        assert_eq!(terse.summary.first_divergent_record, Some(3));
 
         let terse_output = String::from_utf8(terse_output).unwrap();
         let contextual_output = String::from_utf8(contextual_output).unwrap();

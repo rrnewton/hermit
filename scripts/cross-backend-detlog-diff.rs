@@ -476,8 +476,7 @@ fn compare_authoritative_logs(
     right: &[u8],
 ) -> Result<CanonicalComparison, String> {
     let mut diagnostic = Vec::new();
-    let (summary, total_left, total_right) =
-        try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+    let compared = try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
             left,
             right,
             ComparisonSideLabels::new(left_label, right_label),
@@ -495,9 +494,9 @@ fn compare_authoritative_logs(
             )
         })?;
     Ok(CanonicalComparison {
-        summary,
-        total_left,
-        total_right,
+        summary: compared.summary,
+        total_left: compared.records_left,
+        total_right: compared.records_right,
         diagnostic,
     })
 }

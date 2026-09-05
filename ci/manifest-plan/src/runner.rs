@@ -88,6 +88,12 @@ const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 const CELL_CPU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CELL_CPU_ACCOUNTING_GRACE: Duration = Duration::from_secs(1);
 pub const CELL_RESULT_SCHEMA: u64 = 4;
+/// Result schema reserved for the dormant harness-managed verify path.
+///
+/// A row may use this schema only after it carries a validated retained-log
+/// descriptor. Ordinary cells, including the currently active internal
+/// `--verify` path, continue to write [`CELL_RESULT_SCHEMA`].
+pub const RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA: u64 = 5;
 pub const E2E_MACHINE_SHORTNAME_ENV: &str = "E2E_MACHINE_SHORTNAME";
 pub const E2E_KERNEL_VERSION_ENV: &str = "E2E_KERNEL_VERSION";
 pub const E2E_RUN_INDEX_ENV: &str = "E2E_RUN_INDEX";
@@ -952,6 +958,7 @@ pub use retained_verify_log::ComparedVerifyPair;
 pub use retained_verify_log::RetainedVerifyLog;
 pub use retained_verify_log::RetainedVerifyLogPublication;
 pub use retained_verify_log::RetainedVerifyLogRole;
+pub use retained_verify_log::VerifiedRetainedLogCopy;
 pub use retained_verify_log::VerifyLogRetentionBudget;
 pub use retained_verify_log::VerifyLogRetentionPolicy;
 pub use retained_verify_log::VerifyRun;
@@ -961,8 +968,10 @@ pub use retained_verify_log::VerifyRunSpec;
 pub use retained_verify_log::build_verify_run_spec;
 pub use retained_verify_log::cleanup_verify_log_sources;
 pub use retained_verify_log::compare_verify_runs;
+pub use retained_verify_log::copy_verified_retained_verify_log;
 pub use retained_verify_log::load_verify_run;
 pub use retained_verify_log::publish_retained_verify_log;
+pub use retained_verify_log::read_verified_retained_verify_log;
 pub use retained_verify_log::reopen_retained_verify_log_publication;
 use retained_verify_log::require_plain_directory;
 use retained_verify_log::retained_verify_log_relative_path;
@@ -1226,7 +1235,7 @@ pub struct CellResult {
     #[serde(default)]
     pub failure_class: Option<FailureClass>,
     pub error_kind: Option<String>,
-    /// The cell wall-clock bound recorded by schema 4. It remains the fixture
+    /// The historical cell wall-clock bound. It remains the fixture
     /// preparation and inner-invocation wall bound; the additive fields below
     /// describe the post-preparation policy without changing this field's
     /// meaning for existing readers.
@@ -1301,6 +1310,94 @@ pub struct CellResult {
     pub artifact_dir: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetainedVerifyReportClassification {
+    outcome: String,
+    error_kind: Option<String>,
+    reason: Option<String>,
+    result: Option<ObservedResult>,
+    failure_class: Option<FailureClass>,
+}
+
+fn retained_verify_report_classification(
+    report: &VerificationReport,
+) -> RetainedVerifyReportClassification {
+    let incomplete = |reason: String| RetainedVerifyReportClassification {
+        outcome: "ERROR".into(),
+        error_kind: Some("incomplete-verification-evidence".into()),
+        reason: Some(reason),
+        result: None,
+        failure_class: Some(FailureClass::NoResult),
+    };
+    let product_failure = |reason: String| RetainedVerifyReportClassification {
+        outcome: "FAIL".into(),
+        error_kind: None,
+        reason: Some(reason),
+        result: Some(ObservedResult::CrashError),
+        failure_class: Some(FailureClass::ProductFailure),
+    };
+    match report.verdict {
+        Verdict::Matched => match report.require_canonical_match() {
+            Ok(()) => match (report.guest_exit_code, report.guest_signal) {
+                (Some(0), None) => RetainedVerifyReportClassification {
+                    outcome: "PASS".into(),
+                    error_kind: None,
+                    reason: None,
+                    result: Some(ObservedResult::Pass),
+                    failure_class: None,
+                },
+                (Some(code), None) => product_failure(format!("verify exited with status {code}")),
+                (None, Some(signal)) => {
+                    product_failure(format!("verify was killed by signal {signal}"))
+                }
+                (None, None) => {
+                    incomplete("canonical verification match omitted the guest disposition".into())
+                }
+                (Some(_), Some(_)) => incomplete(
+                    "canonical verification match recorded both exit status and signal".into(),
+                ),
+            },
+            Err(reason) => incomplete(reason),
+        },
+        Verdict::Diverged => match report.require_canonical_comparison() {
+            Ok(()) if !report.verified && !report.bitwise_parity => {
+                RetainedVerifyReportClassification {
+                    outcome: "FAIL".into(),
+                    error_kind: None,
+                    reason: report.require_canonical_match().err(),
+                    result: Some(ObservedResult::DeterminismFailure),
+                    failure_class: Some(FailureClass::ProductFailure),
+                }
+            }
+            Ok(()) => incomplete(format!(
+                "canonical verification report contradicts its diverged verdict: verified={} bitwise_parity={}",
+                report.verified, report.bitwise_parity
+            )),
+            Err(reason) => incomplete(reason),
+        },
+        Verdict::NoResult => incomplete(
+            report
+                .require_canonical_comparison()
+                .err()
+                .unwrap_or_else(|| {
+                    "verification report carries canonical evidence but records no_result".into()
+                }),
+        ),
+        Verdict::InfrastructureError => RetainedVerifyReportClassification {
+            outcome: "ERROR".into(),
+            error_kind: Some("infrastructure".into()),
+            reason: Some(match report.infrastructure_error.as_ref() {
+                Some(InfrastructureError::SkidOvershoot { count }) => {
+                    format!("verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)")
+                }
+                None => "verification recorded an incomplete infrastructure error".into(),
+            }),
+            result: None,
+            failure_class: Some(FailureClass::UnderstoodInfrastructureFailure),
+        },
+    }
+}
+
 impl CellResult {
     fn validate_retained_verify_log_binding(&self) -> Result<Option<&RetainedVerifyLog>, String> {
         let expected_id = CellId {
@@ -1319,6 +1416,11 @@ impl CellResult {
         let Some(attempt_row) = retained_attempts.first() else {
             return Ok(None);
         };
+        if self.attempts.len() != 1 {
+            return Err(
+                "a harness-managed verify result must contain exactly one attempt row".into(),
+            );
+        }
         let retained = attempt_row
             .retained_verify_log
             .as_ref()
@@ -1336,6 +1438,69 @@ impl CellResult {
                 expected_relative.display(),
                 retained.relative_path
             ));
+        }
+        let report_json = attempt_row
+            .verification_report
+            .as_deref()
+            .ok_or("retained verify log has no typed verification report")?;
+        let report_sha256 = attempt_row
+            .verification_report_sha256
+            .as_deref()
+            .ok_or("retained verify log has no verification_report_sha256")?;
+        if hex_digest(report_json.as_bytes()) != report_sha256 {
+            return Err("retained verify-log report digest mismatch".into());
+        }
+        let report = VerificationReport::from_json_slice(report_json.as_bytes())
+            .map_err(|error| format!("retained verify-log report is malformed: {error}"))?;
+        let compared_info_messages = report
+            .compared_log_messages
+            .as_ref()
+            .map_or(0, |counts| counts.left);
+        if retained.compared_info_messages != compared_info_messages {
+            return Err(
+                "retained verify-log compared count differs from its verification report".into(),
+            );
+        }
+        let classification = retained_verify_report_classification(&report);
+        if attempt_row.outcome != classification.outcome
+            || attempt_row.error_kind.as_deref() != classification.error_kind.as_deref()
+            || attempt_row.reason != classification.reason
+            || self.outcome != classification.outcome
+            || self.error_kind.as_deref() != classification.error_kind.as_deref()
+            || self.reason != classification.reason
+            || self.result != classification.result
+            || self.failure_class != classification.failure_class
+        {
+            return Err(format!(
+                "retained verify-log outcome does not match its verification report: expected outcome={} error_kind={:?} result={:?} failure_class={:?}",
+                classification.outcome,
+                classification.error_kind,
+                classification.result,
+                classification.failure_class
+            ));
+        }
+        if attempt_row.status != report.guest_exit_code
+            || attempt_row.signal != report.guest_signal
+            || attempt_row.runtime != report.runtime
+            || self.runtime != report.runtime
+            || attempt_row.first_divergent_scheduler_turn != report.first_divergent_scheduler_turn
+            || attempt_row.first_divergent_virtual_nanoseconds
+                != report.first_divergent_virtual_nanoseconds
+            || attempt_row.first_divergent_record != report.first_divergent_record
+            || attempt_row.first_divergent_syscall != report.first_divergent_syscall
+            || attempt_row.first_divergent_left_message != report.first_divergent_left_message
+            || attempt_row.first_divergent_right_message != report.first_divergent_right_message
+            || self.first_divergent_scheduler_turn != report.first_divergent_scheduler_turn
+            || self.first_divergent_virtual_nanoseconds
+                != report.first_divergent_virtual_nanoseconds
+            || self.first_divergent_record != report.first_divergent_record
+            || self.first_divergent_syscall != report.first_divergent_syscall
+            || self.first_divergent_left_message != report.first_divergent_left_message
+            || self.first_divergent_right_message != report.first_divergent_right_message
+        {
+            return Err(
+                "retained verify-log result fields differ from its verification report".into(),
+            );
         }
         Ok(Some(retained))
     }
@@ -1357,7 +1522,78 @@ impl CellResult {
         )
     }
 
-    /// Validate the additive timeout fields while keeping earlier schema-4 rows
+    /// Bind one completed comparison and retained descriptor to the sole
+    /// attempt, then mark the complete result for schema-5 publication.
+    ///
+    /// This is deliberately separate from ordinary result construction so the
+    /// active internal-verify writer cannot claim retained-log evidence merely
+    /// because the additive field exists on the Rust type.
+    fn prepare_retained_verify_log_publication(
+        &mut self,
+        report: &VerificationReport,
+        retained: RetainedVerifyLog,
+    ) -> Result<(), String> {
+        if self.schema != CELL_RESULT_SCHEMA {
+            return Err(format!(
+                "retained verify-log publication requires schema {CELL_RESULT_SCHEMA} input, got {}",
+                self.schema
+            ));
+        }
+        if self.attempts.len() != 1 {
+            return Err(
+                "a harness-managed verify result must contain exactly one attempt row".into(),
+            );
+        }
+        if self.attempts[0].retained_verify_log.is_some() {
+            return Err("verify attempt already carries a retained-log descriptor".into());
+        }
+        let report_json = serde_json::to_string(report)
+            .map_err(|error| format!("cannot encode retained verify-log report: {error}"))?;
+        let report_sha256 = hex_digest(report_json.as_bytes());
+        let classification = retained_verify_report_classification(report);
+        let previous = self.clone();
+        let attempt = &mut self.attempts[0];
+        attempt.outcome = classification.outcome.clone();
+        attempt.error_kind = classification.error_kind.clone();
+        attempt.status = report.guest_exit_code;
+        attempt.signal = report.guest_signal;
+        attempt.timed_out = false;
+        attempt.verification_report = Some(report_json);
+        attempt.verification_report_sha256 = Some(report_sha256);
+        attempt.retained_verify_log = Some(retained);
+        attempt.runtime = report.runtime.clone();
+        attempt.first_divergent_scheduler_turn = report.first_divergent_scheduler_turn;
+        attempt.first_divergent_virtual_nanoseconds = report.first_divergent_virtual_nanoseconds;
+        attempt.first_divergent_record = report.first_divergent_record;
+        attempt.first_divergent_syscall = report.first_divergent_syscall;
+        attempt.first_divergent_left_message = report.first_divergent_left_message.clone();
+        attempt.first_divergent_right_message = report.first_divergent_right_message.clone();
+        attempt.reason = classification.reason.clone();
+
+        self.outcome = classification.outcome;
+        self.error_kind = classification.error_kind;
+        self.result = classification.result;
+        self.failure_class = classification.failure_class;
+        self.runtime = report.runtime.clone();
+        self.first_divergent_scheduler_turn = report.first_divergent_scheduler_turn;
+        self.first_divergent_virtual_nanoseconds = report.first_divergent_virtual_nanoseconds;
+        self.first_divergent_record = report.first_divergent_record;
+        self.first_divergent_syscall = report.first_divergent_syscall;
+        self.first_divergent_left_message = report.first_divergent_left_message.clone();
+        self.first_divergent_right_message = report.first_divergent_right_message.clone();
+        self.reason = classification.reason;
+        self.schema = RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA;
+        if let Err(error) = self
+            .validate_retained_verify_log_binding()
+            .and_then(|_| self.require_current_classification())
+        {
+            *self = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Validate the additive timeout fields while keeping earlier rows
     /// readable. `timeout_seconds` retains its original wall-bound meaning;
     /// only rows carrying both new fields claim the execution CPU/backstop
     /// policy.
@@ -1378,7 +1614,7 @@ impl CellResult {
     }
 
     /// Require evidence emitted by the current runner rather than a readable
-    /// schema-4 row written before the additive timeout fields existed.
+    /// row written before the additive timeout fields existed.
     pub fn require_current_timeout_policy(&self) -> Result<(), String> {
         self.validate_timeout_policy()?;
         if self.execution_cpu_timeout_seconds.is_none()
@@ -1391,7 +1627,7 @@ impl CellResult {
 
     /// Check the classification fields written by the current framework.
     ///
-    /// Both fields remain optional in the deserializer because schema 4 also
+    /// Both fields remain optional in the deserializer because older schemas also
     /// names retained rows written before they existed. Current publication is
     /// stricter: every result is recorded, and every non-pass is attributed.
     pub fn require_current_classification(&self) -> Result<(), String> {
@@ -1460,7 +1696,7 @@ impl CellResult {
         Ok(())
     }
 
-    /// Retained schema-4 rows predate these fields. Accept that exact legacy
+    /// Retained older rows predate these fields. Accept that exact legacy
     /// absence, but validate any row that carries either half of the contract.
     pub fn validate_recorded_classification(&self) -> Result<(), String> {
         if self.result.is_none() && self.failure_class.is_none() {
@@ -3956,17 +4192,34 @@ fn append_result_with_failure(
         message,
         descriptor_visible: false,
     };
+    let retained_verify_log = result
+        .validate_retained_verify_log_binding()
+        .map_err(unpublished)?;
+    match (result.schema, retained_verify_log.is_some()) {
+        (CELL_RESULT_SCHEMA, false) | (RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA, true) => {}
+        (CELL_RESULT_SCHEMA, true) => {
+            return Err(unpublished(format!(
+                "schema {CELL_RESULT_SCHEMA} result cannot carry retained_verify_log; prepare schema {RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA} publication explicitly"
+            )));
+        }
+        (RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA, false) => {
+            return Err(unpublished(format!(
+                "schema {RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA} result requires one retained_verify_log descriptor"
+            )));
+        }
+        (schema, _) => {
+            return Err(unpublished(format!(
+                "current result writer requires schema {CELL_RESULT_SCHEMA}, or schema {RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA} with retained_verify_log, got {schema}"
+            )));
+        }
+    }
     result
         .require_current_classification()
         .map_err(unpublished)?;
     result
         .require_current_timeout_policy()
         .map_err(unpublished)?;
-    if retained_file_already_verified {
-        result
-            .validate_retained_verify_log_binding()
-            .map_err(unpublished)?;
-    } else {
+    if !retained_file_already_verified {
         result
             .validate_retained_verify_logs()
             .map_err(unpublished)?;
@@ -6625,11 +6878,12 @@ backends_disabled:
     /// EXISTED", AND NOTHING ELSE. A row that ran, compared, and located no
     /// divergence must carry the key with an explicit null.
     ///
-    /// WHY IT NEEDS A TEST RATHER THAN BEING OBVIOUS. `CELL_RESULT_SCHEMA` was
-    /// NOT bumped when these coordinates were added, so the schema number
-    /// cannot separate the two meanings. Within schema 4 the only thing that
-    /// distinguishes "this predates the field" from "this ran and found nothing"
-    /// is whether the key is present at all.
+    /// WHY IT NEEDS A TEST RATHER THAN BEING OBVIOUS. The schema was not bumped
+    /// when these coordinates were added, so rows written as schema 4 cannot
+    /// separate the two meanings by version. Within schema 4 the only thing
+    /// that distinguishes "this predates the field" from "this ran and found
+    /// nothing" is whether the key is present at all. Schema 5 does not rewrite
+    /// that history; it makes retained verify-log publication version-visible.
     ///
     /// ⚠️ THE STRUCTURAL CLAIM IS THE DURABLE ONE; THE COUNTS ARE NOT. Schema 4
     /// contains BOTH rows with the key and rows without it, while schemas 1, 2
@@ -6799,23 +7053,7 @@ backends_disabled:
         let decoded: AttemptResult = serde_json::from_value(historical).unwrap();
         assert!(decoded.retained_verify_log.is_none());
 
-        attempt.retained_verify_log = Some(RetainedVerifyLog {
-            relative_path: "retained/verify/1/run-1.log.gz".into(),
-            role: RetainedVerifyLogRole::Run1,
-            cell_id: CellId {
-                test: "fixture/test".into(),
-                mode: "verify".into(),
-                backend: Some("ptrace".into()),
-            },
-            attempt: 1,
-            uncompressed_sha256: "a".repeat(64),
-            uncompressed_bytes: 11,
-            compressed_sha256: "b".repeat(64),
-            compressed_bytes: 12,
-            peer_uncompressed_sha256: "c".repeat(64),
-            peer_uncompressed_bytes: 13,
-            compared_info_messages: 14,
-        });
+        attempt.retained_verify_log = Some(fixture_retained_verify_log());
         let rendered = serde_json::to_value(&attempt).unwrap();
         let descriptor = rendered["retained_verify_log"].as_object().unwrap();
         assert_eq!(
@@ -6841,14 +7079,95 @@ backends_disabled:
         assert_eq!(decoded.retained_verify_log, attempt.retained_verify_log);
     }
 
+    fn fixture_retained_verify_log() -> RetainedVerifyLog {
+        RetainedVerifyLog {
+            relative_path: "retained/verify/1/run-1.log.gz".into(),
+            role: RetainedVerifyLogRole::Run1,
+            cell_id: CellId {
+                test: "fixture/test".into(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            attempt: 1,
+            uncompressed_sha256: "a".repeat(64),
+            uncompressed_bytes: 11,
+            compressed_sha256: "b".repeat(64),
+            compressed_bytes: 12,
+            peer_uncompressed_sha256: "c".repeat(64),
+            peer_uncompressed_bytes: 13,
+            compared_info_messages: 1,
+        }
+    }
+
     #[test]
-    fn schema4_keeps_its_wall_field_and_adds_explicit_execution_bounds() {
+    fn schema4_remains_current_and_schema5_requires_a_retained_descriptor() {
         let row = cell_result_that_located_nothing();
         let mut rendered = serde_json::to_value(&row).expect("cell result serializes");
+        assert_eq!(rendered["schema"], CELL_RESULT_SCHEMA);
         assert_eq!(rendered["timeout_seconds"], 3);
         assert_eq!(rendered["execution_cpu_timeout_seconds"], 1);
         assert_eq!(rendered["execution_wall_timeout_seconds"], 3);
         row.require_current_timeout_policy().unwrap();
+
+        let publication = std::env::temp_dir().join(format!(
+            "hermit-runner-current-schema-publication-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&publication);
+        append_result(&publication, &row).unwrap();
+        let written: CellResult =
+            serde_json::from_slice(fs::read(&publication).unwrap().strip_suffix(b"\n").unwrap())
+                .unwrap();
+        assert_eq!(written.schema, CELL_RESULT_SCHEMA);
+        fs::remove_file(&publication).unwrap();
+
+        let mut retained = row.clone();
+        retained
+            .prepare_retained_verify_log_publication(
+                &canonical_verification_report(),
+                fixture_retained_verify_log(),
+            )
+            .unwrap();
+        let mut schema4_with_descriptor = retained.clone();
+        schema4_with_descriptor.schema = CELL_RESULT_SCHEMA;
+        let error = append_result_with_failure(&publication, &schema4_with_descriptor, None, true)
+            .unwrap_err();
+        assert!(error.message.contains("cannot carry retained_verify_log"));
+        assert!(!publication.exists());
+        assert_eq!(retained.schema, RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA);
+        assert!(retained.attempts[0].verification_report.is_some());
+        assert!(retained.attempts[0].verification_report_sha256.is_some());
+        append_result_with_failure(&publication, &retained, None, true).unwrap();
+        let written: CellResult =
+            serde_json::from_slice(fs::read(&publication).unwrap().strip_suffix(b"\n").unwrap())
+                .unwrap();
+        assert_eq!(written.schema, RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA);
+        assert!(written.attempts[0].retained_verify_log.is_some());
+        fs::remove_file(&publication).unwrap();
+
+        let mut descriptorless_schema5 = row.clone();
+        descriptorless_schema5.schema = RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA;
+        let error = append_result_with_failure(&publication, &descriptorless_schema5, None, true)
+            .unwrap_err();
+        assert!(error.message.contains("requires one retained_verify_log"));
+        assert!(!publication.exists());
+
+        let mut ambiguous = row.clone();
+        ambiguous.attempts.push(ambiguous.attempts[0].clone());
+        let error = ambiguous
+            .prepare_retained_verify_log_publication(
+                &canonical_verification_report(),
+                fixture_retained_verify_log(),
+            )
+            .unwrap_err();
+        assert!(error.contains("exactly one attempt row"), "{error}");
+        assert_eq!(ambiguous.schema, CELL_RESULT_SCHEMA);
+        assert!(
+            ambiguous
+                .attempts
+                .iter()
+                .all(|attempt| attempt.retained_verify_log.is_none())
+        );
 
         let mut half_present = row.clone();
         half_present.execution_wall_timeout_seconds = None;
@@ -6873,13 +7192,23 @@ backends_disabled:
         let object = rendered.as_object_mut().unwrap();
         object.remove("execution_cpu_timeout_seconds");
         object.remove("execution_wall_timeout_seconds");
-        let retained: CellResult = serde_json::from_value(rendered)
-            .expect("a schema-4 row written before the additive fields remains readable");
-        assert_eq!(retained.timeout_seconds, 3);
-        assert_eq!(retained.execution_cpu_timeout_seconds, None);
-        assert_eq!(retained.execution_wall_timeout_seconds, None);
-        retained.validate_timeout_policy().unwrap();
-        assert!(retained.require_current_timeout_policy().is_err());
+        object["attempts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("retained_verify_log");
+        for schema in 1..=CELL_RESULT_SCHEMA {
+            object.insert("schema".into(), JsonValue::from(schema));
+            let retained: CellResult = serde_json::from_value(JsonValue::Object(object.clone()))
+                .unwrap_or_else(|error| {
+                    panic!("schema {schema} row must remain readable: {error}")
+                });
+            assert_eq!(retained.timeout_seconds, 3);
+            assert_eq!(retained.execution_cpu_timeout_seconds, None);
+            assert_eq!(retained.execution_wall_timeout_seconds, None);
+            assert!(retained.attempts[0].retained_verify_log.is_none());
+            retained.validate_timeout_policy().unwrap();
+            assert!(retained.require_current_timeout_policy().is_err());
+        }
     }
 
     fn attempt_with_sabre_evidence(evidence: &str) -> AttemptResult {

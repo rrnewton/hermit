@@ -212,6 +212,13 @@ impl LogDiffCLIOpts {
                 file_b,
                 options.side_labels.clone(),
             )
+            .map(|compared| {
+                (
+                    compared.summary,
+                    compared.records_left,
+                    compared.records_right,
+                )
+            })
         } else {
             try_log_diff_with_records(&self.file_a, file_b, &options, record_envelope)
         };
