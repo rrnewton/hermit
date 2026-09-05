@@ -34,10 +34,14 @@ test:
           kvm: 24
         slow_reason:
           ptrace: Across 60 retained typed passing rows, nearest-rank p90 was 22.531 wall seconds and 20.710660 CPU seconds; ceil(4x wall)=91 and ceil(1.5x CPU)=32.
-          kvm: Across 3 clean qualification repetitions at Hermit 92bacf12deba6a717f77cfcbd6afefc5ffb383f2, nearest-rank p90 was 19.937 wall seconds and 15.647292 CPU seconds; ceil(4x wall)=80 and ceil(1.5x CPU)=24.
+          kvm: The KVM-only workload runs 53 busy-wait and print intervals at 5 ms instead of 50 at 20 ms, reducing VM-exit-heavy clock reads while preserving the baseline's 200-turn instrumented scheduler coverage. Across 3 clean qualification repetitions at Hermit f190205a7b3e65e7ebf347ba0875b668fd72d9a7, nearest-rank p90 was 13.753 wall seconds and 12.809181 CPU seconds; ceil(4x wall)=56 and ceil(1.5x CPU)=20, both covered by the retained 80/24 bounds.
         backends_enabled:
           - ptrace
           - kvm
+        guest_args:
+          kvm:
+            - "53"
+            - "5"
         backends_disabled:
           dbt: DBT application coverage is owned by backend parity
           sabre: SaBRe does not yet determinize busy-wait polling on virtual wall-clock advancement; main validation has observed verify failure under load
