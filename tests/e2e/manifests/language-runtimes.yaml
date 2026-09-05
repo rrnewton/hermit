@@ -89,9 +89,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT Bash qualification is tracked by backend compatibility
-          kvm: KVM interpreter coverage requires separate privileged qualification
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst Bash qualification is tracked by backend compatibility
       replay:
@@ -151,9 +151,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT C++ qualification is tracked by backend compatibility
-          kvm: KVM interpreter coverage requires separate privileged qualification
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst C++ qualification is tracked by backend compatibility
       replay:
@@ -280,9 +280,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT awk support is tracked by backend compatibility
-          kvm: KVM interpreter coverage requires separate privileged qualification
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst awk support is tracked by backend compatibility
       replay:
@@ -400,9 +400,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT Perl qualification is tracked by backend compatibility
-          kvm: KVM interpreter coverage requires separate privileged qualification
           sabre: SaBRe path ineligible - the measured verify pair recorded 132 trusted shared-object sites (33 libc/ld-linux syscall instructions x Perl and tr x two runs; clock_gettime, getrandom, file I/O, memory mapping, and signal operations); forcing the first through the SaBRe marker caused SIGILL, so qualification requires zero trusted or fallback sites
           liteinst: LiteInst Perl qualification is tracked by backend compatibility
       replay:
@@ -462,9 +462,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT Perl support is tracked by backend compatibility
-          kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst Perl support is tracked by backend compatibility
       replay:
@@ -524,9 +524,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT Python support is tracked by backend compatibility
-          kvm: KVM Python coverage is in the privileged applications bucket
           sabre: SaBRe and ptrace each reach L2, but consume different deterministic entropy positions at Python exec and produce different hash seeds and stdout
           liteinst: LiteInst Python support is tracked by backend compatibility
       replay:
@@ -644,11 +644,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: DBT Python support is tracked by backend compatibility
-          kvm: KVM Python coverage is in the privileged applications bucket
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst Python support is tracked by backend compatibility
       replay:
@@ -708,9 +708,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT Rust qualification is tracked by backend compatibility
-          kvm: KVM interpreter coverage requires separate privileged qualification
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst Rust qualification is tracked by backend compatibility
       replay:
@@ -832,9 +832,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         backends_disabled:
           dbt: DBT perl support is tracked by backend compatibility
-          kvm: KVM interpreter coverage requires separate privileged qualification
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst perl support is tracked by backend compatibility
       replay:

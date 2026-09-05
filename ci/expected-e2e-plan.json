@@ -4765,6 +4765,258 @@
       "lane": "portable",
       "mode": "verify",
       "test": "c-programs/netlink-autobind-usersock"
+    },
+    {
+      "backend": "kvm",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/pipe-ipc"
+    },
+    {
+      "backend": "kvm",
+      "category": "backend-parity-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "backend-parity-c/short-io-split-identity"
+    },
+    {
+      "backend": "kvm",
+      "category": "c-programs",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "c-programs/wait-on-child"
+    },
+    {
+      "backend": "kvm",
+      "category": "debugger-c",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "debugger-c/debuggee"
+    },
+    {
+      "backend": "kvm",
+      "category": "determinism-stress",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "determinism-stress/thread-output"
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/bash-random"
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/cpp-stl-determinism"
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/gawk-random"
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/perl-hash-order"
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/perl-io-subprocess-time"
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/perl-random"
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/python-hash-determinism"
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/python-random"
+    },
+    {
+      "backend": "kvm",
+      "category": "language-runtimes",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "language-runtimes/rust-hashmap-iteration"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/clock-determinism"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/date-nanoseconds"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/du-tree-summary"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/errno-path-identity"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/example-date"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/file-timestamp-identity"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/find-tree-metadata"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/harness-width-contract"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/mcookie-random"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/mktemp-name"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/openssl-genpkey"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/openssl-passwd"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/openssl-rand"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/openssl-x509"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/proc-uptime"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/random-device"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/record-getpid"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/shuf-permutation"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/startup-surface-identity"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/startup-tls-guards"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/sysfs-sanitized-prefixes"
+    },
+    {
+      "backend": "kvm",
+      "category": "system-utils",
+      "lane": "portable",
+      "mode": "verify",
+      "test": "system-utils/uuidgen-random"
     }
   ],
   "schema": 1

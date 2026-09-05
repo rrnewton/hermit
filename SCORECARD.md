@@ -2,7 +2,7 @@
 
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. `./ci/compat-envelope/scorecard.rs check` verifies it.
 
-**Green** means this manifest cell is selected by full in `ci/expected-e2e-plan.json`; ordinary validation therefore requires it to pass. **Red** means the cell is in the manifest but is not selected by full. **Red does not mean failed:** a red cell may have passed, failed, produced no verdict, or never run. Manifest-disabled combinations are **Not applicable**; they are neither red nor omitted. The current generated data counts Green as **677** and Red as **182**. The generator classifies the current **4885** manifest-disabled combinations as **Not applicable**.
+**Green** means this manifest cell is selected by full in `ci/expected-e2e-plan.json`; ordinary validation therefore requires it to pass. **Red** means the cell is in the manifest but is not selected by full. **Red does not mean failed:** a red cell may have passed, failed, produced no verdict, or never run. Manifest-disabled combinations are **Not applicable**; they are neither red nor omitted. The current generated data counts Green as **713** and Red as **180**. The generator classifies the current **4851** manifest-disabled combinations as **Not applicable**.
 
 Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and accepts a result only when the typed report says `verified=true`, `verdict=matched`, `bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, a named canonical `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped comparison when invoked directly and does not satisfy this regression plan. These same-backend results do not establish cross-backend parity.
 
@@ -10,22 +10,22 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 | --- | ---: | ---: | ---: | ---: |
 | `ptrace` | 346 | 18 | 713 | 1077 |
 | `dbt` | 0 | 61 | 1016 | 1077 |
-| `kvm` | 192 | 13 | 872 | 1077 |
+| `kvm` | 228 | 11 | 838 | 1077 |
 | `sabre` | 111 | 32 | 934 | 1077 |
 | `liteinst` | 28 | 25 | 1024 | 1077 |
 | `native` | 0 | 33 | 326 | 359 |
-| **Total** | **677** | **182** | **4885** | **5744** |
+| **Total** | **713** | **180** | **4851** | **5744** |
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Green is **677 of 5744**, which is **11.79%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Green is **713 of 5744**, which is **12.41%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
 
-⚠️ **4885 of those 5744 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 859 cells that CAN run, green is **78.81%**.
+⚠️ **4851 of those 5744 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 893 cells that CAN run, green is **79.84%**.
 
-⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 677 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
+⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 713 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
 
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, without anything about the product changing.** Removing a backend whose cells are mostly red RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before comparing this percentage against an earlier one, diff the two lists above: if they differ, the numbers are not comparable and the difference is not a result.
 
@@ -33,11 +33,11 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Not applicable | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 340 / 359 | 0 / 359 | 192 / 359 | 111 / 359 | 28 / 359 | — | 671 | 147 | 977 | 1795 |
+| `verify` | 340 / 359 | 0 / 359 | 228 / 359 | 111 / 359 | 28 / 359 | — | 707 | 145 | 943 | 1795 |
 | `replay` | 1 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | — | 1 | 0 | 1794 | 1795 |
 | `chaos` | 5 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | — | 5 | 2 | 1788 | 1795 |
 | `naked` | — | — | — | — | — | 0 / 359 | 0 | 33 | 326 | 359 |
-| **Total** | | | | | | | **677** | **182** | **4885** | **5744** |
+| **Total** | | | | | | | **713** | **180** | **4851** | **5744** |
 
 ## Cross-backend parity
 
@@ -63,7 +63,7 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `system-utils` | 33 / 34 | 1 / 34 | 0 / 34 | 34 | 102 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 680 selected regression cells: the 677 green compatibility cells above (including 5 chaos-mode race-exposure checks), and 3 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 716 selected regression cells: the 713 green compatibility cells above (including 5 chaos-mode race-exposure checks), and 3 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
 
 ### Selected custom commands outside the comparable denominator
 
@@ -77,19 +77,19 @@ These rows are part of the selected regression denominator even though they are 
 
 ## Status and measurement
 
-Selection and observation answer different questions. The Green/Red table says what full validation selects. The per-cell `measurement` value says what retained evidence observed: `never-measured`, `measured-and-passed`, `measured-no-verdict`, `diverged-unlocated`, or `diverged`. In the current generated data, **zero Green cells are `never-measured`**. Read the generated Status and measurement section for the complete current cross-tab; do not use Red as a failed-test count.
+Selection and observation answer different questions. The Green/Red table says what full validation selects. The per-cell `measurement` value says what retained evidence observed: `never-measured`, `measured-and-passed`, `measured-no-verdict`, `diverged-unlocated`, or `diverged`. In the current generated data, **34 Green cells are `never-measured`**. Read the generated Status and measurement section for the complete current cross-tab; do not use Red as a failed-test count.
 
-The current green/`never-measured` count is **0**, and the current red/`measured-and-passed` count is **91**.
+The current green/`never-measured` count is **34**, and the current red/`measured-and-passed` count is **89**.
 
 Retained history that has not been imported is not counted here. A stored measurement does not establish that it describes current code; `show` reports whether the recorded last test still matches `HEAD:detcore`.
 
-The cross-tab includes all **5744** tracked cells; no row is omitted. The current generated data contains **91 Red cells that are `measured-and-passed`**. These claims use the same counts printed in the table below.
+The cross-tab includes all **5744** tracked cells; no row is omitted. The current generated data contains **89 Red cells that are `measured-and-passed`**. These claims use the same counts printed in the table below.
 
 | Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `green` | 0 | 665 | 0 | 6 | 6 | 677 |
-| `red` | 60 | 91 | 0 | 0 | 31 | 182 |
-| `not-applicable` | 4884 | 0 | 0 | 0 | 1 | 4885 |
+| `green` | 34 | 667 | 0 | 6 | 6 | 713 |
+| `red` | 60 | 89 | 0 | 0 | 31 | 180 |
+| `not-applicable` | 4850 | 0 | 0 | 0 | 1 | 4851 |
 | **Total** | **4944** | **756** | **0** | **6** | **38** | **5744** |
 
 Cells whose stored `measurement` is not `never-measured` are shown individually so status and measurement remain visible together.
@@ -235,7 +235,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `backend-parity-c/pipe-capacity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/pipe-capacity-pin` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/pipe-capacity-pin` | `verify` | `ptrace` | `green` | `measured-and-passed` |
-| `backend-parity-c/pipe-ipc` | `verify` | `kvm` | `red` | `measured-and-passed` |
+| `backend-parity-c/pipe-ipc` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/pipe-ipc` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/pipe-multiwriter-ordering` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/pipe2-flags` | `verify` | `kvm` | `green` | `measured-and-passed` |
@@ -274,7 +274,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `backend-parity-c/set-tid-address` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/set-tid-address` | `verify` | `liteinst` | `red` | `measured-and-passed` |
 | `backend-parity-c/set-tid-address` | `verify` | `ptrace` | `green` | `measured-and-passed` |
-| `backend-parity-c/short-io-split-identity` | `verify` | `kvm` | `red` | `measured-and-passed` |
+| `backend-parity-c/short-io-split-identity` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/short-io-split-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/shutdown-socketpair` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `backend-parity-c/shutdown-socketpair` | `verify` | `ptrace` | `green` | `measured-and-passed` |
