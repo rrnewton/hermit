@@ -24,9 +24,11 @@ pub(crate) enum RecordEnvelopePolicy {
     /// Exclude only records emitted by the DBT evidence transport about
     /// itself. Those records are real and present in a live evidence stream
     /// (`evidence_emit_image_initialization`, reverie-dbt
-    /// native/client.c:863), but live DBT run verification compares them:
-    /// its adapter selects [`Self::AllRecordsV1`]. This policy is offered for
-    /// offline `hermit log-diff` inspection of an archived evidence log.
+    /// native/client.c), but their host-arrival order is not guest behavior.
+    /// Live DBT verification uses Reverie's authenticated initialization count
+    /// as separate typed evidence and selects this policy for the remaining
+    /// records. Offline `hermit log-diff` can apply the same selection to an
+    /// archived evidence log.
     DbtEvidenceTransportV1,
     /// A predicate whose semantics are not one of the named canonical policies.
     CallerDefined,

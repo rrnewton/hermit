@@ -802,10 +802,10 @@ mod tests {
 
     /// The DBT arm builds its own [`verify::ComparisonOptions`], so the record
     /// envelope it names is not covered by the generic verifier's tests. Pin it
-    /// to a canonical policy: an opaque `caller_defined` predicate here would
-    /// silently disqualify every DBT verdict from bitwise parity, and a switch
-    /// to the transport envelope would start excluding records this adapter
-    /// compares today. Either is a deliberate change that must edit this test.
+    /// to the canonical transport policy selected by Reverie's authenticated
+    /// decoder. An opaque `caller_defined` predicate here would silently
+    /// disqualify every DBT verdict from bitwise parity, while `all_records_v1`
+    /// would falsely claim that initialization records remain in the log.
     #[test]
     fn dbt_verdict_names_a_canonical_record_envelope() {
         let source = include_str!("backends.rs");
@@ -830,16 +830,16 @@ mod tests {
         };
         assert_eq!(
             record_envelope_literal(),
-            "RecordEnvelope::all_records_v1()",
-            "the DBT adapter compares every decoded evidence record. Changing this envelope \
-             changes which records are compared, so update the adapter and its evidence \
-             together, not just this literal"
+            "RecordEnvelope::dbt_evidence_transport_v1()",
+            "the DBT adapter compares every non-transport evidence record and compares the \
+             authenticated initialization count separately. Changing this envelope changes \
+             which records are compared, so update the adapter and its evidence together, not \
+             just this literal"
         );
-        // Naming the envelope is worth nothing if the adapter filters the log
-        // on its way in: the verdict would publish `all_records_v1` over an
-        // already-stripped stream, which is exactly the undisclosed filtering
-        // this envelope exists to prevent. `write_canonical_info_with_filter`
-        // invites that at a backend boundary, so pin the unfiltered call.
+        // Naming the envelope is worth nothing if the adapter applies another
+        // unreported filter while materializing the already decoded records.
+        // `write_canonical_info_with_filter` invites that at a backend boundary,
+        // so pin the unfiltered call.
         let materialize = source
             .find("fn materialize_dbt_comparison_log")
             .expect("DBT comparison log materialization");
@@ -852,23 +852,22 @@ mod tests {
         );
         assert!(
             !body.contains("write_canonical_info_with_filter"),
-            "filtering at the DBT boundary while the verdict names all_records_v1 publishes a \
-             policy that was not applied"
+            "filtering at the DBT boundary would apply an undisclosed second policy"
         );
         // Bind the literal above to the real policy, so renaming the
         // constructor without preserving its meaning fails here too.
         assert!(
-            crate::record_envelope::RecordEnvelope::all_records_v1()
+            crate::record_envelope::RecordEnvelope::dbt_evidence_transport_v1()
                 .policy()
                 .is_canonical(),
-            "all_records_v1 must remain a canonical envelope or DBT verdicts silently lose \
+            "dbt_evidence_transport_v1 must remain canonical or DBT verdicts silently lose \
              bitwise-parity eligibility"
         );
         assert_eq!(
-            crate::record_envelope::RecordEnvelope::all_records_v1()
+            crate::record_envelope::RecordEnvelope::dbt_evidence_transport_v1()
                 .policy()
                 .as_str(),
-            "all_records_v1"
+            "dbt_evidence_transport_v1"
         );
     }
 
