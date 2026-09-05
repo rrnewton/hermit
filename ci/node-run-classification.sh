@@ -52,4 +52,3 @@ classify_run() {
     fi
     echo 'pass'
 }
-
