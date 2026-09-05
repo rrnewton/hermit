@@ -724,8 +724,8 @@ impl DbtOrdinaryLogCapture {
     }
 
     fn finish(mut self) -> Result<usize, Error> {
-        let records = decode_dbt_evidence(&mut self.evidence)?;
-        materialize_dbt_ordinary_log(&records, self.destination, &self.destination_path)
+        let evidence = decode_dbt_evidence(&mut self.evidence)?;
+        materialize_dbt_ordinary_log(&evidence.records, self.destination, &self.destination_path)
     }
 }
 

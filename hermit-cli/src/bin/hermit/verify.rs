@@ -544,6 +544,9 @@ fn comparison_report(comparison: &ComparisonSpec) -> ComparisonReport {
         log_scope: Some(comparison.log_scope),
         record_envelope: match comparison.record_envelope {
             RecordEnvelopePolicy::AllRecordsV1 => RecordEnvelopeReport::AllRecordsV1,
+            RecordEnvelopePolicy::DbtEvidenceTransportV1 => {
+                RecordEnvelopeReport::DbtEvidenceTransportV1
+            }
             RecordEnvelopePolicy::CallerDefined => RecordEnvelopeReport::CallerDefined,
         },
         virtualize_time: Some(comparison.virtualize_time),
