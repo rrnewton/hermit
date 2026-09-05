@@ -544,9 +544,6 @@ fn comparison_report(comparison: &ComparisonSpec) -> ComparisonReport {
         log_scope: Some(comparison.log_scope),
         record_envelope: match comparison.record_envelope {
             RecordEnvelopePolicy::AllRecordsV1 => RecordEnvelopeReport::AllRecordsV1,
-            RecordEnvelopePolicy::DbtEvidenceTransportV1 => {
-                RecordEnvelopeReport::DbtEvidenceTransportV1
-            }
             RecordEnvelopePolicy::CallerDefined => RecordEnvelopeReport::CallerDefined,
         },
         virtualize_time: Some(comparison.virtualize_time),
@@ -2610,15 +2607,6 @@ mod tests {
             full.is_bitwise_parity(),
             "a full-INFO unstripped all-records comparison must qualify"
         );
-        assert!(
-            ComparisonSpec {
-                record_envelope: RecordEnvelopePolicy::DbtEvidenceTransportV1,
-                ..full
-            }
-            .is_bitwise_parity(),
-            "the named DBT transport envelope is a disclosed canonical policy"
-        );
-
         // Negatives: each independent weakening of the qualifying spec must be
         // refused, so no single relaxed dimension can pass as bitwise parity.
         let stripped = ComparisonSpec::new(
@@ -2729,72 +2717,6 @@ mod tests {
         assert_eq!(json["verdict"], "no_result");
         assert_eq!(json["runtime"]["run1"]["virtual_nanoseconds"], 34);
         assert_eq!(json["runtime"]["run2"]["syscalls"], 6);
-    }
-
-    #[test]
-    fn dbt_transport_only_is_disclosed_and_cannot_qualify_as_parity() {
-        let output = output(0, b"hello\n", b"");
-        let (left, right) = empty_logs();
-        let transport = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized\n";
-        fs::write(&left, transport).unwrap();
-        fs::write(&right, transport).unwrap();
-
-        let outcome = compare_with_envelope(
-            &output,
-            left,
-            &output,
-            right,
-            LogCompareStrictness::Canonical,
-            RecordEnvelope::dbt_evidence_transport_v1(),
-        )
-        .unwrap();
-        let report = verification_report(&outcome);
-
-        assert_eq!(outcome.verdict, Verdict::Matched);
-        assert_eq!(
-            outcome.compared_log_messages,
-            Some(ComparedLogCounts { left: 0, right: 0 })
-        );
-        assert_eq!(
-            outcome.comparison.record_envelope,
-            RecordEnvelopePolicy::DbtEvidenceTransportV1
-        );
-        assert!(!report.bitwise_parity);
-    }
-
-    #[test]
-    fn dbt_real_detcore_record_matches_under_the_disclosed_envelope() {
-        let output = output(0, b"hello\n", b"");
-        let (left, right) = empty_logs();
-        let record = detcore::detlog::record_suffix(detcore::detlog::DetLogEvent::Syscall);
-        let log = format!(
-            "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized\n\
-             2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall] getpid() = Ok(3){record}\n"
-        );
-        fs::write(&left, &log).unwrap();
-        fs::write(&right, &log).unwrap();
-
-        let outcome = compare_with_envelope(
-            &output,
-            left,
-            &output,
-            right,
-            LogCompareStrictness::Canonical,
-            RecordEnvelope::dbt_evidence_transport_v1(),
-        )
-        .unwrap();
-        let report = verification_report(&outcome);
-        let json = serde_json::to_value(&report).unwrap();
-
-        assert_eq!(
-            outcome.compared_log_messages,
-            Some(ComparedLogCounts { left: 1, right: 1 })
-        );
-        assert!(report.bitwise_parity);
-        assert_eq!(
-            json["comparison"]["record_envelope"],
-            "dbt_evidence_transport_v1"
-        );
     }
 
     #[test]

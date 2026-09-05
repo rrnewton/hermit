@@ -3037,14 +3037,9 @@ impl RunOpts {
             // sidecar available to the harness.
             capture.prepare()?;
         }
-        if guest_run_capture.is_some() && self.selected_backend() == Backend::Dbt {
-            anyhow::bail!(
-                "DBT ordinary-run result capture is unavailable because the launcher currently \
-                 combines guest stderr with controller diagnostics; refusing to label that mixed \
-                 stream as exact guest stderr"
-            );
-        }
-        let staged_run_summary = if guest_run_capture.is_some() {
+        let selected_backend = self.selected_backend();
+        let staged_run_summary = if guest_run_capture.is_some() || selected_backend == Backend::Dbt
+        {
             self.summary_json
                 .clone()
                 .map(|destination| {
@@ -3056,6 +3051,13 @@ impl RunOpts {
         } else {
             None
         };
+        if guest_run_capture.is_some() && selected_backend == Backend::Dbt {
+            anyhow::bail!(
+                "DBT ordinary-run result capture is unavailable because drrun, DynamoRIO core, \
+                 and the guest structurally share file descriptors 1 and 2; refusing to publish \
+                 those mixed streams as exact guest stdout and stderr"
+            );
+        }
         if let Some(path) = &self.backend_engagement_json {
             clear_machine_record(path, "backend engagement")?;
         }
@@ -3092,7 +3094,7 @@ impl RunOpts {
                  host; a successful exit does not establish complete deterministic execution."
             );
         }
-        let backend = self.selected_backend();
+        let backend = selected_backend;
         if backend == Backend::E9patch && self.no_namespace {
             anyhow::bail!(
                 "--backend=e9patch requires mount namespaces to overlay the rewritten ELF at its \

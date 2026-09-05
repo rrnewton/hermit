@@ -231,6 +231,10 @@ pub enum ComparedLogScope {
 #[serde(rename_all = "snake_case")]
 pub enum RecordEnvelopeReport {
     AllRecordsV1,
+    /// Read-only compatibility for reports written before Reverie's typed DBT
+    /// evidence decoder separated transport initialization from comparable
+    /// records. Current producers must emit [`Self::AllRecordsV1`].
+    #[serde(skip_serializing)]
     DbtEvidenceTransportV1,
     CallerDefined,
 }
@@ -693,6 +697,28 @@ mod tests {
         let report = report.expect("a pre-field report is not malformed");
         assert_eq!(report.first_divergent_scheduler_turn, None);
         assert_eq!(report.first_divergent_virtual_nanoseconds, None);
+    }
+
+    #[test]
+    fn historical_dbt_record_envelope_parses_but_current_reports_do_not_emit_it() {
+        let historical = br#"{"verified":true,"bitwise_parity":true,"verdict":"matched",
+            "comparison":{"strictness":"canonical","compare_logs":true,
+            "record_envelope":"dbt_evidence_transport_v1"},
+            "compared_log_messages":{"left":180,"right":180}}"#;
+        let historical = VerificationReport::from_json_slice(historical)
+            .expect("a stored report using the historical envelope must remain readable");
+        let envelope = historical.comparison.as_ref().unwrap().record_envelope;
+        assert_eq!(envelope, RecordEnvelopeReport::DbtEvidenceTransportV1);
+        assert!(envelope.is_canonical());
+        assert!(
+            serde_json::to_string(&historical).is_err(),
+            "the legacy read-only variant must not be emitted by a new serializer"
+        );
+
+        let current = serde_json::to_string(&report(LogCompareStrictness::Canonical, true, 1, 1))
+            .expect("current report serializes");
+        assert!(current.contains("\"record_envelope\":\"all_records_v1\""));
+        assert!(!current.contains("dbt_evidence_transport_v1"));
     }
 
     #[test]

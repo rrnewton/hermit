@@ -76,9 +76,8 @@ pub struct LogDiffCLIOpts {
     #[clap(long)]
     canonical_info: bool,
 
-    /// Versioned record envelope applied before selecting messages. DBT logs
-    /// must opt into their transport envelope explicitly; the default preserves
-    /// every parsed record.
+    /// Versioned record envelope applied before selecting messages. The default
+    /// preserves every comparable record supplied by the log producer.
     #[clap(long, value_enum, default_value = "all-records-v1")]
     record_envelope: RecordEnvelopeArg,
 
@@ -723,130 +722,19 @@ mod tests {
     }
 
     #[test]
-    fn standalone_logdiff_refuses_transport_only_evidence_under_named_dbt_envelope() {
+    fn standalone_default_compares_every_record() {
         let directory = tempfile::tempdir().unwrap();
-        let transport = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized";
-        let left = directory.path().join("left.log");
-        let right = directory.path().join("right.log");
-        let envelope = RecordEnvelope::dbt_evidence_transport_v1();
-
-        std::fs::write(&left, transport).unwrap();
-        std::fs::write(&right, transport).unwrap();
-        assert_eq!(
-            write_canonical_info(&left, &mut Vec::new(), envelope).unwrap(),
-            0
-        );
-        let (empty, records_left, records_right) =
-            try_log_diff_with_records(&left, &right, &follow_options(), envelope).unwrap();
-        assert!(!empty.matched_with_evidence());
-
-        let report = serde_json::to_value(json_report(
-            &empty,
-            &follow_options(),
-            JsonRecords {
-                compared: records_left.min(records_right),
-                available_left: records_left,
-                available_right: records_right,
-                withheld_incomplete_tail: false,
-            },
-            envelope.policy(),
-        ))
-        .unwrap();
-        assert_eq!(report["verdict"], "no_comparable_messages");
-        assert_eq!(report["selected_messages"]["left"], 0);
-        assert_eq!(report["selected_messages"]["right"], 0);
-        assert_eq!(report["records"]["available_left"], 1);
-        assert_eq!(report["records"]["available_right"], 1);
-        assert_eq!(
-            report["comparison"]["record_envelope"],
-            "dbt_evidence_transport_v1"
-        );
-    }
-
-    #[test]
-    fn standalone_default_does_not_silently_apply_the_dbt_envelope() {
-        let directory = tempfile::tempdir().unwrap();
-        let transport = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized";
+        let record = "1970-01-01T00:00:00.000000Z INFO detcore: ordinary record";
         let left = directory.path().join("left.log");
         let right = directory.path().join("right.log");
         let envelope = RecordEnvelope::all_records_v1();
 
-        std::fs::write(&left, transport).unwrap();
-        std::fs::write(&right, transport).unwrap();
+        std::fs::write(&left, record).unwrap();
+        std::fs::write(&right, record).unwrap();
         let (summary, _, _) =
             try_log_diff_with_records(&left, &right, &follow_options(), envelope).unwrap();
         assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
         assert!(summary.matched_with_evidence());
-    }
-
-    #[test]
-    fn standalone_logdiff_admits_one_real_record() {
-        let directory = tempfile::tempdir().unwrap();
-        let real = "2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall] getpid() = Ok(3)";
-        let left = directory.path().join("left.log");
-        let right = directory.path().join("right.log");
-        let envelope = RecordEnvelope::dbt_evidence_transport_v1();
-
-        std::fs::write(&left, real).unwrap();
-        std::fs::write(&right, real).unwrap();
-        assert_eq!(
-            write_canonical_info(&left, &mut Vec::new(), envelope).unwrap(),
-            1
-        );
-        let (one, _, _) =
-            try_log_diff_with_records(&left, &right, &follow_options(), envelope).unwrap();
-        assert_eq!((one.compared_left, one.compared_right), (1, 1));
-        assert!(one.matched_with_evidence());
-
-        let report = serde_json::to_value(json_report(
-            &one,
-            &follow_options(),
-            no_records(),
-            envelope.policy(),
-        ))
-        .unwrap();
-        assert_eq!(
-            report["comparison"]["record_envelope"],
-            "dbt_evidence_transport_v1"
-        );
-    }
-
-    #[test]
-    fn standalone_logdiff_drops_transport_beside_one_real_record() {
-        let directory = tempfile::tempdir().unwrap();
-        let transport = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized";
-        let real = "2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall] getpid() = Ok(3)";
-        let left = directory.path().join("left.log");
-        let right = directory.path().join("right.log");
-        let envelope = RecordEnvelope::dbt_evidence_transport_v1();
-
-        std::fs::write(&left, format!("{transport}\n{real}")).unwrap();
-        std::fs::write(&right, format!("{transport}\n{real}")).unwrap();
-        assert_eq!(
-            write_canonical_info(&left, &mut Vec::new(), envelope).unwrap(),
-            1
-        );
-        let (one, _, _) =
-            try_log_diff_with_records(&left, &right, &follow_options(), envelope).unwrap();
-        assert_eq!((one.compared_left, one.compared_right), (1, 1));
-        assert!(one.matched_with_evidence());
-    }
-
-    #[test]
-    fn standalone_logdiff_ignores_difference_confined_to_transport() {
-        let directory = tempfile::tempdir().unwrap();
-        let transport = "1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized";
-        let real = "2026-08-21T10:00:00.000000Z INFO detcore: DETLOG [syscall] getpid() = Ok(3)";
-        let left = directory.path().join("left.log");
-        let right = directory.path().join("right.log");
-        let envelope = RecordEnvelope::dbt_evidence_transport_v1();
-
-        std::fs::write(&left, format!("{transport}\n{real}")).unwrap();
-        std::fs::write(&right, real).unwrap();
-        let (summary, _, _) =
-            try_log_diff_with_records(&left, &right, &follow_options(), envelope).unwrap();
-        assert!(!summary.diff_found);
-        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
     }
 
     #[test]
@@ -1013,7 +901,7 @@ mod tests {
             "left.log",
             "right.log",
             "--record-envelope",
-            "dbt-evidence-transport-v1",
+            "all-records-v1",
             "--print-logs",
             "--json",
             "diff.json",
@@ -1022,10 +910,7 @@ mod tests {
         assert_eq!(two.file_b, Some(PathBuf::from("right.log")));
         assert!(two.more.print_logs);
         assert_eq!(two.json, Some(PathBuf::from("diff.json")));
-        assert_eq!(
-            two.record_envelope,
-            RecordEnvelopeArg::DbtEvidenceTransportV1
-        );
+        assert_eq!(two.record_envelope, RecordEnvelopeArg::AllRecordsV1);
     }
 
     #[test]

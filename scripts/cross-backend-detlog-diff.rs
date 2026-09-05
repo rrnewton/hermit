@@ -31,13 +31,12 @@
 //! them across backends is where the sharp edges are:
 //!
 //! 1. **Evidence must come from an authoritative sink.** `ptrace` honours the
-//!    host-opened `--log-file`. DBT now publishes a protected ordinary-run log,
-//!    but its transport-only INFO records require a named comparison envelope
-//!    that this diagnostic cannot yet select through the fixed API. SaBRe
-//!    forwards its real Detcore records to raw stderr while the host
-//!    `--log-file` contains only an incomplete controller stream. This tool
-//!    refuses both cases rather than accepting guest-forgeable evidence or
-//!    reporting transport records as a guest divergence.
+//!    host-opened `--log-file`. DBT publishes a protected ordinary-run log whose
+//!    typed decoder authenticates transport initialization separately and
+//!    exposes only comparable records. SaBRe forwards its real Detcore records
+//!    to raw stderr while the host `--log-file` contains only an incomplete
+//!    controller stream. This tool refuses that case rather than accepting
+//!    guest-forgeable evidence.
 //! 2. **Normalization is where fake parity gets manufactured.** Comparison uses
 //!    the fixed `BitwiseInfoV1` policy from `detcore::logdiff`: remove only the
 //!    real wall-clock prefix, canonicalize explicitly marked host addresses by
@@ -171,9 +170,8 @@ fn usage() -> String {
          \x20 --list-normalizations   describe every normalization and exit\n\n\
          Backends: ptrace, dbt, liteinst, sabre, kvm. `e9patch` means\n\
          preprocessing followed by the ptrace runtime; it is not a backend.\n\
-         DBT currently refuses because its protected log includes transport\n\
-         INFO records and the named DBT envelope is not available here. SaBRe\n\
-         also refuses: its Detcore records use raw guest-controllable stderr,\n\
+         DBT publishes comparable records through its protected decoded log.\n\
+         SaBRe refuses: its Detcore records use raw guest-controllable stderr,\n\
          while the host --log-file is incomplete.\n\n\
          Exit: 0 agree, 1 diverge, 2 could not compare.\n",
     );
@@ -289,11 +287,6 @@ fn select_authoritative_stream<'a>(
     from_file: &'a [u8],
     stderr: &'a [u8],
 ) -> Result<(&'static str, &'a [u8], usize), String> {
-    if backend == "dbt" {
-        return Err(format!(
-            "{side} DynamoRIO DBT has an authoritative ordinary-run log file, but that log contains DBT evidence-transport INFO records and this diagnostic cannot yet select the named dbt_evidence_transport_v1 envelope through the fixed BitwiseInfoV1 API; refusing rather than reporting those transport records as a guest divergence"
-        ));
-    }
     if backend == "sabre" {
         return Err(format!(
             "{side} SaBRe Detcore records are forwarded to raw stderr, which is shared with the guest and can be forged, while the host --log-file contains an incomplete controller stream; no isolated typed/authenticated complete sink is exposed, so this diagnostic refuses SaBRe (use strict canonical verify instead)"
@@ -450,12 +443,6 @@ fn validate_fixed_comparison(cfg: &Config) -> Result<(), String> {
             "lossy normalization(s) {} were requested; the fixed BitwiseInfoV1 policy compares virtual time and thread identity exactly, so this diagnostic refuses before running either guest",
             lossy.join(", ")
         ));
-    }
-    if cfg.backends.iter().any(|backend| backend == "dbt") {
-        return Err(
-            "DynamoRIO DBT has an authoritative ordinary-run log file, but that log contains DBT evidence-transport INFO records and this diagnostic cannot yet select the named dbt_evidence_transport_v1 envelope through the fixed BitwiseInfoV1 API; refusing rather than reporting those transport records as a guest divergence"
-                .to_string(),
-        );
     }
     Ok(())
 }
@@ -868,9 +855,11 @@ fn run_self_test() {
         "guest-controllable stderr was accepted without an authoritative log file",
     );
     check(
-        select_authoritative_stream("left", "dbt", authoritative, forged_longer)
-            .is_err_and(|error| error.contains("dbt_evidence_transport_v1")),
-        "DBT transport records were compared without their named envelope",
+        matches!(
+            select_authoritative_stream("left", "dbt", authoritative, forged_longer),
+            Ok(("log-file", selected, _)) if selected == authoritative
+        ),
+        "DBT authoritative log file was refused or displaced by guest-controllable stderr",
     );
     check(
         select_authoritative_stream("left", "sabre", authoritative, forged_longer).is_err_and(
@@ -905,8 +894,8 @@ fn run_self_test() {
             ["ptrace", "dbt"],
             &["wall-clock", "host-addresses"],
         ))
-        .is_err_and(|error| error.contains("dbt_evidence_transport_v1")),
-        "DBT cross-backend comparison was not refused without its named envelope",
+        .is_ok(),
+        "DBT cross-backend comparison was refused despite its comparable decoded log",
     );
 
     let common = format!(
@@ -946,21 +935,25 @@ fn run_self_test() {
         self_test_record(4, "INFO", "guest_observer", "payload=B"),
         self_test_record(5, "INFO", "guest_observer", "tail=D"),
     );
-    for (first, second, expected_left, expected_right) in [
+    for (left_label, first, right_label, second, expected_left, expected_right) in [
         (
+            "ptrace",
             left.as_bytes(),
+            "dbt",
             right.as_bytes(),
             "INFO guest_observer: payload=A",
             "INFO guest_observer: payload=B",
         ),
         (
+            "dbt",
             right.as_bytes(),
+            "ptrace",
             left.as_bytes(),
             "INFO guest_observer: payload=B",
             "INFO guest_observer: payload=A",
         ),
     ] {
-        match compare_authoritative_logs(1, "ptrace", first, "candidate", second) {
+        match compare_authoritative_logs(1, left_label, first, right_label, second) {
             Ok(comparison) => {
                 let summary = &comparison.summary;
                 check(
@@ -987,7 +980,9 @@ fn run_self_test() {
                 check(
                     diagnostic.contains("Comparing INFO messages")
                         && diagnostic.contains("Divergent syscall context:")
-                        && diagnostic.contains("Prior completed syscalls for ptrace:")
+                        && diagnostic.contains(&format!(
+                            "Prior completed syscalls for {left_label}:"
+                        ))
                         && diagnostic.contains("finish syscall #36: read"),
                     "shared first-divergence report did not include selected scope and context",
                 );
@@ -1007,23 +1002,37 @@ fn run_self_test() {
         self_test_record(3, "DEBUG", "guest_observer", "not selected"),
         self_test_record(4, "INFO", "guest_observer", "selected"),
     );
-    match compare_authoritative_logs(0, "left", mixed.as_bytes(), "right", mixed.as_bytes()) {
-        Ok(comparison) => {
-            check(
-                comparison.summary.matched_with_evidence()
-                    && comparison_exit_code(&comparison.summary) == 0,
-                "identical nonempty canonical INFO did not map to exit 0",
-            );
-            check(
-                (
-                    comparison.summary.compared_left,
-                    comparison.summary.compared_right,
-                ) == (2, 2)
-                    && (comparison.total_left, comparison.total_right) == (4, 4),
-                "selected INFO counts were confused with total parsed records",
-            );
+    for (left_label, right_label) in [("ptrace", "dbt"), ("dbt", "ptrace")] {
+        match compare_authoritative_logs(
+            0,
+            left_label,
+            mixed.as_bytes(),
+            right_label,
+            mixed.as_bytes(),
+        ) {
+            Ok(comparison) => {
+                check(
+                    comparison.summary.matched_with_evidence()
+                        && comparison_exit_code(&comparison.summary) == 0,
+                    "identical nonempty canonical INFO did not map to exit 0",
+                );
+                check(
+                    (
+                        comparison.summary.compared_left,
+                        comparison.summary.compared_right,
+                    ) == (2, 2)
+                        && (comparison.total_left, comparison.total_right) == (4, 4),
+                    "selected INFO counts were confused with total parsed records",
+                );
+                check(
+                    comparison.summary.first_divergent_record.is_none()
+                        && comparison.summary.first_divergent_left_message.is_none()
+                        && comparison.summary.first_divergent_right_message.is_none(),
+                    "an identical cross-backend comparison invented a first divergence",
+                );
+            }
+            Err(error) => check(false, &format!("canonical match failed: {error}")),
         }
-        Err(error) => check(false, &format!("canonical match failed: {error}")),
     }
 
     let valid = self_test_structured_record(1, "DETLOG stable", DetLogEvent::Other);

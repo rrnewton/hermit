@@ -729,6 +729,29 @@ impl DbtOrdinaryLogCapture {
     }
 }
 
+/// Complete every other fallible ordinary-run output before publishing the log.
+///
+/// The host-opened log destination starts empty. Keeping log publication last
+/// prevents a later statistics or output failure from leaving bytes that a
+/// caller could mistake for an authoritative completed run.
+#[cfg(feature = "dbt")]
+fn finish_dbt_ordinary_run(
+    ordinary_log: Option<DbtOrdinaryLogCapture>,
+    single_run_stats: Option<DbtStatsCapture>,
+    summary: bool,
+    backend_engagement_json: Option<&Path>,
+    finish_output: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
+    if let Some(capture) = single_run_stats {
+        finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?;
+    }
+    finish_output()?;
+    if let Some(capture) = ordinary_log {
+        capture.finish()?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "dbt")]
 fn validate_dbt_ordinary_log_configuration(
     log_requested: bool,
@@ -765,6 +788,11 @@ fn decode_dbt_evidence(file: &mut std::fs::File) -> Result<DecodedDbtEvidence, E
         ))
     })?;
     let initialization_records = evidence.initialization_records();
+    if initialization_records == 0 {
+        return Err(Error::msg(
+            "DBT canonical evidence contained no validated process image initialization",
+        ));
+    }
     Ok(DecodedDbtEvidence {
         records: evidence.into_records(),
         initialization_records,
@@ -1055,22 +1083,23 @@ pub(super) fn run_dbt(
     if !verify {
         if stdin_is_terminal {
             let status = run_status(&runtime, &runner, &guest, &drrun, config)?;
-            if let Some(capture) = ordinary_log {
-                capture.finish()?;
-            }
-            if let Some(capture) = single_run_stats {
-                finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?;
-            }
+            finish_dbt_ordinary_run(
+                ordinary_log,
+                single_run_stats,
+                summary,
+                backend_engagement_json,
+                || Ok(()),
+            )?;
             return Ok(process_status(status));
         }
         let output = run_once(&runtime, &runner, &guest, &drrun, config, std::io::stdin())?;
-        if let Some(capture) = ordinary_log {
-            capture.finish()?;
-        }
-        if let Some(capture) = single_run_stats {
-            finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?;
-        }
-        write_output(&output)?;
+        finish_dbt_ordinary_run(
+            ordinary_log,
+            single_run_stats,
+            summary,
+            backend_engagement_json,
+            || write_output(&output),
+        )?;
         return Ok(output_status(&output));
     }
 
@@ -2513,6 +2542,56 @@ mod tests {
             fs::read(destination.path()).unwrap(),
             b"original contents",
             "unverified evidence must not replace the host log"
+        );
+    }
+
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn dbt_ordinary_log_is_published_only_after_other_outputs_succeed() {
+        let destination = tempfile::NamedTempFile::new().unwrap();
+        let capture =
+            DbtOrdinaryLogCapture::new(Some(destination.path()), Some(destination.as_file()))
+                .unwrap()
+                .unwrap();
+        let stats = DbtStatsCapture::new().unwrap();
+        let engagement = tempfile::NamedTempFile::new().unwrap();
+        let error = finish_dbt_ordinary_run(
+            Some(capture),
+            Some(stats),
+            false,
+            Some(engagement.path()),
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("typed whole-process statistics were missing"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(destination.path()).unwrap(),
+            b"",
+            "a failed statistics artifact must not leave an authoritative log"
+        );
+
+        let destination = tempfile::NamedTempFile::new().unwrap();
+        let capture =
+            DbtOrdinaryLogCapture::new(Some(destination.path()), Some(destination.as_file()))
+                .unwrap()
+                .unwrap();
+        let error = finish_dbt_ordinary_run(Some(capture), None, false, None, || {
+            Err(Error::msg("injected output publication failure"))
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("output publication failure"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(destination.path()).unwrap(),
+            b"",
+            "a failed output publication must not leave an authoritative log"
         );
     }
 
