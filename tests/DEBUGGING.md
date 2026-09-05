@@ -69,6 +69,81 @@
 
 # c-programs
 
+## c-programs/writev-determinism
+
+### 2026-09-02 — historical CPU variation followed changing test work
+
+- Scope: the reported solo cohort contained 27 `PASS` observations from full
+  validates on one recorded host, at outer DAG width 16 and inner manifest
+  width 8.
+  Its unpartitioned CPU result was mean 0.545198 seconds, sample standard
+  deviation 0.480885 seconds, and CV 0.882. Every observation had exactly one
+  attempt, so retries did not contribute.
+- Distribution: partitioning those same observations by the result row's
+  `test_sha256` changes the result materially:
+
+  | `test_sha256` prefix | n | CPU mean | sample SD | CV | scheduler turns | syscalls |
+  |---|---:|---:|---:|---:|---:|---:|
+  | `3c0b82fdee9b` | 18 | 0.247418s | 0.022896s | 0.093 | 204 | 147 |
+  | `45d3c45959c4` | 2 | 0.483777s | 0.095295s | 0.197 | 613 | 299 |
+  | `8c60c1f11b33` | 5 | 1.313803s | 0.151321s | 0.115 | 4062 | 308 |
+  | `3cdfef2f2edd` | 2 | 1.365126s | 0.030647s | 0.022 | 4474 | 458 |
+
+  Differences between those four source-group means account for 98.16% of
+  the cohort's total squared CPU deviation; 1.84% remains within the groups.
+  Within each hash, the observation SHA-256 and stdout were identical. The
+  first group emitted only `writev-stdout` and `writev-determinism-ok`; the
+  later groups added the two-blocked-writer check, six signal/partial-write
+  checks, or both. Commit `d04efc883640ff111781c6f324e3ed10c60f52ad`
+  adds the signal/partial-write cases to the default path, and
+  `9c4ae3e02c5ddd4f9d72ac43971ac26305ae48f3` adds the two-blocked-writer
+  check. Their larger stable scheduler-turn and syscall counts are direct
+  evidence that the later fixture versions intentionally execute more work.
+- Build and accounting: full validate invokes this bucket with `--prebuilt`.
+  On that path `prepare_test_until` copies the prepared C fixture and does not
+  invoke `cc`; the row's CPU value equalled its sole attempt's CPU value in all
+  27 observations. The measurement is the specific launched child's
+  `wait4(2)` user plus system CPU, including descendants it reaped; it is not
+  the enclosing DAG cgroup counter. Cached compilation, cgroup contamination,
+  and retries therefore do not explain this distribution.
+- Interpretation: the cross-version CV compares different work and is not
+  evidence that one version performs a non-conserved amount of work. The
+  corresponding within-version CPU CVs are 0.022–0.197; the largest value has
+  only two observations. The other nine cells in the original CPU top ten each
+  had one `test_sha256`, so source-version mixing did not explain their ranks.
+  As a same-SHA check outside the ranked solo cohort, two observations at
+  `b779f99f2add10d9fa198466efd2dbce0edbf689` with the same Hermit binary and
+  test hash used 0.210147 and 0.215621 CPU seconds.
+- Debugging rule: before interpreting cell runtime variance, partition rows by
+  `test_sha256` and `binary_sha256`, then hold host, outer/inner concurrency,
+  and attempt count constant. Compare scheduler turns, syscalls, virtual time,
+  observation hash, and stdout. A change in those work counters or outputs is
+  a changed workload to explain before investigating contention or caches.
+
+The raw fields can be inspected without rerunning the cell:
+
+```bash
+artifact_root=${DEV_HERMIT_ROOT:?set DEV_HERMIT_ROOT}/ignored/validate/artifacts
+rg -l 'writev-determinism' \
+  "$artifact_root" \
+  -g results.jsonl |
+while IFS= read -r result; do
+  jq -r 'select(.test == "c-programs/writev-determinism" and
+                .mode == "verify" and .backend == "ptrace" and
+                .outcome == "PASS" and (.cpu_usage_usec | type) == "number") |
+         [.run_id, .hermit_sha, .test_sha256, .binary_sha256,
+          .cpu_usage_usec, .duration_ms, (.attempts | length),
+          .runtime.run1.scheduler_turns, .runtime.run1.syscalls,
+          .attempts[0].observation_sha256] | @tsv' "$result"
+done
+```
+
+The producer implementation is
+`ci/manifest-plan/src/runner.rs`: `prepare_test_until` chooses prebuilt-copy
+versus compilation, `rusage_cpu_usage_usec` reads `wait4` user and system CPU,
+`run_cell` sums preparation and attempt CPU, and `test_digest` hashes the guest
+source bytes.
+
 # chaos-c
 
 # data-handling
