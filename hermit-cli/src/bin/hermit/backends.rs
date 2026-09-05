@@ -594,6 +594,101 @@ fn dbt_evidence_log_level(
     }
 }
 
+/// One authoritative log sink for an ordinary DBT run.
+///
+/// The destination is the file descriptor opened by `GlobalOpts` before any
+/// guest executes. The guest never receives that descriptor. It writes framed
+/// tracing records to Reverie's protected evidence channel instead; only after
+/// the complete DynamoRIO process tree is reaped do we decode that channel and
+/// replace the destination contents.
+#[cfg(feature = "dbt")]
+#[derive(Debug)]
+struct DbtOrdinaryLogCapture {
+    evidence: std::fs::File,
+    destination: std::fs::File,
+    destination_path: PathBuf,
+}
+
+#[cfg(feature = "dbt")]
+fn dbt_ordinary_log_level(requested: Option<LevelFilter>) -> DbtEvidenceLogLevel {
+    match requested {
+        Some(LevelFilter::TRACE) => DbtEvidenceLogLevel::Trace,
+        Some(LevelFilter::DEBUG) => DbtEvidenceLogLevel::Debug,
+        _ => DbtEvidenceLogLevel::Info,
+    }
+}
+
+#[cfg(feature = "dbt")]
+impl DbtOrdinaryLogCapture {
+    fn new(
+        destination_path: Option<&Path>,
+        destination: Option<&std::fs::File>,
+    ) -> Result<Option<Self>, Error> {
+        match (destination_path, destination) {
+            (None, None) => Ok(None),
+            (Some(path), Some(destination)) => Ok(Some(Self {
+                evidence: tempfile::tempfile().map_err(|error| {
+                    Error::msg(format!(
+                        "failed to create protected DBT ordinary-run evidence: {error}"
+                    ))
+                })?,
+                destination: destination.try_clone().map_err(|error| {
+                    Error::msg(format!(
+                        "failed to duplicate the host-opened DBT log {}: {error}",
+                        path.display()
+                    ))
+                })?,
+                destination_path: path.to_owned(),
+            })),
+            (Some(path), None) => Err(Error::msg(format!(
+                "DBT --log-file {} has no host-opened file descriptor",
+                path.display()
+            ))),
+            (None, Some(_)) => Err(Error::msg(
+                "DBT received a host-opened log descriptor without a --log-file path",
+            )),
+        }
+    }
+
+    fn configure(
+        &self,
+        runner: DbtRunner,
+        requested: Option<LevelFilter>,
+    ) -> Result<DbtRunner, Error> {
+        // A retained log is a canonical comparison input, so it must contain
+        // INFO even when the ordinary CLI default would otherwise be WARN.
+        // Preserve more verbose requests for diagnosis.
+        runner
+            .evidence_file(&self.evidence)
+            .map(|runner| runner.evidence_log_level(dbt_ordinary_log_level(requested)))
+            .map_err(|error| {
+                Error::msg(format!(
+                    "failed to configure protected DBT ordinary-run evidence: {error}"
+                ))
+            })
+    }
+
+    fn finish(mut self) -> Result<usize, Error> {
+        let records = decode_dbt_evidence(&mut self.evidence)?;
+        materialize_dbt_ordinary_log(&records, self.destination, &self.destination_path)
+    }
+}
+
+#[cfg(feature = "dbt")]
+fn validate_dbt_ordinary_log_configuration(
+    log_requested: bool,
+    panic_on_unsupported_syscalls: bool,
+) -> Result<(), Error> {
+    if log_requested && !panic_on_unsupported_syscalls {
+        return Err(Error::msg(
+            "DBT --log-file cannot be combined with --allow-unsupported-syscalls: the protected \
+             evidence transport isolates the process group and would change setsid/setpgid \
+             behavior; omit --allow-unsupported-syscalls or omit --log-file",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "dbt")]
 fn decode_dbt_evidence(file: &mut std::fs::File) -> Result<Vec<Vec<u8>>, Error> {
     file.seek(SeekFrom::Start(0))?;
@@ -637,6 +732,13 @@ fn materialize_dbt_comparison_log(
     }
     log.flush()?;
 
+    // Validate the same host-opened object we just wrote, not a second lookup
+    // of the user-supplied pathname. A concurrent rename or replacement must
+    // not let unrelated bytes authorize this evidence sink.
+    let requested_path = path.to_owned();
+    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", log.as_raw_fd()));
+    let path = descriptor_path.as_path();
+
     // The verdict this comparison publishes names `all_records_v1`, so every
     // decoded record must reach the log. Filtering here instead of at the
     // envelope would report a policy that was not applied, which is the exact
@@ -660,7 +762,8 @@ fn materialize_dbt_comparison_log(
     let compared =
         detcore::logdiff::write_canonical_info(path, &mut std::io::sink()).map_err(|error| {
             Error::msg(format!(
-                "DBT canonical evidence did not contain a valid log stream: {error}"
+                "DBT canonical evidence for {} did not contain a valid log stream: {error}",
+                requested_path.display()
             ))
         })?;
     if compared == 0 {
@@ -672,39 +775,94 @@ fn materialize_dbt_comparison_log(
 }
 
 #[cfg(feature = "dbt")]
+fn materialize_dbt_ordinary_log(
+    records: &[Vec<u8>],
+    mut destination: std::fs::File,
+    destination_path: &Path,
+) -> Result<usize, Error> {
+    // Decode has authenticated the transport, but canonical validation can
+    // still refuse an empty or structurally invalid INFO stream. Complete all
+    // validation in an anonymous staging file before changing the requested
+    // destination.
+    let mut staged = tempfile::tempfile().map_err(|error| {
+        Error::msg(format!(
+            "failed to stage the DBT ordinary-run log for {}: {error}",
+            destination_path.display()
+        ))
+    })?;
+    let compared = materialize_dbt_comparison_log(records, staged.try_clone()?, destination_path)?;
+    publish_validated_dbt_log(&mut staged, &mut destination).map_err(|error| {
+        Error::msg(format!(
+            "failed to publish validated DBT ordinary-run log {}: {error}",
+            destination_path.display()
+        ))
+    })?;
+    Ok(compared)
+}
+
+#[cfg(feature = "dbt")]
+trait DbtLogDestination: Write + std::io::Seek {
+    fn set_len(&mut self, len: u64) -> std::io::Result<()>;
+}
+
+#[cfg(feature = "dbt")]
+impl DbtLogDestination for std::fs::File {
+    fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+        std::fs::File::set_len(self, len)
+    }
+}
+
+#[cfg(feature = "dbt")]
+fn publish_validated_dbt_log(
+    staged: &mut std::fs::File,
+    destination: &mut impl DbtLogDestination,
+) -> std::io::Result<()> {
+    staged.seek(SeekFrom::Start(0))?;
+    let expected = staged.metadata()?.len();
+    destination.set_len(0)?;
+
+    let publish = (|| {
+        destination.seek(SeekFrom::Start(0))?;
+        let copied = std::io::copy(staged, &mut *destination)?;
+        if copied != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("copied {copied} bytes from {expected} validated bytes"),
+            ));
+        }
+        destination.flush()
+    })();
+    let Err(primary) = publish else {
+        return Ok(());
+    };
+
+    let mut cleanup_errors = Vec::new();
+    if let Err(error) = destination.set_len(0) {
+        cleanup_errors.push(format!("truncate-to-zero failed: {error}"));
+    }
+    if let Err(error) = destination.seek(SeekFrom::Start(0)) {
+        cleanup_errors.push(format!("rewind-to-zero failed: {error}"));
+    }
+    if cleanup_errors.is_empty() {
+        Err(primary)
+    } else {
+        Err(std::io::Error::new(
+            primary.kind(),
+            format!(
+                "{primary}; cleanup after publication failure also failed: {}",
+                cleanup_errors.join("; ")
+            ),
+        ))
+    }
+}
+
+#[cfg(feature = "dbt")]
 fn dbt_verification_output(output: Output) -> reverie::process::Output {
     reverie::process::Output {
         status: process_status(output.status),
         stdout: output.stdout,
         stderr: output.stderr,
     }
-}
-
-/// The DBT `--log-file` refusal message, named so a test can assert the exact text
-/// rather than a paraphrase of it.
-#[cfg(any(feature = "dbt", test))]
-pub(super) const DBT_LOG_FILE_REFUSAL: &str =
-    "DBT --log-file is unavailable on the ordinary single-run adapter";
-
-/// Is `--log-file` refused for this DBT invocation?
-///
-/// ⚠️ EXTRACTED SO THE POLICY IS DEFENDED. Before this, `git grep 'log-file is
-/// unavailable'` returned exactly ONE hit tree-wide -- the error string itself --
-/// with no test asserting when it fires. An undefended refusal can be reversed by
-/// accident, and there is a live proposal to reverse this one: hermit#1689's first
-/// claim implements DBT `--log-file`, and main adopted the opposite policy in
-/// `f0584c1aac` about four minutes after that branch forked, inside a commit about
-/// verification verdicts rather than as the subject of a decision.
-///
-/// This does NOT take a side on which policy is right -- that is an owner ruling.
-/// It pins what main does TODAY, so reversing it means deleting a test, which is
-/// visible in a diff, instead of editing one condition, which is not.
-///
-/// The rule: a requested log file is refused on the ordinary single-run adapter,
-/// and permitted under `--verify`, where the verification adapter owns the sink.
-#[cfg(any(feature = "dbt", test))]
-fn dbt_log_file_is_refused(log_file_requested: bool, verify: bool) -> bool {
-    log_file_requested && !verify
 }
 
 /// Runs `program` through DynamoRIO with the real Detcore Tool.
@@ -734,15 +892,13 @@ pub(super) fn run_dbt(
     backend_engagement_json: Option<&Path>,
     log: Option<LevelFilter>,
     log_file: Option<&Path>,
+    log_file_handle: Option<&std::fs::File>,
     config: &Config,
     mut environment: BTreeMap<OsString, OsString>,
     verification_stdin: Option<std::fs::File>,
 ) -> Result<ExitStatus, Error> {
     if let Some(path) = verify_json.filter(|_| verify) {
         write_pending_verification_json(path)?;
-    }
-    if dbt_log_file_is_refused(log_file.is_some(), verify) {
-        return Err(Error::msg(DBT_LOG_FILE_REFUSAL));
     }
     // The DBT backend drives a single Detcore external scheduler, so it cannot
     // honor a request to relax thread sequentialization. Fail loudly rather
@@ -762,6 +918,10 @@ pub(super) fn run_dbt(
     // above; the fail-closed policy (PR #644) still drives process-group
     // isolation and the client flag here.
     let panic_on_unsupported_syscalls = config.panic_on_unsupported_syscalls;
+    validate_dbt_ordinary_log_configuration(
+        !verify && log_file.is_some(),
+        panic_on_unsupported_syscalls,
+    )?;
 
     let stdin_is_terminal = std::io::stdin().is_terminal();
 
@@ -773,6 +933,11 @@ pub(super) fn run_dbt(
     let single_run_stats = (!verify && (summary || backend_engagement_json.is_some()))
         .then(DbtStatsCapture::new)
         .transpose()?;
+    let ordinary_log = if verify {
+        None
+    } else {
+        DbtOrdinaryLogCapture::new(log_file, log_file_handle)?
+    };
     let mut runner = DbtRunner::new(&drrun, &client)
         .map_err(|error| {
             Error::msg(format!(
@@ -783,6 +948,9 @@ pub(super) fn run_dbt(
         })?
         .summary(summary)
         .isolated_process_group(panic_on_unsupported_syscalls);
+    if let Some(capture) = &ordinary_log {
+        runner = capture.configure(runner, log)?;
+    }
     if let Some(capture) = &single_run_stats {
         runner = capture.configure(runner);
     }
@@ -822,12 +990,18 @@ pub(super) fn run_dbt(
     if !verify {
         if stdin_is_terminal {
             let status = run_status(&runtime, &runner, &guest, &drrun, config)?;
+            if let Some(capture) = ordinary_log {
+                capture.finish()?;
+            }
             if let Some(capture) = single_run_stats {
                 finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?;
             }
             return Ok(process_status(status));
         }
         let output = run_once(&runtime, &runner, &guest, &drrun, config, std::io::stdin())?;
+        if let Some(capture) = ordinary_log {
+            capture.finish()?;
+        }
         write_output(&output)?;
         if let Some(capture) = single_run_stats {
             finish_single_run_dbt_stats(capture, summary, backend_engagement_json)?;
@@ -1128,6 +1302,7 @@ pub(super) fn run_dbt(
     _backend_engagement_json: Option<&Path>,
     _log: Option<LevelFilter>,
     _log_file: Option<&Path>,
+    _log_file_handle: Option<&std::fs::File>,
     _config: &Config,
     _environment: BTreeMap<OsString, OsString>,
     _verification_stdin: Option<std::fs::File>,
@@ -1438,6 +1613,84 @@ mod tests {
         );
     }
     use super::*;
+
+    #[cfg(feature = "dbt")]
+    struct FaultingDbtLogDestination {
+        bytes: std::io::Cursor<Vec<u8>>,
+        fail_write_after: Option<usize>,
+        written: usize,
+        fail_flush: bool,
+        fail_cleanup_truncate: bool,
+        truncate_calls: usize,
+    }
+
+    #[cfg(feature = "dbt")]
+    impl FaultingDbtLogDestination {
+        fn new(fail_write_after: Option<usize>, fail_flush: bool) -> Self {
+            Self {
+                bytes: std::io::Cursor::new(b"old destination".to_vec()),
+                fail_write_after,
+                written: 0,
+                fail_flush,
+                fail_cleanup_truncate: false,
+                truncate_calls: 0,
+            }
+        }
+    }
+
+    #[cfg(feature = "dbt")]
+    impl Write for FaultingDbtLogDestination {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if let Some(limit) = self.fail_write_after {
+                if self.written >= limit {
+                    return Err(std::io::Error::other("injected write failure"));
+                }
+                let allowed = buffer.len().min(limit - self.written);
+                let written = self.bytes.write(&buffer[..allowed])?;
+                self.written += written;
+                return Ok(written);
+            }
+            self.bytes.write(buffer)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                Err(std::io::Error::other("injected flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(feature = "dbt")]
+    impl std::io::Seek for FaultingDbtLogDestination {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.bytes.seek(position)
+        }
+    }
+
+    #[cfg(feature = "dbt")]
+    impl DbtLogDestination for FaultingDbtLogDestination {
+        fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+            self.truncate_calls += 1;
+            if self.fail_cleanup_truncate && self.truncate_calls > 1 {
+                return Err(std::io::Error::other("injected cleanup failure"));
+            }
+            let len = usize::try_from(len).unwrap();
+            self.bytes.get_mut().resize(len, 0);
+            if self.bytes.position() > len as u64 {
+                self.bytes.set_position(len as u64);
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "dbt")]
+    fn staged_dbt_log(bytes: &[u8]) -> std::fs::File {
+        let mut staged = tempfile::tempfile().unwrap();
+        staged.write_all(bytes).unwrap();
+        staged
+    }
 
     #[cfg(feature = "dbt")]
     fn write_executable(path: &Path, contents: &[u8]) {
@@ -1822,6 +2075,29 @@ mod tests {
 
     #[test]
     #[cfg(feature = "dbt")]
+    fn dbt_canonical_evidence_validates_the_host_opened_object_not_a_replaced_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let requested_path = directory.path().join("requested.log");
+        let retained_path = directory.path().join("opened.log");
+        let file = std::fs::File::create(&requested_path).unwrap();
+        fs::rename(&requested_path, &retained_path).unwrap();
+        fs::write(&requested_path, b"replacement path contents").unwrap();
+        let records =
+            vec![b"1970-01-01T00:00:00.000000Z INFO detcore: DETLOG authoritative\n".to_vec()];
+
+        let compared = materialize_dbt_ordinary_log(&records, file, &requested_path).unwrap();
+
+        assert_eq!(compared, 1);
+        assert_eq!(fs::read(&retained_path).unwrap(), records.concat());
+        assert_eq!(
+            fs::read(&requested_path).unwrap(),
+            b"replacement path contents",
+            "the path replacement must neither supply nor receive authoritative bytes"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
     fn dbt_canonical_evidence_fails_closed_on_empty_or_unframed_records() {
         let empty = tempfile::NamedTempFile::new().unwrap();
         let (file, path) = empty.into_parts();
@@ -2098,36 +2374,150 @@ mod tests {
         }
     }
 
-    /// Pins main's CURRENT DBT `--log-file` policy, which was undefended.
-    ///
-    /// hermit#1689 claim 1 would reverse this. That reversal may well be correct --
-    /// it is an owner ruling, and this test takes no side on it. What it removes is
-    /// the possibility of reversing it SILENTLY: before this, the refusal existed
-    /// only as an error string with no assertion, so flipping the condition changed
-    /// behaviour without changing any test.
+    #[cfg(feature = "dbt")]
     #[test]
-    fn dbt_log_file_is_refused_on_the_single_run_adapter_and_permitted_under_verify() {
-        // the refusal: a log file was asked for, and this is not a verification run
+    fn dbt_ordinary_log_requires_the_host_opened_path_and_descriptor_pair() {
+        assert!(DbtOrdinaryLogCapture::new(None, None).unwrap().is_none());
+
+        let destination = tempfile::NamedTempFile::new().unwrap();
+        let path = destination.path();
         assert!(
-            dbt_log_file_is_refused(true, false),
-            "a requested --log-file must be refused on the ordinary single-run adapter"
+            DbtOrdinaryLogCapture::new(Some(path), Some(destination.as_file()))
+                .unwrap()
+                .is_some(),
+            "a complete host-opened sink must be accepted"
         );
-        // --verify owns its own sink, so the request is honoured there
+
+        let missing_descriptor = DbtOrdinaryLogCapture::new(Some(path), None).unwrap_err();
         assert!(
-            !dbt_log_file_is_refused(true, true),
-            "--verify must keep accepting --log-file; the verification adapter owns the sink"
+            missing_descriptor
+                .to_string()
+                .contains("has no host-opened file descriptor"),
+            "{missing_descriptor}"
         );
-        // no request, nothing to refuse, either way
-        assert!(!dbt_log_file_is_refused(false, false));
-        assert!(!dbt_log_file_is_refused(false, true));
+        let missing_path =
+            DbtOrdinaryLogCapture::new(None, Some(destination.as_file())).unwrap_err();
+        assert!(
+            missing_path
+                .to_string()
+                .contains("without a --log-file path"),
+            "{missing_path}"
+        );
     }
 
-    /// The refusal text is what a caller greps for, so pin it exactly.
+    #[cfg(feature = "dbt")]
     #[test]
-    fn dbt_log_file_refusal_names_the_adapter_it_is_about() {
+    fn dbt_ordinary_log_fails_closed_before_replacing_the_destination() {
+        let destination = tempfile::NamedTempFile::new().unwrap();
+        fs::write(destination.path(), b"original contents").unwrap();
+        let mut capture =
+            DbtOrdinaryLogCapture::new(Some(destination.path()), Some(destination.as_file()))
+                .unwrap()
+                .unwrap();
+        capture.evidence.write_all(b"not framed evidence").unwrap();
+
+        let error = capture.finish().unwrap_err();
+        assert!(
+            error.to_string().contains("malformed or truncated"),
+            "{error}"
+        );
         assert_eq!(
-            DBT_LOG_FILE_REFUSAL,
-            "DBT --log-file is unavailable on the ordinary single-run adapter"
+            fs::read(destination.path()).unwrap(),
+            b"original contents",
+            "unverified evidence must not replace the host log"
+        );
+    }
+
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn dbt_ordinary_log_preserves_the_destination_when_no_info_is_comparable() {
+        let destination = tempfile::NamedTempFile::new().unwrap();
+        fs::write(destination.path(), b"original contents").unwrap();
+        let records = vec![b"1970-01-01T00:00:00.000000Z WARN detcore: warning only\n".to_vec()];
+
+        let error = materialize_dbt_ordinary_log(
+            &records,
+            destination.as_file().try_clone().unwrap(),
+            destination.path(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("no INFO records"), "{error}");
+        assert_eq!(
+            fs::read(destination.path()).unwrap(),
+            b"original contents",
+            "a log that fails the canonical INFO floor must not replace the destination"
+        );
+    }
+
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn dbt_ordinary_log_clears_a_partial_write_and_reports_cleanup_failure() {
+        let mut staged = staged_dbt_log(b"validated canonical log\n");
+        let mut destination = FaultingDbtLogDestination::new(Some(5), false);
+
+        let error = publish_validated_dbt_log(&mut staged, &mut destination).unwrap_err();
+
+        assert!(error.to_string().contains("injected write failure"));
+        assert!(destination.bytes.get_ref().is_empty());
+        assert_eq!(destination.truncate_calls, 2);
+
+        let mut staged = staged_dbt_log(b"validated canonical log\n");
+        let mut destination = FaultingDbtLogDestination::new(Some(5), false);
+        destination.fail_cleanup_truncate = true;
+        let error = publish_validated_dbt_log(&mut staged, &mut destination).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("injected write failure"), "{message}");
+        assert!(message.contains("injected cleanup failure"), "{message}");
+    }
+
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn dbt_ordinary_log_clears_bytes_after_flush_failure() {
+        let mut staged = staged_dbt_log(b"validated canonical log\n");
+        let mut destination = FaultingDbtLogDestination::new(None, true);
+
+        let error = publish_validated_dbt_log(&mut staged, &mut destination).unwrap_err();
+
+        assert!(error.to_string().contains("injected flush failure"));
+        assert!(destination.bytes.get_ref().is_empty());
+        assert_eq!(destination.truncate_calls, 2);
+    }
+
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn dbt_ordinary_log_refuses_relaxed_unsupported_syscall_semantics() {
+        assert!(validate_dbt_ordinary_log_configuration(false, false).is_ok());
+        assert!(validate_dbt_ordinary_log_configuration(true, true).is_ok());
+
+        let error = validate_dbt_ordinary_log_configuration(true, false).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("--allow-unsupported-syscalls"),
+            "{message}"
+        );
+        assert!(message.contains("setsid/setpgid"), "{message}");
+    }
+
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn dbt_ordinary_log_captures_at_least_canonical_info() {
+        for requested in [
+            None,
+            Some(LevelFilter::OFF),
+            Some(LevelFilter::ERROR),
+            Some(LevelFilter::WARN),
+            Some(LevelFilter::INFO),
+        ] {
+            assert_eq!(dbt_ordinary_log_level(requested), DbtEvidenceLogLevel::Info);
+        }
+        assert_eq!(
+            dbt_ordinary_log_level(Some(LevelFilter::DEBUG)),
+            DbtEvidenceLogLevel::Debug
+        );
+        assert_eq!(
+            dbt_ordinary_log_level(Some(LevelFilter::TRACE)),
+            DbtEvidenceLogLevel::Trace
         );
     }
 }
