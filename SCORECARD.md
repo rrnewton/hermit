@@ -2,7 +2,7 @@
 
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. `./ci/compat-envelope/scorecard.rs check` verifies it.
 
-**Green** means this manifest cell is selected by full in `ci/expected-e2e-plan.json`; ordinary validation therefore requires it to pass. **Red** means the cell is in the manifest but is not selected by full. **Red does not mean failed:** a red cell may have passed, failed, produced no verdict, or never run. Manifest-disabled combinations are **Not applicable**; they are neither red nor omitted. The current generated data counts Green as **709** and Red as **186**. The generator classifies the current **4849** manifest-disabled combinations as **Not applicable**.
+**Green** means this manifest cell is selected by full in `ci/expected-e2e-plan.json`; ordinary validation therefore requires it to pass. **Red** means the cell is in the manifest but is not selected by full. **Red does not mean failed:** a red cell may have passed, failed, produced no verdict, or never run. Manifest-disabled combinations are **Not applicable**; they are neither red nor omitted. The current generated data counts Green as **707** and Red as **188**. The generator classifies the current **4849** manifest-disabled combinations as **Not applicable**.
 
 Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and accepts a result only when the typed report says `verified=true`, `verdict=matched`, `bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, a named canonical `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped comparison when invoked directly and does not satisfy this regression plan. These same-backend results do not establish cross-backend parity.
 
@@ -10,22 +10,22 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 | --- | ---: | ---: | ---: | ---: |
 | `ptrace` | 346 | 18 | 713 | 1077 |
 | `dbt` | 0 | 61 | 1016 | 1077 |
-| `kvm` | 224 | 17 | 836 | 1077 |
+| `kvm` | 222 | 19 | 836 | 1077 |
 | `sabre` | 111 | 32 | 934 | 1077 |
 | `liteinst` | 28 | 25 | 1024 | 1077 |
 | `native` | 0 | 33 | 326 | 359 |
-| **Total** | **709** | **186** | **4849** | **5744** |
+| **Total** | **707** | **188** | **4849** | **5744** |
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Green is **709 of 5744**, which is **12.34%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Green is **707 of 5744**, which is **12.31%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
 - backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `native`
 - modes: `chaos`, `naked`, `replay`, `verify`
 
-⚠️ **4849 of those 5744 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 895 cells that CAN run, green is **79.22%**.
+⚠️ **4849 of those 5744 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 895 cells that CAN run, green is **78.99%**.
 
-⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 709 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
+⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 707 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
 
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, without anything about the product changing.** Removing a backend whose cells are mostly red RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before comparing this percentage against an earlier one, diff the two lists above: if they differ, the numbers are not comparable and the difference is not a result.
 
@@ -33,11 +33,11 @@ The mode view makes the current order of work explicit: expand `verify` first, t
 
 | Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Not applicable | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 340 / 359 | 0 / 359 | 224 / 359 | 111 / 359 | 28 / 359 | — | 703 | 151 | 941 | 1795 |
+| `verify` | 340 / 359 | 0 / 359 | 222 / 359 | 111 / 359 | 28 / 359 | — | 701 | 153 | 941 | 1795 |
 | `replay` | 1 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | — | 1 | 0 | 1794 | 1795 |
 | `chaos` | 5 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | 0 / 359 | — | 5 | 2 | 1788 | 1795 |
 | `naked` | — | — | — | — | — | 0 / 359 | 0 | 33 | 326 | 359 |
-| **Total** | | | | | | | **709** | **186** | **4849** | **5744** |
+| **Total** | | | | | | | **707** | **188** | **4849** | **5744** |
 
 ## Cross-backend parity
 
@@ -63,7 +63,7 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `system-utils` | 33 / 34 | 1 / 34 | 0 / 34 | 34 | 102 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 712 selected regression cells: the 709 green compatibility cells above (including 5 chaos-mode race-exposure checks), and 3 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 710 selected regression cells: the 707 green compatibility cells above (including 5 chaos-mode race-exposure checks), and 3 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
 
 ### Selected custom commands outside the comparable denominator
 
@@ -77,9 +77,9 @@ These rows are part of the selected regression denominator even though they are 
 
 ## Status and measurement
 
-Selection and observation answer different questions. The Green/Red table says what full validation selects. The per-cell `measurement` value says what retained evidence observed: `never-measured`, `measured-and-passed`, `measured-no-verdict`, `diverged-unlocated`, or `diverged`. In the current generated data, **32 Green cells are `never-measured`**. Read the generated Status and measurement section for the complete current cross-tab; do not use Red as a failed-test count.
+Selection and observation answer different questions. The Green/Red table says what full validation selects. The per-cell `measurement` value says what retained evidence observed: `never-measured`, `measured-and-passed`, `measured-no-verdict`, `diverged-unlocated`, or `diverged`. In the current generated data, **zero Green cells are `never-measured`**. Read the generated Status and measurement section for the complete current cross-tab; do not use Red as a failed-test count.
 
-The current green/`never-measured` count is **32**, and the current red/`measured-and-passed` count is **91**.
+The current green/`never-measured` count is **0**, and the current red/`measured-and-passed` count is **91**.
 
 Retained history that has not been imported is not counted here. A stored measurement does not establish that it describes current code; `show` reports whether the recorded last test still matches `HEAD:detcore`.
 
@@ -87,10 +87,10 @@ The cross-tab includes all **5744** tracked cells; no row is omitted. The curren
 
 | Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `green` | 32 | 665 | 0 | 6 | 6 | 709 |
-| `red` | 64 | 91 | 0 | 0 | 31 | 186 |
+| `green` | 0 | 695 | 0 | 6 | 6 | 707 |
+| `red` | 64 | 91 | 0 | 0 | 33 | 188 |
 | `not-applicable` | 4848 | 0 | 0 | 0 | 1 | 4849 |
-| **Total** | **4944** | **756** | **0** | **6** | **38** | **5744** |
+| **Total** | **4912** | **786** | **0** | **6** | **40** | **5744** |
 
 Cells whose stored `measurement` is not `never-measured` are shown individually so status and measurement remain visible together.
 
@@ -792,6 +792,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/vmsplice-enosys` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `c-programs/vmsplice-enosys` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/vmsplice-enosys` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `c-programs/wait-on-child` | `verify` | `kvm` | `red` | `diverged` |
 | `c-programs/wait-on-child` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/writev-determinism` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `chaos-c/lock-granularity` | `chaos` | `ptrace` | `green` | `measured-and-passed` |
@@ -804,6 +805,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `data-handling/sqlite-query-determinism` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `data-handling/sqlite-query-determinism` | `verify` | `sabre` | `not-applicable` | `diverged` |
 | `data-handling/zstd-multithread` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `debugger-c/debuggee` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `debugger-c/debuggee` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `debugger-c/debuggee` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `debugger-c/debuggee` | `verify` | `sabre` | `green` | `measured-and-passed` |
@@ -830,67 +832,97 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `determinism-stress-c/thread-contention` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `determinism-stress-c/thread-stress` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `language-runtimes/bash-loop-pipe-time` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `language-runtimes/bash-random` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `language-runtimes/bash-random` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `language-runtimes/cpp-stl-determinism` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `language-runtimes/cpp-stl-determinism` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `language-runtimes/example-python-random` | `verify` | `dbt` | `red` | `diverged` |
 | `language-runtimes/example-python-random` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `language-runtimes/example-python-random` | `verify` | `liteinst` | `green` | `measured-and-passed` |
 | `language-runtimes/example-python-random` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `language-runtimes/example-python-random` | `verify` | `sabre` | `red` | `diverged` |
+| `language-runtimes/gawk-random` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `language-runtimes/gawk-random` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `language-runtimes/lua-random` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `language-runtimes/m4-macro-mkstemp` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `language-runtimes/node-v8-jit` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `language-runtimes/perl-hash-order` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `language-runtimes/perl-hash-order` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `language-runtimes/perl-io-subprocess-time` | `verify` | `kvm` | `red` | `diverged` |
 | `language-runtimes/perl-io-subprocess-time` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `language-runtimes/perl-random` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `language-runtimes/perl-random` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `language-runtimes/python-dict-hash-iteration` | `verify` | `ptrace` | `green` | `diverged-unlocated` |
+| `language-runtimes/python-hash-determinism` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `language-runtimes/python-hash-determinism` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `language-runtimes/python-hashseed` | `verify` | `ptrace` | `red` | `diverged` |
 | `language-runtimes/python-io-subprocess-time` | `verify` | `ptrace` | `green` | `diverged-unlocated` |
+| `language-runtimes/python-random` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `language-runtimes/python-random` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `language-runtimes/ruby-random` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `language-runtimes/rust-hashmap-iteration` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `language-runtimes/rust-hashmap-iteration` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `language-runtimes/tcl-rand-clock` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/auxv-loader-dump` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/clock-determinism` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/clock-determinism` | `verify` | `liteinst` | `red` | `measured-and-passed` |
 | `system-utils/clock-determinism` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/clock-exec-continuity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/date-nanoseconds` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/du-tree-summary` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/du-tree-summary` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/errno-path-identity` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/errno-path-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/example-date` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/example-date` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/example-devrand` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/example-devrand` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/file-timestamp-identity` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/file-timestamp-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/find-tree-metadata` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/find-tree-metadata` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/harness-width-contract` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/harness-width-contract` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/mcookie-random` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/mcookie-random` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/mktemp-name` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/mktemp-name` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/nscd-neutralised` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/openssl-enc` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/openssl-genpkey` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/openssl-genpkey` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/openssl-passwd` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/openssl-passwd` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/openssl-rand` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/openssl-rand` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/openssl-x509` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/openssl-x509` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/overflow-gid-resolves` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/proc-random-uuid` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/proc-uptime` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/proc-uptime` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/procfs-sanitized-paths` | `verify` | `ptrace` | `red` | `diverged` |
 | `system-utils/ps-proc-table` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/random-device` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/random-device` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/record-getpid` | `replay` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/record-getpid` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/record-getpid` | `verify` | `liteinst` | `red` | `measured-and-passed` |
 | `system-utils/record-getpid` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/record-getpid` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `system-utils/shm-coherency-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/shuf-permutation` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/shuf-permutation` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/sort-random` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/ssh-keygen-ed25519` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/startup-surface-identity` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/startup-surface-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/startup-tls-guards` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/startup-tls-guards` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/startup-tls-guards` | `verify` | `sabre` | `red` | `diverged` |
+| `system-utils/sysfs-sanitized-prefixes` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/sysfs-sanitized-prefixes` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `system-utils/uuidgen-random` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/uuidgen-random` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `applications/kvm-python-examples` | `verify` | `kvm` | `red` | `diverged` |
 | `applications/kvm-shell-environment` | `verify` | `kvm` | `green` | `measured-and-passed` |

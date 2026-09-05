@@ -10626,7 +10626,9 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: false
         backends_enabled:
           - ptrace
           - kvm
@@ -10634,6 +10636,11 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
+        ci_disabled_reason:
+          kvm:
+            result: determinism-failure
+            evidence: RUN1735 at Hermit a6f23c68669196aa7a9a801bff686bf671d96a3a
+            reason: Both canonical full-validation attempts diverged at scheduler turn 4, record 77, syscall 28 in previously committed virtual time, so this cell does not meet the zero-retry qualification bar.
       naked:
         ci: false
         backends_enabled: []
