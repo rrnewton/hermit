@@ -33,7 +33,8 @@ agreeing with each other.
 | `hermit run --timeout N` | **one hermit invocation** = one guest execution, **ptrace and liteinst only** | the caller's argument | hermit drops the guest future and unwinds its own container | exit 124, `HERMIT_RUN_TIMEOUT class=run-timeout` |
 | hermit's unwind fallback | the same invocation, `N + 10s` | `RUN_TIMEOUT_UNWIND_GRACE` in `hermit-cli/src/lib.rs` | `_exit(124)` from a `SIGALRM` handler; no destructors | exit 124, `HERMIT_RUN_TIMEOUT_FALLBACK` |
 | `hermit record --record-timeout N` | one recording | the caller's argument | `_exit(124)` from a `SIGALRM` handler | exit 124 |
-| nextest `slow-timeout` | **one cargo test process**, which may invoke hermit zero or many times | `.config/nextest.toml`: 57s base, scaled by the machine wall multiplier | `SIGTERM` to the test binary, 2s grace, then `SIGKILL` | wrapper exit 100, test named by nextest |
+| nextest attempt CPU limit | **one test attempt**, including its complete descendant tree | 22s base, scaled by `HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER` | the per-attempt wrapper sends `SIGTERM`, waits 2s, then uses `cgroup.kill` | exit 124 plus attempt outcome `cpu_timeout` and measured CPU |
+| nextest attempt wall limit | the same individual attempt | 57s base, scaled by `HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER` | the per-attempt wrapper sends `SIGTERM`, waits 2s, then uses `cgroup.kill`; Nextest's generated deadline is 5s later as a backup | exit 124 plus attempt outcome `wall_timeout` and measured CPU/wall |
 | manifest cell CPU limit | all process-group CPU consumed by a cell's executions, aggregated across attempts or seeds | `cpu_timeout_seconds`: 22s default plus measured cell overrides, scaled by the machine CPU multiplier | the harness stops the process group and retains `error_kind=cpu-timeout` | typed cell `ERROR` |
 | manifest cell wall limit | fixture preparation and, separately, the complete execution phase | `timeout_seconds`: 57s default plus measured cell overrides, scaled by the machine wall multiplier | the harness stops the process group and retains `error_kind=wall-timeout` | typed cell `ERROR` |
 | dagrun step wall/CPU limits | **one DAG node**, i.e. a whole batch of cells or tests | explicit `timeout` and `cpu_timeout` on each node in the single `ci/dag/validate.json`, selected by profile labels | dagrun stops the step | node failure |
@@ -70,11 +71,22 @@ not treated as calibrated.
 Machine-specific CPU and wall multipliers are deliberately separate:
 `HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER` and
 `HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER`. Each defaults to `1`, must be a positive
-finite number, and scales its configured component with ceiling rounding. The
-nextest wrapper parses and rewrites every `slow-timeout.period` into a temporary
-TOML config with the wall multiplier, passes it with `--config-file`, and removes
-it on all exits. Validation refuses a wall multiplier whose scaled inner bounds
-would outgrow a committed outer DAG backup. Current result rows carry both
+finite number, and scales its configured component with ceiling rounding.
+For each Nextest attempt, the run wrapper creates one child cgroup before exec,
+polls that cgroup's live aggregate CPU counter, and checks CPU before wall on
+each poll. It keeps supervising after the direct test process exits until the
+whole child cgroup is empty, then takes a stable final CPU read; this catches a
+short test that crosses its CPU limit between polls and a descendant that
+escapes the process group with `setsid`. Missing or malformed cgroup accounting
+is an infrastructure error, never a zero measurement or a passing attempt.
+
+The generated temporary Nextest config scales the same 57-second wall source
+and adds five seconds. That later deadline is only a backup if the wrapper
+cannot report and stop the attempt. The generator refuses multiple
+`slow-timeout` declarations while the wrapper is active, rather than silently
+enforcing a different inner wall limit from an override. Validation refuses a
+wall multiplier whose scaled inner bounds would outgrow a committed outer DAG
+backup. Current manifest result rows carry both
 effective bounds as
 `execution_cpu_timeout_seconds` and `execution_wall_timeout_seconds`; readers
 accept older rows with neither field but refuse current publication unless both
@@ -126,7 +138,8 @@ greppable marker, and that marker — not the status — is what a caller keys o
 | `HERMIT_RUN_TIMEOUT class=run-timeout` | hermit's own bound expired and hermit unwound the container. The line also carries the bound in seconds. | the guest is genuinely slow, or the bound is too tight |
 | `HERMIT_RUN_TIMEOUT_FALLBACK` | the bound expired and **the unwind itself did not finish** within the grace. This is a hermit defect, not a slow guest. | investigate the wedged teardown |
 | `safehermit: bound.wall=APPLIED` … then a kill | the outermost cgroup deadline reaped the tree | the run escaped every inner bound |
-| a nextest-named test with wrapper exit 100 | the test **process** exceeded its per-test cap | `.config/nextest.toml` |
+| `nextest-cpu-wrapper: CPU timeout` | one Nextest attempt consumed its scaled CPU allowance | the per-attempt CPU policy or a slow test |
+| `nextest-cpu-wrapper: wall timeout` | one Nextest attempt reached its scaled wall allowance while still below CPU limit | the per-attempt wall policy, a sleeping test, or lost scheduling time |
 | exit 124 with **no marker at all** | something outside hermit killed it — `timeout(1)` on the cell, or a harness | the cell's `timeout_seconds`, or a missing inner bound |
 
 That last row is the useful one. **A cell that times out with no class line means
@@ -211,4 +224,4 @@ validation. The regression cells for `hermit run --timeout` are in
 `hermit-cli/tests/cli.rs` for that reason.
 
 If that file is ever wired in, its own 12-second startup and 20-second teardown
-budgets must remain below the enclosing 57-second nextest base bound.
+budgets must remain below the enclosing 57-second Nextest-attempt wall bound.

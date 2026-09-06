@@ -7,18 +7,24 @@ use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Child;
 use std::process::Command;
 use std::process::ExitCode;
 use std::process::ExitStatus;
 use std::process::Stdio;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use dagrun::ManualCpuCgroup;
+use dagrun::ManualCpuCgroupStatus;
+use dagrun::SharedCpuCgroupParent;
 use hermit_manifest_plan::nextest_cpu::AttemptCompletion;
 use hermit_manifest_plan::nextest_cpu::AttemptIdentity;
+use hermit_manifest_plan::nextest_cpu::AttemptOutcome;
 use hermit_manifest_plan::nextest_cpu::AttemptRecord;
 use hermit_manifest_plan::nextest_cpu::BINARY_MAP_SCHEMA;
 use hermit_manifest_plan::nextest_cpu::BinaryMap;
@@ -30,20 +36,37 @@ use hermit_manifest_plan::nextest_cpu::read_attempt_records;
 use hermit_manifest_plan::nextest_cpu::read_binary_map;
 use hermit_manifest_plan::nextest_cpu::write_attempt_atomic;
 use hermit_manifest_plan::nextest_cpu::write_binary_map_atomic;
+use hermit_manifest_plan::timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS;
+use hermit_manifest_plan::timeouts::DEFAULT_TEST_WALL_TIMEOUT_SECONDS;
+use hermit_manifest_plan::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV;
+use hermit_manifest_plan::timeouts::TEST_WALL_TIMEOUT_MULTIPLIER_ENV;
+use hermit_manifest_plan::timeouts::resolve_test_timeouts;
+use hermit_manifest_plan::timeouts::timeout_multipliers_from_env;
 
-const ATTEMPT_ENV: &str = "__NEXTEST_ATTEMPT";
+const PRIVATE_ATTEMPT_ENV: &str = "__NEXTEST_ATTEMPT";
+const PUBLIC_ATTEMPT_ENV: &str = "NEXTEST_ATTEMPT";
 const RUN_ID_ENV: &str = "NEXTEST_RUN_ID";
 const PACKAGE_ENV: &str = "CARGO_PKG_NAME";
 const CONTROL_ARM_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL";
 const CONTROL_CWD_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_CWD";
 const CONTROL_PID_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_PID_FILE";
 const CONTROL_SENTINEL_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_SENTINEL";
+const CONTROL_CPU_LIMIT_USEC_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_LIMIT_USEC";
+const CONTROL_WALL_LIMIT_MS_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_WALL_MS";
+const CONTROL_POLL_MS_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_POLL_MS";
+const CONTROL_ACCOUNTING_ERROR_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_ACCOUNTING_ERROR";
 const INFRASTRUCTURE_EXIT: u8 = 70;
+const TIMEOUT_EXIT: u8 = 124;
+const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+const DEFAULT_POLL: Duration = Duration::from_millis(10);
 
 static RECEIVED_SIGNAL: AtomicI32 = AtomicI32::new(0);
+static INTERNAL_TERMINATION: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn remember_signal(signal: libc::c_int) {
-    RECEIVED_SIGNAL.store(signal, Ordering::SeqCst);
+    if !INTERNAL_TERMINATION.load(Ordering::SeqCst) {
+        let _ = RECEIVED_SIGNAL.compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
+    }
 }
 
 fn required_env(name: &str) -> Result<String, String> {
@@ -72,9 +95,19 @@ fn identity_from_command(program: &OsStr, args: &[OsString]) -> Result<AttemptId
             "nextest command package {command_package:?} disagrees with typed inventory package {package:?}"
         ));
     }
-    let attempt = required_env(ATTEMPT_ENV)?
+    let private = env::var(PRIVATE_ATTEMPT_ENV).ok();
+    let public = env::var(PUBLIC_ATTEMPT_ENV).ok();
+    if private.is_some() && public.is_some() && private != public {
+        return Err(format!(
+            "{PRIVATE_ATTEMPT_ENV} and {PUBLIC_ATTEMPT_ENV} disagree"
+        ));
+    }
+    let raw_attempt = public.or(private).ok_or_else(|| {
+        format!("{PUBLIC_ATTEMPT_ENV} or {PRIVATE_ATTEMPT_ENV} must be present and valid UTF-8")
+    })?;
+    let attempt = raw_attempt
         .parse::<u64>()
-        .map_err(|error| format!("{ATTEMPT_ENV} is not a positive integer: {error}"))?;
+        .map_err(|error| format!("nextest attempt is not a positive integer: {error}"))?;
     let identity = AttemptIdentity {
         package: package.to_string(),
         binary: binary.to_string(),
@@ -85,16 +118,70 @@ fn identity_from_command(program: &OsStr, args: &[OsString]) -> Result<AttemptId
     Ok(identity)
 }
 
-fn cpu_usage_usec(pgid: u32) -> Result<u64, String> {
-    let seconds = dagrun::proccpu::subtree_cpu_seconds_in(pgid, Path::new("/proc"))
-        .ok_or_else(|| format!("cannot measure process group {pgid} from /proc"))?;
-    let usec = seconds * 1_000_000.0;
-    if !usec.is_finite() || usec.is_sign_negative() || usec > u64::MAX as f64 {
-        return Err(format!(
-            "process group {pgid} returned invalid CPU seconds {seconds}"
-        ));
+#[derive(Clone, Copy, Debug)]
+struct AttemptLimits {
+    cpu_usec: u64,
+    wall_ms: u64,
+    poll: Duration,
+}
+
+fn parse_positive_control(name: &str) -> Result<Option<u64>, String> {
+    match env::var(name) {
+        Ok(value) => {
+            let parsed = value
+                .parse::<u64>()
+                .map_err(|error| format!("{name} is not a positive integer: {error}"))?;
+            if parsed == 0 {
+                return Err(format!("{name} must be positive"));
+            }
+            Ok(Some(parsed))
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid UTF-8")),
     }
-    Ok(usec as u64)
+}
+
+fn attempt_limits() -> Result<AttemptLimits, String> {
+    let resolved = resolve_test_timeouts(
+        DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+        DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
+        timeout_multipliers_from_env()?,
+    )?;
+    let mut cpu_usec = resolved
+        .cpu_seconds
+        .checked_mul(1_000_000)
+        .ok_or_else(|| "CPU timeout overflows microseconds".to_string())?;
+    let mut wall_ms = resolved
+        .wall_seconds
+        .checked_mul(1_000)
+        .ok_or_else(|| "wall timeout overflows milliseconds".to_string())?;
+    let mut poll = DEFAULT_POLL;
+    if env::var_os(CONTROL_ARM_ENV).is_some() {
+        if let Some(value) = parse_positive_control(CONTROL_CPU_LIMIT_USEC_ENV)? {
+            cpu_usec = value;
+        }
+        if let Some(value) = parse_positive_control(CONTROL_WALL_LIMIT_MS_ENV)? {
+            wall_ms = value;
+        }
+        if let Some(value) = parse_positive_control(CONTROL_POLL_MS_ENV)? {
+            poll = Duration::from_millis(value);
+        }
+    }
+    Ok(AttemptLimits {
+        cpu_usec,
+        wall_ms,
+        poll,
+    })
+}
+
+fn live_cpu_usage_usec(cgroup: &ManualCpuCgroup) -> Result<u64, String> {
+    if env::var_os(CONTROL_ARM_ENV).is_some() && env::var_os(CONTROL_ACCOUNTING_ERROR_ENV).is_some()
+    {
+        return Err("injected malformed CPU accounting".into());
+    }
+    cgroup
+        .cpu_usage_usec()
+        .map_err(|error| format!("cannot read per-attempt CPU accounting: {error}"))
 }
 
 fn elapsed_ms(started: Instant) -> Result<u64, String> {
@@ -103,6 +190,8 @@ fn elapsed_ms(started: Instant) -> Result<u64, String> {
 }
 
 fn install_signal_handlers() -> Result<(), String> {
+    RECEIVED_SIGNAL.store(0, Ordering::SeqCst);
+    INTERNAL_TERMINATION.store(false, Ordering::SeqCst);
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
         let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
         action.sa_sigaction = remember_signal as *const () as usize;
@@ -120,21 +209,11 @@ fn install_signal_handlers() -> Result<(), String> {
     Ok(())
 }
 
-fn wait_for_child(pid: u32) -> Result<Option<ExitStatus>, String> {
-    loop {
-        if RECEIVED_SIGNAL.load(Ordering::SeqCst) != 0 {
-            return Ok(None);
-        }
-        let mut raw_status = 0;
-        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut raw_status, 0) };
-        if waited == pid as libc::pid_t {
-            return Ok(Some(ExitStatus::from_raw(raw_status)));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(format!("waitpid({pid}) failed: {error}"));
+fn completion_from_status(status: ExitStatus) -> Result<AttemptCompletion, String> {
+    match (status.code(), status.signal()) {
+        (Some(code), None) => Ok(AttemptCompletion::Exit { code }),
+        (None, Some(signal)) => Ok(AttemptCompletion::Signal { signal }),
+        _ => Err(format!("child returned unsupported exit status {status:?}")),
     }
 }
 
@@ -158,6 +237,152 @@ fn propagate_signal(signal: i32) -> ! {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopCause {
+    CpuTimeout,
+    WallTimeout,
+    Cancelled(i32),
+}
+
+fn signal_process_group(signal: i32) -> Result<(), String> {
+    INTERNAL_TERMINATION.store(true, Ordering::SeqCst);
+    let pid = std::process::id() as i32;
+    if unsafe { libc::kill(-pid, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "cannot signal test process group {pid} with {signal}: {}",
+            io::Error::last_os_error()
+        ))
+    }
+}
+
+fn reap_and_empty(
+    child: &mut Child,
+    cgroup: &ManualCpuCgroup,
+    status: &mut Option<ExitStatus>,
+    graceful: bool,
+) -> Result<(), String> {
+    if graceful
+        && cgroup.status().map_err(|error| error.to_string())? == ManualCpuCgroupStatus::Populated
+    {
+        signal_process_group(libc::SIGTERM)?;
+        let deadline = Instant::now() + TERMINATION_GRACE;
+        while Instant::now() < deadline {
+            if status.is_none() {
+                *status = child
+                    .try_wait()
+                    .map_err(|error| format!("cannot poll test command: {error}"))?;
+            }
+            if cgroup.status().map_err(|error| error.to_string())? == ManualCpuCgroupStatus::Empty {
+                break;
+            }
+            thread::sleep(DEFAULT_POLL);
+        }
+    }
+    if cgroup.status().map_err(|error| error.to_string())? == ManualCpuCgroupStatus::Populated {
+        cgroup
+            .kill()
+            .map_err(|error| format!("cannot hard-kill per-attempt cgroup: {error}"))?;
+    }
+    if status.is_none() {
+        *status = Some(
+            child
+                .wait()
+                .map_err(|error| format!("cannot reap test command: {error}"))?,
+        );
+    }
+    let deadline = Instant::now() + TERMINATION_GRACE;
+    loop {
+        if cgroup.status().map_err(|error| error.to_string())? == ManualCpuCgroupStatus::Empty {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("per-attempt cgroup remained populated after hard kill".into());
+        }
+        thread::sleep(DEFAULT_POLL);
+    }
+}
+
+fn preserve_teardown_error(primary: String, cgroup: &ManualCpuCgroup) -> String {
+    match cgroup.abort_and_cleanup() {
+        Ok(()) => primary,
+        Err(error) => format!("{primary}; per-attempt cgroup teardown also failed: {error}"),
+    }
+}
+
+fn abort_and_reap(
+    child: &mut Child,
+    cgroup: &ManualCpuCgroup,
+    status: &mut Option<ExitStatus>,
+    primary: String,
+) -> String {
+    let mut detail = preserve_teardown_error(primary, cgroup);
+    if status.is_none() {
+        match child.try_wait() {
+            Ok(Some(observed)) => *status = Some(observed),
+            Ok(None) => {
+                if let Err(error) = child.kill() {
+                    detail.push_str(&format!("; cannot kill direct test child: {error}"));
+                }
+                match child.wait() {
+                    Ok(observed) => *status = Some(observed),
+                    Err(error) => {
+                        detail.push_str(&format!("; cannot reap direct test child: {error}"));
+                    }
+                }
+            }
+            Err(error) => {
+                detail.push_str(&format!("; cannot poll direct test child: {error}"));
+                if let Err(kill) = child.kill() {
+                    detail.push_str(&format!("; cannot kill direct test child: {kill}"));
+                }
+                if let Err(wait) = child.wait() {
+                    detail.push_str(&format!("; cannot reap direct test child: {wait}"));
+                }
+            }
+        }
+    }
+    detail
+}
+
+struct InfrastructureFailure {
+    completion: Option<AttemptCompletion>,
+    cpu_usage_usec: Option<u64>,
+    detail: String,
+}
+
+fn write_infrastructure_record(
+    record_dir: &Path,
+    run_id: String,
+    identity: AttemptIdentity,
+    limits: AttemptLimits,
+    started: Instant,
+    failure: InfrastructureFailure,
+) -> Result<ExitStatus, String> {
+    let record = AttemptRecord::new(
+        run_id,
+        identity,
+        hermit_manifest_plan::nextest_cpu::AttemptMeasurement {
+            cpu_usage_usec: failure.cpu_usage_usec,
+            cpu_limit_usec: limits.cpu_usec,
+            wall_time_ms: elapsed_ms(started)?,
+            wall_limit_ms: limits.wall_ms,
+        },
+        failure.completion,
+        AttemptOutcome::InfrastructureError {
+            detail: failure.detail.clone(),
+        },
+    );
+    write_attempt_atomic(record_dir, &record).map_err(|write| {
+        format!(
+            "{}; cannot publish infrastructure record: {write}",
+            failure.detail
+        )
+    })?;
+    Err(failure.detail)
+}
+
 fn run_wrapper(args: Vec<OsString>) -> Result<ExitStatus, String> {
     let (program, child_args) = args
         .split_first()
@@ -172,56 +397,262 @@ fn run_wrapper(args: Vec<OsString>) -> Result<ExitStatus, String> {
     let record_dir = PathBuf::from(required_env(CPU_RECORD_DIR_ENV)?);
     let run_id = required_env(RUN_ID_ENV)?;
     let identity = identity_from_command(program, child_args)?;
+    let limits = attempt_limits()?;
     let started = Instant::now();
-    let cpu_started = cpu_usage_usec(pid)?;
-
+    install_signal_handlers()?;
+    let parent = match SharedCpuCgroupParent::current() {
+        Ok(parent) => parent,
+        Err(error) => {
+            return write_infrastructure_record(
+                &record_dir,
+                run_id,
+                identity,
+                limits,
+                started,
+                InfrastructureFailure {
+                    completion: None,
+                    cpu_usage_usec: None,
+                    detail: format!("cannot resolve shared per-attempt cgroup parent: {error}"),
+                },
+            );
+        }
+    };
+    let cgroup = match parent.create_child(&identity.key()) {
+        Ok(cgroup) => cgroup,
+        Err(error) => {
+            return write_infrastructure_record(
+                &record_dir,
+                run_id,
+                identity,
+                limits,
+                started,
+                InfrastructureFailure {
+                    completion: None,
+                    cpu_usage_usec: None,
+                    detail: format!("cannot create per-attempt CPU cgroup: {error}"),
+                },
+            );
+        }
+    };
     let mut command = Command::new(program);
     command.args(child_args);
     command.env_remove(CPU_BINARY_MAP_ENV);
     command.env_remove(CPU_RECORD_DIR_ENV);
     command.env_remove(CPU_REPORT_PATH_ENV);
-    let child = command
-        .spawn()
-        .map_err(|error| format!("cannot execute nextest test command: {error}"))?;
-    let child_pid = child.id();
-    install_signal_handlers()?;
-    let status = wait_for_child(child_pid)?;
-    drop(child);
-
-    let supervisor_signal = RECEIVED_SIGNAL.load(Ordering::SeqCst);
-    let completion = if supervisor_signal != 0 {
-        AttemptCompletion::SupervisorSignal {
-            signal: supervisor_signal,
-        }
-    } else {
-        let status = status
-            .ok_or_else(|| "child status is missing without a supervisor signal".to_string())?;
-        match (status.code(), status.signal()) {
-            (Some(code), None) => AttemptCompletion::Exit { code },
-            (None, Some(signal)) => AttemptCompletion::Signal { signal },
-            _ => return Err(format!("child returned unsupported exit status {status:?}")),
+    command.env_remove(TEST_CPU_TIMEOUT_MULTIPLIER_ENV);
+    command.env_remove(TEST_WALL_TIMEOUT_MULTIPLIER_ENV);
+    if let Err(error) = cgroup.attach_command(&mut command) {
+        let detail = preserve_teardown_error(
+            format!("cannot attach test command to per-attempt cgroup: {error}"),
+            &cgroup,
+        );
+        return write_infrastructure_record(
+            &record_dir,
+            run_id,
+            identity,
+            limits,
+            started,
+            InfrastructureFailure {
+                completion: None,
+                cpu_usage_usec: None,
+                detail,
+            },
+        );
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let detail = preserve_teardown_error(
+                format!("cannot execute nextest test command: {error}"),
+                &cgroup,
+            );
+            return write_infrastructure_record(
+                &record_dir,
+                run_id,
+                identity,
+                limits,
+                started,
+                InfrastructureFailure {
+                    completion: None,
+                    cpu_usage_usec: None,
+                    detail,
+                },
+            );
         }
     };
-    let cpu_finished = cpu_usage_usec(pid)?;
-    let cpu_used = cpu_finished.checked_sub(cpu_started).ok_or_else(|| {
-        format!("process-group CPU moved backwards from {cpu_started}us to {cpu_finished}us")
-    })?;
+
+    let mut status = None;
+    let supervision = loop {
+        let cpu = match live_cpu_usage_usec(&cgroup) {
+            Ok(cpu) => cpu,
+            Err(detail) => break Err(detail),
+        };
+        if cpu >= limits.cpu_usec {
+            break Ok(Some(StopCause::CpuTimeout));
+        }
+        let signal = RECEIVED_SIGNAL.load(Ordering::SeqCst);
+        if signal != 0 {
+            break Ok(Some(StopCause::Cancelled(signal)));
+        }
+        let wall = match elapsed_ms(started) {
+            Ok(wall) => wall,
+            Err(detail) => break Err(detail),
+        };
+        if wall >= limits.wall_ms {
+            break Ok(Some(StopCause::WallTimeout));
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(observed) => status = observed,
+                Err(error) => break Err(format!("cannot poll test command: {error}")),
+            }
+        }
+        let group_status = match cgroup.status() {
+            Ok(group_status) => group_status,
+            Err(error) => break Err(format!("cannot read per-attempt cgroup status: {error}")),
+        };
+        if status.is_some() && group_status == ManualCpuCgroupStatus::Empty {
+            break Ok(None);
+        }
+        thread::sleep(limits.poll);
+    };
+
+    let mut cause = match supervision {
+        Ok(cause) => cause,
+        Err(detail) => {
+            let detail = abort_and_reap(&mut child, &cgroup, &mut status, detail);
+            let completion = status.map(completion_from_status).transpose()?;
+            return write_infrastructure_record(
+                &record_dir,
+                run_id,
+                identity,
+                limits,
+                started,
+                InfrastructureFailure {
+                    completion,
+                    cpu_usage_usec: None,
+                    detail,
+                },
+            );
+        }
+    };
+
+    if cause.is_some() {
+        if let Err(detail) = reap_and_empty(&mut child, &cgroup, &mut status, true) {
+            let detail = abort_and_reap(&mut child, &cgroup, &mut status, detail);
+            let completion = status.map(completion_from_status).transpose()?;
+            return write_infrastructure_record(
+                &record_dir,
+                run_id,
+                identity,
+                limits,
+                started,
+                InfrastructureFailure {
+                    completion,
+                    cpu_usage_usec: None,
+                    detail,
+                },
+            );
+        }
+    }
+    let cpu_used = match cgroup.final_cpu_usage_usec() {
+        Ok(cpu) => cpu,
+        Err(error) => {
+            let detail = abort_and_reap(
+                &mut child,
+                &cgroup,
+                &mut status,
+                format!("cannot finalize per-attempt CPU accounting: {error}"),
+            );
+            let completion = status.map(completion_from_status).transpose()?;
+            return write_infrastructure_record(
+                &record_dir,
+                run_id,
+                identity,
+                limits,
+                started,
+                InfrastructureFailure {
+                    completion,
+                    cpu_usage_usec: None,
+                    detail,
+                },
+            );
+        }
+    };
+    let wall_time_ms = elapsed_ms(started)?;
+    if !matches!(cause, Some(StopCause::Cancelled(_))) && cpu_used >= limits.cpu_usec {
+        cause = Some(StopCause::CpuTimeout);
+    } else if cause.is_none() {
+        cause = if wall_time_ms >= limits.wall_ms {
+            Some(StopCause::WallTimeout)
+        } else {
+            None
+        };
+    }
+    if let Err(error) = cgroup.cleanup() {
+        let detail = abort_and_reap(
+            &mut child,
+            &cgroup,
+            &mut status,
+            format!("cannot remove finalized per-attempt cgroup: {error}"),
+        );
+        let completion = status.map(completion_from_status).transpose()?;
+        return write_infrastructure_record(
+            &record_dir,
+            run_id,
+            identity,
+            limits,
+            started,
+            InfrastructureFailure {
+                completion,
+                cpu_usage_usec: Some(cpu_used),
+                detail,
+            },
+        );
+    }
+    let status =
+        status.ok_or_else(|| "child status is missing after cgroup became empty".to_string())?;
+    let completion = completion_from_status(status)?;
+    let outcome = match cause {
+        None => AttemptOutcome::Completed,
+        Some(StopCause::CpuTimeout) => AttemptOutcome::CpuTimeout,
+        Some(StopCause::WallTimeout) => AttemptOutcome::WallTimeout,
+        Some(StopCause::Cancelled(signal)) => AttemptOutcome::Cancelled { signal },
+    };
     let record = AttemptRecord::new(
         run_id,
         identity,
-        cpu_used,
-        elapsed_ms(started)?,
-        completion.clone(),
+        hermit_manifest_plan::nextest_cpu::AttemptMeasurement {
+            cpu_usage_usec: Some(cpu_used),
+            cpu_limit_usec: limits.cpu_usec,
+            wall_time_ms,
+            wall_limit_ms: limits.wall_ms,
+        },
+        Some(completion.clone()),
+        outcome,
     );
     write_attempt_atomic(&record_dir, &record)?;
 
-    match completion {
-        AttemptCompletion::Exit { .. } => {
-            status.ok_or_else(|| "exit completion is missing its child status".to_string())
+    match cause {
+        Some(StopCause::CpuTimeout) => {
+            eprintln!(
+                "nextest-cpu-wrapper: CPU timeout after {cpu_used}us (limit {}us)",
+                limits.cpu_usec
+            );
+            Ok(ExitStatus::from_raw((TIMEOUT_EXIT as i32) << 8))
         }
-        AttemptCompletion::Signal { signal } | AttemptCompletion::SupervisorSignal { signal } => {
-            propagate_signal(signal)
+        Some(StopCause::WallTimeout) => {
+            eprintln!(
+                "nextest-cpu-wrapper: wall timeout after {wall_time_ms}ms (limit {}ms)",
+                limits.wall_ms
+            );
+            Ok(ExitStatus::from_raw((TIMEOUT_EXIT as i32) << 8))
         }
+        Some(StopCause::Cancelled(signal)) => propagate_signal(signal),
+        None => match completion {
+            AttemptCompletion::Exit { .. } => Ok(status),
+            AttemptCompletion::Signal { signal } => propagate_signal(signal),
+        },
     }
 }
 
@@ -288,6 +719,26 @@ fn control_child(mode: &str, args: &[OsString]) -> Result<ExitCode, String> {
             libc::raise(libc::SIGUSR1);
             libc::_exit(255);
         },
+        "cpu-live" => {
+            burn_cpu(500);
+            Ok(ExitCode::SUCCESS)
+        }
+        "cpu-fast" => {
+            burn_cpu(80);
+            Ok(ExitCode::SUCCESS)
+        }
+        "wall" | "accounting-error" => {
+            thread::sleep(Duration::from_millis(400));
+            Ok(ExitCode::SUCCESS)
+        }
+        "peer-target" => {
+            burn_cpu(100);
+            Ok(ExitCode::SUCCESS)
+        }
+        "peer-burn" => {
+            burn_cpu(500);
+            Ok(ExitCode::SUCCESS)
+        }
         "tree" => {
             let executable = env::current_exe().map_err(|error| error.to_string())?;
             let mut children = Vec::new();
@@ -314,7 +765,32 @@ fn control_child(mode: &str, args: &[OsString]) -> Result<ExitCode, String> {
             burn_cpu(100);
             Ok(ExitCode::SUCCESS)
         }
-        "hang" => {
+        "external-cancel" => {
+            let path = PathBuf::from(required_env(CONTROL_PID_FILE_ENV)?);
+            fs::write(&path, format!("{}\n", std::process::id()))
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+            loop {
+                thread::sleep(Duration::from_secs(60));
+            }
+        }
+        "ignore-term" => {
+            let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+            action.sa_sigaction = libc::SIG_IGN;
+            unsafe {
+                libc::sigemptyset(&mut action.sa_mask);
+                if libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) != 0 {
+                    return Err(format!(
+                        "cannot ignore SIGTERM: {}",
+                        io::Error::last_os_error()
+                    ));
+                }
+                if libc::setsid() < 0 {
+                    return Err(format!(
+                        "cannot create escaped session: {}",
+                        io::Error::last_os_error()
+                    ));
+                }
+            }
             let path = PathBuf::from(required_env(CONTROL_PID_FILE_ENV)?);
             fs::write(&path, format!("{}\n", std::process::id()))
                 .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
@@ -363,10 +839,13 @@ fn control_command(
         .env(CPU_RECORD_DIR_ENV, scratch.join("attempts"))
         .env(RUN_ID_ENV, "self-test-run")
         .env(PACKAGE_ENV, "fixture")
-        .env(ATTEMPT_ENV, attempt.to_string())
+        .env(PRIVATE_ATTEMPT_ENV, attempt.to_string())
         .env(CONTROL_ARM_ENV, "1")
         .env(CONTROL_CWD_ENV, scratch)
         .env(CONTROL_SENTINEL_ENV, "preserved")
+        .env(CONTROL_CPU_LIMIT_USEC_ENV, "2000000")
+        .env(CONTROL_WALL_LIMIT_MS_ENV, "5000")
+        .env(CONTROL_POLL_MS_ENV, "10")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -378,6 +857,43 @@ fn find_record<'a>(records: &'a [AttemptRecord], test: &str) -> Result<&'a Attem
         .iter()
         .find(|record| record.identity.test == test)
         .ok_or_else(|| format!("self-test did not find the {test:?} attempt record"))
+}
+
+fn pin_current_to_first_allowed_cpu() -> Result<libc::cpu_set_t, String> {
+    let mut original = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    let size = std::mem::size_of::<libc::cpu_set_t>();
+    if unsafe { libc::sched_getaffinity(0, size, &mut original) } != 0 {
+        return Err(format!(
+            "cannot read self-test CPU affinity: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let cpu = (0..libc::CPU_SETSIZE as usize)
+        .find(|cpu| unsafe { libc::CPU_ISSET(*cpu, &original) })
+        .ok_or_else(|| "self-test CPU affinity contains no CPU".to_string())?;
+    let mut one = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    unsafe {
+        libc::CPU_ZERO(&mut one);
+        libc::CPU_SET(cpu, &mut one);
+    }
+    if unsafe { libc::sched_setaffinity(0, size, &one) } != 0 {
+        return Err(format!(
+            "cannot pin self-test children: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(original)
+}
+
+fn restore_affinity(original: &libc::cpu_set_t) -> Result<(), String> {
+    if unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), original) } != 0
+    {
+        return Err(format!(
+            "cannot restore self-test CPU affinity: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 fn self_test() -> Result<(), String> {
@@ -458,8 +974,9 @@ fn self_test() -> Result<(), String> {
         ));
     }
 
-    let pid_file = scratch.0.join("wall-timeout-child.pid");
-    let mut wall_command = control_command(&executable, &test_binary, &scratch.0, "hang", 1);
+    let pid_file = scratch.0.join("external-cancel-child.pid");
+    let mut wall_command =
+        control_command(&executable, &test_binary, &scratch.0, "external-cancel", 1);
     wall_command.env(CONTROL_PID_FILE_ENV, &pid_file);
     let wall_child = wall_command
         .spawn()
@@ -487,10 +1004,125 @@ fn self_test() -> Result<(), String> {
         ));
     }
 
-    let records = read_attempt_records(&scratch.0.join("attempts"))?;
-    if records.len() != 5 {
+    let mut cpu_live_command =
+        control_command(&executable, &test_binary, &scratch.0, "cpu-live", 1);
+    cpu_live_command.env(CONTROL_CPU_LIMIT_USEC_ENV, "50000");
+    let cpu_live = cpu_live_command
+        .output()
+        .map_err(|error| format!("cannot run live CPU-timeout control: {error}"))?;
+    if cpu_live.status.code() != Some(TIMEOUT_EXIT.into())
+        || !String::from_utf8_lossy(&cpu_live.stderr).contains("CPU timeout")
+    {
         return Err(format!(
-            "self-test expected five atomic attempt records, found {}",
+            "live CPU-timeout control did not time out: {cpu_live:?}"
+        ));
+    }
+
+    let mut cpu_fast_command =
+        control_command(&executable, &test_binary, &scratch.0, "cpu-fast", 1);
+    cpu_fast_command
+        .env(CONTROL_CPU_LIMIT_USEC_ENV, "20000")
+        .env(CONTROL_POLL_MS_ENV, "250");
+    let cpu_fast = cpu_fast_command
+        .output()
+        .map_err(|error| format!("cannot run fast-exit CPU-timeout control: {error}"))?;
+    if cpu_fast.status.code() != Some(TIMEOUT_EXIT.into()) {
+        return Err(format!(
+            "fast-exit CPU-timeout control did not time out: {cpu_fast:?}"
+        ));
+    }
+
+    let mut wall_timeout_command =
+        control_command(&executable, &test_binary, &scratch.0, "wall", 1);
+    wall_timeout_command.env(CONTROL_WALL_LIMIT_MS_ENV, "100");
+    let wall_timeout = wall_timeout_command
+        .output()
+        .map_err(|error| format!("cannot run wall-timeout control: {error}"))?;
+    if wall_timeout.status.code() != Some(TIMEOUT_EXIT.into())
+        || !String::from_utf8_lossy(&wall_timeout.stderr).contains("wall timeout")
+    {
+        return Err(format!(
+            "wall-timeout control did not time out: {wall_timeout:?}"
+        ));
+    }
+
+    let mut accounting =
+        control_command(&executable, &test_binary, &scratch.0, "accounting-error", 1);
+    accounting.env(CONTROL_ACCOUNTING_ERROR_ENV, "1");
+    let accounting = accounting
+        .output()
+        .map_err(|error| format!("cannot run accounting-error control: {error}"))?;
+    if accounting.status.code() != Some(INFRASTRUCTURE_EXIT.into())
+        || !String::from_utf8_lossy(&accounting.stderr).contains("malformed CPU accounting")
+    {
+        return Err(format!(
+            "accounting-error control did not refuse: {accounting:?}"
+        ));
+    }
+
+    let escaped_pid_file = scratch.0.join("ignore-term-child.pid");
+    let mut escaped_command =
+        control_command(&executable, &test_binary, &scratch.0, "ignore-term", 1);
+    escaped_command
+        .env(CONTROL_PID_FILE_ENV, &escaped_pid_file)
+        .env(CONTROL_WALL_LIMIT_MS_ENV, "100");
+    let escaped = escaped_command
+        .output()
+        .map_err(|error| format!("cannot run escaped-descendant control: {error}"))?;
+    if escaped.status.code() != Some(TIMEOUT_EXIT.into()) || !escaped_pid_file.is_file() {
+        return Err(format!(
+            "escaped-descendant control did not time out: {escaped:?}"
+        ));
+    }
+    let escaped_pid = fs::read_to_string(&escaped_pid_file)
+        .map_err(|error| format!("cannot read escaped pid: {error}"))?
+        .trim()
+        .parse::<i32>()
+        .map_err(|error| format!("invalid escaped pid: {error}"))?;
+    if unsafe { libc::kill(escaped_pid, 0) } == 0
+        || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    {
+        return Err(format!(
+            "escaped descendant pid {escaped_pid} survived cgroup kill"
+        ));
+    }
+
+    // The affinity applies only to this mutation control and its children, never to an ordinary
+    // validate. The unrelated peer consumes the same CPU while remaining outside the attempt's
+    // cgroup. The target must reach its wall bound with less than its CPU allowance consumed.
+    let original_affinity = pin_current_to_first_allowed_cpu()?;
+    let mut peer = Command::new(&executable)
+        .args(["--exact", "peer-burn", "--nocapture"])
+        .env(CONTROL_ARM_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("cannot spawn peer-descheduling control: {error}"))?;
+    let mut peer_target = control_command(&executable, &test_binary, &scratch.0, "peer-target", 1);
+    peer_target
+        .env(CONTROL_CPU_LIMIT_USEC_ENV, "150000")
+        .env(CONTROL_WALL_LIMIT_MS_ENV, "120");
+    let peer_target = peer_target
+        .spawn()
+        .map_err(|error| format!("cannot spawn peer-descheduled target: {error}"))?;
+    restore_affinity(&original_affinity)?;
+    let peer_target = peer_target
+        .wait_with_output()
+        .map_err(|error| format!("cannot wait for peer-descheduled target: {error}"))?;
+    let peer_status = peer
+        .wait()
+        .map_err(|error| format!("cannot wait for peer-descheduling control: {error}"))?;
+    if !peer_status.success() || peer_target.status.code() != Some(TIMEOUT_EXIT.into()) {
+        return Err(format!(
+            "peer-descheduling control did not preserve distinct wall enforcement: peer={peer_status}, target={peer_target:?}"
+        ));
+    }
+
+    let records = read_attempt_records(&scratch.0.join("attempts"))?;
+    if records.len() != 11 {
+        return Err(format!(
+            "self-test expected eleven atomic attempt records, found {}",
             records.len()
         ));
     }
@@ -502,18 +1134,18 @@ fn self_test() -> Result<(), String> {
     }
     if !matches!(
         find_record(&records, "success")?.completion,
-        AttemptCompletion::Exit { code: 0 }
+        Some(AttemptCompletion::Exit { code: 0 })
     ) || !matches!(
         find_record(&records, "failure")?.completion,
-        AttemptCompletion::Exit { code: 23 }
+        Some(AttemptCompletion::Exit { code: 23 })
     ) || !matches!(
         find_record(&records, "signal")?.completion,
-        AttemptCompletion::Signal {
+        Some(AttemptCompletion::Signal {
             signal: libc::SIGUSR1
-        }
+        })
     ) || !matches!(
-        find_record(&records, "hang")?.completion,
-        AttemptCompletion::SupervisorSignal {
+        find_record(&records, "external-cancel")?.outcome,
+        AttemptOutcome::Cancelled {
             signal: libc::SIGTERM
         }
     ) {
@@ -522,10 +1154,50 @@ fn self_test() -> Result<(), String> {
         );
     }
     let tree_record = find_record(&records, "tree")?;
-    if tree_record.cpu_usage_usec < 150_000 {
+    if tree_record.cpu_usage_usec.unwrap_or(0) < 150_000 {
         return Err(format!(
-            "process-tree control expected at least 150000us, measured {}us",
+            "process-tree control expected at least 150000us, measured {:?}us",
             tree_record.cpu_usage_usec
+        ));
+    }
+    if !matches!(
+        find_record(&records, "cpu-live")?.outcome,
+        AttemptOutcome::CpuTimeout
+    ) || !matches!(
+        find_record(&records, "cpu-fast")?.outcome,
+        AttemptOutcome::CpuTimeout
+    ) || !matches!(
+        find_record(&records, "wall")?.outcome,
+        AttemptOutcome::WallTimeout
+    ) || !matches!(
+        find_record(&records, "accounting-error")?.outcome,
+        AttemptOutcome::InfrastructureError { .. }
+    ) || !matches!(
+        find_record(&records, "ignore-term")?.outcome,
+        AttemptOutcome::WallTimeout
+    ) {
+        return Err("self-test attempt outcomes do not preserve their distinct causes".into());
+    }
+    let fast = find_record(&records, "cpu-fast")?;
+    if !matches!(fast.completion, Some(AttemptCompletion::Exit { code: 0 }))
+        || fast.cpu_usage_usec.unwrap_or(0) < fast.cpu_limit_usec
+    {
+        return Err(
+            "fast-exit control was not classified from retained final CPU accounting".into(),
+        );
+    }
+    if find_record(&records, "accounting-error")?
+        .cpu_usage_usec
+        .is_some()
+    {
+        return Err("malformed accounting control fabricated a CPU value".into());
+    }
+    let peer_target = find_record(&records, "peer-target")?;
+    if !matches!(peer_target.outcome, AttemptOutcome::WallTimeout)
+        || peer_target.cpu_usage_usec.unwrap_or(u64::MAX) >= peer_target.cpu_limit_usec
+    {
+        return Err(format!(
+            "peer-descheduled target did not stop on wall below its CPU limit: {peer_target:?}"
         ));
     }
     let duplicate = write_attempt_atomic(&scratch.0.join("attempts"), &records[0]);
@@ -533,7 +1205,7 @@ fn self_test() -> Result<(), String> {
         return Err("duplicate atomic attempt publication unexpectedly replaced a record".into());
     }
     println!(
-        "nextest-cpu-wrapper: self-test PASS (process tree, success, failure, signal, wall timeout, typed identity, substituted path, atomic identity)"
+        "nextest-cpu-wrapper: self-test PASS (success, failure, signal, cancellation, live and fast CPU timeout, wall timeout, peer descheduling, malformed accounting, escaped descendant, process tree, typed identity, substituted path, atomic identity)"
     );
     Ok(())
 }

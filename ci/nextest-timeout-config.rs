@@ -53,47 +53,72 @@ fn parse_period_seconds(period: &str) -> Result<u64, String> {
     Ok(seconds)
 }
 
-fn scale_period_value(period: &mut Value, multiplier: f64) -> Result<(), String> {
+fn scale_period_value(
+    period: &mut Value,
+    multiplier: f64,
+    backup_seconds: u64,
+) -> Result<(), String> {
     let source = period
         .as_str()
         .ok_or_else(|| "slow-timeout.period must be a quoted duration string".to_string())?;
     let base_seconds = parse_period_seconds(source)?;
-    let scaled = timeouts::scale_timeout_seconds(base_seconds, multiplier, "wall multiplier")?;
+    let scaled = timeouts::scale_timeout_seconds(base_seconds, multiplier, "wall multiplier")?
+        .checked_add(backup_seconds)
+        .ok_or_else(|| "nextest wall backup overflows whole seconds".to_string())?;
     *period = Value::from(format!("{scaled}s"));
     Ok(())
 }
 
-fn scale_inline_timeout(table: &mut InlineTable, multiplier: f64) -> Result<(), String> {
+fn scale_inline_timeout(
+    table: &mut InlineTable,
+    multiplier: f64,
+    backup_seconds: u64,
+) -> Result<(), String> {
     let period = table
         .get_mut("period")
         .ok_or_else(|| "slow-timeout table is missing period".to_string())?;
-    scale_period_value(period, multiplier)
+    scale_period_value(period, multiplier, backup_seconds)
 }
 
-fn scale_table_timeout(table: &mut Table, multiplier: f64) -> Result<(), String> {
+fn scale_table_timeout(
+    table: &mut Table,
+    multiplier: f64,
+    backup_seconds: u64,
+) -> Result<(), String> {
     let period = table
         .get_mut("period")
         .ok_or_else(|| "slow-timeout table is missing period".to_string())?
         .as_value_mut()
         .ok_or_else(|| "slow-timeout.period must be a scalar value".to_string())?;
-    scale_period_value(period, multiplier)
+    scale_period_value(period, multiplier, backup_seconds)
 }
 
-fn scale_timeout_item(item: &mut Item, multiplier: f64) -> Result<(), String> {
+fn scale_timeout_item(
+    item: &mut Item,
+    multiplier: f64,
+    backup_seconds: u64,
+) -> Result<(), String> {
     match item {
-        Item::Value(Value::InlineTable(table)) => scale_inline_timeout(table, multiplier),
-        Item::Table(table) => scale_table_timeout(table, multiplier),
+        Item::Value(Value::InlineTable(table)) => {
+            scale_inline_timeout(table, multiplier, backup_seconds)
+        }
+        Item::Table(table) => scale_table_timeout(table, multiplier, backup_seconds),
         _ => Err("slow-timeout must be a TOML table".into()),
     }
 }
 
-fn visit_table(table: &mut Table, multiplier: f64, scaled: &mut usize) -> Result<(), String> {
+fn visit_table(
+    table: &mut Table,
+    multiplier: f64,
+    backup_seconds: u64,
+    scaled: &mut usize,
+) -> Result<(), String> {
     for (key, item) in table.iter_mut() {
         if key == "slow-timeout" {
-            scale_timeout_item(item, multiplier)?;
+            scale_timeout_item(item, multiplier, backup_seconds)?;
             *scaled += 1;
         } else {
-            visit_item(item, multiplier, scaled)?;
+            visit_item(item, multiplier, backup_seconds, scaled)?;
         }
     }
     Ok(())
@@ -102,18 +127,26 @@ fn visit_table(table: &mut Table, multiplier: f64, scaled: &mut usize) -> Result
 fn visit_array_of_tables(
     tables: &mut ArrayOfTables,
     multiplier: f64,
+    backup_seconds: u64,
     scaled: &mut usize,
 ) -> Result<(), String> {
     for table in tables.iter_mut() {
-        visit_table(table, multiplier, scaled)?;
+        visit_table(table, multiplier, backup_seconds, scaled)?;
     }
     Ok(())
 }
 
-fn visit_item(item: &mut Item, multiplier: f64, scaled: &mut usize) -> Result<(), String> {
+fn visit_item(
+    item: &mut Item,
+    multiplier: f64,
+    backup_seconds: u64,
+    scaled: &mut usize,
+) -> Result<(), String> {
     match item {
-        Item::Table(table) => visit_table(table, multiplier, scaled),
-        Item::ArrayOfTables(tables) => visit_array_of_tables(tables, multiplier, scaled),
+        Item::Table(table) => visit_table(table, multiplier, backup_seconds, scaled),
+        Item::ArrayOfTables(tables) => {
+            visit_array_of_tables(tables, multiplier, backup_seconds, scaled)
+        }
         Item::None | Item::Value(_) => Ok(()),
     }
 }
@@ -233,11 +266,22 @@ fn scaled_config(
         .parse::<DocumentMut>()
         .map_err(|error| format!("cannot parse nextest TOML: {error}"))?;
     let mut scaled = 0;
-    visit_table(document.as_table_mut(), multiplier, &mut scaled)?;
+    let backup_seconds = cpu_wrapper.map_or(0, |_| timeouts::NEXTEST_WRAPPER_BACKUP_SECONDS);
+    visit_table(
+        document.as_table_mut(),
+        multiplier,
+        backup_seconds,
+        &mut scaled,
+    )?;
     if scaled == 0 {
         return Err("nextest config contains no slow-timeout.period values".into());
     }
     if let Some(wrapper_bin) = cpu_wrapper {
+        if scaled != 1 {
+            return Err(format!(
+                "nextest CPU wrapper requires exactly one inherited slow-timeout declaration, found {scaled}"
+            ));
+        }
         add_cpu_wrapper(&mut document, wrapper_bin)?;
     }
     Ok(document.to_string())
@@ -349,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn adds_one_default_wrapper_inherited_by_ci_without_changing_wall_scaling() {
+    fn adds_one_default_wrapper_inherited_by_ci_with_a_later_wall_backup() {
         let source = concat!(
             "nextest-version = \"0.9.100\"\n",
             "[profile.default]\n",
@@ -367,7 +411,7 @@ mod tests {
         assert_eq!(run_wrapper_count(&document, "default").unwrap(), 1);
         assert_eq!(run_wrapper_count(&document, "ci").unwrap(), 0);
         assert_eq!(rendered.matches("run-wrapper").count(), 1);
-        assert!(rendered.contains("period = \"86s\""));
+        assert!(rendered.contains("period = \"91s\""));
         assert!(rendered.contains("wrapper-scripts"));
         assert!(rendered.contains("target-runner = \"within-wrapper\""));
     }
@@ -386,5 +430,23 @@ mod tests {
             .unwrap_err();
             assert!(error.contains(&format!("profile.{profile} already defines")));
         }
+    }
+
+    #[test]
+    fn wrapper_refuses_multiple_wall_policies_instead_of_enforcing_the_wrong_one() {
+        let source = concat!(
+            "[profile.default]\n",
+            "slow-timeout = { period = \"57s\" }\n",
+            "[[profile.default.overrides]]\n",
+            "filter = \"test(example)\"\n",
+            "slow-timeout = { period = \"90s\" }\n",
+        );
+        let error = scaled_config(
+            source,
+            1.0,
+            Some(Path::new("/tmp/wrapper")),
+        )
+        .unwrap_err();
+        assert!(error.contains("exactly one inherited slow-timeout"), "{error}");
     }
 }

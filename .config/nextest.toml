@@ -13,13 +13,14 @@ status-level = "pass"
 final-status-level = "slow"
 failure-output = "immediate-final"
 success-output = "never"
-# Individual test processes use the owner-approved wall backstop derived from
+# The per-attempt wrapper uses the owner-approved wall limit derived from
 # the completing data-handling/dd-partial-transfers observation:
-# ceil(4 * 14.019s) = 57s. This remains alongside the manifest runner's CPU
-# budget because a wedged process can consume no CPU. Machine-specific wall
-# scaling from HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER and the per-execution CPU
-# measurement wrapper are added to a temporary copy of this canonical file by
-# ci/run-nextest-counted.sh.
+# ceil(4 * 14.019s) = 57s. It enforces the separately scaled 22-second CPU
+# limit first and reports which limit fired. This checked-in value declares
+# the inner wall policy. ci/run-nextest-counted.sh generates a temporary
+# config where Nextest's own slow-timeout is five seconds later, so it is a
+# backup if the wrapper fails rather than a competing first stop. A wedged
+# process can consume no CPU, so both limits remain necessary.
 slow-timeout = { period = "57s", terminate-after = 1, grace-period = "2s" }
 global-timeout = "60m"
 

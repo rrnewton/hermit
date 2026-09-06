@@ -465,7 +465,6 @@ fn reconcile_cpu_attempts(
         let recorded_success = actual
             .get(identity)
             .expect("identity sets were checked above")
-            .completion
             .is_success();
         if *passed != recorded_success {
             return Err(format!(
@@ -609,7 +608,9 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nextest_cpu::{write_attempt_atomic, AttemptCompletion, BinaryMapEntry};
+    use nextest_cpu::{
+        write_attempt_atomic, AttemptCompletion, AttemptOutcome, BinaryMapEntry,
+    };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -666,9 +667,36 @@ mod tests {
                 test: test.into(),
                 attempt,
             },
-            12_345,
-            67,
-            completion,
+            nextest_cpu::AttemptMeasurement {
+                cpu_usage_usec: Some(12_345),
+                cpu_limit_usec: 22_000_000,
+                wall_time_ms: 67,
+                wall_limit_ms: 57_000,
+            },
+            Some(completion),
+            AttemptOutcome::Completed,
+        )
+    }
+
+    fn cpu_timeout_attempt(test: &str, attempt: u64) -> AttemptRecord {
+        AttemptRecord::new(
+            "sample-run".into(),
+            AttemptIdentity {
+                package: "suite".into(),
+                binary: "suite".into(),
+                test: test.into(),
+                attempt,
+            },
+            nextest_cpu::AttemptMeasurement {
+                cpu_usage_usec: Some(22_000_000),
+                cpu_limit_usec: 22_000_000,
+                wall_time_ms: 100,
+                wall_limit_ms: 57_000,
+            },
+            Some(AttemptCompletion::Signal {
+                signal: 15,
+            }),
+            AttemptOutcome::CpuTimeout,
         )
     }
 
@@ -1027,7 +1055,7 @@ mod tests {
         );
         write_record(
             &scratch.0,
-            &attempt("recovers", 1, AttemptCompletion::Exit { code: 23 }),
+            &cpu_timeout_attempt("recovers", 1),
         );
         write_record(
             &scratch.0,
@@ -1041,6 +1069,10 @@ mod tests {
         .unwrap();
         assert_eq!(report.run_id.as_deref(), Some("sample-run"));
         assert_eq!(report.attempts.len(), 3);
+        assert!(matches!(
+            report.attempts[1].outcome,
+            AttemptOutcome::CpuTimeout
+        ));
     }
 
     #[test]

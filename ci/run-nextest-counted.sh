@@ -163,6 +163,7 @@ function run_nextest {
     # is the only input to the aggregate count and per-test result adapter.
     HERMIT_NEXTEST_CPU_BINARY_MAP="$binary_map" \
         HERMIT_NEXTEST_CPU_RECORD_DIR="$attempts" \
+        HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER="$wall_multiplier" \
         NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest \
         --config-file "$nextest_config" run --color never \
         --message-format libtest-json-plus --message-format-version 0.1 \
@@ -342,13 +343,17 @@ PYEOF
     [[ $(<"$scratch/wrapper-counts.json") == \
         '{"executed_tests":1,"filtered_tests":0,"results":[{"attempts":1,"id":"suite$failure","result":"fail"}],"schema":2}' ]] || return 1
     jq -e '
-        .schema == 1 and .run_id == "self-test-nextest" and
+        .schema == 2 and .run_id == "self-test-nextest" and
         (.attempts | length) == 1 and
         .attempts[0].identity == {package:"suite", binary:"suite", test:"failure", attempt:1} and
         .attempts[0].completion == {kind:"exit", code:23} and
-        .attempts[0].cpu_source == "procfs-subtree"
+        .attempts[0].outcome == {kind:"completed"} and
+        .attempts[0].cpu_source == "cgroup" and
+        (.attempts[0].cpu_usage_usec | type) == "number" and
+        .attempts[0].cpu_limit_usec == 22000000 and
+        .attempts[0].wall_limit_ms == 86000
     ' "$scratch/wrapper-cpu.json" >/dev/null || return 1
-    grep -q 'period = "86s"' "$scratch/scaled-nextest.toml" || return 1
+    grep -q 'period = "91s"' "$scratch/scaled-nextest.toml" || return 1
     [[ $(grep -c '^run-wrapper = "hermit-per-test-cpu"$' \
         "$scratch/scaled-nextest.toml") == 1 ]] || return 1
     grep -q '^experimental = \["wrapper-scripts"\]$' \

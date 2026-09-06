@@ -11,13 +11,13 @@ use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 
-pub const ATTEMPT_RECORD_SCHEMA: u64 = 1;
+pub const ATTEMPT_RECORD_SCHEMA: u64 = 2;
 pub const BINARY_MAP_SCHEMA: u64 = 1;
-pub const CPU_REPORT_SCHEMA: u64 = 1;
+pub const CPU_REPORT_SCHEMA: u64 = 2;
 pub const CPU_BINARY_MAP_ENV: &str = "HERMIT_NEXTEST_CPU_BINARY_MAP";
 pub const CPU_RECORD_DIR_ENV: &str = "HERMIT_NEXTEST_CPU_RECORD_DIR";
 pub const CPU_REPORT_PATH_ENV: &str = "HERMIT_NEXTEST_CPU_REPORT_PATH";
-pub const CPU_SOURCE: &str = dagrun::proccpu::CPU_SOURCE_PROCFS;
+pub const CPU_SOURCE: &str = dagrun::proccpu::CPU_SOURCE_CGROUP;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -208,7 +208,6 @@ impl AttemptIdentity {
 pub enum AttemptCompletion {
     Exit { code: i32 },
     Signal { signal: i32 },
-    SupervisorSignal { signal: i32 },
 }
 
 impl AttemptCompletion {
@@ -216,16 +215,28 @@ impl AttemptCompletion {
         match self {
             Self::Exit { code } if (0..=255).contains(code) => Ok(()),
             Self::Exit { code } => Err(format!("exit code {code} is outside 0..=255")),
-            Self::Signal { signal } | Self::SupervisorSignal { signal } if *signal > 0 => Ok(()),
-            Self::Signal { signal } | Self::SupervisorSignal { signal } => {
-                Err(format!("signal {signal} is not positive"))
-            }
+            Self::Signal { signal } if *signal > 0 => Ok(()),
+            Self::Signal { signal } => Err(format!("signal {signal} is not positive")),
         }
     }
+}
 
-    pub fn is_success(&self) -> bool {
-        matches!(self, Self::Exit { code: 0 })
-    }
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AttemptOutcome {
+    Completed,
+    CpuTimeout,
+    WallTimeout,
+    Cancelled { signal: i32 },
+    InfrastructureError { detail: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptMeasurement {
+    pub cpu_usage_usec: Option<u64>,
+    pub cpu_limit_usec: u64,
+    pub wall_time_ms: u64,
+    pub wall_limit_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -236,18 +247,21 @@ pub struct AttemptRecord {
     pub run_id: String,
     pub identity: AttemptIdentity,
     pub cpu_source: String,
-    pub cpu_usage_usec: u64,
+    pub cpu_usage_usec: Option<u64>,
+    pub cpu_limit_usec: u64,
     pub wall_time_ms: u64,
-    pub completion: AttemptCompletion,
+    pub wall_limit_ms: u64,
+    pub completion: Option<AttemptCompletion>,
+    pub outcome: AttemptOutcome,
 }
 
 impl AttemptRecord {
     pub fn new(
         run_id: String,
         identity: AttemptIdentity,
-        cpu_usage_usec: u64,
-        wall_time_ms: u64,
-        completion: AttemptCompletion,
+        measurement: AttemptMeasurement,
+        completion: Option<AttemptCompletion>,
+        outcome: AttemptOutcome,
     ) -> Self {
         let key = identity.key();
         Self {
@@ -256,9 +270,12 @@ impl AttemptRecord {
             run_id,
             identity,
             cpu_source: CPU_SOURCE.into(),
-            cpu_usage_usec,
-            wall_time_ms,
+            cpu_usage_usec: measurement.cpu_usage_usec,
+            cpu_limit_usec: measurement.cpu_limit_usec,
+            wall_time_ms: measurement.wall_time_ms,
+            wall_limit_ms: measurement.wall_limit_ms,
             completion,
+            outcome,
         }
     }
 
@@ -284,7 +301,80 @@ impl AttemptRecord {
                 self.cpu_source
             ));
         }
-        self.completion.validate()
+        if self.cpu_limit_usec == 0 || self.wall_limit_ms == 0 {
+            return Err("attempt limits must be positive".into());
+        }
+        if let Some(completion) = &self.completion {
+            completion.validate()?;
+        }
+        match &self.outcome {
+            AttemptOutcome::Completed => {
+                let usage = self.cpu_usage_usec.ok_or_else(|| {
+                    "completed attempt is missing final CPU accounting".to_string()
+                })?;
+                if usage >= self.cpu_limit_usec || self.wall_time_ms >= self.wall_limit_ms {
+                    return Err("completed attempt reached a timeout boundary".into());
+                }
+                if self.completion.is_none() {
+                    return Err("completed attempt is missing its raw completion".into());
+                }
+            }
+            AttemptOutcome::CpuTimeout => {
+                let usage = self.cpu_usage_usec.ok_or_else(|| {
+                    "CPU-timeout attempt is missing final CPU accounting".to_string()
+                })?;
+                if usage < self.cpu_limit_usec {
+                    return Err(format!(
+                        "CPU-timeout attempt used {usage}us below its {}us limit",
+                        self.cpu_limit_usec
+                    ));
+                }
+                if self.completion.is_none() {
+                    return Err("CPU-timeout attempt is missing its raw completion".into());
+                }
+            }
+            AttemptOutcome::WallTimeout => {
+                let usage = self.cpu_usage_usec.ok_or_else(|| {
+                    "wall-timeout attempt is missing final CPU accounting".to_string()
+                })?;
+                if self.wall_time_ms < self.wall_limit_ms {
+                    return Err(format!(
+                        "wall-timeout attempt ran {}ms below its {}ms limit",
+                        self.wall_time_ms, self.wall_limit_ms
+                    ));
+                }
+                if usage >= self.cpu_limit_usec {
+                    return Err(
+                        "wall timeout cannot take precedence over a reached CPU limit".into(),
+                    );
+                }
+                if self.completion.is_none() {
+                    return Err("wall-timeout attempt is missing its raw completion".into());
+                }
+            }
+            AttemptOutcome::Cancelled { signal } => {
+                if *signal <= 0 {
+                    return Err(format!("cancellation signal {signal} is not positive"));
+                }
+                if self.cpu_usage_usec.is_none() {
+                    return Err("cancelled attempt is missing final CPU accounting".into());
+                }
+                if self.completion.is_none() {
+                    return Err("cancelled attempt is missing its raw completion".into());
+                }
+            }
+            AttemptOutcome::InfrastructureError { detail } => {
+                if detail.trim().is_empty() {
+                    return Err("infrastructure error detail must be nonempty".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn is_success(&self) -> bool {
+        matches!(self.outcome, AttemptOutcome::Completed)
+            && matches!(self.completion, Some(AttemptCompletion::Exit { code: 0 }))
     }
 
     pub fn file_name(&self) -> String {
@@ -453,4 +543,109 @@ pub fn write_binary_map_atomic(path: &Path, map: &BinaryMap) -> Result<(), Strin
 
 pub fn write_report_atomic(path: &Path, report: &CpuReport) -> Result<(), String> {
     write_replace_atomic(path, report, "nextest CPU report")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(outcome: AttemptOutcome) -> AttemptRecord {
+        AttemptRecord::new(
+            "run".into(),
+            AttemptIdentity {
+                package: "package".into(),
+                binary: "binary".into(),
+                test: "test".into(),
+                attempt: 1,
+            },
+            AttemptMeasurement {
+                cpu_usage_usec: Some(10),
+                cpu_limit_usec: 20,
+                wall_time_ms: 30,
+                wall_limit_ms: 40,
+            },
+            Some(AttemptCompletion::Exit { code: 0 }),
+            outcome,
+        )
+    }
+
+    #[test]
+    fn completed_attempt_requires_both_accounting_and_raw_completion() {
+        assert!(record(AttemptOutcome::Completed).validate().is_ok());
+        let mut missing_cpu = record(AttemptOutcome::Completed);
+        missing_cpu.cpu_usage_usec = None;
+        assert!(
+            missing_cpu
+                .validate()
+                .unwrap_err()
+                .contains("CPU accounting")
+        );
+        let mut missing_completion = record(AttemptOutcome::Completed);
+        missing_completion.completion = None;
+        assert!(
+            missing_completion
+                .validate()
+                .unwrap_err()
+                .contains("raw completion")
+        );
+    }
+
+    #[test]
+    fn cpu_timeout_requires_a_reached_cpu_limit() {
+        let mut timeout = record(AttemptOutcome::CpuTimeout);
+        assert!(timeout.validate().unwrap_err().contains("below"));
+        timeout.cpu_usage_usec = Some(timeout.cpu_limit_usec);
+        assert!(timeout.validate().is_ok());
+        assert!(!timeout.is_success());
+    }
+
+    #[test]
+    fn wall_timeout_requires_wall_elapsed_and_cpu_below_limit() {
+        let mut timeout = record(AttemptOutcome::WallTimeout);
+        assert!(timeout.validate().unwrap_err().contains("below"));
+        timeout.wall_time_ms = timeout.wall_limit_ms;
+        assert!(timeout.validate().is_ok());
+        timeout.cpu_usage_usec = Some(timeout.cpu_limit_usec);
+        assert!(timeout.validate().unwrap_err().contains("precedence"));
+    }
+
+    #[test]
+    fn infrastructure_error_can_report_that_accounting_or_completion_is_unavailable() {
+        let mut infrastructure = record(AttemptOutcome::InfrastructureError {
+            detail: "cpu.stat was malformed".into(),
+        });
+        infrastructure.cpu_usage_usec = None;
+        infrastructure.completion = None;
+        assert!(infrastructure.validate().is_ok());
+        infrastructure.outcome = AttemptOutcome::InfrastructureError { detail: " ".into() };
+        assert!(infrastructure.validate().unwrap_err().contains("nonempty"));
+    }
+
+    #[test]
+    fn cancellation_requires_the_signal_accounting_and_raw_completion() {
+        let mut cancelled = record(AttemptOutcome::Cancelled { signal: 15 });
+        assert!(cancelled.validate().is_ok());
+        cancelled.cpu_usage_usec = None;
+        assert!(cancelled.validate().unwrap_err().contains("CPU accounting"));
+        cancelled.cpu_usage_usec = Some(10);
+        cancelled.completion = None;
+        assert!(cancelled.validate().unwrap_err().contains("raw completion"));
+    }
+
+    #[test]
+    fn typed_outcome_round_trip_keeps_timeout_causes_distinct() {
+        for outcome in [AttemptOutcome::CpuTimeout, AttemptOutcome::WallTimeout] {
+            let mut original = record(outcome);
+            original.cpu_usage_usec =
+                Some(if matches!(original.outcome, AttemptOutcome::CpuTimeout) {
+                    original.cpu_limit_usec
+                } else {
+                    10
+                });
+            original.wall_time_ms = original.wall_limit_ms;
+            let bytes = serde_json::to_vec(&original).unwrap();
+            let decoded: AttemptRecord = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(decoded, original);
+        }
+    }
 }

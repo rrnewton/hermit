@@ -138,6 +138,7 @@ use hermit_manifest_plan::service_result::FinalValidateStatus;
 use hermit_manifest_plan::service_result::ScorecardWriteback;
 use hermit_manifest_plan::service_result::ValidationServiceResult;
 use hermit_manifest_plan::timeouts::DEFAULT_TEST_WALL_TIMEOUT_SECONDS;
+use hermit_manifest_plan::timeouts::NEXTEST_WRAPPER_BACKUP_SECONDS;
 use hermit_manifest_plan::timeouts::scale_timeout_seconds;
 use hermit_manifest_plan::timeouts::timeout_multiplier_from_env;
 use hermit_manifest_plan::timeouts::TEST_WALL_TIMEOUT_MULTIPLIER_ENV;
@@ -10774,6 +10775,10 @@ fn render_scaled_nextest_config(root: &Path, multiplier: f64) -> Result<String, 
         .arg(root.join(".config/nextest.toml"))
         .arg(multiplier.to_string())
         .arg(&output_path)
+        .env(
+            "HERMIT_NEXTEST_CPU_WRAPPER_BIN",
+            root.join("target/debug/nextest-cpu-wrapper"),
+        )
         .output()
         .map_err(|error| format!("cannot run nextest timeout transformer: {error}"))?;
     if !output.status.success() {
@@ -10795,14 +10800,16 @@ fn require_matching_scaled_default(
     multiplier: f64,
     nextest_caps: &[NextestTimeoutCap],
 ) -> Result<u64, String> {
-    let expected = scale_timeout_seconds(manifest_base_seconds, multiplier, "wall multiplier")?;
+    let expected = scale_timeout_seconds(manifest_base_seconds, multiplier, "wall multiplier")?
+        .checked_add(NEXTEST_WRAPPER_BACKUP_SECONDS)
+        .ok_or("generated nextest wall backup overflowed")?;
     let actual = nextest_caps
         .first()
         .ok_or("generated nextest config contains no default timeout")?
         .period_seconds;
     if actual != expected {
         return Err(format!(
-            "generated nextest default is {actual}s, but manifest {manifest_base_seconds}s scaled by {multiplier} with ceiling rounding is {expected}s"
+            "generated nextest backup is {actual}s, but manifest {manifest_base_seconds}s scaled by {multiplier} with ceiling rounding plus the {NEXTEST_WRAPPER_BACKUP_SECONDS}s backup is {expected}s"
         ));
     }
     Ok(expected)
@@ -10812,6 +10819,7 @@ fn require_outer_timeout_headroom(
     tag: &str,
     node_timeout_seconds: i64,
     base_inner_seconds: u64,
+    post_scale_slack_seconds: u64,
     termination_grace_seconds: u64,
     attempts: u64,
     wall_multiplier: f64,
@@ -10823,6 +10831,9 @@ fn require_outer_timeout_headroom(
         wall_multiplier,
         &format!("{tag} wall multiplier"),
     )?;
+    let scaled_inner_seconds = scaled_inner_seconds
+        .checked_add(post_scale_slack_seconds)
+        .ok_or_else(|| format!("retry bounds: {tag} scaled timeout plus backup overflowed"))?;
     let one_attempt_seconds = scaled_inner_seconds
         .checked_add(termination_grace_seconds)
         .ok_or_else(|| format!("retry bounds: {tag} timeout plus grace overflowed"))?;
@@ -10843,7 +10854,7 @@ mod nextest_timeout_tests {
     use super::*;
 
     #[test]
-    fn nextest_and_manifest_share_base_and_scaled_wall_bounds() {
+    fn nextest_declares_inner_wall_and_generated_backup_is_later() {
         let root = Path::new(file!())
             .parent()
             .and_then(Path::parent)
@@ -10892,14 +10903,14 @@ mod nextest_timeout_tests {
     #[test]
     fn enclosing_timeout_checks_scale_and_refuse_unsafe_multipliers() {
         assert_eq!(
-            require_outer_timeout_headroom("fixture", 600, 74, 10, 2, 1.0).unwrap(),
+            require_outer_timeout_headroom("fixture", 600, 74, 0, 10, 2, 1.0).unwrap(),
             432
         );
         assert_eq!(
-            require_outer_timeout_headroom("fixture", 600, 74, 10, 2, 1.5).unwrap(),
+            require_outer_timeout_headroom("fixture", 600, 74, 0, 10, 2, 1.5).unwrap(),
             358
         );
-        let error = require_outer_timeout_headroom("fixture", 600, 118, 10, 2, 10.0)
+        let error = require_outer_timeout_headroom("fixture", 600, 118, 0, 10, 2, 10.0)
             .expect_err("an oversized wall multiplier must not outgrow the outer backup");
         assert!(error.contains("wall multiplier 10"), "{error}");
         assert!(error.contains("can consume 2380s"), "{error}");
@@ -11049,6 +11060,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
                 &step.tag(),
                 step.timeout,
                 largest_base_nextest_cap_s,
+                NEXTEST_WRAPPER_BACKUP_SECONDS,
                 NEXTEST_TERMINATION_GRACE_S as u64,
                 1,
                 validated_wall_multiplier,
@@ -11060,6 +11072,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
                 &step.tag(),
                 step.timeout,
                 DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
+                NEXTEST_WRAPPER_BACKUP_SECONDS,
                 NEXTEST_TERMINATION_GRACE_S as u64,
                 1,
                 1.5,
@@ -11108,6 +11121,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         "validated wall multiplier",
     )?)
     .map_err(|error| format!("retry bounds: scaled default is too large: {error}"))?
+        + i64::try_from(NEXTEST_WRAPPER_BACKUP_SECONDS).unwrap()
         + NEXTEST_TERMINATION_GRACE_S;
     let largest_nextest_with_grace_s = largest_nextest_cap_s + NEXTEST_TERMINATION_GRACE_S;
 
@@ -11134,6 +11148,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             tag,
             node_timeout_s,
             largest_cell_cap_s,
+            0,
             MANIFEST_TERMINATION_GRACE_S as u64,
             attempts,
             wall_multiplier,
@@ -11205,6 +11220,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         "oversized-multiplier-control",
         600,
         118,
+        0,
         MANIFEST_TERMINATION_GRACE_S as u64,
         attempts,
         10.0,

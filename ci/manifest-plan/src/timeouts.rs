@@ -12,6 +12,8 @@ pub const MAX_TIMEOUT_SECONDS: u64 = 1800;
 pub const DEFAULT_TEST_CPU_TIMEOUT_SECONDS: u64 = 22;
 /// Owner-approved ordinary-test wall bound: ceil(4 * 14.019 s) = 57 s.
 pub const DEFAULT_TEST_WALL_TIMEOUT_SECONDS: u64 = 57;
+/// Nextest's own wall deadline follows the per-attempt wrapper by this much.
+pub const NEXTEST_WRAPPER_BACKUP_SECONDS: u64 = 5;
 pub const TEST_CPU_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER";
 pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER";
 
