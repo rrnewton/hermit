@@ -5,7 +5,16 @@
 //! complete canonical-INFO input. A consumer must still compare two validated
 //! reports before making a determinism claim.
 
-use std::fs;
+use std::ffi::CString;
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io;
+use std::io::Read;
+use std::mem::MaybeUninit;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -17,6 +26,9 @@ use crate::canonical_verdict::RecordEnvelopeReport;
 pub const RUN_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub const RUN_EVIDENCE_MANIFEST: &str = "manifest.json";
 pub const RUN_EVIDENCE_INFO_ARTIFACT: &str = "canonical-info-v1.log";
+/// A terminal manifest is readable only after its directory entry is durable.
+/// Mode zero is the producer's unpublished state.
+pub const RUN_EVIDENCE_MANIFEST_MODE: u32 = 0o400;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -187,6 +199,61 @@ fn static_manifest_fields_are_valid(report: &RunEvidenceReport) -> bool {
             }
         }
 }
+fn component_cstring(component: &OsStr) -> io::Result<CString> {
+    CString::new(component.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
+}
+
+fn owned_file(fd: RawFd) -> io::Result<File> {
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: a nonnegative open/openat return is one newly owned fd.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+fn open_evidence_directory(path: &Path) -> io::Result<File> {
+    let path = component_cstring(path.as_os_str())?;
+    owned_file(unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    })
+}
+
+fn read_regular_child(
+    directory: &File,
+    name: &OsStr,
+    required_mode: Option<u32>,
+) -> io::Result<Vec<u8>> {
+    let name = component_cstring(name)?;
+    let mut file = owned_file(unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    })?;
+    let mut stat = MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstat initialized the complete structure on success.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || required_mode.is_some_and(|mode| stat.st_mode & 0o777 != mode)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "run-evidence child is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
 
 /// Read and independently validate an ordinary-run sidecar.
 ///
@@ -195,7 +262,21 @@ fn static_manifest_fields_are_valid(report: &RunEvidenceReport) -> bool {
 /// it re-reads the artifact, verifies its length and SHA-256 digest, and runs
 /// the fixed `BitwiseInfoV1` parser over the exact bytes.
 pub fn inspect_run_evidence(directory: &Path) -> RunEvidenceInspection {
-    let manifest = match fs::read(directory.join(RUN_EVIDENCE_MANIFEST)) {
+    let directory = match open_evidence_directory(directory) {
+        Ok(directory) => directory,
+        Err(_) => {
+            return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MissingManifest);
+        }
+    };
+    inspect_run_evidence_directory(&directory)
+}
+
+fn inspect_run_evidence_directory(directory: &File) -> RunEvidenceInspection {
+    let manifest = match read_regular_child(
+        directory,
+        OsStr::new(RUN_EVIDENCE_MANIFEST),
+        Some(RUN_EVIDENCE_MANIFEST_MODE),
+    ) {
         Ok(manifest) => manifest,
         Err(_) => {
             return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MissingManifest);
@@ -238,7 +319,8 @@ pub fn inspect_run_evidence(directory: &Path) -> RunEvidenceInspection {
     let Some(expected_digest) = report.canonical_info.sha256.as_deref() else {
         return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::InvalidManifest);
     };
-    let artifact = match fs::read(directory.join(RUN_EVIDENCE_INFO_ARTIFACT)) {
+    let artifact = match read_regular_child(directory, OsStr::new(RUN_EVIDENCE_INFO_ARTIFACT), None)
+    {
         Ok(artifact) => artifact,
         Err(_) => {
             return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MissingArtifact);
@@ -282,6 +364,9 @@ pub fn inspect_run_evidence(directory: &Path) -> RunEvidenceInspection {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     fn valid_log() -> Vec<u8> {
@@ -309,11 +394,11 @@ Apr 09 06:08:02.100  INFO hermit_test: second evidence record\n"
                 artifact: RUN_EVIDENCE_INFO_ARTIFACT.to_string(),
             },
         };
-        fs::write(
-            directory.join(RUN_EVIDENCE_MANIFEST),
-            serde_json::to_vec(&report).unwrap(),
-        )
-        .unwrap();
+        let manifest = directory.join(RUN_EVIDENCE_MANIFEST);
+        fs::write(&manifest, serde_json::to_vec(&report).unwrap()).unwrap();
+        let mut permissions = fs::metadata(&manifest).unwrap().permissions();
+        permissions.set_mode(RUN_EVIDENCE_MANIFEST_MODE);
+        fs::set_permissions(manifest, permissions).unwrap();
     }
 
     #[test]
@@ -388,6 +473,75 @@ Apr 09 06:08:02.100  INFO hermit_test: second evidence record\n"
         assert_eq!(
             inspect_run_evidence(mismatch.path()),
             RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::DigestMismatch)
+        );
+    }
+    #[test]
+    fn inspector_pins_one_directory_identity() {
+        let parent = tempfile::tempdir().unwrap();
+        let requested = parent.path().join("requested");
+        fs::create_dir(&requested).unwrap();
+        let log = valid_log();
+        write_complete_fixture(&requested, &log, detcore::Digest::new(&log).to_string(), 2);
+        let held = open_evidence_directory(&requested).unwrap();
+
+        let original = parent.path().join("original");
+        fs::rename(&requested, &original).unwrap();
+        fs::create_dir(&requested).unwrap();
+
+        assert!(matches!(
+            inspect_run_evidence_directory(&held),
+            RunEvidenceInspection::Complete(_)
+        ));
+        assert_eq!(
+            inspect_run_evidence(&requested),
+            RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MissingManifest)
+        );
+    }
+
+    #[test]
+    fn inspector_refuses_symlinked_directory_and_children() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let log = valid_log();
+        write_complete_fixture(&source, &log, detcore::Digest::new(&log).to_string(), 2);
+
+        let directory_link = parent.path().join("directory-link");
+        symlink(&source, &directory_link).unwrap();
+        assert_eq!(
+            inspect_run_evidence(&directory_link),
+            RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MissingManifest)
+        );
+
+        let manifest_link_case = parent.path().join("manifest-link");
+        fs::create_dir(&manifest_link_case).unwrap();
+        symlink(
+            source.join(RUN_EVIDENCE_MANIFEST),
+            manifest_link_case.join(RUN_EVIDENCE_MANIFEST),
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_run_evidence(&manifest_link_case),
+            RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MissingManifest)
+        );
+
+        let artifact_link_case = parent.path().join("artifact-link");
+        fs::create_dir(&artifact_link_case).unwrap();
+        fs::copy(
+            source.join(RUN_EVIDENCE_MANIFEST),
+            artifact_link_case.join(RUN_EVIDENCE_MANIFEST),
+        )
+        .unwrap();
+        symlink(
+            source.join(RUN_EVIDENCE_INFO_ARTIFACT),
+            artifact_link_case.join(RUN_EVIDENCE_INFO_ARTIFACT),
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_run_evidence(&artifact_link_case),
+            RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MissingArtifact)
         );
     }
 }

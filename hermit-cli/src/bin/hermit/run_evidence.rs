@@ -6,6 +6,7 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::RawFd;
@@ -23,6 +24,7 @@ use hermit::run_evidence::DispositionLimitation;
 use hermit::run_evidence::GuestDisposition;
 use hermit::run_evidence::RUN_EVIDENCE_INFO_ARTIFACT;
 use hermit::run_evidence::RUN_EVIDENCE_MANIFEST;
+use hermit::run_evidence::RUN_EVIDENCE_MANIFEST_MODE;
 use hermit::run_evidence::RUN_EVIDENCE_SCHEMA_VERSION;
 use hermit::run_evidence::RunEvidenceBackend;
 use hermit::run_evidence::RunEvidenceNoResultReason;
@@ -35,30 +37,73 @@ use uuid::Uuid;
 use super::tracing::LatchedWriter;
 use super::tracing::WriteErrorLatch;
 
-const MANIFEST_STAGING: &str = ".manifest.json.pending";
+const ARTIFACT_MODE: libc::mode_t = 0o600;
+const MANIFEST_UNPUBLISHED_MODE: libc::mode_t = 0o000;
+const MANIFEST_PUBLISHED_MODE: libc::mode_t = RUN_EVIDENCE_MANIFEST_MODE;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectorySyncPoint {
+    ParentClaim,
+    ArtifactPublished,
+    ManifestPreflight,
+    ManifestPublished,
+    ManifestCleanup,
+}
+
+#[cfg(test)]
+enum InjectedSyncFailure {
+    Once {
+        point: DirectorySyncPoint,
+        fired: Arc<std::sync::atomic::AtomicBool>,
+    },
+    PersistentManifestPublication,
+}
 
 #[derive(Default)]
 struct DirectorySync {
     #[cfg(test)]
-    injected_failure: Option<(Arc<std::sync::atomic::AtomicUsize>, usize)>,
+    injected_failure: Option<InjectedSyncFailure>,
 }
 
 impl DirectorySync {
-    fn sync(&self, directory: &File) -> io::Result<()> {
+    fn sync(&self, point: DirectorySyncPoint, directory: &File) -> io::Result<()> {
+        #[cfg(not(test))]
+        let _ = point;
         #[cfg(test)]
-        if let Some((calls, fail_on)) = &self.injected_failure {
-            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            if call == *fail_on {
-                return Err(io::Error::other("injected directory fsync failure"));
+        if let Some(failure) = &self.injected_failure {
+            let should_fail = match failure {
+                InjectedSyncFailure::Once {
+                    point: fail_point,
+                    fired,
+                } => point == *fail_point && !fired.swap(true, std::sync::atomic::Ordering::SeqCst),
+                InjectedSyncFailure::PersistentManifestPublication => matches!(
+                    point,
+                    DirectorySyncPoint::ManifestPublished | DirectorySyncPoint::ManifestCleanup
+                ),
+            };
+            if should_fail {
+                return Err(io::Error::other(format!(
+                    "injected {point:?} directory fsync failure"
+                )));
             }
         }
         directory.sync_all()
     }
 
     #[cfg(test)]
-    fn fail_on(call: usize) -> Self {
+    fn fail_once(point: DirectorySyncPoint) -> Self {
         Self {
-            injected_failure: Some((Arc::new(std::sync::atomic::AtomicUsize::new(0)), call)),
+            injected_failure: Some(InjectedSyncFailure::Once {
+                point,
+                fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_manifest_persistently() -> Self {
+        Self {
+            injected_failure: Some(InjectedSyncFailure::PersistentManifestPublication),
         }
     }
 }
@@ -68,6 +113,8 @@ pub(crate) struct RunEvidenceSession {
     invocation_id: Uuid,
     backend: Backend,
     raw_log: Arc<File>,
+    artifact: File,
+    manifest: File,
     write_error: WriteErrorLatch,
     directory_sync: DirectorySync,
 }
@@ -75,6 +122,14 @@ pub(crate) struct RunEvidenceSession {
 impl RunEvidenceSession {
     /// Atomically claim a destination that did not exist before this invocation.
     pub(crate) fn create(directory: &Path, backend: Backend) -> Result<Self, Error> {
+        Self::create_with_directory_sync(directory, backend, DirectorySync::default())
+    }
+
+    fn create_with_directory_sync(
+        directory: &Path,
+        backend: Backend,
+        directory_sync: DirectorySync,
+    ) -> Result<Self, Error> {
         let invocation_id = Uuid::new_v4();
         let raw_log = tempfile::tempfile().with_context(|| {
             format!(
@@ -88,19 +143,36 @@ impl RunEvidenceSession {
                 directory.display()
             )
         })?;
-        let claimed = create_claimed_directory(directory, invocation_id).with_context(|| {
-            format!(
-                "cannot create --run-evidence-dir {}: the destination must not already exist",
-                directory.display()
-            )
-        })?;
+        let claimed = create_claimed_directory(directory, invocation_id, &directory_sync)
+            .with_context(|| {
+                format!(
+                    "cannot create --run-evidence-dir {}: the destination must not already exist",
+                    directory.display()
+                )
+            })?;
+        let artifact =
+            create_unnamed_file_at(claimed.as_raw_fd(), ARTIFACT_MODE).with_context(|| {
+                format!(
+                    "cannot create unnamed run-evidence artifact in {}",
+                    directory.display()
+                )
+            })?;
+        let manifest = create_unnamed_file_at(claimed.as_raw_fd(), MANIFEST_UNPUBLISHED_MODE)
+            .with_context(|| {
+                format!(
+                    "cannot create unnamed run-evidence manifest in {}",
+                    directory.display()
+                )
+            })?;
         Ok(Self {
             directory: claimed,
             invocation_id,
             backend,
             raw_log: Arc::new(raw_log),
+            artifact,
+            manifest,
             write_error,
-            directory_sync: DirectorySync::default(),
+            directory_sync,
         })
     }
 
@@ -113,7 +185,7 @@ impl RunEvidenceSession {
     }
 
     /// Publish the terminal manifest after the guest result and log artifact are final.
-    pub(crate) fn finish(self, run_result: Result<&ExitStatus, &Error>) -> Result<(), Error> {
+    pub(crate) fn finish(mut self, run_result: Result<&ExitStatus, &Error>) -> Result<(), Error> {
         let observed_disposition = run_result
             .ok()
             .and_then(|status| guest_disposition(self.backend, *status));
@@ -199,7 +271,9 @@ impl RunEvidenceSession {
         Ok(bytes)
     }
 
-    fn publish_canonical_info(&self) -> Result<CanonicalInfoEvidence, RunEvidenceNoResultReason> {
+    fn publish_canonical_info(
+        &mut self,
+    ) -> Result<CanonicalInfoEvidence, RunEvidenceNoResultReason> {
         let bytes = self.read_private_log()?;
         if bytes.is_empty() {
             return Err(RunEvidenceNoResultReason::ZeroCanonicalInfo);
@@ -222,30 +296,22 @@ impl RunEvidenceSession {
         }
 
         let digest = detcore::Digest::new(&bytes).to_string();
-        let mut artifact = create_new_file_at(
-            self.directory.as_raw_fd(),
-            OsStr::new(RUN_EVIDENCE_INFO_ARTIFACT),
-        )
-        .map_err(|_| RunEvidenceNoResultReason::ArtifactWriteFailed)?;
-        artifact
-            .write_all(&bytes)
-            .and_then(|()| artifact.flush())
-            .and_then(|()| artifact.sync_all())
+        write_file_contents(&mut self.artifact, &bytes)
             .map_err(|_| RunEvidenceNoResultReason::ArtifactWriteFailed)?;
-
-        artifact
-            .seek(SeekFrom::Start(0))
-            .map_err(|_| RunEvidenceNoResultReason::ArtifactWriteFailed)?;
-        let mut published = Vec::new();
-        artifact
-            .read_to_end(&mut published)
+        let published = read_file_contents(&mut self.artifact)
             .map_err(|_| RunEvidenceNoResultReason::ArtifactWriteFailed)?;
         if published.len() != bytes.len() || detcore::Digest::new(&published).to_string() != digest
         {
             return Err(RunEvidenceNoResultReason::ArtifactWriteFailed);
         }
+        link_unnamed_file_at(
+            &self.artifact,
+            self.directory.as_raw_fd(),
+            OsStr::new(RUN_EVIDENCE_INFO_ARTIFACT),
+        )
+        .map_err(|_| RunEvidenceNoResultReason::ArtifactWriteFailed)?;
         self.directory_sync
-            .sync(&self.directory)
+            .sync(DirectorySyncPoint::ArtifactPublished, &self.directory)
             .map_err(|_| RunEvidenceNoResultReason::ArtifactWriteFailed)?;
 
         Ok(CanonicalInfoEvidence {
@@ -258,40 +324,105 @@ impl RunEvidenceSession {
         })
     }
 
-    fn publish_manifest(&self, report: &RunEvidenceReport) -> Result<(), Error> {
+    fn publish_manifest(&mut self, report: &RunEvidenceReport) -> Result<(), Error> {
         let mut contents = serde_json::to_vec(report)?;
         contents.push(b'\n');
-        let directory_fd = self.directory.as_raw_fd();
-        let staging = OsStr::new(MANIFEST_STAGING);
-        let destination = OsStr::new(RUN_EVIDENCE_MANIFEST);
-        let mut staged = create_new_file_at(directory_fd, staging)
-            .context("creating a no-clobber staged run-evidence manifest")?;
-        let mut published = false;
-        let result = (|| -> io::Result<()> {
-            staged.write_all(&contents)?;
-            staged.flush()?;
-            staged.sync_all()?;
-            rename_noreplace_at(directory_fd, staging, destination)?;
-            published = true;
-            self.directory_sync.sync(&self.directory)?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            if published {
-                // The open staging handle still names the published inode. Poison
-                // it before unlinking so an observed directory-sync failure cannot
-                // leave a locally readable complete verdict.
-                let _ = staged.set_len(0);
-                let _ = staged.sync_all();
-                let _ = unlink_file_at(directory_fd, destination);
-                let _ = self.directory.sync_all();
-            } else {
-                let _ = unlink_file_at(directory_fd, staging);
-            }
-            return Err(error).context("publishing terminal run-evidence manifest");
+        write_file_contents(&mut self.manifest, &contents)
+            .context("writing the held run-evidence manifest inode")?;
+
+        // A persistent inability to synchronize this directory is discovered
+        // before a complete manifest gets a name.
+        self.directory_sync
+            .sync(DirectorySyncPoint::ManifestPreflight, &self.directory)
+            .context("preflighting the run-evidence directory before manifest publication")?;
+
+        link_unnamed_file_at(
+            &self.manifest,
+            self.directory.as_raw_fd(),
+            OsStr::new(RUN_EVIDENCE_MANIFEST),
+        )
+        .context("linking the exact held run-evidence manifest inode without replacement")?;
+
+        if let Err(publish_error) = self
+            .directory_sync
+            .sync(DirectorySyncPoint::ManifestPublished, &self.directory)
+        {
+            return Err(self.cleanup_failed_manifest_publication(
+                "manifest directory synchronization failed",
+                publish_error,
+            ));
+        }
+
+        if let Err(error) = set_file_mode(&self.manifest, MANIFEST_PUBLISHED_MODE) {
+            return Err(
+                self.cleanup_failed_manifest_publication("manifest activation failed", error)
+            );
+        }
+        if let Err(error) = self.manifest.sync_all() {
+            return Err(self.cleanup_failed_manifest_publication(
+                "activated manifest synchronization failed",
+                error,
+            ));
         }
         Ok(())
     }
+
+    fn cleanup_failed_manifest_publication(
+        &mut self,
+        phase: &str,
+        publish_error: io::Error,
+    ) -> Error {
+        let mut failures = vec![format!("{phase}: {publish_error}")];
+
+        if let Err(error) = set_file_mode(&self.manifest, MANIFEST_UNPUBLISHED_MODE) {
+            failures.push(format!("manifest deactivation failed: {error}"));
+        }
+        if let Err(error) = self.manifest.sync_all() {
+            failures.push(format!("manifest deactivation sync failed: {error}"));
+        }
+
+        match unlink_file_at(
+            self.directory.as_raw_fd(),
+            OsStr::new(RUN_EVIDENCE_MANIFEST),
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("manifest cleanup unlink failed: {error}")),
+        }
+
+        match manifest_is_readable_complete(&self.directory) {
+            Ok(false) => {}
+            Ok(true) => failures.push(
+                "manifest cleanup verification found a readable Complete manifest".to_string(),
+            ),
+            Err(error) => failures.push(format!(
+                "manifest cleanup verification could not decide: {error}"
+            )),
+        }
+
+        if let Err(error) = self
+            .directory_sync
+            .sync(DirectorySyncPoint::ManifestCleanup, &self.directory)
+        {
+            failures.push(format!("manifest cleanup directory fsync failed: {error}"));
+        }
+        Error::msg(failures.join("; "))
+    }
+}
+
+fn write_file_contents(file: &mut File, contents: &[u8]) -> io::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(contents)?;
+    file.flush()?;
+    file.sync_all()
+}
+
+fn read_file_contents(file: &mut File) -> io::Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    Ok(contents)
 }
 
 fn path_cstring(path: &Path) -> io::Result<CString> {
@@ -334,16 +465,43 @@ fn open_directory_at(parent: RawFd, component: &OsStr) -> io::Result<File> {
     })
 }
 
-fn create_new_file_at(parent: RawFd, component: &OsStr) -> io::Result<File> {
-    let component = component_cstring(component)?;
+fn create_unnamed_file_at(directory: RawFd, mode: libc::mode_t) -> io::Result<File> {
+    let dot = c".";
     owned_file(unsafe {
         libc::openat(
-            parent,
-            component.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
+            directory,
+            dot.as_ptr(),
+            libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+            mode,
         )
     })
+}
+
+fn link_unnamed_file_at(file: &File, directory: RawFd, destination: &OsStr) -> io::Result<()> {
+    let empty = c"";
+    let destination = component_cstring(destination)?;
+    if unsafe {
+        libc::linkat(
+            file.as_raw_fd(),
+            empty.as_ptr(),
+            directory,
+            destination.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn set_file_mode(file: &File, mode: libc::mode_t) -> io::Result<()> {
+    if unsafe { libc::fchmod(file.as_raw_fd(), mode) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 fn unlink_file_at(parent: RawFd, component: &OsStr) -> io::Result<()> {
@@ -355,11 +513,12 @@ fn unlink_file_at(parent: RawFd, component: &OsStr) -> io::Result<()> {
     }
 }
 
-fn remove_directory_at(parent: RawFd, component: &OsStr) {
-    if let Ok(component) = component_cstring(component) {
-        unsafe {
-            libc::unlinkat(parent, component.as_ptr(), libc::AT_REMOVEDIR);
-        }
+fn remove_directory_at(parent: RawFd, component: &OsStr) -> io::Result<()> {
+    let component = component_cstring(component)?;
+    if unsafe { libc::unlinkat(parent, component.as_ptr(), libc::AT_REMOVEDIR) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -382,12 +541,79 @@ fn rename_noreplace_at(parent: RawFd, source: &OsStr, destination: &OsStr) -> io
     }
 }
 
+fn file_identity(file: &File) -> io::Result<(libc::dev_t, libc::ino_t)> {
+    let mut stat = MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstat initialized the complete structure on success.
+    let stat = unsafe { stat.assume_init() };
+    Ok((stat.st_dev, stat.st_ino))
+}
+
+fn manifest_is_readable_complete(directory: &File) -> io::Result<bool> {
+    let manifest = match open_directory_child_regular(
+        directory.as_raw_fd(),
+        OsStr::new(RUN_EVIDENCE_MANIFEST),
+    ) {
+        Ok(manifest) => manifest,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::InvalidData
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut manifest = manifest;
+    let mut contents = Vec::new();
+    manifest.read_to_end(&mut contents)?;
+    Ok(serde_json::from_slice::<RunEvidenceReport>(&contents)
+        .ok()
+        .is_some_and(|report| matches!(report.outcome, RunEvidenceOutcome::Complete { .. })))
+}
+
+fn open_directory_child_regular(parent: RawFd, component: &OsStr) -> io::Result<File> {
+    let component = component_cstring(component)?;
+    let file = owned_file(unsafe {
+        libc::openat(
+            parent,
+            component.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    })?;
+    let mut stat = MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstat initialized the complete structure on success.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || stat.st_mode & 0o777 != MANIFEST_PUBLISHED_MODE
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "manifest is not an activated regular file",
+        ));
+    }
+    Ok(file)
+}
+
 /// Claim NEW_PATH by atomically renaming an already-open private directory.
 ///
 /// The returned fd, not the pathname, is the authority for every later child
-/// operation. Renaming NEW_PATH and installing a replacement therefore cannot
-/// redirect either artifact or manifest publication.
-fn create_claimed_directory(path: &Path, invocation_id: Uuid) -> io::Result<File> {
+/// operation. A descriptor-relative identity check after rename refuses a
+/// replaced staging object; a later rename or replacement cannot redirect
+/// publication because no later operation resolves NEW_PATH.
+fn create_claimed_directory(
+    path: &Path,
+    invocation_id: Uuid,
+    directory_sync: &DirectorySync,
+) -> io::Result<File> {
     let destination = path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "destination has no basename")
     })?;
@@ -406,14 +632,30 @@ fn create_claimed_directory(path: &Path, invocation_id: Uuid) -> io::Result<File
     let claimed = match open_directory_at(parent.as_raw_fd(), staging) {
         Ok(claimed) => claimed,
         Err(error) => {
-            remove_directory_at(parent.as_raw_fd(), staging);
-            return Err(error);
+            return match remove_directory_at(parent.as_raw_fd(), staging) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(io::Error::other(format!(
+                    "{error}; staging directory cleanup failed: {cleanup}"
+                ))),
+            };
         }
     };
     if let Err(error) = rename_noreplace_at(parent.as_raw_fd(), staging, destination) {
-        remove_directory_at(parent.as_raw_fd(), staging);
-        return Err(error);
+        return match remove_directory_at(parent.as_raw_fd(), staging) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(io::Error::other(format!(
+                "{error}; staging directory cleanup failed: {cleanup}"
+            ))),
+        };
     }
+
+    let visible = open_directory_at(parent.as_raw_fd(), destination)?;
+    if file_identity(&visible)? != file_identity(&claimed)? {
+        return Err(io::Error::other(
+            "NEW_PATH no longer names the directory inode this invocation claimed",
+        ));
+    }
+    directory_sync.sync(DirectorySyncPoint::ParentClaim, &parent)?;
     Ok(claimed)
 }
 
@@ -447,6 +689,7 @@ fn guest_disposition(backend: Backend, status: ExitStatus) -> Option<GuestDispos
 mod tests {
     use std::fs;
     use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
     use std::sync::Barrier;
     use std::thread;
 
@@ -507,6 +750,21 @@ mod tests {
     }
 
     #[test]
+    fn parent_directory_sync_failure_refuses_before_launch_artifacts() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("claim-fsync");
+        let result = RunEvidenceSession::create_with_directory_sync(
+            &destination,
+            Backend::Ptrace,
+            DirectorySync::fail_once(DirectorySyncPoint::ParentClaim),
+        );
+        let error = result.err().expect("parent sync injection must fail");
+        assert!(format!("{error:#}").contains("ParentClaim"));
+        assert!(destination.is_dir());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+    }
+
+    #[test]
     fn every_artifact_is_no_clobber_and_manifest_is_last() {
         let parent = tempfile::tempdir().unwrap();
         let destination = parent.path().join("one-run");
@@ -530,6 +788,34 @@ mod tests {
             RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::ReportedNoResult(
                 RunEvidenceNoResultReason::ArtifactWriteFailed
             ))
+        );
+    }
+
+    #[test]
+    fn staging_name_replacement_cannot_change_the_linked_manifest_inode() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("staging-replacement");
+        let session = RunEvidenceSession::create(&destination, Backend::Ptrace).unwrap();
+        write_valid_log(&session);
+
+        let attacker = destination.join(".manifest.json.pending");
+        fs::write(&attacker, b"attacker-controlled staging name").unwrap();
+        let attacker_identity = fs::metadata(&attacker).unwrap();
+
+        let status = ExitStatus::Exited(0);
+        session.finish(Ok(&status)).unwrap();
+        assert!(matches!(
+            inspect_run_evidence(&destination),
+            RunEvidenceInspection::Complete(_)
+        ));
+        let after = fs::metadata(&attacker).unwrap();
+        assert_eq!(
+            (attacker_identity.dev(), attacker_identity.ino()),
+            (after.dev(), after.ino())
+        );
+        assert_eq!(
+            fs::read(&attacker).unwrap(),
+            b"attacker-controlled staging name"
         );
     }
 
@@ -597,13 +883,13 @@ mod tests {
     }
 
     #[test]
-    fn directory_fsync_failures_never_leave_complete_evidence() {
+    fn directory_sync_failures_never_leave_complete_evidence() {
         let parent = tempfile::tempdir().unwrap();
 
         let artifact_failure = parent.path().join("artifact-fsync");
         let mut session = RunEvidenceSession::create(&artifact_failure, Backend::Ptrace).unwrap();
         write_valid_log(&session);
-        session.directory_sync = DirectorySync::fail_on(1);
+        session.directory_sync = DirectorySync::fail_once(DirectorySyncPoint::ArtifactPublished);
         let status = ExitStatus::Exited(0);
         session.finish(Ok(&status)).unwrap();
         assert_eq!(
@@ -616,10 +902,63 @@ mod tests {
         let manifest_failure = parent.path().join("manifest-fsync");
         let mut session = RunEvidenceSession::create(&manifest_failure, Backend::Ptrace).unwrap();
         write_valid_log(&session);
-        session.directory_sync = DirectorySync::fail_on(2);
+        session.directory_sync = DirectorySync::fail_once(DirectorySyncPoint::ManifestPublished);
         assert!(session.finish(Ok(&status)).is_err());
         assert_eq!(
             inspect_run_evidence(&manifest_failure),
+            RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MissingManifest)
+        );
+    }
+
+    #[test]
+    fn persistent_manifest_sync_failure_remains_fail_closed() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("persistent-manifest-fsync");
+        let mut session = RunEvidenceSession::create(&destination, Backend::Ptrace).unwrap();
+        write_valid_log(&session);
+        session.directory_sync = DirectorySync::fail_manifest_persistently();
+        let status = ExitStatus::Exited(0);
+        let error = session.finish(Ok(&status)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("manifest cleanup directory fsync failed")
+        );
+        assert_eq!(
+            inspect_run_evidence(&destination),
+            RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MissingManifest),
+            "persistent fsync failure left a readable manifest"
+        );
+    }
+
+    #[test]
+    fn unpublished_manifest_mode_is_never_complete() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("unpublished-mode");
+        let mut session = RunEvidenceSession::create(&destination, Backend::Ptrace).unwrap();
+        write_valid_log(&session);
+        let canonical_info = session.publish_canonical_info().unwrap();
+        let report = RunEvidenceReport {
+            schema_version: RUN_EVIDENCE_SCHEMA_VERSION,
+            invocation_id: session.invocation_id,
+            backend: RunEvidenceBackend::Ptrace,
+            attempt: 1,
+            outcome: RunEvidenceOutcome::Complete {
+                disposition: GuestDisposition::Exited { code: 0 },
+            },
+            canonical_info,
+        };
+        let mut contents = serde_json::to_vec(&report).unwrap();
+        contents.push(b'\n');
+        write_file_contents(&mut session.manifest, &contents).unwrap();
+        link_unnamed_file_at(
+            &session.manifest,
+            session.directory.as_raw_fd(),
+            OsStr::new(RUN_EVIDENCE_MANIFEST),
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_run_evidence(&destination),
             RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MissingManifest)
         );
     }
