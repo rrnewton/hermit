@@ -436,7 +436,7 @@ fn main() {
         None => None,
     };
     if let Some(session) = &evidence {
-        global.set_run_evidence_log_handle(session.log_handle());
+        global.set_run_evidence_log_handle(session.log_handle(), session.write_error_latch());
     }
 
     // Open --log-file HERE, in the host's filename namespace, before any container
