@@ -89,7 +89,7 @@
       "nodes": [
         "check.backend_parity_suites",
         "test.hermit_integration",
-        "test.cli",
+        "test.cli_on_host",
         "test.arbitrary_binaries",
         "test.applications_e2e"
       ]
@@ -97,7 +97,7 @@
     {
       "slug": "modes",
       "nodes": [
-        "test.hermit_modes",
+        "test.hermit_modes_on_host",
         "test.app_strict_verify"
       ]
     },

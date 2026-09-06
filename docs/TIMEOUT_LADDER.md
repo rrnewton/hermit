@@ -36,7 +36,7 @@ agreeing with each other.
 | nextest `slow-timeout` | **one cargo test process**, which may invoke hermit zero or many times | `.config/nextest.toml`: 57s base, scaled by the machine wall multiplier | `SIGTERM` to the test binary, 2s grace, then `SIGKILL` | wrapper exit 100, test named by nextest |
 | manifest cell CPU limit | all process-group CPU consumed by a cell's executions, aggregated across attempts or seeds | `cpu_timeout_seconds`: 22s default plus measured cell overrides, scaled by the machine CPU multiplier | the harness stops the process group and retains `error_kind=cpu-timeout` | typed cell `ERROR` |
 | manifest cell wall limit | fixture preparation and, separately, the complete execution phase | `timeout_seconds`: 57s default plus measured cell overrides, scaled by the machine wall multiplier | the harness stops the process group and retains `error_kind=wall-timeout` | typed cell `ERROR` |
-| dagrun step `timeout` | **one DAG node**, i.e. a whole batch of cells or tests | `ci/dag/{portable,privileged}.json` | dagrun stops the step | node failure |
+| dagrun step wall/CPU limits | **one DAG node**, i.e. a whole batch of cells or tests | explicit `timeout` and `cpu_timeout` on each node in the single `ci/dag/validate.json`, selected by profile labels | dagrun stops the step | node failure |
 | validate run budget | the whole outer validate graph | `HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS` or `--run-timeout` | dagrun stops admitting work and records unfinished nodes | incomplete validation, with named unfinished nodes |
 | validate systemd scope | the same outer run plus teardown grace | validate's safe-ci scope | systemd stops the whole process tree | outer-scope timeout |
 | `safehermit --sh-deadline` | **the whole wrapped process tree** | `bin/safehermit`, default 3600s | `systemd-run --user RuntimeMaxSec`, a **cgroup kill** | exit 124, `safehermit: bound.wall=` |
@@ -45,8 +45,10 @@ Distribution of the selected CI-cell values calibrated at that cutoff:
 
 - manifest CPU: 22s ×488, 25s ×1, 32s ×1, 46s ×1, 56s ×1.
 - manifest wall: 57s ×487, 58s ×1, 74s ×1, 91s ×1, 105s ×1, 118s ×1.
-- dagrun step `timeout`: 600s ×15, 900s ×15, 120s ×11, 180s ×6, 60s ×6, 720s ×5,
-  1200s ×4, 300s ×3, 2400s ×1, 40s ×1, 30s ×1.
+- dagrun node wall and CPU budgets are generated into the committed DAG for
+  every node; there is no per-lane DAG or global CPU fallback to quote. Run the
+  generator's `--check` and the undeclared-node audit rather than copying a
+  count from one labelled selection, because labels and generated partitions move.
 
 ## Individual-test CPU and wall policy
 

@@ -32,9 +32,26 @@ const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SUPER_REPETITIONS: &str = "20";
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
+const PIN_GATE_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; with-proxy ./ci/run-reverie-pin-check.sh --repo "$PWD""#;
 const PINNED_ROOT_TWIN_SUFFIX: &str = "_in_pinned_root";
 pub const HOSTED_PORTABLE_LABEL: &str = "hosted-portable";
+const HOSTED_PRIVILEGED_LABEL: &str = "hosted-privileged";
 const HOSTED_VARIANT_SUFFIX: &str = "_on_host";
+const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 13] = [
+    ("e2e.manifest_applications", "manifest_guest", 1, 8),
+    ("e2e.manifest_backend_parity_c", "manifest_guest", 8, 8),
+    ("e2e.manifest_bin_c", "manifest_guest", 1, 8),
+    ("e2e.manifest_c_programs", "manifest_guest", 8, 8),
+    ("e2e.manifest_chaos_c", "manifest_guest", 1, 8),
+    ("e2e.manifest_data_handling", "manifest_guest", 1, 8),
+    ("e2e.manifest_debugger_c", "manifest_guest", 1, 8),
+    ("e2e.manifest_determinism_stress", "manifest_guest", 1, 8),
+    ("e2e.manifest_determinism_stress_c", "manifest_guest", 1, 8),
+    ("e2e.manifest_language_runtimes", "manifest_guest", 1, 8),
+    ("e2e.manifest_shared_futex_c", "manifest_guest", 1, 8),
+    ("e2e.manifest_system_utils", "manifest_guest", 1, 8),
+    ("e2e.manifest_util_c", "manifest_guest", 1, 8),
+];
 const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.rust_scripts",
     "setup.manifest_plan",
@@ -42,7 +59,6 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.runtime_release",
     "build.e2e_artifact",
     "build.manifest_guests",
-    "quick.build",
 ];
 const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     "CARGO_BUILD_JOBS",
@@ -67,7 +83,7 @@ struct Profile {
     selected_steps: usize,
 }
 
-const PROFILES: [Profile; 6] = [
+const PROFILES: [Profile; 7] = [
     Profile {
         label: "full",
         direct_steps: 266,
@@ -80,8 +96,8 @@ const PROFILES: [Profile; 6] = [
     },
     Profile {
         label: "quick",
-        direct_steps: 16,
-        selected_steps: 17,
+        direct_steps: 15,
+        selected_steps: 16,
     },
     Profile {
         label: "super",
@@ -91,12 +107,17 @@ const PROFILES: [Profile; 6] = [
     Profile {
         label: "privileged",
         direct_steps: 11,
-        selected_steps: 22,
+        selected_steps: 19,
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
         direct_steps: 251,
         selected_steps: 251,
+    },
+    Profile {
+        label: HOSTED_PRIVILEGED_LABEL,
+        direct_steps: 12,
+        selected_steps: 12,
     },
 ];
 
@@ -192,6 +213,7 @@ fn generated_plan(root: &Path, scratch: &Path) -> Result<DagConfig, String> {
         "HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS",
         "DAGRUN_CPU_TIMEOUT_MULTIPLIER",
         "DAGRUN_CPU_TIMEOUT_PLATFORM",
+        "VALIDATE_RUN_STATE",
     ] {
         command.env_remove(name);
     }
@@ -284,6 +306,33 @@ fn is_hosted_variant(step: &Step) -> bool {
     step.job.ends_with(HOSTED_VARIANT_SUFFIX)
 }
 
+fn hosted_resource_tuples(cfg: &DagConfig) -> Result<Vec<(String, String, i64, i64)>, String> {
+    let selected = select_steps_by_labels(cfg, &[HOSTED_PORTABLE_LABEL.to_string()])?;
+    let mut tuples = Vec::new();
+    for step in &selected.steps {
+        let tag = step.tag();
+        let tag = tag
+            .strip_suffix(HOSTED_VARIANT_SUFFIX)
+            .unwrap_or(&tag)
+            .to_string();
+        for (resource, demand) in &step.hint.resources {
+            let capacity = selected
+                .resource_caps
+                .get(resource)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "{HOSTED_PORTABLE_LABEL} step {} demands undeclared resource {resource}",
+                        step.tag()
+                    )
+                })?;
+            tuples.push((tag.clone(), resource.clone(), *demand, capacity));
+        }
+    }
+    tuples.sort();
+    Ok(tuples)
+}
+
 fn is_pinned_root_producer(step: &Step) -> bool {
     PINNED_ROOT_PRODUCER_STEPS.contains(&step.tag().as_str())
         || step.job == "manifest_guests"
@@ -335,66 +384,34 @@ fn pinned_root_fetch() -> Result<Step, String> {
         r#"{{"description":"Pinned-root fetch node","steps":[{{"group":"setup","job":"pinned_root_fetch","desc":"Fetch locked Cargo inputs","description":"Fetch locked Cargo inputs before network-disabled pinned-root commands.","cmd":{},"deps":[],"env":{{"VALIDATE_VERBOSITY":"1"}},"labels":[],"result_manifests":[],"timeout":600,"cpu_timeout":600,"hint":{{"hard_mem_max_bytes":1073741824}},"fail_fast_family":"setup.pinned_root_fetch"}}]}}"#,
         serde_json::to_string(PINNED_ROOT_FETCH_COMMAND).expect("constant is serializable")
     );
-    dag_from_json(&text)
+    let mut step = dag_from_json(&text)
         .map_err(|error| format!("internal pinned-root fetch node is invalid: {error}"))?
         .steps
         .into_iter()
         .next()
-        .ok_or_else(|| "internal pinned-root fetch node disappeared".to_string())
+        .ok_or_else(|| "internal pinned-root fetch node disappeared".to_string())?;
+    step.deps = vec!["pre.reverie_pin".into()];
+    Ok(step)
 }
 
-/// Restore the explicit hosted selection after refreshing generated rows.
+/// Add the hosted label to the corpus-derived portable compatibility rows.
 ///
-/// The selection itself is committed in `validate.json`. Generated compat
-/// rows may be replaced during maintenance, so their hosted label is restored
-/// by typed step identity from the previous committed selection. No runtime
-/// path calls this function.
-fn restore_hosted_portable_selection(
-    cfg: &mut DagConfig,
-    hosted: &DagConfig,
-) -> Result<(), String> {
-    let expected = hosted.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
-    if expected.len() != 251 {
-        return Err(format!(
-            "committed {HOSTED_PORTABLE_LABEL} selection has {} unique steps, expected 251",
-            expected.len()
-        ));
-    }
+/// Authored hosted steps and host-only variants come from the independent typed
+/// source. The corpus rows are regenerated, so their label is derived here from
+/// their typed generated partition rather than copied from the output artifact.
+fn materialize_hosted_portable_selection(cfg: &mut DagConfig) {
     for step in &mut cfg.steps {
-        step.labels.retain(|label| label != HOSTED_PORTABLE_LABEL);
-        if expected.contains(&step.tag()) {
+        if generated_partition(step) == Some(GeneratedPartition::PortableCompat)
+            && !step
+                .labels
+                .iter()
+                .any(|label| label == HOSTED_PORTABLE_LABEL)
+        {
             step.labels.push(HOSTED_PORTABLE_LABEL.into());
             step.labels.sort();
             step.labels.dedup();
         }
     }
-    let actual = cfg
-        .steps
-        .iter()
-        .filter(|step| {
-            step.labels
-                .iter()
-                .any(|label| label == HOSTED_PORTABLE_LABEL)
-        })
-        .map(Step::tag)
-        .collect::<BTreeSet<_>>();
-    let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(format!(
-            "refreshed DAG lost {HOSTED_PORTABLE_LABEL} step(s): {}",
-            missing.join(", ")
-        ));
-    }
-    let variants = actual
-        .iter()
-        .filter(|tag| tag.ends_with(HOSTED_VARIANT_SUFFIX))
-        .count();
-    if variants != 14 {
-        return Err(format!(
-            "{HOSTED_PORTABLE_LABEL} selection has {variants} host-only variants, expected 14"
-        ));
-    }
-    Ok(())
 }
 
 /// Materialize the pinned-root execution split as ordinary committed nodes.
@@ -438,7 +455,7 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
                 }
             })
             .collect();
-        if step.group.starts_with("privileged")
+        if step.group == "privileged-e2e"
             && producer_tags.contains("build.e2e_artifact")
             && !step
                 .deps
@@ -446,6 +463,14 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
                 .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
         {
             step.deps.push("build.e2e_artifact_in_pinned_root".into());
+        }
+        if has_rust_scripts
+            && !step
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.rust_scripts_in_pinned_root")
+        {
+            step.deps.push("build.rust_scripts_in_pinned_root".into());
         }
         if !step
             .deps
@@ -600,14 +625,19 @@ fn refresh_generated_partitions(
             );
         }
     }
-    // A newly introduced derived partition has no committed anchor yet. Append
-    // it once in enum order; subsequent generations replace it in place.
+    // The independent typed source intentionally contains no corpus-derived
+    // partition anchors. Append every generated partition exactly once in a
+    // stable order after replacing any legacy anchors supplied by a focused
+    // test fixture.
     for partition in [
+        GeneratedPartition::PortableCompat,
         GeneratedPartition::PortableFocusedCompat,
         GeneratedPartition::StrictCompat,
         GeneratedPartition::SabreCompat,
         GeneratedPartition::E9patchCompat,
         GeneratedPartition::RrCompat,
+        GeneratedPartition::SuperCompat,
+        GeneratedPartition::SuperStress,
     ] {
         if inserted.insert(partition) {
             steps.extend(
@@ -673,6 +703,7 @@ fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagM
             "full" => true,
             "portable" => cell.lane == "portable",
             HOSTED_PORTABLE_LABEL => cell.lane == "portable",
+            HOSTED_PRIVILEGED_LABEL => cell.lane == "privileged",
             "privileged" => cell.lane == "privileged",
             "quick" => {
                 cell.lane == "portable"
@@ -685,11 +716,167 @@ fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagM
         .collect()
 }
 
+fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
+    let by_tag = cfg
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step))
+        .collect::<BTreeMap<_, _>>();
+    let mut longest = BTreeMap::<String, i64>::new();
+    while longest.len() < by_tag.len() {
+        let mut advanced = false;
+        for (tag, step) in &by_tag {
+            if longest.contains_key(tag) {
+                continue;
+            }
+            if step
+                .deps
+                .iter()
+                .any(|dependency| !by_tag.contains_key(dependency))
+            {
+                return Err(format!(
+                    "{tag} names a dependency outside its selected graph"
+                ));
+            }
+            if step
+                .deps
+                .iter()
+                .any(|dependency| !longest.contains_key(dependency))
+            {
+                continue;
+            }
+            let predecessor = step
+                .deps
+                .iter()
+                .filter_map(|dependency| longest.get(dependency))
+                .copied()
+                .max()
+                .unwrap_or(0);
+            longest.insert(tag.clone(), predecessor + step.timeout);
+            advanced = true;
+        }
+        if !advanced {
+            return Err("selected graph contains a dependency cycle".into());
+        }
+    }
+    longest
+        .values()
+        .copied()
+        .max()
+        .ok_or_else(|| "selected graph is empty".to_string())
+}
+
 fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
-    if cfg.steps.len() != 1368 {
+    if cfg.steps.len() != 1382 {
         return Err(format!(
-            "superset has {} steps, expected 1368",
+            "superset has {} steps, expected 1382",
             cfg.steps.len()
+        ));
+    }
+    if cfg.default_step_timeout != 600
+        || cfg.resource_caps != BTreeMap::from([("manifest_guest".into(), 8)])
+    {
+        return Err(format!(
+            "top-level validation policy changed: default_step_timeout={} resource_caps={:?}",
+            cfg.default_step_timeout, cfg.resource_caps
+        ));
+    }
+    for step in &cfg.steps {
+        if step
+            .hint
+            .resources
+            .keys()
+            .any(|name| name.starts_with("integration_test_binaries."))
+        {
+            return Err(format!(
+                "{} restored a removed integration-test resource demand",
+                step.tag()
+            ));
+        }
+    }
+    let step = |tag: &str| {
+        cfg.steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("committed DAG lost {tag}"))
+    };
+    for (consumer, dependency) in [
+        ("privileged-build.privileged_tests", "test.cli"),
+        ("privileged-build.privileged_tests", "test.hermit_modes"),
+        (
+            "privileged-test.pmu_buck_chaos_cases",
+            "privileged-build.privileged_tests",
+        ),
+    ] {
+        if !step(consumer)?
+            .deps
+            .iter()
+            .any(|candidate| candidate == dependency)
+        {
+            return Err(format!(
+                "{consumer} lost the explicit full-only serialization edge to {dependency}"
+            ));
+        }
+    }
+    let focused_release = step("compatprep.hermit_release")?;
+    let expected_focused_labels = [
+        "portable-strict-compat-only",
+        "strict-compat-only",
+        "sabre-compat-only",
+        "e9patch-compat-only",
+        "rr-compat-only",
+    ];
+    if focused_release.cmd != "cargo build --release -p hermit --features third-party-backends"
+        || focused_release.deps != ["gate.manifest"]
+        || focused_release.labels
+            != expected_focused_labels
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        || focused_release.timeout != 420
+        || focused_release.cpu_timeout != 840
+        || focused_release.hint.hard_mem_max_bytes != Some(16 * 1024 * 1024 * 1024)
+        || focused_release.hint.preferred_inner_jobs != Some(8)
+    {
+        return Err("focused compatibility release producer changed command, dependency, labels, or measured resources".into());
+    }
+    for group in [
+        "portablecompatprep",
+        "strictcompatprep",
+        "sabrecompatprep",
+        "e9patchcompatprep",
+        "rrcompatprep",
+    ] {
+        let prep = step(&format!("{group}.fixtures"))?;
+        if !prep
+            .deps
+            .iter()
+            .any(|dependency| dependency == "compatprep.hermit_release")
+            || prep
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.runtime_release")
+        {
+            return Err(format!(
+                "{group}.fixtures does not use the dedicated focused release producer"
+            ));
+        }
+    }
+    let quick_verify = step("quick.e2e_verify")?;
+    if cfg
+        .steps
+        .iter()
+        .any(|step| step.tag() == "quick.build_in_pinned_root")
+        || quick_verify.deps
+            != [
+                "build.rust_scripts_in_pinned_root".to_string(),
+                "quick.build".to_string(),
+                "setup.pinned_root_fetch".to_string(),
+            ]
+    {
+        return Err(format!(
+            "quick selection changed its single workspace-build topology: deps={:?}",
+            quick_verify.deps
         ));
     }
     let canonical = dag_to_json(cfg);
@@ -697,6 +884,47 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         .map_err(|error| format!("generated DAG fails strict reload: {error}"))?;
     if dag_to_json(&reparsed) != canonical {
         return Err("generated DAG is not byte-stable across a strict reload".into());
+    }
+    let fetch = cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == PINNED_ROOT_FETCH_TAG)
+        .ok_or("committed DAG lost setup.pinned_root_fetch")?;
+    if fetch.deps != ["pre.reverie_pin".to_string()] {
+        return Err(format!(
+            "setup.pinned_root_fetch must depend exactly on pre.reverie_pin before networked input is fetched; got {:?}",
+            fetch.deps
+        ));
+    }
+    let pin = cfg
+        .steps
+        .iter()
+        .find(|step| step.tag() == "pre.reverie_pin")
+        .ok_or("committed DAG lost pre.reverie_pin")?;
+    if pin.cmd != PIN_GATE_COMMAND {
+        return Err(format!(
+            "pre.reverie_pin must use the unconditional with-proxy command; got {:?}",
+            pin.cmd
+        ));
+    }
+    let missing_rust_script_dep = cfg
+        .steps
+        .iter()
+        .filter(|step| {
+            is_manifest_run(step)
+                && !is_hosted_variant(step)
+                && !step
+                    .deps
+                    .iter()
+                    .any(|dependency| dependency == "build.rust_scripts_in_pinned_root")
+        })
+        .map(Step::tag)
+        .collect::<Vec<_>>();
+    if !missing_rust_script_dep.is_empty() {
+        return Err(format!(
+            "local manifest nodes lost their direct build.rust_scripts_in_pinned_root dependency: {}",
+            missing_rust_script_dep.join(", ")
+        ));
     }
     for profile in PROFILES {
         let direct = cfg
@@ -720,9 +948,118 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 profile.selected_steps
             ));
         }
-        for result in expected_for_label(profile.label, cells) {
+        let expected_results = expected_for_label(profile.label, cells);
+        for result in &expected_results {
             result_manifest_owner(&selected.steps, result)
                 .map_err(|error| format!("{} result ownership failed: {error}", profile.label))?;
+        }
+        let expected_result_ids = expected_results
+            .into_iter()
+            .map(result_identity)
+            .collect::<BTreeSet<_>>();
+        let actual_result_ids = selected
+            .steps
+            .iter()
+            .flat_map(Step::effective_result_manifests)
+            .map(result_identity)
+            .collect::<BTreeSet<_>>();
+        if actual_result_ids != expected_result_ids {
+            return Err(format!(
+                "{} selected result population changed: expected={} actual={} missing={:?} extra={:?}",
+                profile.label,
+                expected_result_ids.len(),
+                actual_result_ids.len(),
+                expected_result_ids
+                    .difference(&actual_result_ids)
+                    .collect::<Vec<_>>(),
+                actual_result_ids
+                    .difference(&expected_result_ids)
+                    .collect::<Vec<_>>()
+            ));
+        }
+        if profile.label == "quick" && critical_path_wall_seconds(&selected)? != 8580 {
+            return Err(format!(
+                "quick selected critical path changed from 8580 seconds to {}",
+                critical_path_wall_seconds(&selected)?
+            ));
+        }
+        if profile.label == "privileged" && critical_path_wall_seconds(&selected)? != 3900 {
+            return Err(format!(
+                "local privileged selected critical path changed from 3900 seconds to {}",
+                critical_path_wall_seconds(&selected)?
+            ));
+        }
+        if profile.label == HOSTED_PRIVILEGED_LABEL {
+            let expected = [
+                "build.rust_scripts_on_host",
+                "gate.manifest_on_host",
+                "pre.reverie_pin_on_host",
+                "privileged-build.manifest_guests_on_host",
+                "privileged-only-build.privileged_tests_on_host",
+                "privileged-only-cpuid.faulting_on_host",
+                "privileged-only-e2e.manifest_applications_on_host",
+                "privileged-only-e2e.manifest_backend_parity_c_on_host",
+                "privileged-only-pmu.preemption_on_host",
+                "privileged-only-test.cli_kvm_on_host",
+                "privileged-only-test.pmu_buck_chaos_cases_on_host",
+                "setup.manifest_plan_on_host",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+            let actual = selected
+                .steps
+                .iter()
+                .map(Step::tag)
+                .collect::<BTreeSet<_>>();
+            if actual != expected {
+                return Err(format!(
+                    "hosted privileged node population changed: expected={expected:?} actual={actual:?}"
+                ));
+            }
+            let expected_cpu = [
+                ("pre.reverie_pin_on_host", 300),
+                ("build.rust_scripts_on_host", 7200),
+                ("setup.manifest_plan_on_host", 7200),
+                ("gate.manifest_on_host", 600),
+                ("privileged-only-build.privileged_tests_on_host", 7200),
+                ("privileged-only-cpuid.faulting_on_host", 7200),
+                ("privileged-only-pmu.preemption_on_host", 7200),
+                ("privileged-only-test.pmu_buck_chaos_cases_on_host", 7200),
+                ("privileged-build.manifest_guests_on_host", 7200),
+                ("privileged-only-e2e.manifest_applications_on_host", 7200),
+                (
+                    "privileged-only-e2e.manifest_backend_parity_c_on_host",
+                    7200,
+                ),
+                ("privileged-only-test.cli_kvm_on_host", 7200),
+            ]
+            .into_iter()
+            .map(|(tag, cpu)| (tag.to_string(), cpu))
+            .collect::<BTreeMap<_, _>>();
+            let actual_cpu = selected
+                .steps
+                .iter()
+                .map(|step| (step.tag(), step.cpu_timeout))
+                .collect::<BTreeMap<_, _>>();
+            if actual_cpu != expected_cpu {
+                return Err(format!(
+                    "hosted privileged CPU budgets changed: expected={expected_cpu:?} actual={actual_cpu:?}; every hosted step must retain an explicit measured/current budget rather than dagrun's stale 10-second fallback"
+                ));
+            }
+            if selected
+                .steps
+                .iter()
+                .any(|step| !step.hint.resources.is_empty())
+            {
+                return Err("hosted privileged graph gained an unmeasured resource demand".into());
+            }
+            let critical = critical_path_wall_seconds(&selected)?;
+            if critical != 1500 {
+                return Err(format!(
+                    "hosted privileged critical path changed from 1500 seconds to {critical}"
+                ));
+            }
         }
         if profile.label == "super"
             && selected
@@ -747,6 +1084,29 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 return Err(format!(
                     "{HOSTED_PORTABLE_LABEL} selection contains local pinned-root step(s): {}",
                     pinned.join(", ")
+                ));
+            }
+            let expected_resources = HOSTED_RESOURCE_TUPLES
+                .iter()
+                .map(|(tag, resource, demand, capacity)| {
+                    ((*tag).into(), (*resource).into(), *demand, *capacity)
+                })
+                .collect::<Vec<(String, String, i64, i64)>>();
+            let actual_resources = hosted_resource_tuples(cfg)?;
+            if actual_resources != expected_resources {
+                return Err(format!(
+                    "{HOSTED_PORTABLE_LABEL} effective resource tuples changed: expected={expected_resources:?}, actual={actual_resources:?}"
+                ));
+            }
+            let rust_scripts = selected
+                .steps
+                .iter()
+                .find(|step| step.tag() == "build.rust_scripts")
+                .ok_or_else(|| format!("{HOSTED_PORTABLE_LABEL} lost build.rust_scripts"))?;
+            if rust_scripts.cpu_timeout != 7200 {
+                return Err(format!(
+                    "{HOSTED_PORTABLE_LABEL} build.rust_scripts CPU budget is {}, expected the pre-cutover effective 7200 seconds",
+                    rust_scripts.cpu_timeout
                 ));
             }
         }
@@ -778,23 +1138,15 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
 }
 
 pub fn generate(root: &Path) -> Result<DagConfig, String> {
-    let committed_path = root.join(OUTPUT);
-    let committed_text = fs::read_to_string(&committed_path)
-        .map_err(|error| format!("cannot read {}: {error}", committed_path.display()))?;
-    let committed = dag_from_json(&committed_text)
-        .map_err(|error| format!("invalid {}: {error}", committed_path.display()))?;
-    let hosted =
-        select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.into()]).map_err(|error| {
-            format!("committed DAG has no valid {HOSTED_PORTABLE_LABEL} selection: {error}")
-        })?;
+    let static_source = crate::validation_dag_static::config();
     let scratch = Scratch::create()?;
     let mut generated = generated_plan(root, &scratch.0)?;
     for step in &mut generated.steps {
         normalize_step(step, root, &scratch.0.join("run-state"))?;
     }
     let cells = expected_cells(root)?;
-    let mut refreshed = refresh_generated_partitions(committed, generated)?;
-    restore_hosted_portable_selection(&mut refreshed, &hosted)?;
+    let mut refreshed = refresh_generated_partitions(static_source, generated)?;
+    materialize_hosted_portable_selection(&mut refreshed);
     materialize_pinned_root(&mut refreshed)?;
     materialize_runtime_policy(&mut refreshed);
     attach_result_ownership(&mut refreshed, &cells);
@@ -867,6 +1219,40 @@ mod tests {
             assert!(
                 require_fresh(baseline, &changed).is_err(),
                 "mutation {from:?} passed"
+            );
+        }
+    }
+
+    #[test]
+    fn full_generator_refuses_static_artifact_mutations() {
+        let root = repo_root().unwrap();
+        let generated = canonical_text(&generate(&root).unwrap());
+        let committed = include_str!("../../dag/validate.json");
+        assert_eq!(committed, generated);
+        for mutate in ["command", "dependency", "cap"] {
+            let mut changed = dag_from_json(committed).unwrap();
+            match mutate {
+                "command" => changed
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.tag() == "quick.run_smoke")
+                    .unwrap()
+                    .cmd
+                    .push_str(" --planted"),
+                "dependency" => changed
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.tag() == "quick.run_smoke")
+                    .unwrap()
+                    .deps
+                    .clear(),
+                "cap" => changed.default_step_timeout += 1,
+                _ => unreachable!(),
+            }
+            let changed = canonical_text(&changed);
+            assert!(
+                require_fresh(&changed, &generated).is_err(),
+                "{mutate} mutation was accepted as fresh"
             );
         }
     }
@@ -958,13 +1344,22 @@ mod tests {
                 .iter()
                 .filter(|step| is_hosted_variant(step))
                 .count(),
-            14
+            16
         );
         assert!(selected.steps.iter().all(|step| {
             step.tag() != PINNED_ROOT_FETCH_TAG
                 && !step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX)
                 && !step.cmd.contains("run-in-pinned-root.sh")
         }));
+        assert_eq!(
+            hosted_resource_tuples(&committed).unwrap(),
+            HOSTED_RESOURCE_TUPLES
+                .iter()
+                .map(|(tag, resource, demand, capacity)| {
+                    ((*tag).into(), (*resource).into(), *demand, *capacity)
+                })
+                .collect::<Vec<(String, String, i64, i64)>>(),
+        );
         let cells = expected_cells(&repo_root().unwrap()).unwrap();
         for result in expected_for_label(HOSTED_PORTABLE_LABEL, &cells) {
             result_manifest_owner(&selected.steps, result).unwrap();
@@ -980,6 +1375,44 @@ mod tests {
             .push_str(" && ./ci/hermetic/run-in-pinned-root.sh");
         let error = assert_invariants(&planted_pinned_command, &cells).unwrap_err();
         assert!(error.contains("local pinned-root step"), "{error}");
+
+        let mut planted_early_fetch = committed.clone();
+        planted_early_fetch
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == PINNED_ROOT_FETCH_TAG)
+            .unwrap()
+            .deps
+            .clear();
+        let error = assert_invariants(&planted_early_fetch, &cells).unwrap_err();
+        assert!(
+            error.contains("must depend exactly on pre.reverie_pin"),
+            "{error}"
+        );
+
+        let mut planted_pin_fallback = committed.clone();
+        planted_pin_fallback
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "pre.reverie_pin")
+            .unwrap()
+            .cmd = "if command -v with-proxy; then with-proxy true; else true; fi".into();
+        let error = assert_invariants(&planted_pin_fallback, &cells).unwrap_err();
+        assert!(error.contains("unconditional with-proxy"), "{error}");
+
+        let mut planted_missing_rust_script_dep = committed.clone();
+        planted_missing_rust_script_dep
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "e2e.manifest_applications")
+            .unwrap()
+            .deps
+            .retain(|dependency| dependency != "build.rust_scripts_in_pinned_root");
+        let error = assert_invariants(&planted_missing_rust_script_dep, &cells).unwrap_err();
+        assert!(
+            error.contains("lost their direct build.rust_scripts_in_pinned_root dependency"),
+            "{error}"
+        );
 
         let mut planted_coverage_loss = committed;
         planted_coverage_loss

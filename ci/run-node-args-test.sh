@@ -5,33 +5,16 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# run-node-args-test.sh — guard ci/run-node.sh's argument contract.
-#
-# ⚠️ WHY THIS EXISTS. Until 2026-08-25 run-node.sh read exactly two positional
-# arguments and ignored the rest, so the natural attempt at a targeted test —
-#     ci/run-node.sh portable test.detcore_unit -E 'test(=cpuid_leaf_count)'
-# — ran the WHOLE node, all 534 tests, and printed PASS. Nothing anywhere said
-# the filter had been dropped. The operator read a full-node green as a one-test
-# green, which is a value that reads as information and carries none.
-#
-# The two properties below are what stop that recurring, and neither is visible
-# in a passing run of anything else:
-#   1. an unrecognised trailing argument is a HARD ERROR, never a silent drop;
-#   2. `-- <args>` edits exactly ONE node's command and nothing else in the DAG.
-#
-# Runs no node and needs no build artifacts: the append case uses
-# RUN_NODE_PRINT_ONLY, which stops after writing the scratch DAG.
+# Guard ci/run-node.sh's exact-selection contract. Runtime command replacement
+# was removed with the one-DAG cutover; every trailing form must now refuse.
+
 set -uo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR" || exit 2
 
 RUN_NODE="$ROOT_DIR/ci/run-node.sh"
-RUN_DAG="$ROOT_DIR/ci/run-dag.sh"
 LANE=portable
-DAG="$ROOT_DIR/ci/dag/validate.json"
-# Any node with a stable tag works; this one is chosen because its command is
-# short, so an assertion failure prints something readable.
 NODE=check.dagrun_naming
 failures=0
 
@@ -40,75 +23,43 @@ fail() {
     failures=$((failures + 1))
 }
 
-# Refusals must not depend on the environment that only CI sets, so clear it for
-# every case except the one that is specifically about CI.
 run_local() {
-    env -u CI -u GITHUB_ACTIONS "$@"
+    env -u CI -u GITHUB_ACTIONS -u VALIDATE_RUN_STATE "$@"
 }
 
-# ⚠️ EVERY REFUSAL CHECK ASSERTS ITS REASON, NOT ONLY ITS EXIT CODE. Exit 2 is
-# ALSO what run-node.sh returns for an unknown lane, an unwritable perf dir, and
-# "dagrun not found" — so a code-only assertion passes on a box where nothing
-# works at all, which is a refusal test that cannot fail for the reason it names.
-# The reason string is the only part that distinguishes the guard from the
-# environment.
-expect_refusal() {
-    local what=$1 reason=$2
-    shift 2
+expect_removed_refusal() {
+    local what=$1
+    shift
     local output status
     output=$(run_local "$@" 2>&1)
     status=$?
     if ((status != 2)); then
         fail "$what: expected exit 2, got $status. Output: $output"
-        return
+    elif [[ $output != *"trailing command replacement arguments were removed"* ]]; then
+        fail "$what: exited 2 for the wrong reason. Output: $output"
+    else
+        printf 'run-node-args-test: ok — %s refused by the removed-command guard\n' "$what"
     fi
-    if [[ $output != *"$reason"* ]]; then
-        fail "$what: exited 2 but for the wrong reason — no '$reason' in the output.
-  This is what an environment failure (missing dagrun, bad lane) looks like.
-  Output: $output"
-        return
-    fi
-    printf 'run-node-args-test: ok — %s refused with its own reason\n' "$what"
 }
 
-expect_refusal "a trailing argument with no '--'" \
-    "unexpected argument '-E'" \
+expect_removed_refusal "an unmarked trailing argument" \
     "$RUN_NODE" "$LANE" "$NODE" -E 'test(=nothing)'
-expect_refusal "'--' with a multi-node selection" \
-    "requires exactly one node tag" \
-    "$RUN_NODE" "$LANE" "$NODE,lint.rustfmt" -- --some-flag
-expect_refusal "'--' with nothing after it" \
-    "'--' given with nothing after it" \
+expect_removed_refusal "a literal -- with nothing after it" \
     "$RUN_NODE" "$LANE" "$NODE" --
-expect_refusal "'--' under \$CI" \
-    "refused in CI" \
-    env CI=1 "$RUN_NODE" "$LANE" "$NODE" -- --some-flag
-expect_refusal "'--' under \$GITHUB_ACTIONS" \
-    "refused in CI" \
-    env GITHUB_ACTIONS=true "$RUN_NODE" "$LANE" "$NODE" -- --some-flag
+expect_removed_refusal "a literal -- with replacement text" \
+    "$RUN_NODE" "$LANE" "$NODE" -- --some-flag
+expect_removed_refusal "a multi-node replacement" \
+    "$RUN_NODE" "$LANE" "$NODE,lint.rustfmt" -- --some-flag
 
-# Positive control for the whole file: the trailing-argument refusal must also
-# still print usage, so the operator is told the supported form rather than only
-# that they were wrong.
-usage_output=$(run_local "$RUN_NODE" "$LANE" "$NODE" -E 'test(=nothing)' 2>&1)
-if [[ $usage_output != *"usage: ci/run-node.sh <lane> <group.job>"* ]]; then
-    fail "the trailing-argument refusal did not print usage. Output: $usage_output"
+usage_output=$(run_local "$RUN_NODE" "$LANE" "$NODE" -- 2>&1)
+if [[ $usage_output != *"usage: ci/run-node.sh <portable|privileged>"* ]]; then
+    fail "the replacement refusal did not print the exact-selection usage. Output: $usage_output"
 else
     printf 'run-node-args-test: ok — the refusal prints the supported form\n'
 fi
 
-# ⚠️ A REAL CI SELECTION MUST SURVIVE THE SCRATCH-DAG WRITE.
-#
-# Every check above passes a SINGLE node tag, but ci-portable.yml invokes this
-# script with a comma-joined MULTI-NODE selection — `preflight_nodes` is 11 tags
-# and 251 bytes. When the selection went into the scratch filename, that
-# overflowed NAME_MAX (255) and run-node.sh exited 2 with `File name too long`
-# for the entire preflight job, while every single-node case here stayed green.
-# A guard file whose cases are all one node cannot see that, so the real
-# selection is read from ci/portable-shards.json rather than written down here.
-#
-# RUN_NODE_PRINT_ONLY asks the constructed-plan path to print the selected plan,
-# so this still executes no node.
+# Use the real hosted preflight selection so the positive control covers the
+# long comma-separated input used by the workflow without writing a scratch DAG.
 long_sel=$(python3 -c '
 import json
 print(",".join(json.load(open("ci/portable-shards.json"))["preflight_nodes"]))')
@@ -120,16 +71,13 @@ else
         "$RUN_NODE" "$LANE" "$long_sel" 2>&1)
     long_status=$?
     if ((long_status != 0)); then
-        fail "the real ${#long_sel}-byte preflight selection was refused: exit $long_status.
-  This is the selection ci-portable.yml passes, so a failure here reddens the whole job.
-  Output: $long_output"
-    elif [[ $long_output != *"scheduler-width=validate-default"* ]]; then
-        fail "the constructed-plan path did not inherit validate's scheduler width. Output: $long_output"
+        fail "the real ${#long_sel}-byte preflight selection was refused: exit $long_status. Output: $long_output"
     elif [[ $long_output != *"profile: hosted-portable"* ]]; then
-        fail "the hosted runner did not select the committed hosted-portable graph. Output: $long_output"
+        fail "portable did not select hosted-portable. Output: $long_output"
+    elif [[ $long_output != *"scheduler-width=validate-default"* ]]; then
+        fail "the selection did not inherit validate's scheduler width. Output: $long_output"
     else
-        printf 'run-node-args-test: ok — a %d-byte CI selection reaches the constructed plan\n' \
-            "${#long_sel}"
+        printf 'run-node-args-test: ok — hosted portable selection reaches the committed graph\n'
     fi
 fi
 
@@ -138,144 +86,43 @@ override_output=$(run_local env RUN_NODE_PRINT_ONLY=1 RUN_NODE_JOBS=3 \
     "$RUN_NODE" "$LANE" "$NODE" 2>&1)
 override_status=$?
 if ((override_status != 0)); then
-    fail "the explicit scheduler-width override was refused: exit $override_status. Output: $override_output"
+    fail "the scheduler-width override was refused: exit $override_status. Output: $override_output"
 elif [[ $override_output != *"scheduler-width=-j3"* ]]; then
-    fail "the explicit scheduler-width override was not forwarded. Output: $override_output"
+    fail "RUN_NODE_JOBS was not forwarded. Output: $override_output"
 else
-    printf 'run-node-args-test: ok — RUN_NODE_JOBS explicitly overrides validate default\n'
+    printf 'run-node-args-test: ok — RUN_NODE_JOBS overrides validate default\n'
 fi
 
-# The append case. RUN_NODE_PRINT_ONLY stops before execution, so this asserts
-# the edited command itself rather than a node's outcome.
-tracked_cmd=$(python3 -c '
-import json, sys
-dag = json.load(open(sys.argv[1]))
-tag = sys.argv[2]
-hits = [s for s in dag["steps"]
-        if "{}.{}".format(s.get("group", ""), s.get("job", "")) == tag]
-if len(hits) != 1:
-    sys.exit("expected exactly one step tagged {}, found {}".format(tag, len(hits)))
-print(hits[0]["cmd"])
-' "$DAG" "$NODE") || {
-    fail "could not read the tracked command for $NODE"
-    exit 1
-}
-
-edited_cmd=$(RUN_NODE_PRINT_ONLY=1 run_local "$RUN_NODE" "$LANE" "$NODE" -- -E 'test(=a::b)' 2>/dev/null)
-status=$?
-if ((status != 0)); then
-    fail "RUN_NODE_PRINT_ONLY append run exited $status"
-elif [[ $edited_cmd != "$tracked_cmd"* ]]; then
-    fail "edited command does not extend the tracked one.
-  tracked: $tracked_cmd
-  edited:  $edited_cmd"
-elif [[ $edited_cmd == "$tracked_cmd" ]]; then
-    fail "'--' appended nothing; the arguments were dropped. cmd: $edited_cmd"
+privileged_output=$(run_local env RUN_NODE_PRINT_ONLY=1 \
+    VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS=1 \
+    "$RUN_NODE" privileged cpuid.faulting 2>&1)
+privileged_status=$?
+if ((privileged_status != 0)); then
+    fail "hosted privileged selection was refused: exit $privileged_status. Output: $privileged_output"
+elif [[ $privileged_output != *"profile: hosted-privileged"* ]]; then
+    fail "privileged did not select hosted-privileged. Output: $privileged_output"
+elif [[ $privileged_output != *"cpuid.faulting maps to committed node privileged-only-cpuid.faulting_on_host"* ]]; then
+    fail "privileged public ID was not reported as mapped. Output: $privileged_output"
+elif [[ $privileged_output != *"privileged-only-cpuid.faulting_on_host"* ]]; then
+    fail "privileged public ID did not select the committed hosted node. Output: $privileged_output"
 else
-    # Shell-quoted, so the parenthesis and '=' survive as literals rather than
-    # being re-parsed by the shell that eventually runs the node.
-    suffix=${edited_cmd#"$tracked_cmd"}
-    expected=$(printf ' %q' -E 'test(=a::b)')
-    if [[ $suffix != "$expected" ]]; then
-        fail "appended text is not shell-quoted as expected.
-  expected: $expected
-  actual:   $suffix"
-    else
-        printf 'run-node-args-test: ok — one node command extended by %s\n' "$suffix"
-    fi
+    printf 'run-node-args-test: ok — old privileged IDs select the committed hosted graph\n'
 fi
 
-# Exercise the final runner argv as well as the scratch-DAG edit. The pinned
-# runner retired `--only` in favor of `--selected --ignore-selected-deps`; a
-# print-only test exits before that handoff and therefore cannot catch the two
-# interfaces drifting apart. This stub runs no node, but accepts only the
-# current selector pair and records that run-node.sh actually supplied it.
-selector_probe="$ROOT_DIR/ignored/ci/run-node/selector-probe.$$"
-mkdir -p "$(dirname "$selector_probe")"
-trap 'rm -f -- "$selector_probe"' EXIT
-cat >"$selector_probe" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-selected=0
-ignore_deps=0
-for arg in "$@"; do
-    case "$arg" in
-        --selected) selected=1 ;;
-        --ignore-selected-deps) ignore_deps=1 ;;
-        --only)
-            echo "selector-probe: retired --only reached the runner" >&2
-            exit 2
-            ;;
-    esac
-done
-if ((selected != 1 || ignore_deps != 1)); then
-    echo "selector-probe: current selector pair was incomplete" >&2
-    exit 2
-fi
-echo "selector-probe: current selector pair reached the runner"
-EOF
-chmod +x "$selector_probe"
-selector_output=$(run_local env DAGRUN_BIN="$selector_probe" \
-    "$RUN_NODE" "$LANE" "$NODE" -- --selector-probe 2>&1)
-selector_status=$?
-if ((selector_status != 0)); then
-    fail "the edited-node runner handoff exited $selector_status. Output: $selector_output"
-elif [[ $selector_output != *"current selector pair reached the runner"* ]]; then
-    fail "the edited-node runner handoff did not reach the selector probe. Output: $selector_output"
+privileged_unknown=$(run_local env RUN_NODE_PRINT_ONLY=1 \
+    VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS=1 \
+    "$RUN_NODE" privileged no.such_privileged_node 2>&1)
+privileged_unknown_status=$?
+if ((privileged_unknown_status == 0)); then
+    fail "an unknown privileged ID was accepted. Output: $privileged_unknown"
+elif [[ $privileged_unknown != *"unknown step tag"* ]]; then
+    fail "unknown privileged ID refused without its cause. Output: $privileged_unknown"
 else
-    printf 'run-node-args-test: ok — edited-node handoff uses --selected --ignore-selected-deps\n'
-fi
-
-# ...and nothing else in the DAG moved. Every CPU budget is already committed;
-# this local iteration path may edit exactly one command and no policy.
-
-scratch="$ROOT_DIR/ignored/ci/run-node/$LANE.$NODE.effective.json"
-if [[ ! -f $scratch ]]; then
-    fail "scratch DAG was not written: $scratch"
-else
-    python3 -c '
-import json, sys
-
-source, scratch, tag = sys.argv[1], sys.argv[2], sys.argv[3]
-
-def steps(path):
-    return {
-        "{}.{}".format(s.get("group", ""), s.get("job", "")): s
-        for s in json.load(open(path))["steps"]
-    }
-
-before, after = steps(source), steps(scratch)
-if before.keys() != after.keys():
-    sys.exit("scratch DAG changed the node set: {} vs {}".format(
-        sorted(before), sorted(after)))
-
-cmd_drift, unexplained = [], []
-for key, was in before.items():
-    now = after[key]
-    if was == now:
-        continue
-    if now != was:
-        if now.get("cmd") != was.get("cmd") and {
-            k: v for k, v in now.items() if k != "cmd"
-        } == {k: v for k, v in was.items() if k != "cmd"}:
-            cmd_drift.append(key)
-        else:
-            unexplained.append(key)
-
-if unexplained:
-    sys.exit("steps changed in ways neither edit explains: {}".format(sorted(unexplained)))
-if cmd_drift != [tag]:
-    sys.exit("expected exactly {} to take an edited command, got {}".format(
-        tag, sorted(cmd_drift)))
-missing_cpu = [k for k, s in before.items() if not s.get("cpu_timeout")]
-if missing_cpu:
-    sys.exit("committed DAG has steps without cpu_timeout: {}".format(missing_cpu))
-' "$DAG" "$scratch" "$NODE" || fail "scratch DAG differs from the tracked DAG in an unexplained way"
-    printf 'run-node-args-test: ok — one edited command, no resource policy changed\n'
+    printf 'run-node-args-test: ok — unknown privileged public ID refuses by name\n'
 fi
 
 if ((failures > 0)); then
     printf 'run-node-args-test: %d check(s) FAILED\n' "$failures" >&2
     exit 1
 fi
-printf 'run-node-args-test: OK — 5 reasoned refusals, 1 usage check, 1 real CI selection, scheduler-width default and override, 1 single-node edit, current runner selector, no resource-policy drift\n'
+printf 'run-node-args-test: OK — replacement arguments refuse; exact hosted selections remain executable\n'
