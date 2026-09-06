@@ -39,7 +39,7 @@ trap 'rm -f "$plan_out"' EXIT
 ./scripts/validate.rs portable-only --show-plan-json \
     --skip-inner-dirty-working-tree-and-rebase-freshness-checks >"$plan_out"
 plan_json=$(sed -n '1p' "$plan_out")
-jq -e '.profile == "portable" and .selection_mode == "label"' \
+jq -e '.profile == "portable-only" and .selection_mode == "label"' \
     <<<"$plan_json" >/dev/null || {
     echo "check-shard-coverage.sh: validate did not return the full portable-only plan" >&2
     exit 2
