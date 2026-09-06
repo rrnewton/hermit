@@ -17,22 +17,30 @@ use dagrun::TestResult;
 use dagrun::TestResults;
 use hermit_manifest_plan::cli_help::is_help_flag;
 use hermit_manifest_plan::runner::CellResult;
+use hermit_manifest_plan::runner::DEFAULT_VERIFY_LOG_RETENTION_BUDGET_BYTES;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
+use hermit_manifest_plan::runner::ProcessPermitPool;
+use hermit_manifest_plan::runner::RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA;
+use hermit_manifest_plan::runner::RunCellServiceError;
 use hermit_manifest_plan::runner::RunContext;
 use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 use hermit_manifest_plan::runner::Selection;
-use hermit_manifest_plan::runner::append_result;
+use hermit_manifest_plan::runner::VerifyLogRetentionBudget;
+use hermit_manifest_plan::runner::VerifyLogRetentionPolicy;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::checked_add_cpu_usage;
+use hermit_manifest_plan::runner::cleanup_verify_log_sources;
 use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::infrastructure_error_result;
+use hermit_manifest_plan::runner::no_result_error_result;
 use hermit_manifest_plan::runner::prepare_result_path;
+use hermit_manifest_plan::runner::reopen_retained_verify_log_publication;
 use hermit_manifest_plan::runner::requires_capability;
-use hermit_manifest_plan::runner::run_cell;
+use hermit_manifest_plan::runner::run_cell_with_services;
 use hermit_manifest_plan::runner::write_junit;
 use hermit_manifest_plan::stress_series::HostCapabilities;
 #[cfg(test)]
@@ -1676,6 +1684,10 @@ fn for_each_parallel<T: Send>(
     });
 }
 
+fn retryable_failure_class(failure_class: Option<FailureClass>) -> bool {
+    failure_class == Some(FailureClass::ProductFailure)
+}
+
 fn run_with_retry<T>(
     first_attempt: u64,
     mut execute: impl FnMut(u64) -> T,
@@ -1736,6 +1748,15 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             results_path.display()
         ))
     });
+    let process_permits = ProcessPermitPool::new(capacity);
+    let retention_artifact_root = context.result_root.join("runs").join(&context.run_id);
+    let retention_budget = VerifyLogRetentionBudget::open_with_artifact_root(
+        &context.result_root,
+        &retention_artifact_root,
+        &results_path,
+        VerifyLogRetentionPolicy::new(DEFAULT_VERIFY_LOG_RETENTION_BUDGET_BYTES),
+    )
+    .unwrap_or_else(|error| fail(format!("cannot initialize verify-log retention: {error}")));
     let mut indexed_results = Vec::new();
     let mut attempt_results = vec![Vec::new(); cells.len()];
     let mut failed = false;
@@ -1761,12 +1782,23 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 context.attempt,
                 |attempt| {
                     let attempt_context = context.with_attempt(attempt);
-                    match run_cell(&attempt_context, cell) {
+                    match run_cell_with_services(
+                        &attempt_context,
+                        cell,
+                        &process_permits,
+                        &retention_budget,
+                        &results_path,
+                    ) {
                         Ok(result) => result,
-                        Err(error) => infrastructure_error_result(&attempt_context, cell, error),
+                        Err(RunCellServiceError::NoResult(error)) => {
+                            no_result_error_result(&attempt_context, cell, error)
+                        }
+                        Err(RunCellServiceError::Infrastructure(error)) => {
+                            infrastructure_error_result(&attempt_context, cell, error)
+                        }
                     }
                 },
-                |result| !matches!(result.outcome.as_str(), "PASS" | "HOST-INAPPLICABLE"),
+                |result| retryable_failure_class(result.failure_class),
                 emit,
             );
         },
@@ -1781,7 +1813,23 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             // the complete typed row is already present even if the containing
             // bucket is killed before its JUnit/summary epilogue. The worker
             // waits for this acknowledgement before starting a retry.
-            let published = if let Err(error) = append_result(&results_path, &result) {
+            let published = if result.schema == RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA {
+                match reopen_retained_verify_log_publication(&result).and_then(|publication| {
+                    cleanup_verify_log_sources(Path::new(&result.artifact_dir), &publication)
+                }) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        eprintln!(
+                            "ERROR {} ({}/{}): retained verify-log cleanup failed after durable publication: {error}",
+                            result.test,
+                            result.mode,
+                            result.backend.as_deref().unwrap_or("native")
+                        );
+                        failed = true;
+                        false
+                    }
+                }
+            } else if let Err(error) = retention_budget.append_result(&results_path, &result) {
                 eprintln!(
                     "ERROR {} ({}/{}): completed cell result could not be published: {error}",
                     result.test,
@@ -1965,6 +2013,7 @@ mod tests {
 
     use super::DEFAULT_BUILD_JOBS;
     use super::EXPECTED_PLAN_SCHEMA;
+    use super::FailureClass;
     use super::HostCapability;
     use super::HostCapabilityVerdict;
     use super::accumulate_cell_cpu_usage;
@@ -1975,6 +2024,7 @@ mod tests {
     use super::for_each_parallel;
     use super::host_inapplicable_reason;
     use super::parse;
+    use super::retryable_failure_class;
     use super::run_with_retry;
     use super::scheduled_worker_capacity;
     use super::structured_test_results_from_rows;
@@ -2243,6 +2293,19 @@ mod tests {
         );
         assert_eq!(executions.load(Ordering::SeqCst), 2);
         assert_eq!(rows, [(1, true), (2, false)]);
+    }
+
+    #[test]
+    fn retry_policy_accepts_only_typed_product_failures() {
+        assert!(retryable_failure_class(Some(FailureClass::ProductFailure)));
+        for class in [
+            None,
+            Some(FailureClass::UnderstoodInfrastructureFailure),
+            Some(FailureClass::UnderstoodPrerequisiteFailure),
+            Some(FailureClass::NoResult),
+        ] {
+            assert!(!retryable_failure_class(class));
+        }
     }
 
     #[test]
