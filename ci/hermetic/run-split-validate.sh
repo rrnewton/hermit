@@ -41,7 +41,7 @@
 # CI already runs it as separate jobs: build jobs publish a prebuilt tree, then
 # test, E2E, and final-result jobs consume it. This script reads THE SAME KEYS
 # with THE SAME jq expressions as .github/workflows/ci-portable.yml. Completeness
-# is checked against validate's constructed portable-only plan, never a raw lane
+# is checked against the committed hosted-portable selection, never a generated lane
 # file, so plan-construction changes cannot silently fall out of this path.
 #
 # THE PARTITION IS THE SHARD MAP, NOT THE `group` FIELD. A naive implementation
@@ -200,7 +200,7 @@ test_node_count=$(tr ',' '\n' <<<"$test_nodes" | wc -l)
 total_node_count=$((build_node_count + test_node_count))
 if [[ -z "$shards" ]]; then
     plan_out=$(mktemp)
-    ./scripts/validate.rs portable-only --show-plan-json \
+    ./scripts/validate.rs --hosted-portable-only --show-plan-json \
         --skip-inner-dirty-working-tree-and-rebase-freshness-checks >"$plan_out"
     plan_json=$(sed -n '1p' "$plan_out")
     rm -f "$plan_out"

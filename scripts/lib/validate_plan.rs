@@ -4,15 +4,17 @@
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Plan construction for the validate driver: turn a PROFILE into a `DagConfig`.
+//! Committed-plan selection and audit helpers for the validate driver.
 //!
 //! # The single rule this module exists to enforce
 //!
-//! **Nothing validate runs may execute outside `dagrun`.** Every gate
-//! — preflight submodule init, the Reverie pin check, the manifest gate, each CI
-//! lane node, and each compatibility probe — is a DAG *node*. The driver makes
-//! exactly one kind of call (`run_dag_boxed_ordered`) and never spawns work
-//! itself. The previous Phase-1 wrapper had a `run_subprocess_gate` helper that
+//! **Nothing validate runs may execute outside `dagrun`.** Every gate --
+//! preflight submodule init, the Reverie pin check, the manifest gate, each CI
+//! node, and each compatibility probe -- is a node in the single committed
+//! `ci/dag/validate.json`. Profiles select that immutable graph by labels; this
+//! module does not compile or rewrite a runtime graph. The driver makes exactly
+//! one kind of call (`run_dag_boxed_ordered`) and never spawns work itself. The
+//! previous Phase-1 wrapper had a `run_subprocess_gate` helper that
 //! shelled out for the three preflight gates; that was a second execution path
 //! inside the driver, so those gates were unboxed, untimed by the runner, and
 //! invisible to its typed accounting. It is gone.
@@ -33,14 +35,12 @@
 //! `OOM-KILLED (hit inner MemoryMax; 3 oom_kill event(s))` at `peak≈256.0 MiB`
 //! and failed the run. Boxing works; it just has to be asked for.
 //!
-//! So: every node built here declares `timeout`, `cpu_timeout`, and a memory
+//! So every committed node declares `timeout`, `cpu_timeout`, and a memory
 //! hint, and [`undeclared_nodes`] is the fail-closed audit that keeps it true.
-//!
-//! Note also that `ci/dag/{portable,privileged}.json` declare memory hints on
-//! 47/47 and 8/8 nodes respectively, but `cpu_timeout` on **0/55** — so the
-//! per-step CPU-time guard is currently inert for every shipped lane node. This
-//! module supplies a profile-level `default_step_cpu_timeout` so those nodes get
-//! a load-immune budget without editing 55 JSON rows.
+//! The committed graph deliberately has no global CPU fallback: the generator
+//! records each measured or inherited node budget explicitly, including the
+//! hosted-privileged repair that replaced the retired graph's unusable implicit
+//! 10-second forcing default.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -64,11 +64,10 @@ pub const MANIFEST_PLAN_PRODUCER_TAG: &str = "setup.manifest_plan";
 pub const MANIFEST_PLAN_BUILD_COMMAND: &str = "cargo build -p hermit-manifest-plan --bins";
 pub const MANIFEST_AUDIT_COMMAND: &str = "target/debug/test-harness validate";
 
-/// Per-lane-node CPU budget applied as the DAG-level default, closing the
-/// measured 0/55 `cpu_timeout` gap. Generous relative to the wall timeout because
-/// the build spine legitimately burns many CPU-minutes; it exists to stop an
-/// unbounded spin, not to police normal cost.
-const LANE_DEFAULT_CPU_TIMEOUT_S: i64 = 7200;
+/// CPU fallback for synthetic configs used by generator and self-test fixtures.
+/// Production profile execution selects nodes whose CPU budgets are explicit in
+/// the committed DAG; this value is never a runtime profile rewrite.
+const SYNTHETIC_DEFAULT_CPU_TIMEOUT_S: i64 = 7200;
 
 /// Wall budget for one compatibility probe. Mirrors `STRICT_COMPAT_TIMEOUT=60`
 /// (validate.sh:1091).
@@ -367,10 +366,16 @@ mod tests {
 
     #[test]
     fn manifest_audit_uses_its_measured_cold_cache_cpu_budget_only() {
-        let nodes = preflight_nodes(Path::new("/repo")).unwrap();
+        let root = Path::new(file!())
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("validate_plan.rs lives under scripts/lib");
+        let nodes = preflight_nodes(root).unwrap();
         let expected = vec![
             ("pre.submodules".to_string(), 900, 300, Some(2_147_483_648)),
             ("pre.reverie_pin".to_string(), 900, 300, Some(2_147_483_648)),
+            ("build.rust_scripts".to_string(), 300, 7200, Some(2_147_483_648)),
             ("setup.manifest_plan".to_string(), 180, 7200, Some(2_147_483_648)),
             ("gate.manifest".to_string(), 900, 600, Some(5_368_709_120)),
         ];
@@ -500,7 +505,7 @@ pub fn lane_host_capability_requirements(
 }
 
 /// Every `requires_host_capability` declaration in every shipped lane, under
-/// both the bare and the fused-lane tag spelling, so the caller can look a plan's
+/// both the bare and the committed prefixed tag spelling, so the caller can look a plan's
 /// tags up directly however the plan was assembled.
 pub fn host_capability_requirements(
     root: &Path,
@@ -704,10 +709,9 @@ pub fn config_from_base(base: &DagConfig, steps: Vec<Step>, description: &str) -
     let mut cfg = base.clone();
     cfg.steps = steps;
     cfg.description = description.to_string();
-    // The one DELIBERATE divergence: shipped lane nodes declare cpu_timeout on
-    // 0 of 55, so supply a load-immune default. A node's own cpu_timeout still
-    // wins via effective_cpu_timeout. Recorded here so the audit can exempt it.
-    cfg.default_step_cpu_timeout = LANE_DEFAULT_CPU_TIMEOUT_S;
+    // Synthetic generator/self-test configs use a bounded fallback. Production
+    // selections retain the explicit per-node budgets in the committed DAG.
+    cfg.default_step_cpu_timeout = SYNTHETIC_DEFAULT_CPU_TIMEOUT_S;
     cfg
 }
 

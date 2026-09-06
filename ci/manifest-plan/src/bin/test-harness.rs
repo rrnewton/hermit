@@ -1018,6 +1018,50 @@ fn command_jobs(command: &str) -> Result<Option<i64>, String> {
     Ok(jobs)
 }
 
+const PREBUILT_COMMAND_PREFIX: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; "#;
+const PINNED_COMMAND_PREFIX: &str = "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo ";
+const PINNED_COMMAND_SEPARATOR: &str = r#" -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1"' bash "#;
+
+fn shell_quote_one(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"@%+=:,./-_".contains(&byte))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+fn command_runs_exactly(command: &str, inner: &str) -> bool {
+    let expected = format!("{PREBUILT_COMMAND_PREFIX}{inner}");
+    if command == expected {
+        return true;
+    }
+    let Some(rest) = command.strip_prefix(PINNED_COMMAND_PREFIX) else {
+        return false;
+    };
+    let Some((forwarded, quoted_inner)) = rest.split_once(PINNED_COMMAND_SEPARATOR) else {
+        return false;
+    };
+    let words = forwarded.split_whitespace().collect::<Vec<_>>();
+    let (pairs, remainder) = words.as_chunks::<2>();
+    if words.is_empty()
+        || !remainder.is_empty()
+        || pairs.iter().any(|pair| {
+            pair[0] != "--env"
+                || pair[1].is_empty()
+                || !pair[1]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+    {
+        return false;
+    }
+    let unique = pairs.iter().map(|pair| pair[1]).collect::<BTreeSet<_>>();
+    unique.len() == pairs.len() && quoted_inner == shell_quote_one(&expected)
+}
+
 fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), String> {
     let committed_path = root.join("ci/dag/validate.json");
     let committed = read_dag(&committed_path)?;
@@ -1057,7 +1101,7 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
         if dag
             .steps
             .iter()
-            .filter(|step| step.cmd.ends_with("target/debug/test-harness validate"))
+            .filter(|step| command_runs_exactly(&step.cmd, "target/debug/test-harness validate"))
             .count()
             != 1
         {
@@ -1071,12 +1115,12 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
         if dag
             .steps
             .iter()
-            .filter(|step| step.cmd.ends_with(&build))
+            .filter(|step| command_runs_exactly(&step.cmd, &build))
             .count()
-            != 1
+            != 2
         {
             return Err(format!(
-                "{} must contain exactly one Rust manifest build node",
+                "{} must contain exactly the host and pinned-root Rust manifest build nodes",
                 path.display()
             ));
         }
@@ -1157,11 +1201,39 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
     Ok(())
 }
 
+fn audit_validation_levels_policy(workflow: &str) -> Result<(), String> {
+    for variable in [
+        "VALIDATE_GATE_TIMEOUT_SECONDS",
+        "VALIDATE_GATE_CPU_TIMEOUT_SECONDS",
+        "SUPER_REPETITIONS",
+    ] {
+        if workflow
+            .lines()
+            .any(|line| line.trim_start().starts_with(&format!("{variable}:")))
+        {
+            return Err(format!(
+                "validation-levels.yml still sets {variable}, which would rewrite or conflict with the committed DAG"
+            ));
+        }
+    }
+    for command in [
+        "ci/run-dag.sh privileged",
+        "./scripts/validate.rs super --no-label-pr",
+    ] {
+        if !workflow.contains(command) {
+            return Err(format!(
+                "validation-levels.yml no longer invokes the committed-DAG path {command:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn audit_budget_ordering(root: &Path) -> Result<(), String> {
     let committed = read_dag(&root.join("ci/dag/validate.json"))?;
-    let portable = dagrun::select_steps_by_labels(&committed, &["portable".into()])
+    let portable = dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()])
         .map_err(|error| format!("cannot select portable DAG steps: {error}"))?;
-    let privileged = dagrun::select_steps_by_labels(&committed, &["privileged".into()])
+    let privileged = dagrun::select_steps_by_labels(&committed, &["hosted-privileged".into()])
         .map_err(|error| format!("cannot select privileged DAG steps: {error}"))?;
     for (lane, dag) in [("portable", &portable), ("privileged", &privileged)] {
         for step in &dag.steps {
@@ -1234,6 +1306,11 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
             }
         }
     }
+
+    let validation_levels =
+        fs::read_to_string(root.join(".github/workflows/validation-levels.yml"))
+            .map_err(|error| error.to_string())?;
+    audit_validation_levels_policy(&validation_levels)?;
 
     let privileged_workflow = fs::read_to_string(root.join(".github/workflows/ci-privileged.yml"))
         .map_err(|e| e.to_string())?;
@@ -1979,16 +2056,22 @@ mod tests {
     use super::EXPECTED_PLAN_SCHEMA;
     use super::HostCapability;
     use super::HostCapabilityVerdict;
+    use super::PINNED_COMMAND_PREFIX;
+    use super::PINNED_COMMAND_SEPARATOR;
+    use super::PREBUILT_COMMAND_PREFIX;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
+    use super::audit_validation_levels_policy;
     use super::build_worker_capacity;
     use super::command_jobs;
+    use super::command_runs_exactly;
     use super::expected_plan_document;
     use super::for_each_parallel;
     use super::host_inapplicable_reason;
     use super::parse;
     use super::run_with_retry;
     use super::scheduled_worker_capacity;
+    use super::shell_quote_one;
     use super::structured_test_results_from_rows;
     use super::unique_plan_rows;
 
@@ -2123,6 +2206,24 @@ mod tests {
         fi
         timeout 720s ci/run-dag.sh privileged --unsafe-no-cgroups
 "#;
+
+    #[test]
+    fn validation_levels_cannot_rewrite_committed_graph_policy() {
+        let workflow = include_str!("../../../../.github/workflows/validation-levels.yml");
+        assert!(audit_validation_levels_policy(workflow).is_ok());
+        for planted in [
+            "VALIDATE_GATE_TIMEOUT_SECONDS: 3600",
+            "VALIDATE_GATE_CPU_TIMEOUT_SECONDS: 3600",
+            "SUPER_REPETITIONS: 7",
+        ] {
+            let changed = format!("{workflow}\nenv:\n  {planted}\n");
+            let error = audit_validation_levels_policy(&changed).unwrap_err();
+            assert!(
+                error.contains(planted.split(':').next().unwrap()),
+                "{error}"
+            );
+        }
+    }
 
     #[test]
     fn privileged_unboxed_execution_requires_the_exact_actions_guard() {
@@ -2324,6 +2425,30 @@ mod tests {
             |_, _, _| false,
         );
         assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn manifest_command_audit_accepts_only_exact_host_or_pinned_commands() {
+        let inner = "target/debug/test-harness validate";
+        let host = format!("{PREBUILT_COMMAND_PREFIX}{inner}");
+        assert!(command_runs_exactly(&host, inner));
+        let pinned = format!(
+            "{PINNED_COMMAND_PREFIX}--env E2E_RESULT_ROOT --env VALIDATE_VERBOSITY{PINNED_COMMAND_SEPARATOR}{}",
+            shell_quote_one(&host)
+        );
+        assert!(command_runs_exactly(&pinned, inner));
+        assert!(!command_runs_exactly(
+            &format!("{PREBUILT_COMMAND_PREFIX}true # {inner}"),
+            inner
+        ));
+        assert!(!command_runs_exactly(&format!("{pinned} && true"), inner));
+        assert!(!command_runs_exactly(
+            &format!(
+                "{PINNED_COMMAND_PREFIX}--env E2E_RESULT_ROOT --env E2E_RESULT_ROOT{PINNED_COMMAND_SEPARATOR}{}",
+                shell_quote_one(&host)
+            ),
+            inner
+        ));
     }
 
     #[test]
