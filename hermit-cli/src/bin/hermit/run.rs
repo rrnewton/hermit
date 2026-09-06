@@ -595,7 +595,7 @@ pub(super) fn parse_assignment(src: &str) -> Result<(String, Option<String>), Er
     }
 }
 
-pub(super) fn apply_base_environment(
+fn apply_base_and_explicit_environment(
     command: &mut Command,
     base_env: &BaseEnv,
     env: &[(String, Option<String>)],
@@ -628,8 +628,21 @@ pub(super) fn apply_base_environment(
         }
     }
 
+    Ok(())
+}
+
+fn disable_sanitizer_leak_detection(command: &mut Command) {
     command.env("ASAN_OPTIONS", "detect_leaks=0");
     command.env("LSAN_OPTIONS", "detect_leaks=0");
+}
+
+pub(super) fn apply_base_environment(
+    command: &mut Command,
+    base_env: &BaseEnv,
+    env: &[(String, Option<String>)],
+) -> Result<(), Error> {
+    apply_base_and_explicit_environment(command, base_env, env)?;
+    disable_sanitizer_leak_detection(command);
     Ok(())
 }
 
@@ -1358,6 +1371,85 @@ fn guest_env_disables_sanitizer_leak_detection_on_every_backend() {
         );
     }
 }
+
+#[test]
+fn namespace_only_guest_command_applies_process_options_once() {
+    let ro = RunOpts::parse_from([
+        "fakehermit",
+        "--namespace-only",
+        "--base-env=minimal",
+        "--env=NAMESPACE_ONLY_EXPLICIT=present",
+        "--workdir=/test",
+        "/bin/echo",
+        "first",
+        "second",
+    ]);
+    let command = ro.namespace_only_guest_command().unwrap();
+
+    assert_eq!(command.get_program(), OsStr::new("/bin/echo"));
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        &[OsStr::new("first"), OsStr::new("second")]
+    );
+    assert_eq!(command.get_current_dir(), Some(Path::new("/test")));
+
+    let envs = command.get_captured_envs();
+    assert_eq!(
+        envs.len(),
+        4,
+        "unexpected namespace-only environment: {envs:?}"
+    );
+    assert_eq!(
+        envs.get(OsStr::new("HOME")).map(|value| value.as_os_str()),
+        Some(OsStr::new("/root"))
+    );
+    assert_eq!(
+        envs.get(OsStr::new("HOSTNAME"))
+            .map(|value| value.as_os_str()),
+        Some(OsStr::new("hermetic-container.local"))
+    );
+    assert_eq!(
+        envs.get(OsStr::new("PATH")).map(|value| value.as_os_str()),
+        Some(OsStr::new(
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ))
+    );
+    assert_eq!(
+        envs.get(OsStr::new("NAMESPACE_ONLY_EXPLICIT"))
+            .map(|value| value.as_os_str()),
+        Some(OsStr::new("present"))
+    );
+}
+
+#[test]
+fn namespace_only_guest_command_preserves_sanitizer_environment() {
+    let ro = RunOpts::parse_from(["fakehermit", "--namespace-only", "/bin/true"]);
+    let command = ro.namespace_only_guest_command().unwrap();
+    let sanitizer_overrides: Vec<_> = command
+        .get_envs()
+        .filter(|(name, _)| {
+            *name == OsStr::new("ASAN_OPTIONS") || *name == OsStr::new("LSAN_OPTIONS")
+        })
+        .map(|(name, value)| (name.to_owned(), value.map(OsStr::to_owned)))
+        .collect();
+
+    assert!(
+        sanitizer_overrides.is_empty(),
+        "namespace-only added explicit sanitizer overrides: {sanitizer_overrides:?}"
+    );
+
+    let missing = format!("HERMIT_NAMESPACE_ONLY_MISSING_ENV_{}", std::process::id());
+    assert!(std::env::var_os(&missing).is_none());
+    let option = format!("--env={missing}");
+    let ro = RunOpts::parse_from(["fakehermit", "--namespace-only", &option, "/bin/true"]);
+    let error = match ro.namespace_only_guest_command() {
+        Ok(_) => panic!("namespace-only accepted a missing pass-through environment variable"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains(&missing), "unexpected error: {error}");
+    assert!(error.contains("not set in the host environment"), "{error}");
+}
+
 #[test]
 fn dbt_rejects_mount_and_workdir_options_it_cannot_apply() {
     let mut with_mount = RunOpts::parse_from([
@@ -3719,7 +3811,7 @@ impl RunOpts {
             identity_sources: _identity_sources,
         } = self.mounts(tmpfs.path())?;
 
-        let mut command = Command::new(&self.program);
+        let mut command = self.namespace_only_guest_command()?;
         // `--namespace-only` does NOT go through `with_container`: it unshares
         // `Namespace::PID` and execs the guest directly, so the guest process
         // ITSELF becomes PID 1 of the new namespace and inherits the same
@@ -3754,7 +3846,6 @@ impl RunOpts {
             });
         }
         command
-            .args(&self.args)
             .unshare(Namespace::PID)
             .map_root()
             .hostname("hermetic-container.local")
@@ -4326,6 +4417,19 @@ impl RunOpts {
     }
 
     fn guest_command(&self) -> Result<Command, Error> {
+        self.build_guest_command(true)
+    }
+
+    fn namespace_only_guest_command(&self) -> Result<Command, Error> {
+        // Namespace-only bypasses instrumentation, so preserve the caller's
+        // sanitizer environment instead of installing the leak-disable overrides.
+        self.build_guest_command(false)
+    }
+
+    fn build_guest_command(
+        &self,
+        disable_sanitizer_leak_detection_for_guest: bool,
+    ) -> Result<Command, Error> {
         let program = self.e9patch_program.as_ref().unwrap_or(&self.program);
         let mut command = Command::new(program);
         command.args(&self.args);
@@ -4373,7 +4477,10 @@ impl RunOpts {
             return Ok(command);
         }
 
-        apply_base_environment(&mut command, &self.base_env, &self.env)?;
+        apply_base_and_explicit_environment(&mut command, &self.base_env, &self.env)?;
+        if disable_sanitizer_leak_detection_for_guest {
+            disable_sanitizer_leak_detection(&mut command);
+        }
 
         Ok(command)
     }

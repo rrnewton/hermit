@@ -3288,6 +3288,186 @@ fn namespace_only_rejects_every_explicit_backend() {
 }
 
 #[test]
+fn namespace_only_applies_minimal_and_explicit_environment() {
+    let _guard = hermit_run_guard();
+    let args = [
+        "run",
+        "--namespace-only",
+        "--base-env=minimal",
+        "--env=NAMESPACE_ONLY_EXPLICIT=present",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'home=%s\\nhostname=%s\\npath=%s\\nexplicit=%s\\nhost=%s\\nasan=%s\\nlsan=%s\\n' \
+         \"${HOME-UNSET}\" \"${HOSTNAME-UNSET}\" \"${PATH-UNSET}\" \
+         \"${NAMESPACE_ONLY_EXPLICIT-UNSET}\" \"${NAMESPACE_ONLY_HOST_ONLY-UNSET}\" \
+         \"${ASAN_OPTIONS-UNSET}\" \"${LSAN_OPTIONS-UNSET}\"",
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .env("NAMESPACE_ONLY_HOST_ONLY", "must-not-leak")
+        .env("ASAN_OPTIONS", "namespace-only-host-asan")
+        .env("LSAN_OPTIONS", "namespace-only-host-lsan")
+        .args(args)
+        .output()
+        .expect("failed to run namespace-only minimal-environment regression");
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "home=/root\nhostname=hermetic-container.local\n\
+         path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
+         explicit=present\nhost=UNSET\nasan=UNSET\nlsan=UNSET\n"
+    );
+    assert_eq!(stderr(&output), "");
+}
+
+#[test]
+fn namespace_only_preserves_default_host_environment() {
+    let _guard = hermit_run_guard();
+    let unrelated_secret = "namespace-only-secret-must-not-appear";
+    let args = [
+        "run",
+        "--namespace-only",
+        "--env=NAMESPACE_ONLY_EXPLICIT=present",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'host=%s\\nexplicit=%s\\nasan=%s\\nlsan=%s\\n' \
+         \"$NAMESPACE_ONLY_HOST_ONLY\" \"$NAMESPACE_ONLY_EXPLICIT\" \
+         \"$ASAN_OPTIONS\" \"$LSAN_OPTIONS\"",
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .env("NAMESPACE_ONLY_HOST_ONLY", "preserved")
+        .env("ASAN_OPTIONS", "namespace-only-host-asan")
+        .env("LSAN_OPTIONS", "namespace-only-host-lsan")
+        .env("NAMESPACE_ONLY_UNRELATED_SECRET", unrelated_secret)
+        .args(args)
+        .output()
+        .expect("failed to run namespace-only host-environment regression");
+
+    assert_success(&output, &args);
+    let guest_stdout = stdout(&output);
+    let guest_stderr = stderr(&output);
+    assert_eq!(
+        guest_stdout,
+        "host=preserved\nexplicit=present\nasan=namespace-only-host-asan\n\
+         lsan=namespace-only-host-lsan\n"
+    );
+    assert_eq!(guest_stderr, "");
+    assert!(!guest_stdout.contains(unrelated_secret));
+    assert!(!guest_stderr.contains(unrelated_secret));
+}
+
+#[test]
+fn namespace_only_applies_a_fresh_private_tmpfs_workdir() {
+    let _guard = hermit_run_guard();
+    let marker_source = tempfile::Builder::new()
+        .prefix("hermit_namespace_only_private_")
+        .tempdir_in("/tmp")
+        .expect("failed to allocate a unique namespace-only marker");
+    let marker = marker_source
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("temporary marker name should be UTF-8");
+    let host_marker = Path::new("/test").join(marker);
+    assert!(
+        !host_marker.exists(),
+        "host marker already exists: {host_marker:?}"
+    );
+
+    let script = format!(
+        "test ! -e /test/{marker} || exit 91; /bin/pwd -P; \
+         /usr/bin/stat -f -c %T .; : > /test/{marker}"
+    );
+    let args = [
+        "run",
+        "--namespace-only",
+        "--mount=type=tmpfs,target=/test",
+        "--workdir=/test",
+        "--",
+        "/bin/sh",
+        "-c",
+        &script,
+    ];
+
+    for run in 1..=2 {
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), "/test\ntmpfs\n", "run {run}");
+        assert_eq!(stderr(&output), "", "run {run}");
+        assert!(
+            !host_marker.exists(),
+            "run {run} leaked its private tmpfs marker to {host_marker:?}"
+        );
+    }
+}
+
+#[test]
+fn namespace_only_propagates_guest_exit_status() {
+    let _guard = hermit_run_guard();
+    let args = ["run", "--namespace-only", "--", "/bin/sh", "-c", "exit 37"];
+    let output = hermit(&args);
+
+    assert_eq!(
+        output.status.code(),
+        Some(37),
+        "unexpected output: {output:?}"
+    );
+    assert_eq!(stdout(&output), "");
+    assert_eq!(stderr(&output), "");
+}
+
+#[test]
+fn namespace_only_reports_invalid_process_settings() {
+    let _guard = hermit_run_guard();
+
+    let missing_workdir = "/definitely/missing/hermit-namespace-only-workdir";
+    assert!(!Path::new(missing_workdir).exists());
+    let unrelated_secret = "namespace-only-failure-secret-must-not-appear";
+    let workdir_args = [
+        "run",
+        "--namespace-only",
+        "--workdir",
+        missing_workdir,
+        "--",
+        "/bin/true",
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .env("NAMESPACE_ONLY_UNRELATED_SECRET", unrelated_secret)
+        .args(workdir_args)
+        .output()
+        .expect("failed to run namespace-only bad-workdir regression");
+    assert_hermit_refusal_contains(
+        &output,
+        Refusal::Hermit,
+        &["chdir failed", "ENOENT", "No such file or directory"],
+    );
+    assert!(!stdout(&output).contains(unrelated_secret));
+    assert!(!stderr(&output).contains(unrelated_secret));
+
+    let missing_mount = "/definitely/missing/hermit-namespace-only-mount";
+    assert!(!Path::new(missing_mount).exists());
+    let mount = format!("--mount=type=bind,source={missing_mount},target=/test/input");
+    let output = hermit(&["run", "--namespace-only", &mount, "--", "/bin/true"]);
+    assert_hermit_refusal_contains(
+        &output,
+        Refusal::Hermit,
+        &["--mount source", missing_mount, "does not exist"],
+    );
+
+    let missing_env = format!("HERMIT_NAMESPACE_ONLY_MISSING_ENV_{}", std::process::id());
+    assert!(std::env::var_os(&missing_env).is_none());
+    let env = format!("--env={missing_env}");
+    let output = hermit(&["run", "--namespace-only", &env, "--", "/bin/true"]);
+    assert_hermit_refusal_contains(
+        &output,
+        Refusal::Hermit,
+        &[&missing_env, "not set in the host environment"],
+    );
+}
+
+#[test]
 fn backend_accepted_in_global_position() {
     if dbt_unavailable("backend_accepted_in_global_position") {
         return;
