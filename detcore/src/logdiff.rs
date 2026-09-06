@@ -1835,6 +1835,93 @@ pub fn compare_complete_prefix(
     compare_complete_prefix_with_filter(contents_a, contents_b, opts, w, |_| true)
 }
 
+/// Compare the complete common prefix of two growing logs under the fixed
+/// `BitwiseInfoV1` policy.
+///
+/// The whole byte buffers must be valid UTF-8, and a terminal bounded-writer
+/// marker refuses immediately even though it is not a timestamped record.
+/// Structured-record validation covers every complete record currently
+/// available on each side, while the verdict compares only the common complete
+/// prefix. The unfinished final record remains withheld until a later record
+/// proves that it is complete.
+pub fn compare_complete_bitwise_info_v1_prefix(
+    bytes_a: &[u8],
+    bytes_b: &[u8],
+    side_labels: ComparisonSideLabels,
+    diagnostics: BitwiseInfoV1Diagnostics,
+    w: &mut impl std::io::Write,
+) -> std::io::Result<PrefixComparison> {
+    let contents_a = std::str::from_utf8(bytes_a).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not UTF-8: {error}", side_labels.left),
+        )
+    })?;
+    let contents_b = std::str::from_utf8(bytes_b).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not UTF-8: {error}", side_labels.right),
+        )
+    })?;
+
+    let truncated_a = log_was_truncated(contents_a);
+    let truncated_b = log_was_truncated(contents_b);
+    if truncated_a || truncated_b {
+        let which_side = match (truncated_a, truncated_b) {
+            (true, true) => "both logs were",
+            (true, false) => "the first log was",
+            (false, true) => "the second log was",
+            (false, false) => unreachable!("guarded by the condition above"),
+        };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{which_side} truncated at the configured size bound; the discarded tail was never written"
+            ),
+        ));
+    }
+
+    let records_available_left = complete_record_count(contents_a);
+    let records_available_right = complete_record_count(contents_b);
+    for (label, contents, available) in [
+        (
+            side_labels.left.as_str(),
+            contents_a,
+            records_available_left,
+        ),
+        (
+            side_labels.right.as_str(),
+            contents_b,
+            records_available_right,
+        ),
+    ] {
+        let complete = take_complete_records(contents, available)
+            .expect("the complete-record count always identifies its own prefix");
+        let records = extract_log_messages(complete)
+            .map_err(|error| std::io::Error::new(error.kind(), format!("{label} {error}")))?;
+        validate_structured_events(label, &records, true)?;
+    }
+
+    let records_compared = records_available_left.min(records_available_right);
+    let prefix_a = take_complete_records(contents_a, records_compared)
+        .expect("common prefix never exceeds either side's complete record count");
+    let prefix_b = take_complete_records(contents_b, records_compared)
+        .expect("common prefix never exceeds either side's complete record count");
+    let mut options = bitwise_info_v1_options(side_labels);
+    options.limit = diagnostics.difference_limit;
+    options.syscall_history = diagnostics.syscall_history;
+    options.no_color = diagnostics.no_color;
+    options.print_logs = diagnostics.print_logs;
+    let summary =
+        log_diff_summary_from_strs_with_filter(prefix_a, prefix_b, &options, w, |_| true)?;
+    Ok(PrefixComparison {
+        summary,
+        records_available_left,
+        records_available_right,
+        records_compared,
+    })
+}
+
 /// Compare the complete common prefix after applying a caller-supplied record filter.
 /// Product callers must bind the predicate to a typed, serialized policy; this
 /// backend-neutral layer intentionally carries no backend policy identity.
@@ -2421,6 +2508,33 @@ mod test {
                 .to_string()
                 .contains("missing its structured DETLOG result")
         );
+    }
+
+    #[test]
+    fn bitwise_info_v1_complete_prefix_withholds_the_unfinished_tail() -> std::io::Result<()> {
+        let common = structured_record(1, "DETLOG common", DetLogEvent::Other);
+        let left = format!(
+            "{common}{}",
+            structured_record(2, "DETLOG unfinished-left", DetLogEvent::Other)
+        );
+        let right = format!(
+            "{common}{}",
+            structured_record(2, "DETLOG unfinished-right", DetLogEvent::Other)
+        );
+        let comparison = super::compare_complete_bitwise_info_v1_prefix(
+            left.as_bytes(),
+            right.as_bytes(),
+            super::ComparisonSideLabels::new("left", "right"),
+            super::BitwiseInfoV1Diagnostics::default(),
+            &mut Vec::new(),
+        )?;
+        assert_eq!(comparison.records_available_left, 1);
+        assert_eq!(comparison.records_available_right, 1);
+        assert_eq!(comparison.records_compared, 1);
+        assert!(comparison.summary.matched_with_evidence());
+        assert_eq!(comparison.summary.compared_left, 1);
+        assert_eq!(comparison.summary.compared_right, 1);
+        Ok(())
     }
 
     #[test]
