@@ -2163,7 +2163,7 @@ fn run_kvm_executes_dynamic_guest() {
 /// `2>>file` instead of `2>file` -- the same run with the bit already set --
 /// was deterministic, which is the whole demonstration.
 ///
-/// ⚠️ THE `run_kvm_` PREFIX IS LOAD-BEARING, NOT DECORATION. `ci/dag/privileged.json`
+/// ⚠️ THE `run_kvm_` PREFIX IS LOAD-BEARING, NOT DECORATION. `ci/dag/validate.json`
 /// selects this suite with `-E 'test(/^run_kvm_/)'`, and that is the only lane with
 /// /dev/kvm. Without the prefix the test is selected on PORTABLE instead, where there
 /// is no /dev/kvm, so its own guard returns early and it reports a silent pass -- the
@@ -2267,7 +2267,7 @@ fn run_kvm_verify_is_deterministic_when_the_guest_mutates_hermit_stderr_flags() 
 /// cells go quiet together and THIS one still fails. That is the independence
 /// the other cell explicitly disclaims.
 ///
-/// ⚠️ `run_kvm_` PREFIX IS LOAD-BEARING. `ci/dag/privileged.json` selects this
+/// ⚠️ `run_kvm_` PREFIX IS LOAD-BEARING. `ci/dag/validate.json` selects this
 /// suite with `-E 'test(/^run_kvm_/)'` and that is the only lane with /dev/kvm.
 /// Without the prefix this is selected on PORTABLE, its guard returns early, and
 /// it reports a silent pass -- the exact hazard that node's description warns of.
