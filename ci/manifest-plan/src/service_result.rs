@@ -10,7 +10,8 @@ pub const HISTORICAL_SCHEMA_VERSION: u64 = 1;
 pub const WRITEBACK_SCHEMA_VERSION: u64 = 2;
 pub const SELECTION_SCHEMA_VERSION: u64 = 3;
 pub const TEST_COUNTS_SCHEMA_VERSION: u64 = 4;
-pub const SCHEMA_VERSION: u64 = 5;
+pub const NO_RESULT_DETAIL_SCHEMA_VERSION: u64 = 5;
+pub const SCHEMA_VERSION: u64 = 6;
 pub const HISTORICAL_FIELD_NAMES: [&str; 7] = [
     "schema_version",
     "commit",
@@ -53,7 +54,7 @@ pub const TEST_COUNTS_FIELD_NAMES: [&str; 10] = [
     "passed_tests",
     "scorecard_writeback",
 ];
-pub const FIELD_NAMES: [&str; 11] = [
+pub const NO_RESULT_DETAIL_FIELD_NAMES: [&str; 11] = [
     "schema_version",
     "commit",
     "profile",
@@ -66,6 +67,7 @@ pub const FIELD_NAMES: [&str; 11] = [
     "passed_tests",
     "scorecard_writeback",
 ];
+pub const FIELD_NAMES: [&str; 11] = NO_RESULT_DETAIL_FIELD_NAMES;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -183,11 +185,12 @@ impl ValidationServiceResult {
             HISTORICAL_SCHEMA_VERSION => HISTORICAL_FIELD_NAMES.into_iter().collect(),
             WRITEBACK_SCHEMA_VERSION => WRITEBACK_FIELD_NAMES.into_iter().collect(),
             SELECTION_SCHEMA_VERSION => SELECTION_FIELD_NAMES.into_iter().collect(),
+            NO_RESULT_DETAIL_SCHEMA_VERSION => NO_RESULT_DETAIL_FIELD_NAMES.into_iter().collect(),
             SCHEMA_VERSION => FIELD_NAMES.into_iter().collect(),
             TEST_COUNTS_SCHEMA_VERSION => TEST_COUNTS_FIELD_NAMES.into_iter().collect(),
             other => {
                 return Err(format!(
-                    "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {other}"
+                    "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, {NO_RESULT_DETAIL_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {other}"
                 ));
             }
         };
@@ -209,12 +212,13 @@ impl ValidationServiceResult {
             WRITEBACK_SCHEMA_VERSION,
             SELECTION_SCHEMA_VERSION,
             TEST_COUNTS_SCHEMA_VERSION,
+            NO_RESULT_DETAIL_SCHEMA_VERSION,
             SCHEMA_VERSION,
         ]
         .contains(&self.schema_version)
         {
             return Err(format!(
-                "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {}",
+                "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, {NO_RESULT_DETAIL_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {}",
                 self.schema_version
             ));
         }
@@ -248,17 +252,38 @@ impl ValidationServiceResult {
                 );
             }
         }
-        if self.schema_version != SCHEMA_VERSION && self.detail.is_some() {
+        if self.schema_version < NO_RESULT_DETAIL_SCHEMA_VERSION && self.detail.is_some() {
             return Err(format!(
                 "validation-service-result-historical-fields: schema {} cannot carry detail",
                 self.schema_version
             ));
         }
-        if self.final_validate_status != FinalValidateStatus::CouldNotRun && self.detail.is_some() {
+        if self.schema_version == NO_RESULT_DETAIL_SCHEMA_VERSION
+            && self.final_validate_status != FinalValidateStatus::CouldNotRun
+            && self.detail.is_some()
+        {
             return Err(format!(
-                "validation-service-result-detail: {} must carry null",
+                "validation-service-result-detail: schema {NO_RESULT_DETAIL_SCHEMA_VERSION} {} must carry null",
                 self.final_validate_status.as_str()
             ));
+        }
+        if self.schema_version == SCHEMA_VERSION {
+            match (self.final_validate_status, self.detail.as_ref()) {
+                (FinalValidateStatus::Passed, None) => {}
+                (FinalValidateStatus::Passed, Some(_)) => {
+                    return Err(
+                        "validation-service-result-detail: current PASSED must carry null"
+                            .to_string(),
+                    );
+                }
+                (FinalValidateStatus::Failed | FinalValidateStatus::CouldNotRun, Some(_)) => {}
+                (status, None) => {
+                    return Err(format!(
+                        "validation-service-result-detail: current {} requires a nonempty cause",
+                        status.as_str()
+                    ));
+                }
+            }
         }
         let validation_exit = self.final_validate_status.exit_code();
         if self.schema_version == HISTORICAL_SCHEMA_VERSION {
@@ -512,6 +537,24 @@ mod tests {
         assert_eq!(decoded.schema_version, TEST_COUNTS_SCHEMA_VERSION);
         assert_eq!(decoded.passed_tests, Some(2129));
         assert_eq!(decoded.detail, None);
+
+        let mut value = serde_json::to_value(valid()).unwrap();
+        value["schema_version"] = Value::from(NO_RESULT_DETAIL_SCHEMA_VERSION);
+        let decoded =
+            ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(decoded.schema_version, NO_RESULT_DETAIL_SCHEMA_VERSION);
+        assert_eq!(decoded.detail, None);
+
+        let mut historical_failed = decoded;
+        historical_failed.final_validate_status = FinalValidateStatus::Failed;
+        historical_failed.exit_code = 1;
+        historical_failed.detail = Some(vec!["ordinary failure".into()]);
+        assert!(
+            historical_failed
+                .validate()
+                .unwrap_err()
+                .contains("schema 5 FAILED must carry null")
+        );
     }
 
     #[test]
@@ -521,7 +564,7 @@ mod tests {
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
-                .contains("schema 5 expected")
+                .contains("schema 6 expected")
         );
     }
 
@@ -532,7 +575,7 @@ mod tests {
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
-                .contains("schema 5 expected")
+                .contains("schema 6 expected")
         );
     }
 
@@ -543,17 +586,17 @@ mod tests {
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
-                .contains("schema 5 expected")
+                .contains("schema 6 expected")
         );
     }
     #[test]
-    fn current_detail_is_required_nullable_and_only_names_no_result() {
+    fn current_detail_is_required_for_every_nonpass() {
         let mut missing = serde_json::to_value(valid()).unwrap();
         missing.as_object_mut().unwrap().remove("detail");
         let error =
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&missing).unwrap())
                 .unwrap_err();
-        assert!(error.contains("schema 5 expected"), "{error}");
+        assert!(error.contains("schema 6 expected"), "{error}");
 
         let mut pass_with_detail = valid();
         pass_with_detail.detail = Some(vec!["not pass detail".into()]);
@@ -561,7 +604,21 @@ mod tests {
             pass_with_detail
                 .validate()
                 .unwrap_err()
-                .contains("PASSED must carry null")
+                .contains("current PASSED must carry null")
+        );
+
+        let mut failed = valid();
+        failed.final_validate_status = FinalValidateStatus::Failed;
+        failed.exit_code = 1;
+        failed.passed_tests = Some(2128);
+        failed.detail = Some(vec!["test suite$case: failed: exit 7".into()]);
+        failed.validate().unwrap();
+        failed.detail = None;
+        assert!(
+            failed
+                .validate()
+                .unwrap_err()
+                .contains("current FAILED requires a nonempty cause")
         );
 
         let mut no_result = valid();
@@ -570,11 +627,18 @@ mod tests {
         no_result.executed_tests = None;
         no_result.passed_tests = None;
         no_result.detail = None;
-        no_result.validate().expect("genuine absence stays null");
+        assert!(
+            no_result
+                .validate()
+                .unwrap_err()
+                .contains("current COULD_NOT_RUN requires a nonempty cause")
+        );
         no_result.detail = Some(vec![]);
         assert!(no_result.validate().unwrap_err().contains("nonempty list"));
         no_result.detail = Some(vec![" ".into()]);
         assert!(no_result.validate().unwrap_err().contains("nonempty list"));
+        no_result.detail = Some(vec!["cpu-timeout: used 22 seconds".into()]);
+        no_result.validate().unwrap();
     }
 
     #[test]
@@ -622,6 +686,7 @@ mod tests {
         failed.final_validate_status = FinalValidateStatus::Failed;
         failed.exit_code = 1;
         failed.passed_tests = Some(2128);
+        failed.detail = Some(vec!["ordinary failure: exit 7".into()]);
         failed.validate().unwrap();
 
         let mut failed_missing = failed.clone();
@@ -638,6 +703,7 @@ mod tests {
         no_result.exit_code = 75;
         no_result.executed_tests = None;
         no_result.passed_tests = None;
+        no_result.detail = Some(vec!["infrastructure error: cpu.stat is unreadable".into()]);
         no_result.validate().unwrap();
     }
 

@@ -119,6 +119,7 @@ use dagrun::model::RunResult;
 use dagrun::model::Step;
 use dagrun::model::StepOutcome;
 use dagrun::TestResult;
+use dagrun::TestAttemptOutcome;
 use dagrun::TestResults;
 use dagrun::container_core_budget;
 use dagrun::perflog::append_step_profiles;
@@ -1845,6 +1846,7 @@ fn self_test() -> Result<(), String> {
     let mut genuine_could_not_run =
         RunSummary::new(Verdict::NoResult, COULD_NOT_RUN_EXIT_CODE, "self-test", Vec::new());
     genuine_could_not_run.nodes_executed = 1;
+    genuine_could_not_run.detail.push("fixture could not run".into());
     let could_not_run_path = writeback_result_dir.path().join("could-not-run.json");
     write_validation_service_result(&could_not_run_path, &genuine_could_not_run)?;
     let could_not_run = ValidationServiceResult::from_json_slice(
@@ -2542,6 +2544,7 @@ fn self_test() -> Result<(), String> {
     test_node_coverage_bracket()?;
     typed_libtest_count_bracket()?;
     ledger_gate_origin_bracket()?;
+    typed_test_cause_propagation_bracket()?;
     requalification_plan_bracket(&root)?;
     tool_root_split_bracket()?;
     validate_series_writer_bracket()?;
@@ -8672,8 +8675,71 @@ fn step_with_caps(
 /// failure; every other nonzero remains loud.
 const NO_RESULT_EXIT_CODE: i64 = 75;
 
+fn test_attempt_outcome_name(outcome: TestAttemptOutcome) -> &'static str {
+    match outcome {
+        TestAttemptOutcome::Passed => "passed",
+        TestAttemptOutcome::Failed => "failed",
+        TestAttemptOutcome::CpuTimeout => "cpu_timeout",
+        TestAttemptOutcome::WallTimeout => "wall_timeout",
+        TestAttemptOutcome::Cancelled => "cancelled",
+        TestAttemptOutcome::InfrastructureError => "infrastructure_error",
+    }
+}
+
+fn terminal_test_attempt(result: &TestResult) -> Option<&dagrun::TestAttemptResult> {
+    result.attempt_results.as_ref()?.last()
+}
+
+fn test_results_have_product_failure(results: Option<&[TestResult]>) -> bool {
+    results.is_some_and(|results| {
+        results.iter().any(|result| {
+            terminal_test_attempt(result)
+                .is_some_and(|attempt| attempt.outcome == TestAttemptOutcome::Failed)
+        })
+    })
+}
+
+fn test_results_have_no_result(results: Option<&[TestResult]>) -> bool {
+    results.is_some_and(|results| {
+        results.iter().any(|result| {
+            terminal_test_attempt(result).is_some_and(|attempt| {
+                matches!(
+                    attempt.outcome,
+                    TestAttemptOutcome::CpuTimeout
+                        | TestAttemptOutcome::WallTimeout
+                        | TestAttemptOutcome::Cancelled
+                        | TestAttemptOutcome::InfrastructureError
+                )
+            })
+        })
+    })
+}
+
+fn typed_test_results_json(results: &[TestResult]) -> serde_json::Value {
+    serde_json::Value::Array(
+        results
+            .iter()
+            .map(|result| {
+                serde_json::json!({
+                    "id": result.id,
+                    "result": if result.passed { "pass" } else { "fail" },
+                    "attempts": result.attempts,
+                    "attempt_results": result.attempt_results.as_ref().map(|attempts| attempts.iter().map(|attempt| serde_json::json!({
+                        "attempt": attempt.attempt,
+                        "outcome": test_attempt_outcome_name(attempt.outcome),
+                        "detail": attempt.detail,
+                    })).collect::<Vec<_>>()),
+                })
+            })
+            .collect(),
+    )
+}
+
 fn outcome_is_no_result(outcome: &StepOutcome) -> bool {
-    !outcome.aborted && outcome.returncode == Some(NO_RESULT_EXIT_CODE)
+    !outcome.aborted
+        && !test_results_have_product_failure(outcome.test_results.as_deref())
+        && (outcome.returncode == Some(NO_RESULT_EXIT_CODE)
+            || test_results_have_no_result(outcome.test_results.as_deref()))
 }
 
 fn outcome_is_failure(outcome: &StepOutcome) -> bool {
@@ -10258,7 +10324,38 @@ struct NodeAttempt {
 fn attempt_is_no_result(attempt: &NodeAttempt) -> bool {
     attempt.execution == AttemptExecution::Completed
         && !attempt.aborted
-        && attempt.returncode == Some(NO_RESULT_EXIT_CODE)
+        && !test_results_have_product_failure(attempt.test_results.as_deref())
+        && (attempt.returncode == Some(NO_RESULT_EXIT_CODE)
+            || test_results_have_no_result(attempt.test_results.as_deref()))
+}
+
+fn terminal_test_cause_details(outcomes: &[StepOutcome], attempts: &[NodeAttempt]) -> Vec<String> {
+    let mut detail = Vec::new();
+    for outcome in outcomes {
+        let node_attempts_exist = attempts.iter().any(|attempt| attempt.tag == outcome.tag);
+        let results = terminal_attempt(outcome, attempts)
+            .and_then(|attempt| attempt.test_results.as_deref())
+            .or_else(|| (!node_attempts_exist).then_some(outcome.test_results.as_deref()).flatten());
+        let Some(results) = results else { continue };
+        for result in results {
+            let Some(attempt) = terminal_test_attempt(result) else { continue };
+            if attempt.outcome == TestAttemptOutcome::Passed {
+                continue;
+            }
+            detail.push(format!(
+                "node {} test {} attempt {}: {}: {}",
+                outcome.tag,
+                result.id,
+                attempt.attempt,
+                test_attempt_outcome_name(attempt.outcome),
+                attempt
+                    .detail
+                    .as_deref()
+                    .unwrap_or("typed runner omitted required detail")
+            ));
+        }
+    }
+    detail
 }
 
 fn attempt_result(attempt: &NodeAttempt) -> Option<&'static str> {
@@ -14391,6 +14488,9 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
         "aborted": outcome.aborted,
         "real_seconds": outcome.duration_s,
     });
+    if let Some(test_results) = outcome.test_results.as_deref() {
+        gate["test_results"] = typed_test_results_json(test_results);
+    }
     if let Some(failure_class) = outcome_failure_class(outcome) {
         gate["failure_class"] = serde_json::json!(failure_class);
         if failure_class == FailureClass::NoResult && !outcome.reason.is_empty() {
@@ -14399,6 +14499,141 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
     }
     set_gate_failure_evidence(&mut gate, outcome_is_failure(outcome));
     gate
+}
+
+fn typed_test_cause_propagation_bracket() -> Result<(), String> {
+    let cases = [
+        (TestAttemptOutcome::Failed, "failed", Verdict::Fail, FinalValidateStatus::Failed),
+        (
+            TestAttemptOutcome::CpuTimeout,
+            "cpu_timeout",
+            Verdict::NoResult,
+            FinalValidateStatus::CouldNotRun,
+        ),
+        (
+            TestAttemptOutcome::WallTimeout,
+            "wall_timeout",
+            Verdict::NoResult,
+            FinalValidateStatus::CouldNotRun,
+        ),
+        (
+            TestAttemptOutcome::Cancelled,
+            "cancelled",
+            Verdict::NoResult,
+            FinalValidateStatus::CouldNotRun,
+        ),
+        (
+            TestAttemptOutcome::InfrastructureError,
+            "infrastructure_error",
+            Verdict::NoResult,
+            FinalValidateStatus::CouldNotRun,
+        ),
+    ];
+    let directory = tempfile::tempdir()
+        .map_err(|error| format!("typed test causes: cannot create fixture directory: {error}"))?;
+    let mut distinct_results = BTreeSet::new();
+    for (attempt_outcome, name, verdict, status) in cases {
+        let source = TestResults::current(
+            1,
+            0,
+            vec![TestResult::with_attempt_results(
+                format!("fixture::{name}"),
+                false,
+                vec![dagrun::TestAttemptResult::new(
+                    1,
+                    attempt_outcome,
+                    Some(format!("{name} fixture cause")),
+                )?],
+            )?],
+        )?;
+        let parsed = TestResults::from_json_slice(&source.to_current_json()?)?;
+        let outcome = StepOutcome {
+            tag: "test.typed-cause".into(),
+            ok: false,
+            duration_s: 1.0,
+            summary: String::new(),
+            executed_tests: Some(parsed.executed_tests),
+            filtered_tests: Some(parsed.filtered_tests),
+            test_results: parsed.results,
+            returncode: Some(1),
+            oomed: false,
+            oom_kills: 0,
+            timed_out: false,
+            cpu_timed_out: false,
+            reason: "runner exited unsuccessfully".into(),
+            aborted: false,
+        };
+        let attempt = reported_attempt(&outcome, 1);
+        let expected_ledger_result = if status == FinalValidateStatus::Failed {
+            "fail"
+        } else {
+            "no_result"
+        };
+        let gate = ledger_gate_with_attempts(&outcome, std::slice::from_ref(&attempt));
+        if gate["result"] != expected_ledger_result
+            || gate["test_results"][0]["attempt_results"][0]["outcome"] != name
+            || gate["attempts"][0]["test_results"][0]["attempt_results"][0]["outcome"]
+                != name
+        {
+            return Err(format!(
+                "typed test causes: {name} did not survive into both ledger views: {gate}"
+            ));
+        }
+        let cause = terminal_test_cause_details(
+            std::slice::from_ref(&outcome),
+            std::slice::from_ref(&attempt),
+        );
+        let expected_cause = format!(
+            "node test.typed-cause test fixture::{name} attempt 1: {name}: {name} fixture cause"
+        );
+        if cause != [expected_cause.clone()] {
+            return Err(format!(
+                "typed test causes: {name} rendered the wrong cause: {cause:?}"
+            ));
+        }
+        if (name == "failed") != outcome_is_failure(&outcome)
+            || (name != "failed") != outcome_is_no_result(&outcome)
+        {
+            return Err(format!(
+                "typed test causes: {name} received the wrong product/no-result classification"
+            ));
+        }
+        let exit_code = if status == FinalValidateStatus::Failed {
+            1
+        } else {
+            COULD_NOT_RUN_EXIT_CODE
+        };
+        let mut summary = RunSummary::new(verdict, exit_code, "self-test", cause);
+        summary.nodes_executed = 1;
+        summary.executed_tests = Some(1);
+        summary.passed_tests = Some(0);
+        summary.selection_mode = Some("full".into());
+        let path = directory.path().join(format!("{name}.json"));
+        write_validation_service_result(&path, &summary)?;
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("typed test causes: cannot read {name} result: {error}"))?;
+        let service = ValidationServiceResult::from_json_slice(&bytes)?;
+        if service.final_validate_status != status
+            || service.executed_tests != Some(1)
+            || service.passed_tests != Some(0)
+            || service.detail.as_deref() != Some([expected_cause.clone()].as_slice())
+            || !run_summary_lines(&summary, std::time::Instant::now())
+                .iter()
+                .any(|line| line == &format!("   {expected_cause}"))
+        {
+            return Err(format!(
+                "typed test causes: {name} did not survive service JSON and terminal rendering: {service:?}"
+            ));
+        }
+        distinct_results.insert(bytes);
+    }
+    if distinct_results.len() != cases.len() {
+        return Err("typed test causes: mutating the cause did not change every service result".into());
+    }
+    println!(
+        "  typed test causes: ordinary failure, CPU timeout, wall timeout, cancellation, and infrastructure error survive runner JSON through ledger, service JSON, and terminal output"
+    );
+    Ok(())
 }
 
 /// Serialize one gate from the attempt ledger, not merely cumulative `by_tag`.
@@ -14446,6 +14681,9 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
                 "environmental_verdict": environmental_verdict,
                 "environmental_refuted_shape": environmental_refuted_shape,
             });
+            if let Some(test_results) = a.test_results.as_deref() {
+                attempt["test_results"] = typed_test_results_json(test_results);
+            }
             if let Some(failure_class) = a.failure_class {
                 attempt["failure_class"] = serde_json::json!(failure_class);
             }
@@ -14484,6 +14722,13 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
             gate.as_object_mut()
                 .expect("ledger gate must remain a JSON object")
                 .remove("failure_detail");
+        }
+        if let Some(test_results) = attempt.test_results.as_deref() {
+            gate["test_results"] = typed_test_results_json(test_results);
+        } else {
+            gate.as_object_mut()
+                .expect("ledger gate must remain a JSON object")
+                .remove("test_results");
         }
         set_gate_failure_evidence(&mut gate, attempt_is_failure(attempt));
     }
@@ -16835,7 +17080,7 @@ fn write_validation_service_result(path: &Path, summary: &RunSummary) -> Result<
         profile: summary.profile.clone(),
         selection_mode: summary.selection_mode.clone(),
         final_validate_status: status,
-        detail: if status == FinalValidateStatus::CouldNotRun {
+        detail: if status != FinalValidateStatus::Passed {
             let detail = summary
                 .detail
                 .iter()
@@ -18855,6 +19100,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
              verdict — a TIMEOUT, by contrast, does"
                 .into(),
         ];
+        detail.extend(terminal_test_cause_details(&outcomes, &attempts));
         if let Some(error) = &series_error {
             detail.push(format!(
                 "completed cell results could not be added to the series: {error}"
@@ -19308,6 +19554,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             blocking_listing(&outcomes, &summary_nonblocking, effective_failures);
         detail.push(format!("{effective_failures} blocking failure(s){listing}"));
     }
+    detail.extend(terminal_test_cause_details(&outcomes, &attempts));
     if exit_code != NO_RESULT_EXIT_CODE as u8 && no_results > 0 {
         detail.push(format!(
             "{} gate(s) reported NO_RESULT but did not hide the genuine failure(s): {}",
