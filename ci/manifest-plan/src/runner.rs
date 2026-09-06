@@ -1872,15 +1872,22 @@ fn remaining_cell_time_at(deadline: Instant, now: Instant) -> Duration {
     deadline.saturating_duration_since(now)
 }
 
-fn cell_timeouts(
-    context: &RunContext,
+pub fn resolved_cell_timeouts(
     cell: &SelectedCell,
+    timeout_multipliers: TimeoutMultipliers,
 ) -> Result<ResolvedTestTimeouts, String> {
     resolve_test_timeouts(
         cell.cpu_timeout_seconds,
         cell.timeout_seconds,
-        context.timeout_multipliers,
+        timeout_multipliers,
     )
+}
+
+fn cell_timeouts(
+    context: &RunContext,
+    cell: &SelectedCell,
+) -> Result<ResolvedTestTimeouts, String> {
+    resolved_cell_timeouts(cell, context.timeout_multipliers)
 }
 
 fn execution_deadline_after_preparation(
@@ -4531,7 +4538,7 @@ mod tests {
     }
 
     #[test]
-    fn shipped_readdir_order_identity_uses_its_measured_timeout() {
+    fn shipped_readdir_order_identity_retains_its_resolved_timeouts() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let cells = ManifestSet::load(&root)
             .unwrap()
@@ -4544,10 +4551,28 @@ mod tests {
             })
             .unwrap();
         assert_eq!(cells.len(), 1);
-        assert_eq!(cells[0].timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
+        let cell = &cells[0];
+        assert_eq!(cell.timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
+        assert_eq!(cell.cpu_timeout_seconds, DEFAULT_TEST_CPU_TIMEOUT_SECONDS);
+
+        let multipliers = TimeoutMultipliers {
+            cpu: 1.25,
+            wall: 1.5,
+        };
+        let resolved = resolved_cell_timeouts(cell, multipliers).unwrap();
+        assert_eq!(resolved.cpu_seconds, 28);
+        assert_eq!(resolved.wall_seconds, 86);
+        let mut context = run_context(&root);
+        context.timeout_multipliers = multipliers;
+        let retained = infrastructure_error_result(&context, cell, "fixture".into());
+        assert_eq!(retained.timeout_seconds, resolved.wall_seconds);
         assert_eq!(
-            cells[0].cpu_timeout_seconds,
-            DEFAULT_TEST_CPU_TIMEOUT_SECONDS
+            retained.execution_cpu_timeout_seconds,
+            Some(resolved.cpu_seconds)
+        );
+        assert_eq!(
+            retained.execution_wall_timeout_seconds,
+            Some(resolved.wall_seconds)
         );
     }
 
