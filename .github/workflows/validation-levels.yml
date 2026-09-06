@@ -90,7 +90,6 @@ jobs:
     timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"
-      VALIDATE_GATE_TIMEOUT_SECONDS: "3600"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -170,8 +169,6 @@ jobs:
     timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"
-      SUPER_REPETITIONS: "20"
-      VALIDATE_GATE_TIMEOUT_SECONDS: "7200"
     steps:
       - uses: actions/checkout@v4
         with:
