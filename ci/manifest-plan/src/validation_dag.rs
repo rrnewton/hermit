@@ -33,6 +33,8 @@ const SUPER_REPETITIONS: &str = "20";
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
 const PINNED_ROOT_TWIN_SUFFIX: &str = "_in_pinned_root";
+pub const HOSTED_PORTABLE_LABEL: &str = "hosted-portable";
+const HOSTED_VARIANT_SUFFIX: &str = "_on_host";
 const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.rust_scripts",
     "setup.manifest_plan",
@@ -65,7 +67,7 @@ struct Profile {
     selected_steps: usize,
 }
 
-const PROFILES: [Profile; 5] = [
+const PROFILES: [Profile; 6] = [
     Profile {
         label: "full",
         direct_steps: 266,
@@ -90,6 +92,11 @@ const PROFILES: [Profile; 5] = [
         label: "privileged",
         direct_steps: 11,
         selected_steps: 22,
+    },
+    Profile {
+        label: HOSTED_PORTABLE_LABEL,
+        direct_steps: 251,
+        selected_steps: 251,
     },
 ];
 
@@ -273,6 +280,10 @@ fn is_manifest_run(step: &Step) -> bool {
     step.manifest.is_some() || (step.group == "quick" && step.job == "e2e_verify")
 }
 
+fn is_hosted_variant(step: &Step) -> bool {
+    step.job.ends_with(HOSTED_VARIANT_SUFFIX)
+}
+
 fn is_pinned_root_producer(step: &Step) -> bool {
     PINNED_ROOT_PRODUCER_STEPS.contains(&step.tag().as_str())
         || step.job == "manifest_guests"
@@ -332,6 +343,60 @@ fn pinned_root_fetch() -> Result<Step, String> {
         .ok_or_else(|| "internal pinned-root fetch node disappeared".to_string())
 }
 
+/// Restore the explicit hosted selection after refreshing generated rows.
+///
+/// The selection itself is committed in `validate.json`. Generated compat
+/// rows may be replaced during maintenance, so their hosted label is restored
+/// by typed step identity from the previous committed selection. No runtime
+/// path calls this function.
+fn restore_hosted_portable_selection(
+    cfg: &mut DagConfig,
+    hosted: &DagConfig,
+) -> Result<(), String> {
+    let expected = hosted.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    if expected.len() != 251 {
+        return Err(format!(
+            "committed {HOSTED_PORTABLE_LABEL} selection has {} unique steps, expected 251",
+            expected.len()
+        ));
+    }
+    for step in &mut cfg.steps {
+        step.labels.retain(|label| label != HOSTED_PORTABLE_LABEL);
+        if expected.contains(&step.tag()) {
+            step.labels.push(HOSTED_PORTABLE_LABEL.into());
+            step.labels.sort();
+            step.labels.dedup();
+        }
+    }
+    let actual = cfg
+        .steps
+        .iter()
+        .filter(|step| {
+            step.labels
+                .iter()
+                .any(|label| label == HOSTED_PORTABLE_LABEL)
+        })
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
+    let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "refreshed DAG lost {HOSTED_PORTABLE_LABEL} step(s): {}",
+            missing.join(", ")
+        ));
+    }
+    let variants = actual
+        .iter()
+        .filter(|tag| tag.ends_with(HOSTED_VARIANT_SUFFIX))
+        .count();
+    if variants != 14 {
+        return Err(format!(
+            "{HOSTED_PORTABLE_LABEL} selection has {variants} host-only variants, expected 14"
+        ));
+    }
+    Ok(())
+}
+
 /// Materialize the pinned-root execution split as ordinary committed nodes.
 ///
 /// This transform belongs to maintenance-time generation. Runtime validation
@@ -354,6 +419,9 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
     let has_rust_scripts = producer_tags.contains("build.rust_scripts");
 
     for step in &mut cfg.steps {
+        if is_hosted_variant(step) {
+            continue;
+        }
         if !is_manifest_run(step) {
             continue;
         }
@@ -397,6 +465,7 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
     for producer in &producers {
         let mut twin = producer.clone();
         twin.job.push_str(PINNED_ROOT_TWIN_SUFFIX);
+        twin.labels.retain(|label| label != HOSTED_PORTABLE_LABEL);
         twin.deps = producer
             .deps
             .iter()
@@ -603,6 +672,7 @@ fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagM
         .filter(|cell| match label {
             "full" => true,
             "portable" => cell.lane == "portable",
+            HOSTED_PORTABLE_LABEL => cell.lane == "portable",
             "privileged" => cell.lane == "privileged",
             "quick" => {
                 cell.lane == "portable"
@@ -616,9 +686,9 @@ fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagM
 }
 
 fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
-    if cfg.steps.len() != 1354 {
+    if cfg.steps.len() != 1368 {
         return Err(format!(
-            "superset has {} steps, expected 1354",
+            "superset has {} steps, expected 1368",
             cfg.steps.len()
         ));
     }
@@ -662,6 +732,24 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         {
             return Err("super selection unexpectedly owns manifest result rows".into());
         }
+        if profile.label == HOSTED_PORTABLE_LABEL {
+            let pinned = selected
+                .steps
+                .iter()
+                .filter(|step| {
+                    step.tag() == PINNED_ROOT_FETCH_TAG
+                        || step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX)
+                        || step.cmd.contains("run-in-pinned-root.sh")
+                })
+                .map(Step::tag)
+                .collect::<Vec<_>>();
+            if !pinned.is_empty() {
+                return Err(format!(
+                    "{HOSTED_PORTABLE_LABEL} selection contains local pinned-root step(s): {}",
+                    pinned.join(", ")
+                ));
+            }
+        }
     }
     let known_results = cells.iter().map(result_identity).collect::<BTreeSet<_>>();
     for step in &cfg.steps {
@@ -695,6 +783,10 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
         .map_err(|error| format!("cannot read {}: {error}", committed_path.display()))?;
     let committed = dag_from_json(&committed_text)
         .map_err(|error| format!("invalid {}: {error}", committed_path.display()))?;
+    let hosted =
+        select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.into()]).map_err(|error| {
+            format!("committed DAG has no valid {HOSTED_PORTABLE_LABEL} selection: {error}")
+        })?;
     let scratch = Scratch::create()?;
     let mut generated = generated_plan(root, &scratch.0)?;
     for step in &mut generated.steps {
@@ -702,6 +794,7 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     }
     let cells = expected_cells(root)?;
     let mut refreshed = refresh_generated_partitions(committed, generated)?;
+    restore_hosted_portable_selection(&mut refreshed, &hosted)?;
     materialize_pinned_root(&mut refreshed)?;
     materialize_runtime_policy(&mut refreshed);
     attach_result_ownership(&mut refreshed, &cells);
@@ -850,6 +943,56 @@ mod tests {
                 .unwrap()
                 .description,
             "intentional static edit"
+        );
+    }
+
+    #[test]
+    fn hosted_selection_is_complete_and_excludes_local_pinned_root_steps() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let selected =
+            select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
+        assert_eq!(selected.steps.len(), 251);
+        assert_eq!(
+            selected
+                .steps
+                .iter()
+                .filter(|step| is_hosted_variant(step))
+                .count(),
+            14
+        );
+        assert!(selected.steps.iter().all(|step| {
+            step.tag() != PINNED_ROOT_FETCH_TAG
+                && !step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX)
+                && !step.cmd.contains("run-in-pinned-root.sh")
+        }));
+        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        for result in expected_for_label(HOSTED_PORTABLE_LABEL, &cells) {
+            result_manifest_owner(&selected.steps, result).unwrap();
+        }
+
+        let mut planted_pinned_command = committed.clone();
+        planted_pinned_command
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "e2e.manifest_applications_on_host")
+            .unwrap()
+            .cmd
+            .push_str(" && ./ci/hermetic/run-in-pinned-root.sh");
+        let error = assert_invariants(&planted_pinned_command, &cells).unwrap_err();
+        assert!(error.contains("local pinned-root step"), "{error}");
+
+        let mut planted_coverage_loss = committed;
+        planted_coverage_loss
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "check.dagrun_naming")
+            .unwrap()
+            .labels
+            .retain(|label| label != HOSTED_PORTABLE_LABEL);
+        let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
+        assert!(
+            error.contains("hosted-portable label has 250 direct steps"),
+            "{error}"
         );
     }
 }

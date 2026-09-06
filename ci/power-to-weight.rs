@@ -7,7 +7,7 @@
 //!
 //! Power-to-weight ranking for Hermit CI nodes.
 //!
-//! Each portable-DAG node has a declared scheduling weight and a measured
+//! Each hosted-portable DAG node has a declared scheduling weight and a measured
 //! selection frequency. This tool joins the two so rarely selected, relatively
 //! heavy nodes can be reviewed for moving off the per-commit critical path.
 //!
@@ -92,7 +92,7 @@ fn load_nodes(dag_path: &Path) -> BTreeMap<String, Node> {
             .as_array()
             .into_iter()
             .flatten()
-            .any(|label| label.as_str() == Some("portable"))
+            .any(|label| label.as_str() == Some("hosted-portable"))
         {
             continue;
         }
