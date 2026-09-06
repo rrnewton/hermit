@@ -297,6 +297,58 @@ fn is_inherited_container_output(resource: Option<ResourceID>) -> bool {
     )
 }
 
+/// Exactly the bits `fcntl(F_SETFL)` can change; access mode and creation
+/// flags are silently ignored by the kernel.
+const SETTABLE_STATUS_FLAGS: i32 =
+    libc::O_APPEND | libc::O_ASYNC | libc::O_DIRECT | libc::O_NOATIME | libc::O_NONBLOCK;
+
+/// Status flags whose behavior Detcore implements for inherited stdio without
+/// leaving the change on the supervisor's open file description.
+const CONTAINED_STATUS_FLAGS: i32 = libc::O_APPEND | libc::O_NONBLOCK;
+
+fn unsupported_contained_status_flag_change(current: i32, requested: i32) -> i32 {
+    (current ^ requested) & (SETTABLE_STATUS_FLAGS & !CONTAINED_STATUS_FLAGS)
+}
+
+/// The container's own stdin/stdout/stderr, i.e. the three descriptions the
+/// guest did NOT create.
+///
+/// ⚠️ THESE ARE THE SUPERVISOR'S DESCRIPTIONS. When Hermit passes its own
+/// stdio through to the guest rather than capturing it, the guest's fd 0/1/2
+/// name the very open file descriptions the hermit process holds -- inherited
+/// in turn from whoever invoked hermit. `fcntl(F_SETFL)` mutates the
+/// DESCRIPTION, not the descriptor, so forwarding a guest's request there
+/// changes state that outlives the guest, outlives hermit, and is visible to
+/// hermit's caller. Measured on hermit d7413071581f, both backends:
+/// `hermit run -- /usr/bin/awk 'BEGIN { print 42 }'` turned `O_APPEND` on in
+/// the caller's stderr (0x8001 -> 0x8401) and left it on.
+///
+/// Two runs of one guest must also start from the same descriptor state, so
+/// this is a determinism defect as well as a containment one: under
+/// `hermit run --strict --verify` the two runs share one hermit process, and
+/// the first run's mutation is still there when the second starts.
+///
+/// This is deliberately a SEPARATE predicate from
+/// [`is_inherited_container_output`], which excludes stdin because it exists to
+/// answer an `lseek` question about a redirect file that also carries Hermit's
+/// own diagnostics. Containment applies to all three.
+fn is_inherited_container_stdio(resource: Option<ResourceID>) -> bool {
+    matches!(
+        resource,
+        Some(ResourceID::Device(
+            Device::ContainerStdin | Device::ContainerStdout | Device::ContainerStderr
+        ))
+    )
+}
+
+fn inherited_regular_file_has_logical_append(detfd: &DetFd) -> bool {
+    is_inherited_container_stdio(detfd.resource())
+        && detfd.status_flags() & libc::O_APPEND != 0
+        && detfd
+            .stat()
+            .is_some_and(|stat| stat.mode & libc::S_IFMT == libc::S_IFREG)
+}
+
 fn unix_autobind_addrlen() -> i32 {
     (std::mem::offset_of!(libc::sockaddr_un, sun_path) + UNIX_AUTOBIND_NAME_LEN) as i32
 }
@@ -1885,12 +1937,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let in_type = guest
             .thread_state()
             .with_detfd(call.in_fd(), |detfd| detfd.ty())?;
-        let (out_type, out_resource, out_inode) =
+        let (out_type, out_resource, out_inode, out_has_logical_append) =
             guest.thread_state().with_detfd(call.out_fd(), |detfd| {
                 (
                     detfd.ty(),
                     detfd.resource(),
                     detfd.stat().map(|stat| stat.inode),
+                    inherited_regular_file_has_logical_append(detfd),
                 )
             })?;
 
@@ -1913,6 +1966,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             || !matches!(out_type, FdType::Regular | FdType::Memfd)
         {
             return Err(Errno::ENOSYS.into());
+        }
+
+        // Linux refuses sendfile when the output is a regular file opened with
+        // O_APPEND. The inherited-stdio model must enforce that result itself:
+        // the physical bit is deliberately absent so the guest cannot mutate
+        // the supervisor's open file description.
+        if out_has_logical_append {
+            return Err(Errno::EINVAL.into());
         }
 
         let dettid = guest.thread_state().dettid;
@@ -1945,6 +2006,55 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         resource_release_all(guest).await;
         result
+    }
+
+    /// Put a regular inherited stdio description at EOF before a write when the
+    /// guest has logically enabled O_APPEND. The kernel flag is deliberately
+    /// absent from the shared supervisor description, so Detcore supplies the
+    /// behavior without leaving the flag behind. Pipes and sockets need no
+    /// adjustment because append has no effect on them.
+    async fn position_inherited_append<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<(), Error> {
+        let append = guest.thread_state().with_detfd(fd, |detfd| {
+            is_inherited_container_stdio(detfd.resource())
+                && detfd.status_flags() & libc::O_APPEND != 0
+        })?;
+        if append {
+            match guest
+                .inject_with_retry(Syscall::Lseek(
+                    syscalls::Lseek::new()
+                        .with_fd(fd)
+                        .with_offset(0)
+                        .with_whence(Whence::SEEK_END),
+                ))
+                .await
+            {
+                Ok(_) | Err(Errno::ESPIPE) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the current end of an inherited regular-file stream when the
+    /// guest has logically enabled O_APPEND. Positional writes do not advance
+    /// the open file description's offset, so they cannot use
+    /// `position_inherited_append`; they must write at this explicit offset.
+    async fn inherited_append_offset<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<Option<i64>, Error> {
+        let append = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| inherited_regular_file_has_logical_append(detfd))?;
+        if !append {
+            return Ok(None);
+        }
+        Ok(Some(self.inject_fstat(guest, fd).await?.st_size))
     }
 
     /// SYS_write system call.
@@ -1982,6 +2092,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 raw_ino.expect("Expect that when virtualize_metadata, DetFd's stat is populated!");
             touch_file(guest, r).await;
         }
+
+        self.position_inherited_append(guest, call.fd()).await?;
 
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::W);
@@ -2094,6 +2206,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
 
+        if let Some(offset) = self.inherited_append_offset(guest, call.fd()).await? {
+            call = call.with_offset(offset);
+        }
+
         let result = if guest.config().deterministic_io {
             let mut total_written = 0_i64;
             let mut remaining = call.len();
@@ -2195,6 +2311,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
         })?;
 
+        self.position_inherited_append(guest, call.fd()).await?;
+
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::W);
             if should_tag_sabre_internal_pipe_io(
@@ -2207,7 +2325,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             resource_request(guest, request).await;
         }
-
         let result = if physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking
         {
             self.execute_blocking_pipe_writev(guest, call, open_file_id)
@@ -2400,7 +2517,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub async fn handle_pwritev<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: syscalls::Pwritev,
+        mut call: syscalls::Pwritev,
     ) -> Result<i64, Error> {
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
             let offset = vectored_offset(call.pos_l(), call.pos_h());
@@ -2433,6 +2550,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
 
+        if let Some(offset) = self.inherited_append_offset(guest, call.fd()).await? {
+            let offset = offset as u64;
+            let (low, high) = if std::mem::size_of::<usize>() == 8 {
+                (offset, 0)
+            } else {
+                (offset & u64::from(u32::MAX), offset >> 32)
+            };
+            call = call.with_pos_l(low).with_pos_h(high);
+        }
+
         let result = self
             .record_or_replay_preserving_tool_errors(guest, call)
             .await;
@@ -2453,7 +2580,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub async fn handle_pwritev2<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: syscalls::Pwritev2,
+        mut call: syscalls::Pwritev2,
     ) -> Result<i64, Error> {
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
             let offset = vectored_offset(call.pos_l(), call.pos_h());
@@ -2491,6 +2618,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(resource) = resource {
             let request = guest.thread_state().mk_request(resource, Permission::W);
             resource_request(guest, request).await;
+        }
+
+        let inherited_append = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            inherited_regular_file_has_logical_append(detfd)
+        })?;
+        if inherited_append && call.flags() & libc::RWF_NOAPPEND == 0 {
+            // RWF_APPEND supplies Linux's append behavior for this one call
+            // without changing the supervisor's shared file-description flags.
+            call = call.with_flags(call.flags() | libc::RWF_APPEND);
         }
 
         let result = self
@@ -2710,18 +2846,116 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         match call.cmd() {
             F_GETFL => {
-                let physical_flags = self.record_or_replay(guest, call).await?;
-                let logical_nonblocking = guest
+                let contained = guest
                     .thread_state()
-                    .with_detfd(fd, |detfd| detfd.is_nonblocking())?;
-                let nonblocking = i64::from(OFlag::O_NONBLOCK.bits());
-                if logical_nonblocking {
-                    Ok(physical_flags | nonblocking)
-                } else {
-                    Ok(physical_flags & !nonblocking)
+                    .with_detfd(fd, |detfd| is_inherited_container_stdio(detfd.resource()))?;
+                if contained {
+                    // Answer from the model. Asking the kernel would report
+                    // whatever a PREVIOUS guest left behind on the supervisor's
+                    // description -- which is exactly the leak being closed.
+                    return Ok(i64::from(
+                        guest
+                            .thread_state()
+                            .with_detfd(fd, |detfd| detfd.status_flags())?,
+                    ));
                 }
+                Ok(self.record_or_replay(guest, call).await?)
             }
             F_SETFL(flags) => {
+                let (contained, current) = guest.thread_state().with_detfd(fd, |detfd| {
+                    (
+                        is_inherited_container_stdio(detfd.resource()),
+                        detfd.status_flags(),
+                    )
+                })?;
+                if contained {
+                    // ⚠️ EXACTLY ONE BIT IS ALLOWED THROUGH TO THE SUPERVISOR, AND IT IS
+                    // O_NONBLOCK. Everything else is modeled and never reaches the kernel.
+                    //
+                    // O_NONBLOCK cannot be modeled here. Detcore keeps a SECOND, physical
+                    // view of it (`physically_nonblocking`) because it manipulates the real
+                    // descriptor itself for nonblockize-and-retry, and
+                    // `ioaction_based_on_fd_status` PANICS on the pairing `virt && !phys`:
+                    // "we cannot simulate nonblocking behavior when set to blocking mode in
+                    // the kernel." Modeling the flag creates precisely that pairing.
+                    // MEASURED at 7fc9417bdf47, stdin a socketpair with a byte readable:
+                    //
+                    //     fcntl(0, F_SETFL, O_NONBLOCK); recv(0, &b, 1, 0);
+                    //       ptrace rc=125, kvm rc=125, "Invariant violation, fd 0"
+                    //       (helpers.rs:582); the parent commit returns rc=0, recv=1.
+                    //
+                    // `read(2)` does NOT reach it: `setup_stdio` types stdio
+                    // `FdType::Regular` and `handle_read` routes only Socket/Pipe/
+                    // notification descriptors through the nonblockable path, while the
+                    // socket handlers in `syscalls/io.rs` call it unconditionally by syscall
+                    // kind. A regression test written on `read` passes over a live defect.
+                    //
+                    // ⚠️ AND FORWARDING THE GUEST'S WHOLE WORD IS NOT AN OPTION EITHER. The
+                    // revision that did -- reverting the entire call whenever O_NONBLOCK was
+                    // involved -- LATCHED: once the model carried the flag, every later
+                    // F_SETFL and F_GETFL on that description reverted too, and the O_APPEND
+                    // escape came straight back. MEASURED at 9c75b9db57, guest sets
+                    // O_NONBLOCK then O_APPEND on stderr: supervisor 0x8001 -> 0x8c01, both
+                    // backends. So the forward is scoped to the single bit: the physical
+                    // word is re-read and only its O_NONBLOCK is replaced, leaving whatever
+                    // append-mode or other settable state the CALLER chose untouched.
+                    let unsupported_change =
+                        unsupported_contained_status_flag_change(current, flags);
+                    if unsupported_change != 0 {
+                        // Reflecting a flag from F_GETFL without implementing its behavior
+                        // is worse than refusing it: the guest would make decisions using a
+                        // state that does not exist. O_ASYNC, O_DIRECT and O_NOATIME remain
+                        // on the supervisor's setting unless Detcore learns their behavior.
+                        return Err(Errno::EOPNOTSUPP.into());
+                    }
+                    // The supervisor may itself have supplied an append-mode
+                    // redirect. Detcore can add append behavior without setting
+                    // the shared kernel bit, but cannot make ordinary writes
+                    // non-appending while that physical bit remains set. Refuse
+                    // that one transition instead of reporting a state whose
+                    // writes would contradict F_GETFL.
+                    let physical_now = self
+                        .record_or_replay(
+                            guest,
+                            syscalls::Fcntl::new().with_fd(fd).with_cmd(F_GETFL),
+                        )
+                        .await? as i32;
+                    if physical_now & libc::O_APPEND != 0 && flags & libc::O_APPEND == 0 {
+                        return Err(Errno::EOPNOTSUPP.into());
+                    }
+                    let requested_nonblocking = flags & libc::O_NONBLOCK;
+                    let physical_nonblocking = physical_now & libc::O_NONBLOCK;
+                    if requested_nonblocking != physical_nonblocking {
+                        // Use the physical word read above rather than the model: the model's
+                        // other settable bits are the GUEST's, and pushing those to the kernel
+                        // is the escape. Only the supervisor's own physical word may be echoed
+                        // back.
+                        let physical_next =
+                            (physical_now & !libc::O_NONBLOCK) | requested_nonblocking;
+                        self.record_or_replay(
+                            guest,
+                            syscalls::Fcntl::new()
+                                .with_fd(fd)
+                                .with_cmd(F_SETFL(physical_next)),
+                        )
+                        .await?;
+                        // The kernel really was told, so the physical view is honest and the
+                        // `virt && !phys` pairing cannot arise.
+                        guest.thread_state().with_detfd(fd, |detfd| {
+                            detfd.set_nonblocking(requested_nonblocking != 0)
+                        })?;
+                    }
+                    guest.thread_state().with_detfd(fd, |detfd| {
+                        // fcntl(2): F_SETFL changes only the settable bits and ignores access
+                        // mode and creation flags. Unsupported settable flags were required
+                        // to stay unchanged above; O_APPEND is implemented by the write paths
+                        // and O_NONBLOCK is kept paired with the physical descriptor.
+                        detfd.set_logical_status_flags(
+                            (current & !SETTABLE_STATUS_FLAGS) | (flags & SETTABLE_STATUS_FLAGS),
+                        );
+                    })?;
+                    return Ok(0);
+                }
                 let fd_type = guest.thread_state().with_detfd(fd, |detfd| detfd.ty())?;
                 let force_nonblocking = self.cfg.use_nonblocking_sockets()
                     && !self.cfg.recordreplay_modes
@@ -4443,6 +4677,7 @@ mod test {
     use super::should_tag_sabre_internal_pipe_io;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
+    use super::unsupported_contained_status_flag_change;
     use super::vectored_offset;
     use crate::fd::FdType;
     use crate::resources::Device;
@@ -4454,6 +4689,28 @@ mod test {
     fn linux_flags_assumptions() {
         assert_eq!(libc::SOCK_NONBLOCK, OFlag::O_NONBLOCK.bits());
         assert_eq!(libc::SOCK_CLOEXEC, OFlag::O_CLOEXEC.bits());
+    }
+
+    #[test]
+    fn inherited_stdio_refuses_status_flags_without_implemented_behavior() {
+        let current = libc::O_WRONLY;
+        assert_eq!(
+            unsupported_contained_status_flag_change(current, current | libc::O_APPEND),
+            0,
+            "O_APPEND is implemented by the inherited-stdio write path"
+        );
+        assert_eq!(
+            unsupported_contained_status_flag_change(current, current | libc::O_NONBLOCK),
+            0,
+            "O_NONBLOCK remains paired with the physical descriptor"
+        );
+        for unsupported in [libc::O_ASYNC, libc::O_DIRECT, libc::O_NOATIME] {
+            assert_ne!(
+                unsupported_contained_status_flag_change(current, current | unsupported),
+                0,
+                "flag 0x{unsupported:x} must be refused until its behavior is implemented"
+            );
+        }
     }
 
     #[test]
