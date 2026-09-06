@@ -82,6 +82,7 @@ Execution and output options:
   --results <PATH>                 Write JSONL cell results to PATH
   --junit <PATH>                   Write JUnit output to PATH
   --format <text|json>             Plan output format (default: text)
+  --hermit-run-arg <ARG>           Add a Hermit run argument to verify cells (run only)
   --jobs <N>                       Prepare/run at most N tests/cells concurrently
   -h, --help                       Print this help";
 
@@ -195,6 +196,7 @@ fn print_command_help(command: &str) -> bool {
              --allow-empty                    Permit an empty CI selection; requires --ci-only and category\n  \
              --results <PATH>                 Write JSONL cell results to PATH\n  \
              --junit <PATH>                   Write JUnit output to PATH\n  \
+             --hermit-run-arg <ARG>           Add a Hermit run argument to verify cells\n  \
              --jobs <N>                       Run at most N cells concurrently",
             CommandEnvironment::Run,
         ),
@@ -252,6 +254,7 @@ struct Args {
     junit: Option<PathBuf>,
     format: String,
     jobs: Option<usize>,
+    hermit_run_args: Vec<String>,
 }
 
 /// Take a single-valued selection flag, refusing a second occurrence.
@@ -316,6 +319,9 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
             }
             "--junit" => args.junit = Some(PathBuf::from(required_value(&mut values, "--junit"))),
             "--format" => args.format = required_value(&mut values, "--format"),
+            "--hermit-run-arg" => args
+                .hermit_run_args
+                .push(required_value(&mut values, "--hermit-run-arg")),
             "--jobs" => {
                 let value = required_value(&mut values, "--jobs");
                 let jobs = value
@@ -466,6 +472,9 @@ fn validate_args(command: &str, args: &Args) {
     }
     if !matches!(command, "build" | "run") && args.jobs.is_some() {
         fail("--jobs is accepted by build and run only");
+    }
+    if command != "run" && !args.hermit_run_args.is_empty() {
+        fail("--hermit-run-arg is accepted by run only");
     }
     if args.selection.include_manual
         && (args.selection.test.is_none() || args.selection.mode.is_none())
@@ -630,6 +639,7 @@ fn audit_cli_brackets(root: &Path) {
         "--results",
         "--junit",
         "--format",
+        "--hermit-run-arg",
         "--jobs",
     ] {
         let status = Command::new(&executable)
@@ -674,6 +684,7 @@ fn audit_cli_brackets(root: &Path) {
         vec!["run", "--jobs", "not-a-number"],
         vec!["run", "--jobs", "2", "--jobs", "3"],
         vec!["plan", "--jobs", "2"],
+        vec!["plan", "--hermit-run-arg", "--memory=128MB"],
     ] {
         let status = Command::new(&executable)
             .args(argv)
@@ -1708,10 +1719,14 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     if cells.is_empty() && !args.allow_empty {
         fail("filters selected no cells");
     }
+    if !args.hermit_run_args.is_empty() && cells.iter().any(|cell| cell.id.mode != "verify") {
+        fail("--hermit-run-arg is accepted for verify cells only");
+    }
     let capacity = scheduled_worker_capacity(args);
     let context = RunContext::from_env(root.to_path_buf(), args.prebuilt)
         .unwrap_or_else(|e| fail(e))
-        .with_scheduled_worker_capacity(capacity);
+        .with_scheduled_worker_capacity(capacity)
+        .with_verify_hermit_run_args(args.hermit_run_args.clone());
     for (capability, verdict) in &context.host_capabilities {
         eprintln!(
             "Host capability {}: {} — {}",
@@ -2154,6 +2169,24 @@ mod tests {
         assert_eq!(explicit.configured(), 7);
         assert_eq!(explicit.workers_for(12), 7);
         assert_eq!(explicit.workers_for(1), 1);
+    }
+
+    #[test]
+    fn hermit_run_args_are_repeatable_runner_arguments() {
+        let args = parse(
+            [
+                "--hermit-run-arg",
+                "--memory=128MB",
+                "--hermit-run-arg",
+                "--debug-kvm-lifecycle",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        assert_eq!(
+            args.hermit_run_args,
+            ["--memory=128MB", "--debug-kvm-lifecycle"]
+        );
     }
 
     #[test]

@@ -1421,6 +1421,7 @@ pub struct RunContext {
     pub keep_logs: bool,
     pub run_verify_strict: bool,
     pub record_verify_strict: bool,
+    pub verify_hermit_run_args: Vec<String>,
     /// Per-machine scaling for individual test CPU and wall bounds. This is execution policy,
     /// not part of the canonical manifest.
     pub timeout_multipliers: TimeoutMultipliers,
@@ -1537,6 +1538,7 @@ impl RunContext {
             keep_logs: std::env::var("E2E_KEEP_VERIFY_LOGS").as_deref() == Ok("1"),
             run_verify_strict,
             record_verify_strict,
+            verify_hermit_run_args: Vec::new(),
             timeout_multipliers: timeout_multipliers_from_env()?,
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir,
@@ -1548,6 +1550,11 @@ impl RunContext {
         scheduled_worker_capacity: ScheduledWorkerCapacity,
     ) -> Self {
         self.scheduled_worker_capacity = scheduled_worker_capacity;
+        self
+    }
+
+    pub fn with_verify_hermit_run_args(mut self, verify_hermit_run_args: Vec<String>) -> Self {
+        self.verify_hermit_run_args = verify_hermit_run_args;
         self
     }
 }
@@ -2033,6 +2040,7 @@ pub fn build_spec(
                     .cloned()
                     .unwrap_or_default(),
             );
+            argv.extend(context.verify_hermit_run_args.clone());
             if mode_recipe.compare_io_buffers == Some(false) {
                 argv.push("--no-detlog-io-buffers".into());
             }
@@ -4373,6 +4381,7 @@ mod tests {
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            verify_hermit_run_args: Vec::new(),
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
@@ -4466,6 +4475,7 @@ mod tests {
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            verify_hermit_run_args: Vec::new(),
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
@@ -5134,6 +5144,7 @@ mod tests {
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            verify_hermit_run_args: Vec::new(),
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
@@ -5201,6 +5212,7 @@ mod tests {
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            verify_hermit_run_args: Vec::new(),
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
@@ -5296,6 +5308,7 @@ mod tests {
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            verify_hermit_run_args: Vec::new(),
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
@@ -5568,6 +5581,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: true,
             record_verify_strict: true,
+            verify_hermit_run_args: Vec::new(),
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
@@ -5589,6 +5603,48 @@ backends_disabled:
             .position(|args| args == ["--workdir", "/tmp"])
             .unwrap();
         assert!(workdir < separator);
+    }
+
+    #[test]
+    fn extra_verify_hermit_run_args_precede_the_guest_separator() {
+        let test = recipe(true);
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "verify".into(),
+                backend: Some("kvm".into()),
+            },
+            test,
+            enabled: true,
+            timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
+        };
+        let context = run_context(Path::new("/repo"))
+            .with_verify_hermit_run_args(vec!["--memory=128MB".into()]);
+        let spec = build_spec(
+            &context,
+            &cell,
+            PathBuf::from("/repo/results/cell"),
+            vec!["/bin/true".into(), "--memory=guest".into()],
+            "1",
+            None,
+            cell.timeout_seconds,
+        )
+        .unwrap();
+        let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
+        let hermit_arg = spec
+            .argv
+            .iter()
+            .position(|arg| arg == "--memory=128MB")
+            .unwrap();
+        let guest_arg = spec
+            .argv
+            .iter()
+            .rposition(|arg| arg == "--memory=guest")
+            .unwrap();
+        assert!(hermit_arg < separator);
+        assert!(guest_arg > separator);
     }
 
     #[test]
@@ -5624,6 +5680,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: true,
             record_verify_strict: true,
+            verify_hermit_run_args: Vec::new(),
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
             isolated_workdir: Some(PathBuf::from("/test")),
@@ -5877,6 +5934,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: true,
             record_verify_strict: true,
+            verify_hermit_run_args: Vec::new(),
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
@@ -6034,6 +6092,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: true,
             record_verify_strict: true,
+            verify_hermit_run_args: Vec::new(),
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
             isolated_workdir: None,
@@ -7328,6 +7387,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            verify_hermit_run_args: Vec::new(),
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
@@ -7384,6 +7444,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            verify_hermit_run_args: Vec::new(),
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
@@ -7539,6 +7600,7 @@ backends_disabled:
             keep_logs: false,
             run_verify_strict: false,
             record_verify_strict: false,
+            verify_hermit_run_args: Vec::new(),
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
