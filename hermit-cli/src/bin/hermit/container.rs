@@ -1080,9 +1080,13 @@ where
     F: FnMut() -> Result<(T, D), Error>,
     T: serde::Serialize + serde::de::DeserializeOwned,
 {
-    let ran = container.run_with_deferred_drop(|| match catch_child_panic(&mut f) {
-        Ok((value, deferred)) => (Ok(value), Some(deferred)),
-        Err(error) => (Err(error), None),
+    let ran = container.run_with_deferred_drop(|| {
+        // Runs in the freshly forked container init, not in the caller.
+        let value = arm_container_init_guards().and_then(|()| catch_child_panic(&mut f));
+        match value {
+            Ok((value, deferred)) => (Ok(value), Some(deferred)),
+            Err(error) => (Err(error), None),
+        }
     });
     let run = match ran {
         Ok(run) => run,
@@ -1390,6 +1394,33 @@ mod tests {
         assert!(
             !rendered.contains("panic in container child"),
             "an ordinary error must not be relabelled as a panic: {rendered}"
+        );
+    }
+
+    #[test]
+    fn deferred_drop_wrapper_arms_container_init_guards() {
+        let mut container = Container::new();
+        let run = with_container_deferred_drop(&mut container, || {
+            let mut signal: libc::c_int = 0;
+            let result =
+                unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut signal as *mut libc::c_int) };
+            if result != 0 {
+                return Err(Error::msg(format!(
+                    "PR_GET_PDEATHSIG failed: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+            Ok((signal, ()))
+        })
+        .expect("deferred run should start");
+        let signal = run
+            .finalize()
+            .expect("deferred child cleanup should succeed")
+            .expect("child should report its parent-death signal");
+        assert_eq!(
+            signal,
+            libc::SIGKILL,
+            "deferred container runs must arm the same parent-death guard as ordinary runs"
         );
     }
 

@@ -1811,10 +1811,8 @@ fn sabre_uninstrumented_guest_message(status: &ExitStatus) -> String {
     )
 }
 
-/// Guest-physical memory available to the single-process KVM personality.
-// The KVM personality is a sparse MAP_NORESERVE address space. QEMU needs room
-// for its own ELF mappings in addition to the nested machine's RAM mapping.
-const KVM_GUEST_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
+/// Page size required by KVM userspace memory regions.
+const KVM_GUEST_MEMORY_PAGE_BYTES: u64 = 4096;
 
 /// Maximum `#!` interpreter indirection levels, matching the Linux kernel's
 /// `BINPRM_MAX_RECURSION` limit for chained script interpreters.
@@ -2052,7 +2050,8 @@ async fn run_kvm(
     // TODO-HUMAN-REVIEW(PR-998): Review KVM UTS namespace parity.
     config.has_uts_namespace = false;
     let random_seed = config.rng_seed();
-    let mut backend = new_kvm_backend(capture_output)?;
+    let kvm_memory_bytes = kvm_guest_memory_bytes(config.memory)?;
+    let mut backend = new_kvm_backend(capture_output, kvm_memory_bytes)?;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1120): Review KVM's canonical Detcore root identity.
     backend
@@ -2110,6 +2109,7 @@ async fn run_kvm(
         cleanup_us = teardown_started.duration_since(cleanup_started).as_micros() as u64,
         teardown_us = teardown_finished.duration_since(teardown_started).as_micros() as u64,
         lifecycle_us = teardown_finished.duration_since(dispatch_started).as_micros() as u64,
+        kvm_memory_bytes = kvm_memory_bytes as u64,
         final_vm_release_deferred = defer_teardown,
         "reverie-kvm lifecycle phase timings",
     );
@@ -2129,7 +2129,23 @@ async fn run_kvm(
     })
 }
 
-fn new_kvm_backend(capture_output: bool) -> Result<reverie_kvm::KvmBackend, Error> {
+fn kvm_guest_memory_bytes(configured_memory: u64) -> Result<usize, Error> {
+    if configured_memory == 0 {
+        return Err(anyhow!("KVM guest memory size must be nonzero"));
+    }
+    let rounded = configured_memory
+        .checked_add(KVM_GUEST_MEMORY_PAGE_BYTES - 1)
+        .ok_or_else(|| anyhow!("KVM guest memory size is too large: {configured_memory}"))?
+        / KVM_GUEST_MEMORY_PAGE_BYTES
+        * KVM_GUEST_MEMORY_PAGE_BYTES;
+    usize::try_from(rounded)
+        .map_err(|_| anyhow!("KVM guest memory size does not fit usize: {rounded}"))
+}
+
+fn new_kvm_backend(
+    capture_output: bool,
+    kvm_memory_bytes: usize,
+) -> Result<reverie_kvm::KvmBackend, Error> {
     let stdin = if capture_output {
         let (snapshot_reserved, snapshot) = output_backend_stdin_reservation()?;
         if snapshot_reserved {
@@ -2144,7 +2160,7 @@ fn new_kvm_backend(capture_output: bool) -> Result<reverie_kvm::KvmBackend, Erro
     } else {
         reserved_kvm_stdin()?
     };
-    reverie_kvm::KvmBackend::new_with_stdin(KVM_GUEST_MEMORY_BYTES, stdin)
+    reverie_kvm::KvmBackend::new_with_stdin(kvm_memory_bytes, stdin)
         .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))
 }
 
@@ -3440,6 +3456,18 @@ mod tests {
     use super::*;
 
     static SKID_OVERSHOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn kvm_memory_uses_configured_memory_with_page_rounding() {
+        assert_eq!(kvm_guest_memory_bytes(1).unwrap(), 4096);
+        assert_eq!(kvm_guest_memory_bytes(4096).unwrap(), 4096);
+        assert_eq!(kvm_guest_memory_bytes(4097).unwrap(), 8192);
+        assert_eq!(
+            kvm_guest_memory_bytes(1_000_000_000).unwrap(),
+            1_000_001_536
+        );
+        assert!(kvm_guest_memory_bytes(0).is_err());
+    }
 
     #[test]
     fn skid_overshoot_report_covers_success_error_and_disabled_backends() {
