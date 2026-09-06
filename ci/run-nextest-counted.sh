@@ -211,12 +211,12 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as source:
     report = json.load(source)
     assert report == {
-    "schema": 2,
+    "schema": 3,
     "executed_tests": 2,
     "filtered_tests": 7,
     "results": [
-        {"id": "suite$passes", "result": "pass", "attempts": 1},
-        {"id": "suite$recovers", "result": "pass", "attempts": 2},
+        {"id": "suite$passes", "result": "pass", "attempts": 1, "attempt_results": None},
+        {"id": "suite$recovers", "result": "pass", "attempts": 2, "attempt_results": None},
     ],
     }
 PYEOF
@@ -277,7 +277,12 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as source:
     report = json.load(source)
 assert report["results"] == [
-    {"id": "suite$fails", "result": "fail", "attempts": 1},
+    {
+        "id": "suite$fails",
+        "result": "fail",
+        "attempts": 1,
+        "attempt_results": None,
+    },
 ]
 PYEOF
 
@@ -340,8 +345,19 @@ PYEOF
     printf '%s\n' --color never --message-format json --profile ci -p suite \
         -- --skip skipme >"$scratch/expected-list-arguments"
     cmp -s "$scratch/expected-list-arguments" "$scratch/list-arguments" || return 1
-    [[ $(<"$scratch/wrapper-counts.json") == \
-        '{"executed_tests":1,"filtered_tests":0,"results":[{"attempts":1,"id":"suite$failure","result":"fail"}],"schema":2}' ]] || return 1
+    jq -e '
+        .schema == 3 and .executed_tests == 1 and .filtered_tests == 0 and
+        (.results | length) == 1 and
+        .results[0].id == "suite$failure" and
+        .results[0].result == "fail" and
+        .results[0].attempts == 1 and
+        (.results[0].attempt_results | length) == 1 and
+        .results[0].attempt_results[0] == {
+            attempt: 1,
+            outcome: "failed",
+            detail: "exit 23"
+        }
+    ' "$scratch/wrapper-counts.json" >/dev/null || return 1
     jq -e '
         .schema == 2 and .run_id == "self-test-nextest" and
         (.attempts | length) == 1 and

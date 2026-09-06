@@ -15,7 +15,7 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use dagrun::TestResult;
+use dagrun::{TestAttemptOutcome, TestAttemptResult, TestResult};
 use dagrun::TestResults;
 use nextest_cpu::{
     read_attempt_records, read_binary_map, write_binary_map_atomic, write_report_atomic,
@@ -475,6 +475,101 @@ fn reconcile_cpu_attempts(
     Ok(CpuReport::new(run_id, actual.into_values().collect()))
 }
 
+fn classified_attempt(record: &AttemptRecord) -> Result<TestAttemptResult, String> {
+    let (outcome, detail) = match (&record.outcome, &record.completion) {
+        (nextest_cpu::AttemptOutcome::Completed, Some(nextest_cpu::AttemptCompletion::Exit { code: 0 })) => {
+            (TestAttemptOutcome::Passed, None)
+        }
+        (nextest_cpu::AttemptOutcome::Completed, Some(nextest_cpu::AttemptCompletion::Exit { code })) => {
+            (TestAttemptOutcome::Failed, Some(format!("exit {code}")))
+        }
+        (nextest_cpu::AttemptOutcome::Completed, Some(nextest_cpu::AttemptCompletion::Signal { signal })) => {
+            (TestAttemptOutcome::Failed, Some(format!("signal {signal}")))
+        }
+        (nextest_cpu::AttemptOutcome::Completed, None) => {
+            return Err("completed attempt is missing its raw completion".into());
+        }
+        (nextest_cpu::AttemptOutcome::CpuTimeout, _) => (
+            TestAttemptOutcome::CpuTimeout,
+            Some(format!(
+                "used {}us CPU at a {}us limit",
+                record.cpu_usage_usec.map_or_else(|| "unknown".into(), |value| value.to_string()),
+                record.cpu_limit_usec
+            )),
+        ),
+        (nextest_cpu::AttemptOutcome::WallTimeout, _) => (
+            TestAttemptOutcome::WallTimeout,
+            Some(format!(
+                "ran {}ms wall at a {}ms limit",
+                record.wall_time_ms, record.wall_limit_ms
+            )),
+        ),
+        (nextest_cpu::AttemptOutcome::Cancelled { signal }, _) => (
+            TestAttemptOutcome::Cancelled,
+            Some(format!("cancelled by signal {signal}")),
+        ),
+        (nextest_cpu::AttemptOutcome::InfrastructureError { detail }, _) => (
+            TestAttemptOutcome::InfrastructureError,
+            Some(detail.clone()),
+        ),
+    };
+    TestAttemptResult::new(record.identity.attempt, outcome, detail)
+}
+
+fn classified_test_results(
+    parsed: &ParsedEvents,
+    binary_map: &BinaryMap,
+    report: &CpuReport,
+) -> Result<Vec<TestResult>, String> {
+    let actual = report
+        .attempts
+        .iter()
+        .map(|record| (record.identity.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let mut by_test = BTreeMap::<String, Vec<TestAttemptResult>>::new();
+    for expected in &parsed.expected_attempts {
+        let (package, binary) = binary_map.identity_for_suite(
+            &expected.suite.package,
+            &expected.suite.binary,
+            &expected.suite.kind,
+        )?;
+        let identity = AttemptIdentity {
+            package: package.into(),
+            binary: binary.into(),
+            test: expected.test.clone(),
+            attempt: expected.attempt,
+        };
+        let record = actual.get(&identity).ok_or_else(|| {
+            format!("classified attempt is missing after reconciliation: {identity:?}")
+        })?;
+        let id = displayed_test_id(
+            &expected.suite.package,
+            &expected.suite.binary,
+            &expected.test,
+            &expected.suite.kind,
+            expected.suite.stress_index,
+        );
+        by_test.entry(id).or_default().push(classified_attempt(record)?);
+    }
+    parsed
+        .results
+        .iter()
+        .map(|terminal| {
+            let attempts = by_test.remove(&terminal.id).ok_or_else(|| {
+                format!("terminal test {:?} has no classified attempts", terminal.id)
+            })?;
+            TestResult::with_attempt_results(terminal.id.clone(), terminal.passed, attempts)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|results| {
+            if by_test.is_empty() {
+                Ok(results)
+            } else {
+                Err(format!("classified attempts have no terminal result: {:?}", by_test.keys()))
+            }
+        })
+}
+
 fn parse_events(path: &Path) -> Result<ParsedEvents, String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("nextest-test-results-read {}: {error}", path.display()))?;
@@ -546,17 +641,20 @@ fn run() -> Result<(), String> {
             "nextest-test-results: successful nextest status disagrees with {failed} failed typed result(s)"
         ));
     }
-    let cpu_report = match (attempt_records, binary_map, cpu_report) {
+    let (classified_results, cpu_report) = match (attempt_records, binary_map, cpu_report) {
         (Some(records), Some(binary_map), Some(output)) => {
             let binary_map = read_binary_map(Path::new(&binary_map))?;
             let report = reconcile_cpu_attempts(&parsed, Path::new(&records), &binary_map)?;
-            Some((report, output))
+            let results = classified_test_results(&parsed, &binary_map, &report)?;
+            (results, Some((report, output)))
         }
-        (None, None, None) => None,
+        // Compatibility for parser-only callers. Production run-nextest-counted always supplies
+        // the three CPU arguments, so its current rows carry classified attempts; `null` states
+        // honestly that an older caller supplied no per-attempt accounting.
+        (None, None, None) => (parsed.results.clone(), None),
         _ => unreachable!("argument pairing was checked above"),
     };
-    let report =
-        TestResults::current(parsed.executed_tests, parsed.filtered_tests, parsed.results)?;
+    let report = TestResults::current(parsed.executed_tests, parsed.filtered_tests, classified_results)?;
     if let Some(expected) = match env::var("NEXTEST_EXPECTED_EXECUTED") {
         Ok(value) => Some(parse_u64(value, "NEXTEST_EXPECTED_EXECUTED")?),
         Err(env::VarError::NotPresent) => None,
@@ -1175,6 +1273,104 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("disagree on whether"), "{error}");
+    }
+
+    #[test]
+    fn producer_and_dagrun_format_keep_five_failure_causes_distinct() {
+        let measurement = |cpu_usage_usec| nextest_cpu::AttemptMeasurement {
+            cpu_usage_usec,
+            cpu_limit_usec: 22_000_000,
+            wall_time_ms: 57_000,
+            wall_limit_ms: 57_000,
+        };
+        let identity = |test: &str| AttemptIdentity {
+            package: "suite".into(),
+            binary: "suite".into(),
+            test: test.into(),
+            attempt: 1,
+        };
+        let records = vec![
+            AttemptRecord::new(
+                "run".into(),
+                identity("ordinary"),
+                nextest_cpu::AttemptMeasurement {
+                    wall_time_ms: 10,
+                    ..measurement(Some(1_000))
+                },
+                Some(AttemptCompletion::Exit { code: 7 }),
+                AttemptOutcome::Completed,
+            ),
+            AttemptRecord::new(
+                "run".into(),
+                identity("cpu"),
+                nextest_cpu::AttemptMeasurement {
+                    cpu_usage_usec: Some(22_000_000),
+                    wall_time_ms: 10,
+                    ..measurement(Some(22_000_000))
+                },
+                Some(AttemptCompletion::Signal { signal: 15 }),
+                AttemptOutcome::CpuTimeout,
+            ),
+            AttemptRecord::new(
+                "run".into(),
+                identity("wall"),
+                measurement(Some(1_000)),
+                Some(AttemptCompletion::Signal { signal: 15 }),
+                AttemptOutcome::WallTimeout,
+            ),
+            AttemptRecord::new(
+                "run".into(),
+                identity("cancelled"),
+                nextest_cpu::AttemptMeasurement {
+                    wall_time_ms: 10,
+                    ..measurement(Some(1_000))
+                },
+                Some(AttemptCompletion::Signal { signal: 2 }),
+                AttemptOutcome::Cancelled { signal: 2 },
+            ),
+            AttemptRecord::new(
+                "run".into(),
+                identity("infra"),
+                nextest_cpu::AttemptMeasurement {
+                    cpu_usage_usec: None,
+                    wall_time_ms: 10,
+                    ..measurement(None)
+                },
+                None,
+                AttemptOutcome::InfrastructureError {
+                    detail: "cpu.stat malformed".into(),
+                },
+            ),
+        ];
+        for record in &records {
+            record.validate().unwrap();
+        }
+        let classified = records
+            .iter()
+            .map(classified_attempt)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            classified.iter().map(|row| row.outcome).collect::<Vec<_>>(),
+            vec![
+                TestAttemptOutcome::Failed,
+                TestAttemptOutcome::CpuTimeout,
+                TestAttemptOutcome::WallTimeout,
+                TestAttemptOutcome::Cancelled,
+                TestAttemptOutcome::InfrastructureError,
+            ]
+        );
+        let results = classified
+            .into_iter()
+            .enumerate()
+            .map(|(index, attempt)| {
+                TestResult::with_attempt_results(format!("suite$case-{index}"), false, vec![attempt])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let report = TestResults::current(5, 0, results).unwrap();
+        let decoded = TestResults::from_json_slice(&report.to_current_json().unwrap()).unwrap();
+        assert_eq!(decoded, report);
     }
 
     #[test]

@@ -2165,12 +2165,12 @@ mod tests {
         assert_eq!(
             counts,
             serde_json::json!({
-                "schema": 2,
+                "schema": 3,
                 "executed_tests": 2,
                 "filtered_tests": 0,
                 "results": [
-                    {"id": "suite$passes", "result": "pass", "attempts": 1},
-                    {"id": "suite$fails", "result": "fail", "attempts": 2},
+                    {"id": "suite$passes", "result": "pass", "attempts": 1, "attempt_results": null},
+                    {"id": "suite$fails", "result": "fail", "attempts": 2, "attempt_results": null},
                 ],
             })
         );

@@ -38,7 +38,7 @@ agreeing with each other.
 | manifest cell CPU limit | all process-group CPU consumed by a cell's executions, aggregated across attempts or seeds | `cpu_timeout_seconds`: 22s default plus measured cell overrides, scaled by the machine CPU multiplier | the harness stops the process group and retains `error_kind=cpu-timeout` | typed cell `ERROR` |
 | manifest cell wall limit | fixture preparation and, separately, the complete execution phase | `timeout_seconds`: 57s default plus measured cell overrides, scaled by the machine wall multiplier | the harness stops the process group and retains `error_kind=wall-timeout` | typed cell `ERROR` |
 | dagrun step wall/CPU limits | **one DAG node**, i.e. a whole batch of cells or tests | explicit `timeout` and `cpu_timeout` on each node in the single `ci/dag/validate.json`, selected by profile labels | dagrun stops the step | node failure |
-| validate run budget | the whole outer validate graph | `HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS` or `--run-timeout` | dagrun stops admitting work and records unfinished nodes | incomplete validation, with named unfinished nodes |
+| validate run budgets | the whole outer validate graph | wall: `HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS` or `--run-timeout`; CPU: sum of the selected nodes' effective CPU budgets plus 600s | dagrun stops admitting work and records unfinished nodes | incomplete validation, naming wall expiry, CPU expiry, lost CPU accounting, or named unfinished nodes |
 | validate systemd scope | the same outer run plus teardown grace | validate's safe-ci scope | systemd stops the whole process tree | outer-scope timeout |
 | `safehermit --sh-deadline` | **the whole wrapped process tree** | `bin/safehermit`, default 3600s | `systemd-run --user RuntimeMaxSec`, a **cgroup kill** | exit 124, `safehermit: bound.wall=` |
 
@@ -79,6 +79,19 @@ whole child cgroup is empty, then takes a stable final CPU read; this catches a
 short test that crosses its CPU limit between polls and a descendant that
 escapes the process group with `setsid`. Missing or malformed cgroup accounting
 is an infrastructure error, never a zero measurement or a passing attempt.
+The structured test-result file consumed by Dagrun records every attempt as
+`passed`, `failed`, `cpu_timeout`, `wall_timeout`, `cancelled`, or
+`infrastructure_error`; the CPU measurement report is retained supporting
+evidence, not the only place the cause exists.
+
+Each production Nextest node declares its exact selected-test count. Its outer
+CPU backup is derived as selected tests × one maximum attempt × the 22-second
+inner allowance scaled to the supported 1.5 multiplier, plus 60 seconds of
+node overhead. Validation checks the configured multiplier and 1.5 separately
+and refuses equality as well as inversion. The cumulative validate CPU backup
+is the sum of the exact selected nodes' effective CPU budgets plus 600 seconds
+for driver and between-lane work, and one budget is shared across sequential
+lanes. These are backups; they do not replace or relax the per-attempt limit.
 
 The generated temporary Nextest config scales the same 57-second wall source
 and adds five seconds. That later deadline is only a backup if the wrapper

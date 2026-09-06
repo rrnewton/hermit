@@ -580,10 +580,13 @@ fn run_wrapper(args: Vec<OsString>) -> Result<ExitStatus, String> {
         }
     };
     let wall_time_ms = elapsed_ms(started)?;
-    if !matches!(cause, Some(StopCause::Cancelled(_))) && cpu_used >= limits.cpu_usec {
+    if cpu_used >= limits.cpu_usec {
         cause = Some(StopCause::CpuTimeout);
     } else if cause.is_none() {
-        cause = if wall_time_ms >= limits.wall_ms {
+        let signal = RECEIVED_SIGNAL.load(Ordering::SeqCst);
+        cause = if signal != 0 {
+            Some(StopCause::Cancelled(signal))
+        } else if wall_time_ms >= limits.wall_ms {
             Some(StopCause::WallTimeout)
         } else {
             None
