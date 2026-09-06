@@ -73,6 +73,74 @@
 
 # data-handling
 
+## data-handling/dd-partial-transfers
+
+### 2026-09-02 — portable / verify / ptrace — fixed work stopped by the wall deadline
+
+- Classification: this is a fixed-work cell with an undersized wall bound, not
+  a cell that conditionally builds or selects a variable workload. Its
+  `--prepare` action is a no-op. Each guest execution generates exactly 4096
+  bytes, copies 4096 bytes through `dd bs=1` over a pipe, copies the same 4096
+  bytes through file-backed `dd bs=1`, and transfers one final 89-byte input in
+  13 seven-byte blocks. A healthy strict verification performs that guest work
+  twice.
+- Controlled command: the following is the direct form used for two independent
+  measurements. It requires a built Hermit and the parent repository's
+  `bin/safehermit`; replace the two path variables for another checkout. The
+  measured binary reported `hermit 0.2.0 (2026-09-02, g5910bc208d13)`, had
+  SHA-256 `68b548ee25b7f6b16244ec5e7a9a4d9cf300936c4c38ee9c8225a7cc8582251f`,
+  and ran a guest script with SHA-256
+  `30b56fd75af20124a68e28d744e54bd82b0161e5b91304a3fb047a23d66fd6b2`.
+  The backend was ptrace, the log level was info, and there were no
+  determinism relaxations.
+
+  ```bash
+  dev_hermit=/home/newton/work/dev-hermit
+  hermit_bin="$dev_hermit/hermit/target/debug/hermit"
+  run=$(mktemp -d)
+  mkdir -p "$run/home" "$run/xdg-config" "$run/fixtures"
+  env E2E_FIXTURE_DIR="$run/fixtures" E2E_TMPDIR=/tmp/hermit-e2e \
+    HERMIT_E2E_SCHEDULED_JOBS=1 HOME="$run/home" LC_ALL=C TZ=UTC \
+    XDG_CONFIG_HOME="$run/xdg-config" \
+    "$dev_hermit/bin/safehermit" --sh-deadline 120 \
+    --sh-report "$run/safehermit.report" \
+    "$hermit_bin" --log info run --base-env=minimal --backend ptrace \
+    --strict --verify-strict --verify --verify-json "$run/verify.json" \
+    --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C \
+    --env TZ=UTC --env HOME="$run/home" \
+    --env XDG_CONFIG_HOME="$run/xdg-config" --env E2E_TMPDIR=/test \
+    --env E2E_FIXTURE_DIR="$run/fixtures" \
+    --env HERMIT_E2E_SCHEDULED_JOBS=1 -- \
+    "$PWD/tests/e2e/data-handling/dd-partial-transfers.sh" --run
+  jq '{verdict, bitwise_parity, compared_log_messages, runtime}' \
+    "$run/verify.json"
+  ```
+
+- Real output: two fresh-home invocations on a 316-CPU host each completed in
+  10 seconds and produced byte-identical reports. Both internal executions in
+  both invocations recorded exactly 18,616 syscalls, 8,832 scheduler turns,
+  4,777,481,955 virtual nanoseconds, and 63,224 canonical INFO messages:
+
+  ```json
+  {"verdict":"matched","bitwise_parity":true,"compared_log_messages":{"left":63224,"right":63224},"runtime":{"run1":{"scheduler_turns":8832,"virtual_nanoseconds":4777481955,"syscalls":18616},"run2":{"scheduler_turns":8832,"virtual_nanoseconds":4777481955,"syscalls":18616}}}
+  ```
+
+- Independent control: three fresh-home invocations of exact Hermit
+  `a6b0c37648df774d5859aad23a535caf03a6d392` on
+  `devbig030.atn3.facebook.com` each completed in 9 seconds with matched L2
+  reports and exactly 63,224 INFO messages on both sides. Other retained SHAs
+  record a different but internally equal count; compare work counters only
+  within one exact binary and source revision.
+- Failure evidence: hosted CI at `6fab069e01096d174a196f9a658b7d5468d494d5`
+  completed Run1 twice, entered Run2, and then received SIGTERM after 14.657
+  and 14.664 seconds. A concurrent local run completed one attempt in 14.019
+  seconds, while its peer was killed at 15.042 and 15.036 seconds after using
+  14.298 and 6.466 process CPU-seconds. The smaller CPU total belongs to an
+  incomplete execution; it is not evidence that the cell selected less work.
+- Next: size the per-test CPU and wall bounds in the timeout-policy work. Do not
+  add cached preparation or reduce the transfer population to make this cell
+  fit the current 15-second wall deadline.
+
 # debugger-c
 
 # determinism-stress
