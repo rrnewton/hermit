@@ -771,7 +771,7 @@ pub struct RunOpts {
     /// "compare_logs":bool,"compare_io_buffers":bool,
     /// "log_scope":
     /// "deterministic"|"info"|"full_trace","record_envelope":
-    /// "all_records_v1","strip_lines":bool,
+    /// "all_records_v1"|"dbt_evidence_transport_v1","strip_lines":bool,
     /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
     /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
     /// "skip_commit":bool,"skip_detlog":bool},"dbt_counted_branches":

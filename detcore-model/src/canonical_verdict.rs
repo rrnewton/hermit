@@ -231,10 +231,8 @@ pub enum ComparedLogScope {
 #[serde(rename_all = "snake_case")]
 pub enum RecordEnvelopeReport {
     AllRecordsV1,
-    /// Read-only compatibility for reports written before Reverie's typed DBT
-    /// evidence decoder separated transport initialization from comparable
-    /// records. Current producers must emit [`Self::AllRecordsV1`].
-    #[serde(skip_serializing)]
+    /// DBT evidence with transport initialization counted separately and
+    /// excluded from the comparable records.
     DbtEvidenceTransportV1,
     CallerDefined,
 }
@@ -700,19 +698,21 @@ mod tests {
     }
 
     #[test]
-    fn historical_dbt_record_envelope_parses_but_current_reports_do_not_emit_it() {
-        let historical = br#"{"verified":true,"bitwise_parity":true,"verdict":"matched",
+    fn dbt_record_envelope_round_trips_in_current_reports() {
+        let json = br#"{"verified":true,"bitwise_parity":true,"verdict":"matched",
             "comparison":{"strictness":"canonical","compare_logs":true,
             "record_envelope":"dbt_evidence_transport_v1"},
             "compared_log_messages":{"left":180,"right":180}}"#;
-        let historical = VerificationReport::from_json_slice(historical)
-            .expect("a stored report using the historical envelope must remain readable");
-        let envelope = historical.comparison.as_ref().unwrap().record_envelope;
+        let parsed = VerificationReport::from_json_slice(json)
+            .expect("a report using the DBT envelope must be readable");
+        let envelope = parsed.comparison.as_ref().unwrap().record_envelope;
         assert_eq!(envelope, RecordEnvelopeReport::DbtEvidenceTransportV1);
         assert!(envelope.is_canonical());
-        assert!(
-            serde_json::to_string(&historical).is_err(),
-            "the legacy read-only variant must not be emitted by a new serializer"
+        let serialized =
+            serde_json::to_value(&parsed).expect("the current DBT envelope must serialize");
+        assert_eq!(
+            serialized["comparison"]["record_envelope"],
+            "dbt_evidence_transport_v1"
         );
 
         let current = serde_json::to_string(&report(LogCompareStrictness::Canonical, true, 1, 1))
