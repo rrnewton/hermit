@@ -5,6 +5,11 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -15,11 +20,23 @@ use hermit_manifest_plan::ledger::CellIdentity;
 use hermit_manifest_plan::ledger::CellResult as LedgerCellResult;
 use hermit_manifest_plan::ledger::CellResultsArtifact;
 use hermit_manifest_plan::ledger::CellResultsEvidence;
+use hermit_manifest_plan::ledger::CellResultsEvidenceV10;
 use hermit_manifest_plan::ledger::CellVerdict;
 use hermit_manifest_plan::ledger::ComparedLogCounts;
 use hermit_manifest_plan::ledger::ComparisonSpec;
 use hermit_manifest_plan::ledger::ComparisonTier;
 use hermit_manifest_plan::ledger::RequiredNullable;
+use hermit_manifest_plan::ledger::RetainedVerifyLogArtifact;
+use hermit_manifest_plan::ledger::RetainedVerifyLogIndexRow;
+use hermit_manifest_plan::ledger::RetainedVerifyLogsArtifact;
+use hermit_manifest_plan::ledger::ValidatePath;
+use hermit_manifest_plan::ledger::is_canonical_hermetic_image_digest;
+use hermit_manifest_plan::runner::CELL_RESULT_SCHEMA;
+use hermit_manifest_plan::runner::RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA;
+use hermit_manifest_plan::runner::CellId;
+use hermit_manifest_plan::runner::RetainedVerifyLog;
+use hermit_manifest_plan::runner::VerifyLogRetentionPolicy;
+use hermit_manifest_plan::runner::copy_verified_retained_verify_log;
 use hermit_manifest_plan::runner::outcome_after_retries;
 use serde_json::Value;
 use sha2::Digest;
@@ -34,6 +51,7 @@ use sha2::Sha256;
 /// the same version.
 pub const CELL_RESULTS_LEDGER_SCHEMA_MIN: i64 = 6;
 pub const CELL_RESULTS_LEDGER_SCHEMA_VERSION: i64 = 7;
+pub const RETAINED_VERIFY_LOGS_LEDGER_SCHEMA_VERSION: i64 = 10;
 
 #[derive(Debug)]
 pub struct RetainedCellResults {
@@ -107,6 +125,907 @@ fn read_result_rows(path: &Path) -> Result<Vec<(PathBuf, usize, Value)>, String>
 /// projection deliberately reduces to the latest attempt.
 pub fn all_result_rows(path: &Path) -> Result<Vec<Value>, String> {
     read_result_rows(path).map(|rows| rows.into_iter().map(|(_, _, row)| row).collect())
+}
+
+#[derive(Clone)]
+struct RetainedVerifyLogSource {
+    cell: CellIdentity,
+    attempt: u64,
+    artifact_dir: PathBuf,
+    retained: RetainedVerifyLog,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetentionFailurePoint {
+    ArtifactAncestorSync,
+    BeforeVerifyLogRename,
+    AfterVerifyLogRename,
+    BeforeCellResultPublication,
+}
+
+fn require_normal_component(value: &str, description: &str) -> Result<(), String> {
+    let mut components = Path::new(value).components();
+    if !matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(component)), None) if component == value
+    ) {
+        return Err(format!("{description} is not one normal path component"));
+    }
+    Ok(())
+}
+
+fn checked_relative_path<'a>(
+    root: &'a Path,
+    path: &'a Path,
+    description: &str,
+) -> Result<&'a Path, String> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        format!(
+            "{description} {} is outside {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!(
+            "{description} {} is not a normal relative path below {}",
+            path.display(),
+            root.display()
+        ));
+    }
+    Ok(relative)
+}
+
+fn require_plain_directory(path: &Path, description: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {description} {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "{description} {} is not a non-symlink directory",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn require_plain_directory_path_below(
+    root: &Path,
+    path: &Path,
+    description: &str,
+) -> Result<(), String> {
+    let relative = checked_relative_path(root, path, description)?;
+    require_plain_directory(root, "retained result root")?;
+    let mut current = root.to_owned();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            unreachable!("checked_relative_path accepted only normal components")
+        };
+        current.push(component);
+        require_plain_directory(&current, description)?;
+    }
+    Ok(())
+}
+
+fn create_plain_directory_path_below(
+    root: &Path,
+    relative: &Path,
+    description: &str,
+    failure: Option<RetentionFailurePoint>,
+) -> Result<PathBuf, String> {
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!("{description} is not a normal relative path"));
+    }
+    require_plain_directory(root, "retained validation state root")?;
+    let mut current = root.to_owned();
+    let mut chain = vec![root.to_owned()];
+    let mut created = Vec::new();
+    let create_and_sync = (|| -> Result<PathBuf, String> {
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                unreachable!("relative path was checked above")
+            };
+            current.push(component);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(format!(
+                        "{description} {} is not a non-symlink directory",
+                        current.display()
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&current).map_err(|error| {
+                        format!("cannot create {description} {}: {error}", current.display())
+                    })?;
+                    created.push(current.clone());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "cannot inspect {description} {}: {error}",
+                        current.display()
+                    ));
+                }
+            }
+            chain.push(current.clone());
+        }
+        if !created.is_empty() {
+            for directory in &chain {
+                if failure == Some(RetentionFailurePoint::ArtifactAncestorSync)
+                    && directory == root
+                {
+                    return Err(
+                        "injected failure syncing retained validation artifact ancestor".into(),
+                    );
+                }
+                sync_directory(directory, description)?;
+            }
+        }
+        Ok(current.clone())
+    })();
+    match create_and_sync {
+        Ok(path) => Ok(path),
+        Err(error) => match remove_created_directory_chain(&created, description) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(format!(
+                "{error}; cannot clean newly created directory chain: {cleanup_error}"
+            )),
+        },
+    }
+}
+
+fn remove_created_directory_chain(created: &[PathBuf], description: &str) -> Result<(), String> {
+    for directory in created.iter().rev() {
+        fs::remove_dir(directory).map_err(|error| {
+            format!(
+                "cannot remove newly created {description} {}: {error}",
+                directory.display()
+            )
+        })?;
+        let parent = directory
+            .parent()
+            .ok_or_else(|| format!("newly created directory {} has no parent", directory.display()))?;
+        sync_directory(parent, description)?;
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path, description: &str) -> Result<(), String> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)
+        .map_err(|error| format!("cannot open {description} {}: {error}", path.display()))?;
+    directory
+        .sync_all()
+        .map_err(|error| format!("cannot sync {description} {}: {error}", path.display()))
+}
+
+fn sync_directory_tree(path: &Path) -> Result<(), String> {
+    require_plain_directory(path, "retained verify-log staging directory")?;
+    for entry in fs::read_dir(path).map_err(|error| {
+        format!(
+            "cannot read retained verify-log staging directory {}: {error}",
+            path.display()
+        )
+    })? {
+        let entry = entry.map_err(|error| format!("cannot read staging entry: {error}"))?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+            format!("cannot inspect staging entry {}: {error}", entry.path().display())
+        })?;
+        if metadata.is_dir() {
+            sync_directory_tree(&entry.path())?;
+        } else if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "retained verify-log staging entry {} is not a regular file",
+                entry.path().display()
+            ));
+        }
+    }
+    sync_directory(path, "retained verify-log staging directory")
+}
+
+fn rename_directory_noreplace(source: &Path, destination: &Path) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| "retained verify-log staging path contains NUL".to_string())?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| "retained verify-log destination path contains NUL".to_string())?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result != 0 {
+        return Err(format!(
+            "cannot atomically publish retained verify-log directory {}: {}",
+            destination.to_string_lossy(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+fn collect_verify_log_sources(
+    result_root: &Path,
+    run_id: &str,
+    rows: &[(PathBuf, usize, Value)],
+) -> Result<Vec<RetainedVerifyLogSource>, String> {
+    require_normal_component(run_id, "per-cell result run_id")?;
+    let run_root = result_root.join("runs").join(run_id);
+    require_plain_directory(result_root, "per-cell result root")?;
+    match fs::symlink_metadata(&run_root) {
+        Ok(_) => require_plain_directory_path_below(
+            result_root,
+            &run_root,
+            "retained verify-log run directory",
+        )?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect retained verify-log run directory {}: {error}",
+                run_root.display()
+            ));
+        }
+    }
+    let mut sources = BTreeMap::<(CellIdentity, u64), RetainedVerifyLogSource>::new();
+    for (file, line_number, row) in rows {
+        let schema = row.get("schema").and_then(Value::as_u64).unwrap_or(0);
+        let mode = string(row, "mode")?;
+        let attempts = row
+            .get("attempts")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let compared = attempts.iter().any(|attempt| {
+            attempt
+                .get("verification_report")
+                .and_then(Value::as_str)
+                .is_some()
+        });
+        let descriptors = attempts
+            .iter()
+            .filter_map(|attempt| {
+                attempt
+                    .get("retained_verify_log")
+                    .filter(|value| !value.is_null())
+            })
+            .collect::<Vec<_>>();
+
+        if mode != "verify" && !descriptors.is_empty() {
+            return Err(format!(
+                "{}:{line_number} non-verify result carries retained_verify_log",
+                file.display()
+            ));
+        }
+        if descriptors.len() > 1 {
+            return Err(format!(
+                "{}:{line_number} carries more than one retained_verify_log",
+                file.display()
+            ));
+        }
+        let Some(descriptor) = descriptors.first() else {
+            continue;
+        };
+        if schema != RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA {
+            return Err(format!(
+                "{}:{line_number} schema {schema} cannot claim current retained_verify_log evidence",
+                file.display()
+            ));
+        }
+        if attempts.len() != 1 || !compared {
+            return Err(format!(
+                "{}:{line_number} retained_verify_log is not bound to one compared attempt",
+                file.display()
+            ));
+        }
+        let report_bytes = attempts[0]
+            .get("verification_report")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{}:{line_number} retained_verify_log has no typed verification report",
+                    file.display()
+                )
+            })?;
+        let report_sha256 = attempts[0]
+            .get("verification_report_sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "{}:{line_number} retained_verify_log has no verification_report_sha256",
+                    file.display()
+                )
+            })?;
+        if hex_digest(report_bytes.as_bytes()) != report_sha256 {
+            return Err(format!(
+                "{}:{line_number} retained verify-log report digest mismatch",
+                file.display()
+            ));
+        }
+        let report = VerificationReport::from_json_slice(report_bytes.as_bytes()).map_err(|error| {
+            format!(
+                "{}:{line_number} retained verify-log report is malformed: {error}",
+                file.display()
+            )
+        })?;
+        let retained: RetainedVerifyLog = serde_json::from_value((*descriptor).clone()).map_err(
+            |error| {
+                format!(
+                    "{}:{line_number} retained_verify_log is malformed: {error}",
+                    file.display()
+                )
+            },
+        )?;
+        let attempt = row.get("attempt").and_then(Value::as_u64).unwrap_or(1);
+        if attempt == 0 || retained.attempt != attempt {
+            return Err(format!(
+                "{}:{line_number} retained_verify_log attempt differs from its result row",
+                file.display()
+            ));
+        }
+        let cell = identity(row)?;
+        let expected_id = CellId {
+            test: cell.test.clone(),
+            mode: cell.mode.clone(),
+            backend: Some(cell.backend.clone()),
+        };
+        if retained.cell_id != expected_id {
+            return Err(format!(
+                "{}:{line_number} retained_verify_log cell_id differs from its result row",
+                file.display()
+            ));
+        }
+        let report_count = report
+            .compared_log_messages
+            .as_ref()
+            .map(|counts| counts.left)
+            .unwrap_or(0);
+        if retained.compared_info_messages != report_count {
+            return Err(format!(
+                "{}:{line_number} retained verify-log compared count differs from its verification report",
+                file.display()
+            ));
+        }
+        let artifact_dir = PathBuf::from(string(row, "artifact_dir")?);
+        let relative_artifact = checked_relative_path(
+            &run_root,
+            &artifact_dir,
+            "retained verify-log cell artifact directory",
+        )?;
+        if relative_artifact.components().count() != 1 {
+            return Err(format!(
+                "{}:{line_number} retained verify-log artifact directory is not one cell below {}",
+                file.display(),
+                run_root.display()
+            ));
+        }
+        require_plain_directory_path_below(
+            &run_root,
+            &artifact_dir,
+            "retained verify-log cell artifact directory",
+        )?;
+        let key = (cell.clone(), attempt);
+        let source = RetainedVerifyLogSource {
+            cell,
+            attempt,
+            artifact_dir,
+            retained,
+        };
+        if sources.insert(key, source).is_some() {
+            return Err(format!(
+                "{}:{line_number} duplicates a retained verify-log cell and attempt",
+                file.display()
+            ));
+        }
+    }
+
+    let mut referenced = BTreeSet::new();
+    let mut expected_by_namespace = BTreeMap::<PathBuf, BTreeSet<PathBuf>>::new();
+    for source in sources.values() {
+        let path = source.artifact_dir.join(&source.retained.relative_path);
+        if !referenced.insert(path.clone()) {
+            return Err(
+                "multiple retained_verify_log descriptors reference the same gzip".into(),
+            );
+        }
+        let namespace = source.artifact_dir.join("retained/verify");
+        let relative = checked_relative_path(
+            &namespace,
+            &path,
+            "retained verify-log descriptor path",
+        )?
+        .to_owned();
+        let expected_relative = PathBuf::from(source.attempt.to_string()).join("run-1.log.gz");
+        if relative != expected_relative {
+            return Err(format!(
+                "retained verify-log descriptor path must be {}, got {}",
+                expected_relative.display(),
+                relative.display()
+            ));
+        }
+        let entries = expected_by_namespace.entry(namespace).or_default();
+        entries.insert(
+            relative
+                .parent()
+                .expect("canonical retained log has an attempt directory")
+                .to_owned(),
+        );
+        entries.insert(relative);
+    }
+    if run_root.is_dir() {
+        for entry in fs::read_dir(&run_root).map_err(|error| {
+            format!(
+                "cannot read retained verify-log run directory {}: {error}",
+                run_root.display()
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                format!("cannot read retained verify-log cell directory entry: {error}")
+            })?;
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+                format!(
+                    "cannot inspect retained verify-log cell directory {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                let retained_root = entry.path().join("retained");
+                match fs::symlink_metadata(&retained_root) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot inspect retained verify-log root {}: {error}",
+                            retained_root.display()
+                        ));
+                    }
+                    Ok(retained_metadata)
+                        if retained_metadata.file_type().is_symlink()
+                            || !retained_metadata.is_dir() =>
+                    {
+                        return Err(format!(
+                            "retained verify-log root {} is not a non-symlink directory",
+                            retained_root.display()
+                        ));
+                    }
+                    Ok(_) => {}
+                }
+                let namespace = retained_root.join("verify");
+                match fs::symlink_metadata(&namespace) {
+                    Ok(_) => {
+                        if !expected_by_namespace.contains_key(&namespace) {
+                            return Err(format!(
+                                "unreferenced retained verify-log namespace {}",
+                                namespace.display()
+                            ));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot inspect retained verify-log namespace {}: {error}",
+                            namespace.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for (namespace, expected_entries) in expected_by_namespace {
+        let mut present_entries = BTreeSet::new();
+        collect_retained_namespace_entries(&namespace, &namespace, &mut present_entries)?;
+        if present_entries != expected_entries {
+            let unexpected = present_entries.difference(&expected_entries).count();
+            let missing = expected_entries.difference(&present_entries).count();
+            return Err(format!(
+                "retained verify-log namespace {} differs from result descriptors: {missing} missing, {unexpected} unreferenced or unexpected",
+                namespace.display()
+            ));
+        }
+    }
+    Ok(sources.into_values().collect())
+}
+
+fn publish_retained_verify_logs(
+    parent: &Path,
+    artifact_dir: &Path,
+    sources: &[RetainedVerifyLogSource],
+    policy: VerifyLogRetentionPolicy,
+    failure: Option<RetentionFailurePoint>,
+) -> Result<RetainedVerifyLogsArtifact, String> {
+    if sources.is_empty() {
+        return Err("cannot publish an empty retained verify-log index".into());
+    }
+    let total_compressed_bytes = sources.iter().try_fold(0u64, |total, source| {
+        total
+            .checked_add(source.retained.compressed_bytes)
+            .ok_or_else(|| "retained verify-log compressed byte total overflowed u64".to_string())
+    })?;
+    if total_compressed_bytes > policy.maximum_total_compressed_bytes {
+        return Err(format!(
+            "retained verify logs require {total_compressed_bytes} compressed bytes, exceeding the configured aggregate limit of {} bytes",
+            policy.maximum_total_compressed_bytes
+        ));
+    }
+
+    let final_directory = artifact_dir.join("verify-logs");
+    match fs::symlink_metadata(&final_directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect retained verify-log destination {}: {error}",
+                final_directory.display()
+            ));
+        }
+        Ok(_) => {
+            return Err(format!(
+                "retained verify-log destination already exists: {}",
+                final_directory.display()
+            ));
+        }
+    }
+
+    let staging = tempfile::Builder::new()
+        .prefix(".verify-logs.")
+        .tempdir_in(artifact_dir)
+        .map_err(|error| {
+            format!(
+                "cannot create retained verify-log staging directory in {}: {error}",
+                artifact_dir.display()
+            )
+        })?;
+    let mut index_rows = Vec::with_capacity(sources.len());
+    let mut destination_checks = Vec::with_capacity(sources.len());
+    for (offset, source) in sources.iter().enumerate() {
+        let ordinal = offset + 1;
+        let entry_relative = PathBuf::from(format!("{ordinal:06}"));
+        let entry_root = staging.path().join(&entry_relative);
+        let retained_parent = entry_root
+            .join(&source.retained.relative_path)
+            .parent()
+            .ok_or("retained verify-log destination has no parent")?
+            .to_owned();
+        fs::create_dir_all(&retained_parent).map_err(|error| {
+            format!(
+                "cannot create retained verify-log destination {}: {error}",
+                retained_parent.display()
+            )
+        })?;
+        let destination = entry_root.join(&source.retained.relative_path);
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&destination)
+            .map_err(|error| {
+                format!(
+                    "cannot create retained verify-log destination {}: {error}",
+                    destination.display()
+                )
+            })?;
+        let copied = copy_verified_retained_verify_log(
+            &source.artifact_dir,
+            &source.retained,
+            &source.retained.cell_id,
+            source.attempt,
+            &mut output,
+            policy.maximum_total_compressed_bytes,
+        )?;
+        output
+            .flush()
+            .and_then(|()| output.sync_all())
+            .map_err(|error| {
+                format!(
+                    "cannot sync retained verify-log destination {}: {error}",
+                    destination.display()
+                )
+            })?;
+        if copied.compressed_sha256 != source.retained.compressed_sha256
+            || copied.compressed_bytes != source.retained.compressed_bytes
+            || copied.uncompressed_sha256 != source.retained.uncompressed_sha256
+            || copied.uncompressed_bytes != source.retained.uncompressed_bytes
+        {
+            return Err("retained verify-log copy differs from its descriptor".into());
+        }
+        let final_path = final_directory
+            .join(&entry_relative)
+            .join(&source.retained.relative_path);
+        let relative = final_path
+            .strip_prefix(parent)
+            .map_err(|_| "retained verify-log destination is outside parent root")?
+            .to_string_lossy()
+            .into_owned();
+        index_rows.push(RetainedVerifyLogIndexRow {
+            cell: source.cell.clone(),
+            attempt: source.attempt,
+            retained_verify_log: source.retained.clone(),
+            artifact: RetainedVerifyLogArtifact {
+                path: relative,
+                sha256: copied.compressed_sha256,
+                bytes: copied.compressed_bytes,
+            },
+        });
+        destination_checks.push((
+            entry_relative,
+            source.retained.clone(),
+            source.retained.cell_id.clone(),
+            source.attempt,
+        ));
+    }
+
+    let mut index_bytes = Vec::new();
+    for row in &index_rows {
+        serde_json::to_writer(&mut index_bytes, row)
+            .map_err(|error| format!("cannot encode retained verify-log index row: {error}"))?;
+        index_bytes.push(b'\n');
+    }
+    let staging_index = staging.path().join("index.jsonl");
+    let mut index_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&staging_index)
+        .map_err(|error| {
+            format!(
+                "cannot create retained verify-log index {}: {error}",
+                staging_index.display()
+            )
+        })?;
+    index_file
+        .write_all(&index_bytes)
+        .and_then(|()| index_file.flush())
+        .and_then(|()| index_file.sync_all())
+        .map_err(|error| format!("cannot write retained verify-log index: {error}"))?;
+    sync_directory_tree(staging.path())?;
+    if failure == Some(RetentionFailurePoint::BeforeVerifyLogRename) {
+        return Err("injected failure before retained verify-log directory rename".into());
+    }
+    rename_directory_noreplace(staging.path(), &final_directory)?;
+    let finish_publication = || -> Result<RetainedVerifyLogsArtifact, String> {
+        if failure == Some(RetentionFailurePoint::AfterVerifyLogRename) {
+            return Err("injected failure after retained verify-log directory rename".into());
+        }
+        sync_directory(artifact_dir, "retained validation artifact directory")?;
+        for (entry_relative, retained, cell_id, attempt) in &destination_checks {
+            hermit_manifest_plan::runner::verify_retained_verify_log(
+                &final_directory.join(entry_relative),
+                retained,
+                cell_id,
+                *attempt,
+            )?;
+        }
+        let published_index = final_directory.join("index.jsonl");
+        let metadata = fs::symlink_metadata(&published_index).map_err(|error| {
+            format!(
+                "cannot inspect published retained verify-log index {}: {error}",
+                published_index.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.nlink() != 1 {
+            return Err("published retained verify-log index is not one regular file".into());
+        }
+        let observed = fs::read(&published_index).map_err(|error| {
+            format!(
+                "cannot read published retained verify-log index {}: {error}",
+                published_index.display()
+            )
+        })?;
+        if observed != index_bytes {
+            return Err("published retained verify-log index differs from staged bytes".into());
+        }
+        let index_path = final_directory.join("index.jsonl");
+        let relative = index_path
+            .strip_prefix(parent)
+            .map_err(|_| "retained verify-log index is outside parent root")?
+            .to_string_lossy()
+            .into_owned();
+        Ok(RetainedVerifyLogsArtifact {
+            path: relative,
+            sha256: hex_digest(&index_bytes),
+            row_count: u64::try_from(index_rows.len())
+                .map_err(|_| "retained verify-log index row count does not fit u64")?,
+            compressed_bytes: total_compressed_bytes,
+        })
+    };
+    match finish_publication() {
+        Ok(artifact) => Ok(artifact),
+        Err(error) => match remove_published_verify_logs(artifact_dir) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(format!(
+                "{error}; cannot clean failed retained verify-log publication {}: {cleanup_error}",
+                final_directory.display()
+            )),
+        },
+    }
+}
+
+fn publish_file_noclobber(path: &Path, bytes: &[u8], description: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{description} {} has no parent", path.display()))?;
+    require_plain_directory(parent, "retained validation artifact directory")?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".artifact.")
+        .tempfile_in(parent)
+        .map_err(|error| {
+            format!(
+                "cannot create temporary {description} beside {}: {error}",
+                path.display()
+            )
+        })?;
+    temporary
+        .write_all(bytes)
+        .and_then(|()| temporary.flush())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| format!("cannot write temporary {description}: {error}"))?;
+    temporary.persist_noclobber(path).map_err(|error| {
+        format!(
+            "cannot publish {description} to {} without replacement: {}",
+            path.display(),
+            error.error
+        )
+    })?;
+    if let Err(error) = sync_directory(parent, "retained validation artifact directory") {
+        return match fs::remove_file(path) {
+            Ok(()) => match sync_directory(parent, "retained validation artifact directory") {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(format!(
+                    "{error}; cannot sync cleanup of failed {description}: {cleanup_error}"
+                )),
+            },
+            Err(cleanup_error) => Err(format!(
+                "{error}; cannot remove failed {description} {}: {cleanup_error}",
+                path.display()
+            )),
+        };
+    }
+    Ok(())
+}
+
+/// Publish one immutable companion artifact into the run directory created by
+/// cell-result retention. This deliberately shares the same no-symlink,
+/// no-clobber, file-sync, and parent-directory-sync path as cell evidence.
+pub(crate) fn publish_run_artifact_noclobber(
+    parent: &Path,
+    run_id: &str,
+    name: &str,
+    bytes: &[u8],
+    description: &str,
+) -> Result<String, String> {
+    require_normal_component(run_id, "retained validation run_id")?;
+    require_normal_component(name, "retained validation artifact name")?;
+    let relative_directory = PathBuf::from("ignored")
+        .join("validate")
+        .join("artifacts")
+        .join(run_id);
+    let artifact_dir = create_plain_directory_path_below(
+        parent,
+        &relative_directory,
+        "retained validation artifact directory",
+        None,
+    )?;
+    let artifact = artifact_dir.join(name);
+    if fs::symlink_metadata(&artifact).is_ok() {
+        return Err(format!(
+            "retained validation artifact already exists: {}",
+            artifact.display()
+        ));
+    }
+    publish_file_noclobber(&artifact, bytes, description)?;
+    artifact
+        .strip_prefix(parent)
+        .map_err(|_| "retained validation artifact is outside parent root".to_string())
+        .map(|relative| relative.to_string_lossy().into_owned())
+}
+
+fn remove_published_verify_logs(artifact_dir: &Path) -> Result<(), String> {
+    let path = artifact_dir.join("verify-logs");
+    match fs::remove_dir_all(&path) {
+        Ok(()) => sync_directory(artifact_dir, "retained validation artifact directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot remove retained verify-log publication {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn collect_retained_namespace_entries(
+    namespace: &Path,
+    path: &Path,
+    output: &mut BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect retained verify-log source {}: {error}",
+                path.display()
+            ));
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "retained verify-log namespace entry {} is a symlink",
+                path.display()
+            ));
+        }
+        Ok(metadata) if metadata.is_file() => {
+            let relative = checked_relative_path(
+                namespace,
+                path,
+                "retained verify-log namespace entry",
+            )?;
+            output.insert(relative.to_owned());
+            return Ok(());
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(format!(
+                "retained verify-log namespace entry {} is not a regular file or directory",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+    }
+    for entry in fs::read_dir(path)
+        .map_err(|error| format!("cannot read retained verify-log source {}: {error}", path.display()))?
+    {
+        let entry = entry.map_err(|error| format!("cannot read retained source entry: {error}"))?;
+        let entry_path = entry.path();
+        let relative = checked_relative_path(
+            namespace,
+            &entry_path,
+            "retained verify-log namespace entry",
+        )?;
+        output.insert(relative.to_owned());
+        collect_retained_namespace_entries(namespace, &entry_path, output)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn collect_retained_gzip_paths(path: &Path, output: &mut BTreeSet<PathBuf>) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect retained verify-log artifact {}: {error}",
+                path.display()
+            ));
+        }
+        Ok(metadata) if metadata.is_file() => {
+            if path.extension().is_some_and(|extension| extension == "gz") {
+                output.insert(path.to_owned());
+            }
+            return Ok(());
+        }
+        Ok(metadata) if !metadata.is_dir() => return Ok(()),
+        Ok(_) => {}
+    }
+    for entry in fs::read_dir(path).map_err(|error| {
+        format!(
+            "cannot read retained verify-log artifact {}: {error}",
+            path.display()
+        )
+    })? {
+        let entry = entry.map_err(|error| format!("cannot read retained artifact entry: {error}"))?;
+        collect_retained_gzip_paths(&entry.path(), output)?;
+    }
+    Ok(())
 }
 
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -567,54 +1486,197 @@ pub fn retain_coverage_evidence(
     Ok(RetainedCoverageEvidence { evidence: Value::Object(evidence) })
 }
 
-/// Transform all result rows for one validate invocation into the closed
-/// schema-7 cell-verdict artifact and summary used by ci-hub.
+/// Transform historical result rows for one validate invocation into the
+/// closed schema-7 cell-verdict artifact and summary used by ci-hub.
+///
+/// Current rows that carry retained verify logs require
+/// [`retain_with_policy`]. Keeping this entrypoint unable to guess a storage
+/// limit prevents a new descriptor from disappearing into a schema-7 receipt.
 pub fn retain(
     parent: &Path,
     result_root: &Path,
     commit: &str,
     expected: &[Value],
 ) -> Result<RetainedCellResults, String> {
+    retain_inner(parent, result_root, commit, expected, None, None)
+}
+
+/// Retain cell results plus every harness-managed verify gzip under one shared
+/// aggregate compressed-byte policy.
+///
+/// `scripts/validate.rs` must pass the same policy used by the harness-wide
+/// [`VerifyLogRetentionPolicy`] and the image digest captured for the command
+/// passed to `run-in-pinned-root.sh` when the split-run scheduler is activated.
+/// This function deliberately does not reread `ci/hermetic/image.digest` after
+/// execution. No independent default belongs at this boundary.
+#[allow(dead_code)] // Activated with the harness-managed verify scheduler and its shared policy.
+pub fn retain_with_policy(
+    parent: &Path,
+    result_root: &Path,
+    commit: &str,
+    expected: &[Value],
+    validate_path: ValidatePath,
+    hermetic_image_digest: &str,
+    policy: VerifyLogRetentionPolicy,
+) -> Result<RetainedCellResults, String> {
+    if !is_canonical_hermetic_image_digest(hermetic_image_digest) {
+        return Err("retained verify logs require a canonical hermetic_image_digest".into());
+    }
+    retain_inner(
+        parent,
+        result_root,
+        commit,
+        expected,
+        Some((validate_path, hermetic_image_digest, policy)),
+        None,
+    )
+}
+
+fn retain_inner(
+    parent: &Path,
+    result_root: &Path,
+    commit: &str,
+    expected: &[Value],
+    verify_log_policy: Option<(ValidatePath, &str, VerifyLogRetentionPolicy)>,
+    failure: Option<RetentionFailurePoint>,
+) -> Result<RetainedCellResults, String> {
     let mut run_id: Option<String> = None;
     let mut selected = Vec::new();
     let mut identities = BTreeSet::new();
     let mut observations = BTreeSet::new();
     let mut attempt_rows: BTreeMap<CellIdentity, Vec<(u64, Value)>> = BTreeMap::new();
-    for (file, line_number, row) in read_result_rows(result_root)? {
-            if row.get("schema").and_then(Value::as_u64) != Some(4)
-                || string(&row, "hermit_sha")? != commit
-                || row.get("source_tree_dirty").and_then(Value::as_bool) != Some(false)
-            {
-                return Err(format!(
-                    "{}:{line_number} is not an exact clean schema-4 cell result for {commit}",
-                    file.display()
-                ));
-            }
-            require_current_timeout_policy(&row)
-                .map_err(|error| format!("{}:{line_number} {error}", file.display()))?;
-            let row_run_id = string(&row, "run_id")?;
-            match run_id.as_deref() {
-                None => run_id = Some(row_run_id.into()),
-                Some(existing) if existing == row_run_id => {}
-                Some(existing) => {
+    let mut has_retained_verify_log = false;
+    let source_rows = read_result_rows(result_root)?;
+    for (file, line_number, row) in &source_rows {
+        let schema = row.get("schema").and_then(Value::as_u64).unwrap_or(0);
+        if !matches!(
+            schema,
+            CELL_RESULT_SCHEMA | RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA
+        )
+            || string(row, "hermit_sha")? != commit
+            || row.get("source_tree_dirty").and_then(Value::as_bool) != Some(false)
+        {
+            return Err(format!(
+                "{}:{line_number} is not an exact clean supported cell result for {commit}",
+                file.display()
+            ));
+        }
+        let retained_descriptor_count = row
+            .get("attempts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|attempt| {
+                attempt
+                    .get("retained_verify_log")
+                    .is_some_and(|value| !value.is_null())
+            })
+            .count();
+        let mode = string(row, "mode")?;
+        let backend = row.get("backend").and_then(Value::as_str);
+        let required_verify_schema = if mode == "verify" {
+            match backend {
+                Some("ptrace" | "kvm" | "liteinst") => {
+                    Some(RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA)
+                }
+                // DBT is an explicit pre-launch refusal and SaBRe remains on
+                // its legacy internal comparison path. Neither route can
+                // publish the harness-managed ordinary-run descriptor.
+                Some("dbt" | "sabre") => Some(CELL_RESULT_SCHEMA),
+                Some(backend) if verify_log_policy.is_some() => {
                     return Err(format!(
-                        "per-cell results mix run_id {existing} with {row_run_id}"
+                        "{}:{line_number} verify result uses unsupported backend {backend}",
+                        file.display()
+                    ));
+                }
+                // Historical schema-4 retention predates the backend route
+                // cutover and must remain readable without reclassification.
+                Some(_) => None,
+                None if verify_log_policy.is_some() => {
+                    return Err(format!(
+                        "{}:{line_number} verify result omitted backend",
+                        file.display()
+                    ));
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        match schema {
+            CELL_RESULT_SCHEMA => {
+                if retained_descriptor_count != 0 {
+                    return Err(format!(
+                        "{}:{line_number} schema-4 result cannot carry retained_verify_log",
+                        file.display()
+                    ));
+                }
+                if verify_log_policy.is_some()
+                    && required_verify_schema == Some(RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA)
+                {
+                    return Err(format!(
+                        "{}:{line_number} harness-managed {backend:?} verify result requires schema 5",
+                        file.display()
                     ));
                 }
             }
-            let id = identity(&row)?;
-            let key = id.clone();
-            let attempt = row.get("attempt").and_then(Value::as_u64).unwrap_or(1);
-            if attempt == 0 {
-                return Err("per-cell result attempt must be positive".into());
+            RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA => {
+                if mode != "verify" {
+                    return Err(format!(
+                        "{}:{line_number} schema-5 result must use verify mode",
+                        file.display()
+                    ));
+                }
+                if required_verify_schema != Some(RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA) {
+                    return Err(format!(
+                        "{}:{line_number} schema-5 result is reserved for harness-managed ptrace, kvm, or liteinst verify execution",
+                        file.display(),
+                    ));
+                }
+                if retained_descriptor_count != 1 {
+                    return Err(format!(
+                        "{}:{line_number} schema-5 result requires exactly one retained_verify_log, got {retained_descriptor_count}",
+                        file.display()
+                    ));
+                }
             }
-            if !observations.insert((key.clone(), attempt)) {
-                return Err("per-cell results contain a duplicate identity and attempt".into());
+            _ => unreachable!("the supported-schema check above admitted an unknown schema"),
+        }
+        has_retained_verify_log |= retained_descriptor_count != 0;
+        if retained_descriptor_count != 0 && verify_log_policy.is_none() {
+            return Err(
+                "retained verify-log descriptors require the shared explicit retention policy; refusing to emit schema 7 and lose their binding"
+                    .into(),
+            );
+        }
+        require_current_timeout_policy(row)
+            .map_err(|error| format!("{}:{line_number} {error}", file.display()))?;
+        let row_run_id = string(row, "run_id")?;
+        match run_id.as_deref() {
+            None => run_id = Some(row_run_id.into()),
+            Some(existing) if existing == row_run_id => {}
+            Some(existing) => {
+                return Err(format!(
+                    "per-cell results mix run_id {existing} with {row_run_id}"
+                ));
             }
-            if identities.insert(key.clone()) {
-                selected.push(id);
-            }
-            attempt_rows.entry(key).or_default().push((attempt, row));
+        }
+        let id = identity(row)?;
+        let key = id.clone();
+        let attempt = row.get("attempt").and_then(Value::as_u64).unwrap_or(1);
+        if attempt == 0 {
+            return Err("per-cell result attempt must be positive".into());
+        }
+        if !observations.insert((key.clone(), attempt)) {
+            return Err("per-cell results contain a duplicate identity and attempt".into());
+        }
+        if identities.insert(key.clone()) {
+            selected.push(id);
+        }
+        attempt_rows
+            .entry(key)
+            .or_default()
+            .push((attempt, row.clone()));
     }
     let mut cells = attempt_rows
         .into_iter()
@@ -644,6 +1706,11 @@ pub fn retain(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let run_id = run_id.ok_or("full validation retained zero per-cell result rows")?;
+    let verify_logs = if has_retained_verify_log || verify_log_policy.is_some() {
+        collect_verify_log_sources(result_root, &run_id, &source_rows)?
+    } else {
+        Vec::new()
+    };
     selected.sort();
     cells.sort_by_key(|cell| CellIdentity {
         lane: cell.lane.clone(),
@@ -672,18 +1739,23 @@ pub fn retain(
         .collect::<Result<Vec<_>, String>>()?;
     let population_bytes = serde_json::to_vec(&selected_values)
         .map_err(|error| format!("cannot encode selected cell population: {error}"))?;
-    let artifact_dir = parent
-        .join("ignored")
+    let artifact_relative = PathBuf::from("ignored")
         .join("validate")
         .join("artifacts")
         .join(&run_id);
-    fs::create_dir_all(&artifact_dir).map_err(|error| {
-        format!(
-            "cannot create retained cell artifact {}: {error}",
-            artifact_dir.display()
-        )
-    })?;
+    let artifact_dir = create_plain_directory_path_below(
+        parent,
+        &artifact_relative,
+        "retained validation artifact directory",
+        failure,
+    )?;
     let artifact = artifact_dir.join("cell-results.jsonl");
+    if fs::symlink_metadata(&artifact).is_ok() {
+        return Err(format!(
+            "retained cell artifact already exists: {}",
+            artifact.display()
+        ));
+    }
     let mut artifact_bytes = Vec::new();
     for cell in &cells {
         let mut record = serde_json::to_value(cell)
@@ -698,12 +1770,6 @@ pub fn retain(
             .map_err(|error| format!("cannot encode retained cell row: {error}"))?;
         artifact_bytes.push(b'\n');
     }
-    fs::write(&artifact, &artifact_bytes).map_err(|error| {
-        format!(
-            "cannot publish retained cell artifact {}: {error}",
-            artifact.display()
-        )
-    })?;
     let relative = artifact
         .strip_prefix(parent)
         .map_err(|_| "retained cell artifact is outside parent root")?
@@ -713,26 +1779,95 @@ pub fn retain(
         .map_err(|_| "retained cell count does not fit the ledger type")?;
     let selected_count = u64::try_from(selected.len())
         .map_err(|_| "selected cell count does not fit the ledger type")?;
-    let evidence = CellResultsEvidence {
+    let cell_artifact = CellResultsArtifact {
+        path: relative,
+        sha256: hex_digest(&artifact_bytes),
+        row_count: recorded_count,
+    };
+    let historical_evidence = CellResultsEvidence {
         run_id: run_id.clone(),
         hermit_sha: commit.into(),
         source_tree_dirty: false,
         selected_count,
         recorded_count,
         population_sha256: hex_digest(&population_bytes),
-        artifact: CellResultsArtifact {
-            path: relative,
-            sha256: hex_digest(&artifact_bytes),
-            row_count: recorded_count,
-        },
-        selected,
-        cells,
+        artifact: cell_artifact.clone(),
+        selected: selected.clone(),
+        cells: cells.clone(),
     };
+    let (schema_version, evidence, published_verify_logs) = match verify_log_policy {
+        Some((validate_path, hermetic_image_digest, policy)) if !verify_logs.is_empty() => {
+            let schema10_population_bytes = serde_json::to_vec(&selected).map_err(|error| {
+                format!("cannot encode schema-10 selected cell population: {error}")
+            })?;
+            let retained_verify_logs =
+                publish_retained_verify_logs(parent, &artifact_dir, &verify_logs, policy, failure)?;
+            let evidence = serde_json::to_value(CellResultsEvidenceV10 {
+                path: validate_path,
+                run_id: run_id.clone(),
+                hermit_sha: commit.into(),
+                source_tree_dirty: false,
+                hermetic_image_digest: hermetic_image_digest.into(),
+                selected_count,
+                recorded_count,
+                population_sha256: hex_digest(&schema10_population_bytes),
+                artifact: cell_artifact,
+                retained_verify_logs,
+                selected,
+                cells,
+            });
+            let evidence = match evidence {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    let error = format!("cannot encode schema-10 cell_results evidence: {error}");
+                    return match remove_published_verify_logs(&artifact_dir) {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(format!(
+                            "{error}; retained verify-log cleanup also failed: {cleanup_error}"
+                        )),
+                    };
+                }
+            };
+            (
+                RETAINED_VERIFY_LOGS_LEDGER_SCHEMA_VERSION,
+                evidence,
+                true,
+            )
+        }
+        _ => (
+            CELL_RESULTS_LEDGER_SCHEMA_VERSION,
+            serde_json::to_value(historical_evidence)
+                .map_err(|error| format!("cannot encode cell_results evidence: {error}"))?,
+            false,
+        ),
+    };
+    if failure == Some(RetentionFailurePoint::BeforeCellResultPublication) {
+        let error = "injected failure before retained cell-result publication".to_string();
+        if published_verify_logs {
+            return match remove_published_verify_logs(&artifact_dir) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(format!(
+                    "{error}; retained verify-log cleanup also failed: {cleanup_error}"
+                )),
+            };
+        }
+        return Err(error);
+    }
+    if let Err(error) = publish_file_noclobber(&artifact, &artifact_bytes, "retained cell artifact") {
+        if published_verify_logs {
+            return match remove_published_verify_logs(&artifact_dir) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(format!(
+                    "{error}; retained verify-log cleanup also failed: {cleanup_error}"
+                )),
+            };
+        }
+        return Err(error);
+    }
     Ok(RetainedCellResults {
-        schema_version: CELL_RESULTS_LEDGER_SCHEMA_VERSION,
+        schema_version,
         run_id,
-        evidence: serde_json::to_value(evidence)
-            .map_err(|error| format!("cannot encode cell_results evidence: {error}"))?,
+        evidence,
     })
 }
 
@@ -803,7 +1938,7 @@ mod tests {
     fn result_row(run_id: &str, commit: &str) -> Value {
         let matched = report("matched", "info");
         serde_json::json!({
-            "schema": 4,
+            "schema": CELL_RESULT_SCHEMA,
             "run_id": run_id,
             "hermit_sha": commit,
             "source_tree_dirty": false,
@@ -819,6 +1954,155 @@ mod tests {
             "execution_wall_timeout_seconds": 57,
             "attempts": [attempt(&matched)]
         })
+    }
+
+    const RETAINED_LOG_BODY: &[u8] =
+        b"Apr 09 06:08:01.100  INFO detcore: DETLOG retained\n";
+    const HERMETIC_IMAGE_DIGEST: &str = concat!(
+        "localhost/hermit-hermetic-validate@sha256:",
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    );
+    const RETAINED_LOG_GZIP: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x73, 0x2c, 0x28, 0x52,
+        0x30, 0xb0, 0x54, 0x30, 0x30, 0xb3, 0x32, 0xb0, 0xb0, 0x32, 0x30, 0xd4, 0x33, 0x34,
+        0x30, 0x50, 0x50, 0xf0, 0xf4, 0x73, 0xf3, 0x57, 0x48, 0x49, 0x2d, 0x49, 0xce, 0x2f,
+        0x4a, 0xb5, 0x52, 0x70, 0x71, 0x0d, 0xf1, 0xf1, 0x77, 0x57, 0x28, 0x4a, 0x2d, 0x49,
+        0xcc, 0xcc, 0x4b, 0x4d, 0xe1, 0x02, 0x00, 0x28, 0x0b, 0x31, 0xf5, 0x33, 0x00, 0x00,
+        0x00,
+    ];
+
+    fn add_retained_verify_log(result_root: &Path, row: &mut Value) -> PathBuf {
+        row["schema"] = Value::from(RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA);
+        row["attempt"] = Value::from(1);
+        let run_id = row["run_id"].as_str().unwrap();
+        let slug = format!(
+            "{}-{}-{}",
+            row["test"].as_str().unwrap().replace('/', "-"),
+            row["mode"].as_str().unwrap(),
+            row["backend"].as_str().unwrap()
+        );
+        let artifact_dir = result_root.join("runs").join(run_id).join(slug);
+        let relative = PathBuf::from("retained/verify/1/run-1.log.gz");
+        let source = artifact_dir.join(&relative);
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, RETAINED_LOG_GZIP).unwrap();
+        row["artifact_dir"] = Value::String(artifact_dir.to_string_lossy().into_owned());
+        row["attempts"][0]["retained_verify_log"] =
+            serde_json::to_value(RetainedVerifyLog {
+                relative_path: relative.to_string_lossy().into_owned(),
+                role: hermit_manifest_plan::runner::RetainedVerifyLogRole::Run1,
+                cell_id: CellId {
+                    test: row["test"].as_str().unwrap().into(),
+                    mode: "verify".into(),
+                    backend: Some(row["backend"].as_str().unwrap().into()),
+                },
+                attempt: 1,
+                uncompressed_sha256:
+                    "88c093a87fc7c41d677e0fd785fe0c0c1417f5d0af1c2721a397d8ba9970c054"
+                        .into(),
+                uncompressed_bytes: 51,
+                compressed_sha256:
+                    "57163e2d716668da05d566bb6a489310f4cf79e286937ef2f8308b91df83de35"
+                        .into(),
+                compressed_bytes: 71,
+                peer_uncompressed_sha256:
+                    "88c093a87fc7c41d677e0fd785fe0c0c1417f5d0af1c2721a397d8ba9970c054"
+                        .into(),
+                peer_uncompressed_bytes: 51,
+                compared_info_messages: 123,
+            })
+            .unwrap();
+        source
+    }
+
+    fn write_harness_verify_run(spec: &hermit_manifest_plan::runner::VerifyRunSpec) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::create_dir_all(&spec.paths.capture_dir).unwrap();
+        fs::create_dir_all(&spec.paths.workdir).unwrap();
+        fs::create_dir_all(&spec.paths.evidence).unwrap();
+        fs::write(&spec.paths.stdout, []).unwrap();
+        fs::write(&spec.paths.stderr, []).unwrap();
+        let stdout_metadata = fs::metadata(&spec.paths.stdout).unwrap();
+        let stderr_metadata = fs::metadata(&spec.paths.stderr).unwrap();
+        let empty_sha256 = hex_digest(&[]);
+        let result = serde_json::json!({
+            "schema_version": 1,
+            "disposition": {"kind": "exited", "code": 0},
+            "determinism": spec.expected_policy(),
+            "stdout": {
+                "bytes": 0,
+                "sha256": empty_sha256,
+                "identity": {
+                    "device": stdout_metadata.dev(),
+                    "inode": stdout_metadata.ino(),
+                },
+            },
+            "stderr": {
+                "bytes": 0,
+                "sha256": empty_sha256,
+                "identity": {
+                    "device": stderr_metadata.dev(),
+                    "inode": stderr_metadata.ino(),
+                },
+            },
+        });
+        fs::write(&spec.paths.result, serde_json::to_vec(&result).unwrap()).unwrap();
+        let structured_log = format!(
+            "{} DETLOG_RECORD={{\"schema\":1,\"event\":{{\"kind\":\"other\"}}}}\n",
+            std::str::from_utf8(RETAINED_LOG_BODY).unwrap().trim_end()
+        );
+        fs::write(&spec.paths.log, &structured_log).unwrap();
+        fs::write(
+            &spec.paths.summary,
+            serde_json::to_vec(&serde_json::json!({
+                "sched_turns": 1,
+                "schedevent_replayed": 0,
+                "schedevent_recorded": 0,
+                "schedevent_desynced": 0,
+                "desync_descrip": null,
+                "reprio_descrip": null,
+                "threads_descrip": "[1]",
+                "num_processes": 1,
+                "num_threads": 1,
+                "syscalls": 1,
+                "virttime_elapsed": 1,
+                "virttime_final": 1,
+                "realtime_elapsed": null,
+                "timeslice_stats": {"count": 0, "sum_ns": 0, "min_ns": 0, "max_ns": 0},
+                "per_thread_timeslice": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let invocation_id = if spec.paths.evidence.ends_with("run-1/evidence") {
+            "00000000-0000-0000-0000-000000000001"
+        } else {
+            "00000000-0000-0000-0000-000000000002"
+        };
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "invocation_id": invocation_id,
+            "backend": "ptrace",
+            "attempt": 1,
+            "outcome": {
+                "kind": "complete",
+                "disposition": {"kind": "exited", "code": 0}
+            },
+            "canonical_info": {
+                "policy": "bitwise_info_v1",
+                "record_envelope": "all_records_v1",
+                "message_count": 1,
+                "byte_count": structured_log.len(),
+                "sha256": hex_digest(structured_log.as_bytes()),
+                "artifact": "canonical-info-v1.log"
+            }
+        });
+        let manifest_path = spec.paths.evidence.join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let mut permissions = fs::metadata(&manifest_path).unwrap().permissions();
+        permissions.set_mode(0o400);
+        fs::set_permissions(&manifest_path, permissions).unwrap();
     }
 
     #[test]
@@ -1319,5 +2603,834 @@ mod tests {
         let error = retain(&root, &results, commit, &plan).unwrap_err();
         assert!(error.contains("1 missing, 0 extra"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema10_retains_sorted_verify_gzips_after_the_source_tree_is_deleted() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).unwrap();
+        let results = root.join("disposable-results");
+        let commit = "1010101010101010101010101010101010101010";
+        let mut second = result_row("validate-retained", commit);
+        second["test"] = Value::String("z-last".into());
+        second["backend"] = Value::String("kvm".into());
+        add_retained_verify_log(&results, &mut second);
+        let mut first = result_row("validate-retained", commit);
+        first["test"] = Value::String("a-first".into());
+        add_retained_verify_log(&results, &mut first);
+        append_result_row(&results, &second);
+        append_result_row(&results, &first);
+
+        let retained = retain_with_policy(
+            &root,
+            &results,
+            commit,
+            &[identity_value(&identity(&second).unwrap()).unwrap(), identity_value(&identity(&first).unwrap()).unwrap()],
+            ValidatePath::Full,
+            HERMETIC_IMAGE_DIGEST,
+            VerifyLogRetentionPolicy::new(142),
+        )
+        .unwrap();
+        assert_eq!(retained.schema_version, 10);
+        assert_eq!(
+            retained.evidence["hermetic_image_digest"],
+            HERMETIC_IMAGE_DIGEST
+        );
+        assert_eq!(retained.evidence["retained_verify_logs"]["row_count"], 2);
+        assert_eq!(
+            retained.evidence["retained_verify_logs"]["compressed_bytes"],
+            142
+        );
+        assert_eq!(retained.evidence["selected_count"], 2);
+        let index = root.join(
+            retained.evidence["retained_verify_logs"]["path"]
+                .as_str()
+                .unwrap(),
+        );
+        let index_bytes = fs::read(&index).unwrap();
+        assert_eq!(
+            hex_digest(&index_bytes),
+            retained.evidence["retained_verify_logs"]["sha256"]
+        );
+        let rows = index_bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<RetainedVerifyLogIndexRow>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows[0].cell.test, "a-first");
+        assert_eq!(rows[1].cell.test, "z-last");
+        assert!(rows[0].artifact.path.contains("verify-logs/000001/"));
+        assert!(rows[1].artifact.path.contains("verify-logs/000002/"));
+
+        fs::remove_dir_all(&results).unwrap();
+        for (ordinal, row) in rows.iter().enumerate() {
+            let entry_root = index
+                .parent()
+                .unwrap()
+                .join(format!("{:06}", ordinal + 1));
+            assert_eq!(
+                hermit_manifest_plan::runner::read_verified_retained_verify_log(
+                    &entry_root,
+                    &row.retained_verify_log,
+                    &row.retained_verify_log.cell_id,
+                    row.attempt,
+                )
+                .unwrap(),
+                RETAINED_LOG_BODY
+            );
+            let bytes = fs::read(root.join(&row.artifact.path)).unwrap();
+            assert_eq!(hex_digest(&bytes), row.artifact.sha256);
+            assert_eq!(u64::try_from(bytes.len()).unwrap(), row.artifact.bytes);
+        }
+        let mut gzips = BTreeSet::new();
+        collect_retained_gzip_paths(index.parent().unwrap(), &mut gzips).unwrap();
+        assert_eq!(gzips.len(), 2, "one gzip per compared pair is retained");
+        assert!(!root
+            .join("ignored/validate/artifacts/validate-retained/verify-logs")
+            .join("run-1.log")
+            .exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn harness_publication_is_accepted_by_schema10_retention_without_rewriting_the_row() {
+        use hermit_manifest_plan::ci_selection::CiSelectionSpec;
+        use hermit_manifest_plan::runner::AttemptResult;
+        use hermit_manifest_plan::runner::CellResult;
+        use hermit_manifest_plan::runner::DirectCommand;
+        use hermit_manifest_plan::runner::ModeRecipe;
+        use hermit_manifest_plan::runner::Observation;
+        use hermit_manifest_plan::runner::ObservedResult;
+        use hermit_manifest_plan::runner::RunContext;
+        use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
+        use hermit_manifest_plan::runner::SelectedCell;
+        use hermit_manifest_plan::runner::TestRecipe;
+        use hermit_manifest_plan::runner::VerifyLogRetentionBudget;
+        use hermit_manifest_plan::runner::VerifyRun;
+        use hermit_manifest_plan::runner::build_verify_run_spec;
+        use hermit_manifest_plan::runner::compare_verify_runs;
+        use hermit_manifest_plan::runner::load_verify_run;
+        use hermit_manifest_plan::runner::prepare_result_path_from_root;
+        use hermit_manifest_plan::runner::publish_retained_verify_log;
+        use hermit_manifest_plan::timeouts::TimeoutMultipliers;
+
+        let root = fixture_root();
+        let results = root.join("results");
+        let run_id = "validate-writer-consumer";
+        let run_root = results.join("runs").join(run_id);
+        let artifact_dir = run_root.join("fixture-test-verify-ptrace");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let mode = ModeRecipe {
+            ci: CiSelectionSpec::Uniform(true),
+            backends_enabled: vec!["ptrace".into()],
+            ..ModeRecipe::default()
+        };
+        let test = TestRecipe {
+            id: "fixture/test".into(),
+            description: "fixture".into(),
+            lane: "portable".into(),
+            requires: Vec::new(),
+            occasional: false,
+            program: None,
+            direct: Some(DirectCommand::Argv(vec!["/bin/true".into()])),
+            observation: Observation {
+                status: true,
+                stdout: true,
+                stderr: true,
+                artifacts: Vec::new(),
+            },
+            build: None,
+            modes: BTreeMap::from([("verify".into(), mode)]),
+            preprocessors: Vec::new(),
+        };
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            test,
+            enabled: true,
+            timeout_seconds: 57,
+            cpu_timeout_seconds: 22,
+        };
+        let commit = "1818181818181818181818181818181818181818";
+        let context = RunContext {
+            root: root.clone(),
+            hermit_bin: root.join("hermit"),
+            result_root: results.clone(),
+            build_root: root.join("build"),
+            run_id: run_id.into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: BTreeMap::new(),
+            attempt: 1,
+            run_index: None,
+            source_sha: commit.into(),
+            source_dirty: false,
+            binary_build_sha: None,
+            prebuilt: true,
+            keep_logs: false,
+            run_verify_strict: false,
+            record_verify_strict: false,
+            timeout_multipliers: TimeoutMultipliers::default(),
+            scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
+            isolated_workdir: None,
+        };
+        let run1 = build_verify_run_spec(
+            &context,
+            &cell,
+            artifact_dir.clone(),
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run1,
+            57,
+        )
+        .unwrap();
+        let run2 = build_verify_run_spec(
+            &context,
+            &cell,
+            artifact_dir.clone(),
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run2,
+            57,
+        )
+        .unwrap();
+        write_harness_verify_run(&run1);
+        write_harness_verify_run(&run2);
+        let pair = compare_verify_runs(
+            &run1,
+            load_verify_run(&run1).unwrap(),
+            &run2,
+            load_verify_run(&run2).unwrap(),
+        )
+        .unwrap();
+
+        let attempt = AttemptResult {
+            index: "1".into(),
+            outcome: "PASS".into(),
+            error_kind: None,
+            status: Some(0),
+            signal: None,
+            timed_out: false,
+            duration_ms: 1,
+            cpu_usage_usec: Some(1),
+            observation_sha256: None,
+            argv: run1.execution.argv.clone(),
+            guest_argv: run1.execution.guest_argv.clone(),
+            env: run1.execution.env.clone(),
+            cwd: run1.execution.cwd.to_string_lossy().into_owned(),
+            shell_command: String::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            verification_report: None,
+            verification_report_sha256: None,
+            retained_verify_log: None,
+            runtime: None,
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
+            first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
+            sabre_path_evidence: None,
+            sabre_path_evidence_sha256: None,
+            reason: None,
+        };
+        let mut result = CellResult {
+            schema: CELL_RESULT_SCHEMA,
+            run_id: run_id.into(),
+            machine_shortname: "fixture-host".into(),
+            kernel_version: "7.1.3-fixture".into(),
+            host_capabilities: BTreeMap::new(),
+            attempt: 1,
+            run_index: None,
+            hermit_sha: commit.into(),
+            source_tree_dirty: false,
+            binary_sha256: None,
+            binary_build_sha: None,
+            test_sha256: "fixture-test-digest".into(),
+            test: cell.id.test.clone(),
+            category: cell.category.clone(),
+            lane: cell.test.lane.clone(),
+            mode: cell.id.mode.clone(),
+            backend: cell.id.backend.clone(),
+            classification: "required".into(),
+            outcome: "PASS".into(),
+            result: Some(ObservedResult::Pass),
+            failure_class: None,
+            error_kind: None,
+            timeout_seconds: 57,
+            execution_cpu_timeout_seconds: Some(22),
+            execution_wall_timeout_seconds: Some(57),
+            duration_ms: Some(1),
+            cpu_usage_usec: Some(1),
+            runtime: None,
+            log_level: Some("info".into()),
+            effective_args: Vec::new(),
+            argv: run1.execution.argv.clone(),
+            guest_argv: run1.execution.guest_argv.clone(),
+            env: run1.execution.env.clone(),
+            cwd: run1.execution.cwd.to_string_lossy().into_owned(),
+            shell_command: String::new(),
+            relaxations: Vec::new(),
+            execution_path: None,
+            diversity: None,
+            attempts: vec![attempt],
+            first_divergent_scheduler_turn: None,
+            first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
+            first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
+            reason: None,
+            artifact_dir: artifact_dir.to_string_lossy().into_owned(),
+        };
+        let results_path = run_root.join("results.jsonl");
+        prepare_result_path_from_root(&run_root, &results_path).unwrap();
+        let policy = VerifyLogRetentionPolicy::new(u64::MAX);
+        let budget = VerifyLogRetentionBudget::open(&run_root, &results_path, policy).unwrap();
+        publish_retained_verify_log(pair, &budget, &results_path, &mut result).unwrap();
+
+        let written: Value = serde_json::from_str(
+            fs::read_to_string(&results_path)
+                .unwrap()
+                .trim_end(),
+        )
+        .unwrap();
+        assert_eq!(
+            written["schema"],
+            RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA
+        );
+        assert_eq!(written["outcome"], "PASS");
+        assert!(written["attempts"][0]["verification_report"].is_string());
+        assert!(written["attempts"][0]["retained_verify_log"].is_object());
+
+        let retained = retain_with_policy(
+            &root,
+            &results,
+            commit,
+            &expected(&written),
+            ValidatePath::Full,
+            HERMETIC_IMAGE_DIGEST,
+            policy,
+        )
+        .unwrap();
+        assert_eq!(
+            retained.schema_version,
+            RETAINED_VERIFY_LOGS_LEDGER_SCHEMA_VERSION
+        );
+        assert_eq!(retained.evidence["retained_verify_logs"]["row_count"], 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema5_transition_accepts_mixed_harness_and_legacy_verify_routes() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).unwrap();
+        let results = root.join("results");
+        let commit = "1717171717171717171717171717171717171717";
+        let mut verify = result_row("validate-mixed-schema", commit);
+        add_retained_verify_log(&results, &mut verify);
+        let mut nonverify = result_row("validate-mixed-schema", commit);
+        nonverify["test"] = Value::String("c-programs/nonverify".into());
+        nonverify["mode"] = Value::String("naked".into());
+        nonverify["attempts"] = Value::Array(Vec::new());
+        append_result_row(&results, &verify);
+        append_result_row(&results, &nonverify);
+
+        let retained = retain_with_policy(
+            &root,
+            &results,
+            commit,
+            &[
+                identity_value(&identity(&verify).unwrap()).unwrap(),
+                identity_value(&identity(&nonverify).unwrap()).unwrap(),
+            ],
+            ValidatePath::Full,
+            HERMETIC_IMAGE_DIGEST,
+            VerifyLogRetentionPolicy::new(71),
+        )
+        .unwrap();
+        assert_eq!(
+            retained.schema_version,
+            RETAINED_VERIFY_LOGS_LEDGER_SCHEMA_VERSION
+        );
+        assert_eq!(retained.evidence["selected_count"], 2);
+        assert_eq!(retained.evidence["retained_verify_logs"]["row_count"], 1);
+        fs::remove_dir_all(root).unwrap();
+
+        let root = fixture_root();
+        fs::create_dir_all(&root).unwrap();
+        let results = root.join("results");
+        let mut retained_verify = result_row("validate-partial-schema5", commit);
+        add_retained_verify_log(&results, &mut retained_verify);
+        let mut legacy_verify = result_row("validate-partial-schema5", commit);
+        legacy_verify["test"] = Value::String("c-programs/sabre-legacy-verify".into());
+        legacy_verify["backend"] = Value::String("sabre".into());
+        append_result_row(&results, &retained_verify);
+        append_result_row(&results, &legacy_verify);
+        let retained = retain_with_policy(
+            &root,
+            &results,
+            commit,
+            &[
+                identity_value(&identity(&retained_verify).unwrap()).unwrap(),
+                identity_value(&identity(&legacy_verify).unwrap()).unwrap(),
+            ],
+            ValidatePath::Full,
+            HERMETIC_IMAGE_DIGEST,
+            VerifyLogRetentionPolicy::new(71),
+        )
+        .unwrap();
+        assert_eq!(retained.evidence["selected_count"], 2);
+        assert_eq!(retained.evidence["retained_verify_logs"]["row_count"], 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verify_schema_route_mismatches_refuse() {
+        for (label, backend, retain_descriptor, expected_error) in [
+            ("ptrace-schema4", "ptrace", false, "requires schema 5"),
+            (
+                "sabre-schema5",
+                "sabre",
+                true,
+                "schema-5 result is reserved for harness-managed",
+            ),
+        ] {
+            let root = fixture_root();
+            fs::create_dir_all(&root).unwrap();
+            let results = root.join("results");
+            let commit = "1818181818181818181818181818181818181818";
+            let mut row = result_row(&format!("validate-{label}"), commit);
+            row["backend"] = Value::String(backend.into());
+            if retain_descriptor {
+                add_retained_verify_log(&results, &mut row);
+            }
+            write_result(&results, &row);
+            let error = retain_with_policy(
+                &root,
+                &results,
+                commit,
+                &expected(&row),
+                ValidatePath::Full,
+                HERMETIC_IMAGE_DIGEST,
+                VerifyLogRetentionPolicy::new(71),
+            )
+            .unwrap_err();
+            assert!(error.contains(expected_error), "{label}: {error}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn retained_verify_descriptor_requires_schema5_verify_mode_exactly() {
+        for (label, mutate, expected_error) in [
+            (
+                "schema4-descriptor",
+                0_u8,
+                "schema-4 result cannot carry retained_verify_log",
+            ),
+            (
+                "schema5-nonverify",
+                1_u8,
+                "schema-5 result must use verify mode",
+            ),
+        ] {
+            let root = fixture_root();
+            fs::create_dir_all(&root).unwrap();
+            let results = root.join("results");
+            let commit = "1919191919191919191919191919191919191919";
+            let mut row = result_row(&format!("validate-{label}"), commit);
+            add_retained_verify_log(&results, &mut row);
+            if mutate == 0 {
+                row["schema"] = Value::from(CELL_RESULT_SCHEMA);
+            } else {
+                row["mode"] = Value::String("naked".into());
+            }
+            write_result(&results, &row);
+            let error = retain_with_policy(
+                &root,
+                &results,
+                commit,
+                &expected(&row),
+                ValidatePath::Full,
+                HERMETIC_IMAGE_DIGEST,
+                VerifyLogRetentionPolicy::new(71),
+            )
+            .unwrap_err();
+            assert!(error.contains(expected_error), "{label}: {error}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn descriptor_input_without_the_shared_policy_cannot_fall_back_to_schema7() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).unwrap();
+        let results = root.join("results");
+        let commit = "2020202020202020202020202020202020202020";
+        let mut row = result_row("validate-no-policy", commit);
+        add_retained_verify_log(&results, &mut row);
+        write_result(&results, &row);
+
+        let error = retain(&root, &results, commit, &expected(&row)).unwrap_err();
+        assert!(error.contains("shared explicit retention policy"), "{error}");
+        assert!(!root
+            .join("ignored/validate/artifacts/validate-no-policy/cell-results.jsonl")
+            .exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema4_retention_does_not_inventory_unrelated_run_artifacts() {
+        let root = fixture_root();
+        let results = root.join("results");
+        let commit = "2323232323232323232323232323232323232323";
+        let row = result_row("validate-schema4-no-inventory", commit);
+        write_result(&results, &row);
+        let unrelated = results
+            .join("runs/validate-schema4-no-inventory/unrelated-cell/captures");
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::write(unrelated.join("ordinary.log.gz"), b"not a retained log").unwrap();
+        std::os::unix::fs::symlink(
+            root.join("missing-workdir"),
+            unrelated.join("workdir-link"),
+        )
+        .unwrap();
+
+        let retained = retain(&root, &results, commit, &expected(&row)).unwrap();
+        assert_eq!(retained.schema_version, CELL_RESULTS_LEDGER_SCHEMA_VERSION);
+        assert_eq!(retained.evidence["run_id"], "validate-schema4-no-inventory");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema10_ignores_unrelated_cell_artifacts_outside_retained_verify() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).unwrap();
+        let results = root.join("results");
+        let commit = "2424242424242424242424242424242424242424";
+        let mut row = result_row("validate-schema10-scope", commit);
+        add_retained_verify_log(&results, &mut row);
+        let artifact_dir = PathBuf::from(row["artifact_dir"].as_str().unwrap());
+        let captures = artifact_dir.join("captures/verify/1/run-1");
+        fs::create_dir_all(&captures).unwrap();
+        fs::write(captures.join("ordinary.log.gz"), b"not retained evidence").unwrap();
+        std::os::unix::fs::symlink(
+            root.join("missing-workdir"),
+            artifact_dir.join("workdir-link"),
+        )
+        .unwrap();
+        write_result(&results, &row);
+
+        let retained = retain_with_policy(
+            &root,
+            &results,
+            commit,
+            &expected(&row),
+            ValidatePath::Full,
+            HERMETIC_IMAGE_DIGEST,
+            VerifyLogRetentionPolicy::new(71),
+        )
+        .unwrap();
+        assert_eq!(
+            retained.schema_version,
+            RETAINED_VERIFY_LOGS_LEDGER_SCHEMA_VERSION
+        );
+        assert_eq!(retained.evidence["retained_verify_logs"]["row_count"], 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema10_refuses_an_orphan_retained_verify_namespace_in_a_sibling_cell() {
+        enum OrphanNamespace {
+            File,
+            Directory,
+            Symlink,
+        }
+
+        for mutation in [
+            OrphanNamespace::File,
+            OrphanNamespace::Directory,
+            OrphanNamespace::Symlink,
+        ] {
+            let root = fixture_root();
+            fs::create_dir_all(&root).unwrap();
+            let results = root.join("results");
+            let commit = "2525252525252525252525252525252525252525";
+            let mut row = result_row("validate-orphan-namespace", commit);
+            add_retained_verify_log(&results, &mut row);
+            write_result(&results, &row);
+
+            let orphan = results
+                .join("runs/validate-orphan-namespace/orphan-cell/retained");
+            fs::create_dir_all(&orphan).unwrap();
+            let namespace = orphan.join("verify");
+            match mutation {
+                OrphanNamespace::File => fs::write(&namespace, b"orphan").unwrap(),
+                OrphanNamespace::Directory => fs::create_dir(&namespace).unwrap(),
+                OrphanNamespace::Symlink => {
+                    std::os::unix::fs::symlink(root.join("missing"), &namespace).unwrap()
+                }
+            }
+
+            let error = retain_with_policy(
+                &root,
+                &results,
+                commit,
+                &expected(&row),
+                ValidatePath::Full,
+                HERMETIC_IMAGE_DIGEST,
+                VerifyLogRetentionPolicy::new(71),
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("unreferenced retained verify-log namespace"),
+                "{error}"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn retained_verify_logs_require_the_captured_canonical_image_digest() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).unwrap();
+        let results = root.join("results");
+        let commit = "2121212121212121212121212121212121212121";
+        let mut row = result_row("validate-image-digest", commit);
+        add_retained_verify_log(&results, &mut row);
+        write_result(&results, &row);
+
+        let error = retain_with_policy(
+            &root,
+            &results,
+            commit,
+            &expected(&row),
+            ValidatePath::Full,
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            VerifyLogRetentionPolicy::new(71),
+        )
+        .unwrap_err();
+        assert!(error.contains("canonical hermetic_image_digest"), "{error}");
+        assert!(!root.join("ignored/validate/artifacts").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn two_descriptors_cannot_publish_the_same_gzip_twice() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).unwrap();
+        let results = root.join("results");
+        let commit = "2222222222222222222222222222222222222222";
+        let mut first = result_row("validate-duplicate-log", commit);
+        add_retained_verify_log(&results, &mut first);
+        let mut second = first.clone();
+        second["test"] = Value::String("different-test".into());
+        second["attempts"][0]["retained_verify_log"]["cell_id"]["test"] =
+            Value::String("different-test".into());
+        append_result_row(&results, &first);
+        append_result_row(&results, &second);
+
+        let error = retain_with_policy(
+            &root,
+            &results,
+            commit,
+            &[
+                identity_value(&identity(&first).unwrap()).unwrap(),
+                identity_value(&identity(&second).unwrap()).unwrap(),
+            ],
+            ValidatePath::Full,
+            HERMETIC_IMAGE_DIGEST,
+            VerifyLogRetentionPolicy::new(142),
+        )
+        .unwrap_err();
+        assert!(error.contains("same gzip"), "{error}");
+        assert!(!root
+            .join("ignored/validate/artifacts/validate-duplicate-log/verify-logs")
+            .exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retained_verify_log_copy_refuses_cap_corruption_symlink_hardlink_and_unreferenced_file() {
+        enum Mutation {
+            Cap,
+            Corrupt,
+            Symlink,
+            Hardlink,
+            Traversal,
+            Unreferenced,
+        }
+
+        for mutation in [
+            Mutation::Cap,
+            Mutation::Corrupt,
+            Mutation::Symlink,
+            Mutation::Hardlink,
+            Mutation::Traversal,
+            Mutation::Unreferenced,
+        ] {
+            let root = fixture_root();
+            fs::create_dir_all(&root).unwrap();
+            let results = root.join("results");
+            let commit = "3030303030303030303030303030303030303030";
+            let mut row = result_row("validate-refusal", commit);
+            let source = add_retained_verify_log(&results, &mut row);
+            let limit = match mutation {
+                Mutation::Cap => 70,
+                Mutation::Corrupt => {
+                    fs::write(&source, b"not gzip").unwrap();
+                    71
+                }
+                Mutation::Symlink => {
+                    let target = root.join("outside.log.gz");
+                    fs::write(&target, RETAINED_LOG_GZIP).unwrap();
+                    fs::remove_file(&source).unwrap();
+                    std::os::unix::fs::symlink(&target, &source).unwrap();
+                    71
+                }
+                Mutation::Hardlink => {
+                    let artifact_dir = PathBuf::from(row["artifact_dir"].as_str().unwrap());
+                    fs::hard_link(&source, artifact_dir.join("retained-log-hardlink")).unwrap();
+                    71
+                }
+                Mutation::Traversal => {
+                    row["artifact_dir"] =
+                        Value::String(root.join("outside").to_string_lossy().into_owned());
+                    71
+                }
+                Mutation::Unreferenced => {
+                    fs::write(source.with_file_name("unreferenced.log.gz"), RETAINED_LOG_GZIP)
+                        .unwrap();
+                    142
+                }
+            };
+            write_result(&results, &row);
+            let error = retain_with_policy(
+                &root,
+                &results,
+                commit,
+                &expected(&row),
+                ValidatePath::Full,
+                HERMETIC_IMAGE_DIGEST,
+                VerifyLogRetentionPolicy::new(limit),
+            )
+            .unwrap_err();
+            let expected = match mutation {
+                Mutation::Cap => "aggregate limit",
+                Mutation::Corrupt => "deterministic gzip header",
+                Mutation::Symlink => "symlink",
+                Mutation::Hardlink => "hard links",
+                Mutation::Traversal => "outside",
+                Mutation::Unreferenced => "unreferenced",
+            };
+            assert!(error.contains(expected), "{expected}: {error}");
+            let retained = root.join("ignored/validate/artifacts/validate-refusal");
+            assert!(!retained.join("verify-logs").exists());
+            assert!(!retained.join("cell-results.jsonl").exists());
+            assert!(!fs::read_dir(&retained)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".verify-logs.")));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn schema5_compared_verify_row_without_a_descriptor_refuses() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).unwrap();
+        let results = root.join("results");
+        let commit = "4040404040404040404040404040404040404040";
+        let mut row = result_row("validate-missing-retained", commit);
+        row["schema"] = Value::from(RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA);
+        write_result(&results, &row);
+        let error = retain_with_policy(
+            &root,
+            &results,
+            commit,
+            &expected(&row),
+            ValidatePath::Full,
+            HERMETIC_IMAGE_DIGEST,
+            VerifyLogRetentionPolicy::new(1024),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("requires exactly one retained_verify_log"),
+            "{error}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn artifact_ancestor_sync_failure_removes_the_new_directory_chain() {
+        let root = fixture_root();
+        let results = root.join("results");
+        let commit = "4141414141414141414141414141414141414141";
+        let row = result_row("validate-ancestor-sync", commit);
+        write_result(&results, &row);
+
+        let error = retain_inner(
+            &root,
+            &results,
+            commit,
+            &expected(&row),
+            None,
+            Some(RetentionFailurePoint::ArtifactAncestorSync),
+        )
+        .unwrap_err();
+        assert!(error.contains("artifact ancestor"), "{error}");
+        assert!(
+            !root.join("ignored").exists(),
+            "an ancestor sync failure left the newly created artifact directory chain"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_retained_verify_log_publication_leaves_no_visible_bundle_or_index() {
+        for failure in [
+            RetentionFailurePoint::BeforeVerifyLogRename,
+            RetentionFailurePoint::AfterVerifyLogRename,
+            RetentionFailurePoint::BeforeCellResultPublication,
+        ] {
+            let root = fixture_root();
+            fs::create_dir_all(&root).unwrap();
+            let results = root.join("results");
+            let commit = "5050505050505050505050505050505050505050";
+            let mut row = result_row("validate-interrupted", commit);
+            add_retained_verify_log(&results, &mut row);
+            write_result(&results, &row);
+
+            let error = retain_inner(
+                &root,
+                &results,
+                commit,
+                &expected(&row),
+                Some((
+                    ValidatePath::Full,
+                    HERMETIC_IMAGE_DIGEST,
+                    VerifyLogRetentionPolicy::new(71),
+                )),
+                Some(failure),
+            )
+            .unwrap_err();
+            assert!(error.contains("injected failure"), "{error}");
+            let retained = root.join("ignored/validate/artifacts/validate-interrupted");
+            assert!(!retained.join("verify-logs").exists());
+            assert!(!retained.join("cell-results.jsonl").exists());
+            assert!(!fs::read_dir(&retained)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".verify-logs.")));
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }
