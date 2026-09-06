@@ -368,7 +368,19 @@ impl LogDiffCLIOpts {
             ) {
                 Ok(comparison) => comparison,
                 Err(error) => {
-                    eprintln!("hermit log-diff: comparison failed while following: {error}");
+                    let reason = error.to_string();
+                    eprintln!("hermit log-diff: comparison failed while following: {reason}");
+                    if fixed_bitwise_info_v1 && let Some(path) = &self.json {
+                        let mut report = pending_json_report(options, record_envelope.policy());
+                        report.verdict = JsonVerdict::Refused;
+                        report.refusal = Some(reason);
+                        if let Err(write_error) = write_json(path, &report) {
+                            eprintln!(
+                                "hermit log-diff: could not record the refusal in {}: {write_error}",
+                                path.display()
+                            );
+                        }
+                    }
                     return ExitStatus::Exited(2);
                 }
             };
@@ -770,20 +782,44 @@ mod tests {
         }
     }
 
-    fn follow_static(left_bytes: &[u8], right_bytes: &[u8]) -> ExitStatus {
+    fn follow_static(left_bytes: &[u8], right_bytes: &[u8]) -> (ExitStatus, serde_json::Value) {
         let directory = tempfile::tempdir().unwrap();
         let left = directory.path().join("left.log");
         let right = directory.path().join("right.log");
+        let json = directory.path().join("follow.json");
         std::fs::write(&left, left_bytes).unwrap();
         std::fs::write(&right, right_bytes).unwrap();
 
         let mut options = LogDiffCLIOpts::new(&left, &right);
         options.follow = true;
         options.canonical_info = true;
+        options.json = Some(json.clone());
         options.follow_interval_ms = 1;
         options.follow_timeout_secs = 1;
         options.follow_settle_polls = 1;
-        options.follow_two_runs(&right, &follow_options(), RecordEnvelope::all_records_v1())
+        let status =
+            options.follow_two_runs(&right, &follow_options(), RecordEnvelope::all_records_v1());
+        let report = serde_json::from_str(&std::fs::read_to_string(json).unwrap()).unwrap();
+        (status, report)
+    }
+
+    fn assert_canonical_follow_refusal(left: &[u8], right: &[u8]) {
+        let expected = logdiff::compare_complete_bitwise_info_v1_prefix(
+            left,
+            right,
+            logdiff::ComparisonSideLabels::default(),
+            logdiff::BitwiseInfoV1Diagnostics::default(),
+            &mut Vec::new(),
+        )
+        .expect_err("fixture must make the fixed comparator refuse")
+        .to_string();
+        let (status, report) = follow_static(left, right);
+        assert!(
+            matches!(status, ExitStatus::Exited(2)),
+            "invalid comparison evidence must refuse, got {status:?}"
+        );
+        assert_eq!(report["verdict"], "refused");
+        assert_eq!(report["refusal"], expected);
     }
 
     #[test]
@@ -791,22 +827,20 @@ mod tests {
         let common = current_record(1, "DETLOG common");
         let left = format!("{common}{}", current_record(2, "DETLOG unfinished-left"));
         let right = format!("{common}{}", current_record(2, "DETLOG unfinished-right"));
-        let status = follow_static(left.as_bytes(), right.as_bytes());
+        let (status, report) = follow_static(left.as_bytes(), right.as_bytes());
         assert!(
             matches!(status, ExitStatus::Exited(0)),
             "the differing unfinished tails must be withheld, got {status:?}"
         );
+        assert_eq!(report["verdict"], "identical_so_far");
+        assert!(report["refusal"].is_null());
     }
 
     #[test]
     fn canonical_follow_refuses_prose_only_detlog_records() {
         let prose = b"Apr 09 06:08:01.100  INFO detcore: DETLOG prose\n\
 Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
-        let status = follow_static(prose, prose);
-        assert!(
-            matches!(status, ExitStatus::Exited(2)),
-            "prose-only records must refuse, got {status:?}"
-        );
+        assert_canonical_follow_refusal(prose, prose);
     }
 
     #[test]
@@ -827,11 +861,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             current_record(1, "DETLOG bad-byte"),
             current_record(2, "DETLOG unfinished")
         );
-        let status = follow_static(&invalid, valid.as_bytes());
-        assert!(
-            matches!(status, ExitStatus::Exited(2)),
-            "invalid UTF-8 must refuse, got {status:?}"
-        );
+        assert_canonical_follow_refusal(&invalid, valid.as_bytes());
     }
 
     #[test]
@@ -842,11 +872,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
             current_record(2, "DETLOG unfinished")
         );
         let truncated = format!("{complete}{}\n", logdiff::TRUNCATION_MARKER);
-        let status = follow_static(truncated.as_bytes(), complete.as_bytes());
-        assert!(
-            matches!(status, ExitStatus::Exited(2)),
-            "a terminal truncation marker must refuse before prefix slicing, got {status:?}"
-        );
+        assert_canonical_follow_refusal(truncated.as_bytes(), complete.as_bytes());
     }
 
     #[test]
