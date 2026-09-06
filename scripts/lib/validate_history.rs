@@ -46,8 +46,39 @@ pub struct CacheHit {
     /// What that count COUNTS. Never collapsed: "test(s)" for a bash row,
     /// "node(s)" for a validate.rs row.
     pub executed_unit: &'static str,
+    /// Raw typed counts retained for a current validation-service result.
+    /// These remain optional because historical cache rows did not carry them.
+    pub schema_version: Option<i64>,
+    pub executed_nodes: Option<i64>,
+    pub executed_tests: Option<i64>,
+    pub passed_tests: Option<i64>,
     pub commit: String,
     pub producer: String,
+}
+
+impl CacheHit {
+    /// Counts that can support a current successful validation-service result.
+    ///
+    /// A cache hit may still serve the historical CLI cache contract without
+    /// these values. Publishing a new schema result is stricter: only the
+    /// current typed ledger schema, written by the Rust producer, can supply
+    /// positive executed-node evidence and exact equal test counts.
+    pub fn exact_current_pass_counts(&self) -> Option<(i64, i64, i64)> {
+        if self.schema_version
+            != Some(crate::validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION)
+            || !matches!(
+                self.producer.as_str(),
+                "validate.rs" | "hermit-validate-rs"
+            )
+        {
+            return None;
+        }
+        let nodes = self.executed_nodes?;
+        let executed = self.executed_tests?;
+        let passed = self.passed_tests?;
+        (nodes > 0 && executed > 0 && passed == executed)
+            .then_some((nodes, executed, passed))
+    }
 }
 
 /// The adapter executable comes from the immutable tooling checkout, while
@@ -345,6 +376,10 @@ pub fn cache_lookup(
         cpu_seconds: f(row, "user_seconds") + f(row, "sys_seconds"),
         executed,
         executed_unit: unit,
+        schema_version: i(row, "schema_version"),
+        executed_nodes: i(row, "executed_nodes"),
+        executed_tests: i(row, "executed_tests"),
+        passed_tests: i(row, "passed_tests"),
         commit: {
             let c = s(row, "commit");
             if c.is_empty() { "unknown".to_string() } else { c.to_string() }
