@@ -29,6 +29,10 @@ fn write_canonical_info(
     writer: &mut impl Write,
     record_envelope: RecordEnvelope,
 ) -> std::io::Result<usize> {
+    if record_envelope.policy() == RecordEnvelopePolicy::AllRecordsV1 {
+        let bytes = std::fs::read(file)?;
+        return logdiff::write_bitwise_info_v1_bytes(&bytes, &file.display().to_string(), writer);
+    }
     logdiff::write_canonical_info_with_filter(file, writer, record_envelope.predicate())
 }
 
@@ -39,6 +43,26 @@ fn try_log_diff_with_records(
     record_envelope: RecordEnvelope,
 ) -> std::io::Result<(logdiff::LogDiffSummary, usize, usize)> {
     logdiff::try_log_diff_with_records_and_filter(left, right, options, record_envelope.predicate())
+}
+
+fn try_bitwise_info_v1_with_records(
+    left: &Path,
+    right: &Path,
+    options: &logdiff::LogDiffOpts,
+) -> std::io::Result<(logdiff::LogDiffSummary, usize, usize)> {
+    let mut diagnostic_output = std::io::stderr();
+    logdiff::try_compare_bitwise_info_v1_with_records_and_diagnostics(
+        left,
+        right,
+        options.side_labels.clone(),
+        logdiff::BitwiseInfoV1Diagnostics {
+            difference_limit: options.limit,
+            syscall_history: options.syscall_history,
+            no_color: options.no_color,
+            print_logs: options.print_logs,
+        },
+        &mut diagnostic_output,
+    )
 }
 
 fn compare_complete_prefix(
@@ -205,12 +229,17 @@ impl LogDiffCLIOpts {
             return self.follow_two_runs(file_b, &options, record_envelope);
         }
 
-        let (summary, records_left, records_right) = match try_log_diff_with_records(
-            &self.file_a,
-            file_b,
-            &options,
-            record_envelope,
-        ) {
+        let comparison = if (self.canonical_info || self.json.is_some())
+            && record_envelope.policy() == RecordEnvelopePolicy::AllRecordsV1
+        {
+            try_bitwise_info_v1_with_records(&self.file_a, file_b, &options)
+        } else {
+            // The DBT transport envelope remains on its current named-filter
+            // path. It is a distinct canonical envelope, not an all-record
+            // BitwiseInfoV1 comparison.
+            try_log_diff_with_records(&self.file_a, file_b, &options, record_envelope)
+        };
+        let (summary, records_left, records_right) = match comparison {
             Ok(result) => result,
             Err(error) => {
                 eprintln!(
@@ -1109,6 +1138,41 @@ mod tests {
             serde_json::to_value(report).unwrap()["verdict"],
             "no_result"
         );
+    }
+
+    #[test]
+    fn canonical_all_records_uses_the_fixed_shared_comparator() {
+        let directory = tempfile::tempdir().unwrap();
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+        let suffix = detcore::detlog::record_suffix(detcore::detlog::DetLogEvent::Other);
+        std::fs::write(
+            &left,
+            format!(
+                "Apr 09 06:08:01.100  INFO detcore: DETLOG address={}{}\n",
+                logdiff::host_addr(0x1000),
+                suffix
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &right,
+            format!(
+                "Apr 09 06:08:01.100  INFO detcore: DETLOG address={}{}\n",
+                logdiff::host_addr(0x9000),
+                suffix
+            ),
+        )
+        .unwrap();
+        let options = logdiff::LogDiffOpts {
+            comparison: logdiff::LogComparisonMode::Info,
+            canonicalize_addresses: true,
+            ..Default::default()
+        };
+        let (summary, left_records, right_records) =
+            try_bitwise_info_v1_with_records(&left, &right, &options).unwrap();
+        assert!(summary.matched_with_evidence());
+        assert_eq!((left_records, right_records), (1, 1));
     }
 
     #[test]

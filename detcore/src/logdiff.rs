@@ -50,6 +50,12 @@ pub const TRUNCATION_MARKER: &str = "=== HERMIT LOG TRUNCATED: reached the confi
      (HERMIT_LOG_MAX_BYTES). Output beyond this point was DISCARDED. The run itself continued and \
      was NOT affected. ===";
 
+/// Versioned policy token for the only prefix removed by `BitwiseInfoV1`.
+pub const STRIP_WALL_CLOCK_PREFIX_V1: &str = "real-wall-clock-prefix/v1";
+
+/// Versioned policy token for lossless host-address ordinalization.
+pub const CANON_ADDRESS_ORDINAL_V1: &str = "host-address-to-first-appearance-ordinal/v1";
+
 /// Whether `log_text` is the output of a writer that hit its size bound.
 ///
 /// The question this answers is "was THIS LOG truncated", which is not the same
@@ -541,6 +547,42 @@ fn canonical_info_from_str_with_filter(
 /// values, counts, flags, and every other substantive byte are preserved.
 pub fn write_canonical_info(file: &Path, writer: &mut impl Write) -> std::io::Result<usize> {
     write_canonical_info_with_filter(file, writer, |_| true)
+}
+
+/// Render the canonical INFO messages that `BitwiseInfoV1` would compare from
+/// bytes already captured by the caller.
+///
+/// Unlike [`write_canonical_info`], this fixed-policy form requires UTF-8 and
+/// current structured DETLOG events and refuses a bounded-writer truncation.
+/// A harness can therefore render retained comparison records from the exact
+/// immutable bytes it compared without reopening a mutable pathname.
+pub fn write_bitwise_info_v1_bytes(
+    bytes: &[u8],
+    side_label: &str,
+    writer: &mut impl Write,
+) -> std::io::Result<usize> {
+    let contents = std::str::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{side_label} is not UTF-8: {error}"),
+        )
+    })?;
+    if log_was_truncated(contents) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{side_label} was truncated at the configured size bound"),
+        ));
+    }
+    let records = extract_log_messages(contents)
+        .map_err(|error| std::io::Error::new(error.kind(), format!("{side_label} {error}")))?;
+    validate_structured_events(side_label, &records, true)?;
+    let info = filter_infos(&records);
+    let options = bitwise_info_v1_options(ComparisonSideLabels::new(side_label, side_label));
+    let messages = messages_for_comparison(&info, LogComparisonPolicy::from_options(&options));
+    for message in &messages {
+        writeln!(writer, "{message}")?;
+    }
+    Ok(messages.len())
 }
 
 /// Print canonical INFO messages after applying a caller-supplied record filter.
@@ -1523,6 +1565,169 @@ pub fn try_log_diff_detailed(
     try_log_diff_detailed_with_filter(file_a, file_b, opts, |_| true)
 }
 
+/// Compare two current Hermit logs under the canonical `BitwiseInfoV1` policy.
+///
+/// Callers provide only the two inputs, their reader-facing labels, and
+/// diagnostic-output settings. They cannot weaken record selection or
+/// normalization. The fixed policy compares every INFO record, requires
+/// current structured DETLOG events, canonicalizes only explicitly marked host
+/// addresses to first-appearance ordinals, and otherwise compares the selected
+/// messages exactly.
+pub fn try_compare_bitwise_info_v1(
+    file_a: &Path,
+    file_b: &Path,
+    side_labels: ComparisonSideLabels,
+) -> std::io::Result<LogDiffSummary> {
+    try_compare_bitwise_info_v1_with_records(file_a, file_b, side_labels)
+        .map(|(summary, _, _)| summary)
+}
+
+/// Canonical comparison plus total complete-record counts from both inputs.
+pub fn try_compare_bitwise_info_v1_with_records(
+    file_a: &Path,
+    file_b: &Path,
+    side_labels: ComparisonSideLabels,
+) -> std::io::Result<(LogDiffSummary, usize, usize)> {
+    let bytes_a = std::fs::read(file_a)?;
+    let bytes_b = std::fs::read(file_b)?;
+    try_compare_bitwise_info_v1_bytes_with_records(&bytes_a, &bytes_b, side_labels)
+}
+
+/// Canonical comparison over bytes already captured by the caller.
+pub fn try_compare_bitwise_info_v1_bytes_with_records(
+    bytes_a: &[u8],
+    bytes_b: &[u8],
+    side_labels: ComparisonSideLabels,
+) -> std::io::Result<(LogDiffSummary, usize, usize)> {
+    try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+        bytes_a,
+        bytes_b,
+        side_labels,
+        BitwiseInfoV1Diagnostics::default(),
+        &mut std::io::stderr(),
+    )
+}
+
+/// Output-only settings for a canonical `BitwiseInfoV1` comparison.
+///
+/// These settings control rendered diagnostics only. They cannot change which
+/// records are selected, how records are normalized, or the returned verdict
+/// and counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BitwiseInfoV1Diagnostics {
+    /// Maximum number of differing messages to render. Zero means unlimited.
+    pub difference_limit: u64,
+    /// Number of completed syscalls to render before each divergent syscall.
+    pub syscall_history: u64,
+    /// Disable terminal color in rendered differences.
+    pub no_color: bool,
+    /// Print both selected canonical streams before reporting differences.
+    pub print_logs: bool,
+}
+
+impl Default for BitwiseInfoV1Diagnostics {
+    fn default() -> Self {
+        Self {
+            difference_limit: 20,
+            syscall_history: 5,
+            no_color: false,
+            print_logs: false,
+        }
+    }
+}
+
+/// Canonical file comparison with caller-selected diagnostic output.
+pub fn try_compare_bitwise_info_v1_with_records_and_diagnostics(
+    file_a: &Path,
+    file_b: &Path,
+    side_labels: ComparisonSideLabels,
+    diagnostics: BitwiseInfoV1Diagnostics,
+    writer: &mut impl Write,
+) -> std::io::Result<(LogDiffSummary, usize, usize)> {
+    let bytes_a = std::fs::read(file_a)?;
+    let bytes_b = std::fs::read(file_b)?;
+    try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+        &bytes_a,
+        &bytes_b,
+        side_labels,
+        diagnostics,
+        writer,
+    )
+}
+
+/// Canonical file comparison with caller-selected diagnostic output.
+pub fn try_compare_bitwise_info_v1_with_diagnostics(
+    file_a: &Path,
+    file_b: &Path,
+    side_labels: ComparisonSideLabels,
+    diagnostics: BitwiseInfoV1Diagnostics,
+    writer: &mut impl Write,
+) -> std::io::Result<LogDiffSummary> {
+    try_compare_bitwise_info_v1_with_records_and_diagnostics(
+        file_a,
+        file_b,
+        side_labels,
+        diagnostics,
+        writer,
+    )
+    .map(|(summary, _, _)| summary)
+}
+
+/// Canonical comparison over captured bytes with output-only diagnostics.
+pub fn try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+    bytes_a: &[u8],
+    bytes_b: &[u8],
+    side_labels: ComparisonSideLabels,
+    diagnostics: BitwiseInfoV1Diagnostics,
+    writer: &mut impl Write,
+) -> std::io::Result<(LogDiffSummary, usize, usize)> {
+    let str_a = std::str::from_utf8(bytes_a).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not UTF-8: {error}", side_labels.left),
+        )
+    })?;
+    let str_b = std::str::from_utf8(bytes_b).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not UTF-8: {error}", side_labels.right),
+        )
+    })?;
+    let mut options = bitwise_info_v1_options(side_labels);
+    options.limit = diagnostics.difference_limit;
+    options.syscall_history = diagnostics.syscall_history;
+    options.no_color = diagnostics.no_color;
+    options.print_logs = diagnostics.print_logs;
+    let records_a = record_count(str_a);
+    let records_b = record_count(str_b);
+    let summary = log_diff_summary_from_strs_with_filter(str_a, str_b, &options, writer, |_| true)?;
+    Ok((summary, records_a, records_b))
+}
+
+/// Construct the complete fixed policy used by `BitwiseInfoV1` callers.
+fn bitwise_info_v1_options(side_labels: ComparisonSideLabels) -> LogDiffOpts {
+    LogDiffOpts {
+        strip_lines: false,
+        canonicalize_addresses: true,
+        comparison: LogComparisonMode::Info,
+        side_labels,
+        require_structured_events: true,
+        print_logs: false,
+        limit: 20,
+        ignore_lines: Vec::new(),
+        syscall_history: 5,
+        no_color: false,
+        skip_commit: false,
+        skip_detlog: false,
+        git_diff: false,
+        include_detlogs: vec![
+            DetLogFilter::Syscall,
+            DetLogFilter::SyscallResult,
+            DetLogFilter::Other,
+        ],
+    }
+}
+
 /// Fallible log comparison with a caller-supplied record filter.
 ///
 /// Existing callers keep the unfiltered behavior through
@@ -2014,6 +2219,208 @@ mod test {
     fn compare(left: &str, right: &str) -> super::PrefixComparison {
         super::compare_complete_prefix(left, right, &info_opts(), &mut Vec::new())
             .expect("comparing in-memory strings cannot fail on I/O")
+    }
+
+    fn temp_log(contents: &str) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().expect("create temporary log");
+        std::fs::write(file.path(), contents).expect("write temporary log");
+        file
+    }
+
+    #[test]
+    fn bitwise_info_v1_binds_the_complete_policy() {
+        let labels = super::ComparisonSideLabels::new("left", "right");
+        let options = super::bitwise_info_v1_options(labels.clone());
+        assert!(!options.strip_lines);
+        assert!(options.canonicalize_addresses);
+        assert_eq!(options.comparison, super::LogComparisonMode::Info);
+        assert_eq!(options.side_labels, labels);
+        assert!(options.require_structured_events);
+        assert!(!options.print_logs);
+        assert_eq!(options.limit, 20);
+        assert!(options.ignore_lines.is_empty());
+        assert_eq!(options.syscall_history, 5);
+        assert!(!options.no_color);
+        assert!(!options.skip_commit);
+        assert!(!options.skip_detlog);
+        assert!(!options.git_diff);
+        assert_eq!(
+            options.include_detlogs,
+            [
+                DetLogFilter::Syscall,
+                DetLogFilter::SyscallResult,
+                DetLogFilter::Other,
+            ]
+        );
+    }
+
+    #[test]
+    fn bitwise_info_v1_matches_and_renders_current_records() -> std::io::Result<()> {
+        let left_text = structured_record(
+            1,
+            &format!("DETLOG allocation={}", super::host_addr(0x1000)),
+            DetLogEvent::Other,
+        );
+        let right_text = structured_record(
+            1,
+            &format!("DETLOG allocation={}", super::host_addr(0x9000)),
+            DetLogEvent::Other,
+        );
+        let left = temp_log(&left_text);
+        let right = temp_log(&right_text);
+        let summary = super::try_compare_bitwise_info_v1(
+            left.path(),
+            right.path(),
+            super::ComparisonSideLabels::new("left", "right"),
+        )?;
+        assert!(summary.matched_with_evidence());
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+
+        let mut rendered = Vec::new();
+        assert_eq!(
+            super::write_bitwise_info_v1_bytes(left_text.as_bytes(), "left", &mut rendered)?,
+            1
+        );
+        let rendered = String::from_utf8(rendered).unwrap();
+        assert!(rendered.contains("<addr1>"));
+        assert!(!rendered.contains("0x1000"));
+        Ok(())
+    }
+
+    #[test]
+    fn bitwise_info_v1_reports_first_divergence() -> std::io::Result<()> {
+        let left = structured_record(1, "DETLOG payload=left", DetLogEvent::Other);
+        let right = structured_record(1, "DETLOG payload=right", DetLogEvent::Other);
+        let mut diagnostic = Vec::new();
+        let (summary, records_left, records_right) =
+            super::try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+                left.as_bytes(),
+                right.as_bytes(),
+                super::ComparisonSideLabels::new("left", "right"),
+                super::BitwiseInfoV1Diagnostics {
+                    difference_limit: 1,
+                    syscall_history: 0,
+                    no_color: true,
+                    print_logs: false,
+                },
+                &mut diagnostic,
+            )?;
+        assert!(summary.diff_found);
+        assert!(!summary.refused);
+        assert_eq!(summary.first_divergent_record, Some(1));
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+        assert_eq!((records_left, records_right), (1, 1));
+        assert!(
+            String::from_utf8(diagnostic)
+                .unwrap()
+                .contains("payload=left")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bitwise_info_v1_diagnostics_do_not_change_the_verdict() -> std::io::Result<()> {
+        let left = structured_record(1, "DETLOG payload=left", DetLogEvent::Other);
+        let right = structured_record(1, "DETLOG payload=right", DetLogEvent::Other);
+        let baseline = super::try_compare_bitwise_info_v1_bytes_with_records(
+            left.as_bytes(),
+            right.as_bytes(),
+            super::ComparisonSideLabels::default(),
+        )?;
+        let mut diagnostic = Vec::new();
+        let varied = super::try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+            left.as_bytes(),
+            right.as_bytes(),
+            super::ComparisonSideLabels::default(),
+            super::BitwiseInfoV1Diagnostics {
+                difference_limit: 0,
+                syscall_history: 10,
+                no_color: true,
+                print_logs: true,
+            },
+            &mut diagnostic,
+        )?;
+        assert_eq!(baseline, varied);
+        assert!(!diagnostic.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn bitwise_info_v1_refuses_empty_missing_and_unreadable_inputs() -> std::io::Result<()> {
+        let empty_left = temp_log("");
+        let empty_right = temp_log("");
+        let summary = super::try_compare_bitwise_info_v1(
+            empty_left.path(),
+            empty_right.path(),
+            super::ComparisonSideLabels::default(),
+        )?;
+        assert!(!summary.matched_with_evidence());
+        assert_eq!((summary.compared_left, summary.compared_right), (0, 0));
+
+        let missing_parent = tempfile::tempdir()?;
+        let missing = missing_parent.path().join("missing.log");
+        assert!(
+            super::try_compare_bitwise_info_v1(
+                &missing,
+                empty_right.path(),
+                super::ComparisonSideLabels::default(),
+            )
+            .is_err()
+        );
+        let directory = tempfile::tempdir()?;
+        assert!(
+            super::try_compare_bitwise_info_v1(
+                directory.path(),
+                empty_right.path(),
+                super::ComparisonSideLabels::default(),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bitwise_info_v1_refuses_invalid_utf8_and_truncation() -> std::io::Result<()> {
+        let valid = structured_record(1, "DETLOG payload", DetLogEvent::Other);
+        let mut invalid = valid.clone().into_bytes();
+        invalid.insert(invalid.len() - 1, 0x80);
+        let error = super::try_compare_bitwise_info_v1_bytes_with_records(
+            &invalid,
+            valid.as_bytes(),
+            super::ComparisonSideLabels::new("left", "right"),
+        )
+        .expect_err("invalid UTF-8 must refuse");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("left"));
+
+        let truncated = temp_log(&format!("{valid}{}\n", super::TRUNCATION_MARKER));
+        let complete = temp_log(&valid);
+        let summary = super::try_compare_bitwise_info_v1(
+            truncated.path(),
+            complete.path(),
+            super::ComparisonSideLabels::default(),
+        )?;
+        assert!(summary.diff_found);
+        assert!(summary.refused);
+        assert_eq!((summary.compared_left, summary.compared_right), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn bitwise_info_v1_requires_current_structured_events() {
+        let historical = temp_log(&record(1, "DETLOG stable"));
+        let error = super::try_compare_bitwise_info_v1(
+            historical.path(),
+            historical.path(),
+            super::ComparisonSideLabels::new("left", "right"),
+        )
+        .expect_err("prose-only DETLOG must refuse");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("missing its structured DETLOG result")
+        );
     }
 
     #[test]
