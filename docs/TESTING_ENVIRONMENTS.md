@@ -209,6 +209,9 @@ erasing the host; this table is where the erased identities go back.
 | `scripts/bisect-probe.rs` cost split | `devbig014` | BUILD 36.33s (hermit binary 36.21 + guest 0.12/id) vs TEST 3.53s per cell, range 1.6-10.9; `run --prebuilt` 6 cells 21.76s serial vs 11.55s at `--jobs 6`; 237 portable test ids expand to 304 required cells |
 | `portable` lane, node `test.hermit_unit` | `devbig030` | Warm repeats at `a6b0c37648df`: nextest `-j1` 27.0s and 27.3s; `-j16` 14.4s and 13.7s; `CARGO_BUILD_JOBS=8` unchanged |
 
+The `devbig014` host listed above is also the measurement host for the Demo 5
+full-boot and Demo 6 resume log-volume bounds recorded beside those bounds.
+
 ## Hardware-sensitive Cargo tests
 
 Named tests and the capabilities they require. Paths are relative to the repo

@@ -24,9 +24,9 @@
 //!      check-detcore-backend-abstraction-test.sh in a comment, and a plain grep
 //!      reports it as scheduled. Comments are stripped before matching.
 //!   2. A reference in .github/workflows/ is not evidence of a local gate. The
-//!      portable workflow's integration-branch run is supplemental evidence;
-//!      every other workflow is manual, and none gate a PR. Workflows are NOT a
-//!      reachability source here, by design.
+//!      portable and demo-review integration-branch runs are supplemental
+//!      evidence; the other workflows are manual, and none gate a PR. Workflows
+//!      are NOT a reachability source here, by design.
 //!
 //! Reachability is a fixpoint, not one hop: check-git-pin-uniformity.rs has no DAG
 //! node but ci/run-reverie-pin-check.sh calls it and that has two, so it IS
@@ -35,7 +35,8 @@
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 
@@ -46,6 +47,13 @@ use std::process::Command;
 /// list should shrink. It exists so this checker starts green on a tree that
 /// already has four orphans rather than landing as an immediate red.
 const ALLOWLIST: &[(&str, &str)] = &[
+    (
+        "bin/safehermit-test.sh",
+        "Exercises real Hermit processes, a genuine 15-second hang, cgroup memory \
+         and wall limits, and a release binary that check.lint_checks does not \
+         build. It is an on-demand acceptance bracket; scheduling it in the lint \
+         node would make that node depend on an unrelated release build.",
+    ),
     (
         "scripts/check-default-build-warnings.sh",
         "Builds the workspace; its findings were never counted, so wiring it \
@@ -207,8 +215,9 @@ fn main() {
         println!(
             "check-checker-scheduling: refuse a tracked checker entrypoint that no DAG\n\
              node and no `make lint-checks` recipe line can reach, directly or\n\
-             transitively. Workflows are not a reachability source: the integration-\n\
-             branch portable run is supplemental and the others are manual.\n\
+             transitively. Workflows are not a reachability source: the\n\
+             integration-branch portable and demo-review runs are supplemental\n\
+             and the other nine workflows are manual.\n\
              Deliberate exceptions live in\n\
              ALLOWLIST with a reason each."
         );
@@ -299,7 +308,6 @@ fn main() {
     seed.push_str(&lint_checks_recipe(
         &std::fs::read_to_string("Makefile").expect("Makefile is unreadable"),
     ));
-
     // Fixpoint over EVERY tracked script, not only the checkers.
     //
     // ⚠️ Expanding only checkers is wrong and the first version of this guard did
@@ -368,18 +376,19 @@ fn main() {
             "check-checker-scheduling: {} checker(s) are scheduled by NOTHING.",
             unscheduled.len()
         );
-        eprintln!(
-            "  A checker nothing runs is indistinguishable from a checker that passes."
-        );
+        eprintln!("  A checker nothing runs is indistinguishable from a checker that passes.");
         eprintln!("  Add it to the Makefile's `lint-checks` recipe (which check.lint_checks");
-        eprintln!("  runs, so no DAG edit is needed), or to a DAG node, or add it to");
+        eprintln!("  runs, so no DAG edit is needed), a DAG node, or an explicitly");
+        eprintln!("  scheduled workflow; otherwise add it to");
         eprintln!("  ALLOWLIST in this file WITH A REASON.");
         for c in &unscheduled {
             eprintln!("    {c}");
         }
     }
     for p in &stale {
-        eprintln!("check-checker-scheduling: STALE ALLOWLIST entry {p} -- now scheduled or absent; remove it.");
+        eprintln!(
+            "check-checker-scheduling: STALE ALLOWLIST entry {p} -- now scheduled or absent; remove it."
+        );
     }
     std::process::exit(exit_code_for(unscheduled.len(), stale.len()));
 }
@@ -407,8 +416,8 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
         "-B", "-E", "-I", "-O", "-OO", "-s", "-S", "-u", "-v", "-b", "-d", "-q", "-x",
     ];
     const SHELL_NO_VALUE: [&str; 18] = [
-        "-e", "-x", "-u", "-v", "-n", "-f", "-C", "-a", "-h", "-i", "-l", "-m", "-p",
-        "-r", "-s", "-t", "-c", "-D",
+        "-e", "-x", "-u", "-v", "-n", "-f", "-C", "-a", "-h", "-i", "-l", "-m", "-p", "-r", "-s",
+        "-t", "-c", "-D",
     ];
     const RUSTC_NO_VALUE: [&str; 5] = ["-O", "-g", "-V", "-h", "-v"];
 
@@ -447,8 +456,23 @@ fn runner_flag_path(text: &str, path: &str) -> bool {
     // So an unrecognised flag now yields NO INVOCATION for that occurrence. Uncertainty
     // resolves to orphan -- loud -- instead of to a guess in either direction.
     const RUSTC_VALUE: [&str; 17] = [
-        "-o", "--out-dir", "--emit", "--extern", "--target", "--edition", "--crate-name",
-        "--crate-type", "--cfg", "--check-cfg", "-L", "-l", "-C", "-Z", "-W", "-A", "-D",
+        "-o",
+        "--out-dir",
+        "--emit",
+        "--extern",
+        "--target",
+        "--edition",
+        "--crate-name",
+        "--crate-type",
+        "--cfg",
+        "--check-cfg",
+        "-L",
+        "-l",
+        "-C",
+        "-Z",
+        "-W",
+        "-A",
+        "-D",
     ];
     const PYTHON_VALUE: [&str; 5] = ["-c", "-m", "-X", "-W", "-Q"];
     const SHELL_VALUE: [&str; 3] = ["-o", "-O", "--rcfile"];
@@ -983,7 +1007,10 @@ fn in_command_position(before: &str) -> bool {
     // runner prefix carried as FIXTURE DATA, where the quote is preceded by nothing but
     // indentation. In a genuine embedded command it is preceded by the operator that
     // introduces the literal, so that is what is required.
-    if let Some(rest) = before.strip_suffix('"').or_else(|| before.strip_suffix('\'')) {
+    if let Some(rest) = before
+        .strip_suffix('"')
+        .or_else(|| before.strip_suffix('\''))
+    {
         let opener = rest.trim_end();
         if opener.is_empty() || !opener.ends_with(['=', '(', ',']) {
             return false;
@@ -1076,7 +1103,6 @@ fn decode_json_string(raw: &str) -> String {
     out
 }
 
-
 /// Pull the value of every `"cmd":` field out of a DAG file.
 ///
 /// Deliberately textual rather than a JSON parse: these scripts take no third-party
@@ -1134,8 +1160,16 @@ fn self_test() {
     // ⚠️ PINS THE EXIT STATUS ITSELF. Reported by `agent(codex-rev-2683)`: the failure path
     // was a bare `exit(1)` no test reached, so swapping it for `return` kept every suite
     // green while orphans were admitted at rc=0.
-    assert_eq!(exit_code_for(1, 0), 1, "an unscheduled checker must exit nonzero");
-    assert_eq!(exit_code_for(0, 1), 1, "a stale allowlist entry must exit nonzero");
+    assert_eq!(
+        exit_code_for(1, 0),
+        1,
+        "an unscheduled checker must exit nonzero"
+    );
+    assert_eq!(
+        exit_code_for(0, 1),
+        1,
+        "a stale allowlist entry must exit nonzero"
+    );
     assert_eq!(exit_code_for(3, 2), 1, "both together must exit nonzero");
     assert_eq!(exit_code_for(0, 0), 0, "a clean run must exit zero");
 
@@ -1245,7 +1279,10 @@ fn self_test() {
             "a rooted invocation inside a single-quoted shell fixture is dead text",
         ),
     ] {
-        assert!(!is_invoked(text, path), "false SCHEDULED (silent direction): {why}");
+        assert!(
+            !is_invoked(text, path),
+            "false SCHEDULED (silent direction): {why}"
+        );
     }
 
     // ...and the other half. Every one is a REAL invocation in this repository; if the
@@ -1304,7 +1341,10 @@ fn self_test() {
             "the live artifact consumer invokes the verifier through its checkout root",
         ),
     ] {
-        assert!(is_invoked(text, path), "false ORPHAN (loud direction): {why}");
+        assert!(
+            is_invoked(text, path),
+            "false ORPHAN (loud direction): {why}"
+        );
     }
 
     // Pins JSON DECODING, which nothing else reaches: every other case calls is_invoked
@@ -1352,16 +1392,29 @@ fn self_test() {
     // Comment stripping is what separates a real invocation from a mention.
     let sh = "# ./scripts/check-a.sh mentioned in a comment\n./scripts/check-b.sh\n";
     let stripped = strip_comments(sh, "x.sh");
-    assert!(!stripped.contains("check-a.sh"), "commented-out shell line survived");
-    assert!(stripped.contains("check-b.sh"), "live shell line was dropped");
+    assert!(
+        !stripped.contains("check-a.sh"),
+        "commented-out shell line survived"
+    );
+    assert!(
+        stripped.contains("check-b.sh"),
+        "live shell line was dropped"
+    );
 
     let rs = "// see scripts/check-c.rs for the equivalence proof\nrun(\"scripts/check-d.rs\");\n";
     let stripped = strip_comments(rs, "x.rs");
-    assert!(!stripped.contains("check-c.rs"), "commented-out rust line survived");
-    assert!(stripped.contains("check-d.rs"), "live rust line was dropped");
+    assert!(
+        !stripped.contains("check-c.rs"),
+        "commented-out rust line survived"
+    );
+    assert!(
+        stripped.contains("check-d.rs"),
+        "live rust line was dropped"
+    );
 
     // The real case that made this necessary.
-    let real = "# Equivalence is TESTED, not asserted -- see check-detcore-backend-abstraction-test.sh:\n";
+    let real =
+        "# Equivalence is TESTED, not asserted -- see check-detcore-backend-abstraction-test.sh:\n";
     assert!(
         strip_comments(real, "check-detcore-backend-abstraction.sh").is_empty(),
         "the comment-only reference that fooled the manual sweep still reads as an invocation"
@@ -1371,11 +1424,20 @@ fn self_test() {
     let mk = "lint: lint-checks lint-cargo\n\nlint-checks:\n\t./scripts/check-x.sh\n\t@git diff --check\n\nlint-cargo:\n\t$(CARGO) clippy\n";
     let recipe = lint_checks_recipe(mk);
     assert!(recipe.contains("check-x.sh"), "recipe line missing");
-    assert!(!recipe.contains("clippy"), "lint-cargo leaked into the lint-checks recipe");
+    assert!(
+        !recipe.contains("clippy"),
+        "lint-cargo leaked into the lint-checks recipe"
+    );
 
     // This checker's own ALLOWLIST must not count as scheduling evidence.
-    assert!(!expands_frontier(SELF_PATH), "this file's body is being read as invocations");
-    assert!(expands_frontier("ci/run-reverie-pin-check.sh"), "a real intermediary stopped expanding");
+    assert!(
+        !expands_frontier(SELF_PATH),
+        "this file's body is being read as invocations"
+    );
+    assert!(
+        expands_frontier("ci/run-reverie-pin-check.sh"),
+        "a real intermediary stopped expanding"
+    );
     assert!(
         ALLOWLIST.iter().all(|(p, _)| *p != SELF_PATH),
         "this checker allowlisting itself would hide the very orphan it reports"
@@ -1409,7 +1471,10 @@ target/ci/check-exit-status-class --gate";
     // closed. It has: the scan no longer needs to know that `-X` takes a value, because
     // an unrecognised flag is now ASSUMED to take one.
     assert!(
-        is_invoked("python3 -X faulthandler scripts/check-y.py", "scripts/check-y.py"),
+        is_invoked(
+            "python3 -X faulthandler scripts/check-y.py",
+            "scripts/check-y.py"
+        ),
         "an unrecognised separate-value flag must no longer hide the script after it"
     );
     // The COST of the loud default, pinned so it is a choice and not a surprise: a
@@ -1417,7 +1482,10 @@ target/ci/check-exit-status-class --gate";
     // past the script and reports a FALSE ORPHAN. The remedy is to add the flag, not to
     // widen the default back.
     assert!(
-        !is_invoked("python3 --nonsense-bool scripts/check-y.py", "scripts/check-y.py"),
+        !is_invoked(
+            "python3 --nonsense-bool scripts/check-y.py",
+            "scripts/check-y.py"
+        ),
         "an unknown boolean is assumed to take a value; add it to the runner's list"
     );
     // ⚠️ BOTH DIRECTIONS OF ONE FLAG, WHICH IS WHY THE TABLE IS PER-RUNNER (hermit#2681)
@@ -1503,11 +1571,17 @@ target/ci/check-exit-status-class --gate";
     // A value-taking flag must not hide the script that follows its value. Without
     // the table this stops on `2021` and reports a false ORPHAN.
     assert!(
-        is_invoked("rustc --edition 2021 scripts/check-x.rs", "scripts/check-x.rs"),
+        is_invoked(
+            "rustc --edition 2021 scripts/check-x.rs",
+            "scripts/check-x.rs"
+        ),
         "a separate-value flag hid the script after it"
     );
     assert!(
-        is_invoked("rustc -C opt-level=3 scripts/check-x.rs", "scripts/check-x.rs"),
+        is_invoked(
+            "rustc -C opt-level=3 scripts/check-x.rs",
+            "scripts/check-x.rs"
+        ),
         "a -C value hid the script after it"
     );
     // ⚠️ THE CONTROL FOR THE SILENT DIRECTION. An OUTPUT path must not read as an
@@ -1522,7 +1596,9 @@ target/ci/check-exit-status-class --gate";
         "a mid-sentence mention was read as an invocation"
     );
 
-    println!("PASS: check-checker-scheduling strips comments, keeps invocations, scopes the recipe, and does not read its own allowlist as scheduling");
+    println!(
+        "PASS: check-checker-scheduling strips comments, keeps invocations, scopes the recipe, and does not read its own allowlist as scheduling"
+    );
 }
 
 #[cfg(test)]
@@ -1590,7 +1666,10 @@ mod tests {
     #[test]
     fn a_makefile_without_the_recipe_is_an_error_not_an_empty_pass() {
         let r = std::panic::catch_unwind(|| lint_checks_recipe("lint:\n\techo hi\n"));
-        assert!(r.is_err(), "a missing lint-checks recipe must refuse, not return empty");
+        assert!(
+            r.is_err(),
+            "a missing lint-checks recipe must refuse, not return empty"
+        );
     }
 
     /// The regression that scheduling this checker introduced: its own ALLOWLIST
@@ -1658,10 +1737,7 @@ mod tests {
             "ci/verify-x.sh"
         ));
         assert!(
-            !is_invoked(
-                "VERIFY=\"$ROOT_DIR/ci/verify-x.sh\"",
-                "ci/verify-x.sh"
-            ),
+            !is_invoked("VERIFY=\"$ROOT_DIR/ci/verify-x.sh\"", "ci/verify-x.sh"),
             "assigning a rooted checker path is not execution"
         );
         assert!(
@@ -1784,15 +1860,27 @@ bundle=$("$ROOT_DIR/ci/verify-x.sh" "$pointer")
         //
         // A shell flag that takes NO value: the path after it IS the script.
         // Measured by execution -- `bash -l ./x.sh` and `sh -l ./x.sh` print RAN.
-        assert!(is_invoked("\tbash -l scripts/check-x.sh", "scripts/check-x.sh"));
-        assert!(is_invoked("\tsh -l scripts/check-x.sh", "scripts/check-x.sh"));
+        assert!(is_invoked(
+            "\tbash -l scripts/check-x.sh",
+            "scripts/check-x.sh"
+        ));
+        assert!(is_invoked(
+            "\tsh -l scripts/check-x.sh",
+            "scripts/check-x.sh"
+        ));
         // ...and the value-taking side, so the shell table cannot simply be
         // EMPTIED to satisfy the two above -- that would trade the loud failure
         // (false orphan) for the silent one (false scheduled).
         // Measured: `bash -o ./x.sh` answers "invalid option name", the path was
         // eaten as the value; `python3 -c ./x.sh` is a SyntaxError, never run.
-        assert!(!is_invoked("\tbash -o scripts/check-x.sh", "scripts/check-x.sh"));
-        assert!(!is_invoked("\tpython3 -c scripts/check-x.py", "scripts/check-x.py"));
+        assert!(!is_invoked(
+            "\tbash -o scripts/check-x.sh",
+            "scripts/check-x.sh"
+        ));
+        assert!(!is_invoked(
+            "\tpython3 -c scripts/check-x.py",
+            "scripts/check-x.py"
+        ));
     }
 
     #[test]
