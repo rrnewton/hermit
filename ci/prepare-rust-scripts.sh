@@ -4,10 +4,11 @@
 set -euo pipefail
 
 case ${1:-} in
-    '') check_only=0 ;;
-    --check) check_only=1 ;;
+    '') mode=build ;;
+    --check) mode=check ;;
+    --fetch-only) mode=fetch ;;
     *)
-        printf 'usage: %s [--check]\n' "$0" >&2
+        printf 'usage: %s [--check|--fetch-only]\n' "$0" >&2
         exit 2
         ;;
 esac
@@ -117,8 +118,16 @@ parent=$ROOT_DIR/target/ci
 published=$parent/rust-scripts
 build_target=$parent/rust-script-build
 mkdir -p "$parent"
-exec 9>"$parent/rust-scripts.lock"
-flock 9
+if [[ $mode == fetch ]]; then
+    # Fetching writes only its private generated workspace and CARGO_HOME. Do
+    # not serialize it behind the ordinary producer, which writes the
+    # published binaries and can take minutes in a clean checkout.
+    exec 8>"$parent/rust-scripts-fetch.lock"
+    flock 8
+else
+    exec 9>"$parent/rust-scripts.lock"
+    flock 9
+fi
 
 tracked=$(git ls-files -- '*.rs') || {
     echo 'prepare-rust-scripts: cannot enumerate tracked Rust sources' >&2
@@ -206,12 +215,12 @@ manifest_is_complete() {
     done
 }
 
-if manifest_is_complete; then
+if [[ $mode != fetch ]] && manifest_is_complete; then
     printf 'prepare-rust-scripts: reused %d entrypoints (%d test harnesses) from %s\n' \
         "${#entrypoints[@]}" "${#test_entrypoints[@]}" "$published"
     exit 0
 fi
-if ((check_only)); then
+if [[ $mode == check ]]; then
     printf 'prepare-rust-scripts: prepared binaries are absent, stale, or incomplete; run %s\n' \
         "$ROOT_DIR/ci/prepare-rust-scripts.sh" >&2
     exit 2
@@ -225,10 +234,6 @@ command -v jq >/dev/null 2>&1 || {
     echo 'prepare-rust-scripts: jq is required' >&2
     exit 2
 }
-command -v strip >/dev/null 2>&1 || {
-    echo 'prepare-rust-scripts: strip is required to publish bounded artifacts' >&2
-    exit 2
-}
 
 mkdir -p "$scratch/run" "$scratch/test" "$build_target"
 : >"$scratch/manifest.tsv"
@@ -240,13 +245,6 @@ CLIPPY_WAIVERS=(
     -A clippy::too_many_arguments
     -A clippy::type_complexity
 )
-
-if ! cargo clippy -V >"$packages/clippy-version.out" 2>&1; then
-    echo 'prepare-rust-scripts: REFUSED — cargo clippy is unavailable, so no script has been checked' >&2
-    echo '  Install it with: rustup component add clippy' >&2
-    cat "$packages/clippy-version.out" >&2
-    exit 2
-fi
 
 keys=()
 for source in "${entrypoints[@]}"; do
@@ -286,6 +284,39 @@ if ((package_count != ${#entrypoints[@]})); then
         "$package_count" "${#entrypoints[@]}" >&2
     exit 2
 fi
+
+if [[ $mode == fetch ]]; then
+    # These packages are generated, so they have no committed lockfile. Resolve
+    # one while the network is available, then make the download itself obey
+    # that exact lock. The later pinned-root producer runs offline against this
+    # CARGO_HOME; it must never depend on an unrelated warm host cache.
+    output=$packages/workspace.output
+    if ! cargo generate-lockfile --manifest-path "$workspace_manifest" >"$output" 2>&1; then
+        report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
+            'resolve dependencies for' || exit $?
+    fi
+    cat "$output"
+    if ! cargo fetch --locked --manifest-path "$workspace_manifest" >"$output" 2>&1; then
+        report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
+            'fetch dependencies for' || exit $?
+    fi
+    cat "$output"
+    printf 'prepare-rust-scripts: fetched dependencies for %d entrypoints into %s\n' \
+        "${#entrypoints[@]}" "${CARGO_HOME:-the active Cargo home}"
+    exit 0
+fi
+
+if ! cargo clippy -V >"$packages/clippy-version.out" 2>&1; then
+    echo 'prepare-rust-scripts: REFUSED — cargo clippy is unavailable, so no script has been checked' >&2
+    echo '  Install it with: rustup component add clippy' >&2
+    cat "$packages/clippy-version.out" >&2
+    exit 2
+fi
+
+command -v strip >/dev/null 2>&1 || {
+    echo 'prepare-rust-scripts: strip is required to publish bounded artifacts' >&2
+    exit 2
+}
 
 package_names=()
 test_package_args=()
