@@ -221,6 +221,8 @@ pub struct ModeRecipe {
     pub outcome_classes: Option<u64>,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default)]
+    pub run_args: BTreeMap<String, Vec<String>>,
     pub compare_io_buffers: Option<bool>,
     pub compare_io_buffers_disabled_reason: Option<String>,
     pub rcb_time: Option<bool>,
@@ -780,6 +782,16 @@ fn validate_mode_with_cpu(
                 "{id}: {mode} guest_args names disabled backend {backend}"
             ));
         }
+    }
+    for backend in recipe.run_args.keys() {
+        if !enabled.contains(backend.as_str()) {
+            return Err(format!(
+                "{id}: {mode} run_args names disabled backend {backend}"
+            ));
+        }
+    }
+    if mode != "verify" && !recipe.run_args.is_empty() {
+        return Err(format!("{id}: run_args is supported only by verify mode"));
     }
     match (
         mode,
@@ -2014,6 +2026,13 @@ pub fn build_spec(
             if context.run_verify_strict {
                 argv.push("--verify-strict".into());
             }
+            argv.extend(
+                mode_recipe
+                    .run_args
+                    .get(backend)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
             if mode_recipe.compare_io_buffers == Some(false) {
                 argv.push("--no-detlog-io-buffers".into());
             }
@@ -5911,6 +5930,74 @@ backends_disabled:
             validate_mode("fixture/test", "verify", &missing_rcb_reason, 15)
                 .unwrap_err()
                 .contains("requires rcb_time_disabled_reason")
+        );
+    }
+
+    #[test]
+    fn verify_run_args_are_backend_specific_hermit_arguments() {
+        let mut test = recipe(true);
+        let mode = test.modes.get_mut("verify").unwrap();
+        mode.run_args
+            .insert("ptrace".into(), vec!["--memory=128MB".into()]);
+        validate_mode("fixture/test", "verify", mode, 15).unwrap();
+
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "verify".into(),
+                backend: Some("ptrace".into()),
+            },
+            test,
+            enabled: true,
+            timeout_seconds: 15,
+            cpu_timeout_seconds: 10,
+        };
+        let context = run_context(Path::new("/repo"));
+        let spec = build_spec(
+            &context,
+            &cell,
+            PathBuf::from("/repo/results/cell"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+            cell.timeout_seconds,
+        )
+        .unwrap();
+        let separator = spec.argv.iter().position(|arg| arg == "--").unwrap();
+        let memory_arg = spec
+            .argv
+            .iter()
+            .position(|arg| arg == "--memory=128MB")
+            .unwrap();
+        assert!(
+            memory_arg < separator,
+            "run_args must be Hermit arguments before the guest separator: {:?}",
+            spec.argv
+        );
+        assert!(
+            !spec.guest_argv.iter().any(|arg| arg == "--memory=128MB"),
+            "run_args must not be appended to the guest argv"
+        );
+
+        let mut disabled_backend = recipe(true).modes.remove("verify").unwrap();
+        disabled_backend
+            .run_args
+            .insert("kvm".into(), vec!["--memory=128MB".into()]);
+        assert!(
+            validate_mode("fixture/test", "verify", &disabled_backend, 15)
+                .unwrap_err()
+                .contains("run_args names disabled backend kvm")
+        );
+
+        let mut non_verify = recipe(true).modes.remove("verify").unwrap();
+        non_verify
+            .run_args
+            .insert("ptrace".into(), vec!["--memory=128MB".into()]);
+        assert!(
+            validate_mode("fixture/test", "replay", &non_verify, 15)
+                .unwrap_err()
+                .contains("run_args is supported only by verify mode")
         );
     }
 
