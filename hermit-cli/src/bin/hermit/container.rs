@@ -42,6 +42,7 @@ use nix::sys::signal::Signal;
 use nix::sys::signal::sigaction;
 use nix::unistd::Pid;
 use reverie::process::Container;
+use reverie::process::DeferredContainerRun;
 use reverie::process::ExitStatus;
 use reverie::process::Mount;
 use reverie::process::MountFlags;
@@ -1065,6 +1066,58 @@ where
     }))
 }
 
+/// Runs a container child whose successful result has one child-owned value
+/// that must be dropped after the result crosses the process boundary.
+///
+/// The caller receives a mandatory cleanup handle and must check its status
+/// before publishing success. This keeps guest execution inside the ordinary
+/// container child while allowing independent parent work to overlap teardown.
+pub fn with_container_deferred_drop<F, T, D>(
+    container: &mut Container,
+    mut f: F,
+) -> Result<DeferredContainerRun<Result<T, SerializableError>>, Error>
+where
+    F: FnMut() -> Result<(T, D), Error>,
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let ran = container.run_with_deferred_drop(|| {
+        // This closure is a container init just like the one passed to
+        // `with_container`. Arm its parent-death signal and stop-signal
+        // handlers before any guest setup so an interrupted KVM verification
+        // cannot leave the deferred-cleanup child behind.
+        let result = arm_container_init_guards().and_then(|()| catch_child_panic(&mut f));
+        match result {
+            Ok((value, deferred)) => (Ok(value), Some(deferred)),
+            Err(error) => (Err(error), None),
+        }
+    });
+    let run = match ran {
+        Ok(run) => run,
+        Err(error) => {
+            return match classify_container_result::<T>(Err(error)) {
+                Err(error) => Err(error),
+                Ok(_) => unreachable!("an Err container result cannot classify as success"),
+            };
+        }
+    };
+    if run.provisional().is_err() {
+        let reported = match run.finalize() {
+            Ok(reported) => reported,
+            Err(error) => {
+                return match classify_container_result::<T>(Err(error)) {
+                    Err(error) => Err(error),
+                    Ok(_) => unreachable!("an Err container result cannot classify as success"),
+                };
+            }
+        };
+        return match classify_container_result(Ok(reported)) {
+            Err(error) => Err(error),
+            Ok(_) => unreachable!("the provisional result was already known to be an error"),
+        };
+    }
+    Ok(run)
+}
+
 /// Turn a `Container::run` / [`RunGuarded::run_guarded`] outcome into an error
 /// whose CLASS is still readable by `classify_failure`.
 ///
@@ -1175,6 +1228,120 @@ impl<T> Classified<T> for Result<Result<T, SerializableError>, RunError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_container_child_arms_the_standard_init_guards() {
+        let run = with_container_deferred_drop(&mut Container::new(), || {
+            let mut parent_death_signal = 0;
+            // SAFETY: PR_GET_PDEATHSIG writes one signal number through the
+            // provided live pointer and does not retain it.
+            if unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut parent_death_signal) } == -1 {
+                return Err(Error::new(std::io::Error::last_os_error()));
+            }
+
+            let mut current_mask = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+            // SAFETY: a null set queries the calling thread's mask into the
+            // provided live storage without changing it.
+            if unsafe {
+                libc::pthread_sigmask(
+                    libc::SIG_SETMASK,
+                    std::ptr::null(),
+                    current_mask.as_mut_ptr(),
+                )
+            } != 0
+            {
+                return Err(anyhow!(
+                    "failed to read the deferred container child's signal mask"
+                ));
+            }
+            // SAFETY: pthread_sigmask initialized current_mask above.
+            let current_mask = unsafe { current_mask.assume_init() };
+
+            let mut handlers_installed = true;
+            let mut signals_unblocked = true;
+            for signal in CONTAINER_INIT_STOP_SIGNALS {
+                let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+                // SAFETY: a null replacement action queries this signal's
+                // disposition into the provided live storage.
+                if unsafe {
+                    libc::sigaction(signal as libc::c_int, std::ptr::null(), action.as_mut_ptr())
+                } == -1
+                {
+                    return Err(Error::new(std::io::Error::last_os_error()));
+                }
+                // SAFETY: sigaction initialized action above.
+                let action = unsafe { action.assume_init() };
+                handlers_installed &=
+                    action.sa_sigaction == on_container_init_stop_signal as *const () as usize;
+                // SAFETY: current_mask is initialized and signal is valid.
+                signals_unblocked &=
+                    unsafe { libc::sigismember(&current_mask, signal as libc::c_int) } == 0;
+            }
+
+            Ok((
+                (parent_death_signal, handlers_installed, signals_unblocked),
+                (),
+            ))
+        })
+        .expect("deferred container child should start");
+
+        let (parent_death_signal, handlers_installed, signals_unblocked) = run
+            .finalize()
+            .expect("deferred container child should exit successfully")
+            .expect("deferred container child should report its guard state");
+        assert_eq!(parent_death_signal, libc::SIGKILL);
+        assert!(
+            handlers_installed,
+            "container-init stop handlers were absent"
+        );
+        assert!(
+            signals_unblocked,
+            "container-init stop signals remained blocked"
+        );
+    }
+
+    #[test]
+    fn container_init_stop_handlers_unblock_every_stop_signal() {
+        // Container::setup itself clears inherited masks. Block the three
+        // signals inside the child, immediately before exercising the helper,
+        // so deleting its `thread_unblock` call makes this test fail.
+        let (blocked_before, unblocked_after) = Container::new()
+            .run(|| {
+                let mut blocked = SigSet::empty();
+                for signal in CONTAINER_INIT_STOP_SIGNALS {
+                    blocked.add(signal);
+                }
+                blocked
+                    .thread_block()
+                    .expect("block stop signals in the container child");
+                let before = SigSet::thread_get_mask()
+                    .expect("read the container child's blocked signal mask");
+
+                install_container_init_stop_handlers()
+                    .expect("install and unblock the container-init stop handlers");
+                let after = SigSet::thread_get_mask()
+                    .expect("read the container child's unblocked signal mask");
+
+                (
+                    CONTAINER_INIT_STOP_SIGNALS
+                        .into_iter()
+                        .all(|signal| before.contains(signal)),
+                    CONTAINER_INIT_STOP_SIGNALS
+                        .into_iter()
+                        .all(|signal| !after.contains(signal)),
+                )
+            })
+            .expect("container child should report its signal-mask transition");
+
+        assert!(
+            blocked_before,
+            "test precondition did not block every signal"
+        );
+        assert!(
+            unblocked_after,
+            "container-init stop signals remained blocked"
+        );
+    }
 
     /// ⚠️ RECORD MODE REACHES THE SAME POLICY BY A DIFFERENT CHANNEL, and for
     /// one release the two channels disagreed about what happened.

@@ -10,10 +10,14 @@ use std::io;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::io::stderr;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 
 use tracing::Subscriber;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::util::SubscriberInitExt;
 
 const DEFAULT_TRACE_LEVEL: LevelFilter = LevelFilter::WARN;
@@ -191,6 +195,69 @@ fn file_subscriber<W: Write + Send + 'static>(
 /// COST, measured rather than assumed, on a 477 KB verify log:
 /// synchronous 1.77s versus non-blocking 1.73s -- inside noise, identical
 /// output size. The queue was buying nothing and losing the diagnostic.
+struct ClosableWriter<W> {
+    inner: Arc<Mutex<Option<W>>>,
+}
+
+struct ClosableWriterGuard<'a, W> {
+    inner: MutexGuard<'a, Option<W>>,
+}
+
+impl<W: Write> Write for ClosableWriterGuard<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.inner.as_mut() {
+            Some(writer) => writer.write(buf),
+            // The subscriber is process-global, so it outlives a single
+            // verification run. Once that run closes its file, later tracing
+            // (including KVM teardown) must not retain or mutate the completed
+            // comparison log.
+            None => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self.inner.as_mut() {
+            Some(writer) => writer.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<'a, W: Write + Send + 'static> MakeWriter<'a> for ClosableWriter<W> {
+    type Writer = ClosableWriterGuard<'a, W>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        ClosableWriterGuard {
+            inner: self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        }
+    }
+}
+
+#[must_use = "dropping this guard flushes and closes the synchronous trace writer"]
+struct CloseWriterOnDrop<W: Write> {
+    inner: Arc<Mutex<Option<W>>>,
+}
+
+impl<W: Write> Drop for CloseWriterOnDrop<W> {
+    fn drop(&mut self) {
+        // Take the writer while holding the lock, then drop it after releasing
+        // the lock. A concurrent tracing event either completes before this
+        // point or observes `None` and writes to the sink above.
+        let mut writer = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(writer) = writer.as_mut() {
+            let _ = writer.flush();
+        }
+        drop(writer);
+    }
+}
+
 fn sync_file_subscriber<W: Write + Send + 'static>(
     level: LevelFilter,
     f: W,
@@ -199,19 +266,16 @@ fn sync_file_subscriber<W: Write + Send + 'static>(
         .add_directive("tokio=debug".parse().expect("correct directive"))
         .add_directive(level.into());
 
+    let inner = Arc::new(Mutex::new(Some(f)));
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::sync::Mutex::new(f))
+        .with_writer(ClosableWriter {
+            inner: Arc::clone(&inner),
+        })
         .with_ansi(false)
         .finish();
 
-    /// No drain to wait for: every write already reached the file.
-    struct Flushed;
-    impl Drop for Flushed {
-        fn drop(&mut self) {}
-    }
-
-    (subscriber, Flushed)
+    (subscriber, CloseWriterOnDrop { inner })
 }
 
 /// Initializes SYNCHRONOUS tracing to `f`, for logs whose tail must survive a
@@ -280,13 +344,83 @@ pub fn init_stderr_tracing(level: Option<LevelFilter>) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use super::*;
 
     /// `log_max_bytes` reads the process environment, which libtest's threads
     /// share.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct DropTrackingWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        dropped: Arc<AtomicBool>,
+        flushes: Arc<AtomicUsize>,
+    }
+
+    impl Write for DropTrackingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl Drop for DropTrackingWriter {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn synchronous_guard_closes_writer_while_subscriber_remains_live() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let (subscriber, guard) = sync_file_subscriber(
+            LevelFilter::WARN,
+            DropTrackingWriter {
+                bytes: Arc::clone(&bytes),
+                dropped: Arc::clone(&dropped),
+                flushes: Arc::clone(&flushes),
+            },
+        );
+        let dispatch = tracing::Dispatch::new(subscriber);
+
+        tracing::dispatcher::with_default(&dispatch, || tracing::warn!("before close"));
+        assert!(!dropped.load(Ordering::SeqCst));
+        let before_close = bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert!(String::from_utf8_lossy(&before_close).contains("before close"));
+        let flushes_before_close = flushes.load(Ordering::SeqCst);
+
+        drop(guard);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(
+            flushes.load(Ordering::SeqCst) > flushes_before_close,
+            "dropping the synchronous guard must flush its owned writer"
+        );
+
+        tracing::dispatcher::with_default(&dispatch, || tracing::warn!("after close"));
+        assert_eq!(
+            *bytes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            before_close,
+            "a process-global subscriber must not mutate a completed run log"
+        );
+    }
 
     /// Bracketed both ways on purpose: a bound that always fires would silently
     /// truncate ordinary diagnostic logs, which is the failure mode opposite to

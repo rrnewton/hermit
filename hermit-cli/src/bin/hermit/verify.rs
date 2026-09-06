@@ -8,6 +8,8 @@
 
 use std::collections::BTreeSet;
 use std::io;
+use std::io::Seek;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -35,12 +37,29 @@ use pretty_assertions::Comparison;
 use reverie::process::ExitStatus;
 use reverie::process::Output;
 use tempfile::NamedTempFile;
+use tempfile::SpooledTempFile;
 use tempfile::TempPath;
 use tracing::metadata::LevelFilter;
 
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::record_envelope::RecordEnvelopePolicy;
+
+/// Keep ordinary verification diagnostics cheap while bounding heap use for a
+/// large stdout/stderr difference. Crossing this threshold preserves every
+/// diagnostic byte in an anonymous temporary file rather than truncating it.
+const VERIFICATION_DIAGNOSTIC_MEMORY_LIMIT: usize = 64 * 1024;
+
+fn verification_diagnostic_spool() -> SpooledTempFile {
+    tempfile::spooled_tempfile(VERIFICATION_DIAGNOSTIC_MEMORY_LIMIT)
+}
+
+pub(crate) fn attach_secondary_failure(primary: Error, label: &str, secondary: Error) -> Error {
+    // `anyhow::Context` keeps `primary` in the error chain, so callers can
+    // still downcast to its concrete type. The secondary is diagnostic text,
+    // not a replacement root cause.
+    primary.context(format!("additionally, {label}: {secondary:#}"))
+}
 
 pub(crate) struct ComparedRun<'a> {
     pub output: &'a Output,
@@ -821,13 +840,167 @@ pub(crate) fn retain_verification_logs<const N: usize>(
     logs: [(&str, TempPath); N],
 ) -> Result<Vec<PathBuf>, Error> {
     let mut retained = Vec::with_capacity(N);
+    let mut failure = None;
     eprintln!(":: Verification logs retained:");
     for (label, log) in logs {
-        let path = log.keep()?;
-        eprintln!("::   {label}: {}", path.display());
-        retained.push(path);
+        let source = log.to_path_buf();
+        let result = (|| -> Result<PathBuf, Error> {
+            // TempPath::keep is infallible on Unix even when the pathname has
+            // already disappeared. Verify existence first so a printed
+            // "retained" path is evidence that a file really survived.
+            std::fs::metadata(&source).with_context(|| {
+                format!(
+                    "checking {label} verification log before retention {}",
+                    source.display()
+                )
+            })?;
+            log.keep()
+                .map_err(Error::from)
+                .with_context(|| format!("retaining {label} verification log {}", source.display()))
+        })();
+        match result {
+            Ok(path) => {
+                eprintln!("::   {label}: {}", path.display());
+                retained.push(path);
+            }
+            Err(error) => {
+                failure = Some(match failure {
+                    Some(primary) => attach_secondary_failure(
+                        primary,
+                        &format!("retaining {label} verification log failed"),
+                        error,
+                    ),
+                    None => error,
+                });
+            }
+        }
     }
-    Ok(retained)
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(retained),
+    }
+}
+
+/// A completed comparison whose externally visible effects have not yet been
+/// published.
+///
+/// KVM verification uses this to compare the two closed log files while the
+/// container children release their stopped VMs. Diagnostics are kept in a
+/// bounded-memory spill file and remain unpublished until both cleanup results
+/// have been checked, so a cleanup failure cannot be preceded by a success or
+/// divergence report.
+#[must_use = "a prepared comparison must be published after cleanup succeeds or explicitly discarded after cleanup failure"]
+pub(crate) struct PreparedRunComparison {
+    diagnostics: SpooledTempFile,
+    first_label: String,
+    first_log: TempPath,
+    second_label: String,
+    second_log: TempPath,
+    keep_logs: bool,
+    retain_logs: bool,
+    outcome: Result<VerificationOutcome, Error>,
+}
+
+impl PreparedRunComparison {
+    pub(crate) fn publish(self) -> Result<VerificationOutcome, Error> {
+        let Self {
+            mut diagnostics,
+            first_label,
+            first_log,
+            second_label,
+            second_log,
+            keep_logs: _,
+            retain_logs,
+            outcome,
+        } = self;
+
+        // The comparison result is the primary failure when preparation could
+        // not finish. Publishing and retention are still attempted so an
+        // explicit --keep-logs request cannot be lost behind that failure.
+        let (outcome, mut error) = match outcome {
+            Ok(outcome) => (Some(outcome), None),
+            Err(error) => (None, Some(error)),
+        };
+
+        let diagnostics_result = (|| -> Result<(), Error> {
+            diagnostics
+                .flush()
+                .context("flushing prepared verification diagnostics")?;
+            diagnostics
+                .rewind()
+                .context("rewinding prepared verification diagnostics")?;
+            io::copy(&mut diagnostics, &mut io::stderr().lock())
+                .context("publishing prepared verification diagnostics")?;
+            Ok(())
+        })();
+        if let Err(publish_error) = diagnostics_result {
+            error = Some(match error {
+                Some(primary) => attach_secondary_failure(
+                    primary,
+                    "verification diagnostic publication failed",
+                    publish_error,
+                ),
+                None => publish_error.context("verification diagnostic publication failed"),
+            });
+        }
+
+        let retention_result = retain_logs
+            .then(|| {
+                retain_verification_logs([
+                    (first_label.as_str(), first_log),
+                    (second_label.as_str(), second_log),
+                ])
+            })
+            .transpose();
+        if let Err(retention_error) = retention_result {
+            error = Some(match error {
+                Some(primary) => attach_secondary_failure(
+                    primary,
+                    "verification log retention failed",
+                    retention_error,
+                ),
+                None => retention_error.context("verification log retention failed"),
+            });
+        }
+
+        match (outcome, error) {
+            (_, Some(error)) => Err(error),
+            (Some(outcome), None) => Ok(outcome),
+            (None, None) => unreachable!("a prepared comparison has an outcome or an error"),
+        }
+    }
+
+    /// Discard a comparison that cannot be published after another failure.
+    /// A match or divergence remains hidden, but a comparison-processing error
+    /// is returned for attachment to the primary failure. Explicitly requested
+    /// log retention is attempted independently and returned as a second
+    /// failure rather than masking the comparison error.
+    pub(crate) fn discard_after_primary_failure(self) -> Vec<(&'static str, Error)> {
+        let Self {
+            diagnostics: _,
+            first_label,
+            first_log,
+            second_label,
+            second_log,
+            keep_logs,
+            retain_logs: _,
+            outcome,
+        } = self;
+
+        let mut failures = Vec::new();
+        if let Err(error) = outcome {
+            failures.push(("verification comparison preparation failed", error));
+        }
+        if keep_logs
+            && let Err(error) = retain_verification_logs([
+                (first_label.as_str(), first_log),
+                (second_label.as_str(), second_log),
+            ])
+        {
+            failures.push(("verification log retention failed", error));
+        }
+        failures
+    }
 }
 
 pub fn compare_two_runs(
@@ -836,6 +1009,14 @@ pub fn compare_two_runs(
     options: ComparisonOptions,
 ) -> Result<VerificationOutcome, Error> {
     compare_two_runs_with_unsupported_scan(first, second, options, unsupported_syscalls_from_log)
+}
+
+pub(crate) fn prepare_two_runs(
+    first: ComparedRun<'_>,
+    second: ComparedRun<'_>,
+    options: ComparisonOptions,
+) -> PreparedRunComparison {
+    prepare_two_runs_with_unsupported_scan(first, second, options, unsupported_syscalls_from_log)
 }
 
 fn compare_two_runs_with_unsupported_scan(
@@ -850,6 +1031,156 @@ fn compare_two_runs_with_unsupported_scan(
         label: label1,
     } = first;
     let ComparedRun {
+        output: out2,
+        log: log2,
+        label: label2,
+    } = second;
+    let mut diagnostics = ComparisonDiagnostics::Direct;
+    let comparison = compare_two_runs_to_diagnostics(
+        ComparedRunRef {
+            output: out1,
+            log: log1.as_ref(),
+            label: label1,
+        },
+        ComparedRunRef {
+            output: out2,
+            log: log2.as_ref(),
+            label: label2,
+        },
+        &options,
+        scan_unsupported_syscalls,
+        &mut diagnostics,
+    );
+
+    if comparison.retain_logs {
+        retain_verification_logs([(label1, log1), (label2, log2)])?;
+    }
+    comparison.outcome
+}
+
+fn prepare_two_runs_with_unsupported_scan(
+    first: ComparedRun<'_>,
+    second: ComparedRun<'_>,
+    options: ComparisonOptions,
+    scan_unsupported_syscalls: impl Fn(&Path) -> io::Result<BTreeSet<String>>,
+) -> PreparedRunComparison {
+    let ComparedRun {
+        output: out1,
+        log: log1,
+        label: label1,
+    } = first;
+    let ComparedRun {
+        output: out2,
+        log: log2,
+        label: label2,
+    } = second;
+    let keep_logs = options.keep_logs;
+    let mut diagnostics = verification_diagnostic_spool();
+    let comparison = compare_two_runs_to_diagnostics(
+        ComparedRunRef {
+            output: out1,
+            log: log1.as_ref(),
+            label: label1,
+        },
+        ComparedRunRef {
+            output: out2,
+            log: log2.as_ref(),
+            label: label2,
+        },
+        &options,
+        scan_unsupported_syscalls,
+        &mut ComparisonDiagnostics::Deferred(&mut diagnostics),
+    );
+
+    PreparedRunComparison {
+        diagnostics,
+        first_label: label1.to_owned(),
+        first_log: log1,
+        second_label: label2.to_owned(),
+        second_log: log2,
+        keep_logs,
+        retain_logs: comparison.retain_logs,
+        outcome: comparison.outcome,
+    }
+}
+
+struct ComparisonComputation {
+    retain_logs: bool,
+    outcome: Result<VerificationOutcome, Error>,
+}
+
+#[derive(Clone, Copy)]
+struct ComparedRunRef<'a> {
+    output: &'a Output,
+    log: &'a Path,
+    label: &'a str,
+}
+
+enum ComparisonDiagnostics<'a> {
+    Direct,
+    Deferred(&'a mut SpooledTempFile),
+}
+
+impl ComparisonDiagnostics<'_> {
+    fn line(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
+        match self {
+            Self::Direct => {
+                eprintln!("{args}");
+                Ok(())
+            }
+            Self::Deferred(writer) => writeln!(writer, "{args}"),
+        }
+    }
+
+    fn display_diff(&mut self, left: &str, right: &str) -> io::Result<()> {
+        match self {
+            Self::Direct => {
+                display_diff(left, right);
+                Ok(())
+            }
+            Self::Deferred(writer) => display_diff_to(left, right, *writer),
+        }
+    }
+
+    fn compare_logs(
+        &mut self,
+        left: &Path,
+        right: &Path,
+        options: &logdiff::LogDiffOpts,
+        keep_record: impl Fn(&str) -> bool,
+    ) -> io::Result<logdiff::LogDiffSummary> {
+        match self {
+            Self::Direct => {
+                logdiff::try_log_diff_detailed_with_filter(left, right, options, keep_record)
+            }
+            Self::Deferred(writer) => {
+                let left_bytes = std::fs::read(left)?;
+                let right_bytes = std::fs::read(right)?;
+                logdiff::log_diff_summary_from_strs_with_filter(
+                    String::from_utf8_lossy(&left_bytes),
+                    String::from_utf8_lossy(&right_bytes),
+                    options,
+                    *writer,
+                    keep_record,
+                )
+            }
+        }
+    }
+}
+
+fn compare_two_runs_to_diagnostics(
+    first: ComparedRunRef<'_>,
+    second: ComparedRunRef<'_>,
+    options: &ComparisonOptions,
+    scan_unsupported_syscalls: impl Fn(&Path) -> io::Result<BTreeSet<String>>,
+    diagnostics: &mut ComparisonDiagnostics<'_>,
+) -> ComparisonComputation {
+    let ComparedRunRef {
+        output: out1,
+        log: log1,
+        label: label1,
+    } = first;
+    let ComparedRunRef {
         output: out2,
         log: log2,
         label: label2,
@@ -885,38 +1216,42 @@ fn compare_two_runs_with_unsupported_scan(
         options.virtualize_time,
     );
 
-    if out1.stdout != out2.stdout {
-        failed = true;
-        observed_divergence = true;
-        eprintln!("Mismatch in stdout between {label1} and {label2}:");
-        let str1 = String::from_utf8_lossy(&out1.stdout);
-        let str2 = String::from_utf8_lossy(&out2.stdout);
-        if str1.lines().count() > 1 {
-            display_diff(&str1, &str2);
-        } else {
-            eprintln!("{}", Comparison::new(&str1, &str2));
-        }
-    }
-
-    if out1.stderr != out2.stderr {
-        failed = true;
-        observed_divergence = true;
-        eprintln!("Mismatch in stderr between {label1} and {label2}:");
-        let str1 = String::from_utf8_lossy(&out1.stderr);
-        let str2 = String::from_utf8_lossy(&out2.stderr);
-        if str1.lines().count() > 1 {
-            display_diff(&str1, &str2);
-        } else {
-            eprintln!("{}", Comparison::new(&str1, &str2));
-        }
-    }
-
     let log_processing_result = (|| -> Result<(), Error> {
+        if out1.stdout != out2.stdout {
+            failed = true;
+            observed_divergence = true;
+            diagnostics.line(format_args!(
+                "Mismatch in stdout between {label1} and {label2}:"
+            ))?;
+            let str1 = String::from_utf8_lossy(&out1.stdout);
+            let str2 = String::from_utf8_lossy(&out2.stdout);
+            if str1.lines().count() > 1 {
+                diagnostics.display_diff(&str1, &str2)?;
+            } else {
+                diagnostics.line(format_args!("{}", Comparison::new(&str1, &str2)))?;
+            }
+        }
+
+        if out1.stderr != out2.stderr {
+            failed = true;
+            observed_divergence = true;
+            diagnostics.line(format_args!(
+                "Mismatch in stderr between {label1} and {label2}:"
+            ))?;
+            let str1 = String::from_utf8_lossy(&out1.stderr);
+            let str2 = String::from_utf8_lossy(&out2.stderr);
+            if str1.lines().count() > 1 {
+                diagnostics.display_diff(&str1, &str2)?;
+            } else {
+                diagnostics.line(format_args!("{}", Comparison::new(&str1, &str2)))?;
+            }
+        }
+
         if options.compare_logs {
-            eprintln!(
+            diagnostics.line(format_args!(
                 ":: {}",
                 "Comparing captured verification logs...".yellow().bold()
-            );
+            ))?;
             // The comparison semantics come from `spec` (strip_lines + mode); only
             // the printed syscall-history depth still tracks `verbose`. Historically
             // both were flipped together, so the sole bitwise comparison was also the
@@ -938,6 +1273,11 @@ fn compare_two_runs_with_unsupported_scan(
                 // structured event records.
                 require_structured_events: true,
                 syscall_history: if options.verbose { 10 } else { 5 },
+                // Verification diagnostics must stay on the supplied writer so
+                // the KVM path can spool them until cleanup succeeds. The
+                // standalone log-diff command retains its explicit --git-diff
+                // mode; verification never delegates output to a child process.
+                git_diff: false,
                 // Thread the filter facts from the spec so what the verdict *reports*
                 // (`spec.skip_commit`/`spec.skip_detlog`) is exactly what the diff
                 // engine *does*; the remaining filters stay at their no-op defaults.
@@ -953,9 +1293,9 @@ fn compare_two_runs_with_unsupported_scan(
                 "ComparisonSpec.ignore_lines must match the diff engine's ignore_lines"
             );
 
-            let summary = logdiff::try_log_diff_detailed_with_filter(
-                log1.as_ref(),
-                log2.as_ref(),
+            let summary = diagnostics.compare_logs(
+                log1,
+                log2,
                 &diff_options,
                 options.record_envelope.predicate(),
             )?;
@@ -993,54 +1333,42 @@ fn compare_two_runs_with_unsupported_scan(
                 first_divergent_left_message = summary.first_divergent_left_message.clone();
                 first_divergent_right_message = summary.first_divergent_right_message.clone();
                 if !summary.refused {
-                    eprintln!(
+                    diagnostics.line(format_args!(
                         ":: {}",
                         format!("Log differences found between {label1} and {label2}.")
                             .red()
                             .bold()
-                    );
+                    ))?;
                 }
             }
         } else {
-            eprintln!(
+            diagnostics.line(format_args!(
                 ":: Comparing guest output and exit status only; internal logs were not compared"
-            );
+            ))?;
         }
 
         if out1.status != out2.status {
             failed = true;
             observed_divergence = true;
-            eprintln!(
+            diagnostics.line(format_args!(
                 "Mismatch in exit status between {label1} and {label2}: {}",
                 Comparison::new(&out1.status, &out2.status)
-            );
+            ))?;
         }
 
         if !failed {
-            let mut unsupported = scan_unsupported_syscalls(log1.as_ref())?;
-            unsupported.extend(scan_unsupported_syscalls(log2.as_ref())?);
+            let mut unsupported = scan_unsupported_syscalls(log1)?;
+            unsupported.extend(scan_unsupported_syscalls(log2)?);
             if let Some(message) = detcore::format_unsupported_syscall_warning(&unsupported) {
-                eprintln!("WARNING: {message}");
+                diagnostics.line(format_args!("WARNING: {message}"))?;
             }
         }
         Ok(())
     })();
 
-    if let Err(error) = log_processing_result {
-        if options.keep_logs || failed {
-            retain_verification_logs([(label1, log1), (label2, log2)])?;
-        }
-        return Err(error);
-    }
-
-    // Divergence historically retained both diagnostics. `--keep-logs` extends
-    // that behavior to successful comparisons instead of changing the failure
-    // path.
-    if options.keep_logs || failed {
-        retain_verification_logs([(label1, log1), (label2, log2)])?;
-    }
-
-    if failed {
+    let outcome = if let Err(error) = log_processing_result {
+        Err(error)
+    } else if failed {
         // A refused comparison is a NO-RESULT, not a divergence. A real
         // stdout/stderr/exit-status mismatch still outranks the refusal.
         let verdict = if comparison_refused && !observed_divergence {
@@ -1081,6 +1409,14 @@ fn compare_two_runs_with_unsupported_scan(
             first_divergent_left_message,
             first_divergent_right_message,
         })
+    };
+
+    ComparisonComputation {
+        // Divergence historically retains both diagnostics. `--keep-logs`
+        // extends that behavior to successful comparisons. The owning caller
+        // performs retention after direct publication or deferred cleanup.
+        retain_logs: options.keep_logs || failed,
+        outcome,
     }
 }
 
@@ -1186,18 +1522,31 @@ pub fn announce_verification_outcome(
     }
 }
 
-fn display_diff(left: &str, right: &str) {
+fn display_diff_to(left: &str, right: &str, writer: &mut impl Write) -> io::Result<()> {
     for result in diff::lines(left, right) {
         match result {
             diff::Result::Left(s) => {
-                eprintln!("- {}", s.red());
+                writeln!(writer, "- {}", s.red())?;
             }
             diff::Result::Right(s) => {
-                eprintln!("+ {}", s.green());
+                writeln!(writer, "+ {}", s.green())?;
             }
             diff::Result::Both(s, _) => {
-                eprintln!("  {}", s);
+                writeln!(writer, "  {}", s)?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Preserve the historical direct stderr stream for callers that have no
+/// deferred cleanup to gate publication on.
+fn display_diff(left: &str, right: &str) {
+    for result in diff::lines(left, right) {
+        match result {
+            diff::Result::Left(s) => eprintln!("- {}", s.red()),
+            diff::Result::Right(s) => eprintln!("+ {}", s.green()),
+            diff::Result::Both(s, _) => eprintln!("  {}", s),
         }
     }
 }
@@ -1205,8 +1554,71 @@ fn display_diff(left: &str, right: &str) {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Read;
 
     use super::*;
+
+    #[test]
+    fn verification_diagnostics_roll_to_disk_without_changing_bytes() {
+        let expected: Vec<u8> = (0..=VERIFICATION_DIAGNOSTIC_MEMORY_LIMIT)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let mut diagnostics = verification_diagnostic_spool();
+
+        let (in_memory, rollover_byte) = expected.split_at(VERIFICATION_DIAGNOSTIC_MEMORY_LIMIT);
+        diagnostics.write_all(in_memory).unwrap();
+        assert!(!diagnostics.is_rolled());
+        diagnostics.write_all(rollover_byte).unwrap();
+        assert!(
+            diagnostics.is_rolled(),
+            "crossing the bounded-memory threshold must spill diagnostics"
+        );
+
+        diagnostics.rewind().unwrap();
+        let mut actual = Vec::new();
+        diagnostics.read_to_end(&mut actual).unwrap();
+        assert_eq!(
+            actual, expected,
+            "spilling must preserve every byte in order"
+        );
+    }
+
+    #[test]
+    fn public_comparison_streams_directly_without_creating_a_spool() {
+        let production = include_str!("verify.rs")
+            .rsplit_once("#[cfg(test)]")
+            .expect("production/test boundary")
+            .0;
+        let public_entry = production
+            .split_once("pub fn compare_two_runs(")
+            .expect("public comparison entry")
+            .1
+            .split_once("pub(crate) fn prepare_two_runs(")
+            .expect("deferred comparison entry")
+            .0;
+        assert!(public_entry.contains("compare_two_runs_with_unsupported_scan"));
+
+        let direct = production
+            .split_once("fn compare_two_runs_with_unsupported_scan(")
+            .expect("direct comparison implementation")
+            .1
+            .split_once("fn prepare_two_runs_with_unsupported_scan(")
+            .expect("deferred comparison implementation")
+            .0;
+        assert!(direct.contains("ComparisonDiagnostics::Direct"));
+        assert!(!direct.contains("verification_diagnostic_spool"));
+        assert!(!direct.contains("ComparisonDiagnostics::Deferred"));
+
+        let deferred = production
+            .split_once("fn prepare_two_runs_with_unsupported_scan(")
+            .expect("deferred comparison implementation")
+            .1
+            .split_once("struct ComparisonComputation")
+            .expect("shared comparison computation")
+            .0;
+        assert!(deferred.contains("verification_diagnostic_spool"));
+        assert!(deferred.contains("ComparisonDiagnostics::Deferred"));
+    }
 
     fn output(status: i32, stdout: &[u8], stderr: &[u8]) -> Output {
         Output {
@@ -1387,6 +1799,125 @@ mod tests {
         format!(
             "2026-08-06T01:00:00.000000Z INFO detcore: [dtid 2] DETLOG [syscall] write(fd=1, count={value}){record_suffix}\n"
         )
+    }
+
+    fn prepared_divergence(keep_logs: bool) -> (PreparedRunComparison, PathBuf, PathBuf) {
+        let out = output(0, b"same output\n", b"");
+        let (left, right) = empty_logs();
+        let left_path = left.to_path_buf();
+        let right_path = right.to_path_buf();
+        fs::write(&left_path, detlog_with_value(1)).unwrap();
+        fs::write(&right_path, detlog_with_value(2)).unwrap();
+        let prepared = prepare_two_runs(
+            ComparedRun {
+                output: &out,
+                log: left,
+                label: "run 1",
+            },
+            ComparedRun {
+                output: &out,
+                log: right,
+                label: "run 2",
+            },
+            ComparisonOptions {
+                verbose: false,
+                strictness: LogCompareStrictness::Canonical,
+                compare_logs: true,
+                diagnostic_full_trace: false,
+                compare_io_buffers: true,
+                keep_logs,
+                record_envelope: RecordEnvelope::all_records_v1(),
+                virtualize_time: true,
+            },
+        );
+        (prepared, left_path, right_path)
+    }
+
+    #[test]
+    fn direct_and_deferred_paths_compute_the_same_verdict_and_policy() {
+        let out = output(0, b"same output\n", b"");
+        let comparison_options = || ComparisonOptions {
+            verbose: false,
+            strictness: LogCompareStrictness::Canonical,
+            compare_logs: true,
+            diagnostic_full_trace: false,
+            compare_io_buffers: true,
+            keep_logs: false,
+            record_envelope: RecordEnvelope::all_records_v1(),
+            virtualize_time: true,
+        };
+        let matching_logs = || {
+            let (left, right) = empty_logs();
+            fs::write(&left, detlog_with_value(1)).unwrap();
+            fs::write(&right, detlog_with_value(1)).unwrap();
+            (left, right)
+        };
+
+        let (left, right) = matching_logs();
+        let direct = compare_two_runs(
+            ComparedRun {
+                output: &out,
+                log: left,
+                label: "run 1",
+            },
+            ComparedRun {
+                output: &out,
+                log: right,
+                label: "run 2",
+            },
+            comparison_options(),
+        )
+        .unwrap();
+
+        let (left, right) = matching_logs();
+        let prepared = prepare_two_runs(
+            ComparedRun {
+                output: &out,
+                log: left,
+                label: "run 1",
+            },
+            ComparedRun {
+                output: &out,
+                log: right,
+                label: "run 2",
+            },
+            comparison_options(),
+        );
+        let deferred_report = serde_json::to_value(verification_report(
+            prepared.outcome.as_ref().expect("deferred verdict"),
+        ))
+        .unwrap();
+        let direct_report = serde_json::to_value(verification_report(&direct)).unwrap();
+
+        assert_eq!(direct_report, deferred_report);
+        assert!(prepared.discard_after_primary_failure().is_empty());
+    }
+
+    #[test]
+    fn unpublished_divergence_does_not_retain_logs_after_cleanup_failure() {
+        let (mut prepared, left_path, right_path) = prepared_divergence(false);
+        assert!(prepared.diagnostics.stream_position().unwrap() > 0);
+        assert_eq!(
+            prepared.outcome.as_ref().unwrap().verdict,
+            Verdict::Diverged
+        );
+        assert!(left_path.exists());
+        assert!(right_path.exists());
+
+        assert!(prepared.discard_after_primary_failure().is_empty());
+
+        assert!(!left_path.exists());
+        assert!(!right_path.exists());
+    }
+
+    #[test]
+    fn explicit_keep_logs_survives_cleanup_failure() {
+        let (prepared, left_path, right_path) = prepared_divergence(true);
+        assert!(prepared.discard_after_primary_failure().is_empty());
+        assert!(left_path.exists());
+        assert!(right_path.exists());
+        fs::remove_file(left_path).unwrap();
+        fs::remove_file(right_path).unwrap();
     }
 
     #[test]
@@ -1576,13 +2107,35 @@ mod tests {
             .expect("production/test boundary")
             .0;
         assert!(production.contains("side_labels: compared_labels.clone()"));
-        assert_eq!(
-            production
-                .matches("retain_verification_logs([(label1, log1), (label2, log2)])")
-                .count(),
-            2,
-            "both retained-log paths must use the caller-bound labels"
-        );
+        for binding in [
+            "first_label: label1.to_owned()",
+            "second_label: label2.to_owned()",
+        ] {
+            assert_eq!(
+                production.matches(binding).count(),
+                1,
+                "prepared comparison must store each caller-bound label exactly once"
+            );
+        }
+        let implementation = production
+            .split_once("impl PreparedRunComparison {")
+            .expect("prepared-comparison implementation")
+            .1;
+        let (publication, discard) = implementation
+            .split_once("pub(crate) fn discard_after_primary_failure")
+            .expect("publication and failure-discard paths");
+        for (path, body) in [("publication", publication), ("failure-discard", discard)] {
+            for retained in [
+                "(first_label.as_str(), first_log)",
+                "(second_label.as_str(), second_log)",
+            ] {
+                assert_eq!(
+                    body.matches(retained).count(),
+                    1,
+                    "{path} retention must keep each stored caller-bound label paired with its own log"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2795,13 +3348,14 @@ mod tests {
 
     // Binds the `ComparisonSpec::new` no-filter assumption (and the
     // `compare_two_runs` debug_assert) to reality: the diff engine's default must
-    // actually apply no line filters. If a future default started filtering, the
-    // spec would silently misreport "no filters" — this catches that.
+    // apply no line filters or subprocess output. If a future default changed,
+    // the spec or buffered publication path could silently misreport its behavior.
     #[test]
     fn default_log_diff_opts_apply_no_line_filters() {
         let default = logdiff::LogDiffOpts::default();
         assert!(default.ignore_lines.is_empty());
         assert!(!default.skip_commit);
         assert!(!default.skip_detlog);
+        assert!(!default.git_diff);
     }
 }

@@ -36,6 +36,7 @@ use hermit::Backend;
 use hermit::Context;
 use hermit::DetConfig;
 use hermit::Error;
+use hermit::SerializableError;
 use hermit::Shebang;
 use hermit::SkidOvershootError;
 use hermit::happens_before::DebugInfoResolver;
@@ -46,19 +47,23 @@ use reverie::Errno;
 use reverie::process::Bind;
 use reverie::process::Command;
 use reverie::process::Container;
+use reverie::process::DeferredContainerRun;
 use reverie::process::ExitStatus;
 use reverie::process::Mount;
 use reverie::process::MountFlags;
 use reverie::process::Namespace;
 use reverie::process::Output;
+use tempfile::TempPath;
 
 use super::container::IdentityGuard;
 use super::container::PolicyRefusal;
 use super::container::apply_affinity;
+use super::container::classify_container_result;
 use super::container::default_container;
 use super::container::identity_hardening_mounts;
 use super::container::image_container;
 use super::container::with_container;
+use super::container::with_container_deferred_drop;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::tracing::BoundedWriter;
@@ -68,10 +73,14 @@ use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
 use super::verify::NoResultReason;
+use super::verify::PreparedRunComparison;
+use super::verify::VerificationOutcome;
 use super::verify::VerificationReport;
 use super::verify::VerificationRuntime;
 use super::verify::announce_verification_outcome;
+use super::verify::attach_secondary_failure;
 use super::verify::compare_two_runs;
+use super::verify::prepare_two_runs;
 use super::verify::retain_verification_logs;
 use super::verify::temp_log_files_in;
 use super::verify::validate_log_level;
@@ -86,6 +95,210 @@ use super::verify::write_verification_json;
 const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
 const NORMALIZED_SABRE_DETLOG_TIMESTAMP: &str = "1970-01-01T00:00:00.000000Z";
+
+pub(crate) enum VerifyRun {
+    Complete((Output, u64)),
+    DeferredKvm(DeferredContainerRun<Result<(Output, u64), SerializableError>>),
+}
+
+impl VerifyRun {
+    fn output(&self) -> &Output {
+        &self.provisional().0
+    }
+
+    fn output_mut(&mut self) -> &mut Output {
+        &mut self.provisional_mut().0
+    }
+
+    fn skid_overshoots(&self) -> u64 {
+        self.provisional().1
+    }
+
+    fn provisional(&self) -> &(Output, u64) {
+        match self {
+            Self::Complete(result) => result,
+            Self::DeferredKvm(run) => run
+                .provisional()
+                .as_ref()
+                .expect("a failed KVM run is finalized before it reaches verification"),
+        }
+    }
+
+    fn provisional_mut(&mut self) -> &mut (Output, u64) {
+        match self {
+            Self::Complete(result) => result,
+            Self::DeferredKvm(_) => {
+                unreachable!("only the synchronous SaBRe path mutates provisional output")
+            }
+        }
+    }
+
+    fn finalize(self) -> Result<(Output, u64), Error> {
+        match self {
+            Self::Complete(result) => Ok(result),
+            Self::DeferredKvm(run) => finalize_deferred_kvm_run(run),
+        }
+    }
+}
+
+fn finalize_deferred_kvm_run<T>(
+    run: DeferredContainerRun<Result<T, SerializableError>>,
+) -> Result<T, Error> {
+    match run.finalize() {
+        Ok(reported) => classify_container_result(Ok(reported)),
+        Err(error) => classify_container_result::<T>(Err(error)).map_err(|error| {
+            error.context("KVM verification container failed while releasing its completed VM")
+        }),
+    }
+}
+
+fn finalize_verify_runs(
+    run1: VerifyRun,
+    run2: VerifyRun,
+) -> Result<((Output, u64), (Output, u64)), Error> {
+    // Finalize both handles even when the first cleanup fails. Relying on
+    // `Drop` for run 2 would still reap its child, but would discard a second
+    // cleanup failure and make the diagnostic depend on field-drop order.
+    let first = run1.finalize();
+    let second = run2.finalize();
+    match (first, second) {
+        (Ok(first), Ok(second)) => Ok((first, second)),
+        (Err(first), Ok(_)) => Err(first.context("KVM verification run 1 cleanup failed")),
+        (Ok(_), Err(second)) => Err(second.context("KVM verification run 2 cleanup failed")),
+        (Err(first), Err(second)) => Err(attach_secondary_failure(
+            first.context("KVM verification run 1 cleanup failed"),
+            "KVM verification run 2 cleanup failed",
+            second,
+        )),
+    }
+}
+
+fn verification_compared_runs<'a>(
+    first_output: &'a Output,
+    first_log: TempPath,
+    second_output: &'a Output,
+    second_log: TempPath,
+) -> (ComparedRun<'a>, ComparedRun<'a>) {
+    (
+        ComparedRun {
+            output: first_output,
+            log: first_log,
+            // Accurate on this path: `verify` calls `run_verify` twice, and
+            // each call reaches a separate tracer spawn.
+            label: "run 1",
+        },
+        ComparedRun {
+            output: second_output,
+            log: second_log,
+            label: "run 2",
+        },
+    )
+}
+
+/// Prepare a KVM comparison from both completed guest results, then wait for
+/// both independently running container cleanups before allowing any prepared
+/// conclusion to be published.
+fn orchestrate_deferred_kvm_comparison(
+    run1: VerifyRun,
+    run2: VerifyRun,
+    prepare: impl FnOnce(&Output, &Output) -> PreparedRunComparison,
+    finalize: impl FnOnce(VerifyRun, VerifyRun) -> Result<((Output, u64), (Output, u64)), Error>,
+    publish: impl FnOnce(PreparedRunComparison) -> Result<VerificationOutcome, Error>,
+) -> Result<((Output, u64), (Output, u64), VerificationOutcome), Error> {
+    debug_assert!(matches!(&run1, VerifyRun::DeferredKvm(_)));
+    debug_assert!(matches!(&run2, VerifyRun::DeferredKvm(_)));
+
+    // Receiving both `VerifyRun`s means both guest executions have returned
+    // their provisional results. Their container children are already free to
+    // tear down in parallel while comparison preparation reads those results.
+    let prepared = prepare(run1.output(), run2.output());
+    let (first, second) = match finalize(run1, run2) {
+        Ok(finalized) => finalized,
+        Err(error) => {
+            return Err(discard_prepared_comparison_after_failure(error, prepared));
+        }
+    };
+    let outcome = publish(prepared)?;
+    Ok((first, second, outcome))
+}
+
+fn preserve_primary_error_while_finalizing(
+    run: VerifyRun,
+    primary: Error,
+    cleanup_label: &str,
+) -> (Error, bool) {
+    match run.finalize() {
+        Ok(_) => (primary, true),
+        Err(cleanup) => (
+            attach_secondary_failure(primary, &format!("{cleanup_label} cleanup failed"), cleanup),
+            false,
+        ),
+    }
+}
+
+fn retain_requested_logs_on_error<const N: usize>(
+    mut error: Error,
+    keep_logs: bool,
+    logs: [(&str, TempPath); N],
+) -> Error {
+    if keep_logs && let Err(retention) = retain_verification_logs(logs) {
+        error = attach_secondary_failure(error, "verification log retention failed", retention);
+    }
+    error
+}
+
+fn discard_prepared_comparison_after_failure(
+    mut primary: Error,
+    prepared: PreparedRunComparison,
+) -> Error {
+    for (label, secondary) in prepared.discard_after_primary_failure() {
+        primary = attach_secondary_failure(primary, label, secondary);
+    }
+    primary
+}
+
+fn finalize_verify_run_before_continuing(
+    run: VerifyRun,
+    keep_logs: bool,
+    label: &str,
+    log: TempPath,
+) -> Result<((Output, u64), TempPath), Error> {
+    match run.finalize() {
+        Ok(result) => Ok((result, log)),
+        Err(error) => Err(retain_requested_logs_on_error(
+            error,
+            keep_logs,
+            [(label, log)],
+        )),
+    }
+}
+
+enum DeferredPrintedVerifyLog {
+    File(File),
+    Warning(String),
+}
+
+impl DeferredPrintedVerifyLog {
+    fn open(path: &Path) -> Self {
+        match File::open(path) {
+            Ok(file) => Self::File(file),
+            Err(error) => Self::Warning(format!(
+                "WARNING: --print-verify-logs could not read first-run log {}: {error}\n",
+                path.display()
+            )),
+        }
+    }
+
+    fn publish(self) -> Result<(), Error> {
+        match self {
+            Self::File(mut file) => {
+                std::io::copy(&mut file, &mut std::io::stderr().lock())?;
+            }
+            Self::Warning(warning) => std::io::stderr().write_all(warning.as_bytes())?,
+        }
+        Ok(())
+    }
+}
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
@@ -2611,6 +2824,13 @@ impl RunOpts {
         }
     }
 
+    /// KVM alone returns a provisional result while the container child still
+    /// owns VM teardown. Every other backend has completed cleanup before this
+    /// point and must retain the historical direct diagnostic stream.
+    fn defers_verification_comparison(&self) -> bool {
+        self.runtime_backend() == Backend::Kvm
+    }
+
     fn verify_liteinst_activation(&self) -> Result<(), Error> {
         let executable = std::env::current_exe().context("locate Hermit LiteInst probe")?;
         let mut command = Command::new(executable);
@@ -3791,7 +4011,7 @@ impl RunOpts {
         let (log1, log2) = temp_log_files_in("run1", "run2", retained_log_dir.as_deref())
             .context("Failed to create verification log files")?;
 
-        let (log1_file, log1_path) = log1.into_parts();
+        let (log1_file, mut log1_path) = log1.into_parts();
         let (log2_file, log2_path) = log2.into_parts();
 
         // Verification historically sent both executions to one --summary-json
@@ -3817,7 +4037,7 @@ impl RunOpts {
 
         eprintln!(":: {}", "Run1...".yellow().bold());
 
-        let (mut out1, skid_overshoots_run1) = match run1_options.run_verify(log1_file, global) {
+        let mut run1 = match run1_options.run_verify(log1_file, global) {
             Ok(result) => result,
             Err(error) => {
                 if let Some(overshoot) = error.downcast_ref::<SkidOvershootError>()
@@ -3839,34 +4059,48 @@ impl RunOpts {
                         );
                     }
                 }
-                if self.keep_logs {
-                    retain_verification_logs([("run 1", log1_path)])?;
-                }
-                return Err(error);
+                return Err(retain_requested_logs_on_error(
+                    error,
+                    self.keep_logs,
+                    [("run 1", log1_path)],
+                ));
             }
         };
+        let skid_overshoots_run1 = run1.skid_overshoots();
         let sabre_syscalls1 = match (self.selected_backend() == Backend::Sabre)
-            .then(|| extract_sabre_detlogs(&log1_path, &mut out1.stderr))
+            .then(|| extract_sabre_detlogs(&log1_path, &mut run1.output_mut().stderr))
             .transpose()
         {
             Ok(count) => count,
             Err(error) => {
-                if self.keep_logs {
-                    retain_verification_logs([("run 1", log1_path)])?;
-                }
-                return Err(error);
+                return Err(retain_requested_logs_on_error(
+                    error,
+                    self.keep_logs,
+                    [("run 1", log1_path)],
+                ));
             }
         };
 
         // With --verify the first run's `--log` output was diverted to a
         // temporary file for later comparison rather than shown to the user.
-        // When --print-verify-logs is set, echo that first run's log to stderr so the
-        // user still sees `--log` output, matching a normal (non-verify) run.
-        // The log file is fully flushed here because run_verify runs each
-        // execution in a child process that has already exited.
-        if self.print_verify_logs {
+        // The KVM child has closed this file, but its VM release may still be in
+        // flight. Hold a read-only descriptor and stream it only after cleanup
+        // succeeds; this preserves teardown overlap without buffering a log that
+        // may be as large as 1 GiB (or unbounded when the cap is disabled).
+        let defer_comparison = self.defers_verification_comparison();
+        let mut deferred_printed_log = (self.print_verify_logs && defer_comparison)
+            .then(|| DeferredPrintedVerifyLog::open(&log1_path));
+        if self.print_verify_logs && deferred_printed_log.is_none() {
             match fs::read(&log1_path) {
-                Ok(bytes) => std::io::stderr().write_all(&bytes)?,
+                Ok(bytes) => {
+                    if let Err(error) = std::io::stderr().write_all(&bytes) {
+                        return Err(retain_requested_logs_on_error(
+                            error.into(),
+                            self.keep_logs,
+                            [("run 1", log1_path)],
+                        ));
+                    }
+                }
                 Err(err) => eprintln!(
                     "WARNING: --print-verify-logs could not read first-run log {}: {}",
                     log1_path.display(),
@@ -3875,21 +4109,42 @@ impl RunOpts {
             }
         }
 
-        if !self.verify_allow.satisfies(out1.status) {
+        if !self.verify_allow.satisfies(run1.output().status) {
+            let (finalized, returned_log) =
+                finalize_verify_run_before_continuing(run1, self.keep_logs, "run 1", log1_path)?;
+            log1_path = returned_log;
+            if let Some(print) = deferred_printed_log.take() {
+                if let Err(error) = print.publish() {
+                    return Err(retain_requested_logs_on_error(
+                        error,
+                        self.keep_logs,
+                        [("run 1", log1_path)],
+                    ));
+                }
+            }
+            let (out1, finalized_skid_overshoots_run1) = finalized;
+            debug_assert_eq!(skid_overshoots_run1, finalized_skid_overshoots_run1);
             if skid_overshoots_run1 > 0 {
                 if let Some(path) = &self.verify_json {
                     let summary1 = read_verify_summary(summary1_file.path());
-                    write_skid_overshoot_without_comparison_json(
+                    if let Err(error) = write_skid_overshoot_without_comparison_json(
                         path,
                         skid_overshoots_run1,
                         verification_runtime_from_summaries(summary1.as_ref(), None),
                         Some(out1.status),
-                    )?;
+                    ) {
+                        return Err(retain_requested_logs_on_error(
+                            error,
+                            self.keep_logs,
+                            [("run 1", log1_path)],
+                        ));
+                    }
                 }
-                if self.keep_logs {
-                    retain_verification_logs([("run 1", log1_path)])?;
-                }
-                return Err(Error::new(SkidOvershootError::new(skid_overshoots_run1)));
+                return Err(retain_requested_logs_on_error(
+                    Error::new(SkidOvershootError::new(skid_overshoots_run1)),
+                    self.keep_logs,
+                    [("run 1", log1_path)],
+                ));
             }
             let status = describe_exit_status(out1.status);
             eprintln!(
@@ -3919,22 +4174,63 @@ impl RunOpts {
                     );
                 }
             }
-            if self.keep_logs {
-                retain_verification_logs([("run 1", log1_path)])?;
-            }
-            return Err(Error::msg(format!("First run during --verify {status}")));
+            return Err(retain_requested_logs_on_error(
+                Error::msg(format!("First run during --verify {status}")),
+                self.keep_logs,
+                [("run 1", log1_path)],
+            ));
         }
 
-        let summary1 = take_verify_summary_before_next_run(summary1_file.path())?;
+        let summary1 = match take_verify_summary_before_next_run(summary1_file.path()) {
+            Ok(summary) => summary,
+            Err(error) => {
+                let (mut error, cleanup_succeeded) =
+                    preserve_primary_error_while_finalizing(run1, error, "verification run 1");
+                if cleanup_succeeded
+                    && let Some(print) = deferred_printed_log.take()
+                    && let Err(print_error) = print.publish()
+                {
+                    error = attach_secondary_failure(
+                        error,
+                        "--print-verify-logs output failed",
+                        print_error,
+                    );
+                }
+                return Err(retain_requested_logs_on_error(
+                    error,
+                    self.keep_logs,
+                    [("run 1", log1_path)],
+                ));
+            }
+        };
         if skid_overshoots_run1 > 0
             && let Some(path) = &self.verify_json
         {
-            write_skid_overshoot_without_comparison_json(
+            let (finalized, returned_log) =
+                finalize_verify_run_before_continuing(run1, self.keep_logs, "run 1", log1_path)?;
+            log1_path = returned_log;
+            if let Err(mut error) = write_skid_overshoot_without_comparison_json(
                 path,
                 skid_overshoots_run1,
                 verification_runtime_from_summaries(summary1.as_ref(), None),
-                Some(out1.status),
-            )?;
+                Some(finalized.0.status),
+            ) {
+                if let Some(print) = deferred_printed_log.take()
+                    && let Err(print_error) = print.publish()
+                {
+                    error = attach_secondary_failure(
+                        error,
+                        "--print-verify-logs output failed",
+                        print_error,
+                    );
+                }
+                return Err(retain_requested_logs_on_error(
+                    error,
+                    self.keep_logs,
+                    [("run 1", log1_path)],
+                ));
+            }
+            run1 = VerifyRun::Complete(finalized);
         }
 
         // ⚠️ THE TWO RUNS MUST START FROM IDENTICAL fd STATE, AND WITHOUT THIS
@@ -3973,10 +4269,30 @@ impl RunOpts {
         // housekeeping, and the comparison reports the divergence as before.
         restore_standard_fd_status_flags(fd_flags_before_run1);
 
+        // The first guest and its tool have finished, and their complete
+        // output has crossed the container boundary. Only the kernel's final
+        // release of that stopped VM remains, already running in the first
+        // child while run 2 starts. The two guest executions never overlap.
         eprintln!(":: {}", "Run2...".yellow().bold());
-        let (mut out2, skid_overshoots_run2) = match run2_options.run_verify(log2_file, global) {
+        let mut run2 = match run2_options.run_verify(log2_file, global) {
             Ok(result) => result,
             Err(error) => {
+                let run1_status = run1.output().status;
+                // The run-2 launch error remains the primary typed result.
+                // Cleanup must still be checked, and any second failure is
+                // attached without replacing that original cause.
+                let (mut error, run1_cleanup_succeeded) =
+                    preserve_primary_error_while_finalizing(run1, error, "verification run 1");
+                if run1_cleanup_succeeded
+                    && let Some(print) = deferred_printed_log.take()
+                    && let Err(print_error) = print.publish()
+                {
+                    error = attach_secondary_failure(
+                        error,
+                        "--print-verify-logs output failed",
+                        print_error,
+                    );
+                }
                 if let Some(overshoot) = error.downcast_ref::<SkidOvershootError>()
                     && let Some(path) = &self.verify_json
                 {
@@ -3986,7 +4302,7 @@ impl RunOpts {
                         path,
                         count,
                         verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref()),
-                        Some(out1.status),
+                        Some(run1_status),
                     ) {
                         eprintln!(
                             "WARNING: could not record the skid overshoot in {}: {}",
@@ -3995,29 +4311,34 @@ impl RunOpts {
                         );
                     }
                 }
-                if self.keep_logs {
-                    retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
-                }
-                return Err(error);
+                return Err(retain_requested_logs_on_error(
+                    error,
+                    self.keep_logs,
+                    [("run 1", log1_path), ("run 2", log2_path)],
+                ));
             }
         };
+        let skid_overshoots_run2 = run2.skid_overshoots();
         if let Some(sabre_syscalls1) = sabre_syscalls1 {
-            let sabre_syscalls2 = match extract_sabre_detlogs(&log2_path, &mut out2.stderr) {
-                Ok(count) => count,
-                Err(error) => {
-                    if self.keep_logs {
-                        retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+            let sabre_syscalls2 =
+                match extract_sabre_detlogs(&log2_path, &mut run2.output_mut().stderr) {
+                    Ok(count) => count,
+                    Err(error) => {
+                        return Err(retain_requested_logs_on_error(
+                            error,
+                            self.keep_logs,
+                            [("run 1", log1_path), ("run 2", log2_path)],
+                        ));
                     }
-                    return Err(error);
-                }
-            };
+                };
             if sabre_syscalls1 == 0 || sabre_syscalls2 == 0 {
-                if self.keep_logs {
-                    retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
-                }
-                return Err(Error::msg(format!(
-                    "SaBRe verification captured no syscall DETLOG records: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
-                )));
+                return Err(retain_requested_logs_on_error(
+                    Error::msg(format!(
+                        "SaBRe verification captured no syscall DETLOG records: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
+                    )),
+                    self.keep_logs,
+                    [("run 1", log1_path), ("run 2", log2_path)],
+                ));
             }
             eprintln!(
                 ":: SaBRe syscall DETLOG records included: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
@@ -4057,33 +4378,77 @@ impl RunOpts {
         let failure_message = "Failure: nondeterministic.";
         let summary2 = read_verify_summary(summary2_path);
         let skid_overshoots = skid_overshoots_run1.saturating_add(skid_overshoots_run2);
-        if skid_overshoots > 0
-            && let Some(path) = &self.verify_json
-        {
-            write_skid_overshoot_without_comparison_json(
-                path,
-                skid_overshoots,
-                verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref()),
-                Some(out1.status),
+        let (
+            (out1, finalized_skid_overshoots_run1),
+            (out2, finalized_skid_overshoots_run2),
+            mut outcome,
+        ) = if defer_comparison {
+            // KVM has stopped both guests and closed both logs, but each
+            // container child may still be releasing its VM. Prepare the
+            // comparison into a bounded-memory spill file during that
+            // teardown, then publish nothing until both cleanup results
+            // succeed.
+            let (first, second, outcome) = orchestrate_deferred_kvm_comparison(
+                run1,
+                run2,
+                |first_output, second_output| {
+                    let (first_run, second_run) = verification_compared_runs(
+                        first_output,
+                        log1_path,
+                        second_output,
+                        log2_path,
+                    );
+                    prepare_two_runs(first_run, second_run, comparison_options)
+                },
+                finalize_verify_runs,
+                |prepared| {
+                    if let Some(print) = deferred_printed_log.take()
+                        && let Err(error) = print.publish()
+                    {
+                        return Err(discard_prepared_comparison_after_failure(
+                            error.context("--print-verify-logs output failed"),
+                            prepared,
+                        ));
+                    }
+                    prepared.publish()
+                },
             )?;
-        }
-        let mut outcome = compare_two_runs(
-            ComparedRun {
-                output: &out1,
-                log: log1_path,
-                // Accurate on this path: `verify` calls `run_verify` twice, and
-                // each call builds its own container and guest command and
-                // reaches a separate tracer spawn, so these really are two
-                // fresh executions of the guest.
-                label: "run 1",
-            },
-            ComparedRun {
-                output: &out2,
-                log: log2_path,
-                label: "run 2",
-            },
-            comparison_options,
-        )?;
+            if skid_overshoots > 0
+                && let Some(path) = &self.verify_json
+            {
+                write_skid_overshoot_without_comparison_json(
+                    path,
+                    skid_overshoots,
+                    verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref()),
+                    Some(first.0.status),
+                )?;
+            }
+            (first, second, outcome)
+        } else {
+            // Ptrace, LiteInst, SaBRe, and DBT have no deferred cleanup at
+            // this point. Preserve their historical behavior: diagnostics
+            // are written directly as comparison runs, with no spool file
+            // and no new temporary-file failure surface.
+            let (first, second) = finalize_verify_runs(run1, run2)?;
+            if skid_overshoots > 0
+                && let Some(path) = &self.verify_json
+            {
+                write_skid_overshoot_without_comparison_json(
+                    path,
+                    skid_overshoots,
+                    verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref()),
+                    Some(first.0.status),
+                )?;
+            }
+            let (first_run, second_run) =
+                verification_compared_runs(&first.0, log1_path, &second.0, log2_path);
+            let outcome = compare_two_runs(first_run, second_run, comparison_options)?;
+            (first, second, outcome)
+        };
+
+        debug_assert_eq!(skid_overshoots_run1, finalized_skid_overshoots_run1);
+        debug_assert_eq!(skid_overshoots_run2, finalized_skid_overshoots_run2);
+
         outcome.runtime = verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref());
 
         // Emit the machine-readable verdict (if requested) before collapsing the
@@ -4283,20 +4648,24 @@ impl RunOpts {
         Ok((container, identity_sources))
     }
 
-    pub fn run_verify(
-        &self,
-        log_file: fs::File,
-        global: &GlobalOpts,
-    ) -> Result<(Output, u64), Error> {
+    pub fn run_verify(&self, log_file: fs::File, global: &GlobalOpts) -> Result<VerifyRun, Error> {
+        let defer_kvm_teardown = self.runtime_backend() == Backend::Kvm;
         if self.no_namespace {
             // Verify initializes a process-global tracing subscriber for each run. Keep a plain
             // child-process boundary between runs, but do not configure any namespaces or mounts.
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
             let mut log_file = Some(log_file);
-            return with_container(&mut process, || {
+            if defer_kvm_teardown {
+                let run = with_container_deferred_drop(&mut process, || {
+                    self.run_verify_kvm_in_container(&mut log_file, global, None)
+                })?;
+                return Ok(VerifyRun::DeferredKvm(run));
+            }
+            let result = with_container(&mut process, || {
                 self.run_verify_in_container(&mut log_file, global, None)
-            });
+            })?;
+            return Ok(VerifyRun::Complete(result));
         }
 
         let tmpfs = self.tmpfs()?;
@@ -4304,9 +4673,16 @@ impl RunOpts {
         let (mut container, identity_sources) = self.container(tmpfs.path())?;
 
         let mut log_file = Some(log_file);
-        with_container(&mut container, || {
+        if defer_kvm_teardown {
+            let run = with_container_deferred_drop(&mut container, || {
+                self.run_verify_kvm_in_container(&mut log_file, global, Some(&identity_sources))
+            })?;
+            return Ok(VerifyRun::DeferredKvm(run));
+        }
+        let result = with_container(&mut container, || {
             self.run_verify_in_container(&mut log_file, global, Some(&identity_sources))
-        })
+        })?;
+        Ok(VerifyRun::Complete(result))
     }
 
     fn merge_from_env_settings(&self, command: &mut Command) -> anyhow::Result<()> {
@@ -4546,8 +4922,49 @@ impl RunOpts {
         // `init_sync_file_tracing`.
         let _guard = init_sync_file_tracing(Some(level), BoundedWriter::new(log_file, limit));
 
-        let command = self.guest_command()?;
+        let (command, config) = self.verify_command_and_config(identity_sources)?;
 
+        hermit::run_with_output_backend_timeout_and_skid_overshoots(
+            command,
+            config,
+            self.summary,
+            &self.summary_json,
+            self.runtime_backend(),
+            None,
+        )
+    }
+
+    fn run_verify_kvm_in_container(
+        &self,
+        log_file: &mut Option<fs::File>,
+        global: &GlobalOpts,
+        identity_sources: Option<&IdentityGuard>,
+    ) -> Result<((Output, u64), reverie_kvm::KvmBackend), Error> {
+        let log_file = log_file.take().unwrap();
+        let strictness = self.verification_strictness();
+        let level = verification_log_level(global.log, strictness, self.verify_verbose);
+        let limit = log_max_bytes().map_err(Error::msg)?;
+        let guard = init_sync_file_tracing(Some(level), BoundedWriter::new(log_file, limit));
+        let (command, config) = self.verify_command_and_config(identity_sources)?;
+
+        let ((output, backend), skid_overshoots) =
+            hermit::run_with_deferred_kvm_teardown_and_skid_overshoots(
+                command,
+                config,
+                self.summary,
+                &self.summary_json,
+            )?;
+        // Flush and close the comparison log before the container publishes
+        // the completed run and begins the deferred final VM close.
+        drop(guard);
+        Ok(((output, skid_overshoots), backend))
+    }
+
+    fn verify_command_and_config(
+        &self,
+        identity_sources: Option<&IdentityGuard>,
+    ) -> Result<(Command, DetConfig), Error> {
+        let command = self.guest_command()?;
         let mut config = self.effective_det_config();
         config.mountinfo_root_rewrites = identity_sources
             .map(IdentityGuard::mountinfo_root_rewrites)
@@ -4561,15 +4978,7 @@ impl RunOpts {
         config.mountinfo_mount_ids_captured = identity_sources.is_some();
         config.fdinfo_unlisted_mount_ids.clear();
         self.save_config_to_disk()?;
-
-        hermit::run_with_output_backend_timeout_and_skid_overshoots(
-            command,
-            config,
-            self.summary,
-            &self.summary_json,
-            self.runtime_backend(),
-            None,
-        )
+        Ok((command, config))
     }
 }
 
@@ -4595,9 +5004,16 @@ impl<'a> Tmpfs<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+
     use clap::CommandFactory;
 
     use super::*;
+    use crate::verify::Verdict;
 
     #[test]
     fn first_run_rejected_report_keeps_available_guest_exit_code() {
@@ -4727,19 +5143,531 @@ mod tests {
     }
 
     #[test]
-    fn verification_report_is_published_before_success_is_announced() {
+    fn only_kvm_prepares_comparison_during_cleanup_and_publishes_afterward() {
         let source = include_str!("run.rs");
         let verification = source
-            .split_once("let outcome = compare_two_runs(")
-            .expect("verification comparison")
+            .split_once("fn verify(&self, global: &GlobalOpts)")
+            .expect("verification implementation")
             .1;
+        let comparison_branches = verification
+            .split_once("= if defer_comparison {")
+            .expect("backend-specific comparison publication")
+            .1;
+        let (kvm, direct) = comparison_branches
+            .split_once("} else {")
+            .expect("KVM and direct comparison branches");
+        let direct = direct
+            .split_once("\n        };\n")
+            .expect("end of comparison publication branches")
+            .0;
+
+        let orchestration_call = kvm
+            .find("orchestrate_deferred_kvm_comparison(")
+            .expect("KVM deferred-comparison orchestration");
+        let prepare = kvm
+            .find("prepare_two_runs(first_run, second_run, comparison_options)")
+            .expect("KVM comparison preparation closure");
+        let finalize = kvm
+            .find("finalize_verify_runs,")
+            .expect("KVM cleanup finalization callback");
+        let kvm_publish = kvm
+            .find("prepared.publish()")
+            .expect("KVM comparison publication closure");
+        assert!(orchestration_call < prepare);
+        assert!(prepare < finalize);
+        assert!(finalize < kvm_publish);
+
+        let orchestration = source
+            .split_once("fn orchestrate_deferred_kvm_comparison(")
+            .expect("deferred KVM orchestration helper")
+            .1
+            .split_once("fn preserve_primary_error_while_finalizing(")
+            .expect("end of deferred KVM orchestration helper")
+            .0;
+        let prepare = orchestration
+            .find("let prepared = prepare(run1.output(), run2.output())")
+            .expect("comparison prepared from both completed guest outputs");
+        let finalize = orchestration
+            .find("match finalize(run1, run2)")
+            .expect("KVM cleanup finalization");
+        let compare_publish = orchestration
+            .find("publish(prepared)?")
+            .expect("KVM comparison diagnostics published");
+        assert!(prepare < finalize);
+        assert!(finalize < compare_publish);
+
+        let finalize = direct
+            .find("finalize_verify_runs(run1, run2)?")
+            .expect("non-KVM runs are complete before comparison");
+        let compare = direct
+            .find("let outcome = compare_two_runs(")
+            .expect("non-KVM direct comparison");
+        assert!(finalize < compare);
+        assert!(!direct.contains("prepare_two_runs("));
+        assert!(!direct.contains("prepared.publish()"));
+
         let publish = verification
             .find("write_verification_json(path, &outcome)")
             .expect("verification report publication");
         let announce = verification
             .find("announce_verification_outcome(&outcome")
             .expect("verification announcement");
+        let kvm_branch_start = verification
+            .find("= if defer_comparison {")
+            .expect("KVM comparison branch");
+        assert!(kvm_branch_start + kvm_publish < publish);
         assert!(publish < announce);
+    }
+
+    #[test]
+    fn deferred_comparison_is_selected_only_for_kvm() {
+        for (backend, expected) in [
+            ("ptrace", false),
+            ("liteinst", false),
+            ("sabre", false),
+            ("dbt", false),
+            ("e9patch", false),
+            ("kvm", true),
+        ] {
+            let backend = format!("--backend={backend}");
+            let options = RunOpts::parse_from(["run", backend.as_str(), "--verify", "/bin/true"]);
+            assert_eq!(
+                options.defers_verification_comparison(),
+                expected,
+                "unexpected comparison publication strategy for {backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn kvm_print_verify_logs_waits_for_run_one_cleanup() {
+        let source = include_str!("run.rs");
+        let verification = source
+            .split_once("fn verify(&self, global: &GlobalOpts)")
+            .expect("verification implementation")
+            .1;
+        let open = verification
+            .find("DeferredPrintedVerifyLog::open(&log1_path)")
+            .expect("read-only first-run log handle");
+        let run2 = verification
+            .find("run2_options.run_verify(log2_file, global)")
+            .expect("second guest execution");
+        let finalize = verification
+            .find("match finalize_verify_runs(run1, run2)")
+            .expect("both KVM cleanup handles finalized");
+        let post_cleanup = &verification[finalize..];
+        let publish_block = post_cleanup
+            .find("if let Some(print) = deferred_printed_log.take()")
+            .map(|offset| finalize + offset)
+            .expect("first-run log publication block after cleanup");
+        let publish = verification[publish_block..]
+            .find("if let Err(error) = print.publish()")
+            .map(|offset| publish_block + offset)
+            .expect("streaming first-run log publication after cleanup");
+
+        assert!(open < run2);
+        assert!(run2 < finalize);
+        assert!(finalize < publish_block);
+        assert!(publish_block < publish);
+    }
+
+    struct ExitDuringDeferredCleanup(i32);
+
+    impl Drop for ExitDuringDeferredCleanup {
+        fn drop(&mut self) {
+            unsafe { libc::_exit(self.0) }
+        }
+    }
+
+    fn deferred_test_verify_run(cleanup_exit: i32) -> VerifyRun {
+        let run = Container::new()
+            .run_with_deferred_drop(move || {
+                (
+                    Ok::<_, SerializableError>((
+                        Output {
+                            status: ExitStatus::SUCCESS,
+                            stdout: Vec::new(),
+                            stderr: Vec::new(),
+                        },
+                        0,
+                    )),
+                    ExitDuringDeferredCleanup(cleanup_exit),
+                )
+            })
+            .unwrap();
+        VerifyRun::DeferredKvm(run)
+    }
+
+    struct ControlledDeferredCleanup {
+        control: UnixStream,
+        exit_code: i32,
+    }
+
+    impl Drop for ControlledDeferredCleanup {
+        fn drop(&mut self) {
+            let mut release = [0];
+            let completed_protocol = self.control.write_all(b"S").is_ok()
+                && self.control.read_exact(&mut release).is_ok()
+                && release == *b"R";
+            // `_exit` both makes the requested cleanup status observable to the
+            // parent and avoids running inherited test-harness destructors in
+            // the forked container child.
+            unsafe {
+                libc::_exit(if completed_protocol {
+                    self.exit_code
+                } else {
+                    74
+                })
+            }
+        }
+    }
+
+    fn controlled_deferred_test_verify_run(
+        stdout: &'static [u8],
+        cleanup_exit: i32,
+    ) -> (VerifyRun, UnixStream) {
+        let (controller, cleanup) = UnixStream::pair().expect("cleanup control socket pair");
+        controller
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        controller
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        cleanup
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        cleanup
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let run = Container::new()
+            .run_with_deferred_drop(move || {
+                (
+                    Ok::<_, SerializableError>((
+                        Output {
+                            status: ExitStatus::SUCCESS,
+                            stdout: stdout.to_vec(),
+                            stderr: Vec::new(),
+                        },
+                        0,
+                    )),
+                    ControlledDeferredCleanup {
+                        control: cleanup.try_clone().expect("clone cleanup control socket"),
+                        exit_code: cleanup_exit,
+                    },
+                )
+            })
+            .unwrap();
+        (VerifyRun::DeferredKvm(run), controller)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DeferredOrchestrationEvent {
+        Prepared,
+        FinalizationStarted,
+    }
+
+    fn exercise_controlled_deferred_comparison(
+        cleanup_exit: i32,
+        expect_publication: bool,
+    ) -> (Result<VerificationOutcome, Error>, PathBuf, PathBuf) {
+        let (run1, mut cleanup1) = controlled_deferred_test_verify_run(b"first\n", cleanup_exit);
+        let (run2, mut cleanup2) = controlled_deferred_test_verify_run(b"second\n", 0);
+
+        // A cleanup guard is constructed only after its child has serialized
+        // the provisional guest result. Seeing both S bytes therefore proves
+        // both guest executions completed before comparison preparation starts.
+        let mut started = [0];
+        cleanup1.read_exact(&mut started).unwrap();
+        assert_eq!(started, *b"S");
+        cleanup2.read_exact(&mut started).unwrap();
+        assert_eq!(started, *b"S");
+
+        let first_log = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let second_log = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let first_path = first_log.to_path_buf();
+        let second_path = second_log.to_path_buf();
+        let suffix = detcore::detlog::record_suffix(detcore::detlog::DetLogEvent::Syscall);
+        let log = format!(
+            "2026-08-06T01:00:00.000000Z INFO detcore: [dtid 2] DETLOG [syscall] \
+             write(fd=1, count=1){suffix}\n"
+        );
+        fs::write(&first_log, &log).unwrap();
+        fs::write(&second_log, &log).unwrap();
+        let options = RunOpts::parse_from(["run", "--backend=kvm", "--verify", "/bin/true"])
+            .verification_comparison_options();
+        assert!(
+            options.compare_logs,
+            "the KVM production path compares logs"
+        );
+
+        let (events, observed_events) = mpsc::channel();
+        let prepared_event = events.clone();
+        let finalization_event = events;
+        let publication_started = Arc::new(AtomicBool::new(false));
+        let observed_publication = Arc::clone(&publication_started);
+        let controller = std::thread::spawn(move || {
+            assert_eq!(
+                observed_events.recv_timeout(Duration::from_secs(5)),
+                Ok(DeferredOrchestrationEvent::Prepared)
+            );
+            assert_eq!(
+                observed_events.recv_timeout(Duration::from_secs(5)),
+                Ok(DeferredOrchestrationEvent::FinalizationStarted)
+            );
+            // Preparation is complete while both cleanup children remain
+            // deliberately blocked. The publication closure is the sole route
+            // to diagnostics, implicit divergence retention, and a returned
+            // verdict, so none may become observable with the gate still shut.
+            assert!(!observed_publication.load(Ordering::Acquire));
+            cleanup1.write_all(b"R").unwrap();
+            cleanup2.write_all(b"R").unwrap();
+        });
+
+        let publication_marker = Arc::clone(&publication_started);
+        let result = orchestrate_deferred_kvm_comparison(
+            run1,
+            run2,
+            |first_output, second_output| {
+                assert_eq!(first_output.stdout, b"first\n");
+                assert_eq!(second_output.stdout, b"second\n");
+                let (first, second) =
+                    verification_compared_runs(first_output, first_log, second_output, second_log);
+                let prepared = prepare_two_runs(first, second, options);
+                prepared_event
+                    .send(DeferredOrchestrationEvent::Prepared)
+                    .unwrap();
+                prepared
+            },
+            |run1, run2| {
+                finalization_event
+                    .send(DeferredOrchestrationEvent::FinalizationStarted)
+                    .unwrap();
+                finalize_verify_runs(run1, run2)
+            },
+            |prepared| {
+                publication_marker.store(true, Ordering::Release);
+                prepared.publish()
+            },
+        )
+        .map(|(_, _, outcome)| outcome);
+        controller.join().unwrap();
+        assert_eq!(
+            publication_started.load(Ordering::Acquire),
+            expect_publication,
+            "prepared comparison publication did not follow cleanup outcome"
+        );
+        (result, first_path, second_path)
+    }
+
+    #[test]
+    fn deferred_comparison_overlaps_cleanup_and_publishes_only_after_success() {
+        let (outcome, first_path, second_path) = exercise_controlled_deferred_comparison(0, true);
+        assert_eq!(outcome.unwrap().verdict, Verdict::Diverged);
+        assert!(
+            first_path.exists(),
+            "divergent run-one log was not retained"
+        );
+        assert!(
+            second_path.exists(),
+            "divergent run-two log was not retained"
+        );
+        fs::remove_file(first_path).unwrap();
+        fs::remove_file(second_path).unwrap();
+    }
+
+    #[test]
+    fn deferred_cleanup_failure_suppresses_the_prepared_conclusion() {
+        let (error, first_path, second_path) = exercise_controlled_deferred_comparison(71, false);
+        let error = error.unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::container::ContainerChildExit>()
+                .is_some(),
+            "cleanup failure must remain the typed primary error"
+        );
+        assert!(!first_path.exists(), "unpublished run-one log was retained");
+        assert!(
+            !second_path.exists(),
+            "unpublished run-two log was retained"
+        );
+    }
+
+    #[test]
+    fn deferred_cleanup_failure_rejects_an_otherwise_successful_result() {
+        let run = Container::new()
+            .run_with_deferred_drop(|| {
+                (
+                    Ok::<_, SerializableError>(42),
+                    ExitDuringDeferredCleanup(71),
+                )
+            })
+            .unwrap();
+
+        let error = finalize_deferred_kvm_run(run).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::container::ContainerChildExit>()
+                .is_some(),
+            "cleanup status must keep the common container failure type"
+        );
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("KVM verification container failed while releasing its completed VM")
+                && error.contains("Exited(71)"),
+            "unexpected cleanup error: {error}"
+        );
+    }
+
+    #[test]
+    fn deferred_cleanup_preserves_signal_classification() {
+        let error = deferred_test_verify_run(128 + libc::SIGINT)
+            .finalize()
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::container::SignalDeath>()
+                .expect("SIGINT cleanup must remain a typed signal death")
+                .0,
+            libc::SIGINT
+        );
+    }
+
+    #[test]
+    fn early_cleanup_failure_still_honors_explicit_log_retention() {
+        let log = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let retained_path = log.to_path_buf();
+        fs::write(&retained_path, b"run-one evidence\n").unwrap();
+
+        let error =
+            finalize_verify_run_before_continuing(deferred_test_verify_run(71), true, "run 1", log)
+                .unwrap_err();
+
+        assert!(
+            error
+                .downcast_ref::<crate::container::ContainerChildExit>()
+                .is_some(),
+            "retention must not replace the typed cleanup failure"
+        );
+        assert_eq!(fs::read(&retained_path).unwrap(), b"run-one evidence\n");
+        fs::remove_file(retained_path).unwrap();
+    }
+
+    #[test]
+    fn verification_checks_both_cleanup_statuses_when_both_fail() {
+        let error =
+            finalize_verify_runs(deferred_test_verify_run(71), deferred_test_verify_run(72))
+                .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::container::ContainerChildExit>()
+                .is_some(),
+            "the first cleanup failure must remain the typed primary cause"
+        );
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("run 1") && error.contains("Exited(71)"),
+            "{error}"
+        );
+        assert!(
+            error.contains("run 2") && error.contains("Exited(72)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_keeps_comparison_and_retention_failures_as_secondaries() {
+        let output = Output {
+            status: ExitStatus::SUCCESS,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let (first, second) =
+            temp_log_files_in("missing-run1", "run2", None).expect("temporary logs");
+        let first = first.into_temp_path();
+        let second = second.into_temp_path();
+        let second_path = second.to_path_buf();
+        fs::remove_file(&first).expect("make run-one log unreadable and unretainable");
+
+        let options = RunOpts::parse_from(["run", "--verify", "--keep-logs", "/bin/true"]);
+        let prepared = prepare_two_runs(
+            ComparedRun {
+                output: &output,
+                log: first,
+                label: "run 1",
+            },
+            ComparedRun {
+                output: &output,
+                log: second,
+                label: "run 2",
+            },
+            options.verification_comparison_options(),
+        );
+
+        let cleanup = deferred_test_verify_run(71).finalize().unwrap_err();
+        let error = discard_prepared_comparison_after_failure(cleanup, prepared);
+        assert!(
+            error
+                .downcast_ref::<crate::container::ContainerChildExit>()
+                .is_some(),
+            "the cleanup failure must remain the typed primary cause"
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("Exited(71)"), "{rendered}");
+        assert!(
+            rendered.contains("verification comparison preparation failed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("verification log retention failed"),
+            "{rendered}"
+        );
+        assert!(
+            second_path.exists(),
+            "run-two retention must still be attempted after run one fails"
+        );
+        fs::remove_file(second_path).unwrap();
+    }
+
+    #[test]
+    fn primary_error_survives_a_cleanup_failure() {
+        let (error, cleanup_succeeded) = preserve_primary_error_while_finalizing(
+            deferred_test_verify_run(71),
+            Error::new(SkidOvershootError::new(9)),
+            "verification run 1",
+        );
+        assert!(!cleanup_succeeded);
+        assert_eq!(
+            error
+                .downcast_ref::<SkidOvershootError>()
+                .expect("the primary typed error must survive")
+                .count(),
+            9
+        );
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("HERMIT_SKID_OVERSHOOT") && rendered.contains("Exited(71)"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn summary_reset_error_still_checks_deferred_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary = take_verify_summary_before_next_run(directory.path()).unwrap_err();
+        let (error, cleanup_succeeded) = preserve_primary_error_while_finalizing(
+            deferred_test_verify_run(71),
+            primary,
+            "verification run 1",
+        );
+        assert!(!cleanup_succeeded);
+        assert!(
+            error.downcast_ref::<std::io::Error>().is_some(),
+            "the summary reset I/O error must remain the typed primary cause"
+        );
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("resetting private verification run summary"));
+        assert!(rendered.contains("cleanup failed") && rendered.contains("Exited(71)"));
     }
 
     #[test]
