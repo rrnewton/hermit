@@ -42,6 +42,7 @@ use nix::sys::signal::Signal;
 use nix::sys::signal::sigaction;
 use nix::unistd::Pid;
 use reverie::process::Container;
+use reverie::process::DeferredContainerRun;
 use reverie::process::ExitStatus;
 use reverie::process::Mount;
 use reverie::process::MountFlags;
@@ -1063,6 +1064,51 @@ where
         arm_container_init_guards()?;
         catch_child_panic(&mut f)
     }))
+}
+
+/// Runs a container child whose successful result has one child-owned value
+/// that must be dropped after the result crosses the process boundary.
+///
+/// The caller receives a mandatory cleanup handle and must check its status
+/// before publishing success. This keeps guest execution inside the ordinary
+/// container child while allowing independent parent work to overlap teardown.
+pub fn with_container_deferred_drop<F, T, D>(
+    container: &mut Container,
+    mut f: F,
+) -> Result<DeferredContainerRun<Result<T, SerializableError>>, Error>
+where
+    F: FnMut() -> Result<(T, D), Error>,
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let ran = container.run_with_deferred_drop(|| match catch_child_panic(&mut f) {
+        Ok((value, deferred)) => (Ok(value), Some(deferred)),
+        Err(error) => (Err(error), None),
+    });
+    let run = match ran {
+        Ok(run) => run,
+        Err(error) => {
+            return match classify_container_result::<T>(Err(error)) {
+                Err(error) => Err(error),
+                Ok(_) => unreachable!("an Err container result cannot classify as success"),
+            };
+        }
+    };
+    if run.provisional().is_err() {
+        let reported = match run.finalize() {
+            Ok(reported) => reported,
+            Err(error) => {
+                return match classify_container_result::<T>(Err(error)) {
+                    Err(error) => Err(error),
+                    Ok(_) => unreachable!("an Err container result cannot classify as success"),
+                };
+            }
+        };
+        return match classify_container_result(Ok(reported)) {
+            Err(error) => Err(error),
+            Ok(_) => unreachable!("the provisional result was already known to be an error"),
+        };
+    }
+    Ok(run)
 }
 
 /// Turn a `Container::run` / [`RunGuarded::run_guarded`] outcome into an error

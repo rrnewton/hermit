@@ -1940,13 +1940,19 @@ fn kvm_cwd_resolution_error(requested_cwd: &Path, error: &std::io::Error) -> Err
 }
 
 /// Dispatch a command onto the real reverie-kvm Tool runtime.
+struct KvmRunOutcome {
+    output: Output,
+    deferred_backend: Option<reverie_kvm::KvmBackend>,
+}
+
 async fn run_kvm(
     command: &Command,
     mut config: DetConfig,
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
     capture_output: bool,
-) -> Result<Output, Error> {
+    defer_teardown: bool,
+) -> Result<KvmRunOutcome, Error> {
     let dispatch_started = Instant::now();
     // KVM does not expose the outer container's procfs. Its executor serves a
     // synthetic `/proc/self/mountinfo` containing one deterministic rootfs row
@@ -1979,20 +1985,6 @@ async fn run_kvm(
     config.mountinfo_mount_ids.clear();
     config.mountinfo_mount_ids_captured = false;
     config.fdinfo_unlisted_mount_ids.clear();
-    let stdin = if capture_output {
-        let (snapshot_reserved, snapshot) = output_backend_stdin_reservation()?;
-        if snapshot_reserved {
-            snapshot
-        } else {
-            // Public KVM output-capture callers do not pass through the CLI's
-            // verify setup. Preserve their existing stdin behavior instead of
-            // silently replacing it with /dev/null merely because output is
-            // captured.
-            reserved_kvm_stdin()?
-        }
-    } else {
-        reserved_kvm_stdin()?
-    };
     let requested_cwd = command
         .get_current_dir()
         .map(Path::to_owned)
@@ -2060,8 +2052,7 @@ async fn run_kvm(
     // TODO-HUMAN-REVIEW(PR-998): Review KVM UTS namespace parity.
     config.has_uts_namespace = false;
     let random_seed = config.rng_seed();
-    let mut backend = reverie_kvm::KvmBackend::new_with_stdin(KVM_GUEST_MEMORY_BYTES, stdin)
-        .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))?;
+    let mut backend = new_kvm_backend(capture_output)?;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1120): Review KVM's canonical Detcore root identity.
     backend
@@ -2097,8 +2088,14 @@ async fn run_kvm(
         .clean_up(print_summary, print_summary_to_json_file)
         .await;
     let teardown_started = Instant::now();
-    // Drop explicitly so the host's KVM VM teardown cost remains observable.
-    drop(backend);
+    let deferred_backend = if defer_teardown {
+        Some(backend)
+    } else {
+        // Drop explicitly so the host's KVM VM teardown cost remains
+        // observable on every ordinary run.
+        drop(backend);
+        None
+    };
     let teardown_finished = Instant::now();
 
     // Every field below is a host wall-clock duration. Keep this diagnostic at
@@ -2113,6 +2110,7 @@ async fn run_kvm(
         cleanup_us = teardown_started.duration_since(cleanup_started).as_micros() as u64,
         teardown_us = teardown_finished.duration_since(teardown_started).as_micros() as u64,
         lifecycle_us = teardown_finished.duration_since(dispatch_started).as_micros() as u64,
+        final_vm_release_deferred = defer_teardown,
         "reverie-kvm lifecycle phase timings",
     );
 
@@ -2121,11 +2119,33 @@ async fn run_kvm(
         std::io::stderr().write_all(&stderr)?;
     }
 
-    Ok(Output {
-        status: ExitStatus::Exited(code),
-        stdout,
-        stderr,
+    Ok(KvmRunOutcome {
+        output: Output {
+            status: ExitStatus::Exited(code),
+            stdout,
+            stderr,
+        },
+        deferred_backend,
     })
+}
+
+fn new_kvm_backend(capture_output: bool) -> Result<reverie_kvm::KvmBackend, Error> {
+    let stdin = if capture_output {
+        let (snapshot_reserved, snapshot) = output_backend_stdin_reservation()?;
+        if snapshot_reserved {
+            snapshot
+        } else {
+            // Public KVM output-capture callers do not pass through the CLI's
+            // verify setup. Preserve their existing stdin behavior instead of
+            // silently replacing it with /dev/null merely because output is
+            // captured.
+            reserved_kvm_stdin()?
+        }
+    } else {
+        reserved_kvm_stdin()?
+    };
+    reverie_kvm::KvmBackend::new_with_stdin(KVM_GUEST_MEMORY_BYTES, stdin)
+        .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))
 }
 
 // TODO-HUMAN-REVIEW(PR-743): Review bounded relaunch before DBT guest execution.
@@ -2650,8 +2670,10 @@ async fn dispatch_backend(
             print_summary,
             print_summary_to_json_file,
             false,
+            false,
         )
         .await?
+        .output
         .status);
     }
     if backend == Backend::Dbt {
@@ -2811,6 +2833,51 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
     skid_overshoot_report.finish_with_count(result)
 }
 
+/// Runs one completed KVM verification execution while returning its stopped
+/// backend for the container boundary to release after publishing the result.
+#[doc(hidden)]
+pub fn run_with_deferred_kvm_teardown_and_skid_overshoots(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+) -> Result<((Output, reverie_kvm::KvmBackend), u64), Error> {
+    ensure_kvm_stdin_reserved()?;
+    let report = SkidOvershootReport::begin(false);
+    let config = prepare_backend_config(config, Backend::Kvm);
+    let result = run_with_deferred_kvm_teardown_inner(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+    );
+    report.finish_with_count(result)
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn run_with_deferred_kvm_teardown_inner(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+) -> Result<(Output, reverie_kvm::KvmBackend), Error> {
+    let outcome = run_kvm(
+        &command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        true,
+        true,
+    )
+    .await?;
+    Ok((
+        outcome.output,
+        outcome
+            .deferred_backend
+            .expect("deferred KVM run must return its stopped backend"),
+    ))
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn run_with_output_backend_inner(
     command: Command,
@@ -2862,8 +2929,10 @@ async fn dispatch_output_backend(
             print_summary,
             print_summary_to_json_file,
             true,
+            false,
         )
-        .await;
+        .await
+        .map(|outcome| outcome.output);
     }
     if backend == Backend::Dbt {
         #[cfg(feature = "dbt")]
