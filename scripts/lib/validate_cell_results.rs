@@ -155,6 +155,7 @@ fn require_current_timeout_policy(row: &Value) -> Result<(), String> {
 
 fn canonical_report(
     value: Value,
+    expected_virtualize_time: bool,
 ) -> Result<Option<(VerificationReport, ComparisonSpec, ComparedLogCounts)>, String> {
     // `VerificationReport` owns the complete current top-level report. The
     // ledger types additionally deny unknown comparison/count fields, which
@@ -181,7 +182,10 @@ fn canonical_report(
             .ok_or("incomplete cell comparison: missing `compared_log_messages`")?,
     )
     .map_err(|error| format!("incomplete cell comparison counts: {error}"))?;
-    if !comparison.is_canonical_bitwise_info_v1(&compared_log_messages) {
+    if !comparison.is_canonical_bitwise_info_v1_for_time_policy(
+        expected_virtualize_time,
+        &compared_log_messages,
+    ) {
         return Ok(None);
     }
     let RequiredNullable::Value(compared_log_messages) = compared_log_messages else {
@@ -198,6 +202,19 @@ fn cell_verdict(row: &Value) -> Result<CellVerdict, String> {
             reason: format!("{mode} mode does not perform canonical two-run comparison"),
         });
     }
+    // Verify and chaos compare independent executions and require virtual
+    // time. Replay compares one recording with its replay and deliberately
+    // leaves time real. Bind the receipt to that producer policy: accepting
+    // either boolean would weaken the comparison requirement.
+    let expected_virtualize_time = match mode {
+        "replay" => false,
+        "verify" | "chaos" => true,
+        _ => {
+            return Err(format!(
+                "unsupported cell mode `{mode}` has no declared canonical comparison policy"
+            ));
+        }
+    };
     let Some(attempts) = row.get("attempts").and_then(Value::as_array) else {
         return Ok(CellVerdict::UnavailableWithReason {
             comparison_tier: ComparisonTier::DeclaredButUnverifiable,
@@ -230,7 +247,7 @@ fn cell_verdict(row: &Value) -> Result<CellVerdict, String> {
                 index + 1
             )
         })?;
-        match canonical_report(value) {
+        match canonical_report(value, expected_virtualize_time) {
             Ok(Some(report)) => reports.push(report),
             Ok(None) => {
                 unavailable_reason = Some(format!(
@@ -750,7 +767,11 @@ mod tests {
         std::env::temp_dir().join(format!("validate-cell-results-{}-{id}", std::process::id()))
     }
 
-    fn report(verdict: &str, log_scope: &str) -> String {
+    fn report_with_virtualize_time(
+        verdict: &str,
+        log_scope: &str,
+        virtualize_time: bool,
+    ) -> String {
         let matched = verdict == "matched";
         serde_json::json!({
             "verified": matched,
@@ -764,7 +785,7 @@ mod tests {
                 "compare_io_buffers": true,
                 "log_scope": log_scope,
                 "record_envelope": "all_records_v1",
-                "virtualize_time": true,
+                "virtualize_time": virtualize_time,
                 "strip_lines": false,
                 "canonicalize_addresses": true,
                 "full_trace": true,
@@ -786,6 +807,10 @@ mod tests {
             "first_divergent_right_message": null
         })
         .to_string()
+    }
+
+    fn report(verdict: &str, log_scope: &str) -> String {
+        report_with_virtualize_time(verdict, log_scope, true)
     }
 
     fn replace_report(row: &mut Value, report: &Value) {
@@ -1049,6 +1074,88 @@ mod tests {
         assert_eq!(verdict["state"], "unavailable-with-reason");
         assert!(verdict.get("comparison").is_none());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema7_binds_virtual_time_to_the_comparison_mode() {
+        for (mode, virtualize_time, expected_state) in [
+            ("replay", false, "compared-and-matched"),
+            ("verify", true, "compared-and-matched"),
+            ("chaos", true, "compared-and-matched"),
+            ("replay", true, "unavailable-with-reason"),
+            ("verify", false, "unavailable-with-reason"),
+            ("chaos", false, "unavailable-with-reason"),
+        ] {
+            let root = fixture_root();
+            let results = root.join("results");
+            let commit = "1616161616161616161616161616161616161616";
+            let mut row = result_row(&format!("validate-{mode}-{virtualize_time}"), commit);
+            row["mode"] = Value::String(mode.into());
+            let report = report_with_virtualize_time("matched", "info", virtualize_time);
+            row["attempts"][0] = attempt(&report);
+            write_result(&results, &row);
+
+            let retained = retain(&root, &results, commit, &expected(&row)).unwrap();
+            let verdict = &retained.evidence["cells"][0]["cell_verdict"];
+            assert_eq!(
+                verdict["state"], expected_state,
+                "mode={mode} virtualize_time={virtualize_time}"
+            );
+            if expected_state == "compared-and-matched" {
+                assert_eq!(verdict["comparison"]["virtualize_time"], virtualize_time);
+            } else {
+                assert!(verdict.get("comparison").is_none());
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn schema7_refuses_unknown_or_missing_mode_before_publishing_an_artifact() {
+        for (case, mode) in [
+            ("unknown", Some(Value::String("future-mode".into()))),
+            ("missing", None),
+        ] {
+            let root = fixture_root();
+            let results = root.join("results");
+            let commit = "1717171717171717171717171717171717171717";
+            let run_id = format!("validate-{case}-mode");
+            let mut row = result_row(&run_id, commit);
+            match mode {
+                Some(mode) => row["mode"] = mode,
+                None => {
+                    row.as_object_mut().unwrap().remove("mode");
+                }
+            }
+            write_result(&results, &row);
+            let expected = if case == "missing" {
+                vec![serde_json::json!({
+                    "lane": "portable",
+                    "category": "c-programs",
+                    "test": "uname",
+                    "mode": "verify",
+                    "backend": "ptrace"
+                })]
+            } else {
+                expected(&row)
+            };
+
+            let error = retain(&root, &results, commit, &expected).unwrap_err();
+            if case == "unknown" {
+                assert!(error.contains("unsupported cell mode `future-mode`"), "{error}");
+            } else {
+                assert!(error.contains("no nonempty mode"), "{error}");
+            }
+            assert!(
+                !root
+                    .join("ignored/validate/artifacts")
+                    .join(&run_id)
+                    .join("cell-results.jsonl")
+                    .exists(),
+                "{case} mode published a retained artifact"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
