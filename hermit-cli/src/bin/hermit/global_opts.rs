@@ -17,8 +17,11 @@ use hermit::Backend;
 use tracing::metadata::LevelFilter;
 
 use super::tracing::BoundedWriter;
+use super::tracing::TracingGuard;
 use super::tracing::init_file_tracing;
+use super::tracing::init_file_tracing_with_evidence;
 use super::tracing::init_stderr_tracing;
+use super::tracing::init_stderr_tracing_with_evidence;
 use super::tracing::log_max_bytes;
 
 /// Hermit provides a sandbox for deterministic and reproducible execution.
@@ -72,6 +75,11 @@ pub struct GlobalOpts {
     #[clap(skip)]
     pub log_file_handle: Option<Arc<File>>,
 
+    /// Fresh anonymous host file receiving the opt-in ordinary-run evidence log.
+    /// It is opened before entering the container and never replaces `--log-file`.
+    #[clap(skip)]
+    pub(crate) run_evidence_log_handle: Option<Arc<File>>,
+
     /// Select the process instrumentation backend. This is the preferred, global
     /// position (e.g. `hermit --backend ptrace run ...`); for backwards
     /// compatibility `run` also accepts `--backend` after the subcommand.
@@ -98,6 +106,10 @@ impl GlobalOpts {
         Ok(())
     }
 
+    pub(crate) fn set_run_evidence_log_handle(&mut self, handle: Arc<File>) {
+        self.run_evidence_log_handle = Some(handle);
+    }
+
     /// Initalizes tracing. If using a container, this must be done *inside* of
     /// the container because the tracer may create a new thread.
     ///
@@ -105,7 +117,7 @@ impl GlobalOpts {
     /// `log_file_handle` for why opening at this point resolves the path in the
     /// guest namespace and silently loses it.
     #[must_use = "This function returns a guard that should not be immediately dropped"]
-    pub fn init_tracing(&self) -> Option<impl Drop + use<>> {
+    pub fn init_tracing(&self) -> Option<TracingGuard> {
         if let Some(handle) = &self.log_file_handle {
             // Each subscriber needs an owned File; `try_clone` dups the descriptor,
             // so every run writes through the same host-side open file.
@@ -114,7 +126,19 @@ impl GlobalOpts {
                 .expect("cannot duplicate the host log file descriptor");
             let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
             let file_writer = BoundedWriter::new(file_writer, limit);
-            Some(init_file_tracing(self.log, file_writer))
+            if let Some(evidence) = &self.run_evidence_log_handle {
+                let evidence = evidence
+                    .try_clone()
+                    .expect("cannot duplicate the private run-evidence descriptor");
+                let evidence = BoundedWriter::new(evidence, limit);
+                Some(init_file_tracing_with_evidence(
+                    self.log,
+                    file_writer,
+                    evidence,
+                ))
+            } else {
+                Some(init_file_tracing(self.log, file_writer))
+            }
         } else if let Some(path) = &self.log_file {
             // An internal caller set the path directly rather than going through
             // `open_log_file` -- today that is verify's double-run setup, which
@@ -130,7 +154,26 @@ impl GlobalOpts {
             // re-enable it.
             let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
             let file_writer = BoundedWriter::new(file_writer, limit);
-            Some(init_file_tracing(self.log, file_writer))
+            if let Some(evidence) = &self.run_evidence_log_handle {
+                let evidence = evidence
+                    .try_clone()
+                    .expect("cannot duplicate the private run-evidence descriptor");
+                let evidence = BoundedWriter::new(evidence, limit);
+                Some(init_file_tracing_with_evidence(
+                    self.log,
+                    file_writer,
+                    evidence,
+                ))
+            } else {
+                Some(init_file_tracing(self.log, file_writer))
+            }
+        } else if let Some(evidence) = &self.run_evidence_log_handle {
+            let evidence = evidence
+                .try_clone()
+                .expect("cannot duplicate the private run-evidence descriptor");
+            let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
+            let evidence = BoundedWriter::new(evidence, limit);
+            Some(init_stderr_tracing_with_evidence(self.log, evidence))
         } else {
             init_stderr_tracing(self.log);
             None
