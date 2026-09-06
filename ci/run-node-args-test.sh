@@ -125,6 +125,8 @@ else
   Output: $long_output"
     elif [[ $long_output != *"scheduler-width=validate-default"* ]]; then
         fail "the constructed-plan path did not inherit validate's scheduler width. Output: $long_output"
+    elif [[ $long_output != *"profile: hosted-portable"* ]]; then
+        fail "the hosted runner did not select the committed hosted-portable graph. Output: $long_output"
     else
         printf 'run-node-args-test: ok — a %d-byte CI selection reaches the constructed plan\n' \
             "${#long_sel}"

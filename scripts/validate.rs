@@ -303,6 +303,7 @@ enum Focused {
     LiteinstCompat,
     QemuL2,
     PrivilegedOnly,
+    HostedPortable,
     RequalifyCell { test: String, mode: String, backend: String },
     Only { lane: String, nodes: String },
     Selective { shallow: bool },
@@ -324,6 +325,7 @@ impl Focused {
             Focused::LiteinstCompat => "liteinst-compat-only".into(),
             Focused::QemuL2 => "qemu-l2-only".into(),
             Focused::PrivilegedOnly => "privileged-only".into(),
+            Focused::HostedPortable => "hosted-portable".into(),
             Focused::RequalifyCell { .. } => "cell-requalification".into(),
             Focused::Only { lane, .. } => format!("only-{lane}"),
             Focused::Selective { .. } => "selective".into(),
@@ -345,6 +347,7 @@ impl Focused {
             Focused::LiteinstCompat => "liteinst-compat-only",
             Focused::QemuL2 => "qemu-l2-only",
             Focused::PrivilegedOnly => "privileged-only",
+            Focused::HostedPortable => "hosted-portable-only",
             Focused::RequalifyCell { .. } => "requalify-cell",
             Focused::Only { .. } => "only",
             Focused::Selective { shallow } => {
@@ -424,6 +427,8 @@ fn usage() -> &'static str {
      \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
      \x20 --portable-only               No PMU/CPUID hardware required.\n\
      \x20 --privileged-only             PMU/CPUID-dependent tests only.\n\
+     \x20 --hosted-portable-only        Select the committed host-execution graph used by\n\
+     \x20                                the GitHub portable shard runner.\n\
      \x20 --requalify-cell TEST MODE BACKEND  Run the committed DAG step owning that exact cell.\n\
      \x20 --only <lane> <group.job>[,...]  Run those lane node(s) with their own\n\
      \x20                  declared caps; outside deps are dropped; preflight tags\n\
@@ -614,6 +619,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             "--liteinst-compat-only" => focused.push(Focused::LiteinstCompat),
             "--qemu-l2-only" => focused.push(Focused::QemuL2),
             "--privileged-only" => focused.push(Focused::PrivilegedOnly),
+            "--hosted-portable-only" => focused.push(Focused::HostedPortable),
             "--requalify-cell" => {
                 let test = argv.get(i + 1).cloned().unwrap_or_default();
                 let mode = argv.get(i + 2).cloned().unwrap_or_default();
@@ -807,6 +813,13 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
     }
     if args.allow_local_off_the_record_run {
         args.label_pr = false;
+    }
+    if matches!(args.focused, Some(Focused::HostedPortable))
+        && !args.allow_local_off_the_record_run
+        && !args.show_plan
+    {
+        eprintln!("validate: --hosted-portable-only is an off-record hosted shard selection");
+        return Err(2);
     }
     if args.ignore_selected_deps && args.selected.is_none() {
         eprintln!("validate: --ignore-selected-deps requires --selected");
@@ -3649,6 +3662,26 @@ fn selective_subset_bracket(root: &Path) -> Result<(), String> {
     if !selected_tags.contains(&child) || !selected_tags.contains(&parent) {
         return Err(format!(
             "selective bracket: dependency-closed selection lost child={child} or parent={parent}: {selected_tags:?}"
+        ));
+    }
+
+    let mapped_e2e = local_validation_step_tag("e2e.manifest_applications_on_host");
+    if mapped_e2e != "e2e.manifest_applications"
+        || local_validation_step_tag("test.detcore_unit") != "test.detcore_unit"
+    {
+        return Err("selective bracket: hosted-to-local step identity mapping drifted".into());
+    }
+    let mapped_plan = select_from_committed_decision(
+        &portable,
+        portable.steps.len(),
+        SelectDecision::Nodes([mapped_e2e.clone()].into_iter().collect()),
+    )?;
+    let mapped_tags = mapped_plan.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    if !mapped_tags.contains(&mapped_e2e)
+        || mapped_tags.contains("e2e.manifest_applications_on_host")
+    {
+        return Err(format!(
+            "selective bracket: hosted result identity did not select its local committed counterpart: {mapped_tags:?}"
         ));
     }
 
@@ -7403,6 +7436,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
 
     let committed_label = match (&args.focused, args.level) {
         (Some(Focused::PrivilegedOnly), _) => Some("privileged"),
+        (Some(Focused::HostedPortable), _) => Some("hosted-portable"),
         (Some(Focused::StrictCompat), _) => Some("strict-compat-only"),
         (Some(Focused::PortableStrictCompat), _) => Some("portable-strict-compat-only"),
         (Some(Focused::RrCompat), _) => Some("rr-compat-only"),
@@ -7740,6 +7774,14 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     })
 }
 
+const HOSTED_VARIANT_SUFFIX: &str = "_on_host";
+
+fn local_validation_step_tag(tag: &str) -> String {
+    tag.strip_suffix(HOSTED_VARIANT_SUFFIX)
+        .unwrap_or(tag)
+        .to_string()
+}
+
 /// What `ci/select-tests.rs` decided, and what that means for the plan.
 enum SelectDecision {
     /// No CI-relevant change: run nothing beyond preflight.
@@ -7788,7 +7830,12 @@ fn ask_selector(root: &Path, baseline: Option<&str>) -> SelectDecision {
             let nodes: BTreeSet<String> = sel
                 .get("nodes")
                 .and_then(|n| n.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|value| value.as_str())
+                        .map(local_validation_step_tag)
+                        .collect()
+                })
                 .unwrap_or_default();
             if nodes.is_empty() {
                 SelectDecision::Full("empty selected node set".into())
