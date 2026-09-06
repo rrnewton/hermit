@@ -5,85 +5,25 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# run-node.sh — select named steps from the committed validation DAG without their
+# run-node.sh — execute exact committed validation-DAG nodes without their
 # externally supplied dependencies.
 #
-# WHY (single-engine invariant): the parallel GitHub fan-out (ci-portable.yml)
-# shards the portable lane across many small jobs. Each shard must execute an
-# exact subset of the plan against a prebuilt tree / restored cache produced by
-# an upstream build job. Historically this shim loaded a separate lane DAG and
-# also RE-IMPLEMENTED node execution in
-# jq+bash (extract each node's `.cmd`, `bash -c` it) because the pinned runner
-# predated its `run --selected` node selector. That made GitHub Actions a SECOND
-# execution engine that diverged from the runner: it ignored each node's
-# jobs_flag, timeout, cpu_timeout, and cgroup boxing. This rewrite kills that
-# divergence. Hosted execution now asks scripts/validate.rs to select the
-# requested profile and tags from committed `ci/dag/validate.json`. The scratch
-# path below remains only for the explicitly edited, local-only command mode.
-#
-# REQUIRES the pinned agent-utils runner to support `run --selected` with
-# `--ignore-selected-deps`. At an older pin this script fails closed (argparse
-# rejects the selector), which is intentional: the run-node.sh rewrite and the
-# agent-utils gitlink advance are a COUPLED change and must land together.
+# Hosted jobs restore build outputs before invoking this entry point. The
+# selected nodes still execute through scripts/validate.rs and dagrun, retaining
+# their committed wall, CPU, memory, dependency, and result-ownership policy.
+# This script never edits the committed DAG. To iterate on a different command,
+# invoke that command directly; the result is not evidence for the DAG node.
 #
 # Usage:
-#   ci/run-node.sh <lane> <group.job>[,<group.job>...] [-- <extra args>]
-#     <lane>   portable | privileged  (selects ci/dag/validate.json)
-#     nodes    one or more "group.job" tags, comma-separated. Passed verbatim to
-#              `run --selected --ignore-selected-deps`: the runner executes
-#              EXACTLY those steps (dependency
-#              edges to steps OUTSIDE the selection are dropped — their outputs
-#              are assumed already present from an upstream build/cache job),
-#              while edges AMONG the selected steps are preserved so a selected
-#              sub-graph still runs in the right order.
-#     -- args  RUN ONE TEST INSIDE ONE NODE. Everything after `--` is appended,
-#              shell-quoted, to the END of that node's tracked command line, and
-#              the node runs from a scratch DAG holding only that edit. Requires
-#              a SINGLE node tag, and refuses under $CI/$GITHUB_ACTIONS.
-#
-# ⚠️ WHY `--` EXISTS, AND WHY IT SHOUTS. Before it, this script took exactly two
-# positional arguments and IGNORED any further ones. So the natural attempt at a
-# targeted test —
-#     ci/run-node.sh portable test.detcore_unit -E 'test(=cpuid_leaf_count)'
-# — silently ran the WHOLE node, all 534 tests, and printed PASS. The filter was
-# swallowed, and the operator read a full-node green as a one-test green. That is
-# a mechanism producing a value that reads as information and carries none, so
-# unrecognised trailing arguments are now a hard usage error, and the one form
-# that IS supported announces the exact edited command before running it.
-#
-# ⚠️ AND AN EDITED NODE IS NOT THE NODE. The scratch DAG keeps the node's own
-# boxing, jobs_flag, timeout and cpu_timeout — that is the whole point of going
-# through dagrun rather than hand-copying the cmd — but the command it runs is no
-# longer the tracked one, so its result is ITERATION EVIDENCE ONLY. It cannot
-# stand in for the node in CI, and nothing here writes a receipt.
-#
-# The appended text lands at the end of the line VERBATIM. Knowing what that
-# means for a given node is the caller's job: for a nextest node ending in
-# `-- --skip X` the trailing position is already inside the test binary's own
-# argument list, so a nextest-level `-E` filter must not be appended there.
+#   ci/run-node.sh <lane> <group.job>[,<group.job>...]
+#     <lane>   portable | privileged
+#     nodes    exact comma-separated tags selected from the matching hosted
+#              graph. Dependencies outside the selection are intentionally
+#              omitted because hosted build jobs provide their outputs.
 #
 # Environment:
-#   DAGRUN_BIN   override the runner executable (mirrors run-dag.sh).
-#   RUN_NODE_JOBS        optional outer-concurrency override across selected
-#                        nodes. When unset, constructed-plan runs leave `-j`
-#                        unset and use validate's host-adaptive default. The
-#                        local-only edited-command path keeps its historical
-#                        one-node default. Inner per-node parallelism (cargo /
-#                        nextest -j) comes from each node's jobs_flag in the DAG.
-#   RUN_NODE_PERF_DIR    directory for per-step + whole-run resource-usage CSVs
-#                        (default ignored/ci/perf/run-node/<lane>). CI uploads it
-#                        as a per-shard performance artifact.
-#   RUN_NODE_PRINT_ONLY  with `--`, write the scratch DAG, print the edited node
-#                        command on stdout and exit 0 WITHOUT running it. This
-#                        exists so ci/run-node-args-test.sh can assert the exact
-#                        edited command without needing that node's build
-#                        artifacts; it says on stderr that nothing was executed,
-#                        because a runner that silently runs nothing is the very
-#                        failure this `--` support was added to remove.
-#
-# Example:
-#   ci/run-node.sh portable test.hermit_unit,test.detcore_unit
-#   ci/run-node.sh portable test.detcore_unit -- -E 'test(=cpuid::tests::cpuid_leaf_count)'
+#   RUN_NODE_JOBS        optional outer scheduler width.
+#   RUN_NODE_PRINT_ONLY  print the selected plan without execution.
 
 set -uo pipefail
 
@@ -94,7 +34,7 @@ cd "$ROOT_DIR" || exit 2
 source "$ROOT_DIR/ci/configure-build-jobs.sh" launcher || exit $?
 
 usage() {
-    echo "usage: ci/run-node.sh <lane> <group.job>[,<group.job>...] [-- <args appended to one node's cmd>]" >&2
+    echo "usage: ci/run-node.sh <portable|privileged> <group.job>[,<group.job>...]" >&2
 }
 
 lane=${1:-}
@@ -105,245 +45,36 @@ if [[ -z $lane || -z $sel ]]; then
 fi
 shift 2
 
-# Validate the label before creating any scratch, perf, or run-state output.
+if (($# > 0)); then
+    echo "run-node.sh: trailing command replacement arguments were removed; the runtime accepts only ci/dag/validate.json" >&2
+    echo "             invoke a modified command directly for local iteration; it is not validation evidence" >&2
+    usage
+    exit 2
+fi
+
 case "$lane" in
     portable) profile=(--hosted-portable-only) ;;
-    privileged) profile=(--privileged-only) ;;
+    privileged) profile=(--hosted-privileged-only) ;;
     *)
         echo "run-node.sh: unknown lane '$lane' (expected portable or privileged)" >&2
         exit 2
         ;;
 esac
 
-# Fail closed on anything else. Silently ignoring trailing arguments is what let
-# a swallowed test filter read as a targeted green; see the header.
-append=()
-if (($# > 0)); then
-    if [[ $1 != "--" ]]; then
-        echo "run-node.sh: unexpected argument '$1'. Node-command arguments must follow a literal '--'." >&2
-        usage
-        exit 2
-    fi
-    shift
-    if (($# == 0)); then
-        echo "run-node.sh: '--' given with nothing after it." >&2
-        exit 2
-    fi
-    append=("$@")
+extra=(--allow-local-off-the-record-run --selected "$sel" \
+    --ignore-selected-deps --no-label-pr --verbose)
+scheduler_width=validate-default
+if [[ -n ${RUN_NODE_JOBS:-} ]]; then
+    extra+=(-j "$RUN_NODE_JOBS")
+    scheduler_width=-j$RUN_NODE_JOBS
 fi
-
-if ((${#append[@]} == 0)); then
-    extra=(--allow-local-off-the-record-run --selected "$sel" \
-        --ignore-selected-deps --no-label-pr --verbose)
-    scheduler_width=validate-default
-    if [[ -n ${RUN_NODE_JOBS:-} ]]; then
-        extra+=(-j "$RUN_NODE_JOBS")
-        scheduler_width=-j$RUN_NODE_JOBS
-    fi
-    if [[ -n ${GITHUB_ACTIONS:-} || -n ${CI:-} ]]; then
-        extra+=(--allow-cgroup-failure \
-            --skip-inner-dirty-working-tree-and-rebase-freshness-checks)
-    fi
-    if [[ -n ${RUN_NODE_PRINT_ONLY:-} ]]; then
-        extra+=(--show-plan)
-    fi
-    echo "run-node.sh: lane=$lane nodes=$sel scheduler-width=$scheduler_width via validate's constructed plan" >&2
-    exec ./scripts/validate.rs "${profile[@]}" "${extra[@]}"
-fi
-
-dag="$ROOT_DIR/ci/dag/validate.json"
-if [[ ! -f $dag ]]; then
-    echo "run-node.sh: committed validation DAG is missing: $dag" >&2
-    exit 2
-fi
-
-# Every step's wall, CPU, and memory policy is explicit in validate.json. This
-# entrypoint may edit one command for local iteration, but never stamps policy.
-
-# One test inside one node: run the node's own boxing and limits over an edited
-# command. Refused in CI, refused for a multi-node selection, and never silent.
-if ((${#append[@]} > 0)); then
-    if [[ -n ${GITHUB_ACTIONS:-} || -n ${CI:-} ]]; then
-        echo "run-node.sh: '--' node-command arguments are a local iteration aid and are refused in CI." >&2
-        echo "            CI must run the tracked command; edit ci/dag/validate.json instead." >&2
-        exit 2
-    fi
-    if [[ $sel == *,* ]]; then
-        echo "run-node.sh: '--' requires exactly one node tag, got '$sel'." >&2
-        exit 2
-    fi
-
-    # `--labels` includes dependencies. Admit an edited node only when it is in
-    # that exact dependency-closed population, not merely somewhere in the
-    # superset and not only when it carries the label directly.
-    RUN_NODE_LANE="$lane" RUN_NODE_TAG="$sel" python3 -c '
-import json, os, sys
-
-source = sys.argv[1]
-lane = os.environ["RUN_NODE_LANE"]
-tag = os.environ["RUN_NODE_TAG"]
-dag = json.load(open(source))
-steps = {}
-for step in dag["steps"]:
-    step_tag = "{}.{}".format(step.get("group", ""), step.get("job", ""))
-    if step_tag in steps:
-        sys.exit(f"run-node.sh: duplicate step tag {step_tag!r} in {source}")
-    steps[step_tag] = step
-selected = {
-    step_tag for step_tag, step in steps.items()
-    if lane in step.get("labels", [])
-}
-pending = list(selected)
-while pending:
-    current = pending.pop()
-    for dependency in steps[current].get("deps", []):
-        if dependency not in steps:
-            sys.exit(f"run-node.sh: {current!r} names missing dependency {dependency!r} in {source}")
-        if dependency not in selected:
-            selected.add(dependency)
-            pending.append(dependency)
-if tag not in selected:
-    sys.exit(f"run-node.sh: node {tag!r} is not in the selected dependency closure for lane {lane!r}")
-' "$dag" || exit 2
-fi
-
-quoted=""
-if ((${#append[@]} > 0)); then
-    quoted=$(printf ' %q' "${append[@]}")
-fi
-
-scratch_dir="$ROOT_DIR/ignored/ci/run-node"
-mkdir -p "$scratch_dir" || {
-    echo "run-node.sh: could not create scratch dir: $scratch_dir" >&2
-    exit 2
-}
-
-# ⚠️ THE SELECTION CANNOT GO INTO THE FILENAME UNCONDITIONALLY.
-#
-# `$sel` is a comma-joined MULTI-NODE selection in CI — ci-portable.yml passes
-# `jq -r '.preflight_nodes|join(",")'`, which is 11 tags and 251 bytes — and
-# "<lane>." + sel + ".effective.json" costs 24 bytes of overhead, so anything
-# past 231 bytes of selection overflows NAME_MAX (255). The scratch write then
-# died with `OSError: [Errno 36] File name too long` and run-node.sh exited 2,
-# taking out the WHOLE preflight job while every single-node use kept working.
-#
-# ⚠️ AND NOTE WHY NOTHING CAUGHT IT: until the scratch DAG became unconditional,
-# the filename was built INSIDE the `--` branch, which refuses a multi-node
-# selection three lines earlier ("'--' requires exactly one node tag"). A long
-# `$sel` was structurally unreachable. The guard did not move; the code it was
-# protecting moved out from behind it.
-#
-# Keep the readable name whenever it fits — that is the single-node iteration
-# case, and ci/run-node-args-test.sh asserts that exact path by name — and
-# digest anything longer. The digest is a pure function of the selection, so a
-# repeated run of the same selection still reuses one file.
-scratch_name() {
-    local lane=$1 sel=$2 name
-    name="${lane}.${sel}.effective.json"
-    if ((${#name} <= 200)); then
-        printf '%s\n' "$name"
-        return 0
-    fi
-    printf '%s.%s.effective.json\n' "$lane" \
-        "$(printf '%s' "$sel" | sha1sum | cut -d' ' -f1 | cut -c1-16)"
-}
-scratch_dag="$scratch_dir/$(scratch_name "$lane" "$sel")"
-RUN_NODE_TAG="$sel" RUN_NODE_APPEND="$quoted" \
-    python3 -c '
-import json, os, sys
-
-source, destination = sys.argv[1], sys.argv[2]
-tag = os.environ["RUN_NODE_TAG"]
-extra = os.environ["RUN_NODE_APPEND"]
-dag = json.load(open(source))
-
-def step_tag(step):
-    return "{}.{}".format(step.get("group", ""), step.get("job", ""))
-
-edited = ""
-if extra:
-    hits = [s for s in dag["steps"] if step_tag(s) == tag]
-    if len(hits) != 1:
-        sys.exit(f"run-node.sh: {len(hits)} step(s) match tag {tag!r} in {source}")
-    hits[0]["cmd"] += extra
-    edited = hits[0]["cmd"]
-
-json.dump(dag, open(destination, "w"), indent=2)
-print(edited)
-' "$dag" "$scratch_dag" >"$scratch_dir/.state" || exit 2
-dag="$scratch_dag"
-edited_cmd=$(sed -n 1p "$scratch_dir/.state")
-
-if [[ -n $quoted ]]; then
-    echo "run-node.sh: ⚠️  EDITED NODE COMMAND — iteration evidence only, NOT the tracked node." >&2
-    echo "run-node.sh: scratch DAG: $scratch_dag" >&2
-    echo "run-node.sh: $sel now runs: $edited_cmd" >&2
-    if [[ -n ${RUN_NODE_PRINT_ONLY:-} ]]; then
-        echo "run-node.sh: RUN_NODE_PRINT_ONLY set — the edited command above was NOT executed." >&2
-        printf '%s\n' "$edited_cmd"
-        exit 0
-    fi
-fi
-
-# Locate the runner. Mirror ci/run-dag.sh's find_runner EXACTLY: an explicit
-# override, then the TRACKED, source-invoked engine resolver
-# (agent-utils/common/bin/dagrun), then the tracked, source-invoked
-# Python entrypoint (agent-utils/py/bin), then a resolver already on PATH. NEVER
-# auto-select the untracked prebuilt Rust binary (rs/bin): a compiled artifact
-# can silently drift from its source (the historical cpu_timeout gap), and the
-# CI execution path must stay tracked, deterministic, and self-describing.
-find_runner() {
-    if [[ -n ${DAGRUN_BIN:-} ]]; then
-        printf '%s\n' "$DAGRUN_BIN"
-        return 0
-    fi
-    local base="$ROOT_DIR/agent-utils"
-    if [[ -x "$base/common/bin/dagrun" ]]; then
-        printf '%s\n' "$base/common/bin/dagrun"
-        return 0
-    fi
-    if [[ -x "$base/py/bin/dagrun" ]]; then
-        printf '%s\n' "$base/py/bin/dagrun"
-        return 0
-    fi
-    if command -v dagrun >/dev/null 2>&1; then
-        command -v dagrun
-        return 0
-    fi
-    return 1
-}
-
-runner=$(find_runner) || {
-    echo "run-node.sh: dagrun not found." >&2
-    echo "            Build it with: (cd agent-utils && ./setup) or set DAGRUN_BIN." >&2
-    exit 2
-}
-
-jobs=${RUN_NODE_JOBS:-1}
-perf_dir=${RUN_NODE_PERF_DIR:-"$ROOT_DIR/ignored/ci/perf/run-node/${lane}"}
-mkdir -p "$perf_dir" || {
-    echo "run-node.sh: could not create perf dir: $perf_dir" >&2
-    exit 2
-}
-export VALIDATE_RUN_STATE=${VALIDATE_RUN_STATE:-"$ROOT_DIR/target/validation/run-node-${lane}-$$"}
-mkdir -p "$VALIDATE_RUN_STATE" || {
-    echo "run-node.sh: could not create validation run-state directory: $VALIDATE_RUN_STATE" >&2
-    exit 2
-}
-
-# Boxing policy. dagrun boxes fail-closed by default (two-level
-# cgroup-v2 + a systemd --user scope, or it exits 3). Inside GitHub Actions the
-# runner deliberately SKIPS the systemd --user scope (its skip_in_ci path keys on
-# $GITHUB_ACTIONS / $CI), so the default no-opt-out path would exit 3 in ANY
-# Actions context. run-node.sh is used ONLY by the hosted, EPHEMERAL ubuntu
-# portable lane — where the throwaway VM IS the containment boundary — so we opt
-# out of fail-closed boxing there with --allow-cgroup-failure. A local developer
-# run (no $GITHUB_ACTIONS / $CI) still boxes fail-closed.
-acf=()
 if [[ -n ${GITHUB_ACTIONS:-} || -n ${CI:-} ]]; then
-    acf=(--allow-cgroup-failure)
+    extra+=(--allow-cgroup-failure \
+        --skip-inner-dirty-working-tree-and-rebase-freshness-checks)
+fi
+if [[ -n ${RUN_NODE_PRINT_ONLY:-} ]]; then
+    extra+=(--show-plan)
 fi
 
-echo "run-node.sh: lane=$lane runner=$runner nodes=$sel -j$jobs cargo-jobs=$CARGO_BUILD_JOBS reverie-dbt-budget=portable-build-child-only perf-dir=$perf_dir${acf+ (unboxed: ephemeral CI VM)}" >&2
-exec "$runner" run --dag "$dag" --selected "$sel" --ignore-selected-deps \
-    -j "$jobs" --perf-dir "$perf_dir" "${acf[@]}" -v
+echo "run-node.sh: lane=$lane nodes=$sel scheduler-width=$scheduler_width via the committed hosted selection" >&2
+exec ./scripts/validate.rs "${profile[@]}" "${extra[@]}"

@@ -17,9 +17,11 @@
 #   ci/run-dag.sh <label> [runner-args...]
 #     <label>           quick | portable | full | super | privileged
 #                       (selects labelled steps from ci/dag/validate.json)
-#     runner-args       forwarded verbatim to `dagrun run`
+#     runner-args       allowlisted non-selection controls forwarded to `dagrun run`
 #                       (e.g. -j 8, --max-mem 32G, --perf-dir ./perf,
 #                        -k/--keep-going, -v, -q)
+#                       graph, label, selected-step, command, stress, and
+#                       resource-policy overrides are refused
 #
 # Examples:
 #   ci/run-dag.sh portable --max-mem 32G
@@ -28,11 +30,6 @@
 #
 # Environment:
 #   DAGRUN_BIN     override the runner executable to use.
-#   RUN_DAG_FILE_OVERRIDE  run this exact DAG file instead of ci/dag/validate.json.
-#                          Used by scripts/validate.rs --selective to feed a subset DAG
-#                          (a dependency-closed slice of the lane) while keeping
-#                          the lane argument for runner labeling. The override
-#                          must exist and be readable, or run-dag.sh fails closed.
 
 set -uo pipefail
 
@@ -51,20 +48,76 @@ lane=$1
 shift
 
 if [[ -n ${RUN_DAG_FILE_OVERRIDE:-} ]]; then
-    dag="$RUN_DAG_FILE_OVERRIDE"
-    if [[ ! -f $dag ]]; then
-        echo "run-dag.sh: RUN_DAG_FILE_OVERRIDE set but not a file: $dag" >&2
-        exit 2
-    fi
-    echo "run-dag.sh: using DAG override for lane '$lane': $dag" >&2
-else
-    dag="$ROOT_DIR/ci/dag/validate.json"
-    if [[ ! $lane =~ ^(quick|portable|full|super|privileged)$ ]]; then
-        echo "run-dag.sh: unknown validation label '$lane'" >&2
-        echo "            known labels: quick, portable, full, super, privileged" >&2
-        exit 2
-    fi
+    echo "run-dag.sh: RUN_DAG_FILE_OVERRIDE was removed; runtime validation accepts only ci/dag/validate.json" >&2
+    exit 2
 fi
+dag="$ROOT_DIR/ci/dag/validate.json"
+if [[ ! $lane =~ ^(quick|portable|full|super|privileged)$ ]]; then
+    echo "run-dag.sh: unknown validation label '$lane'" >&2
+    echo "            known labels: quick, portable, full, super, privileged" >&2
+    exit 2
+fi
+case $lane in
+    portable) selection_label=hosted-portable ;;
+    privileged) selection_label=hosted-privileged ;;
+    *) selection_label=$lane ;;
+esac
+
+# The wrapper, not its caller, owns both graph identity and label selection.
+# dagrun accepts repeated options with the final value winning, so merely
+# placing these options first would let a trailing caller argument replace the
+# committed DAG or select a different profile. Forward only runner controls
+# that cannot change graph contents or the selected node population.
+validate_runner_args() {
+    local arg
+    while (($# > 0)); do
+        arg=$1
+        shift
+        case "$arg" in
+            --dag|--dag=*|--labels|--labels=*|--selected|--selected=*|\
+            --ignore-selected-deps|--ignore-selected-deps=*|--args|--args=*|\
+            --stress|--stress=*|--resource-caps-path|--resource-caps-path=*|\
+            --small-default-cap|--small-default-cap=*)
+                echo "run-dag.sh: refusing caller graph/selection override '$arg'; this entry point owns --dag and --labels" >&2
+                return 2
+                ;;
+            -s|-j|--max-steps|--max-cpus|--jobs|--cores|--cpuset|--pin|\
+            --max-mem|--perf-dir|--profile-timeseries|--planner|--profile-sync|\
+            --profile-sync-direction|--run-timeout|--cpu-timeout-multiplier)
+                if (($# == 0)); then
+                    echo "run-dag.sh: runner option '$arg' requires a value" >&2
+                    return 2
+                fi
+                shift
+                ;;
+            --max-steps=*|--max-cpus=*|--jobs=*|--cores=*|--cpuset=*|--pin=*|\
+            --max-mem=*|--perf-dir=*|--profile-timeseries=*|--planner=*|\
+            --profile-sync=*|--profile-sync-direction=*|--run-timeout=*|\
+            --cpu-timeout-multiplier=*|-s?*|-j?*)
+                ;;
+            --admission)
+                # dagrun's admission wait is optional. It consumes the next
+                # token only when that token is a nonnegative value rather
+                # than another flag; dagrun remains responsible for validating
+                # the number and its range.
+                if (($# > 0)) && [[ $1 != -* ]]; then
+                    shift
+                fi
+                ;;
+            --admission=*|--no-profile|--profile|--show-plan|\
+            --no-profile-feedback|--profile-memory-feedback|-k|--keep-going|\
+            --no-color|--allow-cgroup-failure|--unsafe-no-cgroups|\
+            --allow-unwise-nest-dagruns|-v|-q|--quiet)
+                ;;
+            *)
+                echo "run-dag.sh: unsupported runner argument '$arg'; pass only documented non-selection run controls" >&2
+                return 2
+                ;;
+        esac
+    done
+}
+
+validate_runner_args "$@" || exit $?
 
 # Locate the runner. Prefer an explicit override, then the TRACKED, source-invoked
 # engine resolver (agent-utils/common/bin/dagrun -> engine-resolver),
@@ -122,13 +175,13 @@ if (($# > 0)) && [[ $1 == list || $1 == ascii || $1 == dot || $1 == json ]]; the
     shift
 fi
 
-if [[ $verb != run && -z ${RUN_DAG_FILE_OVERRIDE:-} ]]; then
+if [[ $verb != run ]]; then
     echo "run-dag.sh: '$verb' cannot represent the '$lane' label selection." >&2
     echo "            Inspect the committed superset directly: $runner $verb --dag $dag" >&2
     exit 2
 fi
 
-echo "run-dag.sh: lane=$lane runner=$runner verb=$verb cargo-jobs=$CARGO_BUILD_JOBS reverie-dbt-budget=portable-build-child-only" >&2
+echo "run-dag.sh: lane=$lane selection-label=$selection_label runner=$runner verb=$verb cargo-jobs=$CARGO_BUILD_JOBS reverie-dbt-budget=portable-build-child-only" >&2
 if [[ $verb == run ]]; then
     export HERMIT_REAL_RUST_SCRIPT
     HERMIT_REAL_RUST_SCRIPT=$(command -v rust-script) || {
@@ -139,9 +192,16 @@ if [[ $verb == run ]]; then
     export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1
     export PATH="$ROOT_DIR/ci/rust-script-bin:$PATH"
 fi
-if [[ $verb == run && -z ${RUN_DAG_FILE_OVERRIDE:-} ]]; then
-    export VALIDATE_RUN_STATE=${VALIDATE_RUN_STATE:-"$ROOT_DIR/target/validation/run-dag-${lane}-$$"}
-    mkdir -p "$VALIDATE_RUN_STATE" || exit 2
-    exec "$runner" "$verb" --dag "$dag" --labels "$lane" "$@"
+if [[ $verb == run ]]; then
+    if [[ -n ${VALIDATE_RUN_STATE:-} ]]; then
+        echo "run-dag.sh: refusing inherited VALIDATE_RUN_STATE; every top-level run owns a unique state directory" >&2
+        exit 2
+    fi
+    VALIDATE_RUN_STATE="$ROOT_DIR/target/validation/run-dag-${lane}-$$-$(date +%s%N)"
+    export VALIDATE_RUN_STATE
+    export E2E_RESULT_ROOT=${E2E_RESULT_ROOT:-"$VALIDATE_RUN_STATE/results"}
+    export E2E_BUILD_ROOT=${E2E_BUILD_ROOT:-"$VALIDATE_RUN_STATE/build"}
+    mkdir -p "$VALIDATE_RUN_STATE" "$E2E_RESULT_ROOT" "$E2E_BUILD_ROOT" || exit 2
+    exec "$runner" "$verb" --dag "$dag" --labels "$selection_label" "$@"
 fi
 exec "$runner" "$verb" --dag "$dag" "$@"

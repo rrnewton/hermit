@@ -8,8 +8,9 @@ independent gates concurrently. On hosts with delegated cgroup v2 support, it
 can also box each node for memory limits and full process-subtree teardown.
 
 - [`validate.json`](validate.json) — the one committed superset. Steps declare
-  `quick`, `portable`, `hosted-portable`, `full`, `super`, and `privileged`
-  labels; dagrun selects the requested label and its dependency ancestry without rewriting the graph.
+  `quick`, `portable`, `hosted-portable`, `full`, `super`, `privileged`, and
+  `hosted-privileged` labels; dagrun selects the requested label and its
+  dependency ancestry without rewriting the graph.
 
 Run a lane with the wrapper:
 
@@ -21,25 +22,33 @@ agent-utils/py/bin/dagrun ascii --dag ci/dag/validate.json  # inspect the supers
 
 ## Status: active local lanes and manual hosted diagnostics
 
-`scripts/validate.rs` reads `validate.json` and selects the requested label.
-The hosted workflows select the explicit `hosted-portable` label from the same
-file. Its 13 E2E producers and final scorecard retain host commands and typed
-host dependencies; the ordinary `portable` label selects their pinned-root
-counterparts. Standard profile execution does
-not merge lane files, regenerate nodes, or rewrite commands and resource caps.
+`scripts/validate.rs` reads `validate.json` and selects local labels.
+`ci/run-dag.sh portable` and `ci/run-dag.sh privileged` map to the explicit
+`hosted-portable` and `hosted-privileged` labels in that same file. The hosted
+nodes retain host commands and typed host dependencies; local labels select
+their pinned-root counterparts. Standard profile execution does not merge lane
+files, regenerate nodes, or rewrite commands and resource caps.
 
 `generate-validation-dag --check` is a maintenance check, not part of runtime
-plan construction. It treats static nodes in `validate.json` as authored source
-and regenerates only the namespaced compatibility/stress partition from the
-manifest corpus. `--write` updates this same file; there is no secondary DAG.
+plan construction. Static step definitions live as private typed generator
+input in `ci/manifest-plan/src/validation_dag_static.rs`; generated manifest,
+compatibility, stress, local pinned-root, and hosted variants are composed with
+them to emit the entire file deterministically. `--check` regenerates from that
+independent source and refuses any command, dependency, or cap drift in the
+committed artifact. `--write` updates this same file; there is no secondary
+runnable DAG.
 
-The privileged DAG is limited to the focused build, CPUID faulting, PMU skid,
-manifest validation, and KVM E2E cells so the manual self-hosted smoke stays
-within its 270-second workflow bound. Each sequential build/KVM segment is
-capped at 120 seconds, yielding a 240-second maximum DAG timeout path; the
-manifest audit recomputes and enforces that bound. The 139-program
-record/replay ratchet is preserved as a separate step in the manually dispatched
-full validation job.
+The local privileged selection contains 19 nodes with a 3900-second critical
+path. The separately labelled hosted privileged smoke preserves its historical
+12-node population and 1500-second critical path, so the manual workflow keeps
+its audited 1560-second launcher bound. The stale hosted file omitted CPU
+budgets and therefore inherited dagrun's 10-second fallback; every hosted node
+now carries the corresponding current-plan CPU budget explicitly. This is a
+correctness repair, not a claim that the obsolete fallback was equivalent.
+Commands, dependencies, wall bounds, and the absence of hosted resource demands
+remain checked against the hosted selection. The 139-program record/replay
+ratchet remains a separate step in the manually dispatched full validation
+job.
 
 The `mem_race` family and three nonblocking post-DAG diagnostics run in the
 manually dispatched `super` tier so a known host-sensitive hang cannot consume
@@ -47,8 +56,9 @@ the serialized capability lane unexpectedly.
 
 The `Validation Levels` workflow does not launch for pull requests, `main`, or a
 schedule. Its quick, privileged, and super levels remain available by manual
-dispatch. The manual [`ci-dag.yml`](../../.github/workflows/ci-dag.yml) workflow
-runs either DAG on demand.
+dispatch. The manual [`ci-dag.yml`](../../.github/workflows/ci-dag.yml)
+workflow selects either the `hosted-portable` or `hosted-privileged` label from
+the same committed superset on demand.
 
 ### Runner dependency
 
