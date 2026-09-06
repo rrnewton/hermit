@@ -18,8 +18,8 @@ use dagrun::model::StepOutcome;
 use crate::validate_plan::node;
 use crate::validate_plan::shell_quote;
 
-/// `GATE_TIMEOUT_SECONDS` (validate.sh:400). A gates.json row with
-/// `"timeout": 0` used bare `run_check`, which inherits this default.
+/// `GATE_TIMEOUT_SECONDS` (validate.sh:400). A generated super node without
+/// an explicit override inherits this historical default before it is committed.
 pub const DEFAULT_GATE_TIMEOUT_S: i64 = 600;
 
 /// `SUPER_REPETITIONS` (validate.sh:682).

@@ -404,7 +404,7 @@ tool refused for the reason you meant, and equally when it could not run at all.
 Measured 2026-08-25 on `ci/run-node-args-test.sh`. Five checks asserted that
 `ci/run-node.sh` refuses a malformed invocation with exit 2. But exit 2 is also
 what that script returns for an unknown lane, an unwritable perf directory, and
-`dagrun not found`. Removing `ci/dag/portable.json` — standing in for a box where
+`dagrun not found`. Removing `ci/dag/validate.json` — standing in for a box where
 the runner is simply unavailable — produced:
 
     exit-code-only:   ok / ok / ok / ok / ok          <- all five vacuous
