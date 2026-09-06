@@ -34,6 +34,37 @@ def _candidate_authorities() -> list[Path]:
     return candidates
 
 
+#: Exit status for "could not consult the contract at all". Mirrors
+#: check_outcome_adapter.EXIT_AUTHORITY_UNAVAILABLE deliberately: one spelling
+#: across both pinned-authority adapters, so a caller learns the rule once.
+EXIT_AUTHORITY_UNAVAILABLE = 3
+
+
+class AuthorityUnavailable(RuntimeError):
+    """The contract could not be OBTAINED. Says nothing about any pull request.
+
+    ⚠️ NOT A VERDICT. Measured 2026-09-04 on the host recorded for this
+    measurement in ``docs/TESTING_ENVIRONMENTS.md`` under "Named measurement
+    hosts": with `gh` unreachable this raised an ordinary RuntimeError, `make
+    lint-checks` exited 1, and the validation DAG recorded check.lint_checks as
+    FAILED -- an outage reported as a code defect.
+    """
+
+
+class AuthorityRefused(RuntimeError):
+    """Reached and answered no. Not an outage; see check_outcome_adapter."""
+
+
+# ⚠️ IMPORTED, NOT COPIED. Two lists of transport signatures is exactly where one
+# gets a new entry and the other does not, and the consequence of the stale copy
+# is a silent skip.
+from check_outcome_adapter import _is_transport_failure  # noqa: E402
+
+
+class AuthorityIntegrityError(RuntimeError):
+    """Obtained and does NOT match the pin. A refusal; still fails closed."""
+
+
 def _fetch_pinned_source() -> bytes:
     """Fetch the private parent file through authenticated GitHub tooling."""
     proxy = shutil.which("with-proxy")
@@ -43,7 +74,7 @@ def _fetch_pinned_source() -> bytes:
     elif gh:
         command = [gh]
     else:
-        raise RuntimeError(
+        raise AuthorityUnavailable(
             "cannot fetch the pinned review-label contract: gh is unavailable; "
             "set DEV_HERMIT_PARENT to a dev-hermit checkout"
         )
@@ -58,9 +89,13 @@ def _fetch_pinned_source() -> bytes:
     result = subprocess.run(command, capture_output=True, check=False)
     if result.returncode != 0:
         detail = result.stderr.decode(errors="replace").strip() or "no error output"
-        raise RuntimeError(
-            "cannot fetch the pinned review-label contract with gh api: "
-            f"{detail}"
+        if _is_transport_failure(detail):
+            raise AuthorityUnavailable(
+                "cannot fetch the pinned review-label contract: " f"{detail}"
+            )
+        raise AuthorityRefused(
+            "the pinned review-label contract was reached and refused: "
+            f"{detail}. This is not an outage and is not being skipped"
         )
     return result.stdout
 
@@ -75,7 +110,7 @@ def _verified_source() -> bytes:
     source = _fetch_pinned_source()
     digest = hashlib.sha256(source).hexdigest()
     if digest != AUTHORITY_SHA256:
-        raise RuntimeError(
+        raise AuthorityIntegrityError(
             "canonical review-label contract digest mismatch: "
             f"expected {AUTHORITY_SHA256}, got {digest}"
         )
@@ -115,9 +150,39 @@ def lint_records() -> tuple[str, ...]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--materialize-authority",
+        metavar="DIR",
+        default="",
+        help=(
+            "write the verified authority under DIR at its pinned relative "
+            "path and exit, so later invocations can read it locally via "
+            "DEV_HERMIT_PARENT instead of fetching it again"
+        ),
+    )
     parser.add_argument("--format", choices=("lint-records",), default="lint-records")
-    parser.parse_args(argv)
-    print("\n".join(lint_records()))
+    args = parser.parse_args(argv)
+    # Nothing on stdout when the contract cannot be consulted: callers read
+    # stdout as the records. The distinction rides the exit status.
+    try:
+        if args.materialize_authority:
+            # Same purpose as in check_outcome_adapter: one fetch per checker
+            # instead of one per process, which is what removes the window the
+            # codex lane reproduced. Digest-verified before writing.
+            target = Path(args.materialize_authority) / AUTHORITY_RELATIVE_PATH
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(_verified_source())
+            return 0
+        records = lint_records()
+    except AuthorityUnavailable as unavailable:
+        print(
+            f"COULD-NOT-DETERMINE: {unavailable}. state: NO SIGNAL -- the "
+            "review-label contract was not consulted, so this says nothing "
+            "about any pull request and is not a failing verdict.",
+            file=sys.stderr,
+        )
+        return EXIT_AUTHORITY_UNAVAILABLE
+    print("\n".join(records))
     return 0
 
 

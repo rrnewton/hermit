@@ -10,6 +10,37 @@
 
 set -euo pipefail
 
+# Same rule as the check-status checkers: if the pinned review-label contract
+# cannot be consulted, no case here is evaluable. Declare it and exit 0 so
+# `make lint-checks` still passes and ci/lint-checks-node.sh classifies the run
+# no_result (exit 75) instead of fail. A nonzero exit could never be reported as
+# no_result -- classify_run lets a real failure outrank any marker.
+_probe_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+_auth_rc=0
+_authority_dir=$("$_probe_root/scripts/authority-available.sh" "$_probe_root/scripts/review_contract_adapter.py") || _auth_rc=$?
+# ⚠️ ONLY EXIT 3 MAY SKIP, AND AN EARLIER VERSION OF THIS GUARD GOT IT WRONG.
+# It treated ANY nonzero from the helper as "unavailable", so a TAMPERED
+# authority -- fetched successfully, wrong bytes, AuthorityIntegrityError, exit
+# 1 -- was laundered into a no-result skip. That is the most dangerous possible
+# reading: the one failure mode the content pin exists to catch, silently
+# reported as "could not evaluate". Measured 2026-09-04: checker exited 0 with a
+# marker against a deliberately corrupted authority.
+if [ "$_auth_rc" -eq 3 ]; then
+    echo "NO-RESULT-CASE: core-review-protocol-lint-test.sh: the pinned review-label contract could not be consulted; no case in this checker was evaluated"
+    exit 0
+elif [ "$_auth_rc" -ne 0 ]; then
+    echo "core-review-protocol-lint-test.sh: obtaining the pinned review-label contract failed with exit $_auth_rc; that is not an outage and is not being skipped" >&2
+    exit "$_auth_rc"
+fi
+# ⚠️ EXPORTING THIS IS THE POINT, not tidiness. Every later adapter process in
+# this checker now reads the authority from disk instead of fetching it again,
+# so a 504 arriving after the check above cannot turn a case into a nonzero
+# exit. Probing alone left exactly that window open; see
+# scripts/authority-available.sh.
+export DEV_HERMIT_PARENT="$_authority_dir"
+trap 'rm -rf "$_authority_dir"' EXIT
+
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly LINT="$SCRIPT_DIR/core-review-protocol-lint.sh"
 readonly CONTRACT_ADAPTER="$SCRIPT_DIR/review_contract_adapter.py"

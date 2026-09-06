@@ -11,6 +11,44 @@ ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 SHELL_CLASSIFIER="$ROOT_DIR/scripts/classify-required-check.sh"
 PYTHON_CLASSIFIER="$ROOT_DIR/scripts/check_outcome_adapter.py"
 
+# ⚠️ THE AUTHORITY MUST BE REACHABLE BEFORE ANY CASE HERE MEANS ANYTHING. If it
+# is not, every case below is unevaluable, so this declares that and exits 0
+# rather than failing. `make lint-checks` then still passes and
+# ci/lint-checks-node.sh classifies the run no_result (exit 75), which the
+# ledger records as no_result rather than fail.
+#
+# ⚠️ EXIT 0 IS REQUIRED HERE, NOT MERELY TIDY. classify_run in
+# ci/lint-checks-node.sh deliberately lets a real failure outrank any marker --
+# "A REAL FAILURE ALWAYS WINS" -- so a nonzero exit could never be reported as
+# no_result no matter what this printed. The marker channel only works on a
+# passing target.
+#
+# Only exit 3 from the probe takes this path; see scripts/authority-available.sh
+# for why 3 cannot be a refusal, a bug, or a tampered authority.
+_auth_rc=0
+_authority_dir=$("$ROOT_DIR/scripts/authority-available.sh") || _auth_rc=$?
+# ⚠️ ONLY EXIT 3 MAY SKIP, AND AN EARLIER VERSION OF THIS GUARD GOT IT WRONG.
+# It treated ANY nonzero from the helper as "unavailable", so a TAMPERED
+# authority -- fetched successfully, wrong bytes, AuthorityIntegrityError, exit
+# 1 -- was laundered into a no-result skip. That is the most dangerous possible
+# reading: the one failure mode the content pin exists to catch, silently
+# reported as "could not evaluate". Measured 2026-09-04: checker exited 0 with a
+# marker against a deliberately corrupted authority.
+if [ "$_auth_rc" -eq 3 ]; then
+    echo "NO-RESULT-CASE: test-check-status-outcome.sh: the pinned check-status authority could not be consulted; no case in this checker was evaluated"
+    exit 0
+elif [ "$_auth_rc" -ne 0 ]; then
+    echo "test-check-status-outcome.sh: obtaining the pinned check-status authority failed with exit $_auth_rc; that is not an outage and is not being skipped" >&2
+    exit "$_auth_rc"
+fi
+# ⚠️ EXPORTING THIS IS THE POINT, not tidiness. Every later adapter process in
+# this checker now reads the authority from disk instead of fetching it again,
+# so a 504 arriving after the check above cannot turn a case into a nonzero
+# exit. Probing alone left exactly that window open; see
+# scripts/authority-available.sh.
+export DEV_HERMIT_PARENT="$_authority_dir"
+trap 'rm -rf "$_authority_dir"' EXIT
+
 check() {
     local expected=$1 status=$2 conclusion=$3 python_result shell_result
     python_result=$("$PYTHON_CLASSIFIER" --status "$status" --conclusion "$conclusion")
