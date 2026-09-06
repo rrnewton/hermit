@@ -14,6 +14,8 @@ use std::io::stderr;
 use tracing::Subscriber;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 const DEFAULT_TRACE_LEVEL: LevelFilter = LevelFilter::WARN;
@@ -148,17 +150,32 @@ impl<W: Write> Write for BoundedWriter<W> {
     }
 }
 
+fn env_filter(level: LevelFilter) -> EnvFilter {
+    EnvFilter::from_default_env()
+        .add_directive("tokio=debug".parse().expect("correct directive"))
+        .add_directive(level.into())
+}
+
+/// Keeps a nonblocking public writer alive when one is installed. A private
+/// evidence layer is synchronous and therefore needs no drain worker or guard.
+pub struct TracingGuard {
+    _worker: Option<tracing_appender::non_blocking::WorkerGuard>,
+}
+
+impl TracingGuard {
+    fn synchronous() -> Self {
+        Self { _worker: None }
+    }
+}
+
 /// Returns a non-blocking subscriber for logging to a file.
 ///
 /// NOTE: Writes to `f` are unbuffered, so this may be slow.
 fn file_subscriber<W: Write + Send + 'static>(
     level: LevelFilter,
     f: W,
-) -> (impl Subscriber, impl Drop) {
-    let filter = EnvFilter::from_default_env()
-        .add_directive("tokio=debug".parse().expect("correct directive"))
-        .add_directive(level.into());
-
+) -> (impl Subscriber, tracing_appender::non_blocking::WorkerGuard) {
+    let filter = env_filter(level);
     let (writer, guard) = tracing_appender::non_blocking(f);
 
     let subscriber = tracing_subscriber::fmt()
@@ -191,27 +208,13 @@ fn file_subscriber<W: Write + Send + 'static>(
 /// COST, measured rather than assumed, on a 477 KB verify log:
 /// synchronous 1.77s versus non-blocking 1.73s -- inside noise, identical
 /// output size. The queue was buying nothing and losing the diagnostic.
-fn sync_file_subscriber<W: Write + Send + 'static>(
-    level: LevelFilter,
-    f: W,
-) -> (impl Subscriber, impl Drop) {
-    let filter = EnvFilter::from_default_env()
-        .add_directive("tokio=debug".parse().expect("correct directive"))
-        .add_directive(level.into());
-
-    let subscriber = tracing_subscriber::fmt()
+fn sync_file_subscriber<W: Write + Send + 'static>(level: LevelFilter, f: W) -> impl Subscriber {
+    let filter = env_filter(level);
+    tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::sync::Mutex::new(f))
         .with_ansi(false)
-        .finish();
-
-    /// No drain to wait for: every write already reached the file.
-    struct Flushed;
-    impl Drop for Flushed {
-        fn drop(&mut self) {}
-    }
-
-    (subscriber, Flushed)
+        .finish()
 }
 
 /// Initializes SYNCHRONOUS tracing to `f`, for logs whose tail must survive a
@@ -219,20 +222,23 @@ fn sync_file_subscriber<W: Write + Send + 'static>(
 pub fn init_sync_file_tracing<W: Write + Send + 'static>(
     level: Option<LevelFilter>,
     f: W,
-) -> impl Drop {
+) -> TracingGuard {
     let level = level.unwrap_or(DEFAULT_TRACE_LEVEL);
-    let (subscriber, guard) = sync_file_subscriber(level, f);
+    let subscriber = sync_file_subscriber(level, f);
     subscriber
         .try_init()
         .expect("global tracing subscriber to install");
-    guard
+    TracingGuard::synchronous()
 }
 
 /// Initializes tracing to the given file `f`.
 ///
 /// NOTE: Writes to `f` are unbuffered, so this may be slow.
 #[must_use = "This function returns a guard that should not be immediately dropped"]
-pub fn init_file_tracing<W: Write + Send + 'static>(level: Option<LevelFilter>, f: W) -> impl Drop {
+pub fn init_file_tracing<W: Write + Send + 'static>(
+    level: Option<LevelFilter>,
+    f: W,
+) -> TracingGuard {
     let level = level.unwrap_or(DEFAULT_TRACE_LEVEL);
 
     let (subscriber, guard) = file_subscriber(level, f);
@@ -241,7 +247,70 @@ pub fn init_file_tracing<W: Write + Send + 'static>(level: Option<LevelFilter>, 
         .try_init()
         .expect("global tracing subscriber to install");
 
-    guard
+    TracingGuard {
+        _worker: Some(guard),
+    }
+}
+
+/// Preserve the public file logger while synchronously duplicating INFO-and-
+/// higher events into a private evidence descriptor. This creates only the
+/// public logger's existing nonblocking worker; the evidence writer is direct.
+pub fn init_file_tracing_with_evidence<P, E>(
+    level: Option<LevelFilter>,
+    public: P,
+    evidence: E,
+) -> TracingGuard
+where
+    P: Write + Send + 'static,
+    E: Write + Send + 'static,
+{
+    let (public_writer, guard) = tracing_appender::non_blocking(public);
+    let public_layer = tracing_subscriber::fmt::layer()
+        .with_writer(public_writer)
+        .with_ansi(false)
+        .with_filter(env_filter(level.unwrap_or(DEFAULT_TRACE_LEVEL)));
+    let evidence_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::sync::Mutex::new(evidence))
+        .with_ansi(false)
+        .with_filter(LevelFilter::INFO);
+    tracing_subscriber::registry()
+        .with(public_layer)
+        .with(evidence_layer)
+        .try_init()
+        .expect("global tracing subscriber to install");
+    TracingGuard {
+        _worker: Some(guard),
+    }
+}
+
+fn equalize_tracing_thread_number() {
+    // Create an extra, pointless thread just so that our thread number starts at the same DetTid
+    // "3" that the `init_file_tracing` option does.
+    std::thread::spawn(|| {}).join().unwrap();
+}
+
+/// Preserve the public stderr logger while synchronously duplicating INFO-and-
+/// higher events into a private evidence descriptor. The only spawned thread
+/// is the same joined PID/TID equalization thread used without evidence.
+pub fn init_stderr_tracing_with_evidence<E>(level: Option<LevelFilter>, evidence: E) -> TracingGuard
+where
+    E: Write + Send + 'static,
+{
+    equalize_tracing_thread_number();
+    let public_layer = tracing_subscriber::fmt::layer()
+        .with_writer(|| detcore::util::RetryingStderr)
+        .with_ansi(stderr().is_terminal())
+        .with_filter(env_filter(level.unwrap_or(DEFAULT_TRACE_LEVEL)));
+    let evidence_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::sync::Mutex::new(evidence))
+        .with_ansi(false)
+        .with_filter(LevelFilter::INFO);
+    tracing_subscriber::registry()
+        .with(public_layer)
+        .with(evidence_layer)
+        .try_init()
+        .expect("global tracing subscriber to install");
+    TracingGuard::synchronous()
 }
 
 /// Returns a tracing subscriber that logs to `stderr`.
@@ -250,9 +319,7 @@ pub fn init_file_tracing<W: Write + Send + 'static>(level: Option<LevelFilter>, 
 pub fn stderr_subscriber(level: Option<LevelFilter>) -> impl Subscriber {
     let level = level.unwrap_or(DEFAULT_TRACE_LEVEL);
 
-    let filter = EnvFilter::from_default_env()
-        .add_directive("tokio=debug".parse().expect("correct directive"))
-        .add_directive(level.into());
+    let filter = env_filter(level);
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         // NOT `io::stderr`: a guest can set O_NONBLOCK on the inherited fd 2,
@@ -269,9 +336,7 @@ pub fn stderr_subscriber(level: Option<LevelFilter>) -> impl Subscriber {
 ///
 /// NOTE: Writes to stderr are unbuffered, so this may be slow.
 pub fn init_stderr_tracing(level: Option<LevelFilter>) {
-    // Create an extra, pointless thread just so that our thread number starts at the same DetTid
-    // "3" that the `init_file_tracing` option does.
-    std::thread::spawn(|| {}).join().unwrap();
+    equalize_tracing_thread_number();
 
     stderr_subscriber(level)
         .try_init()
