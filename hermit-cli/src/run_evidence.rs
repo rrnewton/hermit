@@ -15,6 +15,7 @@ use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -26,6 +27,8 @@ use crate::canonical_verdict::RecordEnvelopeReport;
 pub const RUN_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub const RUN_EVIDENCE_MANIFEST: &str = "manifest.json";
 pub const RUN_EVIDENCE_INFO_ARTIFACT: &str = "canonical-info-v1.log";
+const RUN_EVIDENCE_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
+pub const RUN_EVIDENCE_INFO_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 /// A terminal manifest is readable only after its directory entry is durable.
 /// Mode zero is the producer's unpublished state.
 pub const RUN_EVIDENCE_MANIFEST_MODE: u32 = 0o400;
@@ -133,17 +136,114 @@ pub struct RunEvidenceReport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunEvidenceInspectionFailure {
     MissingManifest,
+    ManifestTooLarge,
     MalformedManifest,
     UnsupportedSchema,
     InvalidManifest,
     ReportedNoResult(RunEvidenceNoResultReason),
     MissingArtifact,
+    ArtifactTooLarge,
     ArtifactSizeMismatch,
     DigestMismatch,
     TruncatedCanonicalInfo,
     MalformedCanonicalInfo,
     ZeroCanonicalInfo,
     MessageCountMismatch,
+}
+
+impl std::fmt::Display for RunEvidenceInspectionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunEvidenceFileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// Digest and exact inode identity of one harness-owned guest stream.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapturedGuestStream {
+    pub bytes: u64,
+    pub sha256: String,
+    pub identity: RunEvidenceFileIdentity,
+}
+
+/// Determinism settings bound by one ordinary-run result.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestRunDeterminism {
+    pub detlog_io_buffers: bool,
+    pub virtualize_time: bool,
+}
+
+/// Typed terminal result for one harness-managed ordinary execution.
+///
+/// The named stdout/stderr files are separate from Hermit's own diagnostic
+/// descriptors. A producer publishes this sidecar only after both held output
+/// descriptors are final and their visible paths still name the same inodes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestRunResult {
+    pub schema_version: u32,
+    pub disposition: GuestDisposition,
+    pub determinism: GuestRunDeterminism,
+    pub stdout: CapturedGuestStream,
+    pub stderr: CapturedGuestStream,
+}
+
+impl GuestRunResult {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn from_current_json_slice(bytes: &[u8]) -> Result<Self, String> {
+        let result: Self = serde_json::from_slice(bytes)
+            .map_err(|error| format!("invalid guest run result: {error}"))?;
+        result.validate_current()?;
+        Ok(result)
+    }
+
+    pub fn validate_current(&self) -> Result<(), String> {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported guest run result schema {}; expected {}",
+                self.schema_version,
+                Self::SCHEMA_VERSION
+            ));
+        }
+        if matches!(
+            self.disposition,
+            GuestDisposition::Signaled { signal, .. } if signal <= 0
+        ) {
+            return Err("guest run result signal must be positive".into());
+        }
+        for (name, stream) in [("stdout", &self.stdout), ("stderr", &self.stderr)] {
+            let valid_sha = stream.sha256.len() == 64
+                && stream
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+            if !valid_sha {
+                return Err(format!(
+                    "guest run result {name} sha256 is not lowercase hex"
+                ));
+            }
+            if stream.identity.inode == 0 {
+                return Err(format!("guest run result {name} inode must be nonzero"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedRunEvidence {
+    pub report: RunEvidenceReport,
+    pub canonical_info: Vec<u8>,
+    pub artifact_identity: RunEvidenceFileIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -223,36 +323,70 @@ fn open_evidence_directory(path: &Path) -> io::Result<File> {
     })
 }
 
+struct RegularChild {
+    bytes: Vec<u8>,
+    identity: RunEvidenceFileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegularChildReadFailure {
+    Unavailable,
+    TooLarge,
+    SizeChanged,
+}
+
 fn read_regular_child(
     directory: &File,
     name: &OsStr,
     required_mode: Option<u32>,
-) -> io::Result<Vec<u8>> {
-    let name = component_cstring(name)?;
+    maximum_bytes: u64,
+) -> Result<RegularChild, RegularChildReadFailure> {
+    let name = component_cstring(name).map_err(|_| RegularChildReadFailure::Unavailable)?;
     let mut file = owned_file(unsafe {
         libc::openat(
             directory.as_raw_fd(),
             name.as_ptr(),
             libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
-    })?;
+    })
+    .map_err(|_| RegularChildReadFailure::Unavailable)?;
     let mut stat = MaybeUninit::<libc::stat>::zeroed();
     if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
+        return Err(RegularChildReadFailure::Unavailable);
     }
     // SAFETY: fstat initialized the complete structure on success.
     let stat = unsafe { stat.assume_init() };
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG
         || required_mode.is_some_and(|mode| stat.st_mode & 0o777 != mode)
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "run-evidence child is not a regular file",
-        ));
+        return Err(RegularChildReadFailure::Unavailable);
+    }
+    let initial_size =
+        u64::try_from(stat.st_size).map_err(|_| RegularChildReadFailure::Unavailable)?;
+    if initial_size > maximum_bytes {
+        return Err(RegularChildReadFailure::TooLarge);
     }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    (&mut file)
+        .take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| RegularChildReadFailure::Unavailable)?;
+    if u64::try_from(bytes.len()).map_err(|_| RegularChildReadFailure::TooLarge)? > maximum_bytes {
+        return Err(RegularChildReadFailure::TooLarge);
+    }
+    let metadata = file
+        .metadata()
+        .map_err(|_| RegularChildReadFailure::Unavailable)?;
+    if metadata.len() != initial_size || metadata.len() != bytes.len() as u64 {
+        return Err(RegularChildReadFailure::SizeChanged);
+    }
+    Ok(RegularChild {
+        bytes,
+        identity: RunEvidenceFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+    })
 }
 
 /// Read and independently validate an ordinary-run sidecar.
@@ -262,39 +396,52 @@ fn read_regular_child(
 /// it re-reads the artifact, verifies its length and SHA-256 digest, and runs
 /// the fixed `BitwiseInfoV1` parser over the exact bytes.
 pub fn inspect_run_evidence(directory: &Path) -> RunEvidenceInspection {
-    let directory = match open_evidence_directory(directory) {
-        Ok(directory) => directory,
-        Err(_) => {
-            return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MissingManifest);
-        }
-    };
-    inspect_run_evidence_directory(&directory)
+    match load_run_evidence(directory) {
+        Ok(evidence) => RunEvidenceInspection::Complete(evidence.report),
+        Err(failure) => RunEvidenceInspection::NoResult(failure),
+    }
 }
 
+#[cfg(test)]
 fn inspect_run_evidence_directory(directory: &File) -> RunEvidenceInspection {
-    let manifest = match read_regular_child(
+    match load_run_evidence_directory(directory) {
+        Ok(evidence) => RunEvidenceInspection::Complete(evidence.report),
+        Err(failure) => RunEvidenceInspection::NoResult(failure),
+    }
+}
+
+/// Load a complete report and the exact canonical bytes through one held
+/// directory descriptor.
+pub fn load_run_evidence(
+    directory: &Path,
+) -> Result<ValidatedRunEvidence, RunEvidenceInspectionFailure> {
+    let directory = open_evidence_directory(directory)
+        .map_err(|_| RunEvidenceInspectionFailure::MissingManifest)?;
+    load_run_evidence_directory(&directory)
+}
+
+fn load_run_evidence_directory(
+    directory: &File,
+) -> Result<ValidatedRunEvidence, RunEvidenceInspectionFailure> {
+    let manifest = read_regular_child(
         directory,
         OsStr::new(RUN_EVIDENCE_MANIFEST),
         Some(RUN_EVIDENCE_MANIFEST_MODE),
-    ) {
-        Ok(manifest) => manifest,
-        Err(_) => {
-            return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MissingManifest);
-        }
-    };
-    let report: RunEvidenceReport = match serde_json::from_slice(&manifest) {
-        Ok(report) => report,
-        Err(_) => {
-            return RunEvidenceInspection::NoResult(
-                RunEvidenceInspectionFailure::MalformedManifest,
-            );
-        }
-    };
+        RUN_EVIDENCE_MANIFEST_MAX_BYTES,
+    )
+    .map_err(|failure| match failure {
+        RegularChildReadFailure::Unavailable => RunEvidenceInspectionFailure::MissingManifest,
+        RegularChildReadFailure::TooLarge => RunEvidenceInspectionFailure::ManifestTooLarge,
+        RegularChildReadFailure::SizeChanged => RunEvidenceInspectionFailure::MalformedManifest,
+    })?
+    .bytes;
+    let report: RunEvidenceReport = serde_json::from_slice(&manifest)
+        .map_err(|_| RunEvidenceInspectionFailure::MalformedManifest)?;
     if report.schema_version != RUN_EVIDENCE_SCHEMA_VERSION {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::UnsupportedSchema);
+        return Err(RunEvidenceInspectionFailure::UnsupportedSchema);
     }
     if !static_manifest_fields_are_valid(&report) {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::InvalidManifest);
+        return Err(RunEvidenceInspectionFailure::InvalidManifest);
     }
     match report.outcome {
         RunEvidenceOutcome::NoResult { reason, .. } => {
@@ -302,64 +449,63 @@ fn inspect_run_evidence_directory(directory: &File) -> RunEvidenceInspection {
                 || report.canonical_info.byte_count != 0
                 || report.canonical_info.sha256.is_some()
             {
-                return RunEvidenceInspection::NoResult(
-                    RunEvidenceInspectionFailure::InvalidManifest,
-                );
+                return Err(RunEvidenceInspectionFailure::InvalidManifest);
             }
-            return RunEvidenceInspection::NoResult(
-                RunEvidenceInspectionFailure::ReportedNoResult(reason),
-            );
+            return Err(RunEvidenceInspectionFailure::ReportedNoResult(reason));
         }
         RunEvidenceOutcome::Complete { .. } => {}
     }
 
     if report.canonical_info.message_count == 0 {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::ZeroCanonicalInfo);
+        return Err(RunEvidenceInspectionFailure::ZeroCanonicalInfo);
     }
     let Some(expected_digest) = report.canonical_info.sha256.as_deref() else {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::InvalidManifest);
+        return Err(RunEvidenceInspectionFailure::InvalidManifest);
     };
-    let artifact = match read_regular_child(directory, OsStr::new(RUN_EVIDENCE_INFO_ARTIFACT), None)
-    {
-        Ok(artifact) => artifact,
-        Err(_) => {
-            return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MissingArtifact);
-        }
-    };
-    if artifact.len() as u64 != report.canonical_info.byte_count {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::ArtifactSizeMismatch);
+    if report.canonical_info.byte_count > RUN_EVIDENCE_INFO_MAX_BYTES {
+        return Err(RunEvidenceInspectionFailure::ArtifactTooLarge);
     }
-    if detcore::Digest::new(&artifact).to_string() != expected_digest {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::DigestMismatch);
+    let artifact = read_regular_child(
+        directory,
+        OsStr::new(RUN_EVIDENCE_INFO_ARTIFACT),
+        None,
+        RUN_EVIDENCE_INFO_MAX_BYTES,
+    )
+    .map_err(|failure| match failure {
+        RegularChildReadFailure::Unavailable => RunEvidenceInspectionFailure::MissingArtifact,
+        RegularChildReadFailure::TooLarge => RunEvidenceInspectionFailure::ArtifactTooLarge,
+        RegularChildReadFailure::SizeChanged => RunEvidenceInspectionFailure::ArtifactSizeMismatch,
+    })?;
+    if artifact.bytes.len() as u64 != report.canonical_info.byte_count {
+        return Err(RunEvidenceInspectionFailure::ArtifactSizeMismatch);
     }
-    if std::str::from_utf8(&artifact)
+    if detcore::Digest::new(&artifact.bytes).to_string() != expected_digest {
+        return Err(RunEvidenceInspectionFailure::DigestMismatch);
+    }
+    if std::str::from_utf8(&artifact.bytes)
         .ok()
         .is_some_and(detcore::logdiff::log_was_truncated)
     {
-        return RunEvidenceInspection::NoResult(
-            RunEvidenceInspectionFailure::TruncatedCanonicalInfo,
-        );
+        return Err(RunEvidenceInspectionFailure::TruncatedCanonicalInfo);
     }
     let mut canonical = Vec::new();
-    let count = match detcore::logdiff::write_bitwise_info_v1_bytes(
-        &artifact,
+    let count = detcore::logdiff::write_bitwise_info_v1_bytes(
+        &artifact.bytes,
         RUN_EVIDENCE_INFO_ARTIFACT,
         &mut canonical,
-    ) {
-        Ok(count) => count as u64,
-        Err(_) => {
-            return RunEvidenceInspection::NoResult(
-                RunEvidenceInspectionFailure::MalformedCanonicalInfo,
-            );
-        }
-    };
+    )
+    .map_err(|_| RunEvidenceInspectionFailure::MalformedCanonicalInfo)? as u64;
     if count == 0 {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::ZeroCanonicalInfo);
+        return Err(RunEvidenceInspectionFailure::ZeroCanonicalInfo);
     }
     if count != report.canonical_info.message_count {
-        return RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::MessageCountMismatch);
+        return Err(RunEvidenceInspectionFailure::MessageCountMismatch);
     }
-    RunEvidenceInspection::Complete(report)
+    Ok(ValidatedRunEvidence {
+        report,
+        canonical_info: artifact.bytes,
+        artifact_identity: artifact.identity,
+    })
 }
 
 #[cfg(test)]
@@ -473,6 +619,41 @@ Apr 09 06:08:02.100  INFO hermit_test: second evidence record\n"
         assert_eq!(
             inspect_run_evidence(mismatch.path()),
             RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::DigestMismatch)
+        );
+    }
+
+    #[test]
+    fn oversized_manifest_and_artifact_are_no_result_without_reading_their_bodies() {
+        let oversized_manifest = tempfile::tempdir().unwrap();
+        let manifest = oversized_manifest.path().join(RUN_EVIDENCE_MANIFEST);
+        let file = fs::File::create(&manifest).unwrap();
+        file.set_len(RUN_EVIDENCE_MANIFEST_MAX_BYTES + 1).unwrap();
+        let mut permissions = fs::metadata(&manifest).unwrap().permissions();
+        permissions.set_mode(RUN_EVIDENCE_MANIFEST_MODE);
+        fs::set_permissions(&manifest, permissions).unwrap();
+        assert_eq!(
+            inspect_run_evidence(oversized_manifest.path()),
+            RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::ManifestTooLarge)
+        );
+
+        let oversized_artifact = tempfile::tempdir().unwrap();
+        let log = valid_log();
+        write_complete_fixture(
+            oversized_artifact.path(),
+            &log,
+            detcore::Digest::new(&log).to_string(),
+            2,
+        );
+        let artifact = oversized_artifact.path().join(RUN_EVIDENCE_INFO_ARTIFACT);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&artifact)
+            .unwrap()
+            .set_len(RUN_EVIDENCE_INFO_MAX_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            inspect_run_evidence(oversized_artifact.path()),
+            RunEvidenceInspection::NoResult(RunEvidenceInspectionFailure::ArtifactTooLarge)
         );
     }
     #[test]

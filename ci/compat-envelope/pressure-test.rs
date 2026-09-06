@@ -6,9 +6,11 @@
 //! chrono = "0.4"
 //! csv = "1"
 //! dagrun = { path = "../../agent-utils/rs/dagrun" }
+//! flate2 = "1"
 //! hermit-manifest-plan = { path = "../manifest-plan" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
+//! sha2 = "0.10"
 //! ```
 
 #[path = "../../scripts/lib/rust_script_prelude.rs"]
@@ -21,16 +23,18 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
-use std::io::Write as _;
 use std::process::Command;
-use std::process::Stdio;
 use std::process::ExitCode;
+use std::process::Stdio;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use dagrun::cgroup::aggregate_slice_max_cpus;
+use dagrun::container_core_budget;
 use dagrun::io::dag_from_json;
 use dagrun::io::dag_to_json;
 use dagrun::model::CmdType;
@@ -43,28 +47,35 @@ use dagrun::model::StepClass;
 use dagrun::model::StepOutcome;
 use dagrun::model::effective_cpu_count;
 use dagrun::model::effective_cpu_timeout;
-use dagrun::cgroup::aggregate_slice_max_cpus;
-use dagrun::container_core_budget;
 use dagrun::scheduler::BoxedCgroups;
 use dagrun::scheduler::run_dag_boxed_deadline;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use hermit_manifest_plan::canonical_verdict::RuntimeStats;
+use hermit_manifest_plan::canonical_verdict::Verdict;
 use hermit_manifest_plan::canonical_verdict::VerificationReport;
 use hermit_manifest_plan::canonical_verdict::VerificationRuntime;
-use hermit_manifest_plan::canonical_verdict::Verdict;
 use hermit_manifest_plan::host_capability::CapabilityVerdict;
 use hermit_manifest_plan::host_capability::HostCapability;
 use hermit_manifest_plan::runner::AttemptResult;
 use hermit_manifest_plan::runner::CELL_RESULT_SCHEMA;
+use hermit_manifest_plan::runner::CellId as RunnerCellId;
 use hermit_manifest_plan::runner::CellResult;
-use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
-use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::E2E_RUN_INDEX_ENV;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::ObservedResult;
+use hermit_manifest_plan::runner::RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA;
+use hermit_manifest_plan::runner::RetainedVerifyLog;
+use hermit_manifest_plan::runner::RetainedVerifyLogRole;
+use hermit_manifest_plan::runner::cell_result_after_retries;
+use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
+use hermit_manifest_plan::runner::verify_retained_verify_log;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
 
 const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
 const PORTABLE_DAG: &str = "ci/dag/portable.json";
@@ -915,8 +926,8 @@ struct ManifestBudgetRow {
 }
 
 fn read_result_rows(path: &Path) -> Result<Vec<CellResult>, String> {
-    let text = fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let text =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let mut rows: Vec<CellResult> = Vec::new();
     let mut attempts = BTreeSet::new();
     let mut artifact_dirs = BTreeSet::new();
@@ -974,12 +985,34 @@ fn read_result_rows(path: &Path) -> Result<Vec<CellResult>, String> {
                 row.attempt
             ));
         }
-        if row.schema != CELL_RESULT_SCHEMA {
+        if !matches!(
+            row.schema,
+            CELL_RESULT_SCHEMA | RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA
+        ) {
             return Err(format!(
                 "{}:{} has unsupported cell-result schema {}",
                 path.display(),
                 index + 1,
                 row.schema
+            ));
+        }
+        if row.schema == RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA
+            && row
+                .validate_retained_verify_log_binding()
+                .map_err(|error| {
+                    format!(
+                        "invalid {}:{} retained verification evidence: {error}",
+                        path.display(),
+                        index + 1
+                    )
+                })?
+                .is_none()
+        {
+            return Err(format!(
+                "{}:{} schema-{} result has no retained-log descriptor",
+                path.display(),
+                index + 1,
+                RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA
             ));
         }
         if let Some(first) = rows.first() {
@@ -1143,7 +1176,9 @@ fn execute_typed_dag(
         // starts if the CPU budget is narrower than such a step's declared width, and
         // the budget defaults to `jobs`, so it must be passed explicitly here for the
         // same reason as in scripts/validate.rs::scheduler_cpu_budget.
-        let cpu_budget = container_core_budget().min(aggregate_slice_max_cpus()).max(1);
+        let cpu_budget = container_core_budget()
+            .min(aggregate_slice_max_cpus())
+            .max(1);
         let result: RunResult = run_dag_boxed_deadline(
             &pass,
             jobs,
@@ -1822,11 +1857,19 @@ fn series_run_index(dir_name: &str) -> u64 {
 /// coordinates, source depth, ancestry and compression have one implementation.
 /// The writer refuses the batch whole if any result cannot be represented.
 fn collect_series_result_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = fs::read_dir(path)
-        .map_err(|e| format!("cannot read pressure result directory {}: {e}", path.display()))?;
+    let entries = fs::read_dir(path).map_err(|e| {
+        format!(
+            "cannot read pressure result directory {}: {e}",
+            path.display()
+        )
+    })?;
     for entry in entries {
-        let entry = entry
-            .map_err(|e| format!("cannot read pressure result entry under {}: {e}", path.display()))?;
+        let entry = entry.map_err(|e| {
+            format!(
+                "cannot read pressure result entry under {}: {e}",
+                path.display()
+            )
+        })?;
         let file_type = entry
             .file_type()
             .map_err(|e| format!("cannot classify {}: {e}", entry.path().display()))?;
@@ -1872,10 +1915,7 @@ fn collect_series_rows(results: &Path) -> Result<Vec<(String, CellResult)>, Stri
             collected.push((key, row));
         }
     }
-    collected.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.attempt.cmp(&b.1.attempt))
-    });
+    collected.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.attempt.cmp(&b.1.attempt)));
     Ok(collected)
 }
 
@@ -2811,11 +2851,8 @@ fn write_plan_after_scorecard_check(
             })?;
         for repetition in repetition_numbers(selection.repetitions) {
             let slug = cell_run_slug(cell, repetition);
-            let evidence_run_id = cell_evidence_run_id(
-                cell,
-                repetition,
-                selection.run_id_prefix.as_deref(),
-            );
+            let evidence_run_id =
+                cell_evidence_run_id(cell, repetition, selection.run_id_prefix.as_deref());
             let tag = format!("cell.{slug}");
             let cell_dir = results.join("cells").join(&slug);
             let result_file = cell_dir.join("results.jsonl");
@@ -3031,8 +3068,7 @@ fn write_plan_after_scorecard_check(
 
     let max_timeout = steps.iter().map(|step| step.timeout).max().unwrap_or(120);
     let mut dag = canonical;
-    dag.resource_caps =
-        BTreeMap::from([("cargo_writer".into(), 1), ("manifest_guest".into(), 4)]);
+    dag.resource_caps = BTreeMap::from([("cargo_writer".into(), 1), ("manifest_guest".into(), 4)]);
     dag.default_step_timeout = max_timeout;
     dag.default_step_cpu_timeout = max_timeout * 2;
     dag.steps = steps;
@@ -3547,9 +3583,7 @@ fn is_proven_oom_attempt(runner: RunnerEvidence, harness_status: Option<i32>) ->
         && !runner.ok
         && runner.oom
         && !runner.timed_out
-        && harness_status.is_some_and(|status| {
-            !matches!(status, 0 | PREPARATION_FAILED_STATUS)
-        })
+        && harness_status.is_some_and(|status| !matches!(status, 0 | PREPARATION_FAILED_STATUS))
 }
 
 fn runner_observed_terminal_attempt(runner: RunnerEvidence, harness_status: Option<i32>) -> bool {
@@ -3560,8 +3594,7 @@ fn runner_observed_terminal_attempt(runner: RunnerEvidence, harness_status: Opti
             !matches!(
                 status,
                 INCOMPLETE_ATTEMPT_STATUS | PREPARATION_FAILED_STATUS
-            )
-                && runner.ok == (status == 0)
+            ) && runner.ok == (status == 0)
         })
 }
 
@@ -3608,8 +3641,10 @@ fn result_row_identity_and_invocation_match(
             None
         }
     });
-    let identity_matches = row.schema == CELL_RESULT_SCHEMA
-        && row.run_id == slug
+    let identity_matches = matches!(
+        row.schema,
+        CELL_RESULT_SCHEMA | RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA
+    ) && row.run_id == slug
         && row.hermit_sha == metadata.hermit_sha
         && row.source_tree_dirty == metadata.source_tree_dirty
         && row.test == cell.test
@@ -3847,9 +3882,7 @@ fn repeated_run_has_unacceptable_product_result(
     retried: usize,
     total: usize,
 ) -> bool {
-    repetitions.is_some()
-        && !repeated_red
-        && (total == 0 || clean_passes != total || retried > 0)
+    repetitions.is_some() && !repeated_red && (total == 0 || clean_passes != total || retried > 0)
 }
 
 fn repeated_cell_summary(
@@ -3899,9 +3932,7 @@ fn verify_repetition_summary_json(
     for cell in repeated_cells {
         let terminal_passes = cell.get("passes").and_then(JsonValue::as_u64);
         let clean_passes = cell.get("clean_passes").and_then(JsonValue::as_u64);
-        let retried = cell
-            .get("retried_repetitions")
-            .and_then(JsonValue::as_u64);
+        let retried = cell.get("retried_repetitions").and_then(JsonValue::as_u64);
         let total = cell.get("total").and_then(JsonValue::as_u64);
         if terminal_passes.is_none()
             || clean_passes.is_none()
@@ -3993,7 +4024,7 @@ fn verification_report_path(artifact_dir: &Path) -> PathBuf {
     artifact_dir.join("verify-1.json")
 }
 
-fn retained_verification_logs(
+fn legacy_retained_verification_logs(
     cell: &CellId,
     artifact_dir: &Path,
 ) -> Result<Vec<String>, String> {
@@ -4065,7 +4096,7 @@ fn retained_verification_logs(
     Ok(run1.into_iter().chain(run2).collect())
 }
 
-fn normalized_ptrace_golden(
+fn legacy_normalized_ptrace_golden(
     cell: &CellId,
     artifact_dir: &Path,
 ) -> Result<Option<String>, String> {
@@ -4119,6 +4150,153 @@ fn normalized_ptrace_golden(
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
+#[derive(Clone, Debug)]
+struct RetainedVerificationEvidence {
+    paths: Vec<String>,
+    normalized_ptrace_golden: Option<String>,
+    descriptor: Option<RetainedVerifyLog>,
+    complete: bool,
+}
+
+impl RetainedVerificationEvidence {
+    fn absent() -> Self {
+        Self {
+            paths: Vec::new(),
+            normalized_ptrace_golden: None,
+            descriptor: None,
+            complete: false,
+        }
+    }
+}
+
+fn harness_managed_verify_backend(backend: &str) -> bool {
+    matches!(backend, "ptrace" | "kvm" | "liteinst")
+}
+
+fn retained_verification_evidence(
+    cell: &CellId,
+    artifact_dir: &Path,
+    row: &CellResult,
+) -> Result<RetainedVerificationEvidence, String> {
+    if cell.mode != "verify" {
+        if row.schema == RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA {
+            return Err("a non-verify result uses the retained verify-log schema".into());
+        }
+        return Ok(RetainedVerificationEvidence::absent());
+    }
+
+    if harness_managed_verify_backend(&cell.backend) {
+        if row.schema != RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA {
+            return Err(format!(
+                "current {} verify result requires schema {} retained-log evidence, got schema {}",
+                cell.backend, RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA, row.schema
+            ));
+        }
+        let descriptor = row
+            .validate_retained_verify_log_binding()
+            .map_err(|error| {
+                format!(
+                    "invalid current {} retained-log binding: {error}",
+                    cell.backend
+                )
+            })?
+            .ok_or_else(|| {
+                "a current harness-managed verify result must carry exactly one retained-log descriptor"
+                    .to_string()
+            })?;
+        let expected_cell = RunnerCellId {
+            test: cell.test.clone(),
+            mode: cell.mode.clone(),
+            backend: Some(cell.backend.clone()),
+        };
+        verify_retained_verify_log(artifact_dir, descriptor, &expected_cell, row.attempt)?;
+        let path = artifact_dir.join(&descriptor.relative_path);
+        let path = path.to_string_lossy().into_owned();
+        return Ok(RetainedVerificationEvidence {
+            paths: vec![path.clone()],
+            normalized_ptrace_golden: (cell.backend == "ptrace").then_some(path),
+            descriptor: Some(descriptor.clone()),
+            complete: true,
+        });
+    }
+
+    if row.schema == RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA {
+        return Err(format!(
+            "{} verify unexpectedly uses the harness-managed retained-log schema",
+            cell.backend
+        ));
+    }
+    let paths = legacy_retained_verification_logs(cell, artifact_dir)?;
+    let normalized_ptrace_golden = legacy_normalized_ptrace_golden(cell, artifact_dir)?;
+    let complete =
+        paths.len() == 2 && (cell.backend != "ptrace" || normalized_ptrace_golden.is_some());
+    Ok(RetainedVerificationEvidence {
+        paths,
+        normalized_ptrace_golden,
+        descriptor: None,
+        complete,
+    })
+}
+
+fn validate_verification_report(report: JsonValue, source: &str) -> Result<JsonValue, String> {
+    let canonical = VerificationReport::from_current_json_value(report.clone())
+        .map_err(|e| format!("incomplete canonical verification report {source}: {e}"))?;
+    match (canonical.verdict, canonical.verified) {
+        (Verdict::Matched, true)
+        | (Verdict::Diverged | Verdict::NoResult | Verdict::InfrastructureError, false) => {}
+        (verdict, verified) => {
+            return Err(format!(
+                "inconsistent verification report {source}: verdict={verdict} verified={verified}"
+            ));
+        }
+    }
+    if !matches!(
+        canonical.verdict,
+        Verdict::NoResult | Verdict::InfrastructureError
+    ) && canonical.comparison.is_none()
+    {
+        return Err(format!(
+            "terminal verification report {source} has no comparison object"
+        ));
+    }
+    if canonical.bitwise_parity && canonical.verdict != Verdict::Matched {
+        return Err(format!(
+            "verification report {source} claims bitwise parity without a match"
+        ));
+    }
+    if canonical.verdict != Verdict::InfrastructureError || canonical.comparison.is_some() {
+        canonical.require_canonical_comparison().map_err(|error| {
+            format!("verification report {source} cannot support a product verdict: {error}")
+        })?;
+    }
+    if canonical.verdict == Verdict::Matched {
+        canonical.require_canonical_match().map_err(|error| {
+            format!("verification report {source} cannot support a green result: {error}")
+        })?;
+    }
+    if canonical.verdict == Verdict::InfrastructureError && canonical.infrastructure_error.is_none()
+    {
+        return Err(format!(
+            "verification report {source} names infrastructure_error without its cause"
+        ));
+    }
+    if !matches!(
+        canonical.verdict,
+        Verdict::Diverged | Verdict::InfrastructureError
+    ) && (canonical.first_divergent_scheduler_turn.is_some()
+        || canonical.first_divergent_virtual_nanoseconds.is_some()
+        || canonical.first_divergent_record.is_some()
+        || canonical.first_divergent_syscall.is_some()
+        || canonical.first_divergent_left_message.is_some()
+        || canonical.first_divergent_right_message.is_some())
+    {
+        return Err(format!(
+            "verification report {source} records divergence evidence without a divergent verdict"
+        ));
+    }
+    Ok(report)
+}
+
 fn read_verification_report(
     cell: &CellId,
     artifact_dir: &Path,
@@ -4134,75 +4312,46 @@ fn read_verification_report(
         .map_err(|e| format!("cannot read verification report {}: {e}", path.display()))?;
     let report: JsonValue = serde_json::from_str(&text)
         .map_err(|e| format!("invalid verification report {}: {e}", path.display()))?;
-    let canonical = VerificationReport::from_current_json_value(report.clone())
-        .map_err(|e| format!("incomplete canonical verification report {}: {e}", path.display()))?;
-    match (canonical.verdict, canonical.verified) {
-        (Verdict::Matched, true)
-        | (Verdict::Diverged | Verdict::NoResult | Verdict::InfrastructureError, false) => {}
-        (verdict, verified) => {
+    Ok(Some(validate_verification_report(
+        report,
+        &path.display().to_string(),
+    )?))
+}
+
+fn read_result_verification_report(
+    cell: &CellId,
+    artifact_dir: &Path,
+    row: &CellResult,
+) -> Result<Option<JsonValue>, String> {
+    if cell.mode == "verify" && harness_managed_verify_backend(&cell.backend) {
+        if row.schema != RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA {
             return Err(format!(
-                "inconsistent verification report {}: verdict={verdict} verified={verified}",
-                path.display()
+                "current {} verify result requires schema {} embedded verification evidence, got schema {}",
+                cell.backend, RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA, row.schema
             ));
         }
+        let source = format!(
+            "schema-{} embedded report for {} attempt {}",
+            row.schema,
+            display_id(cell),
+            row.attempt
+        );
+        row.validate_retained_verify_log_binding()
+            .map_err(|error| format!("invalid {source}: {error}"))?
+            .ok_or_else(|| format!("{source} has no retained-log descriptor"))?;
+        let attempt = row
+            .attempts
+            .first()
+            .ok_or_else(|| format!("{source} has no attempt"))?;
+        let text = attempt
+            .verification_report
+            .as_deref()
+            .ok_or_else(|| format!("{source} is missing"))?;
+        let report: JsonValue =
+            serde_json::from_str(text).map_err(|error| format!("invalid {source}: {error}"))?;
+        return Ok(Some(validate_verification_report(report, &source)?));
     }
-    if !matches!(
-        canonical.verdict,
-        Verdict::NoResult | Verdict::InfrastructureError
-    ) && canonical.comparison.is_none()
-    {
-        return Err(format!(
-            "terminal verification report {} has no comparison object",
-            path.display()
-        ));
-    }
-    if canonical.bitwise_parity && canonical.verdict != Verdict::Matched {
-        return Err(format!(
-            "verification report {} claims bitwise parity without a match",
-            path.display()
-        ));
-    }
-    if canonical.verdict != Verdict::InfrastructureError || canonical.comparison.is_some() {
-        canonical.require_canonical_comparison().map_err(|error| {
-            format!(
-                "verification report {} cannot support a product verdict: {error}",
-                path.display()
-            )
-        })?;
-    }
-    if canonical.verdict == Verdict::Matched {
-        canonical.require_canonical_match().map_err(|error| {
-            format!(
-                "verification report {} cannot support a green result: {error}",
-                path.display()
-            )
-        })?;
-    }
-    if canonical.verdict == Verdict::InfrastructureError
-        && canonical.infrastructure_error.is_none()
-    {
-        return Err(format!(
-            "verification report {} names infrastructure_error without its cause",
-            path.display()
-        ));
-    }
-    if !matches!(
-        canonical.verdict,
-        Verdict::Diverged | Verdict::InfrastructureError
-    )
-        && (canonical.first_divergent_scheduler_turn.is_some()
-            || canonical.first_divergent_virtual_nanoseconds.is_some()
-            || canonical.first_divergent_record.is_some()
-            || canonical.first_divergent_syscall.is_some()
-            || canonical.first_divergent_left_message.is_some()
-            || canonical.first_divergent_right_message.is_some())
-    {
-        return Err(format!(
-            "verification report {} records divergence evidence without a divergent verdict",
-            path.display()
-        ));
-    }
-    Ok(Some(report))
+    read_verification_report(cell, artifact_dir)
 }
 
 fn summarize(
@@ -4392,19 +4541,17 @@ fn summarize(
                                     && (proven_oom || runner_completed) =>
                             {
                                 match result_row_invocation(row) {
-                                    Ok(invocation) => {
-                                        (
-                                            row.outcome.clone(),
-                                            true,
-                                            row.reason.clone(),
-                                            row.error_kind.clone(),
-                                            row.result,
-                                            row.failure_class,
-                                            row.attempt,
-                                            Some(invocation),
-                                            Some(result_artifact_dir(results, row)?),
-                                        )
-                                    }
+                                    Ok(invocation) => (
+                                        row.outcome.clone(),
+                                        true,
+                                        row.reason.clone(),
+                                        row.error_kind.clone(),
+                                        row.result,
+                                        row.failure_class,
+                                        row.attempt,
+                                        Some(invocation),
+                                        Some(result_artifact_dir(results, row)?),
+                                    ),
                                     Err(error) => {
                                         evidence_errors.push(format!(
                                             "{} does not carry complete literal attempt invocations: {error}",
@@ -4498,65 +4645,63 @@ fn summarize(
                     None,
                 )
             };
-            let verification = match artifact_dir.as_deref() {
-                Some(artifact_dir) => match read_verification_report(cell, artifact_dir) {
-                    Ok(Some(report)) => Some(report),
-                    Ok(None)
-                        if matches!(cell.mode.as_str(), "verify" | "replay")
-                            && !proven_oom
-                            && !proven_timeout =>
-                    {
-                        evidence_errors.push(format!(
-                            "missing verification report {}",
-                            verification_report_path(artifact_dir).display()
-                        ));
-                        None
+            let selected_result_row = if row_valid {
+                Some(cell_result_after_retries(&result_rows_for_history)?)
+            } else {
+                None
+            };
+            let verification = match (artifact_dir.as_deref(), selected_result_row) {
+                (Some(artifact_dir), Some(selected)) => {
+                    match read_result_verification_report(cell, artifact_dir, selected) {
+                        Ok(Some(report)) => Some(report),
+                        Ok(None)
+                            if matches!(cell.mode.as_str(), "verify" | "replay")
+                                && !proven_oom
+                                && !proven_timeout =>
+                        {
+                            evidence_errors.push(format!(
+                                "missing verification report for {} attempt {}",
+                                display_id(cell),
+                                selected.attempt
+                            ));
+                            None
+                        }
+                        Ok(None) => None,
+                        Err(error) => {
+                            evidence_errors.push(error);
+                            None
+                        }
                     }
-                    Ok(None) => None,
-                    Err(error) => {
-                        evidence_errors.push(error);
-                        None
-                    }
-                },
-                None => None,
+                }
+                _ => None,
             };
             let verification_verdict = verification
                 .as_ref()
                 .and_then(|report| report.get("verdict"))
                 .and_then(JsonValue::as_str);
-            let verification_logs = match artifact_dir.as_deref() {
-                Some(artifact_dir) => match retained_verification_logs(cell, artifact_dir) {
-                    Ok(logs) => logs,
-                    Err(error) => {
-                        evidence_errors.push(error);
-                        Vec::new()
+            let verification_log_evidence = match (artifact_dir.as_deref(), selected_result_row) {
+                (Some(artifact_dir), Some(selected)) => {
+                    match retained_verification_evidence(cell, artifact_dir, selected) {
+                        Ok(evidence) => evidence,
+                        Err(error) => {
+                            evidence_errors.push(error);
+                            RetainedVerificationEvidence::absent()
+                        }
                     }
-                },
-                None => Vec::new(),
-            };
-            let normalized_ptrace_golden = match artifact_dir.as_deref() {
-                Some(artifact_dir) => match normalized_ptrace_golden(cell, artifact_dir) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        evidence_errors.push(error);
-                        None
-                    }
-                },
-                None => None,
+                }
+                _ => RetainedVerificationEvidence::absent(),
             };
             if cell.mode == "verify"
                 && matches!(verification_verdict, Some("matched" | "diverged"))
-                && verification_logs.len() != 2
+                && !verification_log_evidence.complete
             {
-                evidence_errors.push(
-                "terminal verify result must retain exactly one nonempty run1 log and one nonempty run2 log"
-                    .into(),
-            );
+                evidence_errors
+                    .push("terminal verify result has no complete retained-log evidence".into());
             }
             if cell.mode == "verify"
                 && cell.backend == "ptrace"
                 && matches!(verification_verdict, Some("matched" | "diverged"))
-                && normalized_ptrace_golden.is_none()
+                && verification_log_evidence.normalized_ptrace_golden.is_none()
                 && !evidence_errors
                     .iter()
                     .any(|error| error.contains("golden-log normalization"))
@@ -4575,7 +4720,7 @@ fn summarize(
                 reason.as_deref(),
                 &cell.mode,
                 verification_verdict,
-                verification_logs.len() == 2,
+                verification_log_evidence.complete,
                 evidence_errors.is_empty(),
             );
             // Current rows take their functional result from the framework.
@@ -4657,10 +4802,9 @@ fn summarize(
             // writer and the scorecard enforces that boundary.
             if row_valid {
                 if let Some(terminal) = result_rows_for_history.last() {
-                    for earlier_row in earlier_attempts_that_located(
-                        &result_rows_for_history,
-                        terminal.attempt,
-                    ) {
+                    for earlier_row in
+                        earlier_attempts_that_located(&result_rows_for_history, terminal.attempt)
+                    {
                         if earlier_row.attempt == attempt {
                             continue;
                         }
@@ -4677,21 +4821,28 @@ fn summarize(
                         }
                         let earlier_invocation = result_row_invocation(earlier_row)?;
                         let earlier_artifact_dir = result_artifact_dir(results, earlier_row)?;
-                        let earlier_verification = read_verification_report(
+                        let earlier_verification = read_result_verification_report(
                             cell,
                             &earlier_artifact_dir,
+                            earlier_row,
                         )?
                         .ok_or_else(|| {
                             format!(
-                                "earlier attempt {} located a divergence but has no verification report at {}",
-                                earlier_row.attempt,
-                                verification_report_path(&earlier_artifact_dir).display()
+                                "earlier attempt {} located a divergence but has no verification report",
+                                earlier_row.attempt
                             )
                         })?;
-                        let earlier_verification_logs =
-                            retained_verification_logs(cell, &earlier_artifact_dir)?;
-                        let earlier_normalized_ptrace_golden =
-                            crate::normalized_ptrace_golden(cell, &earlier_artifact_dir)?;
+                        let earlier_log_evidence = retained_verification_evidence(
+                            cell,
+                            &earlier_artifact_dir,
+                            earlier_row,
+                        )?;
+                        if !earlier_log_evidence.complete {
+                            return Err(format!(
+                                "earlier attempt {} has no complete retained-log evidence",
+                                earlier_row.attempt
+                            ));
+                        }
                         let expected_result = match cell.mode.as_str() {
                             "verify" => ObservedResult::DeterminismFailure,
                             "replay" => ObservedResult::ReplayFailure,
@@ -4727,8 +4878,9 @@ fn summarize(
                             "result_row_valid": true,
                             "result": earlier_result.as_str(),
                             "verification": earlier_verification,
-                            "verification_logs": earlier_verification_logs,
-                            "normalized_ptrace_golden": earlier_normalized_ptrace_golden,
+                            "verification_logs": earlier_log_evidence.paths,
+                            "normalized_ptrace_golden": earlier_log_evidence.normalized_ptrace_golden,
+                            "retained_verify_log": earlier_log_evidence.descriptor,
                             "evidence_errors": Vec::<String>::new(),
                             "runner_seen": runner.seen,
                             "runner_ok": runner.ok,
@@ -4754,8 +4906,9 @@ fn summarize(
                 "result_row_valid": row_valid,
                 "result": result,
                 "verification": verification,
-                "verification_logs": verification_logs,
-                "normalized_ptrace_golden": normalized_ptrace_golden,
+                "verification_logs": verification_log_evidence.paths,
+                "normalized_ptrace_golden": verification_log_evidence.normalized_ptrace_golden,
+                "retained_verify_log": verification_log_evidence.descriptor,
                 "evidence_errors": evidence_errors,
                 "runner_seen": runner.seen,
                 "runner_ok": runner.ok,
@@ -4773,7 +4926,7 @@ fn summarize(
     );
     println!();
     println!(
-        "Metric: current pre-basic-sanity manifest contract. Verify uses the legacy stripped comparison unless that cell's verification report says bitwise_parity=true; this is not the Milestone 2 strict-default metric."
+        "Metric: current pre-basic-sanity manifest contract. Harness-managed verify uses BitwiseInfoV1; historical schema-4 rows retain their recorded comparison policy."
     );
     println!();
     if metadata.source_tree_dirty {
@@ -5015,11 +5168,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn literal_shell_command(
-    cwd: &str,
-    env: &BTreeMap<String, String>,
-    argv: &[String],
-) -> String {
+fn literal_shell_command(cwd: &str, env: &BTreeMap<String, String>, argv: &[String]) -> String {
     let mut words = vec![
         "cd".into(),
         recorded_shell_quote(cwd),
@@ -5137,16 +5286,9 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
     // fixture's current 50 ms commands.
     let declared_critical_path_seconds = CONTROL_STEP_TIMEOUT_SECONDS * 2
         + CELL_WALL_TIMEOUT_SECONDS * i64::try_from(cell_waves).unwrap();
-    let run_timeout_seconds =
-        declared_critical_path_seconds + CONTROL_STEP_TIMEOUT_SECONDS;
+    let run_timeout_seconds = declared_critical_path_seconds + CONTROL_STEP_TIMEOUT_SECONDS;
     let execution = with_execution_root(scratch, || {
-        execute_typed_dag(
-            &dag,
-            jobs,
-            None,
-            Instant::now(),
-            run_timeout_seconds,
-        )
+        execute_typed_dag(&dag, jobs, None, Instant::now(), run_timeout_seconds)
     })?;
     let cell_outcomes: Vec<_> = execution
         .outcomes
@@ -5280,6 +5422,7 @@ fn fixture_attempt(outcome: &str, status: i32) -> AttemptResult {
         stderr: String::new(),
         verification_report: None,
         verification_report_sha256: None,
+        retained_verify_log: None,
         runtime: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
@@ -5305,7 +5448,9 @@ fn self_test(root: &Path) -> Result<(), String> {
     if series_run_index("a-cell-repetition-0004") != 4
         || series_run_index("a-cell-with-no-suffix") != 0
     {
-        return Err("pressure repetition ordinals no longer match retained result directories".into());
+        return Err(
+            "pressure repetition ordinals no longer match retained result directories".into(),
+        );
     }
     // A divergence located by an earlier attempt remains an observation even
     // when the terminal retry passes. An attempt that located nothing does not
@@ -5402,18 +5547,10 @@ fn self_test(root: &Path) -> Result<(), String> {
     )?;
     if backend_specific.len() != 2
         || backend_specific
-            .get(&(
-                "fixture/test".into(),
-                "verify".into(),
-                "ptrace".into(),
-            ))
+            .get(&("fixture/test".into(), "verify".into(), "ptrace".into()))
             .is_none_or(|budget| budget.timeout_seconds != 30)
         || backend_specific
-            .get(&(
-                "fixture/test".into(),
-                "verify".into(),
-                "liteinst".into(),
-            ))
+            .get(&("fixture/test".into(), "verify".into(), "liteinst".into()))
             .is_none_or(|budget| budget.timeout_seconds != 15)
     {
         return Err("backend-specific cell timeouts were collapsed together".into());
@@ -5547,7 +5684,9 @@ fn self_test(root: &Path) -> Result<(), String> {
     validate_repetition_selection(&exact_green_repetitions)
         .map_err(|e| format!("explicit exact green repetition was refused: {e}"))?;
     if CellSelection::default().scheduler_jobs() != default_jobs() {
-        return Err("pressure scheduler default diverged from the host-adaptive validate policy".into());
+        return Err(
+            "pressure scheduler default diverged from the host-adaptive validate policy".into(),
+        );
     }
     let mut jobs_args = vec![
         "--results".to_string(),
@@ -5641,9 +5780,15 @@ fn self_test(root: &Path) -> Result<(), String> {
         || selected_cell_dependencies(true, false, "naked", "native", None)
             != ["setup.manifest_plan".to_string()]
         || selected_cell_dependencies(true, false, "verify", "ptrace", None)
-            != ["setup.manifest_plan".to_string(), "build.runtime_release".to_string()]
+            != [
+                "setup.manifest_plan".to_string(),
+                "build.runtime_release".to_string(),
+            ]
         || selected_cell_dependencies(true, false, "verify", "liteinst", None)
-            != ["setup.manifest_plan".to_string(), "build.liteinst_runtime_release".to_string()]
+            != [
+                "setup.manifest_plan".to_string(),
+                "build.liteinst_runtime_release".to_string(),
+            ]
     {
         return Err(
             "selected-cell dependencies lost the LiteInst positive/negative build bracket".into(),
@@ -6159,9 +6304,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .cells
         .iter()
         .find(|cell| {
-            cell.status == "not-applicable"
-                && cell.id.mode == "verify"
-                && cell.id.backend == "kvm"
+            cell.status == "not-applicable" && cell.id.mode == "verify" && cell.id.backend == "kvm"
         })
         .ok_or("self-test needs at least one disabled KVM verify cell")?
         .clone();
@@ -6207,9 +6350,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     let red_kvm = tracked
         .cells
         .iter()
-        .find(|cell| {
-            cell.status == "red" && cell.id.mode == "verify" && cell.id.backend == "kvm"
-        })
+        .find(|cell| cell.status == "red" && cell.id.mode == "verify" && cell.id.backend == "kvm")
         .ok_or("self-test needs at least one red KVM verify cell")?;
     let red_as_disabled = CellSelection {
         test: Some(red_kvm.id.test.clone()),
@@ -6316,8 +6457,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         "3".to_string(),
     ]
     .into_iter();
-    let (_, _, parsed_green_backend) =
-        result_options(root, &mut green_backend_args, false, true)?;
+    let (_, _, parsed_green_backend) = result_options(root, &mut green_backend_args, false, true)?;
     if !parsed_green_backend.green
         || parsed_green_backend.backend.as_deref() != Some("kvm")
         || parsed_green_backend.mode.as_deref() != Some("verify")
@@ -6523,23 +6663,21 @@ fn self_test(root: &Path) -> Result<(), String> {
     )
     .map_err(|e| format!("cannot parse second-invocation DAG: {e}"))?;
     let first_run_ids: BTreeSet<_> = (1..=3)
-        .map(|number| {
-            cell_evidence_run_id(&exact_id, Some(number), Some("validate-one-pid100"))
-        })
+        .map(|number| cell_evidence_run_id(&exact_id, Some(number), Some("validate-one-pid100")))
         .collect();
     let second_run_ids: BTreeSet<_> = (1..=3)
-        .map(|number| {
-            cell_evidence_run_id(&exact_id, Some(number), Some("validate-two-pid200"))
-        })
+        .map(|number| cell_evidence_run_id(&exact_id, Some(number), Some("validate-two-pid200")))
         .collect();
     if !first_run_ids.is_disjoint(&second_run_ids)
-        || second_invocation_dag.steps.iter().filter(|step| step.group == "cell").any(
-            |step| {
+        || second_invocation_dag
+            .steps
+            .iter()
+            .filter(|step| step.group == "cell")
+            .any(|step| {
                 !step
                     .cmd
                     .contains(&format!("E2E_RUN_ID='validate-two-pid200--{}'", step.job))
-            },
-        )
+            })
     {
         return Err("independent repeated-cell invocations reused an evidence run ID".into());
     }
@@ -6584,11 +6722,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .iter()
         .filter(|step| step.tag() == "setup.manifest_plan")
         .collect();
-    let recursive_metadata_tags = [
-        "e2e.metadata",
-        "build.workspace",
-        "build.e2e_artifact",
-    ];
+    let recursive_metadata_tags = ["e2e.metadata", "build.workspace", "build.e2e_artifact"];
     let repeated_jobs: BTreeSet<_> = repeated_cell_steps
         .iter()
         .map(|step| step.job.clone())
@@ -6625,7 +6759,10 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     let preparation_tag = preparation_steps[0].tag();
     if preparation_steps[0].deps
-        != ["setup.manifest_plan".to_string(), "build.runtime_release".to_string()]
+        != [
+            "setup.manifest_plan".to_string(),
+            "build.runtime_release".to_string(),
+        ]
     {
         return Err("repeated exact preparation does not depend on its direct Hermit build".into());
     }
@@ -6765,14 +6902,10 @@ fn self_test(root: &Path) -> Result<(), String> {
     let mut unscoped_disabled_metadata = repeated_metadata.clone();
     unscoped_disabled_metadata.probe_disabled = true;
     unscoped_disabled_metadata.backend = None;
-    let unscoped_disabled_error = validate_run_contract(
-        root,
-        &repeated_results,
-        &unscoped_disabled_metadata,
-        false,
-    )
-    .err()
-    .ok_or("retained run accepted an unscoped disabled population")?;
+    let unscoped_disabled_error =
+        validate_run_contract(root, &repeated_results, &unscoped_disabled_metadata, false)
+            .err()
+            .ok_or("retained run accepted an unscoped disabled population")?;
     if !unscoped_disabled_error.contains("--probe-disabled requires --backend") {
         return Err(format!(
             "retained unscoped disabled run reported the wrong error: {unscoped_disabled_error}"
@@ -6925,8 +7058,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     let disabled_batch_result_metadata = disabled_batch_metadata;
     if !repeated_metadata.is_exact()
         || green_batch_metadata.is_exact()
-        || top_level_repeated_result_description(&repeated_metadata, 1, 1, 0, 0, 2)
-            != "flaky"
+        || top_level_repeated_result_description(&repeated_metadata, 1, 1, 0, 0, 2) != "flaky"
         || top_level_repeated_result_description(&red_batch_result_metadata, 1, 1, 0, 0, 2)
             != "one or more repeated checks failed or required a retry"
     {
@@ -6937,27 +7069,22 @@ fn self_test(root: &Path) -> Result<(), String> {
     let exact_red_heading = summary_heading(&repeated_metadata);
     let exact_red_result = repeated_summary_line(&repeated_metadata, 1, 1, 0, 0, 2);
     let retried_exact_red_result = repeated_summary_line(&repeated_metadata, 2, 1, 0, 1, 2);
-    let all_recovered_exact_red_result =
-        repeated_summary_line(&repeated_metadata, 2, 0, 0, 2, 2);
-    let all_failed_exact_red_result =
-        repeated_summary_line(&repeated_metadata, 0, 0, 0, 2, 2);
+    let all_recovered_exact_red_result = repeated_summary_line(&repeated_metadata, 2, 0, 0, 2, 2);
+    let all_failed_exact_red_result = repeated_summary_line(&repeated_metadata, 0, 0, 0, 2, 2);
     let red_batch_heading = summary_heading(&red_batch_result_metadata);
-    let red_batch_result =
-        repeated_summary_line(&red_batch_result_metadata, 1, 1, 0, 0, 2);
+    let red_batch_result = repeated_summary_line(&red_batch_result_metadata, 1, 1, 0, 0, 2);
     let one_recovered_red_batch_result =
         repeated_summary_line(&red_batch_result_metadata, 2, 1, 0, 1, 2);
     let recovered_red_batch_result =
         repeated_summary_line(&red_batch_result_metadata, 2, 0, 0, 2, 2);
-    let failed_red_batch_result =
-        repeated_summary_line(&red_batch_result_metadata, 0, 0, 0, 2, 2);
+    let failed_red_batch_result = repeated_summary_line(&red_batch_result_metadata, 0, 0, 0, 2, 2);
     let green_batch_heading = summary_heading(&green_batch_metadata);
     let green_batch_result = repeated_summary_line(&green_batch_metadata, 1, 1, 0, 0, 2);
     let disabled_batch_heading = summary_heading(&disabled_batch_result_metadata);
     let disabled_batch_result =
         repeated_summary_line(&disabled_batch_result_metadata, 1, 1, 0, 0, 2);
     if exact_red_heading != "# Repeated red-cell results"
-        || exact_red_result
-            != "Repeated result: 1/2 terminally passed; 1/2 passed cleanly; flaky."
+        || exact_red_result != "Repeated result: 1/2 terminally passed; 1/2 passed cleanly; flaky."
         || retried_exact_red_result
             != "Repeated result: 2/2 terminally passed; 1/2 passed cleanly; flaky."
         || all_recovered_exact_red_result
@@ -7025,9 +7152,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         let tag = step.tag();
         let expected: BTreeSet<&str> = match tag.as_str() {
             "build.workspace" | "build.runtime_release" => BTreeSet::new(),
-            "build.e2e_artifact" => {
-                BTreeSet::from(["build.workspace", "build.runtime_release"])
-            }
+            "build.e2e_artifact" => BTreeSet::from(["build.workspace", "build.runtime_release"]),
             "build.liteinst_runtime_release" => BTreeSet::from(["build.e2e_artifact"]),
             other => return Err(format!("unexpected green-batch build node {other}")),
         };
@@ -7037,8 +7162,7 @@ fn self_test(root: &Path) -> Result<(), String> {
                 tag
             ));
         }
-        if tag == "build.e2e_artifact"
-            && !step.cmd.contains("./ci/publish-hermit-e2e-artifact.sh")
+        if tag == "build.e2e_artifact" && !step.cmd.contains("./ci/publish-hermit-e2e-artifact.sh")
         {
             return Err("green batch replaced the canonical prebuilt artifact publisher".into());
         }
@@ -7067,7 +7191,10 @@ fn self_test(root: &Path) -> Result<(), String> {
             .filter(|step| step.group == "prepare")
             .any(|step| {
                 step.deps
-                    != ["setup.manifest_plan".to_string(), "build.e2e_artifact".to_string()]
+                    != [
+                        "setup.manifest_plan".to_string(),
+                        "build.e2e_artifact".to_string(),
+                    ]
             })
         || green_batch_dag
             .steps
@@ -7076,9 +7203,9 @@ fn self_test(root: &Path) -> Result<(), String> {
             .any(|step| {
                 !step.deps.contains(&"build.e2e_artifact".to_string())
                     || !step.deps.contains(&"setup.manifest_plan".to_string())
-                    || !step.cmd.contains(
-                        "./ci/run-with-hermit-e2e-artifact.sh --require-install",
-                    )
+                    || !step
+                        .cmd
+                        .contains("./ci/run-with-hermit-e2e-artifact.sh --require-install")
             })
     {
         return Err(
@@ -7734,10 +7861,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         || appended[0].duration_ms != Some(19_000)
         || appended[0].timeout_seconds != 20
         || appended[0].first_divergent_syscall != Some(37)
-        || appended[0].first_divergent_left_message.as_deref()
-            != Some("INFO detcore: left event")
-        || appended[0].first_divergent_right_message.as_deref()
-            != Some("INFO detcore: right event")
+        || appended[0].first_divergent_left_message.as_deref() != Some("INFO detcore: left event")
+        || appended[0].first_divergent_right_message.as_deref() != Some("INFO detcore: right event")
         || appended[1].attempt != 2
         || appended[1].result != Some(ObservedResult::Pass)
         || appended[1].failure_class.is_some()
@@ -7823,9 +7948,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             Some(0),
         )? != 2
     {
-        return Err(
-            "a retry without divergence coordinates was mistaken for one execution".into(),
-        );
+        return Err("a retry without divergence coordinates was mistaken for one execution".into());
     }
     if repetition_passed_cleanly("pass", &appended) {
         return Err(
@@ -7933,10 +8056,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         ),
     )
     .map_err(|e| format!("cannot write summarize retry results: {e}"))?;
-    let summarize_runner = BTreeMap::from([(
-        format!("cell.{summarize_retry_slug}"),
-        runner_ok,
-    )]);
+    let summarize_runner = BTreeMap::from([(format!("cell.{summarize_retry_slug}"), runner_ok)]);
     summarize(
         root,
         &summarize_retry_results,
@@ -8096,9 +8216,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         || batch_failed_json["repeated_cells"][0]["clean_passes"] != 0
         || batch_failed_json["repeated_cells"][0]["result"] != "failed every repetition"
     {
-        return Err(
-            "exact or batch JSON confused recovered retries with terminal failures".into(),
-        );
+        return Err("exact or batch JSON confused recovered retries with terminal failures".into());
     }
     verify_repetition_summary_json(&exact_recovered_json, 2, 1)?;
     verify_repetition_summary_json(&exact_all_recovered_json, 4, 2)?;
@@ -8212,7 +8330,10 @@ fn self_test(root: &Path) -> Result<(), String> {
     )
     .map_err(|e| format!("cannot write mismatched nested series fixture: {e}"))?;
     if collect_series_rows(&nested_results).is_ok() {
-        return Err("a framework result whose run_index disagreed with its pressure directory was accepted".into());
+        return Err(
+            "a framework result whose run_index disagreed with its pressure directory was accepted"
+                .into(),
+        );
     }
     let mut reused_artifact = second_row.clone();
     reused_artifact.artifact_dir = first_row.artifact_dir.clone();
@@ -8271,7 +8392,9 @@ fn self_test(root: &Path) -> Result<(), String> {
         true,
         Some(INCOMPLETE_ATTEMPT_STATUS),
     ) {
-        return Err("a result row whose shell command does not encode argv/env was accepted".into());
+        return Err(
+            "a result row whose shell command does not encode argv/env was accepted".into(),
+        );
     }
     result_row.shell_command = "cd /repo && env LC_ALL=C hermit run".into();
     result_row.attempts[0].shell_command = "cd /repo && env LC_ALL=C hermit run".into();
@@ -8374,7 +8497,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("retained result-row evidence crossed between repetitions".into());
     }
 
-    if !retained_verification_logs(&sample_a, &sample_artifact_dir)?.is_empty() {
+    if !legacy_retained_verification_logs(&sample_a, &sample_artifact_dir)?.is_empty() {
         return Err("missing verify-log directory produced retained logs".into());
     }
     let verification_path = verification_report_path(&sample_artifact_dir);
@@ -8388,24 +8511,24 @@ fn self_test(root: &Path) -> Result<(), String> {
     let run2_log = verify_log_directory.join("run2_log_fixture.log");
     fs::write(&run1_log, "run one\n")
         .map_err(|e| format!("cannot write run1 verify-log fixture: {e}"))?;
-    if retained_verification_logs(&sample_a, &sample_artifact_dir).is_ok() {
+    if legacy_retained_verification_logs(&sample_a, &sample_artifact_dir).is_ok() {
         return Err("retained verify-log evidence accepted a missing run2 capture".into());
     }
     fs::write(&run2_log, "run two\n")
         .map_err(|e| format!("cannot write run2 verify-log fixture: {e}"))?;
-    if retained_verification_logs(&sample_a, &sample_artifact_dir)?.len() != 2 {
+    if legacy_retained_verification_logs(&sample_a, &sample_artifact_dir)?.len() != 2 {
         return Err("one nonempty run1/run2 verify-log pair was refused".into());
     }
     let duplicate_run1 = verify_log_directory.join("run1_log_duplicate.log");
     fs::write(&duplicate_run1, "duplicate\n")
         .map_err(|e| format!("cannot write duplicate run1 fixture: {e}"))?;
-    if retained_verification_logs(&sample_a, &sample_artifact_dir).is_ok() {
+    if legacy_retained_verification_logs(&sample_a, &sample_artifact_dir).is_ok() {
         return Err("duplicate retained run1 verify-log capture was accepted".into());
     }
     fs::remove_file(&duplicate_run1)
         .map_err(|e| format!("cannot remove duplicate run1 fixture: {e}"))?;
     fs::write(&run2_log, "").map_err(|e| format!("cannot empty run2 verify-log fixture: {e}"))?;
-    if retained_verification_logs(&sample_a, &sample_artifact_dir).is_ok() {
+    if legacy_retained_verification_logs(&sample_a, &sample_artifact_dir).is_ok() {
         return Err("empty retained run2 verify-log capture was accepted".into());
     }
     fs::write(&run2_log, "run two\n")
@@ -8413,30 +8536,167 @@ fn self_test(root: &Path) -> Result<(), String> {
 
     let golden_status = verify_log_directory.join("normalized-ptrace-golden.status");
     let golden_log = verify_log_directory.join("normalized-ptrace-golden.log");
-    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir)?.is_some() {
+    if legacy_normalized_ptrace_golden(&sample_a, &sample_artifact_dir)?.is_some() {
         return Err("absent normalized ptrace golden produced an artifact".into());
     }
     fs::write(&golden_log, "canonical INFO\n")
         .map_err(|e| format!("cannot write normalized golden fixture: {e}"))?;
-    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir).is_ok() {
+    if legacy_normalized_ptrace_golden(&sample_a, &sample_artifact_dir).is_ok() {
         return Err("normalized ptrace golden without status was accepted".into());
     }
     fs::remove_file(&golden_log)
         .map_err(|e| format!("cannot remove normalized golden fixture: {e}"))?;
     fs::write(&golden_status, "0\n")
         .map_err(|e| format!("cannot write normalized golden status: {e}"))?;
-    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir).is_ok() {
+    if legacy_normalized_ptrace_golden(&sample_a, &sample_artifact_dir).is_ok() {
         return Err("normalized ptrace golden status without output was accepted".into());
     }
     fs::write(&golden_log, "canonical INFO\n")
         .map_err(|e| format!("cannot restore normalized golden fixture: {e}"))?;
-    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir)?.is_none() {
+    if legacy_normalized_ptrace_golden(&sample_a, &sample_artifact_dir)?.is_none() {
         return Err("complete normalized ptrace golden output/status pair was refused".into());
     }
     fs::write(&golden_status, "not-a-status\n")
         .map_err(|e| format!("cannot mutate normalized golden status: {e}"))?;
-    if normalized_ptrace_golden(&sample_a, &sample_artifact_dir).is_ok() {
+    if legacy_normalized_ptrace_golden(&sample_a, &sample_artifact_dir).is_ok() {
         return Err("nonnumeric normalized ptrace golden status was accepted".into());
+    }
+
+    let legacy_error =
+        retained_verification_evidence(&sample_a, &sample_artifact_dir, &first_row).unwrap_err();
+    if !legacy_error.contains("requires schema") {
+        return Err(format!(
+            "a current ptrace result without a descriptor was not refused precisely: {legacy_error}"
+        ));
+    }
+    let mut descriptor_row = first_row.clone();
+    descriptor_row.schema = RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA;
+    let missing_descriptor =
+        retained_verification_evidence(&sample_a, &sample_artifact_dir, &descriptor_row)
+            .unwrap_err();
+    if !missing_descriptor.contains("exactly one retained-log descriptor") {
+        return Err(format!(
+            "schema-5 result without a descriptor was not refused precisely: {missing_descriptor}"
+        ));
+    }
+
+    let canonical = b"canonical INFO\n";
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(canonical)
+        .map_err(|e| format!("cannot encode descriptor fixture: {e}"))?;
+    let compressed = encoder
+        .finish()
+        .map_err(|e| format!("cannot finish descriptor fixture: {e}"))?;
+    let relative = PathBuf::from("retained/verify/1/run-1.log.gz");
+    let retained_path = sample_artifact_dir.join(&relative);
+    fs::create_dir_all(
+        retained_path
+            .parent()
+            .expect("retained descriptor fixture has a parent"),
+    )
+    .map_err(|e| format!("cannot create retained descriptor fixture directory: {e}"))?;
+    fs::write(&retained_path, &compressed)
+        .map_err(|e| format!("cannot write retained descriptor fixture: {e}"))?;
+    descriptor_row.attempts[0].retained_verify_log = Some(RetainedVerifyLog {
+        relative_path: relative.to_string_lossy().into_owned(),
+        role: RetainedVerifyLogRole::Run1,
+        cell_id: RunnerCellId {
+            test: sample_a.test.clone(),
+            mode: sample_a.mode.clone(),
+            backend: Some(sample_a.backend.clone()),
+        },
+        attempt: 1,
+        uncompressed_sha256: format!("{:x}", Sha256::digest(canonical)),
+        uncompressed_bytes: canonical.len() as u64,
+        compressed_sha256: format!("{:x}", Sha256::digest(&compressed)),
+        compressed_bytes: compressed.len() as u64,
+        peer_uncompressed_sha256: "b".repeat(64),
+        peer_uncompressed_bytes: canonical.len() as u64,
+        compared_info_messages: 1,
+    });
+    descriptor_row.outcome = "PASS".into();
+    descriptor_row.result = Some(ObservedResult::Pass);
+    descriptor_row.failure_class = None;
+    descriptor_row.first_divergent_record = None;
+    descriptor_row.first_divergent_syscall = None;
+    descriptor_row.first_divergent_scheduler_turn = None;
+    descriptor_row.first_divergent_virtual_nanoseconds = None;
+    descriptor_row.first_divergent_left_message = None;
+    descriptor_row.first_divergent_right_message = None;
+    descriptor_row.attempts[0].outcome = "PASS".into();
+    descriptor_row.attempts[0].status = Some(0);
+    let embedded_report = serde_json::to_string(&json!({
+        "verified": true,
+        "bitwise_parity": true,
+        "verdict": "matched",
+        "infrastructure_error": null,
+        "comparison": {
+            "strictness": "canonical",
+            "display_name": "BitwiseInfoV1",
+            "compare_logs": true,
+            "compare_io_buffers": true,
+            "log_scope": "info",
+            "record_envelope": "all_records_v1",
+            "virtualize_time": true,
+            "strip_lines": false,
+            "canonicalize_addresses": true,
+            "full_trace": true,
+            "exact_remainder": true,
+            "stripped_prefixes": ["real-wall-clock-prefix/v1"],
+            "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
+            "ignore_lines": false,
+            "skip_commit": false,
+            "skip_detlog": false
+        },
+        "compared_log_messages": {"left": 1, "right": 1},
+        "guest_exit_code": 0,
+        "guest_signal": null,
+        "first_divergent_scheduler_turn": null,
+        "first_divergent_virtual_nanoseconds": null,
+        "first_divergent_record": null,
+        "first_divergent_syscall": null,
+        "first_divergent_left_message": null,
+        "first_divergent_right_message": null
+    }))
+    .map_err(|error| format!("cannot encode embedded verification fixture: {error}"))?;
+    descriptor_row.attempts[0].verification_report_sha256 =
+        Some(format!("{:x}", Sha256::digest(embedded_report.as_bytes())));
+    descriptor_row.attempts[0].verification_report = Some(embedded_report.clone());
+    fs::write(&verification_path, "{").map_err(|error| {
+        format!("cannot write conflicting legacy verification fixture: {error}")
+    })?;
+    let selected_report =
+        read_result_verification_report(&sample_a, &sample_artifact_dir, &descriptor_row)?
+            .ok_or("schema-5 embedded verification report was not selected")?;
+    if selected_report.get("verdict").and_then(JsonValue::as_str) != Some("matched") {
+        return Err("schema-5 embedded verification report lost its typed verdict".into());
+    }
+    fs::remove_file(&verification_path).map_err(|error| {
+        format!("cannot remove conflicting legacy verification fixture: {error}")
+    })?;
+    let report_sha256 = descriptor_row.attempts[0]
+        .verification_report_sha256
+        .clone();
+    descriptor_row.attempts[0].verification_report_sha256 = Some("0".repeat(64));
+    if read_result_verification_report(&sample_a, &sample_artifact_dir, &descriptor_row).is_ok() {
+        return Err("schema-5 embedded verification report digest mismatch was accepted".into());
+    }
+    descriptor_row.attempts[0].verification_report_sha256 = report_sha256;
+    let descriptor_evidence =
+        retained_verification_evidence(&sample_a, &sample_artifact_dir, &descriptor_row)?;
+    if !descriptor_evidence.complete
+        || descriptor_evidence.paths != [retained_path.to_string_lossy().into_owned()]
+        || descriptor_evidence.normalized_ptrace_golden
+            != Some(retained_path.to_string_lossy().into_owned())
+        || descriptor_evidence.descriptor.is_none()
+    {
+        return Err("valid retained-log descriptor did not become authoritative evidence".into());
+    }
+    fs::write(&retained_path, b"not gzip")
+        .map_err(|e| format!("cannot corrupt retained descriptor fixture: {e}"))?;
+    if retained_verification_evidence(&sample_a, &sample_artifact_dir, &descriptor_row).is_ok() {
+        return Err("corrupt descriptor-backed retained log was accepted".into());
     }
 
     fs::write(&verification_path, "{")

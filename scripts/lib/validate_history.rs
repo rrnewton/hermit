@@ -225,7 +225,7 @@ fn failure_row_blocks_pass_cache(row: &serde_json::Value, key: &CacheKey<'_>) ->
     // unsupported row failure authority.
     let typed_cell_divergence = i(row, "schema_version").is_some_and(|schema| {
         (crate::validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_MIN
-            ..=crate::validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION)
+            ..=crate::validate_cell_results::RETAINED_VERIFY_LOGS_LEDGER_SCHEMA_VERSION)
             .contains(&schema)
             && row
                 .get("cell_results")
@@ -563,7 +563,7 @@ pub fn self_test() -> Result<String, String> {
 
     // A FAIL lookup must not require the pass conditions (a fail is noted, not reused).
     let failing = base(serde_json::json!({
-        "schema_version": crate::validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION,
+        "schema_version": crate::validate_cell_results::RETAINED_VERIFY_LOGS_LEDGER_SCHEMA_VERSION,
         "result": "fail", "failures": 3, "producer": "hermit-validate-rs",
         "dag_jobs": 4, "concurrent_validates": 0,
         "gates_expected": 1, "gates_run": 1,
@@ -580,7 +580,7 @@ pub fn self_test() -> Result<String, String> {
     // cache until this reader explicitly supports that schema.
     let mut newer_failing = failing.clone();
     newer_failing["schema_version"] = serde_json::json!(
-        crate::validate_cell_results::CELL_RESULTS_LEDGER_SCHEMA_VERSION + 1
+        crate::validate_cell_results::RETAINED_VERIFY_LOGS_LEDGER_SCHEMA_VERSION + 1
     );
     if cache_lookup(&[newer_failing, rs_pass.clone()], "pass", &key).is_none() {
         return Err(

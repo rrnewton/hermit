@@ -4,7 +4,12 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::{self};
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
@@ -14,20 +19,34 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitStatus;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use detcore::logdiff::ComparisonSideLabels;
 use detcore_model::summary::PathEvidence;
+use detcore_model::summary::RunSummary;
+use flate2::Compression;
+use flate2::GzBuilder;
+use flate2::read::MultiGzDecoder;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
 
+use crate::canonical_verdict::ComparedLogMessages;
+use crate::canonical_verdict::ComparedLogScope;
+use crate::canonical_verdict::ComparisonReport;
 use crate::canonical_verdict::InfrastructureError;
+use crate::canonical_verdict::LogCompareStrictness;
+use crate::canonical_verdict::RecordEnvelopeReport;
+use crate::canonical_verdict::RuntimeStats;
 use crate::canonical_verdict::Verdict;
 pub use crate::canonical_verdict::VerificationReport;
 pub use crate::canonical_verdict::VerificationRuntime;
@@ -73,6 +92,8 @@ const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 const CELL_CPU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CELL_CPU_ACCOUNTING_GRACE: Duration = Duration::from_secs(1);
 pub const CELL_RESULT_SCHEMA: u64 = 4;
+pub const RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA: u64 = 5;
+pub const DEFAULT_VERIFY_LOG_RETENTION_BUDGET_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub const E2E_MACHINE_SHORTNAME_ENV: &str = "E2E_MACHINE_SHORTNAME";
 pub const E2E_KERNEL_VERSION_ENV: &str = "E2E_KERNEL_VERSION";
 pub const E2E_RUN_INDEX_ENV: &str = "E2E_RUN_INDEX";
@@ -251,7 +272,7 @@ pub struct ManifestSet {
     tests: BTreeMap<String, (String, u64, u64, TestRecipe)>,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct CellId {
     pub test: String,
     pub mode: String,
@@ -932,6 +953,34 @@ pub struct CellRunSpec {
     fixed_workdir_source: PathBuf,
 }
 
+mod retained_verify_log;
+pub use retained_verify_log::ComparedVerifyPair;
+pub use retained_verify_log::RetainedVerifyLog;
+pub use retained_verify_log::RetainedVerifyLogPublication;
+pub use retained_verify_log::RetainedVerifyLogRole;
+pub use retained_verify_log::VerifiedRetainedLogCopy;
+pub use retained_verify_log::VerifyLogRetentionBudget;
+pub use retained_verify_log::VerifyLogRetentionPolicy;
+pub use retained_verify_log::VerifyRun;
+pub use retained_verify_log::VerifyRunObservation;
+pub use retained_verify_log::VerifyRunPaths;
+pub use retained_verify_log::VerifyRunPolicy;
+pub use retained_verify_log::VerifyRunSpec;
+pub use retained_verify_log::build_verify_run_spec;
+pub use retained_verify_log::cleanup_verify_log_sources;
+pub use retained_verify_log::compare_verify_runs;
+pub use retained_verify_log::copy_verified_retained_verify_log;
+pub use retained_verify_log::load_verify_run;
+pub use retained_verify_log::publish_retained_verify_log;
+pub use retained_verify_log::read_verified_retained_verify_log;
+pub use retained_verify_log::reopen_retained_verify_log_publication;
+use retained_verify_log::require_plain_directory;
+use retained_verify_log::retained_verify_log_relative_path;
+use retained_verify_log::sync_plain_directory;
+use retained_verify_log::sync_relative_directory_chain_with_failure;
+pub use retained_verify_log::verify_retained_verify_log;
+pub use retained_verify_log::verify_run_paths;
+
 /// The existing pressure-test result vocabulary for one executed cell.
 ///
 /// This is separate from [`FailureClass`]: two product failures can have
@@ -1075,6 +1124,10 @@ pub struct AttemptResult {
     pub stderr: String,
     pub verification_report: Option<String>,
     pub verification_report_sha256: Option<String>,
+    /// Typed binding for the single canonical run-1 log retained after a
+    /// harness-managed comparison. Historical and legacy SaBRe rows omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_verify_log: Option<RetainedVerifyLog>,
     /// Runtime totals for the two executions compared by this attempt.
     pub runtime: Option<VerificationRuntime>,
     /// The divergence position, LIFTED OUT of `verification_report` so it is a
@@ -1256,6 +1309,294 @@ pub struct CellResult {
     pub artifact_dir: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetainedVerifyReportClassification {
+    outcome: String,
+    error_kind: Option<String>,
+    reason: Option<String>,
+    result: Option<ObservedResult>,
+    failure_class: Option<FailureClass>,
+}
+
+fn retained_verify_report_classification(
+    report: &VerificationReport,
+) -> RetainedVerifyReportClassification {
+    let incomplete = |reason: String| RetainedVerifyReportClassification {
+        outcome: "ERROR".into(),
+        error_kind: Some("incomplete-verification-evidence".into()),
+        reason: Some(reason),
+        result: None,
+        failure_class: Some(FailureClass::NoResult),
+    };
+    let product_failure = |reason: String| RetainedVerifyReportClassification {
+        outcome: "FAIL".into(),
+        error_kind: None,
+        reason: Some(reason),
+        result: Some(ObservedResult::CrashError),
+        failure_class: Some(FailureClass::ProductFailure),
+    };
+    match report.verdict {
+        Verdict::Matched => match report.require_canonical_match() {
+            Ok(()) => match (report.guest_exit_code, report.guest_signal) {
+                (Some(0), None) => RetainedVerifyReportClassification {
+                    outcome: "PASS".into(),
+                    error_kind: None,
+                    reason: None,
+                    result: Some(ObservedResult::Pass),
+                    failure_class: None,
+                },
+                (Some(code), None) => product_failure(format!("verify exited with status {code}")),
+                (None, Some(signal)) => {
+                    product_failure(format!("verify was killed by signal {signal}"))
+                }
+                (None, None) => {
+                    incomplete("canonical verification match omitted the guest disposition".into())
+                }
+                (Some(_), Some(_)) => incomplete(
+                    "canonical verification match recorded both exit status and signal".into(),
+                ),
+            },
+            Err(reason) => incomplete(reason),
+        },
+        Verdict::Diverged => match report.require_canonical_comparison() {
+            Ok(()) if !report.verified && !report.bitwise_parity => {
+                RetainedVerifyReportClassification {
+                    outcome: "FAIL".into(),
+                    error_kind: None,
+                    reason: report.require_canonical_match().err(),
+                    result: Some(ObservedResult::DeterminismFailure),
+                    failure_class: Some(FailureClass::ProductFailure),
+                }
+            }
+            Ok(()) => incomplete(format!(
+                "canonical verification report contradicts its diverged verdict: verified={} bitwise_parity={}",
+                report.verified, report.bitwise_parity
+            )),
+            Err(reason) => incomplete(reason),
+        },
+        Verdict::NoResult => incomplete(
+            report
+                .require_canonical_comparison()
+                .err()
+                .unwrap_or_else(|| {
+                    "verification report carries canonical evidence but records no_result".into()
+                }),
+        ),
+        Verdict::InfrastructureError => RetainedVerifyReportClassification {
+            outcome: "ERROR".into(),
+            error_kind: Some("infrastructure".into()),
+            reason: Some(match report.infrastructure_error.as_ref() {
+                Some(InfrastructureError::SkidOvershoot { count }) => {
+                    format!("verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)")
+                }
+                None => "verification recorded an incomplete infrastructure error".into(),
+            }),
+            result: None,
+            failure_class: Some(FailureClass::UnderstoodInfrastructureFailure),
+        },
+    }
+}
+
+impl CellResult {
+    /// Validate the schema, attempt, cell, report digest, and retained-log
+    /// descriptor binding before a read-side consumer trusts it.
+    pub fn validate_retained_verify_log_binding(
+        &self,
+    ) -> Result<Option<&RetainedVerifyLog>, String> {
+        let expected_id = CellId {
+            test: self.test.clone(),
+            mode: self.mode.clone(),
+            backend: self.backend.clone(),
+        };
+        let retained_attempts = self
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.retained_verify_log.is_some())
+            .collect::<Vec<_>>();
+        if retained_attempts.len() > 1 {
+            return Err("one result row carries more than one retained verify log".into());
+        }
+        let Some(attempt_row) = retained_attempts.first() else {
+            return Ok(None);
+        };
+        if self.attempts.len() != 1 {
+            return Err(
+                "a harness-managed verify result must contain exactly one attempt row".into(),
+            );
+        }
+        let retained = attempt_row
+            .retained_verify_log
+            .as_ref()
+            .expect("the attempt was selected for carrying a descriptor");
+        if self.mode != "verify" {
+            return Err("a non-verify result row carries a retained verify log".into());
+        }
+        if retained.cell_id != expected_id || retained.attempt != self.attempt {
+            return Err("retained verify log does not match its result-row identity".into());
+        }
+        let expected_relative = retained_verify_log_relative_path(self.attempt)?;
+        if Path::new(&retained.relative_path) != expected_relative {
+            return Err(format!(
+                "retained verify log path must be exactly {}, got {}",
+                expected_relative.display(),
+                retained.relative_path
+            ));
+        }
+        let report_json = attempt_row
+            .verification_report
+            .as_deref()
+            .ok_or("retained verify log has no typed verification report")?;
+        let report_sha256 = attempt_row
+            .verification_report_sha256
+            .as_deref()
+            .ok_or("retained verify log has no verification_report_sha256")?;
+        if hex_digest(report_json.as_bytes()) != report_sha256 {
+            return Err("retained verify-log report digest mismatch".into());
+        }
+        let report = VerificationReport::from_json_slice(report_json.as_bytes())
+            .map_err(|error| format!("retained verify-log report is malformed: {error}"))?;
+        let compared_info_messages = report
+            .compared_log_messages
+            .as_ref()
+            .map_or(0, |counts| counts.left);
+        if retained.compared_info_messages != compared_info_messages {
+            return Err(
+                "retained verify-log compared count differs from its verification report".into(),
+            );
+        }
+        let classification = retained_verify_report_classification(&report);
+        if attempt_row.outcome != classification.outcome
+            || attempt_row.error_kind.as_deref() != classification.error_kind.as_deref()
+            || attempt_row.reason != classification.reason
+            || self.outcome != classification.outcome
+            || self.error_kind.as_deref() != classification.error_kind.as_deref()
+            || self.reason != classification.reason
+            || self.result != classification.result
+            || self.failure_class != classification.failure_class
+        {
+            return Err(format!(
+                "retained verify-log outcome does not match its verification report: expected outcome={} error_kind={:?} result={:?} failure_class={:?}",
+                classification.outcome,
+                classification.error_kind,
+                classification.result,
+                classification.failure_class
+            ));
+        }
+        if attempt_row.status != report.guest_exit_code
+            || attempt_row.signal != report.guest_signal
+            || attempt_row.runtime != report.runtime
+            || self.runtime != report.runtime
+            || attempt_row.first_divergent_scheduler_turn != report.first_divergent_scheduler_turn
+            || attempt_row.first_divergent_virtual_nanoseconds
+                != report.first_divergent_virtual_nanoseconds
+            || attempt_row.first_divergent_record != report.first_divergent_record
+            || attempt_row.first_divergent_syscall != report.first_divergent_syscall
+            || attempt_row.first_divergent_left_message != report.first_divergent_left_message
+            || attempt_row.first_divergent_right_message != report.first_divergent_right_message
+            || self.first_divergent_scheduler_turn != report.first_divergent_scheduler_turn
+            || self.first_divergent_virtual_nanoseconds
+                != report.first_divergent_virtual_nanoseconds
+            || self.first_divergent_record != report.first_divergent_record
+            || self.first_divergent_syscall != report.first_divergent_syscall
+            || self.first_divergent_left_message != report.first_divergent_left_message
+            || self.first_divergent_right_message != report.first_divergent_right_message
+        {
+            return Err(
+                "retained verify-log result fields differ from its verification report".into(),
+            );
+        }
+        Ok(Some(retained))
+    }
+
+    fn validate_retained_verify_logs(&self) -> Result<(), String> {
+        let Some(retained) = self.validate_retained_verify_log_binding()? else {
+            return Ok(());
+        };
+        let expected_id = CellId {
+            test: self.test.clone(),
+            mode: self.mode.clone(),
+            backend: self.backend.clone(),
+        };
+        verify_retained_verify_log(
+            Path::new(&self.artifact_dir),
+            retained,
+            &expected_id,
+            self.attempt,
+        )
+    }
+
+    /// Bind one completed comparison and retained descriptor to the sole
+    /// attempt, then mark the complete result for schema-5 publication.
+    ///
+    /// This is deliberately separate from ordinary result construction so the
+    /// active internal-verify writer cannot claim retained-log evidence merely
+    /// because the additive field exists on the Rust type.
+    fn prepare_retained_verify_log_publication(
+        &mut self,
+        report: &VerificationReport,
+        retained: RetainedVerifyLog,
+    ) -> Result<(), String> {
+        if self.schema != CELL_RESULT_SCHEMA {
+            return Err(format!(
+                "retained verify-log publication requires schema {CELL_RESULT_SCHEMA} input, got {}",
+                self.schema
+            ));
+        }
+        if self.attempts.len() != 1 {
+            return Err(
+                "a harness-managed verify result must contain exactly one attempt row".into(),
+            );
+        }
+        if self.attempts[0].retained_verify_log.is_some() {
+            return Err("verify attempt already carries a retained-log descriptor".into());
+        }
+        let report_json = serde_json::to_string(report)
+            .map_err(|error| format!("cannot encode retained verify-log report: {error}"))?;
+        let report_sha256 = hex_digest(report_json.as_bytes());
+        let classification = retained_verify_report_classification(report);
+        let previous = self.clone();
+        let attempt = &mut self.attempts[0];
+        attempt.outcome = classification.outcome.clone();
+        attempt.error_kind = classification.error_kind.clone();
+        attempt.status = report.guest_exit_code;
+        attempt.signal = report.guest_signal;
+        attempt.timed_out = false;
+        attempt.verification_report = Some(report_json);
+        attempt.verification_report_sha256 = Some(report_sha256);
+        attempt.retained_verify_log = Some(retained);
+        attempt.runtime = report.runtime.clone();
+        attempt.first_divergent_scheduler_turn = report.first_divergent_scheduler_turn;
+        attempt.first_divergent_virtual_nanoseconds = report.first_divergent_virtual_nanoseconds;
+        attempt.first_divergent_record = report.first_divergent_record;
+        attempt.first_divergent_syscall = report.first_divergent_syscall;
+        attempt.first_divergent_left_message = report.first_divergent_left_message.clone();
+        attempt.first_divergent_right_message = report.first_divergent_right_message.clone();
+        attempt.reason = classification.reason.clone();
+
+        self.outcome = classification.outcome;
+        self.error_kind = classification.error_kind;
+        self.result = classification.result;
+        self.failure_class = classification.failure_class;
+        self.runtime = report.runtime.clone();
+        self.first_divergent_scheduler_turn = report.first_divergent_scheduler_turn;
+        self.first_divergent_virtual_nanoseconds = report.first_divergent_virtual_nanoseconds;
+        self.first_divergent_record = report.first_divergent_record;
+        self.first_divergent_syscall = report.first_divergent_syscall;
+        self.first_divergent_left_message = report.first_divergent_left_message.clone();
+        self.first_divergent_right_message = report.first_divergent_right_message.clone();
+        self.reason = classification.reason;
+        self.schema = RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA;
+        if let Err(error) = self
+            .validate_retained_verify_log_binding()
+            .and_then(|_| self.require_current_classification())
+        {
+            *self = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
 impl CellResult {
     /// Validate the additive timeout fields while keeping earlier schema-4 rows
     /// readable. `timeout_seconds` retains its original wall-bound meaning;
@@ -1385,6 +1726,66 @@ impl ScheduledWorkerCapacity {
 
     pub fn workers_for(self, count: usize) -> usize {
         self.0.min(count)
+    }
+}
+
+/// Shared cap for launched child processes, including both members of a
+/// harness-managed verify pair.
+#[derive(Clone, Debug)]
+pub struct ProcessPermitPool {
+    inner: Arc<(Mutex<usize>, Condvar)>,
+    capacity: usize,
+}
+
+impl ProcessPermitPool {
+    pub fn new(capacity: ScheduledWorkerCapacity) -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(capacity.configured()), Condvar::new())),
+            capacity: capacity.configured(),
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn acquire(&self) -> Result<ProcessPermit, String> {
+        let (available, wake) = &*self.inner;
+        let mut available = available
+            .lock()
+            .map_err(|_| "global process-permit lock is poisoned".to_string())?;
+        while *available == 0 {
+            available = wake
+                .wait(available)
+                .map_err(|_| "global process-permit lock is poisoned".to_string())?;
+        }
+        *available -= 1;
+        Ok(ProcessPermit {
+            inner: Arc::clone(&self.inner),
+            capacity: self.capacity,
+        })
+    }
+}
+
+struct ProcessPermit {
+    inner: Arc<(Mutex<usize>, Condvar)>,
+    capacity: usize,
+}
+
+impl Drop for ProcessPermit {
+    fn drop(&mut self) {
+        let (available, wake) = &*self.inner;
+        let mut available = available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *available = available
+            .checked_add(1)
+            .expect("process permit count cannot overflow");
+        assert!(
+            *available <= self.capacity,
+            "process permit returned more than once"
+        );
+        wake.notify_one();
     }
 }
 
@@ -1672,6 +2073,7 @@ pub fn prepare_test(
         dir,
         execution_deadline_after_preparation(Instant::now(), timeouts.wall_seconds)?,
         timeouts.wall_seconds,
+        None,
     )
     .map(|(guest, _cpu_usage_usec)| guest)
 }
@@ -1682,6 +2084,7 @@ fn prepare_test_until(
     dir: &Path,
     deadline: Instant,
     wall_timeout_seconds: u64,
+    process_permits: Option<&ProcessPermitPool>,
 ) -> Result<(Vec<String>, u64), String> {
     prepare_dirs(&context.root, dir)?;
     let mut cpu_usage_usec = 0u64;
@@ -1730,6 +2133,7 @@ fn prepare_test_until(
                         &args,
                         deadline,
                         wall_timeout_seconds,
+                        process_permits,
                     )?)
                     .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
             }
@@ -1759,6 +2163,7 @@ fn prepare_test_until(
                         &args,
                         deadline,
                         wall_timeout_seconds,
+                        process_permits,
                     )?)
                     .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
             }
@@ -1776,6 +2181,7 @@ fn prepare_test_until(
                         &["--prepare".into()],
                         deadline,
                         wall_timeout_seconds,
+                        process_permits,
                     )?)
                     .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
             }
@@ -1915,6 +2321,7 @@ fn run_preparation(
     args: &[String],
     deadline: Instant,
     cell_timeout_seconds: u64,
+    process_permits: Option<&ProcessPermitPool>,
 ) -> Result<u64, String> {
     let captures = dir.join("captures");
     if remaining_cell_time(deadline).is_zero() {
@@ -1930,7 +2337,7 @@ fn run_preparation(
         &preparation_env(dir),
         &captures.join("prepare.stdout"),
         &captures.join("prepare.stderr"),
-        (deadline, None),
+        ProcessExecutionOptions::new(deadline, None, process_permits),
     )?;
     if output.timeout.is_some() || !output.status.success() {
         // Carry the child's own words back. This used to return the bare sentence
@@ -2171,6 +2578,7 @@ pub fn execute_spec(spec: &CellRunSpec) -> Result<AttemptResult, String> {
         spec.timeout_seconds,
         spec.timeout_seconds,
         None,
+        None,
     )
 }
 
@@ -2180,6 +2588,7 @@ fn execute_spec_until(
     cpu_timeout_seconds: u64,
     wall_timeout_seconds: u64,
     remaining_cpu_usec: Option<u64>,
+    process_permits: Option<&ProcessPermitPool>,
 ) -> Result<AttemptResult, String> {
     // The attempt label comes from the spec rather than a parallel parameter.
     // `build_spec` already stored it, and every caller passed the same value to
@@ -2238,7 +2647,7 @@ fn execute_spec_until(
         &spec.env,
         &stdout_path,
         &stderr_path,
-        (deadline, remaining_cpu_usec),
+        ProcessExecutionOptions::new(deadline, remaining_cpu_usec, process_permits),
     )?;
     if spec.id.mode == "verify" && spec.id.backend.as_deref() == Some("ptrace") {
         if let Some(directory) = &spec.verification_log_dir {
@@ -2498,6 +2907,7 @@ fn execute_spec_until(
         stderr,
         verification_report: report_json,
         verification_report_sha256: report_sha,
+        retained_verify_log: None,
         runtime,
         first_divergent_scheduler_turn,
         first_divergent_virtual_nanoseconds,
@@ -2574,10 +2984,39 @@ struct ProcessOutput {
     cpu_usage_usec: u64,
 }
 
-struct ProcessLimits {
+struct ProcessExecutionOptions<'a> {
     deadline: Instant,
     cpu_budget_usec: Option<u64>,
     cpu_poll_interval: Duration,
+    process_permits: Option<&'a ProcessPermitPool>,
+    exclusive_captures: bool,
+}
+
+impl<'a> ProcessExecutionOptions<'a> {
+    fn new(
+        deadline: Instant,
+        cpu_budget_usec: Option<u64>,
+        process_permits: Option<&'a ProcessPermitPool>,
+    ) -> Self {
+        Self {
+            deadline,
+            cpu_budget_usec,
+            cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            process_permits,
+            exclusive_captures: false,
+        }
+    }
+
+    fn exclusive_captures(mut self) -> Self {
+        self.exclusive_captures = true;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_cpu_poll_interval(mut self, cpu_poll_interval: Duration) -> Self {
+        self.cpu_poll_interval = cpu_poll_interval;
+        self
+    }
 }
 
 /// Add two complete CPU measurements, refusing missing or overflowing input.
@@ -2672,39 +3111,34 @@ fn execute_process(
     env: &BTreeMap<String, String>,
     stdout: &Path,
     stderr: &Path,
-    limits: (Instant, Option<u64>),
+    options: ProcessExecutionOptions<'_>,
 ) -> Result<ProcessOutput, String> {
-    execute_process_with_cpu_poll_interval(
-        cwd,
-        program,
-        args,
-        env,
-        stdout,
-        stderr,
-        ProcessLimits {
-            deadline: limits.0,
-            cpu_budget_usec: limits.1,
-            cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
-        },
-    )
-}
-
-fn execute_process_with_cpu_poll_interval(
-    cwd: &Path,
-    program: &str,
-    args: &[String],
-    env: &BTreeMap<String, String>,
-    stdout: &Path,
-    stderr: &Path,
-    limits: ProcessLimits,
-) -> Result<ProcessOutput, String> {
-    let ProcessLimits {
+    let ProcessExecutionOptions {
         deadline,
         cpu_budget_usec,
         cpu_poll_interval,
-    } = limits;
-    let stdout_file = File::create(stdout).map_err(|e| format!("{}: {e}", stdout.display()))?;
-    let stderr_file = File::create(stderr).map_err(|e| format!("{}: {e}", stderr.display()))?;
+        process_permits,
+        exclusive_captures,
+    } = options;
+    let _permit = process_permits
+        .map(ProcessPermitPool::acquire)
+        .transpose()?;
+    let open_capture = |path: &Path| {
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        if exclusive_captures {
+            options.create_new(true);
+        } else {
+            options.create(true).truncate(true);
+        }
+        options
+            .open(path)
+            .map_err(|error| format!("{}: {error}", path.display()))
+    };
+    let stdout_file = open_capture(stdout)?;
+    let stderr_file = open_capture(stderr)?;
     let mut command = Command::new(program);
     command
         .args(args)
@@ -2814,6 +3248,7 @@ fn cell_timeout_attempt(
         stderr: String::new(),
         verification_report: Some(report),
         verification_report_sha256: Some(report_sha256),
+        retained_verify_log: None,
         runtime: None,
         first_divergent_scheduler_turn: None,
         first_divergent_virtual_nanoseconds: None,
@@ -2951,7 +3386,383 @@ fn apply_failed_chaos_assertion(
     }
 }
 
+fn execute_verify_run_until(
+    spec: &VerifyRunSpec,
+    deadline: Instant,
+    cpu_budget_usec: u64,
+    process_permits: &ProcessPermitPool,
+) -> Result<(ProcessOutput, Duration), String> {
+    if remaining_cell_time(deadline).is_zero() {
+        return Err(format!(
+            "{} could not start before the pair wall deadline",
+            spec.run.comparison_label()
+        ));
+    }
+    if cpu_budget_usec == 0 {
+        return Err(format!(
+            "{} could not start because the pair CPU budget was exhausted",
+            spec.run.comparison_label()
+        ));
+    }
+    let started = Instant::now();
+    let output = execute_process(
+        &spec.execution.cwd,
+        &spec.execution.argv[0],
+        &spec.execution.argv[1..],
+        &spec.execution.env,
+        &spec.paths.diagnostic_stdout,
+        &spec.paths.diagnostic_stderr,
+        ProcessExecutionOptions::new(deadline, Some(cpu_budget_usec), Some(process_permits))
+            .exclusive_captures(),
+    )?;
+    let duration = started.elapsed();
+    Ok((output, duration))
+}
+
+struct HarnessVerifyResultContext {
+    started: Instant,
+    timeouts: ResolvedTestTimeouts,
+    preparation_cpu_usage_usec: u64,
+    execution_cpu_usage_usec: u64,
+    binary_sha256: Option<String>,
+}
+
+fn build_harness_managed_verify_result(
+    context: &RunContext,
+    cell: &SelectedCell,
+    dir: &Path,
+    run1_spec: &VerifyRunSpec,
+    run1: &VerifyRunObservation,
+    report: &VerificationReport,
+    execution: HarnessVerifyResultContext,
+) -> Result<CellResult, String> {
+    let HarnessVerifyResultContext {
+        started,
+        timeouts,
+        preparation_cpu_usage_usec,
+        execution_cpu_usage_usec,
+        binary_sha256,
+    } = execution;
+    let classification = retained_verify_report_classification(report);
+    let report_json = serde_json::to_string(report)
+        .map_err(|error| format!("cannot encode harness-managed verification report: {error}"))?;
+    let report_sha256 = hex_digest(report_json.as_bytes());
+    let mut attempt = AttemptResult {
+        index: context.attempt.to_string(),
+        outcome: classification.outcome.clone(),
+        error_kind: classification.error_kind.clone(),
+        status: report.guest_exit_code,
+        signal: report.guest_signal,
+        timed_out: false,
+        duration_ms: started.elapsed().as_millis(),
+        cpu_usage_usec: Some(execution_cpu_usage_usec),
+        observation_sha256: None,
+        argv: run1_spec.execution.argv.clone(),
+        guest_argv: run1_spec.execution.guest_argv.clone(),
+        env: run1_spec.execution.env.clone(),
+        cwd: run1_spec.execution.cwd.to_string_lossy().into_owned(),
+        shell_command: shell_command(
+            &run1_spec.execution.cwd.to_string_lossy(),
+            &run1_spec.execution.env,
+            &run1_spec.execution.argv,
+        ),
+        stdout: String::from_utf8_lossy(&run1.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&run1.stderr).into_owned(),
+        verification_report: Some(report_json),
+        verification_report_sha256: Some(report_sha256),
+        retained_verify_log: None,
+        runtime: report.runtime.clone(),
+        first_divergent_scheduler_turn: report.first_divergent_scheduler_turn,
+        first_divergent_virtual_nanoseconds: report.first_divergent_virtual_nanoseconds,
+        first_divergent_record: report.first_divergent_record,
+        first_divergent_syscall: report.first_divergent_syscall,
+        first_divergent_left_message: report.first_divergent_left_message.clone(),
+        first_divergent_right_message: report.first_divergent_right_message.clone(),
+        sabre_path_evidence: None,
+        sabre_path_evidence_sha256: None,
+        reason: classification.reason.clone(),
+    };
+    attempt.observation_sha256 = Some(observation_hash(&cell.test.observation, &attempt, dir));
+    let cpu_usage_usec = preparation_cpu_usage_usec
+        .checked_add(execution_cpu_usage_usec)
+        .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
+    Ok(CellResult {
+        artifact_dir: dir.display().to_string(),
+        schema: CELL_RESULT_SCHEMA,
+        run_id: context.run_id.clone(),
+        machine_shortname: context.machine_shortname.clone(),
+        kernel_version: context.kernel_version.clone(),
+        host_capabilities: context.host_capabilities.clone(),
+        attempt: context.attempt,
+        run_index: context.run_index,
+        hermit_sha: context.source_sha.clone(),
+        source_tree_dirty: context.source_dirty,
+        binary_sha256,
+        binary_build_sha: context.binary_build_sha.clone(),
+        test_sha256: test_digest(&context.root, &cell.test)?,
+        test: cell.id.test.clone(),
+        category: cell.category.clone(),
+        lane: cell.test.lane.clone(),
+        mode: cell.id.mode.clone(),
+        backend: cell.id.backend.clone(),
+        classification: if cell.enabled { "required" } else { "disabled" }.into(),
+        outcome: classification.outcome,
+        result: classification.result,
+        failure_class: classification.failure_class,
+        error_kind: classification.error_kind,
+        timeout_seconds: timeouts.wall_seconds,
+        execution_cpu_timeout_seconds: Some(timeouts.cpu_seconds),
+        execution_wall_timeout_seconds: Some(timeouts.wall_seconds),
+        duration_ms: Some(started.elapsed().as_millis()),
+        cpu_usage_usec: Some(cpu_usage_usec),
+        runtime: report.runtime.clone(),
+        log_level: Some("info".into()),
+        effective_args: run1_spec.execution.argv.iter().skip(1).cloned().collect(),
+        argv: run1_spec.execution.argv.clone(),
+        guest_argv: run1_spec.execution.guest_argv.clone(),
+        env: run1_spec.execution.env.clone(),
+        cwd: run1_spec.execution.cwd.to_string_lossy().into_owned(),
+        shell_command: attempt.shell_command.clone(),
+        relaxations: cell_relaxations(cell),
+        execution_path: None,
+        diversity: None,
+        attempts: vec![attempt],
+        first_divergent_scheduler_turn: report.first_divergent_scheduler_turn,
+        first_divergent_virtual_nanoseconds: report.first_divergent_virtual_nanoseconds,
+        first_divergent_record: report.first_divergent_record,
+        first_divergent_syscall: report.first_divergent_syscall,
+        first_divergent_left_message: report.first_divergent_left_message.clone(),
+        first_divergent_right_message: report.first_divergent_right_message.clone(),
+        reason: classification.reason,
+    })
+}
+
+fn run_harness_managed_verify_cell(
+    context: &RunContext,
+    cell: &SelectedCell,
+    process_permits: &ProcessPermitPool,
+    retention_budget: &VerifyLogRetentionBudget,
+    results_path: &Path,
+) -> Result<CellResult, RunCellServiceError> {
+    let dir = cell_artifact_dir(context, cell);
+    let started = Instant::now();
+    let timeouts = cell_timeouts(context, cell).map_err(RunCellServiceError::Infrastructure)?;
+    let preparation_deadline = execution_deadline_after_preparation(started, timeouts.wall_seconds)
+        .map_err(RunCellServiceError::Infrastructure)?;
+    let binary_before = fs::read(&context.hermit_bin)
+        .ok()
+        .map(|bytes| hex_digest(&bytes));
+    let (guest, preparation_cpu_usage_usec) = prepare_test_until(
+        context,
+        cell,
+        &dir,
+        preparation_deadline,
+        timeouts.wall_seconds,
+        Some(process_permits),
+    )
+    .map_err(RunCellServiceError::Infrastructure)?;
+    let deadline = execution_deadline_after_preparation(Instant::now(), timeouts.wall_seconds)
+        .map_err(RunCellServiceError::Infrastructure)?;
+    let cpu_budget_usec = timeouts.cpu_seconds.saturating_mul(1_000_000);
+    let run1_spec = build_verify_run_spec(
+        context,
+        cell,
+        dir.clone(),
+        guest.clone(),
+        context.attempt,
+        VerifyRun::Run1,
+        remaining_cell_seconds(deadline),
+    )
+    .map_err(RunCellServiceError::NoResult)?;
+    let run2_spec = build_verify_run_spec(
+        context,
+        cell,
+        dir.clone(),
+        guest,
+        context.attempt,
+        VerifyRun::Run2,
+        remaining_cell_seconds(deadline),
+    )
+    .map_err(RunCellServiceError::NoResult)?;
+    retained_verify_log::prepare_verify_run_destinations(&run1_spec, &run2_spec)
+        .map_err(RunCellServiceError::NoResult)?;
+
+    let (run1_joined, run2_joined) = thread::scope(|scope| {
+        let run1 = scope.spawn(|| {
+            execute_verify_run_until(&run1_spec, deadline, cpu_budget_usec, process_permits)
+        });
+        let run2 = scope.spawn(|| {
+            execute_verify_run_until(&run2_spec, deadline, cpu_budget_usec, process_permits)
+        });
+        (run1.join(), run2.join())
+    });
+    let no_result = |spec: &VerifyRunSpec, cause: String| {
+        RunCellServiceError::NoResult(retained_verify_log::with_hermit_diagnostic_stderr(
+            spec, cause,
+        ))
+    };
+    let (run1_output, _) = run1_joined
+        .map_err(|_| RunCellServiceError::Infrastructure("verify run 1 worker panicked".into()))?
+        .map_err(|cause| no_result(&run1_spec, cause))?;
+    let (run2_output, _) = run2_joined
+        .map_err(|_| RunCellServiceError::Infrastructure("verify run 2 worker panicked".into()))?
+        .map_err(|cause| no_result(&run2_spec, cause))?;
+    for (spec, output) in [(&run1_spec, &run1_output), (&run2_spec, &run2_output)] {
+        if let Some(timeout) = output.timeout {
+            let cause = format!(
+                "{} Hermit process reached {} before terminal producer validation",
+                spec.run.comparison_label(),
+                timeout.error_kind()
+            );
+            return Err(no_result(spec, cause));
+        }
+    }
+    let execution_cpu_usage_usec = run1_output
+        .cpu_usage_usec
+        .checked_add(run2_output.cpu_usage_usec)
+        .ok_or_else(|| {
+            RunCellServiceError::NoResult("verify-pair CPU usage overflowed u64".into())
+        })?;
+    if execution_cpu_usage_usec >= cpu_budget_usec {
+        return Err(RunCellServiceError::NoResult(format!(
+            "verify pair exceeded {} CPU s in aggregate",
+            timeouts.cpu_seconds
+        )));
+    }
+
+    let run1 = load_verify_run(&run1_spec).map_err(|cause| no_result(&run1_spec, cause))?;
+    run1.validate_process_status(&run1_spec, run1_output.status)
+        .map_err(|cause| no_result(&run1_spec, cause))?;
+    let run2 = load_verify_run(&run2_spec).map_err(|cause| no_result(&run2_spec, cause))?;
+    run2.validate_process_status(&run2_spec, run2_output.status)
+        .map_err(|cause| no_result(&run2_spec, cause))?;
+    let pair = compare_verify_runs(&run1_spec, run1.clone(), &run2_spec, run2)
+        .map_err(RunCellServiceError::NoResult)?;
+    let report = pair.comparison().report.clone();
+    let binary_sha256 = fs::read(&context.hermit_bin)
+        .ok()
+        .map(|bytes| hex_digest(&bytes));
+    if binary_before.is_some() && binary_before != binary_sha256 {
+        return Err(RunCellServiceError::Infrastructure(
+            "Hermit binary changed while the verify pair was executing".into(),
+        ));
+    }
+    let mut result = build_harness_managed_verify_result(
+        context,
+        cell,
+        &dir,
+        &run1_spec,
+        &run1,
+        &report,
+        HarnessVerifyResultContext {
+            started,
+            timeouts,
+            preparation_cpu_usage_usec,
+            execution_cpu_usage_usec,
+            binary_sha256,
+        },
+    )
+    .map_err(RunCellServiceError::Infrastructure)?;
+    publish_retained_verify_log(pair, retention_budget, results_path, &mut result).map_err(
+        |error| {
+            RunCellServiceError::Infrastructure(format!(
+                "retained verify-log publication failed: {error}"
+            ))
+        },
+    )?;
+    Ok(result)
+}
+
+pub fn no_result_error_result(
+    context: &RunContext,
+    cell: &SelectedCell,
+    reason: String,
+) -> CellResult {
+    let mut result = infrastructure_error_result(context, cell, reason);
+    result.failure_class = Some(FailureClass::NoResult);
+    result.error_kind = Some("incomplete-verification-evidence".into());
+    result
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RunCellServiceError {
+    NoResult(String),
+    Infrastructure(String),
+}
+
+impl std::fmt::Display for RunCellServiceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoResult(message) | Self::Infrastructure(message) => formatter.write_str(message),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VerifyExecutionRoute {
+    HarnessManaged,
+    DbtRefused,
+    SabreInternal,
+    Legacy,
+}
+
+fn verify_execution_route(cell: &SelectedCell) -> VerifyExecutionRoute {
+    if cell.id.mode != "verify" {
+        return VerifyExecutionRoute::Legacy;
+    }
+    match cell.id.backend.as_deref() {
+        Some("ptrace" | "kvm" | "liteinst") => VerifyExecutionRoute::HarnessManaged,
+        Some("dbt") => VerifyExecutionRoute::DbtRefused,
+        Some("sabre") => VerifyExecutionRoute::SabreInternal,
+        _ => VerifyExecutionRoute::Legacy,
+    }
+}
+
 pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, String> {
+    let process_permits = ProcessPermitPool::new(context.scheduled_worker_capacity);
+    run_cell_inner(context, cell, &process_permits)
+}
+
+pub fn run_cell_with_services(
+    context: &RunContext,
+    cell: &SelectedCell,
+    process_permits: &ProcessPermitPool,
+    retention_budget: &VerifyLogRetentionBudget,
+    results_path: &Path,
+) -> Result<CellResult, RunCellServiceError> {
+    match verify_execution_route(cell) {
+        VerifyExecutionRoute::HarnessManaged => run_harness_managed_verify_cell(
+            context,
+            cell,
+            process_permits,
+            retention_budget,
+            results_path,
+        ),
+        VerifyExecutionRoute::DbtRefused => Err(RunCellServiceError::NoResult(
+            "DBT harness-managed verify is refused before launch because its evidence_file transport implies isolated process groups that can change guest setsid/setpgid results".into(),
+        )),
+        VerifyExecutionRoute::SabreInternal =>
+            run_sabre_internal_verify_cell(context, cell, process_permits),
+        VerifyExecutionRoute::Legacy => run_cell_inner(context, cell, process_permits)
+            .map_err(RunCellServiceError::Infrastructure),
+    }
+}
+
+fn run_sabre_internal_verify_cell(
+    context: &RunContext,
+    cell: &SelectedCell,
+    process_permits: &ProcessPermitPool,
+) -> Result<CellResult, RunCellServiceError> {
+    // SaBRe cannot provide the private authoritative ordinary-run INFO sidecar:
+    // its plugin DETLOG is available only on the shared stderr stream.
+    run_cell_inner(context, cell, process_permits).map_err(RunCellServiceError::Infrastructure)
+}
+
+fn run_cell_inner(
+    context: &RunContext,
+    cell: &SelectedCell,
+    process_permits: &ProcessPermitPool,
+) -> Result<CellResult, String> {
     let dir = cell_artifact_dir(context, cell);
     let started = Instant::now();
     let timeouts = cell_timeouts(context, cell)?;
@@ -2966,6 +3777,7 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         &dir,
         preparation_deadline,
         timeouts.wall_seconds,
+        Some(process_permits),
     )?;
     // Fixture preparation keeps its scaled wall-clock guard above. Post-preparation
     // execution uses its separately measured bound as an aggregate CPU-second budget
@@ -2994,10 +3806,15 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                     &spec,
                     &cell.test.observation,
                     &dir,
-                    deadline,
-                    timeouts.cpu_seconds,
-                    timeouts.wall_seconds,
-                    Some(execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec)),
+                    ObservedExecutionOptions {
+                        deadline,
+                        cpu_timeout_seconds: timeouts.cpu_seconds,
+                        wall_timeout_seconds: timeouts.wall_seconds,
+                        remaining_cpu_usec: Some(
+                            execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec),
+                        ),
+                        process_permits: Some(process_permits),
+                    },
                 )?);
                 execution_cpu_usage_usec = execution_cpu_usage_usec
                     .checked_add(
@@ -3035,10 +3852,15 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                     &spec,
                     &cell.test.observation,
                     &dir,
-                    deadline,
-                    timeouts.cpu_seconds,
-                    timeouts.wall_seconds,
-                    Some(execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec)),
+                    ObservedExecutionOptions {
+                        deadline,
+                        cpu_timeout_seconds: timeouts.cpu_seconds,
+                        wall_timeout_seconds: timeouts.wall_seconds,
+                        remaining_cpu_usec: Some(
+                            execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec),
+                        ),
+                        process_permits: Some(process_permits),
+                    },
                 )?);
                 execution_cpu_usage_usec = execution_cpu_usage_usec
                     .checked_add(
@@ -3068,10 +3890,15 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                     &spec,
                     &cell.test.observation,
                     &dir,
-                    deadline,
-                    timeouts.cpu_seconds,
-                    timeouts.wall_seconds,
-                    Some(execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec)),
+                    ObservedExecutionOptions {
+                        deadline,
+                        cpu_timeout_seconds: timeouts.cpu_seconds,
+                        wall_timeout_seconds: timeouts.wall_seconds,
+                        remaining_cpu_usec: Some(
+                            execution_cpu_budget_usec.saturating_sub(execution_cpu_usage_usec),
+                        ),
+                        process_permits: Some(process_permits),
+                    },
                 )?);
                 execution_cpu_usage_usec = execution_cpu_usage_usec
                     .checked_add(
@@ -3100,10 +3927,13 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
                 &spec,
                 &cell.test.observation,
                 &dir,
-                deadline,
-                timeouts.cpu_seconds,
-                timeouts.wall_seconds,
-                Some(execution_cpu_budget_usec),
+                ObservedExecutionOptions {
+                    deadline,
+                    cpu_timeout_seconds: timeouts.cpu_seconds,
+                    wall_timeout_seconds: timeouts.wall_seconds,
+                    remaining_cpu_usec: Some(execution_cpu_budget_usec),
+                    process_permits: Some(process_permits),
+                },
             )?);
         }
     }
@@ -3619,21 +4449,273 @@ fn diversity_evidence(
     })
 }
 
-pub fn prepare_result_path(path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+fn nearest_existing_directory(path: &Path) -> Result<PathBuf, String> {
+    let mut candidate = path.to_owned();
+    loop {
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(format!(
+                    "stable result root {} is not a non-symlink directory",
+                    candidate.display()
+                ));
+            }
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                candidate = candidate
+                    .parent()
+                    .ok_or_else(|| {
+                        format!(
+                            "cannot find an existing directory above result path {}",
+                            path.display()
+                        )
+                    })?
+                    .to_owned();
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect prospective result directory {}: {error}",
+                    candidate.display()
+                ));
+            }
+        }
     }
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
 }
 
-pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
-    result.require_current_classification()?;
-    result.require_current_timeout_policy()?;
+fn prepare_result_path_from_root_with_failure(
+    stable_root: &Path,
+    path: &Path,
+    directory_sync_failure_at: Option<usize>,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    require_plain_directory(stable_root, "stable result root")?;
+    let relative_parent = parent.strip_prefix(stable_root).map_err(|_| {
+        format!(
+            "result path {} is outside stable result root {}",
+            path.display(),
+            stable_root.display()
+        )
+    })?;
+    if relative_parent
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!(
+            "result directory {} is not a normal path below stable root {}",
+            parent.display(),
+            stable_root.display()
+        ));
+    }
+    let mut current = stable_root.to_owned();
+    for component in relative_parent.components() {
+        let Component::Normal(component) = component else {
+            unreachable!("result parent components were checked above")
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(format!(
+                    "result directory {} is not a non-symlink directory",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current).map_err(|error| {
+                    format!(
+                        "cannot create result directory {}: {error}",
+                        current.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect result directory {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    sync_relative_directory_chain_with_failure(
+        stable_root,
+        parent,
+        "result directory",
+        directory_sync_failure_at,
+    )?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| e.to_string())?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err(format!(
+            "result path {} is not a regular file",
+            path.display()
+        ));
+    }
+    file.sync_all().map_err(|e| e.to_string())?;
+    sync_plain_directory(parent, "result directory after result-file creation")
+}
+
+/// Create and durably sync a result file from a caller-established directory.
+pub fn prepare_result_path_from_root(stable_root: &Path, path: &Path) -> Result<(), String> {
+    prepare_result_path_from_root_with_failure(stable_root, path, None)
+}
+
+pub fn prepare_result_path(path: &Path) -> Result<(), String> {
+    let absolute_path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("cannot resolve relative result path: {error}"))?
+            .join(path)
+    };
+    let parent = absolute_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stable_root = nearest_existing_directory(parent)?;
+    prepare_result_path_from_root(&stable_root, &absolute_path)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResultPublicationFailurePoint {
+    TemporaryWrite,
+    TemporaryFileSync,
+    BeforeRename,
+    ParentDirectorySync,
+}
+
+#[derive(Debug)]
+struct ResultPublicationFailure {
+    message: String,
+    descriptor_visible: bool,
+}
+
+fn read_existing_result(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot open result file {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if !file
+        .metadata()
+        .map_err(|error| format!("cannot inspect result file {}: {error}", path.display()))?
+        .is_file()
+    {
+        return Err(format!(
+            "result path {} is not a regular file",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read result file {}: {error}", path.display()))?;
+    Ok(Some(bytes))
+}
+
+fn write_atomic_file(path: &Path, bytes: &[u8], description: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".result-publication.")
+        .suffix(".staging")
+        .tempfile_in(parent)
+        .map_err(|error| {
+            format!(
+                "cannot create temporary {description} in {}: {error}",
+                parent.display()
+            )
+        })?;
+    temporary
+        .write_all(bytes)
+        .and_then(|()| temporary.flush())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| format!("cannot write temporary {description}: {error}"))?;
+    temporary.persist(path).map_err(|error| {
+        format!(
+            "cannot atomically publish {description} {}: {}",
+            path.display(),
+            error.error
+        )
+    })?;
+    sync_plain_directory(parent, &format!("{description} parent directory"))
+}
+
+fn restore_previous_result(path: &Path, previous: Option<&[u8]>) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match previous {
+        Some(bytes) => write_atomic_file(path, bytes, "previous result file"),
+        None => match fs::remove_file(path) {
+            Ok(()) => sync_plain_directory(parent, "result directory after rollback"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "cannot remove new result file {} during rollback: {error}",
+                path.display()
+            )),
+        },
+    }
+}
+
+fn append_result_with_failure(
+    path: &Path,
+    result: &CellResult,
+    failure: Option<ResultPublicationFailurePoint>,
+    retained_file_already_verified: bool,
+) -> Result<(), ResultPublicationFailure> {
+    let unpublished = |message| ResultPublicationFailure {
+        message,
+        descriptor_visible: false,
+    };
+    let retained_verify_log = result
+        .validate_retained_verify_log_binding()
+        .map_err(unpublished)?;
+    match (result.schema, retained_verify_log.is_some()) {
+        (CELL_RESULT_SCHEMA, false) | (RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA, true) => {}
+        (CELL_RESULT_SCHEMA, true) => {
+            return Err(unpublished(format!(
+                "schema {CELL_RESULT_SCHEMA} result cannot carry retained_verify_log; prepare schema {RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA} publication explicitly"
+            )));
+        }
+        (RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA, false) => {
+            return Err(unpublished(format!(
+                "schema {RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA} result requires one retained_verify_log descriptor"
+            )));
+        }
+        (schema, _) => {
+            return Err(unpublished(format!(
+                "current result writer requires schema {CELL_RESULT_SCHEMA}, or schema {RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA} with retained_verify_log, got {schema}"
+            )));
+        }
+    }
+    result
+        .require_current_classification()
+        .map_err(unpublished)?;
+    result
+        .require_current_timeout_policy()
+        .map_err(unpublished)?;
+    if !retained_file_already_verified {
+        result
+            .validate_retained_verify_logs()
+            .map_err(unpublished)?;
+    }
     // A missing prerequisite means the cell did not execute. Keep the typed
     // value for the harness summary and JUnit skip, but do not publish a cell
     // row that downstream readers could count as an observation. The validate
@@ -3641,20 +4723,103 @@ pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
     if result.outcome == "HOST-INAPPLICABLE" {
         return Ok(());
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    require_plain_directory(parent, "prepared result directory").map_err(|message| {
+        ResultPublicationFailure {
+            message,
+            descriptor_visible: false,
+        }
+    })?;
+    let previous = read_existing_result(path).map_err(|message| ResultPublicationFailure {
+        message,
+        descriptor_visible: false,
+    })?;
+    let mut next = previous.clone().unwrap_or_default();
+    serde_json::to_writer(&mut next, result).map_err(|error| ResultPublicationFailure {
+        message: error.to_string(),
+        descriptor_visible: false,
+    })?;
+    next.push(b'\n');
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".results.jsonl.")
+        .suffix(".staging")
+        .tempfile_in(parent)
+        .map_err(|error| ResultPublicationFailure {
+            message: format!(
+                "cannot create temporary result file in {}: {error}",
+                parent.display()
+            ),
+            descriptor_visible: false,
+        })?;
+    if failure == Some(ResultPublicationFailurePoint::TemporaryWrite) {
+        return Err(ResultPublicationFailure {
+            message: "injected failure writing the temporary result file".into(),
+            descriptor_visible: false,
+        });
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut file, result).map_err(|e| e.to_string())?;
-    file.write_all(b"\n").map_err(|e| e.to_string())?;
-    // The bucket runner publishes each completed cell before printing its
-    // PASS/FAIL/ERROR line. Flush the row now rather than waiting for the
-    // bucket's JUnit/summary epilogue, which an outer node timeout may kill.
-    file.flush().map_err(|e| e.to_string())
+    temporary
+        .write_all(&next)
+        .and_then(|()| temporary.flush())
+        .map_err(|error| ResultPublicationFailure {
+            message: format!("cannot write temporary result file: {error}"),
+            descriptor_visible: false,
+        })?;
+    if failure == Some(ResultPublicationFailurePoint::TemporaryFileSync) {
+        return Err(ResultPublicationFailure {
+            message: "injected failure syncing the temporary result file".into(),
+            descriptor_visible: false,
+        });
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| ResultPublicationFailure {
+            message: format!("cannot sync temporary result file: {error}"),
+            descriptor_visible: false,
+        })?;
+    if failure == Some(ResultPublicationFailurePoint::BeforeRename) {
+        return Err(ResultPublicationFailure {
+            message: "injected failure at result-row publication boundary".into(),
+            descriptor_visible: false,
+        });
+    }
+    temporary
+        .persist(path)
+        .map_err(|error| ResultPublicationFailure {
+            message: format!(
+                "cannot atomically publish result file {}: {}",
+                path.display(),
+                error.error
+            ),
+            descriptor_visible: false,
+        })?;
+    let durable = if failure == Some(ResultPublicationFailurePoint::ParentDirectorySync) {
+        Err("injected failure syncing the result directory after result-row rename".to_string())
+    } else {
+        sync_plain_directory(parent, "result directory")
+    };
+    if let Err(error) = durable {
+        return match restore_previous_result(path, previous.as_deref()) {
+            Ok(()) => Err(ResultPublicationFailure {
+                message: error,
+                descriptor_visible: false,
+            }),
+            Err(rollback_error) => Err(ResultPublicationFailure {
+                message: format!(
+                    "{error}; result-row rollback also failed and the new row may remain visible: {rollback_error}"
+                ),
+                descriptor_visible: true,
+            }),
+        };
+    }
+    Ok(())
+}
+
+pub fn append_result(path: &Path, result: &CellResult) -> Result<(), String> {
+    append_result_with_failure(path, result, None, false).map_err(|error| error.message)
 }
 
 pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
@@ -4036,21 +5201,34 @@ fn command_help_contains(program: &Path, args: &[&str], needle: &str) -> bool {
         })
 }
 
-fn execute_observed_until(
-    spec: &CellRunSpec,
-    observation: &Observation,
-    dir: &Path,
+struct ObservedExecutionOptions<'a> {
     deadline: Instant,
     cpu_timeout_seconds: u64,
     wall_timeout_seconds: u64,
     remaining_cpu_usec: Option<u64>,
+    process_permits: Option<&'a ProcessPermitPool>,
+}
+
+fn execute_observed_until(
+    spec: &CellRunSpec,
+    observation: &Observation,
+    dir: &Path,
+    options: ObservedExecutionOptions<'_>,
 ) -> Result<AttemptResult, String> {
+    let ObservedExecutionOptions {
+        deadline,
+        cpu_timeout_seconds,
+        wall_timeout_seconds,
+        remaining_cpu_usec,
+        process_permits,
+    } = options;
     let mut attempt = execute_spec_until(
         spec,
         deadline,
         cpu_timeout_seconds,
         wall_timeout_seconds,
         remaining_cpu_usec,
+        process_permits,
     )?;
     attempt.observation_sha256 = Some(observation_hash(observation, &attempt, dir));
     Ok(attempt)
@@ -4060,6 +5238,58 @@ fn execute_observed_until(
 mod tests {
     use super::*;
     use crate::ci_selection::BackendCiDisabledReason;
+
+    #[test]
+    fn verify_backends_select_explicit_execution_routes() {
+        for (backend, expected) in [
+            ("ptrace", VerifyExecutionRoute::HarnessManaged),
+            ("kvm", VerifyExecutionRoute::HarnessManaged),
+            ("liteinst", VerifyExecutionRoute::HarnessManaged),
+            ("dbt", VerifyExecutionRoute::DbtRefused),
+            ("sabre", VerifyExecutionRoute::SabreInternal),
+        ] {
+            let mut cell = ptrace_cell("verify");
+            cell.id.backend = Some(backend.into());
+            assert_eq!(verify_execution_route(&cell), expected);
+        }
+        let mut non_verify = ptrace_cell("verify");
+        non_verify.id.mode = "chaos".into();
+        assert_eq!(
+            verify_execution_route(&non_verify),
+            VerifyExecutionRoute::Legacy
+        );
+    }
+
+    #[test]
+    fn process_permits_allow_a_pair_concurrently_and_preserve_the_global_cap() {
+        let pool = ProcessPermitPool::new(ScheduledWorkerCapacity::new(2));
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        let entered = std::sync::Barrier::new(3);
+        let release = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let pool = &pool;
+                let active = &active;
+                let entered = &entered;
+                let release = &release;
+                scope.spawn(move || {
+                    let _permit = pool.acquire().unwrap();
+                    active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    entered.wait();
+                    release.wait();
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+            entered.wait();
+            assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 2);
+            let (available, _) = &*pool.inner;
+            assert_eq!(*available.lock().unwrap(), 0);
+            release.wait();
+        });
+        assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let (available, _) = &*pool.inner;
+        assert_eq!(*available.lock().unwrap(), 2);
+    }
 
     #[test]
     fn failure_class_schema_matches_serialized_enum() {
@@ -4264,7 +5494,7 @@ mod tests {
             .collect()
     }
 
-    fn assert_minimal_guest_env(argv: &[String], dir: &str, tmp: &str, jobs: &str) {
+    pub(super) fn assert_minimal_guest_env(argv: &[String], dir: &str, tmp: &str, jobs: &str) {
         let mut base_env = Vec::new();
         let mut index = 0;
         while index < argv.len() {
@@ -4296,7 +5526,7 @@ mod tests {
         );
     }
 
-    fn ptrace_cell(mode: &str) -> SelectedCell {
+    pub(super) fn ptrace_cell(mode: &str) -> SelectedCell {
         let mut test = recipe(true);
         if mode != "verify" {
             let mode_recipe = test.modes.remove("verify").unwrap();
@@ -4335,7 +5565,7 @@ mod tests {
         ])
     }
 
-    fn run_context(root: &Path) -> RunContext {
+    pub(super) fn run_context(root: &Path) -> RunContext {
         RunContext {
             root: root.into(),
             hermit_bin: root.join("hermit"),
@@ -4706,7 +5936,7 @@ mod tests {
         // This is the exact boundary reached when the aggregate execution
         // backstop is gone before a later attempt starts: no child process can
         // exist or have an exit status.
-        let attempt = execute_spec_until(&spec, Instant::now(), 15, 57, None).unwrap();
+        let attempt = execute_spec_until(&spec, Instant::now(), 15, 57, None, None).unwrap();
         assert_eq!(attempt.outcome, "ERROR");
         assert_eq!(attempt.error_kind.as_deref(), Some("wall-timeout"));
         assert!(attempt.timed_out);
@@ -4757,6 +5987,7 @@ mod tests {
             1,
             5,
             Some(0),
+            None,
         )
         .unwrap();
         assert_eq!(attempt.outcome, "ERROR");
@@ -4782,7 +6013,7 @@ mod tests {
                 &BTreeMap::new(),
                 &root.join(format!("{label}.stdout")),
                 &root.join(format!("{label}.stderr")),
-                (Instant::now() + Duration::from_secs(10), None),
+                ProcessExecutionOptions::new(Instant::now() + Duration::from_secs(10), None, None),
             )
             .unwrap()
         };
@@ -4813,7 +6044,7 @@ mod tests {
             &BTreeMap::new(),
             &root.join(format!("{label}.stdout")),
             &root.join(format!("{label}.stderr")),
-            (Instant::now() + wall, Some(cpu_budget_usec)),
+            ProcessExecutionOptions::new(Instant::now() + wall, Some(cpu_budget_usec), None),
         )
         .unwrap()
     }
@@ -4898,6 +6129,7 @@ mod tests {
             1,
             5,
             Some(1_000_000),
+            None,
         )
         .unwrap();
         assert!(attempt.timed_out);
@@ -4920,7 +6152,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let output = execute_process_with_cpu_poll_interval(
+        let output = execute_process(
             &root,
             "/bin/sh",
             &[
@@ -4930,11 +6162,8 @@ mod tests {
             &BTreeMap::new(),
             &root.join("completed.stdout"),
             &root.join("completed.stderr"),
-            ProcessLimits {
-                deadline: Instant::now() + Duration::from_secs(5),
-                cpu_budget_usec: Some(1),
-                cpu_poll_interval: Duration::from_secs(5),
-            },
+            ProcessExecutionOptions::new(Instant::now() + Duration::from_secs(5), Some(1), None)
+                .with_cpu_poll_interval(Duration::from_secs(5)),
         )
         .unwrap();
         assert!(output.status.success());
@@ -4958,6 +6187,7 @@ mod tests {
             1,
             1,
             Some(5_000_000),
+            None,
         )
         .unwrap();
         assert!(attempt.timed_out);
@@ -6240,7 +7470,7 @@ backends_disabled:
     /// `CellResult` coordinates and the whole package stayed GREEN, 126 tests, 0
     /// failures, INCLUDING this test. A check that stays green while the hazard it
     /// names is open is the failure this file is full of warnings about.
-    fn cell_result_that_located_nothing() -> CellResult {
+    pub(super) fn cell_result_that_located_nothing() -> CellResult {
         CellResult {
             schema: CELL_RESULT_SCHEMA,
             run_id: "fixture".into(),
@@ -6444,6 +7674,7 @@ backends_disabled:
             stderr: String::new(),
             verification_report: None,
             verification_report_sha256: None,
+            retained_verify_log: None,
             runtime: None,
             sabre_path_evidence: Some(evidence.into()),
             sabre_path_evidence_sha256: Some("b".into()),
@@ -7255,6 +8486,7 @@ backends_disabled:
             ],
             Instant::now() + Duration::from_secs(5),
             5,
+            None,
         )
         .unwrap_err();
         assert!(error.contains("fixture preparation failed for /bin/sh: exited 17"));
@@ -7322,6 +8554,7 @@ backends_disabled:
             &["-c".into(), "sleep 60".into()],
             Instant::now() + Duration::from_secs(1),
             cell.timeout_seconds,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -7346,6 +8579,7 @@ backends_disabled:
             &["-c".into(), "true".into()],
             Instant::now() + Duration::from_secs(1),
             cell.timeout_seconds,
+            None,
         )
         .expect("healthy fixture preparation must finish silently under the same bound");
         fs::remove_dir_all(root).unwrap();
