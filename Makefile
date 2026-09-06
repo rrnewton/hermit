@@ -139,6 +139,7 @@ lint: lint-checks lint-cargo ## Run the full lint suite matching CI (rustfmt, sh
 lint-checks: ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
 	./scripts/check-skill-discovery.rs
 	./scripts/check-github-actions-triggers.rs
+	./scripts/test-pre-push-submodule-diagnosis.sh
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh
 	bash ./tests/compat/real_compat_workload.sh --self-test-localhost-port
