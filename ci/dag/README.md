@@ -8,8 +8,8 @@ independent gates concurrently. On hosts with delegated cgroup v2 support, it
 can also box each node for memory limits and full process-subtree teardown.
 
 - [`validate.json`](validate.json) — the one committed superset. Steps declare
-  `quick`, `portable`, `full`, `super`, and `privileged` labels; dagrun selects
-  the requested label and its dependency ancestry without rewriting the graph.
+  `quick`, `portable`, `hosted-portable`, `full`, `super`, and `privileged`
+  labels; dagrun selects the requested label and its dependency ancestry without rewriting the graph.
 
 Run a lane with the wrapper:
 
@@ -22,7 +22,10 @@ agent-utils/py/bin/dagrun ascii --dag ci/dag/validate.json  # inspect the supers
 ## Status: active local lanes and manual hosted diagnostics
 
 `scripts/validate.rs` reads `validate.json` and selects the requested label.
-The hosted workflows select from the same file. Standard profile execution does
+The hosted workflows select the explicit `hosted-portable` label from the same
+file. Its 13 E2E producers and final scorecard retain host commands and typed
+host dependencies; the ordinary `portable` label selects their pinned-root
+counterparts. Standard profile execution does
 not merge lane files, regenerate nodes, or rewrite commands and resource caps.
 
 `generate-validation-dag --check` is a maintenance check, not part of runtime

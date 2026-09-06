@@ -107,7 +107,7 @@ shift 2
 
 # Validate the label before creating any scratch, perf, or run-state output.
 case "$lane" in
-    portable) profile=(portable-only) ;;
+    portable) profile=(--hosted-portable-only) ;;
     privileged) profile=(--privileged-only) ;;
     *)
         echo "run-node.sh: unknown lane '$lane' (expected portable or privileged)" >&2

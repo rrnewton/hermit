@@ -4,9 +4,9 @@
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Generate `ci/test-footprints.json` from Cargo metadata and the portable DAG.
+//! Generate `ci/test-footprints.json` from Cargo metadata and the hosted-portable DAG.
 //!
-//! Cargo owns package paths and dependency edges. The portable DAG owns test
+//! Cargo owns package paths and dependency edges. The hosted-portable DAG owns test
 //! nodes and commands. `ci/test-footprints-policy.json` contains only the
 //! fail-safe path policy and semantic edges for non-Cargo harnesses.
 
@@ -345,7 +345,7 @@ fn load_dag_targets(
             .as_array()
             .into_iter()
             .flatten()
-            .any(|label| label.as_str() == Some("portable"))
+            .any(|label| label.as_str() == Some("hosted-portable"))
         {
             continue;
         }

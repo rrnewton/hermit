@@ -1064,6 +1064,7 @@ jobs:
         run: |
           set -euo pipefail
           job=${NODE#e2e.}
+          job=${job%_on_host}
           out="$E2E_RESULT_ROOT/portable/$job"
           captures="$E2E_RESULT_ROOT/runs/$E2E_RUN_ID"
           stage="ignored/parity/$SLUG/parity-v1"
