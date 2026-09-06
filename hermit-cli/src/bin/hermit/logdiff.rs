@@ -66,15 +66,32 @@ fn try_bitwise_info_v1_with_records(
 }
 
 fn compare_complete_prefix(
-    left: &str,
-    right: &str,
+    left: &[u8],
+    right: &[u8],
     options: &logdiff::LogDiffOpts,
     writer: &mut impl Write,
     record_envelope: RecordEnvelope,
+    fixed_bitwise_info_v1: bool,
 ) -> std::io::Result<logdiff::PrefixComparison> {
+    if fixed_bitwise_info_v1 {
+        return logdiff::compare_complete_bitwise_info_v1_prefix(
+            left,
+            right,
+            options.side_labels.clone(),
+            logdiff::BitwiseInfoV1Diagnostics {
+                difference_limit: options.limit,
+                syscall_history: options.syscall_history,
+                no_color: options.no_color,
+                print_logs: options.print_logs,
+            },
+            writer,
+        );
+    }
+    let left = String::from_utf8_lossy(left);
+    let right = String::from_utf8_lossy(right);
     logdiff::compare_complete_prefix_with_filter(
-        left,
-        right,
+        &left,
+        &right,
         options,
         writer,
         record_envelope.predicate(),
@@ -323,6 +340,8 @@ impl LogDiffCLIOpts {
         let deadline = (self.follow_timeout_secs > 0)
             .then(|| Instant::now() + Duration::from_secs(self.follow_timeout_secs));
 
+        let fixed_bitwise_info_v1 = (self.canonical_info || self.json.is_some())
+            && record_envelope.policy() == RecordEnvelopePolicy::AllRecordsV1;
         let mut previous_sizes: Option<(usize, usize)> = None;
         let mut unchanged_polls = 0u32;
         let mut last_reported_records = usize::MAX;
@@ -345,6 +364,7 @@ impl LogDiffCLIOpts {
                 options,
                 &mut transcript,
                 record_envelope,
+                fixed_bitwise_info_v1,
             ) {
                 Ok(comparison) => comparison,
                 Err(error) => {
@@ -683,10 +703,10 @@ fn no_records() -> JsonRecords {
 
 /// Read a log that may not exist yet or may be mid-write. A run that has not
 /// created its log is "nothing to compare", not an error.
-fn read_growing_log(path: &Path) -> std::io::Result<String> {
+fn read_growing_log(path: &Path) -> std::io::Result<Vec<u8>> {
     match std::fs::read(path) {
-        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error),
     }
 }
@@ -712,6 +732,13 @@ mod tests {
 
     use super::*;
 
+    fn current_record(second: usize, body: &str) -> String {
+        format!(
+            "Apr 09 06:08:{second:02}.100  INFO detcore: {body}{}\n",
+            detcore::detlog::record_suffix(detcore::detlog::DetLogEvent::Other)
+        )
+    }
+
     /// Append `count` records to `path`, one every `gap`, flushing each so a
     /// reader sees a genuinely growing file. Record `diverge_at` carries
     /// `marker`, so two writers with different markers part company there.
@@ -726,10 +753,8 @@ mod tests {
             let mut file = std::fs::File::create(&path).unwrap();
             for index in 0..count {
                 let body = if index == diverge_at { marker } else { "same" };
-                writeln!(
-                    file,
-                    "Apr 09 06:08:{:02}.100  INFO detcore: record {index} {body}",
-                    index % 60
+                file.write_all(
+                    current_record(index % 60, &format!("DETLOG record {index} {body}")).as_bytes(),
                 )
                 .unwrap();
                 file.flush().unwrap();
@@ -743,6 +768,85 @@ mod tests {
             comparison: logdiff::LogComparisonMode::Info,
             ..Default::default()
         }
+    }
+
+    fn follow_static(left_bytes: &[u8], right_bytes: &[u8]) -> ExitStatus {
+        let directory = tempfile::tempdir().unwrap();
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+        std::fs::write(&left, left_bytes).unwrap();
+        std::fs::write(&right, right_bytes).unwrap();
+
+        let mut options = LogDiffCLIOpts::new(&left, &right);
+        options.follow = true;
+        options.canonical_info = true;
+        options.follow_interval_ms = 1;
+        options.follow_timeout_secs = 1;
+        options.follow_settle_polls = 1;
+        options.follow_two_runs(&right, &follow_options(), RecordEnvelope::all_records_v1())
+    }
+
+    #[test]
+    fn canonical_follow_compares_only_the_complete_structured_prefix() {
+        let common = current_record(1, "DETLOG common");
+        let left = format!("{common}{}", current_record(2, "DETLOG unfinished-left"));
+        let right = format!("{common}{}", current_record(2, "DETLOG unfinished-right"));
+        let status = follow_static(left.as_bytes(), right.as_bytes());
+        assert!(
+            matches!(status, ExitStatus::Exited(0)),
+            "the differing unfinished tails must be withheld, got {status:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_follow_refuses_prose_only_detlog_records() {
+        let prose = b"Apr 09 06:08:01.100  INFO detcore: DETLOG prose\n\
+Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
+        let status = follow_static(prose, prose);
+        assert!(
+            matches!(status, ExitStatus::Exited(2)),
+            "prose-only records must refuse, got {status:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_follow_refuses_invalid_utf8() {
+        let mut invalid = format!(
+            "{}{}",
+            current_record(1, "DETLOG bad-byte"),
+            current_record(2, "DETLOG unfinished")
+        )
+        .into_bytes();
+        let invalid_index = invalid
+            .windows(3)
+            .position(|window| window == b"bad")
+            .expect("fixture contains its invalidated word");
+        invalid[invalid_index] = 0xff;
+        let valid = format!(
+            "{}{}",
+            current_record(1, "DETLOG bad-byte"),
+            current_record(2, "DETLOG unfinished")
+        );
+        let status = follow_static(&invalid, valid.as_bytes());
+        assert!(
+            matches!(status, ExitStatus::Exited(2)),
+            "invalid UTF-8 must refuse, got {status:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_follow_refuses_a_terminal_truncation_marker() {
+        let complete = format!(
+            "{}{}",
+            current_record(1, "DETLOG common"),
+            current_record(2, "DETLOG unfinished")
+        );
+        let truncated = format!("{complete}{}\n", logdiff::TRUNCATION_MARKER);
+        let status = follow_static(truncated.as_bytes(), complete.as_bytes());
+        assert!(
+            matches!(status, ExitStatus::Exited(2)),
+            "a terminal truncation marker must refuse before prefix slicing, got {status:?}"
+        );
     }
 
     #[test]
