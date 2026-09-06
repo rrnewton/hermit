@@ -636,7 +636,7 @@ fn pending_json_report(
         first_divergent_syscall: None,
         first_divergent_left_message: None,
         first_divergent_right_message: None,
-        refused: false,
+        refusal_reason: None,
     };
     let mut report = json_report(&summary, options, no_records(), record_envelope);
     report.verdict = JsonVerdict::NoResult;
@@ -965,7 +965,7 @@ mod tests {
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
-            refused: false,
+            refusal_reason: None,
         };
         let records = JsonRecords {
             compared: 40,
@@ -1037,7 +1037,7 @@ mod tests {
             first_divergent_syscall: Some(3),
             first_divergent_left_message: Some("INFO detcore: left".into()),
             first_divergent_right_message: Some("INFO detcore: right".into()),
-            refused: false,
+            refusal_reason: None,
         };
         let value = serde_json::to_value(json_report(
             &summary,
@@ -1139,7 +1139,7 @@ mod tests {
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
-            refused: false,
+            refusal_reason: None,
         };
         write_json(
             &path,

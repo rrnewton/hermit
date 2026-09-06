@@ -1675,6 +1675,12 @@ fn for_each_parallel<T: Send>(
         }
     });
 }
+/// Retry only a completed product failure. Re-running a named infrastructure,
+/// prerequisite, or no-result condition duplicates evidence without changing
+/// the cause, and was doubling every affected row.
+fn retryable_cell_outcome(outcome: &str, failure_class: Option<FailureClass>) -> bool {
+    outcome == "FAIL" && failure_class == Some(FailureClass::ProductFailure)
+}
 
 fn run_with_retry<T>(
     first_attempt: u64,
@@ -1766,7 +1772,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         Err(error) => infrastructure_error_result(&attempt_context, cell, error),
                     }
                 },
-                |result| !matches!(result.outcome.as_str(), "PASS" | "HOST-INAPPLICABLE"),
+                |result| retryable_cell_outcome(&result.outcome, result.failure_class),
                 emit,
             );
         },
@@ -1806,17 +1812,14 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                     result.test,
                     result.mode,
                     result.backend.as_deref().unwrap_or("native"),
-                    result.reason.as_deref().unwrap_or("infrastructure error")
+                    result.reason_for_display()
                 );
             }
             // A FAILURE MUST SAY ENOUGH TO BE CLASSIFIED, NOT JUST COUNTED.
             let located = if result.outcome == "PASS" {
                 String::new()
             } else if result.outcome == "HOST-INAPPLICABLE" {
-                format!(
-                    " {}",
-                    result.reason.as_deref().unwrap_or("host-inapplicable")
-                )
+                format!(" {}", result.reason_for_display())
             } else {
                 let coords = [
                     ("turn", result.first_divergent_scheduler_turn),
@@ -1831,8 +1834,8 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 if !coords.is_empty() {
                     suffix.push_str(&format!(" [{}]", coords.join(" ")));
                 }
-                if let Some(reason) = result.reason.as_deref() {
-                    suffix.push_str(&format!(" {reason}"));
+                if result.outcome != "PASS" {
+                    suffix.push_str(&format!(" {}", result.reason_for_display()));
                 }
                 suffix.push_str(&format!("\n    evidence: {}", result.artifact_dir));
                 suffix
@@ -1960,6 +1963,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use hermit_manifest_plan::runner::FailureClass;
     use hermit_manifest_plan::runner::ManifestSet;
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 
@@ -1975,6 +1979,7 @@ mod tests {
     use super::for_each_parallel;
     use super::host_inapplicable_reason;
     use super::parse;
+    use super::retryable_cell_outcome;
     use super::run_with_retry;
     use super::scheduled_worker_capacity;
     use super::structured_test_results_from_rows;
@@ -2191,6 +2196,26 @@ mod tests {
         rows.sort_unstable();
         assert_eq!(rows, (0..8).map(|index| (index, index)).collect::<Vec<_>>());
         assert!(maximum.load(Ordering::SeqCst) > 1);
+    }
+    #[test]
+    fn retry_policy_retries_only_classified_product_failures() {
+        assert!(retryable_cell_outcome(
+            "FAIL",
+            Some(FailureClass::ProductFailure)
+        ));
+        for (outcome, class) in [
+            ("PASS", None),
+            ("HOST-INAPPLICABLE", None),
+            ("FAIL", None),
+            ("FAIL", Some(FailureClass::UnderstoodInfrastructureFailure)),
+            ("ERROR", Some(FailureClass::NoResult)),
+            ("ERROR", Some(FailureClass::UnderstoodPrerequisiteFailure)),
+        ] {
+            assert!(
+                !retryable_cell_outcome(outcome, class),
+                "{outcome} {class:?}"
+            );
+        }
     }
 
     #[test]
