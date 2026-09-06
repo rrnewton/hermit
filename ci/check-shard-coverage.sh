@@ -7,11 +7,11 @@
 #
 # check-shard-coverage.sh — fail-closed correspondence guard for the parallel
 # portable fan-out. Asserts that ci/portable-shards.json assigns EVERY step in
-# the committed DAG's portable label selection to exactly one job, with no overlap
+# the committed DAG's hosted-portable label selection to exactly one job, with no overlap
 # and no unknown step names:
 #
 #   union(preflight, builds, test shards, e2e, final)
-#     == { steps selected from ci/dag/validate.json by the portable label }
+#     == { steps selected from ci/dag/validate.json by the hosted-portable label }
 #
 # The immutable E2E artifact and the LiteInst producer are deliberately assigned
 # to one completed-build job after the debug and release producers. Keeping that
@@ -36,10 +36,10 @@ command -v jq >/dev/null 2>&1 || { echo "check-shard-coverage.sh: jq is required
 # inside validate, and emits its JSON as the first stdout line.
 plan_out=$(mktemp)
 trap 'rm -f "$plan_out"' EXIT
-./scripts/validate.rs portable-only --show-plan-json \
+./scripts/validate.rs --hosted-portable-only --show-plan-json \
     --skip-inner-dirty-working-tree-and-rebase-freshness-checks >"$plan_out"
 plan_json=$(sed -n '1p' "$plan_out")
-jq -e '.profile == "portable-only" and .selection_mode == "label"' \
+jq -e '.profile == "hosted-portable" and .selection_mode == "label"' \
     <<<"$plan_json" >/dev/null || {
     echo "check-shard-coverage.sh: validate did not return the full portable-only plan" >&2
     exit 2

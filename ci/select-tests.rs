@@ -223,7 +223,7 @@ impl Dag {
         for s in v["steps"].as_array().unwrap_or(&vec![]) {
             if !str_vec(&s["labels"])
                 .iter()
-                .any(|label| label == "portable")
+                .any(|label| label == "hosted-portable")
             {
                 continue;
             }
@@ -1051,7 +1051,7 @@ fn self_test() {
         "dbt-only skips strict compat cells",
         !dbt.nodes.iter().any(|node| node.starts_with("compat.")),
     );
-    check("dbt-only skips language_runtimes", !dbt.nodes.contains("e2e.manifest_language_runtimes"));
+    check("dbt-only skips language_runtimes", !dbt.nodes.contains("e2e.manifest_language_runtimes_on_host"));
     check("dbt-only is a strict subset", dbt.nodes.len() < dag.all_nodes.len());
     check("dbt-only includes preflight", dbt.nodes.contains("lint.rustfmt"));
 
