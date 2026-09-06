@@ -17,7 +17,7 @@ under-declaration.
 
 ## Current-command measurement
 
-The exact commands from `ci/dag/portable.json` were run in persistent user
+The exact commands from `ci/dag/validate.json` were run in persistent user
 systemd scopes at Hermit `58725c5778b631353ef2aff0326c187a065d7332`, with
 `MemoryAccounting=1`, `MemoryMax=16GiB`, `MemorySwapMax=0`, and
 `CARGO_BUILD_JOBS=8`. The scoped commands are unchanged through the landing

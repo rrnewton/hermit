@@ -278,7 +278,7 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 
 **Outer** — how many gates may co-run:
 
-- `resource_caps` gates *scarce* resources. `portable.json` keeps only
+- `resource_caps` gates *scarce* resources. The `portable` label keeps only
   `{"manifest_guest": 8}`. Ordinary manifest buckets use disjoint cell trees
   and request one slot after the shared build barrier. The two high-width
   buckets, `backend-parity-c` and `c-programs`, request all eight slots and pass
@@ -286,7 +286,7 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
   the measured worker width. Legacy Hermit guest gates and direct strict
   compatibility probes have no shared scarce-resource demand; they may overlap
   when dependencies, the outer scheduler width, and memory allow.
-  `privileged.json` declares no resource cap: `/dev/kvm` supports concurrent
+  The `privileged` label declares no resource cap: `/dev/kvm` supports concurrent
   guests, so its three consumers may overlap. The PMU is
   **not** a scarce resource and carries no cap: reverie
   measures retired conditional branches with per-task (`cpu = -1`) counters that
