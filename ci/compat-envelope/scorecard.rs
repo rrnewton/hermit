@@ -11921,6 +11921,7 @@ red/`measured-and-passed` count is **0**.",
         attempts: vec![SeriesAttemptDisposition {
             index: "1".into(),
             kind: SeriesNoVerdictKind::NotRun,
+            detail: None,
             attempt_outcome: "ERROR".into(),
             disposition: if timed_out {
                 SeriesOutcome::Timeout
