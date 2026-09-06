@@ -1,4 +1,8 @@
 #!/usr/bin/env -S rust-script --force
+//! ```cargo
+//! [dependencies]
+//! detcore = { package = "hermit-detcore", path = "../detcore" }
+//! ```
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
@@ -6,17 +10,20 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-//! Run one guest under two backends and report the FIRST DETLOG DIVERGENCE.
+//! Run one guest under two backends and report the first canonical INFO
+//! divergence.
 //!
 //! This is a diagnostic comparison of one run from each execution path. It does
 //! not establish L2, full parity, or repeat determinism: those require
 //! `hermit run --strict --verify --verify-strict --verify-json ...` for each
-//! in-scope backend. In particular, matching guest output is not DETLOG parity.
+//! in-scope backend. In particular, matching guest output is not canonical log
+//! parity.
 //!
 //! **The first-divergence report is the point.** A boolean ("these backends
 //! differ") is not actionable. "They agree for 157 records and then ptrace logs
 //! `openat(...) = Ok(3)` where DBT logs `openat(...) = Ok(4)`" is a bug report.
-//! So this prints the divergent pair with surrounding context from both sides.
+//! The shared `detcore::logdiff` implementation prints the divergent pair with
+//! context from both sides.
 //!
 //! ## Two things that make this harder than `hermit log-diff`
 //!
@@ -31,17 +38,18 @@
 //!    paths rather than accepting guest-forgeable or incomplete records. It
 //!    never chooses a stderr stream merely because it contains more
 //!    record-looking lines.
-//! 2. **Normalization is where fake parity gets manufactured.** Every
-//!    normalization here is opt-in except the wall-clock prefix, and every one
-//!    actually applied is listed in the output. If a lossy normalization could
-//!    hide a real difference, an apparent match is a refusal rather than rc 0.
+//! 2. **Normalization is where fake parity gets manufactured.** Comparison uses
+//!    the fixed `BitwiseInfoV1` policy from `detcore::logdiff`: remove only the
+//!    real wall-clock prefix, canonicalize explicitly marked host addresses by
+//!    first appearance, and compare every other selected byte exactly. Legacy
+//!    lossy normalization flags are recognized but refused before either run.
 //!
 //! ## Usage
 //!
 //! ```text
 //! ./scripts/cross-backend-detlog-diff.rs --backends ptrace,ptrace -- /bin/true
 //! ./scripts/cross-backend-detlog-diff.rs --backends ptrace,liteinst --detlog-heap -- ./guest arg
-//! ./scripts/cross-backend-detlog-diff.rs --normalize host-addresses,virtual-time -- ./guest
+//! ./scripts/cross-backend-detlog-diff.rs --context 3 --backends ptrace,kvm -- ./guest
 //! ./scripts/cross-backend-detlog-diff.rs --self-test
 //! ./scripts/cross-backend-detlog-diff.rs --list-normalizations
 //! ```
@@ -54,22 +62,24 @@
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
 
-use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Exact in-band line emitted by Hermit's bounded log writer at end-of-file.
-/// Keep this byte-for-byte aligned with `detcore::logdiff::TRUNCATION_MARKER`.
-const TRUNCATION_MARKER: &str = "=== HERMIT LOG TRUNCATED: reached the configured size bound \
-     (HERMIT_LOG_MAX_BYTES). Output beyond this point was DISCARDED. The run itself continued and \
-     was NOT affected. ===";
+use detcore::detlog::DetLogEvent;
+use detcore::detlog::record_suffix;
+use detcore::logdiff::BitwiseInfoV1Diagnostics;
+use detcore::logdiff::ComparisonSideLabels;
+use detcore::logdiff::LogDiffSummary;
+use detcore::logdiff::try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics;
+use detcore::logdiff::write_bitwise_info_v1_bytes;
 
-/// A normalization the caller can switch on, and the reason it is or is not
-/// safe. `default_on` is reserved for rewrites that erase something with no
-/// deterministic content at all.
+/// A historical command-line normalization name and whether the fixed
+/// `BitwiseInfoV1` policy applies it. Names that can erase deterministic
+/// content remain parse-compatible but are refused before capture.
 struct Normalization {
     name: &'static str,
     default_on: bool,
@@ -87,7 +97,7 @@ const NORMALIZATIONS: &[Normalization] = &[
     },
     Normalization {
         name: "host-addresses",
-        default_on: false,
+        default_on: true,
         what: "explicit <hostaddr 0x...> markers -> first-appearance ordinals, preserving identity and aliasing; bare hex remains exact",
         masks: None,
     },
@@ -154,10 +164,10 @@ fn usage() -> String {
          \x20 --hermit PATH           hermit binary (default: target/debug/hermit)\n\
          \x20 --detlog-stack          pass --detlog-stack to both runs\n\
          \x20 --detlog-heap           pass --detlog-heap to both runs\n\
-         \x20 --context N             records of context around the divergence (default: 5)\n\
-         \x20 --normalize LIST        comma-separated; see --list-normalizations\n\
+         \x20 --context N             completed syscalls before divergence (default: 5)\n\
+         \x20 --normalize LIST        legacy names; lossy requests refuse before capture\n\
          \x20 --keep DIR              keep the raw captured streams in DIR\n\
-         \x20 --self-test             run inert parser/normalization/selection checks\n\
+         \x20 --self-test             run inert comparison and selection checks\n\
          \x20 --list-normalizations   describe every normalization and exit\n\n\
          Backends: ptrace, dbt, liteinst, sabre, kvm. `e9patch` means\n\
          preprocessing followed by the ptrace runtime; it is not a backend.\n\
@@ -270,33 +280,6 @@ fn parse_args() -> Result<Config, String> {
     Ok(cfg)
 }
 
-fn log_was_truncated(log_text: &str) -> bool {
-    let trimmed = log_text.trim_end_matches(['\n', '\r']);
-    if !trimmed.ends_with(TRUNCATION_MARKER) {
-        return false;
-    }
-    let marker_start = trimmed.len() - TRUNCATION_MARKER.len();
-    marker_start == 0 || trimmed.as_bytes()[marker_start - 1] == b'\n'
-}
-
-fn ensure_complete_evidence(side: &str, source: &str, raw: &str) -> Result<(), String> {
-    if log_was_truncated(raw) {
-        return Err(format!(
-            "{side} authoritative {source} ends with the canonical {TRUNCATION_MARKER}; refusing to compare a retained prefix"
-        ));
-    }
-    Ok(())
-}
-
-fn ensure_complete_pair(left: &str, right: &str) -> Result<(), String> {
-    match (log_was_truncated(left), log_was_truncated(right)) {
-        (false, false) => Ok(()),
-        (true, false) => Err("left synthetic stream is truncated".into()),
-        (false, true) => Err("right synthetic stream is truncated".into()),
-        (true, true) => Err("left and right synthetic streams are truncated".into()),
-    }
-}
-
 fn select_authoritative_stream<'a>(
     side: &str,
     backend: &str,
@@ -314,22 +297,16 @@ fn select_authoritative_stream<'a>(
         ));
     }
     if from_file.is_empty() {
-        let stderr_records = stderr.lines().filter(|line| is_record(line)).count();
         return Err(format!(
-            "{side} {} produced no authoritative --log-file evidence; refusing {} guest-controllable stderr record(s)",
+            "{side} {} produced no authoritative --log-file evidence; refusing {} guest-controllable stderr byte(s)",
             backend_description(backend).unwrap_or("unknown execution path"),
-            stderr_records
+            stderr.len()
         ));
     }
-    let evidence_label = format!(
-        "{side} {}",
-        backend_description(backend).unwrap_or("unknown execution path")
-    );
-    ensure_complete_evidence(&evidence_label, "log-file", from_file)?;
     Ok(("log-file", from_file, stderr.len()))
 }
 
-/// One backend's captured deterministic trace, plus where it actually came from.
+/// One backend's authoritative captured log and its provenance.
 struct Capture {
     backend: String,
     /// "log-file" or "stderr" — which stream carried the trace.
@@ -337,15 +314,8 @@ struct Capture {
     /// Bytes seen on the other stream, so a silent split can be reported.
     other_stream_bytes: usize,
     exit_code: Option<i32>,
-    records: Vec<String>,
-}
-
-/// A DETLOG record is any line carrying a deterministic fact: a `DETLOG` entry
-/// or a scheduler `COMMIT turn`. Everything else in the trace (build chatter,
-/// backend banners, DEBUG diagnostics) is not part of the deterministic
-/// contract and is not compared.
-fn is_record(line: &str) -> bool {
-    line.contains("DETLOG") || line.contains("COMMIT turn")
+    authoritative: Vec<u8>,
+    selected_records: usize,
 }
 
 fn capture(cfg: &Config, backend: &str, side: &str, tmpdir: &Path) -> Result<Capture, String> {
@@ -404,19 +374,25 @@ fn capture(cfg: &Config, backend: &str, side: &str, tmpdir: &Path) -> Result<Cap
 
     // `--log-file` is opened by Hermit in the host namespace and is the only
     // authoritative single-run sink available here. Stderr is shared with the
-    // guest: record-looking lines there are diagnostics, never evidence. Check
-    // the COMPLETE raw authoritative stream for the anchored truncation marker
-    // before filtering it down to deterministic records.
+    // guest: record-looking lines there are diagnostics, never evidence.
     let (source, authoritative, other_bytes) =
         select_authoritative_stream(side, backend, &from_file, &stderr)?;
-    let records: Vec<String> = authoritative
-        .lines()
-        .filter(|line| is_record(line))
-        .map(str::to_string)
-        .collect();
-    if records.is_empty() {
+    let mut canonical_records = Vec::new();
+    let evidence_label = format!(
+        "{side} {}",
+        backend_description(backend).unwrap_or("unknown execution path")
+    );
+    let selected_records = write_bitwise_info_v1_bytes(
+        authoritative.as_bytes(),
+        &evidence_label,
+        &mut canonical_records,
+    )
+    .map_err(|error| {
+        format!("cannot read canonical INFO evidence for {evidence_label}: {error}")
+    })?;
+    if selected_records == 0 {
         return Err(format!(
-            "{} authoritative {source} contained no deterministic records",
+            "{} authoritative {source} contained no comparable INFO records",
             backend_description(backend).unwrap_or("unknown execution path")
         ));
     }
@@ -425,7 +401,6 @@ fn capture(cfg: &Config, backend: &str, side: &str, tmpdir: &Path) -> Result<Cap
         fs::create_dir_all(dir).map_err(|error| {
             format!("cannot create --keep directory {}: {error}", dir.display())
         })?;
-        let retained_records = records.join("\n");
         let retained = [
             (
                 dir.join(format!("{side}-{backend}.stderr")),
@@ -437,7 +412,7 @@ fn capture(cfg: &Config, backend: &str, side: &str, tmpdir: &Path) -> Result<Cap
             ),
             (
                 dir.join(format!("{side}-{backend}.records")),
-                retained_records.as_bytes(),
+                canonical_records.as_slice(),
             ),
         ];
         if let Some((path, _)) = retained.iter().find(|(path, _)| path.exists()) {
@@ -461,162 +436,20 @@ fn capture(cfg: &Config, backend: &str, side: &str, tmpdir: &Path) -> Result<Cap
         source,
         other_stream_bytes: other_bytes,
         exit_code: out.status.code(),
-        records,
+        authoritative: authoritative.as_bytes().to_vec(),
+        selected_records,
     })
-}
-
-/// Replace each distinct match of `pat` with a stable first-appearance ordinal,
-/// so identity and aliasing survive while the host-specific value does not.
-fn ordinalize(
-    line: &str,
-    seen: &mut HashMap<String, usize>,
-    prefix: &str,
-    is_start: fn(&str) -> Option<usize>,
-) -> String {
-    let bytes: Vec<char> = line.chars().collect();
-    let mut out = String::with_capacity(line.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let rest: String = bytes[i..].iter().collect();
-        if let Some(len) = is_start(&rest) {
-            let token: String = bytes[i..i + len].iter().collect();
-            let next = seen.len();
-            let id = *seen.entry(token).or_insert(next);
-            out.push_str(&format!("{prefix}{id}"));
-            i += len;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
-fn canonicalize_host_addresses(line: &str, seen: &mut HashMap<String, usize>) -> String {
-    const PREFIX: &str = "<hostaddr ";
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(start) = rest.find(PREFIX) {
-        out.push_str(&rest[..start]);
-        let candidate = &rest[start + PREFIX.len()..];
-        let Some(hex) = candidate
-            .strip_prefix("0x")
-            .or_else(|| candidate.strip_prefix("0X"))
-        else {
-            out.push_str(PREFIX);
-            rest = candidate;
-            continue;
-        };
-        let digits = hex.chars().take_while(char::is_ascii_hexdigit).count();
-        if digits == 0 || hex.as_bytes().get(digits) != Some(&b'>') {
-            out.push_str(PREFIX);
-            rest = candidate;
-            continue;
-        }
-        let token = &candidate[..2 + digits];
-        let next = seen.len() + 1;
-        let ordinal = *seen.entry(token.to_string()).or_insert(next);
-        out.push_str(&format!("<addr{ordinal}>"));
-        rest = &hex[digits + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-fn vtime_at(s: &str) -> Option<usize> {
-    // 1_767_225_600.007_940_575s
-    let b = s.as_bytes();
-    if !b[0].is_ascii_digit() {
-        return None;
-    }
-    let n = b
-        .iter()
-        .take_while(|c| c.is_ascii_digit() || **c == b'_' || **c == b'.')
-        .count();
-    if n >= 12 && b.get(n) == Some(&b's') && s[..n].contains('.') {
-        Some(n + 1)
-    } else {
-        None
-    }
-}
-
-/// Thread/process identity appears under several spellings, and they must all
-/// map to the SAME ordinal for one identity -- `dtid 3`, `dettid 3` and
-/// `DetPid(3)` are one thread, so keying the map on the spelling as well as the
-/// number would hand the same thread three different ordinals and manufacture a
-/// divergence that is not there.  Key on the NUMBER; keep the spelling intact.
-const ID_PREFIXES: &[&str] = &["dtid ", "dettid ", "DetPid(", "DetTid("];
-
-fn normalize_identities(line: &str, seen: &mut HashMap<String, usize>) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    'outer: while !rest.is_empty() {
-        for kw in ID_PREFIXES {
-            if let Some(after) = rest.strip_prefix(*kw) {
-                let n = after.chars().take_while(char::is_ascii_digit).count();
-                if n > 0 {
-                    let digits = &after[..n];
-                    let next = seen.len();
-                    let id = *seen.entry(digits.to_string()).or_insert(next);
-                    out.push_str(kw);
-                    out.push_str(&format!("#{id}"));
-                    rest = &after[n..];
-                    continue 'outer;
-                }
-            }
-        }
-        let ch = rest.chars().next().unwrap();
-        out.push(ch);
-        rest = &rest[ch.len_utf8()..];
-    }
-    out
-}
-
-fn normalize(records: &[String], enabled: &[String]) -> Vec<String> {
-    let on = |name: &str| enabled.iter().any(|e| e == name);
-    let mut addrs = HashMap::new();
-    let mut tids = HashMap::new();
-    records
-        .iter()
-        .map(|line| {
-            let mut s = line.clone();
-            if on("wall-clock") {
-                // `2026-08-06T13:38:32.654561Z  INFO ...` -> `INFO ...`
-                if let Some(idx) = s.find('Z') {
-                    let head = &s[..idx];
-                    if head.len() >= 19
-                        && head.starts_with(|c: char| c.is_ascii_digit())
-                        && head.contains('T')
-                    {
-                        s = s[idx + 1..].trim_start().to_string();
-                    }
-                }
-            }
-            if on("host-addresses") {
-                s = canonicalize_host_addresses(&s, &mut addrs);
-            }
-            if on("thread-identity") {
-                s = normalize_identities(&s, &mut tids);
-            }
-            if on("virtual-time") {
-                let mut vt = HashMap::new();
-                s = ordinalize(&s, &mut vt, "<VTIME>", vtime_at);
-                let _ = vt;
-            }
-            s
-        })
-        .collect()
 }
 
 fn print_manifest(cfg: &Config, a: &Capture, b: &Capture) {
     println!("== provenance ==");
     for c in [a, b] {
         println!(
-            "  {:<8} ({}) trace from {:<8} ({} records, {} bytes on the other stream), guest exit {}",
+            "  {:<8} ({}) trace from {:<8} ({} INFO records, {} bytes on the other stream), guest exit {}",
             c.backend,
             backend_description(&c.backend).unwrap_or("unknown execution path"),
             c.source,
-            c.records.len(),
+            c.selected_records,
             c.other_stream_bytes,
             c.exit_code
                 .map(|c| c.to_string())
@@ -667,81 +500,103 @@ fn lossy_normalizations(enabled: &[String]) -> Vec<&'static str> {
         .collect()
 }
 
-fn matching_records_refusal(enabled: &[String]) -> Option<String> {
-    let lossy = lossy_normalizations(enabled);
-    (!lossy.is_empty()).then(|| {
-        format!(
-            "selected records match only after lossy normalization(s) {}; real differences may have been erased",
+fn validate_fixed_comparison(cfg: &Config) -> Result<(), String> {
+    let lossy = lossy_normalizations(&cfg.normalize);
+    if !lossy.is_empty() {
+        return Err(format!(
+            "lossy normalization(s) {} were requested; BitwiseInfoV1 compares virtual time and thread identity exactly",
             lossy.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+struct CanonicalComparison {
+    summary: LogDiffSummary,
+    total_left: usize,
+    total_right: usize,
+    diagnostic: Vec<u8>,
+}
+
+fn compare_captures(
+    cfg: &Config,
+    left: &Capture,
+    right: &Capture,
+) -> Result<CanonicalComparison, String> {
+    let mut diagnostic = Vec::new();
+    let (summary, total_left, total_right) =
+        try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+            &left.authoritative,
+            &right.authoritative,
+            ComparisonSideLabels::new(&left.backend, &right.backend),
+            BitwiseInfoV1Diagnostics {
+                difference_limit: 1,
+                syscall_history: u64::try_from(cfg.context).unwrap_or(u64::MAX),
+                no_color: true,
+                print_logs: false,
+            },
+            &mut diagnostic,
         )
+        .map_err(|error| format!("BitwiseInfoV1 comparison failed: {error}"))?;
+    Ok(CanonicalComparison {
+        summary,
+        total_left,
+        total_right,
+        diagnostic,
     })
 }
 
-fn report_divergence(cfg: &Config, a: &Capture, b: &Capture, na: &[String], nb: &[String]) -> i32 {
-    let first = (0..na.len().min(nb.len())).find(|&i| na[i] != nb[i]);
-    let ctx = cfg.context;
+fn comparison_exit_code(summary: &LogDiffSummary) -> i32 {
+    if summary.refused || summary.compared_left == 0 || summary.compared_right == 0 {
+        2
+    } else if summary.diff_found {
+        1
+    } else if summary.matched_with_evidence() {
+        0
+    } else {
+        2
+    }
+}
 
-    match first {
-        None if na.len() == nb.len() => {
-            if let Some(reason) = matching_records_refusal(&cfg.normalize) {
-                eprintln!("\nREFUSAL: {reason}; this diagnostic cannot emit a match.");
-                return 2;
-            }
+fn report_comparison(left: &Capture, right: &Capture, comparison: &CanonicalComparison) -> i32 {
+    let summary = &comparison.summary;
+    println!(
+        "  selected INFO records: {} {} | {} {} (all parsed records: {} | {})",
+        left.backend,
+        summary.compared_left,
+        right.backend,
+        summary.compared_right,
+        comparison.total_left,
+        comparison.total_right,
+    );
+    match comparison_exit_code(summary) {
+        0 => {
             println!(
-                "\nDIAGNOSTIC MATCH: {} selected records compared.",
-                na.len()
+                "\nDIAGNOSTIC MATCH: {} selected INFO records compared.",
+                summary.compared_left
             );
             0
         }
-        None => {
-            // One is a strict prefix of the other.
-            let (short, long, si, li) = if na.len() < nb.len() {
-                (a, b, na.len(), nb.len())
-            } else {
-                (b, a, nb.len(), na.len())
-            };
-            println!(
-                "\nFIRST DIVERGENCE: streams agree for all {si} records, then {} ENDS while {} \
-                 continues to {li}.",
-                short.backend, long.backend
-            );
-            let longer = if na.len() < nb.len() { nb } else { na };
-            println!("\n  next records only {} produced:", long.backend);
-            for line in longer.iter().skip(si).take(ctx) {
-                println!("    + {line}");
+        1 => {
+            match summary.first_divergent_record {
+                Some(record) => println!("\nFIRST DIVERGENCE at 1-based log record {record}."),
+                None => println!("\nFIRST DIVERGENCE: the selected INFO streams differ."),
             }
+            println!(
+                "  Only the FIRST divergence is meaningful; everything after it is downstream."
+            );
             1
         }
-        Some(i) => {
-            println!(
-                "\nFIRST DIVERGENCE at record index {i} (1-based record {}).",
-                i + 1
-            );
-            println!(
-                "  {} records: {} | {} records: {}",
-                a.backend,
-                na.len(),
-                b.backend,
-                nb.len()
-            );
-            println!("\n  context (identical in both):");
-            for (j, line) in na.iter().enumerate().take(i).skip(i.saturating_sub(ctx)) {
-                println!("    {j:>6} | {line}");
+        _ => {
+            if summary.refused {
+                eprintln!("\nREFUSAL: a captured log is truncated; no result was produced.");
+            } else {
+                eprintln!(
+                    "\nREFUSAL: the comparison selected {} | {} INFO records; both sides must contain evidence.",
+                    summary.compared_left, summary.compared_right
+                );
             }
-            println!("\n  >>> divergent record {i}:");
-            println!("    - {:<8} {}", a.backend, na[i]);
-            println!("    + {:<8} {}", b.backend, nb[i]);
-            println!("\n  following context (already downstream of the divergence):");
-            for j in (i + 1)..(i + 1 + ctx) {
-                let l = na.get(j).map(String::as_str).unwrap_or("<end>");
-                let r = nb.get(j).map(String::as_str).unwrap_or("<end>");
-                println!("    {j:>6} - {}", l);
-                println!("    {j:>6} + {}", r);
-            }
-            println!(
-                "\n  Only the FIRST divergence is meaningful; everything after it is downstream."
-            );
-            1
+            2
         }
     }
 }
@@ -770,6 +625,11 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    if let Err(error) = validate_fixed_comparison(&cfg) {
+        eprintln!("cross-backend-detlog-diff: {error}");
+        std::process::exit(2);
+    }
 
     if !cfg.hermit.exists() {
         eprintln!(
@@ -842,21 +702,30 @@ fn main() {
     let (a, b) = (&captures[0], &captures[1]);
 
     println!(
-        "cross-backend DETLOG diff: {} vs {}  guest: {}",
+        "cross-backend canonical INFO diff: {} vs {}  guest: {}",
         a.backend,
         b.backend,
         cfg.guest.join(" ")
     );
     print_manifest(&cfg, a, b);
 
-    for c in [a, b] {
-        if c.records.is_empty() {
-            eprintln!(
-                "\ncross-backend-detlog-diff: {} produced NO deterministic records on either \
-                 stream; there is nothing to compare. Check that the run succeeded and that the \
-                 backend is available in this build.",
-                c.backend
-            );
+    let comparison = match compare_captures(&cfg, a, b) {
+        Ok(comparison) => comparison,
+        Err(error) => {
+            eprintln!("\ncross-backend-detlog-diff: {error}; no result was produced");
+            if let Err(cleanup) = fs::remove_dir_all(&tmpdir) {
+                eprintln!(
+                    "cross-backend-detlog-diff: warning: could not remove scratch dir {}: {cleanup}",
+                    tmpdir.display()
+                );
+            }
+            std::process::exit(2);
+        }
+    };
+    {
+        let mut stdout = std::io::stdout().lock();
+        if let Err(error) = stdout.write_all(&comparison.diagnostic) {
+            eprintln!("cross-backend-detlog-diff: cannot write comparison report: {error}");
             if let Err(cleanup) = fs::remove_dir_all(&tmpdir) {
                 eprintln!(
                     "cross-backend-detlog-diff: warning: could not remove scratch dir {}: {cleanup}",
@@ -867,9 +736,7 @@ fn main() {
         }
     }
 
-    let na = normalize(&a.records, &cfg.normalize);
-    let nb = normalize(&b.records, &cfg.normalize);
-    let code = report_divergence(&cfg, a, b, &na, &nb);
+    let code = report_comparison(a, b, &comparison);
     if let Err(error) = fs::remove_dir_all(&tmpdir) {
         eprintln!(
             "cross-backend-detlog-diff: warning: could not remove scratch dir {}: {error}",
@@ -916,46 +783,86 @@ fn run_self_test() {
         "e9patch was presented as an independent backend",
     );
 
-    let record = "2026-08-06T13:38:32.654561Z INFO DETLOG dettid 9 brk=0xabcdef01";
-    check(is_record(record), "DETLOG line was not selected");
+    let structured_record = |second: usize, body: &str| {
+        format!(
+            "2026-08-06T13:38:{second:02}.654561Z INFO detcore: {body}{}\n",
+            record_suffix(DetLogEvent::Other)
+        )
+    };
+    let left = structured_record(1, "DETLOG address=<hostaddr 0x111111>");
+    let right = structured_record(1, "DETLOG address=<hostaddr 0xaaaaaa>");
+    let mut diagnostic = Vec::new();
+    let (matched, total_left, total_right) =
+        try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+            left.as_bytes(),
+            right.as_bytes(),
+            ComparisonSideLabels::new("left", "right"),
+            BitwiseInfoV1Diagnostics {
+                difference_limit: 1,
+                syscall_history: 1,
+                no_color: true,
+                print_logs: false,
+            },
+            &mut diagnostic,
+        )
+        .expect("shared canonical comparison should parse current records");
     check(
-        !is_record("INFO build chatter"),
-        "non-DETLOG line was selected",
+        matched.matched_with_evidence()
+            && matched.compared_left == 1
+            && matched.compared_right == 1
+            && total_left == 1
+            && total_right == 1,
+        "shared canonical comparison did not match ordinal-equivalent addresses",
     );
-    let normalized = normalize(&[record.to_string()], &["wall-clock".into()]);
     check(
-        normalized == ["INFO DETLOG dettid 9 brk=0xabcdef01"],
-        "default normalization changed more than the wall-clock prefix",
+        comparison_exit_code(&matched) == 0,
+        "shared canonical match did not produce exit 0",
     );
 
-    let complete = "INFO detcore: DETLOG complete";
-    let truncated = format!("{complete}\n{TRUNCATION_MARKER}\n");
+    let different = structured_record(1, "DETLOG value=2");
+    let (diverged, _, _) = try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+        left.as_bytes(),
+        different.as_bytes(),
+        ComparisonSideLabels::new("left", "right"),
+        BitwiseInfoV1Diagnostics {
+            difference_limit: 1,
+            syscall_history: 1,
+            no_color: true,
+            print_logs: false,
+        },
+        &mut Vec::new(),
+    )
+    .expect("shared canonical comparison should report a divergence");
     check(
-        log_was_truncated(&truncated),
-        "canonical end-of-file truncation marker was not detected",
+        diverged.diff_found && diverged.first_divergent_record == Some(1),
+        "shared comparator did not report the first divergent record",
     );
     check(
-        !log_was_truncated(&format!(
-            "INFO detcore: DETLOG guest quoted {TRUNCATION_MARKER}"
-        )),
-        "guest-controlled marker text on a prefixed line triggered truncation",
+        comparison_exit_code(&diverged) == 1,
+        "shared canonical divergence did not produce exit 1",
     );
+
+    let truncated = format!("{left}{}\n", detcore::logdiff::TRUNCATION_MARKER);
+    let (refused, _, _) = try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+        truncated.as_bytes(),
+        right.as_bytes(),
+        ComparisonSideLabels::new("left", "right"),
+        BitwiseInfoV1Diagnostics::default(),
+        &mut Vec::new(),
+    )
+    .expect("truncation is a typed refusal, not a parser error");
     check(
-        !log_was_truncated(&format!("{TRUNCATION_MARKER}\ntrailing data")),
-        "non-terminal marker triggered truncation",
+        refused.refused && comparison_exit_code(&refused) == 2,
+        "shared comparator did not refuse a truncated input",
     );
+
+    let mut rendered = Vec::new();
+    let rendered_count = write_bitwise_info_v1_bytes(left.as_bytes(), "left", &mut rendered)
+        .expect("shared canonical renderer should accept current records");
+    let rendered = String::from_utf8(rendered).expect("canonical INFO is UTF-8");
     check(
-        ensure_complete_pair(&truncated, complete).is_err_and(|error| error.starts_with("left ")),
-        "one-sided left truncation did not identify and refuse the left side",
-    );
-    check(
-        ensure_complete_pair(complete, &truncated).is_err_and(|error| error.starts_with("right ")),
-        "one-sided right truncation did not identify and refuse the right side",
-    );
-    check(
-        ensure_complete_pair(&truncated, &truncated)
-            .is_err_and(|error| error.starts_with("left and right ")),
-        "two-sided truncation did not identify and refuse both sides",
+        rendered_count == 1 && rendered.contains("<addr1>") && !rendered.contains("0x111111"),
+        "shared canonical renderer did not ordinalize the marked host address",
     );
 
     let authoritative = "INFO detcore: DETLOG authoritative";
@@ -1002,53 +909,51 @@ fn run_self_test() {
         "empty authoritative evidence did not refuse",
     );
 
-    let marked_left = normalize(
-        &["INFO DETLOG marked=<hostaddr 0x111111> bare=0xabcdef01".into()],
-        &["host-addresses".into()],
-    );
-    let marked_right = normalize(
-        &["INFO DETLOG marked=<hostaddr 0xaaaaaa> bare=0xabcdef01".into()],
-        &["host-addresses".into()],
-    );
+    let compare = |left: &str, right: &str| {
+        try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
+            left.as_bytes(),
+            right.as_bytes(),
+            ComparisonSideLabels::new("left", "right"),
+            BitwiseInfoV1Diagnostics::default(),
+            &mut Vec::new(),
+        )
+        .expect("shared canonical comparison should accept current records")
+        .0
+    };
+    let bare_left = structured_record(2, "DETLOG result=0xabcdef01");
+    let bare_right = structured_record(2, "DETLOG result=0xabcdef02");
     check(
-        marked_left == marked_right && marked_left[0].contains("<addr1>"),
-        "explicit host-address markers did not canonicalize by ordinal",
-    );
-    let bare_left = normalize(
-        &["INFO DETLOG result=0xabcdef01".into()],
-        &["host-addresses".into()],
-    );
-    let bare_right = normalize(
-        &["INFO DETLOG result=0xabcdef02".into()],
-        &["host-addresses".into()],
-    );
-    check(
-        bare_left != bare_right,
+        compare(&bare_left, &bare_right).diff_found,
         "meaningful bare hexadecimal difference was erased",
     );
-    let alias_left = normalize(
-        &["INFO DETLOG pair=<hostaddr 0x111111>,<hostaddr 0x111111>".into()],
-        &["host-addresses".into()],
-    );
-    let alias_right = normalize(
-        &["INFO DETLOG pair=<hostaddr 0xaaaaaa>,<hostaddr 0xbbbbbb>".into()],
-        &["host-addresses".into()],
-    );
+    let alias_left = structured_record(3, "DETLOG pair=<hostaddr 0x111111>,<hostaddr 0x111111>");
+    let alias_right = structured_record(3, "DETLOG pair=<hostaddr 0xaaaaaa>,<hostaddr 0xbbbbbb>");
     check(
-        alias_left != alias_right,
+        compare(&alias_left, &alias_right).diff_found,
         "host-address canonicalization erased an aliasing difference",
     );
+
+    let fixed = Config {
+        hermit: PathBuf::from("target/debug/hermit"),
+        backends: vec!["ptrace".into(), "ptrace".into()],
+        guest: vec!["/bin/true".into()],
+        detlog_stack: false,
+        detlog_heap: false,
+        context: 5,
+        normalize: vec!["wall-clock".into(), "host-addresses".into()],
+        keep: None,
+    };
     check(
-        matching_records_refusal(&["wall-clock".into(), "virtual-time".into()]).is_some(),
-        "virtual-time-normalized equality could emit a match",
+        validate_fixed_comparison(&fixed).is_ok(),
+        "fixed canonical normalizations were refused",
     );
+    let lossy = Config {
+        normalize: vec!["wall-clock".into(), "virtual-time".into()],
+        ..fixed
+    };
     check(
-        matching_records_refusal(&["thread-identity".into()]).is_some(),
-        "thread-identity-normalized equality could emit a match",
-    );
-    check(
-        matching_records_refusal(&["wall-clock".into(), "host-addresses".into()]).is_none(),
-        "canonical-only normalization was incorrectly classified as lossy",
+        validate_fixed_comparison(&lossy).is_err(),
+        "lossy virtual-time normalization was not refused before capture",
     );
 
     if failures.is_empty() {
