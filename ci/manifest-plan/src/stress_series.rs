@@ -326,7 +326,7 @@ impl SeriesRow {
             self.validate_host_facts()?;
         }
         if self.schema == SeriesSchema::V3 {
-            self.validate_classification()?;
+            self.validate_recorded_classification()?;
         }
         Ok(())
     }
@@ -345,7 +345,7 @@ impl SeriesRow {
         }
         self.validate_host_facts()?;
         if self.schema == SeriesSchema::V3 {
-            self.validate_classification()?;
+            self.validate_recorded_classification()?;
         }
         if self.series.source_tree_dirty {
             return Err(
@@ -816,7 +816,7 @@ impl SeriesRow {
                 | (
                     SeriesOutcome::NoResult,
                     Some(ObservedResult::Oom),
-                    Some(FailureClass::NoResult)
+                    Some(FailureClass::UnderstoodInfrastructureFailure)
                 )
                 | (
                     SeriesOutcome::Errored,
@@ -840,6 +840,24 @@ impl SeriesRow {
                 self.series.failure_class
             ))
         }
+    }
+
+    fn validate_recorded_classification(&self) -> Result<(), String> {
+        // Retained v3 rows written before OOM received its existing
+        // infrastructure classification used no_result. Keep those rows
+        // readable, while validate_for_write requires the current tuple.
+        if (
+            self.series.outcome,
+            self.series.result,
+            self.series.failure_class,
+        ) == (
+            SeriesOutcome::NoResult,
+            Some(ObservedResult::Oom),
+            Some(FailureClass::NoResult),
+        ) {
+            return Ok(());
+        }
+        self.validate_classification()
     }
 }
 
@@ -1118,6 +1136,27 @@ mod tests {
             retained_v2.validate_for_write().unwrap_err(),
             "new rows must use stress-series/v3, got stress-series/v2"
         );
+    }
+
+    #[test]
+    fn current_oom_uses_the_existing_infrastructure_class() {
+        let mut oom = row(SeriesSchema::V3);
+        oom.series.outcome = SeriesOutcome::NoResult;
+        oom.series.result = Some(ObservedResult::Oom);
+        oom.series.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+        oom.validate_classification().unwrap();
+
+        oom.series.failure_class = Some(FailureClass::NoResult);
+        assert!(
+            oom.validate_classification()
+                .unwrap_err()
+                .contains("classification mismatch")
+        );
+        oom.validate_for_read().unwrap();
+        oom.validate_for_projection().unwrap();
+        oom.validate_for_write().unwrap_err();
+
+        no_verdict_row().validate_classification().unwrap();
     }
 
     #[test]

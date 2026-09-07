@@ -1009,7 +1009,8 @@ impl ObservedResult {
             | Self::ParityFailure
             | Self::ReplayFailure
             | Self::CrashError => Some(FailureClass::ProductFailure),
-            Self::Timeout | Self::Oom => Some(FailureClass::NoResult),
+            Self::Timeout => Some(FailureClass::NoResult),
+            Self::Oom => Some(FailureClass::UnderstoodInfrastructureFailure),
         }
     }
 }
@@ -1312,6 +1313,14 @@ impl CellResult {
     /// names retained rows written before they existed. Current publication is
     /// stricter: every result is recorded, and every non-pass is attributed.
     pub fn require_current_classification(&self) -> Result<(), String> {
+        if self.result == Some(ObservedResult::Oom)
+            && self.failure_class != Some(FailureClass::UnderstoodInfrastructureFailure)
+        {
+            return Err(format!(
+                "result=oom requires failure_class=understood_infrastructure_failure, got {:?}",
+                self.failure_class
+            ));
+        }
         match self.outcome.as_str() {
             "PASS" => {
                 if self.result != Some(ObservedResult::Pass)
@@ -1365,9 +1374,10 @@ impl CellResult {
                         | FailureClass::NoResult,
                     ),
                 )
+                | (Some(ObservedResult::Timeout), Some(FailureClass::NoResult))
                 | (
-                    Some(ObservedResult::Timeout | ObservedResult::Oom),
-                    Some(FailureClass::NoResult),
+                    Some(ObservedResult::Oom),
+                    Some(FailureClass::UnderstoodInfrastructureFailure),
                 ) => {}
                 other => {
                     return Err(format!(
@@ -1417,6 +1427,16 @@ impl CellResult {
     /// absence, but validate any row that carries either half of the contract.
     pub fn validate_recorded_classification(&self) -> Result<(), String> {
         if self.result.is_none() && self.failure_class.is_none() {
+            return Ok(());
+        }
+        if matches!(self.outcome.as_str(), "FAIL" | "ERROR")
+            && self.result == Some(ObservedResult::Oom)
+            && self.failure_class == Some(FailureClass::NoResult)
+            && !matches!(
+                self.error_kind.as_deref(),
+                Some("cpu-timeout" | "wall-timeout" | "cancelled")
+            )
+        {
             return Ok(());
         }
         self.require_current_classification()
@@ -3136,7 +3156,11 @@ fn failure_class(
     if outcome == "HOST-INAPPLICABLE" {
         Some(FailureClass::UnderstoodPrerequisiteFailure)
     } else {
-        Some(FailureClass::NoResult)
+        // A current non-pass that reached this branch has neither an explicit
+        // no-result kind nor a product observation. That is a framework
+        // classification failure, which is an identified infrastructure
+        // failure rather than an absence of evidence.
+        Some(FailureClass::UnderstoodInfrastructureFailure)
     }
 }
 
@@ -6732,6 +6756,27 @@ backends_disabled:
         timeout.failure_class = Some(FailureClass::NoResult);
         timeout.error_kind = Some("cpu-timeout".into());
         timeout.require_current_classification().unwrap();
+
+        let mut oom = cell_result_that_located_nothing();
+        oom.outcome = "ERROR".into();
+        oom.result = Some(ObservedResult::Oom);
+        oom.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+        oom.error_kind = Some("infrastructure".into());
+        oom.require_current_classification().unwrap();
+        oom.failure_class = Some(FailureClass::NoResult);
+        oom.validate_recorded_classification().unwrap();
+        assert!(
+            oom.require_current_classification()
+                .unwrap_err()
+                .contains("requires failure_class")
+        );
+
+        oom.error_kind = Some("cpu-timeout".into());
+        assert!(
+            oom.validate_recorded_classification()
+                .unwrap_err()
+                .contains("requires failure_class")
+        );
     }
 
     #[test]
@@ -6909,7 +6954,7 @@ backends_disabled:
                 "contradictory-cancellation",
                 "ERROR",
                 Some(observed),
-                Some(FailureClass::NoResult),
+                observed.failure_class(),
                 Some("cancelled"),
                 Some("cancelled by signal 15"),
             );
@@ -7008,6 +7053,43 @@ backends_disabled:
                 invalid_evidence.error_kind.as_deref()
             ),
             Some(FailureClass::NoResult)
+        );
+    }
+
+    #[test]
+    fn oom_and_unclassified_nonpass_use_the_existing_infrastructure_class() {
+        assert_eq!(
+            ObservedResult::Oom.failure_class(),
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+        assert_eq!(
+            failure_class("ERROR", None, None),
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+        assert_eq!(
+            failure_class("ERROR", None, Some("future-runner-error")),
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+
+        assert_eq!(
+            failure_class("ERROR", None, Some("incomplete-verification-evidence")),
+            Some(FailureClass::NoResult),
+            "explicitly absent or unusable evidence remains no-result"
+        );
+        assert_eq!(
+            failure_class("FAIL", Some(ObservedResult::CrashError), None),
+            Some(FailureClass::ProductFailure),
+            "a completed unclassified process failure remains product-attributed"
+        );
+        assert_eq!(
+            failure_class("ERROR", None, Some("infrastructure")),
+            Some(FailureClass::UnderstoodInfrastructureFailure),
+            "an explicitly classified infrastructure failure is unchanged"
+        );
+        assert_eq!(
+            failure_class("HOST-INAPPLICABLE", None, None),
+            Some(FailureClass::UnderstoodPrerequisiteFailure),
+            "host inapplicability remains a prerequisite failure"
         );
     }
 

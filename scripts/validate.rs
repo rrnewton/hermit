@@ -8735,6 +8735,19 @@ fn test_results_have_product_failure(results: Option<&[TestResult]>) -> bool {
     })
 }
 
+fn test_results_have_infrastructure_failure(results: Option<&[TestResult]>) -> bool {
+    results.is_some_and(|results| {
+        results.iter().any(|result| {
+            !result.passed
+                && result.attempt_results.as_ref().is_some_and(|attempts| {
+                    attempts
+                        .iter()
+                        .any(|attempt| attempt.outcome == TestAttemptOutcome::InfrastructureError)
+                })
+        })
+    })
+}
+
 fn test_results_have_no_result(results: Option<&[TestResult]>) -> bool {
     results.is_some_and(|results| {
         results.iter().any(|result| {
@@ -10404,6 +10417,12 @@ fn terminal_test_cause_details(outcomes: &[StepOutcome], attempts: &[NodeAttempt
                 "node {}: structured test results refused: {error}",
                 outcome.tag
             ));
+        } else if outcome_is_oom(outcome)
+            && outcome_failure_class(outcome) == Some(FailureClass::UnderstoodInfrastructureFailure)
+        {
+            if let Some(reason) = primary_reason {
+                detail.push(format!("node {}: {reason}", outcome.tag));
+            }
         }
         let results = recorded_attempt
             .and_then(|attempt| attempt.test_results.as_deref())
@@ -10458,15 +10477,26 @@ fn attempt_is_failure(attempt: &NodeAttempt) -> bool {
 fn outcome_failure_class(outcome: &StepOutcome) -> Option<FailureClass> {
     if outcome.ok || outcome.aborted {
         None
+    } else if test_results_have_product_failure(outcome.test_results.as_deref()) {
+        Some(FailureClass::ProductFailure)
+    } else if outcome_is_oom(outcome) {
+        Some(FailureClass::UnderstoodInfrastructureFailure)
+    } else if test_results_have_infrastructure_failure(outcome.test_results.as_deref()) {
+        Some(FailureClass::UnderstoodInfrastructureFailure)
     } else if outcome_is_no_result(outcome)
         || outcome.returncode.is_none()
         || outcome_hit_its_budget(outcome)
-        || reason_is_oom(&outcome.reason)
     {
         Some(FailureClass::NoResult)
     } else {
         Some(FailureClass::ProductFailure)
     }
+}
+
+fn failure_detail_for_class(failure_class: FailureClass, reason: &str) -> Option<&str> {
+    matches!(failure_class, FailureClass::NoResult | FailureClass::UnderstoodInfrastructureFailure)
+        .then_some(reason)
+        .filter(|detail| !detail.is_empty())
 }
 
 fn terminal_attempt<'a>(outcome: &StepOutcome, attempts: &'a [NodeAttempt]) -> Option<&'a NodeAttempt> {
@@ -10500,15 +10530,18 @@ fn step_test_attempt_outcome(outcome: &StepOutcome) -> TestAttemptOutcome {
         TestAttemptOutcome::Cancelled
     } else if test_results_have_product_failure(outcome.test_results.as_deref()) {
         TestAttemptOutcome::Failed
+    } else if outcome_is_oom(outcome) {
+        TestAttemptOutcome::InfrastructureError
     } else if outcome.cpu_timed_out {
         TestAttemptOutcome::CpuTimeout
     } else if outcome.timed_out {
         TestAttemptOutcome::WallTimeout
     } else if outcome.test_results_error.is_some() {
         TestAttemptOutcome::InfrastructureError
+    } else if test_results_have_infrastructure_failure(outcome.test_results.as_deref()) {
+        TestAttemptOutcome::InfrastructureError
     } else if outcome_is_no_result(outcome)
         || outcome.returncode.is_none()
-        || reason_is_oom(&outcome.reason)
     {
         TestAttemptOutcome::NoResult
     } else {
@@ -10534,9 +10567,9 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
         retry_detail: None,
         environmental_class: None,
         detail_observed: false,
-        failure_detail: (failure_class == Some(FailureClass::NoResult)
-            && !outcome.reason.is_empty())
-            .then(|| outcome.reason.clone()),
+        failure_detail: failure_class
+            .and_then(|class| failure_detail_for_class(class, &outcome.reason))
+            .map(str::to_string),
         failure_class,
         test_results: outcome.test_results.clone(),
         test_results_error: outcome.test_results_error.clone(),
@@ -13145,9 +13178,14 @@ fn reason_is_budget_breach(reason: &str) -> bool {
 
 /// The OOM spelling is produced by dagrun's `step_failure_reason`. Keep the
 /// exact owned prefix beside the timeout predicate so a resource exhaustion is
-/// recorded as `no_result` without an outer reader interpreting prose.
+/// attributed through the existing infrastructure class without a broad
+/// substring match.
 fn reason_is_oom(reason: &str) -> bool {
     reason.starts_with("OOM-KILLED (hit inner MemoryMax;")
+}
+
+fn outcome_is_oom(outcome: &StepOutcome) -> bool {
+    outcome.oomed || reason_is_oom(&outcome.reason)
 }
 
 /// Pin the budget-breach predicate to the PRODUCER, not to a copy of its text.
@@ -14692,8 +14730,8 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
     }
     if let Some(failure_class) = outcome_failure_class(outcome) {
         gate["failure_class"] = serde_json::json!(failure_class);
-        if failure_class == FailureClass::NoResult && !outcome.reason.is_empty() {
-            gate["failure_detail"] = serde_json::json!(outcome.reason);
+        if let Some(detail) = failure_detail_for_class(failure_class, &outcome.reason) {
+            gate["failure_detail"] = serde_json::json!(detail);
         }
     }
     set_gate_failure_evidence(&mut gate, outcome_is_failure(outcome));
@@ -14829,6 +14867,34 @@ fn typed_test_cause_propagation_bracket() -> Result<(), String> {
             ),
         ),
         (
+            TestAttemptOutcome::InfrastructureError,
+            "unclassified_nonpass",
+            Verdict::NoResult,
+            FinalValidateStatus::CouldNotRun,
+            cell(
+                "unclassified_nonpass",
+                "ERROR",
+                None,
+                FailureClass::UnderstoodInfrastructureFailure,
+                "future-runner-error",
+                "runner reached an otherwise-unclassified nonpass",
+            ),
+        ),
+        (
+            TestAttemptOutcome::InfrastructureError,
+            "oom",
+            Verdict::NoResult,
+            FinalValidateStatus::CouldNotRun,
+            cell(
+                "oom",
+                "ERROR",
+                Some(ObservedResult::Oom),
+                FailureClass::UnderstoodInfrastructureFailure,
+                "infrastructure",
+                "cell exceeded its inner MemoryMax",
+            ),
+        ),
+        (
             TestAttemptOutcome::NoResult,
             "no_result",
             Verdict::NoResult,
@@ -14888,11 +14954,22 @@ fn typed_test_cause_propagation_bracket() -> Result<(), String> {
         } else {
             "no_result"
         };
+        let expected_failure_class = match attempt_outcome {
+            TestAttemptOutcome::Failed => FailureClass::ProductFailure,
+            TestAttemptOutcome::InfrastructureError => {
+                FailureClass::UnderstoodInfrastructureFailure
+            }
+            _ => FailureClass::NoResult,
+        };
+        let expected_attempt_outcome = test_attempt_outcome_name(attempt_outcome);
         let gate = ledger_gate_with_attempts(&outcome, std::slice::from_ref(&attempt));
         if gate["result"] != expected_ledger_result
-            || gate["test_results"][0]["attempt_results"][0]["outcome"] != name
+            || gate["failure_class"] != expected_failure_class.as_str()
+            || gate["attempts"][0]["failure_class"] != expected_failure_class.as_str()
+            || gate["test_results"][0]["attempt_results"][0]["outcome"]
+                != expected_attempt_outcome
             || gate["attempts"][0]["test_results"][0]["attempt_results"][0]["outcome"]
-                != name
+                != expected_attempt_outcome
         {
             return Err(format!(
                 "typed test causes: {name} did not survive into both ledger views: {gate}"
@@ -14904,7 +14981,7 @@ fn typed_test_cause_propagation_bracket() -> Result<(), String> {
         );
         let detail = typed_attempt.detail.as_deref().unwrap();
         let expected_cause = format!(
-            "node test.typed-cause test fixture::{name} [kvm/verify] attempt 1: {name}: {detail}"
+            "node test.typed-cause test fixture::{name} [kvm/verify] attempt 1: {expected_attempt_outcome}: {detail}"
         );
         if cause != [expected_cause.clone()] {
             return Err(format!(
@@ -15085,6 +15162,34 @@ fn typed_test_cause_propagation_bracket() -> Result<(), String> {
         ));
     }
 
+    let mixed_infrastructure = TestResult::with_attempt_results(
+        "fixture::mixed-infrastructure [kvm/verify]".into(),
+        false,
+        vec![
+            TestAttemptResult::new(
+                1,
+                TestAttemptOutcome::Failed,
+                Some("attempt 1 guest exited 7".into()),
+            )?,
+            TestAttemptResult::new(
+                2,
+                TestAttemptOutcome::InfrastructureError,
+                Some("attempt 2 cpu.stat was unreadable".into()),
+            )?,
+        ],
+    )?;
+    let mut mixed_infrastructure_outcome = mixed_outcome.clone();
+    mixed_infrastructure_outcome.tag = "test.mixed-infrastructure".into();
+    mixed_infrastructure_outcome.oomed = true;
+    mixed_infrastructure_outcome.oom_kills = 1;
+    mixed_infrastructure_outcome.test_results = Some(vec![mixed_infrastructure]);
+    if outcome_failure_class(&mixed_infrastructure_outcome)
+        != Some(FailureClass::ProductFailure)
+        || step_test_attempt_outcome(&mixed_infrastructure_outcome) != TestAttemptOutcome::Failed
+    {
+        return Err("typed test causes: product evidence lost precedence over infrastructure and OOM observations".into());
+    }
+
     let recovered = TestResult::with_attempt_results(
         "fixture::recovered [kvm/verify]".into(),
         true,
@@ -15253,11 +15358,103 @@ fn typed_test_cause_propagation_bracket() -> Result<(), String> {
         }
     }
 
+    let oom_reason = dagrun::model::step_failure_reason(
+        Some(-9),
+        true,
+        2,
+        false,
+        57,
+        false,
+        None,
+        &[],
+        false,
+        22,
+        1,
+        1.0,
+        "",
+    );
+    let oom_outcome = StepOutcome {
+        tag: "test.outer-oom".into(),
+        ok: false,
+        duration_s: 1.0,
+        summary: String::new(),
+        executed_tests: None,
+        filtered_tests: None,
+        test_results: None,
+        test_results_error: None,
+        returncode: Some(-9),
+        oomed: true,
+        oom_kills: 2,
+        timed_out: false,
+        cpu_timed_out: false,
+        reason: oom_reason.clone(),
+        aborted: false,
+    };
+    if outcome_is_failure(&oom_outcome)
+        || !outcome_is_no_result(&oom_outcome)
+        || outcome_failure_class(&oom_outcome)
+            != Some(FailureClass::UnderstoodInfrastructureFailure)
+        || step_test_attempt_outcome(&oom_outcome) != TestAttemptOutcome::InfrastructureError
+    {
+        return Err("typed test causes: OOM did not retain its infrastructure classification".into());
+    }
+    let oom_attempt = reported_attempt(&oom_outcome, 1);
+    let oom_gate = ledger_gate_with_attempts(
+        &oom_outcome,
+        std::slice::from_ref(&oom_attempt),
+    );
+    if oom_gate["result"] != "no_result"
+        || oom_gate["failure_class"] != "understood_infrastructure_failure"
+        || oom_gate["failure_detail"] != oom_reason
+        || oom_gate["attempts"][0]["failure_class"]
+            != "understood_infrastructure_failure"
+        || oom_gate["attempts"][0]["failure_detail"] != oom_reason
+    {
+        return Err(format!(
+            "typed test causes: OOM lost its class or exact detail in the ledger: {oom_gate}"
+        ));
+    }
+    let oom_detail = terminal_test_cause_details(
+        std::slice::from_ref(&oom_outcome),
+        std::slice::from_ref(&oom_attempt),
+    );
+    let expected_oom_detail = format!("node test.outer-oom: {oom_reason}");
+    if oom_detail != [expected_oom_detail.clone()] {
+        return Err(format!(
+            "typed test causes: OOM lost its exact terminal detail: {oom_detail:?}"
+        ));
+    }
+    let mut oom_summary = RunSummary::new(
+        Verdict::NoResult,
+        COULD_NOT_RUN_EXIT_CODE,
+        "self-test",
+        oom_detail,
+    );
+    oom_summary.commit = "0123456789012345678901234567890123456789".into();
+    oom_summary.nodes_executed = 1;
+    oom_summary.selection_mode = Some("full".into());
+    let oom_path = directory.path().join("outer-oom.json");
+    write_validation_service_result(&oom_path, &oom_summary)?;
+    let oom_service = ValidationServiceResult::from_json_slice(
+        &std::fs::read(&oom_path)
+            .map_err(|error| format!("typed test causes: cannot read OOM result: {error}"))?,
+    )?;
+    if oom_service.final_validate_status != FinalValidateStatus::CouldNotRun
+        || oom_service.detail.as_deref() != Some([expected_oom_detail.clone()].as_slice())
+        || !run_summary_lines(&oom_summary, std::time::Instant::now())
+            .iter()
+            .any(|line| line == &format!("   {expected_oom_detail}"))
+    {
+        return Err(format!(
+            "typed test causes: OOM lost its cause in service or terminal output: {oom_service:?}"
+        ));
+    }
+
     if distinct_results.len() != case_count {
         return Err("typed test causes: mutating the cause did not change every service result".into());
     }
     println!(
-        "  typed test causes: ordinary failure, CPU timeout, wall timeout, cancellation, infrastructure error, no_result, and timeout-plus-evidence collisions survive CellResult JSONL through ledger, service JSON, and terminal output"
+        "  typed test causes: ordinary failure, CPU timeout, wall timeout, cancellation, infrastructure error, OOM, no_result, and timeout-plus-evidence collisions survive CellResult JSONL through ledger, service JSON, and terminal output"
     );
     Ok(())
 }
