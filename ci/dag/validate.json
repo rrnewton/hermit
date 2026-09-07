@@ -913,6 +913,12 @@
           "test": "applications/timed-progress-bar",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_applications"
         }
       ],
       "deps": [
@@ -2212,6 +2218,12 @@
           "test": "backend-parity-c/vectored-io",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_backend_parity_c"
         }
       ],
       "deps": [
@@ -2313,6 +2325,12 @@
           "test": "bin-c/posix-timer-test",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_bin_c"
         }
       ],
       "deps": [
@@ -5187,6 +5205,12 @@
           "test": "c-programs/writev-determinism",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_c_programs"
         }
       ],
       "deps": [
@@ -5247,6 +5271,12 @@
           "test": "chaos-c/lock-granularity",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_chaos_c"
         }
       ],
       "deps": [
@@ -5335,6 +5365,12 @@
           "test": "data-handling/zstd-multithread",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_data_handling"
         }
       ],
       "deps": [
@@ -5409,6 +5445,12 @@
           "test": "debugger-c/debuggee",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_debugger_c"
         }
       ],
       "deps": [
@@ -5539,6 +5581,12 @@
           "test": "determinism-stress-c/thread-stress",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_determinism_stress_c"
         }
       ],
       "deps": [
@@ -5627,6 +5675,12 @@
           "test": "determinism-stress/thread-output",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_determinism_stress"
         }
       ],
       "deps": [
@@ -5869,6 +5923,12 @@
           "test": "language-runtimes/tcl-rand-clock",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_language_runtimes"
         }
       ],
       "deps": [
@@ -5915,7 +5975,14 @@
         "lane": "portable",
         "category": "shared-futex-c"
       },
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_shared_futex_c"
+        }
+      ],
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.manifest_guests_in_pinned_root",
@@ -6373,6 +6440,12 @@
           "test": "system-utils/uuidgen-random",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_system_utils"
         }
       ],
       "deps": [
@@ -6419,7 +6492,14 @@
         "lane": "portable",
         "category": "util-c"
       },
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_util_c"
+        }
+      ],
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.manifest_guests_in_pinned_root",
@@ -6461,7 +6541,14 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./tests/e2e/lib/applications/run_all.sh",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.applications_e2e"
+        }
+      ],
       "deps": [
         "build.e2e_artifact"
       ],
@@ -6597,12 +6684,21 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} --workspace --exclude hermit-detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.regular_crates"
+        }
+      ],
       "deps": [
         "build.e2e_artifact",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "392"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 900,
@@ -6632,12 +6728,21 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --lib --bins -j 1",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.hermit_unit"
+        }
+      ],
       "deps": [
         "build.e2e_artifact",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "490"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 900,
@@ -6667,12 +6772,21 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --lib --bins",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.detcore_unit"
+        }
+      ],
       "deps": [
         "build.e2e_artifact",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "652"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 900,
@@ -6702,12 +6816,21 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_misc -j 1 -- --skip has_rdrand_without_detcore --skip rdrand_rdseed_is_masked --skip ordinary_clone_child_starts_before_parent_resumes --skip ordinary_clone_parent_mode_can_resume_before_child --skip network_syscalls_are_deterministic_across_five_runs",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.detcore_misc"
+        }
+      ],
       "deps": [
         "build.e2e_artifact",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "27"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 720,
@@ -6737,12 +6860,21 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-detcore --test tests_parallelism -j 4 -- --skip detcore",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.detcore_parallel"
+        }
+      ],
       "deps": [
         "build.e2e_artifact",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "5"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 720,
@@ -6772,7 +6904,14 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test chown_virtual_root_identity --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test robust_futex_owner_death --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test writev_determinism --test zero_copy_pipe_fallback -j 1",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.hermit_integration"
+        }
+      ],
       "integration_test_binaries": [
         "aio_nr_determinism",
         "arch_status_determinism",
@@ -6823,7 +6962,9 @@
         "build.e2e_artifact",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "138"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 1200,
@@ -6853,7 +6994,14 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test arbitrary_binaries -j 1 -- --skip record_replay_stable_arbitrary_binaries",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.arbitrary_binaries"
+        }
+      ],
       "integration_test_binaries": [
         "arbitrary_binaries"
       ],
@@ -6861,7 +7009,9 @@
         "build.e2e_artifact",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "3"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 900,
@@ -6890,7 +7040,14 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.cli"
+        }
+      ],
       "integration_test_binaries": [
         "cli"
       ],
@@ -6899,7 +7056,9 @@
         "build.liteinst_runtime_release",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "71"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 900,
@@ -6927,7 +7086,14 @@
         "hosted-portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.cli_on_host"
+        }
+      ],
       "integration_test_binaries": [
         "cli"
       ],
@@ -6936,7 +7102,9 @@
         "build.liteinst_runtime_release",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "71"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 900,
@@ -6966,7 +7134,14 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced -j 1",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.liteinst_strict"
+        }
+      ],
       "integration_test_binaries": [
         "liteinst_advanced"
       ],
@@ -6975,7 +7150,9 @@
         "build.liteinst_runtime_release",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "23"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 900,
@@ -7005,7 +7182,14 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test sabre_examples -j 1",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.sabre_examples"
+        }
+      ],
       "integration_test_binaries": [
         "sabre_examples"
       ],
@@ -7013,7 +7197,9 @@
         "build.e2e_artifact",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "5"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 900,
@@ -7042,7 +7228,14 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.hermit_modes"
+        }
+      ],
       "integration_test_binaries": [
         "hermit_modes"
       ],
@@ -7050,7 +7243,9 @@
         "build.e2e_artifact",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "18"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 900,
@@ -7078,7 +7273,14 @@
         "hosted-portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.hermit_modes_on_host"
+        }
+      ],
       "integration_test_binaries": [
         "hermit_modes"
       ],
@@ -7086,7 +7288,9 @@
         "build.e2e_artifact",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "18"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 900,
@@ -7116,7 +7320,14 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test app_strict_verify -j 1 -- --ignored --skip java_ --skip javac_ --skip go_hello_is_deterministic_under_strict_verify --skip go_goroutines_are_deterministic_under_strict_verify",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.app_strict_verify"
+        }
+      ],
       "integration_test_binaries": [
         "app_strict_verify"
       ],
@@ -7124,7 +7335,9 @@
         "build.e2e_artifact",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "6"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 900,
@@ -7154,7 +7367,14 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test command_strict_verify -j 1 -- --ignored --skip kernel_pseudofile_commands_are_deterministic_under_strict_verify",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.command_strict_verify"
+        }
+      ],
       "integration_test_binaries": [
         "command_strict_verify"
       ],
@@ -7162,7 +7382,9 @@
         "build.e2e_artifact",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "9"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 900,
@@ -7192,7 +7414,14 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test epoll_determinism --test rcx_canonicalization -j 1 -- --ignored",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.ignored_syscall_regressions"
+        }
+      ],
       "integration_test_binaries": [
         "epoll_determinism",
         "rcx_canonicalization"
@@ -7201,7 +7430,9 @@
         "build.e2e_artifact",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "2"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 720,
@@ -7231,7 +7462,14 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test rr_suite -j 1 rr_scratch_directories_are_fresh_and_cleaned -- --exact",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.rr_suite_contract"
+        }
+      ],
       "integration_test_binaries": [
         "rr_suite"
       ],
@@ -7239,7 +7477,9 @@
         "build.e2e_artifact",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "1"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 720,
@@ -7269,7 +7509,14 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbt --strict --require-backend --no-parent-scorecard",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.dbt_parity"
+        }
+      ],
       "deps": [
         "build.runtime_release",
         "check.dbt_runtime_abi"
@@ -7304,7 +7551,14 @@
         "portable"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -e; HERMIT=target/debug/hermit; ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled'; REPS=${L4_REPS:-20}; EXECUTED=0; CURRENT_TEST=''; RESULTS=(); publish_counts() { local status=$? count_status; trap - EXIT; set +e; if ((status != 0)) && [[ -n $CURRENT_TEST ]]; then RESULTS+=(\"envelope/$CURRENT_TEST\" fail 1); fi; ./ci/write-structured-test-counts.sh \"$EXECUTED\" 0 \"${RESULTS[@]}\"; count_status=$?; if ((status == 0 && count_status != 0)); then status=$count_status; fi; exit \"$status\"; }; trap publish_counts EXIT; run_probe() { local id=\"$1\"; local c=\"$2\"; CURRENT_TEST=\"$id\"; EXECUTED=$((EXECUTED + 1)); printf '##TEST-START %s\\n' \"$id\" >&2; timeout 30s $HERMIT $ARGS --strict -- $c </dev/null >&2; timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null >&2; timeout 30s $HERMIT $ARGS --strict --verify --detlog-heap --detlog-stack -- $c </dev/null >&2; local i; for ((i=0;i<REPS;i++)); do timeout 30s $HERMIT $ARGS --strict --verify -- $c </dev/null >&2; done; printf '##TEST-END %s PASS\\n' \"$id\" >&2; RESULTS+=(\"envelope/$id\" pass 1); CURRENT_TEST=''; }; run_probe true '/bin/true'; run_probe echo '/bin/echo hermit-envelope'; run_probe date '/bin/date -u +%Y'",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "test.envelope_levels"
+        }
+      ],
       "deps": [
         "build.workspace"
       ],
@@ -7436,8 +7690,15 @@
       "labels": [
         "full"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; NEXTEST_EXPECTED_EXECUTED=6 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit \"$status\"",
-      "result_manifests": [],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit \"$status\"",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "privileged-test.pmu_buck_chaos_cases"
+        }
+      ],
       "integration_test_binaries": [
         "hermit_modes"
       ],
@@ -7445,7 +7706,9 @@
         "privileged-build.privileged_tests",
         "privileged-pmu.preemption"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "6"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 120,
@@ -7517,6 +7780,12 @@
           "test": "applications/kvm-shell-environment",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "privileged-e2e.manifest_applications"
         }
       ],
       "deps": [
@@ -7575,6 +7844,12 @@
           "test": "backend-parity-c/cpuid-probe",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "privileged-e2e.manifest_backend_parity_c"
         }
       ],
       "deps": [
@@ -7615,15 +7890,24 @@
         "full",
         "kvm"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; NEXTEST_EXPECTED_EXECUTED=24 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
-      "result_manifests": [],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "privileged-test.cli_kvm"
+        }
+      ],
       "integration_test_binaries": [
         "cli"
       ],
       "deps": [
         "privileged-build.privileged_tests"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "24"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 180,
@@ -10178,6 +10462,12 @@
           "test": "system-utils/uuidgen-random",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "quick.e2e_verify"
         }
       ],
       "deps": [
@@ -10215,7 +10505,14 @@
         "quick"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh -p hermit-detcore --lib",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "quick.detcore_unit"
+        }
+      ],
       "deps": [
         "quick.build",
         "setup.nextest"
@@ -10408,7 +10705,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; env HERMIT_FLAG_MATRIX_REPORT=$PWD/target/relaxed-flag-matrix/results.tsv $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test relaxed_flag_matrix meaningful_flag_combinations_run_without_crashing -j 1 --no-capture -- --exact --ignored",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.relaxed_hermit_flag_matrix"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -10440,7 +10744,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-detcore --test tests_parallelism mem_race::bottom_detcore -j 1 -- --exact",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -10472,7 +10783,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-detcore --test tests_parallelism mem_race::default_detcore -j 1 -- --exact",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore"
+        }
+      ],
       "deps": [
         "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore"
       ],
@@ -10504,7 +10822,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-detcore --test tests_parallelism mem_race::middle_detcore -j 1 -- --exact",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore"
+        }
+      ],
       "deps": [
         "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore"
       ],
@@ -10536,7 +10861,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-detcore --test tests_parallelism mem_race::top_detcore -j 1 -- --exact",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore"
+        }
+      ],
       "deps": [
         "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore"
       ],
@@ -10568,7 +10900,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test pselect6_simulation -j 1 --",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.pselect_signal_interruption_diagnostic"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -10600,7 +10939,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test record_replay record_replay_matrix -j 1 -- --exact",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.record_replay_matrix_diagnostic"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -10632,7 +10978,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; env HERMIT_APP_VERIFY_TIMEOUT=20s RUST_BACKTRACE=1 $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test app_strict_verify java -j 1 --no-capture -- --ignored",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.managed_jvm_strict_verify_diagnostics"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -10664,7 +11017,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-detcore --test tests_misc ordinary_clone_ -j 1 --",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.post_fork_scheduling_diagnostics"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -10696,7 +11056,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-detcore --test tests_misc network_syscalls_are_deterministic_across_five_runs -j 1 -- --exact",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.network_syscall_determinism_diagnostic"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -10728,7 +11095,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test ipc_determinism ipc_patterns_are_deterministic_across_five_runs -j 1 -- --exact",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.ipc_determinism_diagnostic"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -10760,7 +11134,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test random_determinism random_sources_repeat_across_runs_and_change_with_seed -j 1 -- --exact",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.random_source_determinism_diagnostic"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -10792,7 +11173,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test integration_matrix -j 1 --",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.threaded_integration_matrix_diagnostic"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -10824,7 +11212,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test cli -j 1 -- run_liteinst_rejects_non_fork_clone run_liteinst_handles_inherited_ignored_sigchld run_liteinst_verifies_forked_guest run_liteinst_verifies_raw_fork_guest",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.liteinst_python3_verify_diagnostics"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -10856,7 +11251,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test hermit_modes hello_race_chaos_verify -j 1 -- --exact",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.chaos_hello_race_verification_diagnostic"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -10888,7 +11290,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test cli run_dbt_verifies_pipe_backpressure -j 1 -- --exact",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.dbt_pipe_backpressure_diagnostic"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -10920,7 +11329,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test cli run_dbt_recovers_after_failed_exec -j 1 -- --exact",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.dbt_failed_exec_recovery_diagnostic"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -10952,7 +11368,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test cli run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them -j 1 -- --exact",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.dbt_unsupported_syscall_aggregation_diagnostic"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -10984,7 +11407,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test cli run_dbt_strict_returns_with_blocked_stdin_source -j 1 -- --exact",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.dbt_strict_blocked_stdin_teardown_diagnostic"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -11016,7 +11446,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test cli run_dbt_keeps_diagnostics_out_of_guest_stderr -j 1 -- --exact",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.dbt_guest_stderr_isolation_diagnostic"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -11048,7 +11485,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test hermit_modes default_ -j 1 --",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.weekly_relaxed_default_mode_cases"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -11080,7 +11524,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test stress_suite -j 1 -- --skip slow_cas_search_and_replay",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.weekly_portable_chaos_cases"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -11112,7 +11563,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test stress_suite -j 1 -- --ignored --skip slow_cas_search_and_replay",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.weekly_ignored_portable_chaos_cases"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -11144,7 +11602,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test hermit_modes chaos_buck_ -j 1 -- --ignored",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.pmu_buck_chaos_cases"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -11176,7 +11641,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -u\niters=${ANALYZE_SKID_CALIBRATION_ITERATIONS:-64}\nperiod=${ANALYZE_SKID_CALIBRATION_PERIOD:-1000000}\nfloor=${ANALYZE_SKID_MINIMUM_MARGIN:-20000}\ncal_timeout=${ANALYZE_SKID_CALIBRATION_TIMEOUT:-30}\nfor name in iters period floor cal_timeout; do\n    eval \"v=\\$$name\"\n    case \"$v\" in\n        ''|*[!0-9]*|0*) echo \"Analyze PMU calibration error: $name must be a positive integer, got $v\" >&2; exit 2 ;;\n    esac\ndone\nbin=$PWD/target/ci-pmu-skid\nmkdir -p \"$(dirname \"$bin\")\" || exit 1\ncc -O2 -Wall -Wextra -Werror -std=gnu11 tests/util/pmu_skid.c -o \"$bin\" || {\n    echo \"Analyze PMU calibration error: failed to build tests/util/pmu_skid.c\" >&2; exit 1; }\nout=$(timeout \"$cal_timeout\" \"$bin\" --iterations \"$iters\" --period \"$period\" 2>&1) || {\n    status=$?; printf 'Analyze PMU calibration failed (exit %s):\\n%s\\n' \"$status\" \"$out\" >&2; exit \"$status\"; }\nprintf '%s\\n' \"$out\"\nrec=$(printf '%s\\n' \"$out\" | sed -n 's/^Recommended margin: \\([0-9][0-9]*\\) RCB.*/\\1/p')\ncase \"$rec\" in\n    ''|*[!0-9]*|0*) echo \"Analyze PMU calibration error: output omitted a valid recommended margin\" >&2; exit 1 ;;\nesac\nmargin=$rec\nif [ \"$margin\" -lt \"$floor\" ]; then margin=$floor; fi\nprintf 'Analyze PMU skid margin: calibrated=%s RCB, conservative floor=%s RCB, using=%s RCB\\n' \\\n    \"$rec\" \"$floor\" \"$margin\"\nHERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test analyze -j 1 analyze_hello_race -- --exact --ignored",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.pmu_analyze_hello_race_stress_calibrated_skid"
+        }
+      ],
       "deps": [
         "setup.nextest",
         "super.build_workspace"
@@ -11241,7 +11713,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; env HERMIT_LEVELDB_BUILD_DIR=$PWD/target/hermit-leveldb-build-super $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test leveldb full_leveldb_suite_is_deterministic_under_strict -j 1 -- --exact --ignored",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.full_leveldb_strict_determinism"
+        }
+      ],
       "deps": [
         "super.build_pinned_leveldb_super_fixture"
       ],
@@ -11273,7 +11752,14 @@
         "super"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test sqlite_veryquick sqlite_veryquick_is_deterministic_under_strict_hermit -j 1 -- --exact --ignored",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "super.sqlite_veryquick_strict_determinism"
+        }
+      ],
       "deps": [
         "super.build_workspace"
       ],
@@ -11401,15 +11887,24 @@
       "labels": [
         "privileged"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; NEXTEST_EXPECTED_EXECUTED=6 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit \"$status\"",
-      "result_manifests": [],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit \"$status\"",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "privileged-only-test.pmu_buck_chaos_cases"
+        }
+      ],
       "integration_test_binaries": [
         "hermit_modes"
       ],
       "deps": [
         "privileged-only-pmu.preemption"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "6"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 120,
@@ -11448,6 +11943,12 @@
           "test": "applications/kvm-shell-environment",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "privileged-only-e2e.manifest_applications"
         }
       ],
       "deps": [
@@ -11505,6 +12006,12 @@
           "test": "backend-parity-c/cpuid-probe",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "privileged-only-e2e.manifest_backend_parity_c"
         }
       ],
       "deps": [
@@ -11544,15 +12051,24 @@
         "privileged",
         "kvm"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; NEXTEST_EXPECTED_EXECUTED=24 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
-      "result_manifests": [],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "privileged-only-test.cli_kvm"
+        }
+      ],
       "integration_test_binaries": [
         "cli"
       ],
       "deps": [
         "privileged-only-build.privileged_tests"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "24"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 180,
@@ -11713,7 +12229,14 @@
         "liteinst-compat-only"
       ],
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test liteinst_advanced -j 1",
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "liteinst.strict"
+        }
+      ],
       "deps": [
         "liteinst.runtime",
         "setup.nextest"
@@ -12354,6 +12877,12 @@
           "test": "applications/timed-progress-bar",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_applications_on_host"
         }
       ],
       "deps": [
@@ -13648,6 +14177,12 @@
           "test": "backend-parity-c/vectored-io",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_backend_parity_c_on_host"
         }
       ],
       "deps": [
@@ -13710,6 +14245,12 @@
           "test": "bin-c/posix-timer-test",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_bin_c_on_host"
         }
       ],
       "deps": [
@@ -16579,6 +17120,12 @@
           "test": "c-programs/writev-determinism",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_c_programs_on_host"
         }
       ],
       "deps": [
@@ -16634,6 +17181,12 @@
           "test": "chaos-c/lock-granularity",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_chaos_c_on_host"
         }
       ],
       "deps": [
@@ -16717,6 +17270,12 @@
           "test": "data-handling/zstd-multithread",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_data_handling_on_host"
         }
       ],
       "deps": [
@@ -16786,6 +17345,12 @@
           "test": "debugger-c/debuggee",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_debugger_c_on_host"
         }
       ],
       "deps": [
@@ -16911,6 +17476,12 @@
           "test": "determinism-stress-c/thread-stress",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_determinism_stress_c_on_host"
         }
       ],
       "deps": [
@@ -16994,6 +17565,12 @@
           "test": "determinism-stress/thread-output",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_determinism_stress_on_host"
         }
       ],
       "deps": [
@@ -17231,6 +17808,12 @@
           "test": "language-runtimes/tcl-rand-clock",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_language_runtimes_on_host"
         }
       ],
       "deps": [
@@ -17272,7 +17855,14 @@
         "lane": "portable",
         "category": "shared-futex-c"
       },
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_shared_futex_c_on_host"
+        }
+      ],
       "deps": [
         "build.e2e_artifact",
         "build.manifest_guests",
@@ -17725,6 +18315,12 @@
           "test": "system-utils/uuidgen-random",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_system_utils_on_host"
         }
       ],
       "deps": [
@@ -17766,7 +18362,14 @@
         "lane": "portable",
         "category": "util-c"
       },
-      "result_manifests": [],
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "e2e.manifest_util_c_on_host"
+        }
+      ],
       "deps": [
         "build.e2e_artifact",
         "build.manifest_guests",
@@ -18067,15 +18670,24 @@
       "labels": [
         "hosted-privileged"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; NEXTEST_EXPECTED_EXECUTED=6 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit \"$status\"",
-      "result_manifests": [],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit \"$status\"",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "privileged-only-test.pmu_buck_chaos_cases_on_host"
+        }
+      ],
       "integration_test_binaries": [
         "hermit_modes"
       ],
       "deps": [
         "privileged-only-pmu.preemption_on_host"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "6"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 120,
@@ -18146,6 +18758,12 @@
           "test": "applications/kvm-shell-environment",
           "mode": "verify",
           "backend": "kvm"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "privileged-only-e2e.manifest_applications_on_host"
         }
       ],
       "deps": [
@@ -18199,6 +18817,12 @@
           "test": "backend-parity-c/cpuid-probe",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "privileged-only-e2e.manifest_backend_parity_c_on_host"
         }
       ],
       "deps": [
@@ -18233,15 +18857,24 @@
       "labels": [
         "hosted-privileged"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; NEXTEST_EXPECTED_EXECUTED=24 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
-      "result_manifests": [],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "privileged-only-test.cli_kvm_on_host"
+        }
+      ],
       "integration_test_binaries": [
         "cli"
       ],
       "deps": [
         "privileged-only-build.privileged_tests_on_host"
       ],
-      "env": {},
+      "env": {
+        "NEXTEST_EXPECTED_EXECUTED": "24"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 180,

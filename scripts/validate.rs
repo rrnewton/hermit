@@ -8325,7 +8325,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     let ordinary_observed = barrier.join("ordinary.observed");
     ordinary.deps = vec!["compatprep.fixtures".into()];
     ordinary.cmd = format!(
-        "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active}; i=0; while test ! -e {first} || test ! -e {second}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}",
+        "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active}; i=0; while test ! -e {first} || test ! -e {second}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}; printf '%s\\n' '{{\"schema\":2,\"executed_tests\":0,\"filtered_tests\":0,\"results\":[]}}' > \"$DAGRUN_TEST_COUNTS_PATH\"",
         tag = validate_plan::shell_quote(&ordinary.tag()),
         active = validate_plan::shell_quote(&barrier.join("ordinary.active").to_string_lossy()),
         first = validate_plan::shell_quote(&barrier.join("0.active").to_string_lossy()),
@@ -10955,17 +10955,18 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
 
     fn require_expected_nextest_count(
         tag: &str,
-        command: &str,
+        environment: &BTreeMap<String, String>,
         expected: usize,
     ) -> Result<(), String> {
-        let declaration = format!("NEXTEST_EXPECTED_EXECUTED={expected}");
-        if !command.contains(&declaration) {
-            return Err(format!(
-                "retry bounds: {tag} must require exactly {expected} executed tests through \
-                 {declaration}"
-            ));
+        match environment.get("NEXTEST_EXPECTED_EXECUTED") {
+            Some(actual) if actual == &expected.to_string() => Ok(()),
+            Some(actual) => Err(format!(
+                "retry bounds: {tag} must require exactly {expected} executed tests through its typed environment, got {actual:?}"
+            )),
+            None => Err(format!(
+                "retry bounds: {tag} must require exactly {expected} executed tests through its typed environment"
+            )),
         }
-        Ok(())
     }
 
     let nextest = std::fs::read_to_string(root.join(".config/nextest.toml"))
@@ -11088,7 +11089,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             .iter()
             .find(|step| step.tag() == tag)
             .ok_or_else(|| format!("retry bounds: exact-count node {tag} is absent"))?;
-        require_expected_nextest_count(tag, &step.cmd, expected)?;
+        require_expected_nextest_count(tag, &step.env, expected)?;
     }
     let buffered_mutation =
         "./ci/run-nextest-counted.sh -p fixture >\"$log\" 2>&1 || status=$?; cat \"$log\"";
@@ -11100,7 +11101,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         ));
     }
     let count_error =
-        require_expected_nextest_count("test.fixture", "./ci/run-nextest-counted.sh -p fixture", 7)
+        require_expected_nextest_count("test.fixture", &BTreeMap::new(), 7)
             .expect_err("missing exact-count declaration mutation must be refused");
     if !count_error.contains("test.fixture") || !count_error.contains("exactly 7") {
         return Err(format!(
@@ -12223,10 +12224,10 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     };
     e2e_step.manifest = Some(e2e_manifest.clone());
     e2e_step.result_manifests = Some(vec![
-        ResultManifest::ManifestCell(e2e_manifest),
-        ResultManifest::StructuredTestResults(StructuredTestResultsManifest::current(
-            "e2e.manifest_attempt",
-        )),
+        dagrun::model::ResultManifest::ManifestCell(e2e_manifest),
+        dagrun::model::ResultManifest::StructuredTestResults(
+            dagrun::model::StructuredTestResultsManifest::current("e2e.manifest_attempt"),
+        ),
     ]);
     let e2e_retry = run_lane_once(
         &DagConfig { steps: vec![e2e_step], ..Default::default() },
@@ -12275,9 +12276,11 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         validate_plan::shell_quote(&ordinary_attempts.to_string_lossy()),
     );
     let mut ordinary_step = step("ordinary_structured", &ordinary_cmd);
-    ordinary_step.result_manifests = Some(vec![ResultManifest::StructuredTestResults(
-        StructuredTestResultsManifest::current("fixture.ordinary_structured"),
-    )]);
+    ordinary_step.result_manifests = Some(vec![
+        dagrun::model::ResultManifest::StructuredTestResults(
+            dagrun::model::StructuredTestResultsManifest::current("fixture.ordinary_structured"),
+        ),
+    ]);
     let ordinary_retry = run_lane_once(
         &DagConfig { steps: vec![ordinary_step], ..Default::default() },
         1,
