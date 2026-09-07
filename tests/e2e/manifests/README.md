@@ -138,11 +138,26 @@ The mode contracts are:
 
 | Mode | Contract |
 | --- | --- |
-| `verify` | Run each enabled backend with `hermit run --strict --verify` |
+| `verify` | Compare two independently scheduled strict executions under the backend-specific evidence contract below |
 | `chaos` | Search declared seeds and require cross-seed diversity plus exact within-seed reproduction |
 | `replay` | Run ptrace `record start --strict --verify` in an isolated recording directory |
 | `naked` | Opt-in meta-CI only; run natively three to five times and require declared variation |
 | `custom` | Run declared edge-case Hermit arguments and require three to five identical observations |
+
+For ptrace, KVM, and LiteInst, `verify` is harness-managed: the scheduler
+launches two ordinary `hermit run --strict --run-evidence-dir ...` processes
+with independent work and capture directories under the global `--jobs`
+process cap. The harness loads both typed sidecars and performs the
+`BitwiseInfoV1` comparison in process. It deterministically gzips and verifies
+run 1's canonical INFO stream, atomically publishes its descriptor with the
+result, and then removes both raw logs.
+
+SaBRe explicitly remains on Hermit's internal `--verify --verify-strict` path:
+its plugin DETLOG stream is available only on shared stderr, so splitting it
+would not preserve the same evidence. DBT verify is refused before launch:
+its current `evidence_file` transport implies isolated process-group setup,
+which can change guest-visible `setsid`/`setpgid` outcomes. Neither exception
+is evidence for another backend.
 
 `verify`, `chaos`, and `custom` may set an absolute `workdir` path. The harness
 passes it to `hermit run` before the guest-command separator, so it is resolved

@@ -75,6 +75,9 @@ mod validate_history;
 #[path = "lib/validate_cell_results.rs"]
 mod validate_cell_results;
 
+#[path = "lib/validate_test_results.rs"]
+mod validate_test_results;
+
 #[path = "lib/validate_plan.rs"]
 mod validate_plan;
 
@@ -130,6 +133,8 @@ use dagrun::scheduler::start_run_cpu_budget;
 use dagrun::scheduler::steps_violating_run_timeout;
 use dagrun::scheduler::BoxedCgroups;
 use dagrun::scheduler::monotonic_now_ns;
+use hermit_manifest_plan::ledger::ValidatePath;
+use hermit_manifest_plan::ledger::is_canonical_hermetic_image_digest;
 use dagrun::scheduler::RunCpuBudget;
 use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
 use hermit_manifest_plan::ledger::HistoryRow;
@@ -138,6 +143,8 @@ use hermit_manifest_plan::runner::CellResult;
 use hermit_manifest_plan::runner::ObservedResult;
 use hermit_manifest_plan::runner::structured_test_results;
 use hermit_manifest_plan::runner::ManifestSet;
+use hermit_manifest_plan::runner::VerifyLogRetentionPolicy;
+use hermit_manifest_plan::runner::DEFAULT_VERIFY_LOG_RETENTION_BUDGET_BYTES;
 use hermit_manifest_plan::runner::Population;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::FailureClass;
@@ -1231,8 +1238,12 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     for relative in [
         ".config/nextest.toml",
         "Makefile",
+        "Cargo.lock",
+        "ci/manifest-plan/Cargo.toml",
+        "ci/manifest-plan/src/ledger.rs",
         "ci/dag/validate.json",
         "ci/manifest-plan/src/runner.rs",
+        "ci/manifest-plan/src/runner/retained_verify_log.rs",
         "ci/manifest-plan/src/service_result.rs",
         "ci/manifest-plan/src/timeouts.rs",
         "ci/manifest-plan/validation-service-result-schema.json",
@@ -1240,8 +1251,11 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         "ci/run-nextest-counted.sh",
         "ci/verify-submodules.sh",
         "scripts/validate.rs",
+        "hermit-cli/src/run_evidence.rs",
+        "scripts/lib/validate_cell_results.rs",
         "scripts/lib/validate_history.rs",
         "scripts/lib/validate_plan.rs",
+        "scripts/lib/validate_test_results.rs",
         "scripts/lib/validate_super.rs",
         "tests/e2e/manifests/applications.yaml",
         "tests/e2e/manifests/backend-parity-c.yaml",
@@ -1249,7 +1263,15 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         "tests/e2e/manifests/data-handling.yaml",
         "tests/e2e/manifests/defaults.yaml",
     ] {
-        std::fs::copy(root.join(relative), checkout.join(relative)).map_err(|error| {
+        let destination = checkout.join(relative);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "submodule service result: cannot create parent for {relative}: {error}"
+                )
+            })?;
+        }
+        std::fs::copy(root.join(relative), &destination).map_err(|error| {
             format!("submodule service result: cannot copy {relative} into fixture: {error}")
         })?;
     }
@@ -1261,8 +1283,12 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 ".config/nextest.toml",
                 "Makefile",
                 "ci/dag/validate.json",
+                "Cargo.lock",
+                "ci/manifest-plan/Cargo.toml",
+                "ci/manifest-plan/src/ledger.rs",
                 "ci/manifest-plan/src/runner.rs",
                 "ci/manifest-plan/src/service_result.rs",
+                "ci/manifest-plan/src/runner/retained_verify_log.rs",
                 "ci/manifest-plan/src/timeouts.rs",
                 "ci/manifest-plan/validation-service-result-schema.json",
                 "ci/nextest-timeout-config.rs",
@@ -1270,8 +1296,11 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "ci/verify-submodules.sh",
                 "scripts/validate.rs",
                 "scripts/lib/validate_history.rs",
+                "hermit-cli/src/run_evidence.rs",
+                "scripts/lib/validate_cell_results.rs",
                 "scripts/lib/validate_plan.rs",
                 "scripts/lib/validate_super.rs",
+                "scripts/lib/validate_test_results.rs",
                 "tests/e2e/manifests/applications.yaml",
                 "tests/e2e/manifests/backend-parity-c.yaml",
                 "tests/e2e/manifests/c-programs.yaml",
@@ -2531,6 +2560,7 @@ fn self_test() -> Result<(), String> {
         validate_super::self_test(&root)?,
         validate_envelope::self_test()?,
         validate_history::self_test()?,
+        validate_test_results::self_test()?,
         validate_receipt::self_test()?,
         validate_runtime::self_test()?,
         prebuilt_rust_script_plan_bracket(&root)?,
@@ -3431,10 +3461,38 @@ fn ledger_schema_and_coverage(
 fn ledger_schema_version(
     coverage_schema: i64,
     cell_results: Option<&validate_cell_results::RetainedCellResults>,
+    test_results: Option<&validate_test_results::RetainedTestResults>,
 ) -> i64 {
-    cell_results
-        .map(|results| results.schema_version)
-        .unwrap_or(coverage_schema)
+    [
+        coverage_schema,
+        cell_results.map_or(coverage_schema, |results| results.schema_version),
+        test_results.map_or(coverage_schema, |results| results.schema_version),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(coverage_schema)
+}
+
+fn paired_ledger_evidence<'a>(
+    cell_results: Option<&'a validate_cell_results::RetainedCellResults>,
+    test_results: Option<&'a validate_test_results::RetainedTestResults>,
+) -> (
+    Option<&'a validate_cell_results::RetainedCellResults>,
+    Option<&'a validate_test_results::RetainedTestResults>,
+) {
+    match cell_results {
+        Some(results)
+            if results.schema_version
+                == validate_cell_results::RETAINED_VERIFY_LOGS_LEDGER_SCHEMA_VERSION =>
+        {
+            match test_results {
+                Some(test_results) => (Some(results), Some(test_results)),
+                None => (None, None),
+            }
+        }
+        Some(results) => (Some(results), None),
+        None => (None, None),
+    }
 }
 
 /// Two-sided producer bracket for [`ledger_schema_and_coverage`]. Inert: it
@@ -3480,18 +3538,42 @@ fn cell_results_schema_bracket() -> Result<(), String> {
         run_id: "schema-bracket".into(),
         evidence: serde_json::json!({}),
     };
-    let current = ledger_schema_version(COVERAGE_LEDGER_SCHEMA_VERSION, Some(&retained));
+    let current = ledger_schema_version(COVERAGE_LEDGER_SCHEMA_VERSION, Some(&retained), None);
     if current != 7 {
         return Err(format!(
             "cell-results schema: current payload must emit schema 7, got {current}"
         ));
     }
-    if ledger_schema_version(COVERAGE_LEDGER_SCHEMA_VERSION, None)
+    let (historical_cell, historical_test) = paired_ledger_evidence(Some(&retained), None);
+    if historical_cell.is_none() || historical_test.is_some() {
+        return Err("cell-results schema: historical schema-7 cell-only evidence was lost".into());
+    }
+    let retained = validate_cell_results::RetainedCellResults {
+        schema_version: validate_cell_results::RETAINED_VERIFY_LOGS_LEDGER_SCHEMA_VERSION,
+        run_id: "schema-bracket".into(),
+        evidence: serde_json::json!({}),
+    };
+    let current = ledger_schema_version(COVERAGE_LEDGER_SCHEMA_VERSION, Some(&retained), None);
+    if current != 10 {
+        return Err(format!(
+            "cell-results schema: retained verify-log payload must emit schema 10, got {current}"
+        ));
+    }
+    if ledger_schema_version(COVERAGE_LEDGER_SCHEMA_VERSION, None, None)
         != COVERAGE_LEDGER_SCHEMA_VERSION
     {
         return Err("cell-results schema: a row without cell results changed schema".into());
     }
-    println!("  cell-results schema: current payload -> schema 7; absent payload -> schema 5");
+    let (partial_cell, partial_test) = paired_ledger_evidence(Some(&retained), None);
+    if partial_cell.is_some() || partial_test.is_some() {
+        return Err(
+            "cell-results schema: unpaired schema-10 cell evidence reached the ledger writer"
+                .into(),
+        );
+    }
+    println!(
+        "  cell-results schema: historical payload -> schema 7; schema-10 partial publication omitted; absent payload -> schema 5"
+    );
     Ok(())
 }
 
@@ -14393,6 +14475,161 @@ fn run_test_counts(
     });
     Ok((executed, passed, filtered))
 }
+fn retained_test_results_inputs(
+    planned_test_nodes: &BTreeSet<String>,
+    outcomes: &[StepOutcome],
+    attempts: &[NodeAttempt],
+    compat: Option<CompatMode>,
+    compat_prefix: Option<&str>,
+) -> Result<
+    (
+        Vec<validate_test_results::NodeTestResultsInput>,
+        Option<TestResults>,
+    ),
+    String,
+> {
+    let final_outcomes = outcomes
+        .iter()
+        .map(|outcome| (outcome.tag.as_str(), outcome))
+        .collect::<BTreeMap<_, _>>();
+    let mut nodes = Vec::with_capacity(planned_test_nodes.len());
+    for tag in planned_test_nodes {
+        let outcome = final_outcomes.get(tag.as_str()).ok_or_else(|| {
+            format!("selected test-result producer {tag} has no terminal outcome")
+        })?;
+        let latest = terminal_attempt(outcome, attempts).ok_or_else(|| {
+            format!("selected test-result producer {tag} has no recorded terminal attempt")
+        })?;
+        if !latest.reported || latest.execution != AttemptExecution::Completed || latest.aborted {
+            return Err(format!(
+                "selected test-result producer {tag} latest attempt {} has no completed report",
+                latest.attempt
+            ));
+        }
+        let executed_tests = outcome
+            .executed_tests
+            .ok_or_else(|| format!("selected test-result producer {tag} has no executed_tests"))?;
+        let filtered_tests = outcome
+            .filtered_tests
+            .ok_or_else(|| format!("selected test-result producer {tag} has no filtered_tests"))?;
+        let results = latest.test_results.clone().ok_or_else(|| {
+            format!(
+                "selected test-result producer {tag} latest attempt {} has no producer-owned terminal rows",
+                latest.attempt
+            )
+        })?;
+        if outcome.test_results.as_ref() != Some(&results) {
+            return Err(format!(
+                "selected test-result producer {tag} outcome differs from its terminal attempt"
+            ));
+        }
+        nodes.push(validate_test_results::NodeTestResultsInput {
+            node: tag.clone(),
+            outer_attempt: u64::try_from(latest.attempt)
+                .map_err(|_| format!("node {tag} outer attempt does not fit u64"))?,
+            test_results: TestResults::current(executed_tests, filtered_tests, results)?,
+        });
+    }
+    let compatibility = match compat {
+        Some(_) => {
+            let prefix =
+                compat_prefix.ok_or("compatibility mode has no committed tag prefix")?;
+            Some(compat_test_results(outcomes, attempts, prefix)?)
+        }
+        None => None,
+    };
+    Ok((nodes, compatibility))
+}
+
+fn exact_test_totals(
+    executed_tests: Option<i64>,
+    passed_tests: Option<i64>,
+    filtered_tests: Option<i64>,
+) -> Result<validate_test_results::ExactTestTotals, String> {
+    let convert = |name: &str, value: Option<i64>| {
+        u64::try_from(value.ok_or_else(|| format!("{name} is unknown"))?)
+            .map_err(|_| format!("{name} is negative"))
+    };
+    let executed_tests = convert("executed_tests", executed_tests)?;
+    let passed_tests = convert("passed_tests", passed_tests)?;
+    if passed_tests > executed_tests {
+        return Err("passed_tests exceeds executed_tests".into());
+    }
+    Ok(validate_test_results::ExactTestTotals {
+        executed_tests,
+        passed_tests,
+        filtered_tests: convert("filtered_tests", filtered_tests)?,
+    })
+}
+
+fn retained_validate_path(profile: &str) -> Option<ValidatePath> {
+    match profile {
+        "quick" => Some(ValidatePath::Quick),
+        "full" => Some(ValidatePath::Full),
+        "super" => Some(ValidatePath::Super),
+        _ => None,
+    }
+}
+
+fn pinned_root_image_digest(root: &Path) -> Result<String, String> {
+    const MAX_IMAGE_DIGEST_FILE_BYTES: u64 = 512;
+    let path = root.join("ci/hermetic/image.digest");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|error| {
+            format!(
+                "cannot securely open pinned-root image digest {}: {error}",
+                path.display()
+            )
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "cannot inspect opened pinned-root image digest {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "pinned-root image digest {} is not a regular file",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_IMAGE_DIGEST_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            format!(
+                "cannot read pinned-root image digest {}: {error}",
+                path.display()
+            )
+        })?;
+    if bytes.len() as u64 > MAX_IMAGE_DIGEST_FILE_BYTES {
+        return Err(format!(
+            "pinned-root image digest {} exceeds {MAX_IMAGE_DIGEST_FILE_BYTES} bytes",
+            path.display()
+        ));
+    }
+    let digest = std::str::from_utf8(&bytes)
+        .map_err(|_| {
+            format!(
+                "pinned-root image digest {} is not UTF-8",
+                path.display()
+            )
+        })?
+        .trim()
+        .to_string();
+    if !is_canonical_hermetic_image_digest(&digest) {
+        return Err(format!(
+            "pinned-root image digest {} is not a canonical immutable image reference",
+            path.display()
+        ));
+    }
+    Ok(digest)
+}
+
 
 /// Derive the per-node coverage obligation from dagrun's structured test counts.
 ///
@@ -16634,6 +16871,21 @@ fn no_result_propagation_bracket() -> Result<(), String> {
     );
     Ok(())
 }
+fn validate_generated_ledger_evidence(row: &HistoryRow) -> Result<(), String> {
+    if row.schema_version.map(i64::from)
+        != Some(validate_cell_results::RETAINED_VERIFY_LOGS_LEDGER_SCHEMA_VERSION)
+    {
+        return Ok(());
+    }
+    row.retained_verify_logs_artifact()?
+        .ok_or("schema-10 writer failed its retained verify-log accessor")?;
+    row.cell_results_evidence()
+        .ok_or("schema-10 writer failed its cell_results accessor")?;
+    row.test_results_evidence()?
+        .ok_or("schema-10 writer failed its test_results accessor")?;
+    Ok(())
+}
+
 
 /// Write one validation record through the single configured authority.
 ///
@@ -16658,9 +16910,18 @@ fn write_ledger(
     suite_complete: bool,
     coverage: serde_json::Value,
     cell_results: Option<&validate_cell_results::RetainedCellResults>,
+    test_results: Option<&validate_test_results::RetainedTestResults>,
 ) {
+    let had_unpaired_schema10 = cell_results.is_some_and(|results| {
+        results.schema_version
+            == validate_cell_results::RETAINED_VERIFY_LOGS_LEDGER_SCHEMA_VERSION
+    }) && test_results.is_none();
+    let (cell_results, test_results) = paired_ledger_evidence(cell_results, test_results);
+    if had_unpaired_schema10 {
+        eprintln!("validate: warning: omitting unpaired schema-10 cell evidence from failure ledger row");
+    }
     let (coverage_schema, coverage) = ledger_schema_and_coverage(coverage);
-    let ledger_schema = ledger_schema_version(coverage_schema, cell_results);
+    let ledger_schema = ledger_schema_version(coverage_schema, cell_results, test_results);
     // `gate_records` counts typed scheduler outcomes, including an explicit
     // UNKNOWN record for a spawn/supervisor failure. `executed_nodes` counts
     // only terminal attempts with a collected child exit status. The two must
@@ -16753,7 +17014,7 @@ fn write_ledger(
         .map(|results| results.run_id.as_str())
         .or_else(|| coverage.get("run_id").and_then(serde_json::Value::as_str))
         .or(environment_run_id.as_deref());
-    let record = serde_json::json!({
+    let mut record = serde_json::json!({
         "schema_version": ledger_schema,
         "repo": "hermit",
         "producer": LEDGER_PRODUCER,
@@ -16866,6 +17127,12 @@ fn write_ledger(
         "cell_results": cell_results.map(|results| &results.evidence),
         "gates": gates,
     });
+    if let Some(test_results) = test_results {
+        record
+            .as_object_mut()
+            .expect("ledger record is an object")
+            .insert("test_results".into(), serde_json::to_value(&test_results.evidence).unwrap());
+    }
     let typed = match serde_json::from_value::<HistoryRow>(record.clone()) {
         Ok(typed) => typed,
         Err(error) => {
@@ -16879,6 +17146,10 @@ fn write_ledger(
         eprintln!(
             "validate: warning: generated ledger row has malformed HistoryRow retry_rounds"
         );
+        return;
+    }
+    if let Err(error) = validate_generated_ledger_evidence(&typed) {
+        eprintln!("validate: warning: generated ledger row failed its evidence accessors: {error}");
         return;
     }
     if typed.executed_nodes() != Ok(Some(executed_nodes)) {
@@ -19543,6 +19814,28 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             }
         };
     eprintln!("validate: per-cell results: {}", e2e_result_root.display());
+    let retained_image_digest = if !nesting.nested
+        && !args.allow_local_off_the_record_run
+        && retained_validate_path(&plan.profile).is_some()
+    {
+        match pinned_root_image_digest(&root) {
+            Ok(digest) => Some(digest),
+            Err(error) => {
+                return RunSummary::refused(
+                    3,
+                    &plan.profile,
+                    "pinned-root image identity",
+                    vec![
+                        error,
+                        "retained verify logs must name the exact immutable validation image"
+                            .into(),
+                    ],
+                )
+            }
+        }
+    } else {
+        None
+    };
 
     // ---- box-wide concurrency observation (validate.sh:1499) -----------------
     //
@@ -19917,6 +20210,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
                 false,
                 coverage.clone(),
                 None,
+                None,
             );
         }
         // This is below the interrupted run's ledger write. Keep the checkout
@@ -20155,8 +20449,8 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // A full top-level run must carry the exact per-cell population it just
     // judged. Older schema-5 rows could say only that buckets passed; they could
     // not open or satisfy a cell-specific failure obligation. Retain the typed
-    // rows before appending the ledger entry so schema 7 is emitted only when
-    // the artifact has actually been published and bound by checksum.
+    // rows before appending the ledger entry so the outer schema is emitted only
+    // after every artifact has been published and bound by checksum.
     let should_retain_cells = plan.suite_complete || plan.cell_evidence_expected.is_some();
     let retained_cell_results = if !nesting.nested
         && !args.allow_local_off_the_record_run
@@ -20168,19 +20462,84 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             None => validate_cell_results::expected_plan(&root),
         };
         let result = expected.and_then(|expected| {
-            validate_cell_results::retain(
-                parent.as_deref().unwrap_or(&root),
-                &e2e_result_root,
-                &commit,
-                &expected,
-            )
+            match (
+                retained_validate_path(&plan.profile),
+                retained_image_digest.as_deref(),
+            ) {
+                (Some(validate_path), Some(image_digest)) => {
+                    validate_cell_results::retain_with_policy(
+                        parent.as_deref().unwrap_or(&root),
+                        &e2e_result_root,
+                        &commit,
+                        &expected,
+                        validate_path,
+                        image_digest,
+                        VerifyLogRetentionPolicy::new(
+                            DEFAULT_VERIFY_LOG_RETENTION_BUDGET_BYTES,
+                        ),
+                    )
+                }
+                _ => validate_cell_results::retain(
+                    parent.as_deref().unwrap_or(&root),
+                    &e2e_result_root,
+                    &commit,
+                    &expected,
+                ),
+            }
         });
         match result {
             Ok(results) => Some(results),
             Err(error) => {
                 eprintln!(
                     "validate: ERROR: cannot retain complete per-cell evidence: {error}; \
-                     refusing a schema-7 receipt"
+                     refusing a receipt"
+                );
+                exit_code = 1;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let retained_test_results = if retained_cell_results.as_ref().is_some_and(|results| {
+        results.schema_version
+            == validate_cell_results::RETAINED_VERIFY_LOGS_LEDGER_SCHEMA_VERSION
+    }) {
+        let retained = (|| {
+            let cell_results = retained_cell_results
+                .as_ref()
+                .ok_or_else(|| "schema-10 cell evidence disappeared before test retention".to_string())?;
+            let validate_path = retained_validate_path(&plan.profile)
+                .ok_or_else(|| "schema-10 test results require quick, full, or super path".to_string())?;
+            let (nodes, compatibility) = retained_test_results_inputs(
+                &plan.planned_test_nodes,
+                &outcomes,
+                &attempts,
+                plan.compat,
+                plan.compat_prefix,
+            )?;
+            let expected = exact_test_totals(executed_tests, passed_tests, filtered_tests)?;
+            validate_test_results::retain(
+                parent.as_deref().unwrap_or(&root),
+                validate_path,
+                &cell_results.run_id,
+                &commit,
+                attribution_tree_dirty,
+                &plan.planned_test_nodes,
+                plan.compat.is_some(),
+                nodes,
+                compatibility,
+                expected,
+            )
+        })();
+        match retained {
+            Ok(results) => {
+                println!("Test-results artifact: {}", results.evidence.artifact.path);
+                Some(results)
+            }
+            Err(error) => {
+                eprintln!(
+                    "validate: ERROR: cannot retain complete per-test evidence: {error}; refusing a receipt"
                 );
                 exit_code = 1;
                 None
@@ -20294,6 +20653,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             plan.suite_complete && execution_complete,
             coverage,
             retained_cell_results.as_ref(),
+            retained_test_results.as_ref(),
         );
     }
 
@@ -20654,6 +21014,7 @@ fn stop_test_seam(
             "",
             false,
             serde_json::json!({}),
+            None,
             None,
         );
     }
