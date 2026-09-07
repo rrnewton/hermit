@@ -235,6 +235,67 @@ pub struct RetainedVerifyLogPublication {
     run2_digest: ContentDigest,
 }
 
+/// The result-row state observed while holding the publication lock.
+///
+/// A committed row can still carry a directory-sync warning: its exact bytes
+/// are authoritative, but the caller must surface the durability failure and
+/// must not publish a stale fallback row or remove its referenced raw inputs.
+#[derive(Debug)]
+pub enum RetainedVerifyLogPublicationOutcome {
+    Committed {
+        publication: Box<RetainedVerifyLogPublication>,
+        durability_warning: Option<String>,
+    },
+    RolledBack {
+        reason: String,
+    },
+    Indeterminate {
+        reason: String,
+    },
+}
+
+#[derive(Debug)]
+enum RetainedVerifyLogPublicationError {
+    RolledBack(String),
+    Committed {
+        publication: Box<RetainedVerifyLogPublication>,
+        warning: String,
+    },
+    Indeterminate(String),
+}
+
+impl RetainedVerifyLogPublicationError {
+    fn message(&self) -> &str {
+        match self {
+            Self::RolledBack(message) | Self::Indeterminate(message) => message,
+            Self::Committed { warning, .. } => warning,
+        }
+    }
+
+    #[cfg(test)]
+    fn contains(&self, needle: &str) -> bool {
+        self.message().contains(needle)
+    }
+}
+
+impl From<String> for RetainedVerifyLogPublicationError {
+    fn from(message: String) -> Self {
+        Self::RolledBack(message)
+    }
+}
+
+impl From<&str> for RetainedVerifyLogPublicationError {
+    fn from(message: &str) -> Self {
+        Self::RolledBack(message.into())
+    }
+}
+
+impl std::fmt::Display for RetainedVerifyLogPublicationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
 /// Storage policy shared by every retained verify log in one validation run.
 ///
 /// The aggregate limit is explicit rather than inferred from free space: a
@@ -259,6 +320,29 @@ struct VerifyLogRetentionState {
     accounted_compressed_bytes: u64,
 }
 
+#[derive(Debug)]
+enum ResultPublicationHealth {
+    Healthy,
+    Indeterminate(String),
+}
+
+impl ResultPublicationHealth {
+    fn require_healthy(&self) -> Result<(), String> {
+        match self {
+            Self::Healthy => Ok(()),
+            Self::Indeterminate(reason) => Err(format!(
+                "result publication is latched indeterminate; refusing further mutation: {reason}"
+            )),
+        }
+    }
+
+    fn latch(&mut self, reason: String) {
+        if matches!(self, Self::Healthy) {
+            *self = Self::Indeterminate(reason);
+        }
+    }
+}
+
 /// Synchronized aggregate accounting for retained verify logs.
 ///
 /// Clones share one counter. Each compressed write is provisionally charged
@@ -272,7 +356,7 @@ pub struct VerifyLogRetentionBudget {
     retention_root: PathBuf,
     results_path: PathBuf,
     state: Arc<Mutex<VerifyLogRetentionState>>,
-    result_publication: Arc<Mutex<()>>,
+    result_publication: Arc<Mutex<ResultPublicationHealth>>,
 }
 
 impl VerifyLogRetentionBudget {
@@ -359,7 +443,7 @@ impl VerifyLogRetentionBudget {
             state: Arc::new(Mutex::new(VerifyLogRetentionState {
                 accounted_compressed_bytes,
             })),
-            result_publication: Arc::new(Mutex::new(())),
+            result_publication: Arc::new(Mutex::new(ResultPublicationHealth::Healthy)),
         })
     }
 
@@ -375,15 +459,37 @@ impl VerifyLogRetentionBudget {
             .accounted_compressed_bytes)
     }
 
+    /// Linearize a run-wide catastrophic containment failure with result-row
+    /// publication. A transaction already holding this lock completes before
+    /// the halt; every later retained or ordinary publication refuses without
+    /// mutating the result file. The first exact cause remains authoritative.
+    pub fn halt_result_publication(&self, reason: &str) -> Result<(), String> {
+        let mut publication = self
+            .result_publication
+            .lock()
+            .map_err(|_| "retained verify-log result-publication lock is poisoned".to_string())?;
+        publication.latch(reason.to_string());
+        Ok(())
+    }
+
     /// Serialize an ordinary result-row publication with retained-descriptor
     /// publication so concurrent workers cannot overwrite each other's rows.
     pub fn append_result(&self, path: &Path, result: &CellResult) -> Result<(), String> {
         self.require_results_path(path)?;
-        let _publication = self
+        let mut publication = self
             .result_publication
             .lock()
             .map_err(|_| "retained verify-log result-publication lock is poisoned".to_string())?;
-        append_result_with_failure(path, result, None, false).map_err(|error| error.message)
+        publication.require_healthy()?;
+        match append_result_with_failure(path, result, None, false) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if error.state != ResultPublicationState::RolledBack {
+                    publication.latch(error.message.clone());
+                }
+                Err(error.message)
+            }
+        }
     }
 
     fn reserve_additional(&self, compressed_bytes: u64) -> Result<(), String> {
@@ -2699,23 +2805,23 @@ fn abort_staged_verify_log(
     retained_directory: &Path,
     reservation: VerifyLogRetentionReservation,
     primary_error: String,
-) -> Result<RetainedVerifyLogPublication, String> {
+) -> Result<RetainedVerifyLogPublication, RetainedVerifyLogPublicationError> {
     let staging_path = temporary.path().to_owned();
     let retention_root = reservation.budget.retention_root.clone();
     match temporary.close() {
         Ok(()) => {
             match remove_empty_retained_verify_directories(&retention_root, retained_directory) {
                 Ok(()) => match reservation.rollback() {
-                    Ok(()) => Err(primary_error),
+                    Ok(()) => Err(primary_error.into()),
                     Err(accounting_error) => Err(format!(
                         "{primary_error}; removed the retained verify-log staging file but could not roll back its accounting: {accounting_error}"
-                    )),
+                    ).into()),
                 },
                 Err(sync_error) => {
                     reservation.commit();
                     Err(format!(
                         "{primary_error}; removed the retained verify-log staging file but could not durably clean up its directories, so its bytes remain charged: {sync_error}"
-                    ))
+                    ).into())
                 }
             }
         }
@@ -2724,7 +2830,7 @@ fn abort_staged_verify_log(
             Err(format!(
                 "{primary_error}; could not remove retained verify-log staging file {}, so its bytes remain charged: {removal_error}",
                 staging_path.display()
-            ))
+            ).into())
         }
     }
 }
@@ -2733,12 +2839,12 @@ fn abort_empty_retained_verify_log_layout(
     retention_root: &Path,
     retained_directory: &Path,
     primary_error: String,
-) -> Result<RetainedVerifyLogPublication, String> {
+) -> Result<RetainedVerifyLogPublication, RetainedVerifyLogPublicationError> {
     match remove_empty_retained_verify_directories(retention_root, retained_directory) {
-        Ok(()) => Err(primary_error),
+        Ok(()) => Err(primary_error.into()),
         Err(cleanup_error) => Err(format!(
             "{primary_error}; could not durably clean up the empty retained verify-log directories: {cleanup_error}"
-        )),
+        ).into()),
     }
 }
 
@@ -2748,7 +2854,7 @@ fn abort_retained_verify_log(
     reservation: VerifyLogRetentionReservation,
     primary_error: String,
     fail_final_removal: bool,
-) -> Result<RetainedVerifyLogPublication, String> {
+) -> Result<RetainedVerifyLogPublication, RetainedVerifyLogPublicationError> {
     let retention_root = reservation.budget.retention_root.clone();
     let removal = if fail_final_removal {
         Err(std::io::Error::other(
@@ -2761,32 +2867,32 @@ fn abort_retained_verify_log(
         Ok(()) => {
             match remove_empty_retained_verify_directories(&retention_root, retained_directory) {
                 Ok(()) => match reservation.rollback() {
-                    Ok(()) => Err(primary_error),
+                    Ok(()) => Err(primary_error.into()),
                     Err(accounting_error) => Err(format!(
                         "{primary_error}; removed the unreferenced retained verify log but could not roll back its accounting: {accounting_error}"
-                    )),
+                    ).into()),
                 },
                 Err(sync_error) => {
                     reservation.commit();
                     Err(format!(
                         "{primary_error}; removed the unreferenced retained verify log but could not durably clean up its directories, so its bytes remain charged: {sync_error}"
-                    ))
+                    ).into())
                 }
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match remove_empty_retained_verify_directories(&retention_root, retained_directory) {
                 Ok(()) => match reservation.rollback() {
-                    Ok(()) => Err(primary_error),
+                    Ok(()) => Err(primary_error.into()),
                     Err(accounting_error) => Err(format!(
                         "{primary_error}; retained verify log was absent but its accounting could not be rolled back: {accounting_error}"
-                    )),
+                    ).into()),
                 },
                 Err(sync_error) => {
                     reservation.commit();
                     Err(format!(
                         "{primary_error}; retained verify log was absent but its directories could not be durably cleaned up, so its bytes remain charged: {sync_error}"
-                    ))
+                    ).into())
                 }
             }
         }
@@ -2795,7 +2901,7 @@ fn abort_retained_verify_log(
             Err(format!(
                 "{primary_error}; could not remove unreferenced retained verify log {}, so its bytes remain charged: {removal_error}",
                 retained_path.display()
-            ))
+            ).into())
         }
     }
 }
@@ -2807,7 +2913,7 @@ fn retain_verify_log_with_limit(
     results_path: &Path,
     result: &mut CellResult,
     hooks: VerifyLogTransactionHooks<'_>,
-) -> Result<RetainedVerifyLogPublication, String> {
+) -> Result<RetainedVerifyLogPublication, RetainedVerifyLogPublicationError> {
     retention_budget.require_artifact_dir(&pair.artifact_dir)?;
     let retained_relative = retained_verify_log_relative_path(pair.attempt)?;
     let retained_path = pair.artifact_dir.join(&retained_relative);
@@ -2871,13 +2977,15 @@ fn retain_verify_log_with_limit(
             return Err(format!(
                 "retained verify log {} already exists",
                 retained_path.display()
-            ));
+            )
+            .into());
         }
         Err(error) => {
             return Err(format!(
                 "cannot inspect retained verify log {}: {error}",
                 retained_path.display()
-            ));
+            )
+            .into());
         }
     }
 
@@ -3208,7 +3316,7 @@ fn retain_verify_log_with_limit(
             hooks.fail_final_removal,
         );
     }
-    let result_publication = match retention_budget.result_publication.lock() {
+    let mut result_publication = match retention_budget.result_publication.lock() {
         Ok(publication) => publication,
         Err(_) => {
             return abort_retained_verify_log(
@@ -3220,6 +3328,16 @@ fn retain_verify_log_with_limit(
             );
         }
     };
+    if let Err(error) = result_publication.require_healthy() {
+        drop(result_publication);
+        return abort_retained_verify_log(
+            &retained_path,
+            &retained_directory,
+            reservation,
+            error,
+            hooks.fail_final_removal,
+        );
+    }
     let previous_result = result.clone();
     if let Err(error) =
         result.prepare_retained_verify_log_publication(&comparison.report, retained.clone())
@@ -3234,36 +3352,51 @@ fn retain_verify_log_with_limit(
             hooks.fail_final_removal,
         );
     }
+    let publication = || RetainedVerifyLogPublication {
+        retained: retained.clone(),
+        run1_raw: run1_log.clone(),
+        run2_raw: run2_log.clone(),
+        run1_digest: run1_log_digest.clone(),
+        run2_digest: run2_log_digest.clone(),
+    };
     if let Err(error) =
         append_result_with_failure(results_path, result, hooks.result_publication_failure, true)
     {
-        drop(result_publication);
-        if !error.descriptor_visible {
-            *result = previous_result;
-            return abort_retained_verify_log(
-                &retained_path,
-                &retained_directory,
-                reservation,
-                error.message,
-                hooks.fail_final_removal,
-            );
-        }
-        reservation.commit();
-        return Err(format!(
-            "{}; retained verify log remains published and charged because its result row may be visible",
-            error.message
-        ));
+        return match error.state {
+            ResultPublicationState::RolledBack => {
+                drop(result_publication);
+                *result = previous_result;
+                abort_retained_verify_log(
+                    &retained_path,
+                    &retained_directory,
+                    reservation,
+                    error.message,
+                    hooks.fail_final_removal,
+                )
+            }
+            ResultPublicationState::Committed => {
+                result_publication.latch(error.message.clone());
+                drop(result_publication);
+                reservation.commit();
+                Err(RetainedVerifyLogPublicationError::Committed {
+                    publication: Box::new(publication()),
+                    warning: error.message,
+                })
+            }
+            ResultPublicationState::Indeterminate => {
+                result_publication.latch(error.message.clone());
+                drop(result_publication);
+                reservation.commit();
+                Err(RetainedVerifyLogPublicationError::Indeterminate(
+                    error.message,
+                ))
+            }
+        };
     }
     drop(result_publication);
     reservation.commit();
 
-    Ok(RetainedVerifyLogPublication {
-        retained,
-        run1_raw: run1_log,
-        run2_raw: run2_log,
-        run1_digest: run1_log_digest,
-        run2_digest: run2_log_digest,
-    })
+    Ok(publication())
 }
 
 /// Durably publish run 1 and the result row that retains its descriptor.
@@ -3272,20 +3405,59 @@ fn retain_verify_log_with_limit(
 /// and re-read before the descriptor is added to the attempt and the complete
 /// result row is atomically replaced and synced. Accounting becomes permanent
 /// only after that row is durable.
-pub fn publish_retained_verify_log(
+pub fn publish_retained_verify_log_outcome(
     pair: ComparedVerifyPair,
     retention_budget: &VerifyLogRetentionBudget,
     results_path: &Path,
     result: &mut CellResult,
-) -> Result<RetainedVerifyLogPublication, String> {
-    retain_verify_log_with_limit(
+) -> RetainedVerifyLogPublicationOutcome {
+    match retain_verify_log_with_limit(
         pair,
         VERIFY_LOG_MAX_UNCOMPRESSED_BYTES,
         retention_budget,
         results_path,
         result,
         VerifyLogTransactionHooks::default(),
-    )
+    ) {
+        Ok(publication) => RetainedVerifyLogPublicationOutcome::Committed {
+            publication: Box::new(publication),
+            durability_warning: None,
+        },
+        Err(RetainedVerifyLogPublicationError::Committed {
+            publication,
+            warning,
+        }) => RetainedVerifyLogPublicationOutcome::Committed {
+            publication,
+            durability_warning: Some(warning),
+        },
+        Err(RetainedVerifyLogPublicationError::RolledBack(reason)) => {
+            RetainedVerifyLogPublicationOutcome::RolledBack { reason }
+        }
+        Err(RetainedVerifyLogPublicationError::Indeterminate(reason)) => {
+            RetainedVerifyLogPublicationOutcome::Indeterminate { reason }
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn publish_retained_verify_log(
+    pair: ComparedVerifyPair,
+    retention_budget: &VerifyLogRetentionBudget,
+    results_path: &Path,
+    result: &mut CellResult,
+) -> Result<RetainedVerifyLogPublication, String> {
+    match publish_retained_verify_log_outcome(pair, retention_budget, results_path, result) {
+        RetainedVerifyLogPublicationOutcome::Committed {
+            publication,
+            durability_warning: None,
+        } => Ok(*publication),
+        RetainedVerifyLogPublicationOutcome::Committed {
+            durability_warning: Some(reason),
+            ..
+        }
+        | RetainedVerifyLogPublicationOutcome::RolledBack { reason }
+        | RetainedVerifyLogPublicationOutcome::Indeterminate { reason } => Err(reason),
+    }
 }
 
 fn cleanup_verify_log_sources_with(
@@ -3492,62 +3664,118 @@ fn require_plain_liteinst_resource(path: &Path, description: &str) -> Result<(),
     Ok(())
 }
 
-fn discover_liteinst_runtime(context: &RunContext) -> Result<Option<[PathBuf; 2]>, String> {
-    let explicit = std::env::var_os(LITEINST_RUNTIME_ENV);
-    if explicit.as_ref().is_some_and(|value| value.is_empty()) {
-        return Err(format!("{LITEINST_RUNTIME_ENV} is empty"));
-    }
-    let mut candidates = Vec::new();
-    if let Some(explicit) = explicit {
-        candidates.push(PathBuf::from(explicit));
+fn absolute_invocation_path(path: &Path, current_dir: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_owned()
     } else {
-        let binary_dir = context
-            .hermit_bin
-            .parent()
-            .ok_or_else(|| "Hermit executable has no parent directory".to_string())?;
-        candidates.push(binary_dir.join(LITEINST_RUNTIME_FILE));
-        candidates.push(binary_dir.join("deps").join(LITEINST_RUNTIME_FILE));
-        if let Some(install) = std::env::var_os(HERMIT_INSTALL_DIR_ENV) {
-            if install.is_empty() {
-                return Err(format!("{HERMIT_INSTALL_DIR_ENV} is empty"));
-            }
-            candidates.push(
-                PathBuf::from(install)
-                    .join("rsrcs")
-                    .join(LITEINST_RUNTIME_FILE),
-            );
-        }
-        if let Some(target_dir) = binary_dir.parent() {
-            candidates.push(
-                target_dir
-                    .join("install_pkg/rsrcs")
-                    .join(LITEINST_RUNTIME_FILE),
-            );
-        }
+        current_dir.join(path)
     }
+}
 
-    for candidate in candidates {
-        let candidate = if candidate.is_absolute() {
-            candidate
-        } else {
-            context.root.join(candidate)
-        };
-        match fs::symlink_metadata(&candidate) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
+fn inspected_liteinst_runtime(
+    candidate: PathBuf,
+    required_by: Option<&str>,
+) -> Result<Option<[PathBuf; 2]>, String> {
+    match fs::symlink_metadata(&candidate) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(required_by) = required_by {
                 return Err(format!(
-                    "cannot inspect LiteInst runtime {}: {error}",
+                    "{required_by} does not name a regular file: {}",
                     candidate.display()
                 ));
             }
-            Ok(_) => {}
+            return Ok(None);
         }
-        require_plain_liteinst_resource(&candidate, "LiteInst runtime")?;
-        let revision = liteinst_revision_path(&candidate);
-        require_plain_liteinst_resource(&revision, "LiteInst runtime revision")?;
-        return Ok(Some([candidate, revision]));
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect LiteInst runtime {}: {error}",
+                candidate.display()
+            ));
+        }
+        Ok(_) => {}
     }
-    Ok(None)
+    require_plain_liteinst_resource(&candidate, "LiteInst runtime")?;
+    let revision = liteinst_revision_path(&candidate);
+    require_plain_liteinst_resource(&revision, "LiteInst runtime revision")?;
+    Ok(Some([candidate, revision]))
+}
+
+fn discover_liteinst_runtime_from(
+    invoked_executable: &Path,
+    current_dir: &Path,
+    explicit_runtime: Option<&OsStr>,
+    explicit_install: Option<&OsStr>,
+) -> Result<Option<[PathBuf; 2]>, String> {
+    if let Some(explicit) = explicit_runtime {
+        if explicit.is_empty() {
+            return Err(format!("{LITEINST_RUNTIME_ENV} is empty"));
+        }
+        return inspected_liteinst_runtime(
+            absolute_invocation_path(Path::new(explicit), current_dir),
+            Some(LITEINST_RUNTIME_ENV),
+        );
+    }
+
+    let invoked = absolute_invocation_path(invoked_executable, current_dir);
+    let executable = fs::canonicalize(&invoked).map_err(|error| {
+        format!(
+            "cannot resolve Hermit executable {} for LiteInst discovery: {error}",
+            invoked.display()
+        )
+    })?;
+    let executable_directory = executable
+        .parent()
+        .ok_or_else(|| "Hermit executable has no parent directory".to_string())?;
+    for candidate in [
+        executable_directory.join(LITEINST_RUNTIME_FILE),
+        executable_directory
+            .join("deps")
+            .join(LITEINST_RUNTIME_FILE),
+    ] {
+        if let Some(runtime) = inspected_liteinst_runtime(candidate, None)? {
+            return Ok(Some(runtime));
+        }
+    }
+
+    let install_directory = if let Some(explicit) = explicit_install {
+        if explicit.is_empty() {
+            return Err(format!("{HERMIT_INSTALL_DIR_ENV} is empty"));
+        }
+        Some(absolute_invocation_path(Path::new(explicit), current_dir))
+    } else {
+        let invoked_directory = (invoked_executable.is_absolute()
+            || invoked_executable.components().count() > 1)
+            .then_some(invoked.as_path())
+            .and_then(Path::parent);
+        let built_in = executable_directory
+            .parent()
+            .map(|target| target.join("install_pkg"));
+        invoked_directory
+            .filter(|directory| directory.join("rsrcs").is_dir())
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                executable_directory
+                    .join("rsrcs")
+                    .is_dir()
+                    .then(|| executable_directory.to_owned())
+            })
+            .or_else(|| built_in.filter(|directory| directory.join("rsrcs").is_dir()))
+    };
+    match install_directory {
+        Some(directory) => {
+            inspected_liteinst_runtime(directory.join("rsrcs").join(LITEINST_RUNTIME_FILE), None)
+        }
+        None => Ok(None),
+    }
+}
+
+fn discover_liteinst_runtime(context: &RunContext) -> Result<Option<[PathBuf; 2]>, String> {
+    discover_liteinst_runtime_from(
+        &context.hermit_bin,
+        &context.root,
+        std::env::var_os(LITEINST_RUNTIME_ENV).as_deref(),
+        std::env::var_os(HERMIT_INSTALL_DIR_ENV).as_deref(),
+    )
 }
 
 fn readonly_identity_mount_argument(path: &Path) -> Result<String, String> {
@@ -4141,13 +4369,93 @@ mod tests {
     }
 
     #[test]
+    fn liteinst_runtime_discovery_matches_cli_precedence_with_symlinked_argv0() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let resolved_directory = root.join("target/debug");
+        let invoked_directory = root.join("package/bin");
+        let explicit_install = root.join("explicit-install");
+        let built_in_install = root.join("target/install_pkg");
+        fs::create_dir_all(&resolved_directory).unwrap();
+        fs::create_dir_all(&invoked_directory).unwrap();
+        let resolved_executable = resolved_directory.join("hermit");
+        let invoked_executable = invoked_directory.join("hermit");
+        fs::write(&resolved_executable, b"hermit sentinel").unwrap();
+        std::os::unix::fs::symlink(&resolved_executable, &invoked_executable).unwrap();
+
+        let stage = |runtime: PathBuf, marker: &[u8]| {
+            fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+            fs::write(&runtime, marker).unwrap();
+            fs::write(liteinst_revision_path(&runtime), b"revision\n").unwrap();
+            runtime
+        };
+        let explicit_runtime = stage(root.join("override/runtime.so"), b"explicit-runtime");
+        let direct = stage(
+            resolved_directory.join(LITEINST_RUNTIME_FILE),
+            b"resolved-direct",
+        );
+        let deps = stage(
+            resolved_directory.join("deps").join(LITEINST_RUNTIME_FILE),
+            b"resolved-deps",
+        );
+        let explicit_install_runtime = stage(
+            explicit_install.join("rsrcs").join(LITEINST_RUNTIME_FILE),
+            b"explicit-install",
+        );
+        let invoked_resource = stage(
+            invoked_directory.join("rsrcs").join(LITEINST_RUNTIME_FILE),
+            b"invoked-resource",
+        );
+        let resolved_resource = stage(
+            resolved_directory.join("rsrcs").join(LITEINST_RUNTIME_FILE),
+            b"resolved-resource",
+        );
+        let built_in_resource = stage(
+            built_in_install.join("rsrcs").join(LITEINST_RUNTIME_FILE),
+            b"built-in-resource",
+        );
+        let discover = |runtime: Option<&Path>, install: Option<&Path>| {
+            discover_liteinst_runtime_from(
+                &invoked_executable,
+                root,
+                runtime.map(Path::as_os_str),
+                install.map(Path::as_os_str),
+            )
+            .unwrap()
+            .unwrap()[0]
+                .clone()
+        };
+
+        assert_eq!(
+            discover(Some(&explicit_runtime), Some(&explicit_install)),
+            explicit_runtime
+        );
+        assert_eq!(discover(None, None), direct);
+        fs::remove_file(&direct).unwrap();
+        fs::remove_file(liteinst_revision_path(&direct)).unwrap();
+        assert_eq!(discover(None, None), deps);
+        fs::remove_file(&deps).unwrap();
+        fs::remove_file(liteinst_revision_path(&deps)).unwrap();
+        assert_eq!(
+            discover(None, Some(&explicit_install)),
+            explicit_install_runtime
+        );
+        assert_eq!(discover(None, None), invoked_resource);
+        fs::remove_dir_all(invoked_directory.join("rsrcs")).unwrap();
+        assert_eq!(discover(None, None), resolved_resource);
+        fs::remove_dir_all(resolved_directory.join("rsrcs")).unwrap();
+        assert_eq!(discover(None, None), built_in_resource);
+    }
+
+    #[test]
     fn liteinst_runtime_is_identity_mounted_read_only_without_physical_copies() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("repo");
         let cell_dir = directory.path().join("results/cell");
-        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(root.join("rsrcs")).unwrap();
         fs::create_dir_all(&cell_dir).unwrap();
-        let runtime = root.join(LITEINST_RUNTIME_FILE);
+        fs::write(root.join("hermit"), b"packaged hermit sentinel").unwrap();
+        let runtime = root.join("rsrcs").join(LITEINST_RUNTIME_FILE);
         let revision = liteinst_revision_path(&runtime);
         fs::write(&runtime, b"runtime-bytes").unwrap();
         fs::write(&revision, b"8c8c0a57649c9ffbf8a7a14291a64320f64b935f\n").unwrap();
@@ -4465,13 +4773,13 @@ mod tests {
             (run1.join().unwrap().unwrap(), run2.join().unwrap().unwrap())
         });
         assert_eq!(
-            run1_output.status.code(),
+            run1_output.status_code(),
             Some(0),
             "run 1 diagnostics: {}",
             String::from_utf8_lossy(&fs::read(&run1_spec.paths.diagnostic_stderr).unwrap())
         );
         assert_eq!(
-            run2_output.status.code(),
+            run2_output.status_code(),
             Some(0),
             "run 2 diagnostics: {}",
             String::from_utf8_lossy(&fs::read(&run2_spec.paths.diagnostic_stderr).unwrap())
@@ -5235,6 +5543,30 @@ mod tests {
     }
 
     #[test]
+    fn catastrophic_halt_preserves_first_cause_and_refuses_later_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let budget = verify_log_retention_budget(directory.path(), u64::MAX);
+        let results_path = budget.results_path.clone();
+        let before = fs::read(&results_path).unwrap();
+        let first = "forced supervisor loss in cell zero";
+        let later = "later containment report must not replace the first";
+
+        budget.halt_result_publication(first).unwrap();
+        budget.halt_result_publication(later).unwrap();
+        let error = budget
+            .append_result(&results_path, &cell_result_that_located_nothing())
+            .unwrap_err();
+
+        assert!(error.contains(first), "{error}");
+        assert!(!error.contains(later), "{error}");
+        assert_eq!(
+            fs::read(&results_path).unwrap(),
+            before,
+            "a post-abort publication must refuse without mutation"
+        );
+    }
+
+    #[test]
     fn aggregate_retention_budget_accepts_exact_bound_and_refuses_one_byte_over() {
         let directory = tempfile::tempdir().unwrap();
         let body = structured_info_record("DETLOG aggregate retention bound");
@@ -5495,6 +5827,296 @@ mod tests {
             .unwrap();
             assert_eq!(restarted.accounted_compressed_bytes().unwrap(), 0);
         }
+    }
+
+    #[test]
+    fn result_publication_reread_distinguishes_committed_and_indeterminate_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let body = structured_info_record("DETLOG publication state");
+
+        let committed_root = directory.path().join("committed");
+        fs::create_dir(&committed_root).unwrap();
+        let committed_artifact = committed_root.join("cell");
+        let (committed_run1, committed_run2) =
+            verify_pair_fixture(&committed_artifact, &body, &body, true);
+        let committed_pair = compare_verify_runs(
+            &committed_run1,
+            load_verify_run(&committed_run1).unwrap(),
+            &committed_run2,
+            load_verify_run(&committed_run2).unwrap(),
+        )
+        .unwrap();
+        let committed_budget = verify_log_retention_budget(&committed_root, u64::MAX);
+        let committed_results = committed_budget.results_path.clone();
+        let mut committed_result = verify_cell_result(&committed_run1);
+        let committed_error = retain_verify_log_with_limit(
+            committed_pair,
+            4096,
+            &committed_budget,
+            &committed_results,
+            &mut committed_result,
+            VerifyLogTransactionHooks {
+                result_publication_failure: Some(
+                    ResultPublicationFailurePoint::ParentDirectorySyncAndRollbackFailure,
+                ),
+                ..VerifyLogTransactionHooks::default()
+            },
+        )
+        .unwrap_err();
+        let publication = match committed_error {
+            RetainedVerifyLogPublicationError::Committed {
+                publication,
+                warning,
+            } => {
+                assert!(warning.contains("exact next result bytes"), "{warning}");
+                publication
+            }
+            other => panic!("expected committed publication warning, got {other}"),
+        };
+        assert_eq!(
+            committed_result.schema,
+            RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA
+        );
+        let mut exact_next = serde_json::to_vec(&committed_result).unwrap();
+        exact_next.push(b'\n');
+        assert_eq!(fs::read(&committed_results).unwrap(), exact_next);
+        assert_eq!(
+            committed_budget.accounted_compressed_bytes().unwrap(),
+            publication.retained.compressed_bytes
+        );
+        assert!(committed_run1.paths.log.is_file());
+        assert!(committed_run2.paths.log.is_file());
+        let charged = publication.retained.compressed_bytes;
+        let committed_bytes = fs::read(&committed_results).unwrap();
+        let append_error = committed_budget
+            .append_result(&committed_results, &cell_result_that_located_nothing())
+            .unwrap_err();
+        assert!(
+            append_error.contains("latched indeterminate"),
+            "{append_error}"
+        );
+        assert_eq!(fs::read(&committed_results).unwrap(), committed_bytes);
+
+        let blocked_artifact = committed_root.join("blocked-cell");
+        let (blocked_run1, blocked_run2) =
+            verify_pair_fixture(&blocked_artifact, &body, &body, true);
+        let blocked_pair = compare_verify_runs(
+            &blocked_run1,
+            load_verify_run(&blocked_run1).unwrap(),
+            &blocked_run2,
+            load_verify_run(&blocked_run2).unwrap(),
+        )
+        .unwrap();
+        let mut blocked_result = verify_cell_result(&blocked_run1);
+        let blocked_error = retain_verify_log_with_limit(
+            blocked_pair,
+            4096,
+            &committed_budget,
+            &committed_results,
+            &mut blocked_result,
+            VerifyLogTransactionHooks::default(),
+        )
+        .unwrap_err();
+        assert!(
+            blocked_error.contains("latched indeterminate"),
+            "{blocked_error}"
+        );
+        assert!(!blocked_artifact.join("retained").exists());
+        assert!(blocked_run1.paths.log.is_file());
+        assert!(blocked_run2.paths.log.is_file());
+        assert_eq!(
+            committed_budget.accounted_compressed_bytes().unwrap(),
+            charged
+        );
+        drop(committed_budget);
+        let reopened = VerifyLogRetentionBudget::open(
+            &committed_root,
+            &committed_results,
+            VerifyLogRetentionPolicy::new(u64::MAX),
+        )
+        .unwrap();
+        assert_eq!(reopened.accounted_compressed_bytes().unwrap(), charged);
+
+        let indeterminate_root = directory.path().join("indeterminate");
+        fs::create_dir(&indeterminate_root).unwrap();
+        let indeterminate_artifact = indeterminate_root.join("cell");
+        let (indeterminate_run1, indeterminate_run2) =
+            verify_pair_fixture(&indeterminate_artifact, &body, &body, true);
+        let indeterminate_pair = compare_verify_runs(
+            &indeterminate_run1,
+            load_verify_run(&indeterminate_run1).unwrap(),
+            &indeterminate_run2,
+            load_verify_run(&indeterminate_run2).unwrap(),
+        )
+        .unwrap();
+        let indeterminate_budget = verify_log_retention_budget(&indeterminate_root, u64::MAX);
+        let indeterminate_results = indeterminate_budget.results_path.clone();
+        let mut indeterminate_result = verify_cell_result(&indeterminate_run1);
+        let indeterminate_error = retain_verify_log_with_limit(
+            indeterminate_pair,
+            4096,
+            &indeterminate_budget,
+            &indeterminate_results,
+            &mut indeterminate_result,
+            VerifyLogTransactionHooks {
+                result_publication_failure: Some(
+                    ResultPublicationFailurePoint::ParentDirectorySyncAndAmbiguousBytes,
+                ),
+                ..VerifyLogTransactionHooks::default()
+            },
+        )
+        .unwrap_err();
+        match indeterminate_error {
+            RetainedVerifyLogPublicationError::Indeterminate(reason) => assert!(
+                reason.contains("neither the exact previous nor exact next state"),
+                "{reason}"
+            ),
+            other => panic!("expected indeterminate publication, got {other}"),
+        }
+        assert_eq!(
+            indeterminate_result.schema,
+            RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA
+        );
+        assert_eq!(
+            fs::read(&indeterminate_results).unwrap(),
+            b"injected ambiguous result bytes\n"
+        );
+        assert!(indeterminate_budget.accounted_compressed_bytes().unwrap() > 0);
+        let retained_path = indeterminate_artifact.join("retained/verify/1/run-1.log.gz");
+        assert!(retained_path.is_file());
+        assert!(indeterminate_run1.paths.log.is_file());
+        assert!(indeterminate_run2.paths.log.is_file());
+        let indeterminate_bytes = fs::read(&indeterminate_results).unwrap();
+        let append_error = indeterminate_budget
+            .append_result(&indeterminate_results, &cell_result_that_located_nothing())
+            .unwrap_err();
+        assert!(
+            append_error.contains("latched indeterminate"),
+            "{append_error}"
+        );
+        assert_eq!(
+            fs::read(&indeterminate_results).unwrap(),
+            indeterminate_bytes
+        );
+        drop(indeterminate_budget);
+        assert!(
+            VerifyLogRetentionBudget::open(
+                &indeterminate_root,
+                &indeterminate_results,
+                VerifyLogRetentionPolicy::new(u64::MAX),
+            )
+            .is_err()
+        );
+        assert!(
+            retained_path.is_file(),
+            "indeterminate state must be preserved"
+        );
+    }
+
+    #[test]
+    fn production_finalizer_publishes_one_two_sided_fallback_after_no_clobber_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_dir = directory.path().join("cell");
+        let body = structured_info_record("DETLOG finalizer no-clobber");
+        let (run1_spec, run2_spec) = verify_pair_fixture(&artifact_dir, &body, &body, true);
+        let pair = compare_verify_runs(
+            &run1_spec,
+            load_verify_run(&run1_spec).unwrap(),
+            &run2_spec,
+            load_verify_run(&run2_spec).unwrap(),
+        )
+        .unwrap();
+        let budget = verify_log_retention_budget(directory.path(), u64::MAX);
+
+        let retained_path = artifact_dir.join("retained/verify/1/run-1.log.gz");
+        fs::create_dir_all(retained_path.parent().unwrap()).unwrap();
+        fs::write(&retained_path, b"pre-existing no-clobber sentinel").unwrap();
+
+        let mut executing_run1 = run1_spec.clone();
+        executing_run1.execution.argv = vec!["/bin/true".into()];
+        let mut executing_run2 = run2_spec.clone();
+        executing_run2.execution.argv = vec!["/bin/true".into()];
+        let permits = super::super::ProcessPermitPool::new(ScheduledWorkerCapacity::new(2));
+        let cpu_budget = super::super::SharedProcessCpuBudget::new(5_000_000);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (run1_execution, run2_execution) = thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                super::super::execute_verify_run_until(
+                    &executing_run1,
+                    deadline,
+                    &cpu_budget,
+                    0,
+                    &permits,
+                )
+            });
+            let second = scope.spawn(|| {
+                super::super::execute_verify_run_until(
+                    &executing_run2,
+                    deadline,
+                    &cpu_budget,
+                    1,
+                    &permits,
+                )
+            });
+            (
+                first.join().unwrap().unwrap(),
+                second.join().unwrap().unwrap(),
+            )
+        });
+        assert!(run1_execution.0.success());
+        assert!(run2_execution.0.success());
+
+        let context = run_context(directory.path());
+        let cell = ptrace_cell("verify");
+        let error = super::super::finalize_harness_verify_result(
+            pair,
+            &budget,
+            &budget.results_path,
+            verify_cell_result(&run1_spec),
+            super::super::HarnessVerifyPublicationContext {
+                context: &context,
+                cell: &cell,
+                started: Instant::now(),
+                preparation_cpu_usage_usec: 0,
+                run1_spec: &executing_run1,
+                run2_spec: &executing_run2,
+                run1_execution: &run1_execution,
+                run2_execution: &run2_execution,
+            },
+        )
+        .unwrap_err();
+        let fallback = match error {
+            RunCellServiceError::EvidencedInfrastructure(result) => *result,
+            other => panic!("expected rolled-back evidenced result, got {other}"),
+        };
+        assert_eq!(fallback.schema, CELL_RESULT_SCHEMA);
+        assert_eq!(fallback.error_kind.as_deref(), Some("result-publication"));
+        assert_eq!(fallback.attempts.len(), 2);
+        assert!(fallback.attempts.iter().all(|attempt| {
+            attempt.outcome == "PASS"
+                && attempt.status == Some(0)
+                && !attempt.timed_out
+                && attempt.cpu_usage_usec.is_some()
+        }));
+        assert_eq!(fs::read(&budget.results_path).unwrap(), b"");
+        budget
+            .append_result(&budget.results_path, &fallback)
+            .unwrap();
+        let rows = fs::read_to_string(&budget.results_path).unwrap();
+        assert_eq!(
+            rows.lines().count(),
+            1,
+            "fallback must be appended exactly once"
+        );
+        let published: CellResult = serde_json::from_str(rows.trim_end()).unwrap();
+        assert_eq!(published.schema, CELL_RESULT_SCHEMA);
+        assert_eq!(published.attempts.len(), 2);
+        assert_eq!(
+            fs::read(&retained_path).unwrap(),
+            b"pre-existing no-clobber sentinel"
+        );
+        assert!(run1_spec.paths.log.is_file());
+        assert!(run2_spec.paths.log.is_file());
     }
 
     #[test]

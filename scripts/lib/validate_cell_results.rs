@@ -2760,6 +2760,7 @@ mod tests {
         use hermit_manifest_plan::runner::ModeRecipe;
         use hermit_manifest_plan::runner::Observation;
         use hermit_manifest_plan::runner::ObservedResult;
+        use hermit_manifest_plan::runner::RetainedVerifyLogPublicationOutcome;
         use hermit_manifest_plan::runner::RunContext;
         use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
         use hermit_manifest_plan::runner::SelectedCell;
@@ -2770,7 +2771,7 @@ mod tests {
         use hermit_manifest_plan::runner::compare_verify_runs;
         use hermit_manifest_plan::runner::load_verify_run;
         use hermit_manifest_plan::runner::prepare_result_path_from_root;
-        use hermit_manifest_plan::runner::publish_retained_verify_log;
+        use hermit_manifest_plan::runner::publish_retained_verify_log_outcome;
         use hermit_manifest_plan::timeouts::TimeoutMultipliers;
 
         let root = fixture_root();
@@ -2951,7 +2952,22 @@ mod tests {
         prepare_result_path_from_root(&run_root, &results_path).unwrap();
         let policy = VerifyLogRetentionPolicy::new(u64::MAX);
         let budget = VerifyLogRetentionBudget::open(&run_root, &results_path, policy).unwrap();
-        publish_retained_verify_log(pair, &budget, &results_path, &mut result).unwrap();
+        match publish_retained_verify_log_outcome(pair, &budget, &results_path, &mut result) {
+            RetainedVerifyLogPublicationOutcome::Committed {
+                durability_warning: None,
+                ..
+            } => {}
+            RetainedVerifyLogPublicationOutcome::Committed {
+                durability_warning: Some(warning),
+                ..
+            } => panic!("publication committed with a durability warning: {warning}"),
+            RetainedVerifyLogPublicationOutcome::RolledBack { reason } => {
+                panic!("publication rolled back: {reason}")
+            }
+            RetainedVerifyLogPublicationOutcome::Indeterminate { reason } => {
+                panic!("publication state is indeterminate: {reason}")
+            }
+        }
 
         let written: Value = serde_json::from_str(
             fs::read_to_string(&results_path)

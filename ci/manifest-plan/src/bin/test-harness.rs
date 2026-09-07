@@ -8,8 +8,7 @@ use std::process::Command;
 use std::process::ExitCode;
 use std::process::Output;
 use std::process::Stdio;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
 
@@ -889,7 +888,7 @@ fn run_audits_parallel(root: &Path, audits: &[(PathBuf, Vec<&str>)], jobs: usize
     let mut results = std::iter::repeat_with(|| None)
         .take(audits.len())
         .collect::<Vec<Option<Result<Output, String>>>>();
-    for_each_parallel(
+    let abort_reason = for_each_parallel(
         audits.len(),
         ScheduledWorkerCapacity::new(jobs),
         |index, emit| {
@@ -899,13 +898,16 @@ fn run_audits_parallel(root: &Path, audits: &[(PathBuf, Vec<&str>)], jobs: usize
                 .current_dir(root)
                 .output()
                 .map_err(|error| format!("cannot execute {}: {error}", program.display()));
-            let _ = emit(result, false);
+            let _ = emit(DirectedCompletion::publish(result), false);
         },
-        |index, result, _| {
+        |_| unreachable!("validation audits never emit an abort directive"),
+        |index, result, _, directive| {
+            debug_assert_eq!(directive, CompletionDirective::Publish);
             results[index] = Some(result);
             true
         },
     );
+    debug_assert!(abort_reason.is_none());
 
     for ((program, args), result) in audits.iter().zip(results) {
         let output = result
@@ -1571,20 +1573,23 @@ fn build(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let mut results = std::iter::repeat_with(|| None)
         .take(cells.len())
         .collect::<Vec<Option<Result<(), String>>>>();
-    for_each_parallel(
+    let abort_reason = for_each_parallel(
         cells.len(),
         capacity,
         |index, emit| {
             let cell = &cells[index];
             let dir = context.build_root.join(cell.id.test.replace('/', "-"));
             let result = hermit_manifest_plan::runner::prepare_test(&context, cell, &dir).map(drop);
-            let _ = emit(result, false);
+            let _ = emit(DirectedCompletion::publish(result), false);
         },
-        |index, result, _| {
+        |_| unreachable!("fixture preparation never emits an abort directive"),
+        |index, result, _, directive| {
+            debug_assert_eq!(directive, CompletionDirective::Publish);
             results[index] = Some(result);
             true
         },
     );
+    debug_assert!(abort_reason.is_none());
     let mut failed = false;
     for (cell, result) in cells.iter().zip(results) {
         match result.expect("every fixture preparation worker returns one result") {
@@ -1688,6 +1693,73 @@ fn audit_compile(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode 
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CompletionDirective {
+    Publish,
+    Suppress(String),
+    AbortRun(String),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DirectedCompletion<T> {
+    value: T,
+    directive: CompletionDirective,
+}
+
+impl<T> DirectedCompletion<T> {
+    fn publish(value: T) -> Self {
+        Self {
+            value,
+            directive: CompletionDirective::Publish,
+        }
+    }
+
+    fn suppress(value: T, reason: String) -> Self {
+        Self {
+            value,
+            directive: CompletionDirective::Suppress(reason),
+        }
+    }
+
+    fn abort_run(value: T, reason: String) -> Self {
+        Self {
+            value,
+            directive: CompletionDirective::AbortRun(reason),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct DispatchState {
+    next: usize,
+    halted: Option<String>,
+}
+
+impl DispatchState {
+    fn claim(&mut self, count: usize) -> Option<usize> {
+        if self.halted.is_some() || self.next >= count {
+            return None;
+        }
+        let index = self.next;
+        self.next += 1;
+        Some(index)
+    }
+
+    fn halt(&mut self, reason: String) -> (String, bool) {
+        let newly_halted = self.halted.is_none();
+        if newly_halted {
+            self.halted = Some(reason);
+        }
+        (
+            self.halted
+                .as_ref()
+                .expect("a halted dispatcher retains its first cause")
+                .clone(),
+            newly_halted,
+        )
+    }
+}
+
 /// Execute `count` independent items with at most `jobs` workers, delivering
 /// each emitted value to `consume` immediately and waiting for its
 /// acknowledgement before the worker may continue.
@@ -1697,29 +1769,39 @@ fn audit_compile(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode 
 /// deliberately not a collect-then-publish helper: an outer bucket timeout
 /// must not discard rows that completed before the timeout, and a retry must
 /// not start before the prior attempt is flushed.
+///
+/// Claiming and catastrophic halting share one mutex. Consequently each index
+/// is either already in flight when the first abort is observed or is never
+/// started. The halt hook runs after that scheduling boundary and before the
+/// potentially slow consumer, and an abort acknowledgement is always false.
 fn for_each_parallel<T: Send>(
     count: usize,
     capacity: ScheduledWorkerCapacity,
-    execute: impl Fn(usize, &mut dyn FnMut(T, bool) -> bool) + Sync,
-    mut consume: impl FnMut(usize, T, bool) -> bool,
-) {
+    execute: impl Fn(usize, &mut dyn FnMut(DirectedCompletion<T>, bool) -> bool) + Sync,
+    mut halt: impl FnMut(&str),
+    mut consume: impl FnMut(usize, T, bool, CompletionDirective) -> bool,
+) -> Option<String> {
     if count == 0 {
-        return;
+        return None;
     }
     let workers = capacity.workers_for(count);
-    let next = AtomicUsize::new(0);
-    let (sender, receiver) = mpsc::channel::<(usize, T, bool, mpsc::SyncSender<bool>)>();
+    let dispatch = Mutex::new(DispatchState::default());
+    let (sender, receiver) =
+        mpsc::channel::<(usize, DirectedCompletion<T>, bool, mpsc::SyncSender<bool>)>();
     thread::scope(|scope| {
         for _ in 0..workers {
             let sender = sender.clone();
             let execute = &execute;
-            let next = &next;
+            let dispatch = &dispatch;
             scope.spawn(move || {
                 loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    if index >= count {
+                    let index = dispatch
+                        .lock()
+                        .expect("parallel dispatch lock is not poisoned")
+                        .claim(count);
+                    let Some(index) = index else {
                         break;
-                    }
+                    };
                     let mut emit = |value, will_retry| {
                         let (ack_sender, ack_receiver) = mpsc::sync_channel(0);
                         if sender.send((index, value, will_retry, ack_sender)).is_err() {
@@ -1732,11 +1814,38 @@ fn for_each_parallel<T: Send>(
             });
         }
         drop(sender);
-        for (index, value, will_retry, ack_sender) in receiver {
-            let acknowledged = consume(index, value, will_retry);
-            let _ = ack_sender.send(acknowledged);
+        for (index, completion, will_retry, ack_sender) in receiver {
+            let DirectedCompletion { value, directive } = completion;
+            let (directive, newly_halted) = {
+                let mut state = dispatch
+                    .lock()
+                    .expect("parallel dispatch lock is not poisoned");
+                match directive {
+                    CompletionDirective::AbortRun(reason) => {
+                        let (reason, newly_halted) = state.halt(reason);
+                        (CompletionDirective::AbortRun(reason), newly_halted)
+                    }
+                    directive => match &state.halted {
+                        Some(reason) => (CompletionDirective::AbortRun(reason.clone()), false),
+                        None => (directive, false),
+                    },
+                }
+            };
+            if newly_halted {
+                let CompletionDirective::AbortRun(reason) = &directive else {
+                    unreachable!("only an abort directive can halt dispatch")
+                };
+                halt(reason);
+            }
+            let aborting = matches!(directive, CompletionDirective::AbortRun(_));
+            let acknowledged = consume(index, value, will_retry, directive);
+            let _ = ack_sender.send(acknowledged && !aborting);
         }
     });
+    dispatch
+        .into_inner()
+        .expect("parallel dispatch lock is not poisoned")
+        .halted
 }
 /// Retry only a completed product failure. Re-running a named infrastructure,
 /// prerequisite, or no-result condition duplicates evidence without changing
@@ -1760,6 +1869,43 @@ fn run_with_retry<T>(
         let will_retry = retryable(&result) && attempt < MAX_ATTEMPTS_PER_CELL;
         if !emit(result, will_retry) || !will_retry {
             break;
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum CellPublicationDisposition {
+    Published,
+    Suppressed(String),
+    RetainedCleanupFailed(String),
+    AppendFailed(String),
+}
+
+/// The single consumer-side publication gate. A retained-result finalizer can
+/// report authoritative-but-not-durable or indeterminate bytes; either state
+/// must bypass both legacy append and raw-log cleanup, and its `false`
+/// acknowledgement is what stops `run_with_retry`.
+fn publish_completed_cell_result(
+    schema: u64,
+    directive: CompletionDirective,
+    cleanup_retained: impl FnOnce() -> Result<(), String>,
+    append_legacy: impl FnOnce() -> Result<(), String>,
+) -> CellPublicationDisposition {
+    match directive {
+        CompletionDirective::Suppress(reason) | CompletionDirective::AbortRun(reason) => {
+            return CellPublicationDisposition::Suppressed(reason);
+        }
+        CompletionDirective::Publish => {}
+    }
+    if schema == RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA {
+        match cleanup_retained() {
+            Ok(()) => CellPublicationDisposition::Published,
+            Err(error) => CellPublicationDisposition::RetainedCleanupFailed(error),
+        }
+    } else {
+        match append_legacy() {
+            Ok(()) => CellPublicationDisposition::Published,
+            Err(error) => CellPublicationDisposition::AppendFailed(error),
         }
     }
 }
@@ -1841,7 +1987,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let mut cell_cpu_usage_usec = Some(0u64);
     let mut cpu_measurements = 0usize;
     let expected = cells.len();
-    for_each_parallel(
+    let abort_reason = for_each_parallel(
         expected,
         capacity,
         |index, emit| {
@@ -1849,7 +1995,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             if let Some((_, reason)) =
                 host_inapplicable_reason(&cell.test.requires, &context.host_capabilities)
             {
-                let _ = emit(host_inapplicable_result(&context, cell, reason), false);
+                let _ = emit(
+                    DirectedCompletion::publish(host_inapplicable_result(&context, cell, reason)),
+                    false,
+                );
                 return;
             }
 
@@ -1864,22 +2013,57 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         retention_budget.as_ref(),
                         &results_path,
                     ) {
-                        Ok(result) => result,
-                        Err(RunCellServiceError::NoResult(error)) => {
-                            no_result_error_result(&attempt_context, cell, error)
-                        }
+                        Ok(result) => DirectedCompletion::publish(result),
+                        Err(RunCellServiceError::NoResult(error)) => DirectedCompletion::publish(
+                            no_result_error_result(&attempt_context, cell, error),
+                        ),
                         Err(RunCellServiceError::Infrastructure(error)) => {
-                            infrastructure_error_result(&attempt_context, cell, error)
+                            DirectedCompletion::publish(infrastructure_error_result(
+                                &attempt_context,
+                                cell,
+                                error,
+                            ))
                         }
                         Err(RunCellServiceError::EvidencedNoResult(result))
-                        | Err(RunCellServiceError::EvidencedInfrastructure(result)) => *result,
+                        | Err(RunCellServiceError::EvidencedInfrastructure(result)) => {
+                            DirectedCompletion::publish(*result)
+                        }
+                        Err(RunCellServiceError::UncontainedProcess(result)) => {
+                            let reason = format!(
+                                "process cleanup remains unproven; refusing result publication and retry: {}",
+                                result.reason_for_display()
+                            );
+                            DirectedCompletion::abort_run(*result, reason)
+                        }
+                        Err(RunCellServiceError::PublicationCommittedWithWarning {
+                            result,
+                            reason,
+                        })
+                        | Err(RunCellServiceError::PublicationIndeterminate { result, reason }) => {
+                            DirectedCompletion::suppress(*result, reason)
+                        }
                     }
                 },
-                |result| retryable_cell_outcome(&result.outcome, result.failure_class),
+                |completion| {
+                    completion.directive == CompletionDirective::Publish
+                        && retryable_cell_outcome(
+                            &completion.value.outcome,
+                            completion.value.failure_class,
+                        )
+                },
                 emit,
             );
         },
-        |index, mut result: CellResult, will_retry| {
+        |reason| {
+            if let Some(retention_budget) = &retention_budget {
+                if let Err(error) = retention_budget.halt_result_publication(reason) {
+                    eprintln!(
+                        "test-harness: could not latch catastrophic result-publication halt: {error}"
+                    );
+                }
+            }
+        },
+        |index, mut result: CellResult, will_retry, directive| {
             accumulate_cell_cpu_usage(
                 &mut cell_cpu_usage_usec,
                 &mut cpu_measurements,
@@ -1890,42 +2074,59 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             // the complete typed row is already present even if the containing
             // bucket is killed before its JUnit/summary epilogue. The worker
             // waits for this acknowledgement before starting a retry.
-            let published = if result.schema == RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA {
-                match reopen_retained_verify_log_publication(&result).and_then(|publication| {
-                    cleanup_verify_log_sources(Path::new(&result.artifact_dir), &publication)
-                }) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        eprintln!(
-                            "ERROR {} ({}/{}): retained verify-log cleanup failed after durable publication: {error}",
-                            result.test,
-                            result.mode,
-                            result.backend.as_deref().unwrap_or("native")
-                        );
-                        failed = true;
-                        false
-                    }
+            let publication = publish_completed_cell_result(
+                result.schema,
+                directive,
+                || {
+                    reopen_retained_verify_log_publication(&result).and_then(|publication| {
+                        cleanup_verify_log_sources(Path::new(&result.artifact_dir), &publication)
+                    })
+                },
+                || {
+                    retention_budget.as_ref().map_or_else(
+                        || append_result(&results_path, &result),
+                        |budget| budget.append_result(&results_path, &result),
+                    )
+                },
+            );
+            let published = match publication {
+                CellPublicationDisposition::Published => true,
+                CellPublicationDisposition::Suppressed(error) => {
+                    eprintln!(
+                        "ERROR {} ({}/{}): {error}",
+                        result.test,
+                        result.mode,
+                        result.backend.as_deref().unwrap_or("native")
+                    );
+                    failed = true;
+                    false
                 }
-            } else if let Err(error) = retention_budget.as_ref().map_or_else(
-                || append_result(&results_path, &result),
-                |budget| budget.append_result(&results_path, &result),
-            ) {
-                eprintln!(
-                    "ERROR {} ({}/{}): completed cell result could not be published: {error}",
-                    result.test,
-                    result.mode,
-                    result.backend.as_deref().unwrap_or("native")
-                );
-                result.outcome = "ERROR".into();
-                result.result = None;
-                result.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
-                result.error_kind = Some("result-publication".into());
-                result.reason = Some(format!(
-                    "completed cell result could not be published: {error}"
-                ));
-                false
-            } else {
-                true
+                CellPublicationDisposition::RetainedCleanupFailed(error) => {
+                    eprintln!(
+                        "ERROR {} ({}/{}): retained verify-log cleanup failed after durable publication: {error}",
+                        result.test,
+                        result.mode,
+                        result.backend.as_deref().unwrap_or("native")
+                    );
+                    failed = true;
+                    false
+                }
+                CellPublicationDisposition::AppendFailed(error) => {
+                    eprintln!(
+                        "ERROR {} ({}/{}): completed cell result could not be published: {error}",
+                        result.test,
+                        result.mode,
+                        result.backend.as_deref().unwrap_or("native")
+                    );
+                    result.outcome = "ERROR".into();
+                    result.result = None;
+                    result.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+                    result.error_kind = Some("result-publication".into());
+                    result.reason = Some(format!(
+                        "completed cell result could not be published: {error}"
+                    ));
+                    false
+                }
             };
 
             if result.outcome == "ERROR" {
@@ -2002,6 +2203,12 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             published
         },
     );
+    if let Some(reason) = &abort_reason {
+        eprintln!(
+            "test-harness: catastrophic process containment failure aborted the run: {reason}"
+        );
+        failed = true;
+    }
     if indexed_results.len() != expected {
         eprintln!(
             "test-harness: only {} of {expected} selected cells returned a result",
@@ -2080,6 +2287,8 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::process::ExitCode;
+    use std::sync::Barrier;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -2087,9 +2296,13 @@ mod tests {
 
     use hermit_manifest_plan::runner::FailureClass;
     use hermit_manifest_plan::runner::ManifestSet;
+    use hermit_manifest_plan::runner::RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA;
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 
+    use super::CellPublicationDisposition;
+    use super::CompletionDirective;
     use super::DEFAULT_BUILD_JOBS;
+    use super::DirectedCompletion;
     use super::EXPECTED_PLAN_SCHEMA;
     use super::HostCapability;
     use super::HostCapabilityVerdict;
@@ -2106,6 +2319,7 @@ mod tests {
     use super::for_each_parallel;
     use super::host_inapplicable_reason;
     use super::parse;
+    use super::publish_completed_cell_result;
     use super::retryable_cell_outcome;
     use super::run_with_retry;
     use super::scheduled_worker_capacity;
@@ -2296,9 +2510,11 @@ mod tests {
                 maximum.fetch_max(now, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(10));
                 active.fetch_sub(1, Ordering::SeqCst);
-                assert!(emit(index, false));
+                assert!(emit(DirectedCompletion::publish(index), false));
             },
-            |index, value, _| {
+            |_| panic!("ordinary completion must not halt dispatch"),
+            |index, value, _, directive| {
+                assert_eq!(directive, CompletionDirective::Publish);
                 consumed.lock().unwrap().push((index, value));
                 true
             },
@@ -2345,13 +2561,15 @@ mod tests {
                             assert_eq!(published.load(Ordering::SeqCst), 1);
                         }
                         executions.fetch_add(1, Ordering::SeqCst);
-                        attempt
+                        DirectedCompletion::publish(attempt)
                     },
-                    |attempt| *attempt == 1,
+                    |completion| completion.value == 1,
                     emit,
                 );
             },
-            |_, attempt, will_retry| {
+            |_| panic!("ordinary completion must not halt dispatch"),
+            |_, attempt, will_retry, directive| {
+                assert_eq!(directive, CompletionDirective::Publish);
                 rows.lock().unwrap().push((attempt, will_retry));
                 published.fetch_add(1, Ordering::SeqCst);
                 true
@@ -2408,13 +2626,15 @@ mod tests {
                     1,
                     |attempt| {
                         executions[index].fetch_add(1, Ordering::SeqCst);
-                        (index, attempt)
+                        DirectedCompletion::publish((index, attempt))
                     },
-                    |(index, attempt)| *index == 0 && *attempt == 1,
+                    |completion| completion.value.0 == 0 && completion.value.1 == 1,
                     emit,
                 );
             },
-            |index, _, will_retry| {
+            |_| panic!("ordinary completion must not halt dispatch"),
+            |index, _, will_retry, directive| {
+                assert_eq!(directive, CompletionDirective::Publish);
                 if !will_retry {
                     terminal.lock().unwrap().push(index);
                 }
@@ -2439,15 +2659,559 @@ mod tests {
                     1,
                     |attempt| {
                         executions.fetch_add(1, Ordering::SeqCst);
-                        attempt
+                        DirectedCompletion::publish(attempt)
                     },
                     |_| true,
                     emit,
                 );
             },
-            |_, _, _| false,
+            |_| panic!("ordinary completion must not halt dispatch"),
+            |_, _, _, _| false,
         );
         assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn authoritative_warning_and_indeterminate_bypass_consumers_and_retry() {
+        for reason in [
+            "authoritative schema-5 bytes have a durability warning",
+            "result publication is indeterminate",
+        ] {
+            let executions = AtomicUsize::new(0);
+            let raw_cleanups = AtomicUsize::new(0);
+            let outer_appends = AtomicUsize::new(0);
+            for_each_parallel(
+                1,
+                ScheduledWorkerCapacity::new(1),
+                |_, emit| {
+                    run_with_retry(
+                        1,
+                        |attempt| {
+                            executions.fetch_add(1, Ordering::SeqCst);
+                            DirectedCompletion::suppress(attempt, reason.to_string())
+                        },
+                        |_| true,
+                        emit,
+                    );
+                },
+                |_| panic!("suppression must not halt dispatch"),
+                |_, _, _, directive| {
+                    let disposition = publish_completed_cell_result(
+                        RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA,
+                        directive,
+                        || {
+                            raw_cleanups.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        },
+                        || {
+                            outer_appends.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        },
+                    );
+                    assert_eq!(
+                        disposition,
+                        CellPublicationDisposition::Suppressed(reason.to_string())
+                    );
+                    false
+                },
+            );
+            assert_eq!(executions.load(Ordering::SeqCst), 1);
+            assert_eq!(raw_cleanups.load(Ordering::SeqCst), 0);
+            assert_eq!(outer_appends.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn catastrophic_abort_halts_claims_and_suppresses_in_flight_completion() {
+        const CAUSE: &str = "forced supervisor loss for deterministic control";
+        let claimed = Barrier::new(2);
+        let fatal_latched = Barrier::new(2);
+        let executions = [
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ];
+        let publication_attempts = AtomicUsize::new(0);
+        let raw_cleanups = AtomicUsize::new(0);
+        let outer_appends = AtomicUsize::new(0);
+        let observed = Mutex::new(Vec::new());
+
+        let abort_reason = for_each_parallel(
+            executions.len(),
+            ScheduledWorkerCapacity::new(2),
+            |index, emit| {
+                assert!(index < 2, "a post-abort cell was claimed: {index}");
+                run_with_retry(
+                    1,
+                    |attempt| {
+                        executions[index].fetch_add(1, Ordering::SeqCst);
+                        claimed.wait();
+                        if index == 0 {
+                            DirectedCompletion::abort_run((index, attempt), CAUSE.into())
+                        } else {
+                            fatal_latched.wait();
+                            DirectedCompletion::publish((index, attempt))
+                        }
+                    },
+                    |_| true,
+                    emit,
+                );
+            },
+            |reason| {
+                assert_eq!(reason, CAUSE);
+                fatal_latched.wait();
+            },
+            |index, value, _, directive| {
+                let schema = if index == 0 {
+                    RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA
+                } else {
+                    RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA - 1
+                };
+                let disposition = publish_completed_cell_result(
+                    schema,
+                    directive.clone(),
+                    || {
+                        publication_attempts.fetch_add(1, Ordering::SeqCst);
+                        raw_cleanups.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    || {
+                        publication_attempts.fetch_add(1, Ordering::SeqCst);
+                        outer_appends.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                );
+                assert_eq!(
+                    disposition,
+                    CellPublicationDisposition::Suppressed(CAUSE.into())
+                );
+                assert_eq!(directive, CompletionDirective::AbortRun(CAUSE.into()));
+                observed.lock().unwrap().push((index, value));
+                true
+            },
+        );
+
+        assert_eq!(abort_reason.as_deref(), Some(CAUSE));
+        assert_eq!(executions[0].load(Ordering::SeqCst), 1);
+        assert_eq!(executions[1].load(Ordering::SeqCst), 1);
+        assert_eq!(executions[2].load(Ordering::SeqCst), 0);
+        assert_eq!(executions[3].load(Ordering::SeqCst), 0);
+        assert_eq!(publication_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(raw_cleanups.load(Ordering::SeqCst), 0);
+        assert_eq!(outer_appends.load(Ordering::SeqCst), 0);
+        let mut observed = observed.into_inner().unwrap();
+        observed.sort_unstable();
+        assert_eq!(observed, [(0, (0, 1)), (1, (1, 1))]);
+        let exit_code = if abort_reason.is_some() {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
+        assert_eq!(exit_code, ExitCode::FAILURE);
+    }
+
+    const CATASTROPHIC_CHILD_ENV: &str = "HERMIT_FATAL_CONTAINMENT_CHILD";
+    const CATASTROPHIC_FIXTURE_ROOT_ENV: &str = "HERMIT_FATAL_CONTAINMENT_ROOT";
+    const CATASTROPHIC_TEST_NAME: &str =
+        "tests::catastrophic_supervisor_loss_is_fatal_until_outer_cgroup_teardown";
+
+    fn process_start_time(pid: u32) -> Option<u64> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let fields = stat
+            .rsplit_once(") ")?
+            .1
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        fields.get(19)?.parse().ok()
+    }
+
+    fn write_catastrophic_manifest(root: &std::path::Path) {
+        let manifests = root.join("tests/e2e/manifests");
+        fs::create_dir_all(&manifests).unwrap();
+        fs::write(
+            manifests.join("defaults.yaml"),
+            "schema: 3\ntimeout_seconds: 20\ncpu_timeout_seconds: 10\n",
+        )
+        .unwrap();
+        let mode = r#"
+    modes:
+      naked:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          native: fixture exercises supervised execution only
+      verify:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: custom mode owns the fixture
+          dbt: custom mode owns the fixture
+          kvm: custom mode owns the fixture
+          sabre: custom mode owns the fixture
+          liteinst: custom mode owns the fixture
+      replay:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: custom mode owns the fixture
+          dbt: custom mode owns the fixture
+          kvm: custom mode owns the fixture
+          sabre: custom mode owns the fixture
+          liteinst: custom mode owns the fixture
+      chaos:
+        ci: false
+        backends_enabled: []
+        backends_disabled:
+          ptrace: custom mode owns the fixture
+          dbt: custom mode owns the fixture
+          kvm: custom mode owns the fixture
+          sabre: custom mode owns the fixture
+          liteinst: custom mode owns the fixture
+      custom:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: fixture exercises the ptrace launch supervisor
+          kvm: fixture exercises the ptrace launch supervisor
+          sabre: fixture exercises the ptrace launch supervisor
+          liteinst: fixture exercises the ptrace launch supervisor"#;
+        fs::write(
+            manifests.join("fatal-control.yaml"),
+            format!(
+                r#"schema: 3
+bucket: fatal-control
+test:
+  - id: fatal-control/abort
+    description: Force the real launch supervisor to exit before cleanup
+    lane: portable
+    requires: []
+    occasional: false
+    direct: [/bin/true]
+    observation:
+      status: true
+      stdout: true
+      stderr: true
+      artifacts: []
+{mode}
+  - id: fatal-control/must-not-start
+    description: A post-fatal cell must never be claimed
+    lane: portable
+    requires: []
+    occasional: false
+    direct: [/bin/true]
+    observation:
+      status: true
+      stdout: true
+      stderr: true
+      artifacts: []
+{mode}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_catastrophic_fake_hermit(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(
+            path,
+            r#"#!/bin/sh
+case " $* " in
+  *" version --json "*|*" --help "*) exit 0 ;;
+esac
+printf 'execution\n' >> "$HERMIT_FATAL_INVOCATIONS"
+setsid /bin/sh -c '
+  echo $$ > "$HERMIT_FATAL_PAYLOAD_PID"
+  sed -n "s|^0::|/sys/fs/cgroup|p" /proc/self/cgroup > "$HERMIT_FATAL_PAYLOAD_CGROUP"
+  while [ ! -e "$HERMIT_FATAL_LATE_RELEASE" ]; do sleep 0.01; done
+  printf late > "$HERMIT_FATAL_LATE_MARKER"
+' </dev/null >/dev/null 2>&1 &
+while [ ! -s "$HERMIT_FATAL_PAYLOAD_PID" ] || [ ! -s "$HERMIT_FATAL_PAYLOAD_CGROUP" ]; do
+  sleep 0.01
+done
+supervisor=
+parent_tgid=$(sed -n 's/^Tgid:[[:space:]]*//p' "/proc/$PPID/status")
+printf 'self=%s parent=%s parent_tgid=%s\n' "$$" "$PPID" "$parent_tgid" > "$HERMIT_FATAL_TOPOLOGY"
+for status in /proc/[0-9]*/status; do
+  candidate=${status#/proc/}
+  candidate=${candidate%/status}
+  candidate_parent=$(sed -n 's/^PPid:[[:space:]]*//p' "$status")
+  [ "$candidate_parent" = "$parent_tgid" ] || continue
+  descriptor=$(readlink "/proc/$candidate/fd/198")
+  printf 'candidate=%s fd198=%s\n' "$candidate" "$descriptor" >> "$HERMIT_FATAL_TOPOLOGY"
+  if [ "$candidate" != "$$" ] && [ -r "/proc/$candidate/fdinfo/198" ]; then
+    supervisor=$candidate
+    break
+  fi
+done
+[ -n "$supervisor" ] || exit 91
+printf '%s\n' "$supervisor" > "$HERMIT_FATAL_SUPERVISOR_PID"
+while [ ! -e "$HERMIT_FATAL_RELEASE" ]; do sleep 0.01; done
+exit 0
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn run_catastrophic_child(root: &std::path::Path) -> ! {
+        let manifests = ManifestSet::load(root).unwrap();
+        let args = super::Args {
+            selection: hermit_manifest_plan::runner::Selection {
+                lane: Some("portable".into()),
+                category: Some("fatal-control".into()),
+                mode: Some("custom".into()),
+                backend: Some("ptrace".into()),
+                ..Default::default()
+            },
+            results: Some(root.join("results.jsonl")),
+            junit: Some(root.join("junit.xml")),
+            format: "text".into(),
+            jobs: Some(1),
+            ..Default::default()
+        };
+        let code = super::run(root, &manifests, &args);
+        std::process::exit(if code == ExitCode::FAILURE { 1 } else { 97 });
+    }
+
+    /// A real supervisor loss must stop the inner harness without claiming containment. The
+    /// enclosing Dagrun step cgroup remains the sole recovery authority and proves the escaped
+    /// payload gone before returning. The fake Hermit locates the actual sibling supervisor by
+    /// its production-only fixed control descriptor (198), rather than using a test kill hook.
+    #[test]
+    fn catastrophic_supervisor_loss_is_fatal_until_outer_cgroup_teardown() {
+        if std::env::var_os(CATASTROPHIC_CHILD_ENV).is_some() {
+            let root =
+                std::path::PathBuf::from(std::env::var_os(CATASTROPHIC_FIXTURE_ROOT_ENV).unwrap());
+            run_catastrophic_child(&root);
+        }
+
+        let manager = dagrun::Cgroups::direct();
+        if !dagrun::CgroupManager::enabled(&manager) {
+            eprintln!(
+                "HOST LIMITATION: DAGRUN_DIRECT_CGROUP=1 but direct cgroupfs containment could not be established"
+            );
+            return;
+        }
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let fake_hermit = root.join("fake-hermit");
+        let payload_pid_path = root.join("payload.pid");
+        let payload_cgroup_path = root.join("payload.cgroup");
+        let supervisor_pid_path = root.join("supervisor.pid");
+        let release_path = root.join("supervisor.release");
+        let late_release_path = root.join("late.release");
+        let late_marker_path = root.join("late.marker");
+        let invocations_path = root.join("invocations");
+        let inner_output_path = root.join("inner.output");
+        let topology_path = root.join("topology");
+        write_catastrophic_manifest(root);
+        write_catastrophic_fake_hermit(&fake_hermit);
+
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "add",
+                "tests/e2e/manifests/defaults.yaml",
+                "tests/e2e/manifests/fatal-control.yaml",
+                "fake-hermit",
+            ],
+            vec![
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "failed to prepare fixture git repository");
+        }
+
+        let exports = [
+            (CATASTROPHIC_CHILD_ENV, "1".to_string()),
+            (CATASTROPHIC_FIXTURE_ROOT_ENV, root.display().to_string()),
+            ("HERMIT_BIN", fake_hermit.display().to_string()),
+            (
+                "HERMIT_FATAL_INVOCATIONS",
+                invocations_path.display().to_string(),
+            ),
+            (
+                "HERMIT_FATAL_PAYLOAD_PID",
+                payload_pid_path.display().to_string(),
+            ),
+            (
+                "HERMIT_FATAL_PAYLOAD_CGROUP",
+                payload_cgroup_path.display().to_string(),
+            ),
+            (
+                "HERMIT_FATAL_SUPERVISOR_PID",
+                supervisor_pid_path.display().to_string(),
+            ),
+            ("HERMIT_FATAL_RELEASE", release_path.display().to_string()),
+            (
+                "HERMIT_FATAL_LATE_RELEASE",
+                late_release_path.display().to_string(),
+            ),
+            (
+                "HERMIT_FATAL_LATE_MARKER",
+                late_marker_path.display().to_string(),
+            ),
+            ("HERMIT_FATAL_TOPOLOGY", topology_path.display().to_string()),
+            (
+                "E2E_RESULT_ROOT",
+                root.join("result-root").display().to_string(),
+            ),
+            ("E2E_RUN_ID", "fatal-control".to_string()),
+            ("E2E_MACHINE_SHORTNAME", "fixture-host".to_string()),
+            ("E2E_KERNEL_VERSION", "fixture-kernel".to_string()),
+        ]
+        .into_iter()
+        .map(|(name, value)| format!("export {name}={}", shell_quote_one(&value)))
+        .collect::<Vec<_>>()
+        .join("; ");
+        let command = format!(
+            "{exports}; exec {} --exact {} --nocapture >{} 2>&1",
+            shell_quote_one(&std::env::current_exe().unwrap().to_string_lossy()),
+            shell_quote_one(CATASTROPHIC_TEST_NAME),
+            shell_quote_one(&inner_output_path.to_string_lossy()),
+        );
+        let document = serde_json::json!({
+            "steps": [{
+                "group": "containment",
+                "job": "fatal-supervisor",
+                "desc": "outer teardown after a real inner supervisor loss",
+                "cmd": command,
+                "timeout": 30,
+                "cpu_timeout": 30
+            }]
+        });
+        let dag = dagrun::dag_from_value(&document).unwrap();
+        let cgroups =
+            Some(std::sync::Arc::new(manager) as std::sync::Arc<dyn dagrun::CgroupManager>);
+        let run = std::thread::spawn(move || {
+            dagrun::run_dag_boxed_limited(&dag, 1, 1, false, 0, cgroups)
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while (!payload_pid_path.is_file()
+            || !payload_cgroup_path.is_file()
+            || !supervisor_pid_path.is_file())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let observation = if payload_pid_path.is_file()
+            && payload_cgroup_path.is_file()
+            && supervisor_pid_path.is_file()
+        {
+            let payload_pid = fs::read_to_string(&payload_pid_path)
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap();
+            let supervisor_pid = fs::read_to_string(&supervisor_pid_path)
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap();
+            let cgroup =
+                std::path::PathBuf::from(fs::read_to_string(&payload_cgroup_path).unwrap().trim());
+            Some((
+                payload_pid,
+                process_start_time(payload_pid),
+                supervisor_pid,
+                process_start_time(supervisor_pid),
+                cgroup.clone(),
+                fs::read_to_string(cgroup.join("cgroup.events"))
+                    .ok()
+                    .is_some_and(|events| events.lines().any(|line| line == "populated 1")),
+            ))
+        } else {
+            None
+        };
+        let supervisor_pidfd = observation.as_ref().map(|(_, _, supervisor_pid, _, _, _)| {
+            let descriptor = fs::read_link(format!("/proc/{supervisor_pid}/fd/198")).unwrap();
+            assert!(
+                descriptor.to_string_lossy().starts_with("socket:["),
+                "selected sibling does not own the production supervisor control socket"
+            );
+            let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, *supervisor_pid, 0) };
+            assert_ne!(pidfd, -1, "cannot open exact supervisor pidfd");
+            pidfd as libc::c_int
+        });
+        if let Some(pidfd) = supervisor_pidfd {
+            let sent = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd,
+                    libc::SIGKILL,
+                    0usize,
+                    0u32,
+                )
+            };
+            unsafe { libc::close(pidfd) };
+            assert_eq!(sent, 0, "cannot kill exact supervisor through pidfd");
+        }
+        fs::write(&release_path, b"release\n").unwrap();
+        let result = run.join().unwrap();
+        let output = fs::read_to_string(&inner_output_path).unwrap_or_default();
+        let (payload_pid, payload_start, supervisor_pid, supervisor_start, cgroup, populated) =
+            observation.unwrap_or_else(|| {
+                panic!(
+                    "inner fixture never reached its release barrier; topology:\n{}\ninner:\n{output}",
+                    fs::read_to_string(&topology_path).unwrap_or_default()
+                )
+            });
+
+        assert!(
+            !result.ok,
+            "outer Dagrun must retain the inner fatal exit:\n{output}"
+        );
+        assert!(
+            populated,
+            "outer step cgroup was not observed populated before release"
+        );
+        assert!(payload_start.is_some() && supervisor_start.is_some());
+        assert!(
+            output.contains("process cleanup remains unproven")
+                && output.contains("catastrophic process containment failure aborted the run")
+                && output.contains("only 1 of 2 selected cells returned a result"),
+            "inner harness did not report the supervisor loss as fatal and unpublished:\n{output}"
+        );
+        assert_eq!(
+            fs::read_to_string(&invocations_path)
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "fatal loss must permit neither retry nor a new cell claim"
+        );
+        assert!(
+            fs::read_to_string(root.join("results.jsonl"))
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "an uncontained result must never be appended"
+        );
+        assert_ne!(process_start_time(payload_pid), payload_start);
+        assert_ne!(process_start_time(supervisor_pid), supervisor_start);
+        assert!(!cgroup.exists(), "proved-empty step cgroup was not removed");
+        fs::write(&late_release_path, b"release\n").unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            !late_marker_path.exists(),
+            "the retained payload survived outer teardown"
+        );
     }
 
     #[test]

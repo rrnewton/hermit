@@ -11,6 +11,9 @@ use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::io::FromRawFd;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Component;
@@ -961,6 +964,7 @@ mod retained_verify_log;
 pub use retained_verify_log::ComparedVerifyPair;
 pub use retained_verify_log::RetainedVerifyLog;
 pub use retained_verify_log::RetainedVerifyLogPublication;
+pub use retained_verify_log::RetainedVerifyLogPublicationOutcome;
 pub use retained_verify_log::RetainedVerifyLogRole;
 pub use retained_verify_log::VerifiedRetainedLogCopy;
 pub use retained_verify_log::VerifyLogRetentionBudget;
@@ -976,7 +980,9 @@ pub use retained_verify_log::compare_verify_runs;
 pub use retained_verify_log::copy_verified_retained_verify_log;
 use retained_verify_log::create_plain_relative_directory;
 pub use retained_verify_log::load_verify_run;
+#[cfg(test)]
 pub use retained_verify_log::publish_retained_verify_log;
+pub use retained_verify_log::publish_retained_verify_log_outcome;
 pub use retained_verify_log::read_verified_retained_verify_log;
 pub use retained_verify_log::reopen_retained_verify_log_publication;
 use retained_verify_log::require_plain_directory;
@@ -2305,6 +2311,35 @@ pub fn prepare_test(
         None,
     )
     .map(|(guest, _cpu_usage_usec)| guest)
+    .map_err(|error| error.message)
+}
+
+#[derive(Debug)]
+struct PreparationError {
+    message: String,
+    process: Option<ProcessOutput>,
+}
+
+impl From<String> for PreparationError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            process: None,
+        }
+    }
+}
+
+impl std::fmt::Display for PreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+#[cfg(test)]
+impl PreparationError {
+    fn contains(&self, needle: &str) -> bool {
+        self.message.contains(needle)
+    }
 }
 
 fn prepare_test_until(
@@ -2314,7 +2349,7 @@ fn prepare_test_until(
     deadline: Instant,
     wall_timeout_seconds: u64,
     process_permits: Option<&ProcessPermitPool>,
-) -> Result<(Vec<String>, u64), String> {
+) -> Result<(Vec<String>, u64), PreparationError> {
     prepare_dirs(&context.root, dir)?;
     let mut cpu_usage_usec = 0u64;
     if context.prebuilt && cell.test.program.is_some() {
@@ -2323,7 +2358,7 @@ fn prepare_test_until(
             .join(cell.test.id.replace('/', "-"))
             .join("fixtures");
         if !source.is_dir() {
-            return Err(format!("prebuilt fixture is missing: {}", source.display()));
+            return Err(format!("prebuilt fixture is missing: {}", source.display()).into());
         }
         let destination = dir.join("fixtures");
         if destination.exists() {
@@ -2424,7 +2459,7 @@ fn prepare_test_until(
             argv
         }
         (None, Some(DirectCommand::Argv(argv))) => argv.clone(),
-        _ => return Err(format!("{} has unsupported program kind", cell.test.id)),
+        _ => return Err(format!("{} has unsupported program kind", cell.test.id).into()),
     };
     guest.extend(guest_args);
     if context.isolated_workdir.is_some() || supports_test_workdir(&cell.id.mode, backend) {
@@ -2551,13 +2586,14 @@ fn run_preparation(
     deadline: Instant,
     cell_timeout_seconds: u64,
     process_permits: Option<&ProcessPermitPool>,
-) -> Result<u64, String> {
+) -> Result<u64, PreparationError> {
     let captures = dir.join("captures");
     if remaining_cell_time(deadline).is_zero() {
         return Err(with_diagnostic(
             format!("cell exceeded {cell_timeout_seconds} s during fixture preparation"),
             &captures,
-        ));
+        )
+        .into());
     }
     let output = execute_process(
         &context.root,
@@ -2568,24 +2604,47 @@ fn run_preparation(
         &captures.join("prepare.stderr"),
         ProcessExecutionOptions::new(deadline, None, process_permits),
     )?;
-    if output.timeout.is_some() || !output.status.success() {
+    if let Some(error) = &output.monitor_error {
+        let message = with_diagnostic(
+            format!(
+                "fixture preparation process monitoring failed after spawn: {}",
+                error.reason
+            ),
+            &captures,
+        );
+        return Err(PreparationError {
+            message,
+            process: Some(output),
+        });
+    }
+    if output.timeout.is_some() || !output.success() {
         // Carry the child's own words back. This used to return the bare sentence
         // and drop `prepare.stderr` on the floor, which turned every denied or
         // broken compile into the same uninformative line.
         let how = if output.timeout.is_some() {
             format!("cell exceeded {cell_timeout_seconds} s during fixture preparation")
         } else {
-            match output.status.code() {
+            match output.status.as_ref().and_then(ExitStatus::code) {
                 Some(code) => format!("exited {code}"),
                 None => "was killed by a signal".to_string(),
             }
         };
-        return Err(with_diagnostic(
+        let message = with_diagnostic(
             format!("fixture preparation failed for {program}: {how}"),
             &captures,
-        ));
+        );
+        return Err(PreparationError {
+            message,
+            process: Some(output),
+        });
     }
-    Ok(output.cpu_usage_usec)
+    match output.cpu_usage_usec {
+        Some(cpu_usage_usec) => Ok(cpu_usage_usec),
+        None => Err(PreparationError {
+            message: "fixture preparation completed without a CPU usage measurement".into(),
+            process: Some(output),
+        }),
+    }
 }
 
 pub fn build_spec(
@@ -2883,26 +2942,62 @@ fn execute_spec_until(
         &stderr_path,
         ProcessExecutionOptions::new(deadline, remaining_cpu_usec, process_permits),
     )?;
-    if spec.id.mode == "verify" && spec.id.backend.as_deref() == Some("ptrace") {
-        if let Some(directory) = &spec.verification_log_dir {
-            normalize_ptrace_golden(&spec.argv[0], directory)?;
-        }
-    }
+    let normalization_error = if output.monitor_error.is_none()
+        && spec.id.mode == "verify"
+        && spec.id.backend.as_deref() == Some("ptrace")
+    {
+        spec.verification_log_dir.as_ref().and_then(|directory| {
+            normalize_ptrace_golden(&spec.argv[0], directory)
+                .err()
+                .map(|error| format!("post-execution ptrace-log normalization failed: {error}"))
+        })
+    } else {
+        None
+    };
     let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
     let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
-    let mut outcome = if output.timeout.is_some() || !output.status.success() {
+    let process_monitor_failed = output.monitor_error.is_some();
+    let post_execution_failed = process_monitor_failed || normalization_error.is_some();
+    let status_code = output.status.as_ref().and_then(ExitStatus::code);
+    let status_signal = output
+        .status
+        .as_ref()
+        .and_then(std::os::unix::process::ExitStatusExt::signal);
+    let mut outcome = if post_execution_failed {
+        "ERROR"
+    } else if output.timeout.is_some() || !output.success() {
         "FAIL"
     } else {
         "PASS"
     }
     .to_string();
     let mut reason = output
-        .timeout
-        .map(|kind| kind.reason(cpu_timeout_seconds, wall_timeout_seconds));
-    let mut error_kind = None;
+        .monitor_error
+        .as_ref()
+        .map(|error| {
+            format!(
+                "process group {} monitoring failed after spawn: {}",
+                error.process_group_id, error.reason
+            )
+        })
+        .or(normalization_error)
+        .or_else(|| {
+            output
+                .timeout
+                .map(|kind| kind.reason(cpu_timeout_seconds, wall_timeout_seconds))
+        });
+    let mut error_kind = post_execution_failed.then(|| {
+        if output.cleanup_is_unproven() {
+            "process-cleanup-unproven"
+        } else {
+            "incomplete-verification-evidence"
+        }
+        .to_string()
+    });
     let failure_class_line = stderr.lines().next().unwrap_or_default();
     let launch_refusal = spec.id.mode != "naked"
-        && !output.status.success()
+        && !process_monitor_failed
+        && !output.success()
         && stdout.is_empty()
         && matches!(
             failure_class_line,
@@ -2933,8 +3028,9 @@ fn execute_spec_until(
     });
     let backend_unavailable = spec.id.mode != "naked"
         && !launch_refusal
+        && !post_execution_failed
         && output.timeout.is_none()
-        && !output.status.success()
+        && !output.success()
         && stdout.is_empty()
         && unavailable_class
             .as_deref()
@@ -2954,7 +3050,8 @@ fn execute_spec_until(
     // shape is unavailable evidence, not a product crash. In particular, the
     // human error line must never override a mismatched class into FAIL.
     let invalid_backend_evidence = output.timeout.is_none()
-        && !output.status.success()
+        && !post_execution_failed
+        && !output.success()
         && !backend_unavailable
         && failure_class_line
             .starts_with("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=");
@@ -2969,7 +3066,8 @@ fn execute_spec_until(
     // result. Keep that absence as no-result instead of letting the following
     // English line manufacture a product failure.
     let unclassified_internal_failure = output.timeout.is_none()
-        && !output.status.success()
+        && !post_execution_failed
+        && !output.success()
         && !launch_refusal
         && !backend_unavailable
         && !invalid_backend_evidence
@@ -2986,7 +3084,8 @@ fn execute_spec_until(
     let producer_failure_classified = launch_refusal
         || backend_unavailable
         || invalid_backend_evidence
-        || unclassified_internal_failure;
+        || unclassified_internal_failure
+        || post_execution_failed;
     let mut report_json = None;
     let mut report_sha = None;
     let mut runtime = None;
@@ -3086,7 +3185,7 @@ fn execute_spec_until(
                                 ) | None
                             )
                             && output.timeout.is_none()
-                            && output.status.code().is_some_and(|code| code != 0)
+                            && status_code.is_some_and(|code| code != 0)
                         {
                             // The producer correctly has no comparison to
                             // report, but an ordinary nonzero process exit is
@@ -3097,7 +3196,7 @@ fn execute_spec_until(
                             reason = Some(format!(
                                 "{} exited with status {} before producing a terminal comparison",
                                 spec.id.mode,
-                                output.status.code().unwrap()
+                                status_code.unwrap()
                             ));
                         } else if let Err(error) = report.require_canonical_comparison() {
                             outcome = "ERROR".into();
@@ -3107,7 +3206,7 @@ fn execute_spec_until(
                             outcome = "FAIL".into();
                             reason = Some(error);
                         } else if output.timeout.is_none()
-                            && (output.status.success() || spec.id.mode == "chaos")
+                            && (output.success() || spec.id.mode == "chaos")
                         {
                             // Chaos deliberately admits a reproduced nonzero
                             // guest class. Verify and replay still require the
@@ -3119,7 +3218,7 @@ fn execute_spec_until(
                             reason = Some(format!(
                                 "{} exited with status {}",
                                 spec.id.mode,
-                                output.status.code().unwrap_or(128)
+                                status_code.unwrap_or(128)
                             ));
                         }
                     }
@@ -3139,19 +3238,21 @@ fn execute_spec_until(
             }
         }
     }
-    if let Some(timeout) = output.timeout {
-        error_kind = Some(timeout.error_kind().into());
-        reason = Some(timeout.reason(cpu_timeout_seconds, wall_timeout_seconds));
+    if !post_execution_failed {
+        if let Some(timeout) = output.timeout {
+            error_kind = Some(timeout.error_kind().into());
+            reason = Some(timeout.reason(cpu_timeout_seconds, wall_timeout_seconds));
+        }
     }
     Ok(AttemptResult {
         index: index.into(),
         outcome,
         error_kind,
-        status: output.status.code(),
-        signal: std::os::unix::process::ExitStatusExt::signal(&output.status),
+        status: status_code,
+        signal: status_signal,
         timed_out: output.timeout.is_some(),
         duration_ms: started.elapsed().as_millis(),
-        cpu_usage_usec: Some(output.cpu_usage_usec),
+        cpu_usage_usec: output.cpu_usage_usec,
         observation_sha256: None,
         argv: spec.argv.clone(),
         guest_argv: spec.guest_argv.clone(),
@@ -3235,9 +3336,55 @@ impl ProcessTimeout {
 
 #[derive(Debug)]
 struct ProcessOutput {
-    status: ExitStatus,
+    status: Option<ExitStatus>,
     timeout: Option<ProcessTimeout>,
-    cpu_usage_usec: u64,
+    cpu_usage_usec: Option<u64>,
+    monitor_error: Option<ProcessMonitoringError>,
+}
+
+impl ProcessOutput {
+    fn completed(status: ExitStatus, timeout: Option<ProcessTimeout>, cpu_usage_usec: u64) -> Self {
+        Self {
+            status: Some(status),
+            timeout,
+            cpu_usage_usec: Some(cpu_usage_usec),
+            monitor_error: None,
+        }
+    }
+
+    fn success(&self) -> bool {
+        self.monitor_error.is_none() && self.status.as_ref().is_some_and(ExitStatus::success)
+    }
+
+    fn status_code(&self) -> Option<i32> {
+        self.status.as_ref().and_then(ExitStatus::code)
+    }
+
+    fn signal(&self) -> Option<i32> {
+        self.status
+            .as_ref()
+            .and_then(std::os::unix::process::ExitStatusExt::signal)
+    }
+
+    fn cleanup_is_unproven(&self) -> bool {
+        self.monitor_error
+            .as_ref()
+            .is_some_and(|error| error.cleanup == ProcessGroupCleanupDisposition::UnprovenStillLive)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessGroupCleanupDisposition {
+    Gone,
+    UnprovenStillLive,
+}
+
+#[derive(Debug)]
+struct ProcessMonitoringError {
+    reason: String,
+    errno: Option<i32>,
+    process_group_id: u32,
+    cleanup: ProcessGroupCleanupDisposition,
 }
 
 #[derive(Default)]
@@ -3359,7 +3506,69 @@ fn rusage_cpu_usage_usec(usage: &libc::rusage) -> Result<u64, String> {
         .ok_or_else(|| "wait4 CPU usage overflowed u64".to_string())
 }
 
-fn wait4_process(pid: u32, options: libc::c_int) -> Result<Option<(ExitStatus, u64)>, String> {
+struct ReapedProcess {
+    status: ExitStatus,
+    cpu_usage_usec: Option<u64>,
+    cpu_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct Wait4Error {
+    pid: u32,
+    source: std::io::Error,
+}
+
+impl Wait4Error {
+    fn is_no_child(&self) -> bool {
+        self.source.raw_os_error() == Some(libc::ECHILD)
+    }
+}
+
+impl std::fmt::Display for Wait4Error {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "wait4({}) failed: {}", self.pid, self.source)
+    }
+}
+
+fn waitid_pidfd(
+    pidfd: &File,
+    pid: u32,
+    options: libc::c_int,
+) -> Result<Option<libc::siginfo_t>, Wait4Error> {
+    loop {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                pidfd.as_raw_fd() as libc::id_t,
+                &mut info,
+                options,
+            )
+        };
+        if result == 0 {
+            return Ok((unsafe { info.si_pid() } != 0).then_some(info));
+        }
+        let source = std::io::Error::last_os_error();
+        if source.kind() != std::io::ErrorKind::Interrupted {
+            return Err(Wait4Error { pid, source });
+        }
+    }
+}
+
+fn process_has_exited(identity: &ProcessGroupIdentity) -> Result<bool, Wait4Error> {
+    let payload_pidfd = identity
+        .payload_pidfd
+        .as_ref()
+        .expect("payload pidfd is required after launch validation");
+    waitid_pidfd(
+        payload_pidfd,
+        identity.leader_pid,
+        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+    )
+    .map(|info| info.is_some())
+}
+
+fn wait4_process(pid: u32, options: libc::c_int) -> Result<Option<ReapedProcess>, Wait4Error> {
     loop {
         let mut status = 0;
         let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
@@ -3368,16 +3577,18 @@ fn wait4_process(pid: u32, options: libc::c_int) -> Result<Option<(ExitStatus, u
             return Ok(None);
         }
         if waited == pid as libc::pid_t {
-            return Ok(Some((
-                ExitStatus::from_raw(status),
-                rusage_cpu_usage_usec(&usage)?,
-            )));
+            let cpu = rusage_cpu_usage_usec(&usage);
+            return Ok(Some(ReapedProcess {
+                status: ExitStatus::from_raw(status),
+                cpu_usage_usec: cpu.as_ref().ok().copied(),
+                cpu_error: cpu.err(),
+            }));
         }
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::Interrupted {
             continue;
         }
-        return Err(format!("wait4({pid}) failed: {error}"));
+        return Err(Wait4Error { pid, source: error });
     }
 }
 
@@ -3389,13 +3600,14 @@ fn wait4_process(pid: u32, options: libc::c_int) -> Result<Option<(ExitStatus, u
 /// dagrun's process-group reader: its one short-lived snapshot is shared by all
 /// concurrent cells, rather than making every cell enumerate the host's entire
 /// `/proc` tree on every poll.
-fn process_group_cpu_usage_usec(pgid: u32) -> Result<Option<u64>, String> {
-    dagrun::proccpu::subtree_cpu_seconds(pgid)
+fn process_group_cpu_usage_usec(identity: &ProcessGroupIdentity) -> Result<Option<u64>, String> {
+    dagrun::proccpu::anchored_subtree_cpu_seconds(identity.cpu_anchor)
         .map(|seconds| {
             let usec = seconds * 1_000_000.0;
             if !usec.is_finite() || usec.is_sign_negative() || usec > u64::MAX as f64 {
                 return Err(format!(
-                    "process group {pgid} returned invalid live CPU seconds {seconds}"
+                    "process group {} returned invalid live CPU seconds {seconds}",
+                    identity.leader_pid
                 ));
             }
             Ok(usec as u64)
@@ -3403,24 +3615,1568 @@ fn process_group_cpu_usage_usec(pgid: u32) -> Result<Option<u64>, String> {
         .transpose()
 }
 
-fn stop_process_group(pid: u32) -> Result<(ExitStatus, u64), String> {
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGTERM);
-    }
-    let grace = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(result) = wait4_process(pid, libc::WNOHANG)? {
-            return Ok(result);
+const GROUP_SUPERVISOR_CLEANUP: u64 = 1;
+const GROUP_SUPERVISOR_RELEASE: u64 = 2;
+const GROUP_SUPERVISOR_OK: u64 = 1;
+const GROUP_SUPERVISOR_WIRE_WORDS: usize = 6;
+const GROUP_CLEANUP_GRACEFUL: u64 = 1;
+const GROUP_CLEANUP_IMMEDIATE: u64 = 2;
+const GROUP_SUPERVISOR_CONTROL_FD: libc::c_int = 198;
+const GROUP_SUPERVISOR_LAUNCH_FD: libc::c_int = 199;
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RawSupervisorState {
+    Initializing = 0,
+    Running = 1,
+    EmptyAnchored = 2,
+    ReleasedClean = 3,
+}
+
+#[derive(Debug)]
+struct SupervisorReceipt {
+    address: usize,
+}
+
+impl SupervisorReceipt {
+    fn new() -> Result<Self, String> {
+        let length = std::mem::size_of::<std::sync::atomic::AtomicU8>();
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if address == libc::MAP_FAILED {
+            return Err(format!(
+                "cannot allocate process-group supervisor receipt: {}",
+                std::io::Error::last_os_error()
+            ));
         }
-        if Instant::now() >= grace {
+        unsafe {
+            address
+                .cast::<std::sync::atomic::AtomicU8>()
+                .write(std::sync::atomic::AtomicU8::new(
+                    RawSupervisorState::Initializing as u8,
+                ));
+        }
+        Ok(Self {
+            address: address as usize,
+        })
+    }
+
+    fn load(&self) -> RawSupervisorState {
+        let phase = unsafe { &*(self.address as *const std::sync::atomic::AtomicU8) }
+            .load(std::sync::atomic::Ordering::Acquire);
+        match phase {
+            value if value == RawSupervisorState::Running as u8 => RawSupervisorState::Running,
+            value if value == RawSupervisorState::EmptyAnchored as u8 => {
+                RawSupervisorState::EmptyAnchored
+            }
+            value if value == RawSupervisorState::ReleasedClean as u8 => {
+                RawSupervisorState::ReleasedClean
+            }
+            _ => RawSupervisorState::Initializing,
+        }
+    }
+}
+
+impl Drop for SupervisorReceipt {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(
+                self.address as *mut libc::c_void,
+                std::mem::size_of::<std::sync::atomic::AtomicU8>(),
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RawLinuxProcessStat {
+    state: u8,
+    process_group_id: u32,
+    start_time_ticks: u64,
+    cpu_ticks: u64,
+}
+
+fn raw_errno() -> i32 {
+    // SAFETY: Linux exposes the calling thread's errno through this pointer.
+    unsafe { *libc::__errno_location() }
+}
+
+fn raw_read_exact(fd: libc::c_int, bytes: &mut [u8]) -> i32 {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        // SAFETY: `bytes[offset..]` is writable for the advertised length.
+        let read = unsafe {
+            libc::read(
+                fd,
+                bytes[offset..].as_mut_ptr().cast(),
+                bytes.len() - offset,
+            )
+        };
+        if read > 0 {
+            offset += read as usize;
+        } else if read == 0 {
+            return libc::EPIPE;
+        } else {
+            let error = raw_errno();
+            if error != libc::EINTR {
+                return error;
+            }
+        }
+    }
+    0
+}
+
+fn raw_write_all(fd: libc::c_int, bytes: &[u8]) -> i32 {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        // SAFETY: `bytes[offset..]` is readable for the advertised length.
+        let written =
+            unsafe { libc::write(fd, bytes[offset..].as_ptr().cast(), bytes.len() - offset) };
+        if written > 0 {
+            offset += written as usize;
+        } else if written == 0 {
+            return libc::EPIPE;
+        } else {
+            let error = raw_errno();
+            if error != libc::EINTR {
+                return error;
+            }
+        }
+    }
+    0
+}
+
+fn wire_bytes(words: &[u64; GROUP_SUPERVISOR_WIRE_WORDS]) -> &[u8] {
+    // SAFETY: an initialized fixed-size integer array is plain bytes.
+    unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), std::mem::size_of_val(words)) }
+}
+
+fn wire_bytes_mut(words: &mut [u64; GROUP_SUPERVISOR_WIRE_WORDS]) -> &mut [u8] {
+    // SAFETY: an initialized fixed-size integer array is plain bytes.
+    unsafe {
+        std::slice::from_raw_parts_mut(words.as_mut_ptr().cast(), std::mem::size_of_val(words))
+    }
+}
+
+fn raw_store_supervisor_state(address: usize, state: RawSupervisorState) {
+    unsafe { &*(address as *const std::sync::atomic::AtomicU8) }
+        .store(state as u8, std::sync::atomic::Ordering::Release);
+}
+
+fn raw_sleep_poll_interval() {
+    let request = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 20_000_000,
+    };
+    // SAFETY: both pointers describe initialized timespec storage.
+    unsafe {
+        libc::nanosleep(&request, std::ptr::null_mut());
+    }
+}
+
+fn raw_proc_stat_path(pid: u32, path: &mut [u8; 64]) -> bool {
+    let prefix = b"/proc/";
+    path[..prefix.len()].copy_from_slice(prefix);
+    let mut reversed = [0u8; 10];
+    let mut value = pid;
+    let mut digits = 0;
+    loop {
+        reversed[digits] = b'0' + (value % 10) as u8;
+        digits += 1;
+        value /= 10;
+        if value == 0 {
             break;
         }
-        thread::sleep(Duration::from_millis(20));
     }
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
+    let suffix = b"/stat";
+    let needed = prefix.len() + digits + suffix.len() + 1;
+    if needed > path.len() {
+        return false;
     }
-    wait4_process(pid, 0)?.ok_or_else(|| format!("blocking wait4({pid}) returned no child"))
+    for index in 0..digits {
+        path[prefix.len() + index] = reversed[digits - index - 1];
+    }
+    let suffix_start = prefix.len() + digits;
+    path[suffix_start..suffix_start + suffix.len()].copy_from_slice(suffix);
+    path[suffix_start + suffix.len()] = 0;
+    true
+}
+
+fn raw_parse_decimal(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut value = 0u64;
+    for byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .checked_mul(10)?
+            .checked_add(u64::from(*byte - b'0'))?;
+    }
+    Some(value)
+}
+
+fn raw_read_linux_process_stat(pid: u32) -> Result<RawLinuxProcessStat, i32> {
+    let mut path = [0u8; 64];
+    if !raw_proc_stat_path(pid, &mut path) {
+        return Err(libc::ENAMETOOLONG);
+    }
+    // SAFETY: `path` is NUL-terminated and points to initialized storage.
+    let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(raw_errno());
+    }
+    let mut bytes = [0u8; 1024];
+    let mut length = 0usize;
+    loop {
+        // SAFETY: the remaining buffer is writable.
+        let read = unsafe {
+            libc::read(
+                fd,
+                bytes[length..].as_mut_ptr().cast(),
+                bytes.len() - length,
+            )
+        };
+        if read > 0 {
+            length += read as usize;
+            if length == bytes.len() {
+                unsafe { libc::close(fd) };
+                return Err(libc::EOVERFLOW);
+            }
+        } else if read == 0 {
+            break;
+        } else if raw_errno() != libc::EINTR {
+            let error = raw_errno();
+            unsafe { libc::close(fd) };
+            return Err(error);
+        }
+    }
+    unsafe { libc::close(fd) };
+    let close = bytes[..length]
+        .windows(2)
+        .rposition(|window| window == b") ")
+        .ok_or(libc::EINVAL)?;
+    let tail = &bytes[close + 2..length];
+    let mut fields = [None; 20];
+    let mut cursor = 0usize;
+    for field in &mut fields {
+        while cursor < tail.len() && tail[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let start = cursor;
+        while cursor < tail.len() && !tail[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if start == cursor {
+            return Err(libc::EINVAL);
+        }
+        *field = Some(&tail[start..cursor]);
+    }
+    let state = fields[0]
+        .and_then(|field| field.first().copied())
+        .ok_or(libc::EINVAL)?;
+    let process_group_id = raw_parse_decimal(fields[2].ok_or(libc::EINVAL)?)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(libc::EINVAL)?;
+    let mut cpu_ticks = 0u64;
+    for field in fields.iter().take(15).skip(11) {
+        cpu_ticks = cpu_ticks
+            .checked_add(raw_parse_decimal(field.ok_or(libc::EINVAL)?).ok_or(libc::EINVAL)?)
+            .ok_or(libc::EOVERFLOW)?;
+    }
+    let start_time_ticks =
+        raw_parse_decimal(fields[19].ok_or(libc::EINVAL)?).ok_or(libc::EINVAL)?;
+    Ok(RawLinuxProcessStat {
+        state,
+        process_group_id,
+        start_time_ticks,
+        cpu_ticks,
+    })
+}
+
+fn raw_process_session_id(pid: u32) -> Result<u32, i32> {
+    // SAFETY: getsid reads kernel process metadata and has no pointer arguments.
+    let session_id = unsafe { libc::syscall(libc::SYS_getsid, pid as libc::pid_t) };
+    if session_id == -1 {
+        return Err(raw_errno());
+    }
+    u32::try_from(session_id).map_err(|_| libc::EOVERFLOW)
+}
+
+/// Return 0 only after a complete procfs scan proves that the anchored group
+/// contains no non-zombie member. A disappearing entry invalidates the scan;
+/// the caller retries without releasing the sentinel.
+///
+/// Only processes proven to be in another session may bypass the full stat
+/// read. A same-session process can join the anchored group, so its current
+/// group and state are always read together from stat. The target session is
+/// obtained from the authenticated unreaped sentinel, whose PID cannot be
+/// recycled while this scan runs.
+fn raw_group_has_non_zombie(process_group_id: u32, sentinel_pid: u32) -> i32 {
+    let target_session_id = match raw_process_session_id(sentinel_pid) {
+        Ok(session_id) => session_id,
+        Err(libc::ESRCH) => return -libc::EAGAIN,
+        Err(error) => return -error,
+    };
+    // SAFETY: the literal is NUL-terminated.
+    let fd = unsafe {
+        libc::open(
+            c"/proc".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return -raw_errno();
+    }
+    let mut buffer = [0u8; 8192];
+    loop {
+        // SAFETY: getdents64 writes at most `buffer.len()` bytes to the buffer.
+        let count =
+            unsafe { libc::syscall(libc::SYS_getdents64, fd, buffer.as_mut_ptr(), buffer.len()) };
+        if count < 0 {
+            let error = raw_errno();
+            if error == libc::EINTR {
+                continue;
+            }
+            unsafe { libc::close(fd) };
+            return -error;
+        }
+        if count == 0 {
+            unsafe { libc::close(fd) };
+            return 0;
+        }
+        let mut offset = 0usize;
+        while offset < count as usize {
+            if offset + 19 > count as usize {
+                unsafe { libc::close(fd) };
+                return -libc::EIO;
+            }
+            let reclen = u16::from_ne_bytes([buffer[offset + 16], buffer[offset + 17]]) as usize;
+            if reclen < 20 || offset + reclen > count as usize {
+                unsafe { libc::close(fd) };
+                return -libc::EIO;
+            }
+            let name = &buffer[offset + 19..offset + reclen];
+            let name_end = name
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(name.len());
+            if let Some(pid) =
+                raw_parse_decimal(&name[..name_end]).and_then(|value| u32::try_from(value).ok())
+            {
+                if pid != sentinel_pid {
+                    match raw_process_session_id(pid) {
+                        Ok(observed_session) if observed_session != target_session_id => {}
+                        Err(libc::ESRCH) => {
+                            unsafe { libc::close(fd) };
+                            return -libc::EAGAIN;
+                        }
+                        // A same-session process can still join the target group. An
+                        // unexpected getsid failure also cannot prove that it is safe
+                        // to skip, so both cases require the authoritative stat read.
+                        Ok(_) | Err(_) => match raw_read_linux_process_stat(pid) {
+                            Ok(stat)
+                                if stat.process_group_id == process_group_id
+                                    && !matches!(stat.state, b'Z' | b'X') =>
+                            {
+                                unsafe { libc::close(fd) };
+                                return 1;
+                            }
+                            Ok(_) => {}
+                            Err(libc::ENOENT | libc::ESRCH) => {
+                                unsafe { libc::close(fd) };
+                                return -libc::EAGAIN;
+                            }
+                            Err(error) => {
+                                unsafe { libc::close(fd) };
+                                return -error;
+                            }
+                        },
+                    }
+                }
+            }
+            offset += reclen;
+        }
+    }
+}
+
+fn raw_anchor_matches(leader_pid: u32, sentinel_pid: u32, start_time_ticks: u64) -> i32 {
+    match raw_read_linux_process_stat(sentinel_pid) {
+        Ok(stat)
+            if stat.state == b'Z'
+                && stat.process_group_id == leader_pid
+                && stat.start_time_ticks == start_time_ticks =>
+        {
+            0
+        }
+        Ok(_) => libc::ESTALE,
+        Err(error) => error,
+    }
+}
+
+fn raw_reap_sentinel(sentinel_pid: u32) -> i32 {
+    loop {
+        // SAFETY: the supervisor is the sentinel's parent and owns its wait.
+        let waited = unsafe { libc::waitpid(sentinel_pid as libc::pid_t, std::ptr::null_mut(), 0) };
+        if waited == sentinel_pid as libc::pid_t {
+            return 0;
+        }
+        let error = raw_errno();
+        if error != libc::EINTR {
+            return error;
+        }
+    }
+}
+
+fn raw_prepare_supervisor_fds(control_fd: libc::c_int, launch_fd: libc::c_int) -> bool {
+    let saved_control = unsafe { libc::fcntl(control_fd, libc::F_DUPFD_CLOEXEC, 256) };
+    if saved_control == -1 {
+        return false;
+    }
+    if launch_fd != GROUP_SUPERVISOR_LAUNCH_FD
+        && unsafe { libc::dup3(launch_fd, GROUP_SUPERVISOR_LAUNCH_FD, 0) } == -1
+    {
+        unsafe { libc::close(saved_control) };
+        return false;
+    }
+    if unsafe { libc::dup3(saved_control, GROUP_SUPERVISOR_CONTROL_FD, 0) } == -1 {
+        unsafe { libc::close(saved_control) };
+        return false;
+    }
+    unsafe { libc::close(saved_control) };
+    let lower = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            0u32,
+            (GROUP_SUPERVISOR_CONTROL_FD - 1) as u32,
+            0u32,
+        )
+    };
+    let upper = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            (GROUP_SUPERVISOR_LAUNCH_FD + 1) as u32,
+            u32::MAX,
+            0u32,
+        )
+    };
+    if lower == -1 || upper == -1 {
+        for fd in 0..1_048_576 {
+            if fd != GROUP_SUPERVISOR_CONTROL_FD && fd != GROUP_SUPERVISOR_LAUNCH_FD {
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+    true
+}
+
+fn raw_signal_owned_group(leader_pid: u32, signal: libc::c_int) -> i32 {
+    if !matches!(signal, libc::SIGTERM | libc::SIGCONT | libc::SIGKILL) {
+        return libc::EINVAL;
+    }
+    let result = unsafe { libc::kill(-(leader_pid as libc::pid_t), signal) };
+    if result == 0 {
+        return 0;
+    }
+    let error = raw_errno();
+    if error == libc::ESRCH { 0 } else { error }
+}
+
+fn raw_cleanup_owned_group(
+    leader_pid: u32,
+    sentinel_pid: u32,
+    start_time_ticks: u64,
+    graceful: bool,
+    bounded: bool,
+) -> i32 {
+    if graceful && raw_anchor_matches(leader_pid, sentinel_pid, start_time_ticks) == 0 {
+        let _ = raw_signal_owned_group(leader_pid, libc::SIGTERM);
+        let _ = raw_signal_owned_group(leader_pid, libc::SIGCONT);
+        for _ in 0..500 {
+            if raw_group_has_non_zombie(leader_pid, sentinel_pid) == 0 {
+                break;
+            }
+            raw_sleep_poll_interval();
+        }
+        // Do not publish the empty state from the graceful scan alone. A final
+        // supervisor-owned SIGKILL plus full scan closes the last fork/exit race.
+    }
+    let mut attempts = 0usize;
+    loop {
+        let anchor = raw_anchor_matches(leader_pid, sentinel_pid, start_time_ticks);
+        if anchor == 0 {
+            let _ = raw_signal_owned_group(leader_pid, libc::SIGKILL);
+            if raw_group_has_non_zombie(leader_pid, sentinel_pid) == 0 {
+                return 0;
+            }
+        }
+        attempts += 1;
+        if bounded && attempts >= 500 {
+            return if anchor == libc::ESTALE {
+                libc::ESTALE
+            } else {
+                libc::ETIMEDOUT
+            };
+        }
+        raw_sleep_poll_interval();
+    }
+}
+
+fn raw_confirm_owned_group_empty(leader_pid: u32, sentinel_pid: u32, start_time_ticks: u64) -> i32 {
+    for _ in 0..500 {
+        let anchor = raw_anchor_matches(leader_pid, sentinel_pid, start_time_ticks);
+        if anchor != 0 {
+            return anchor;
+        }
+        match raw_group_has_non_zombie(leader_pid, sentinel_pid) {
+            0 => return 0,
+            1 => return libc::EBUSY,
+            error if error == -libc::EAGAIN => raw_sleep_poll_interval(),
+            error => return -error,
+        }
+    }
+    libc::ETIMEDOUT
+}
+
+fn raw_autonomous_group_cleanup(
+    leader_pid: u32,
+    sentinel_pid: u32,
+    start_time_ticks: u64,
+    receipt_address: usize,
+) {
+    if raw_cleanup_owned_group(leader_pid, sentinel_pid, start_time_ticks, false, false) == 0
+        && raw_reap_sentinel(sentinel_pid) == 0
+    {
+        raw_store_supervisor_state(receipt_address, RawSupervisorState::ReleasedClean);
+        return;
+    }
+    // A hard identity mismatch can never authorize a numeric signal or anchor
+    // release. Keep the supervisor alive and retain the anchor fail-closed.
+    loop {
+        raw_sleep_poll_interval();
+    }
+}
+
+fn raw_supervisor_ready_barrier(control_fd: libc::c_int) -> i32 {
+    let ready = [GROUP_SUPERVISOR_OK, 0, 0, 0, 0, 0];
+    let error = raw_write_all(control_fd, wire_bytes(&ready));
+    if error != 0 {
+        return error;
+    }
+    let mut ack = [0u64; GROUP_SUPERVISOR_WIRE_WORDS];
+    let error = raw_read_exact(control_fd, wire_bytes_mut(&mut ack));
+    if error != 0 {
+        return error;
+    }
+    if ack[0] != GROUP_SUPERVISOR_OK {
+        return if ack[1] == 0 {
+            libc::ECANCELED
+        } else {
+            ack[1] as i32
+        };
+    }
+    0
+}
+
+/// Async-signal-safe child of `fork`: this function uses fixed stack storage
+/// and raw Linux/POSIX syscalls only, then terminates with `_exit`.
+fn raw_process_group_supervisor(
+    control_fd: libc::c_int,
+    launch_fd: libc::c_int,
+    receipt_address: usize,
+) -> ! {
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    let mut error = if unsafe { libc::sigemptyset(&mut action.sa_mask) } == -1 {
+        raw_errno()
+    } else {
+        0
+    };
+    action.sa_sigaction = libc::SIG_IGN;
+    if error == 0 && unsafe { libc::sigaction(libc::SIGPIPE, &action, std::ptr::null_mut()) } == -1
+    {
+        error = raw_errno();
+    }
+    action.sa_sigaction = libc::SIG_DFL;
+    action.sa_flags = 0;
+    if error == 0 && unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) } == -1
+    {
+        error = raw_errno();
+    }
+    let mut launch = [0u64; GROUP_SUPERVISOR_WIRE_WORDS];
+    if raw_read_exact(launch_fd, wire_bytes_mut(&mut launch)) != 0 {
+        unsafe { libc::_exit(1) }
+    }
+    let leader_pid = launch[0] as u32;
+    if leader_pid <= 1 || leader_pid > libc::pid_t::MAX as u32 {
+        error = libc::EINVAL;
+    }
+    let sentinel = if error == 0 {
+        unsafe { libc::syscall(libc::SYS_fork) as libc::pid_t }
+    } else {
+        -1
+    };
+    if sentinel == 0 {
+        unsafe {
+            libc::close(control_fd);
+            libc::close(launch_fd);
+            if libc::setpgid(0, leader_pid as libc::pid_t) == -1 {
+                libc::_exit(2);
+            }
+            libc::_exit(0);
+        }
+    }
+    if sentinel < 0 && error == 0 {
+        error = raw_errno();
+    }
+    let sentinel_pid = sentinel.max(0) as u32;
+    if error == 0 {
+        loop {
+            let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+            let waited = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    sentinel_pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if waited == 0 {
+                break;
+            }
+            error = raw_errno();
+            if error != libc::EINTR {
+                break;
+            }
+        }
+    }
+    let stat = if error == 0 {
+        match raw_read_linux_process_stat(sentinel_pid) {
+            Ok(stat) if stat.state == b'Z' && stat.process_group_id == leader_pid => Some(stat),
+            Ok(_) => {
+                error = libc::ESTALE;
+                None
+            }
+            Err(stat_error) => {
+                error = stat_error;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let report = [
+        u64::from(error == 0),
+        error as u64,
+        leader_pid as u64,
+        sentinel_pid as u64,
+        stat.map_or(0, |value| value.start_time_ticks),
+        stat.map_or(0, |value| value.cpu_ticks),
+    ];
+    let report_error = raw_write_all(control_fd, wire_bytes(&report));
+    let ack = [
+        u64::from(error == 0 && report_error == 0),
+        if error != 0 { error } else { report_error } as u64,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let ack_error = raw_write_all(launch_fd, wire_bytes(&ack));
+    unsafe { libc::close(launch_fd) };
+    if error != 0 || report_error != 0 || ack_error != 0 {
+        if sentinel_pid != 0 {
+            if let Some(stat) = stat {
+                raw_autonomous_group_cleanup(
+                    leader_pid,
+                    sentinel_pid,
+                    stat.start_time_ticks,
+                    receipt_address,
+                );
+            } else {
+                unsafe { libc::kill(sentinel_pid as libc::pid_t, libc::SIGKILL) };
+                let _ = raw_reap_sentinel(sentinel_pid);
+            }
+        }
+        unsafe { libc::_exit(2) }
+    }
+    let stat = match stat {
+        Some(stat) => stat,
+        None => unsafe { libc::_exit(2) },
+    };
+    raw_store_supervisor_state(receipt_address, RawSupervisorState::Running);
+    let mut state = RawSupervisorState::Running;
+    loop {
+        let mut command = [0u64; GROUP_SUPERVISOR_WIRE_WORDS];
+        let read_error = raw_read_exact(control_fd, wire_bytes_mut(&mut command));
+        if read_error != 0 {
+            raw_autonomous_group_cleanup(
+                leader_pid,
+                sentinel_pid,
+                stat.start_time_ticks,
+                receipt_address,
+            );
+            unsafe { libc::_exit(0) }
+        }
+        let identity_error = if command[2] as u32 != leader_pid
+            || command[3] as u32 != sentinel_pid
+            || command[4] != stat.start_time_ticks
+        {
+            libc::ESTALE
+        } else {
+            raw_anchor_matches(leader_pid, sentinel_pid, stat.start_time_ticks)
+        };
+        let mut reply_error = identity_error;
+        if reply_error == 0
+            && command[0] == GROUP_SUPERVISOR_CLEANUP
+            && state == RawSupervisorState::Running
+        {
+            let graceful = match command[1] {
+                GROUP_CLEANUP_GRACEFUL => Some(true),
+                GROUP_CLEANUP_IMMEDIATE => Some(false),
+                _ => None,
+            };
+            reply_error = match graceful {
+                Some(graceful) => raw_cleanup_owned_group(
+                    leader_pid,
+                    sentinel_pid,
+                    stat.start_time_ticks,
+                    graceful,
+                    true,
+                ),
+                None => libc::EINVAL,
+            };
+            if reply_error == 0 {
+                state = RawSupervisorState::EmptyAnchored;
+                raw_store_supervisor_state(receipt_address, state);
+            }
+        } else if reply_error == 0
+            && command[0] == GROUP_SUPERVISOR_RELEASE
+            && state == RawSupervisorState::EmptyAnchored
+        {
+            reply_error =
+                raw_confirm_owned_group_empty(leader_pid, sentinel_pid, stat.start_time_ticks);
+            if reply_error == 0 {
+                reply_error = raw_reap_sentinel(sentinel_pid);
+            }
+            if reply_error == 0 {
+                state = RawSupervisorState::ReleasedClean;
+                raw_store_supervisor_state(receipt_address, state);
+            }
+        } else if reply_error == 0
+            && command[0] == GROUP_SUPERVISOR_CLEANUP
+            && state == RawSupervisorState::EmptyAnchored
+        {
+            reply_error = libc::EALREADY;
+        } else if reply_error == 0 {
+            reply_error = libc::EINVAL;
+        }
+        let reply = [u64::from(reply_error == 0), reply_error as u64, 0, 0, 0, 0];
+        if raw_write_all(control_fd, wire_bytes(&reply)) != 0 {
+            if state != RawSupervisorState::ReleasedClean {
+                raw_autonomous_group_cleanup(
+                    leader_pid,
+                    sentinel_pid,
+                    stat.start_time_ticks,
+                    receipt_address,
+                );
+            }
+            unsafe { libc::_exit(0) }
+        }
+        if state == RawSupervisorState::ReleasedClean {
+            unsafe { libc::_exit(0) }
+        }
+    }
+}
+
+/// Wait for the exact supervisor object referenced by a pidfd. The poll keeps
+/// numeric PID reuse out of the lifecycle protocol; waitid reaps when the
+/// caller's SIGCHLD policy retained a waitable child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SupervisorExit {
+    Success,
+    Failure,
+    StatusUnavailable,
+}
+
+fn wait_supervisor_pidfd(pidfd: &File, blocking: bool) -> Result<Option<SupervisorExit>, String> {
+    let mut descriptor = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut descriptor, 1, if blocking { -1 } else { 0 }) };
+        if result == 0 {
+            return Ok(None);
+        }
+        if result == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!(
+                "cannot poll process-group supervisor pidfd: {error}"
+            ));
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err("process-group supervisor pidfd became invalid".into());
+        }
+        break;
+    }
+    loop {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                pidfd.as_raw_fd() as libc::id_t,
+                &mut info,
+                libc::WEXITED,
+            )
+        };
+        if result == 0 {
+            let successful = info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0;
+            return Ok(Some(if successful {
+                SupervisorExit::Success
+            } else {
+                SupervisorExit::Failure
+            }));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            return Ok(Some(SupervisorExit::StatusUnavailable));
+        }
+        return Err(format!(
+            "cannot reap process-group supervisor by pidfd: {error}"
+        ));
+    }
+}
+
+fn open_process_pidfd(pid: u32, role: &str) -> Result<File, String> {
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if descriptor == -1 {
+        return Err(format!(
+            "cannot open {role} pidfd for {pid}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor as libc::c_int) })
+}
+
+struct ProcessGroupLaunchSupervisor {
+    supervisor_pid: u32,
+    supervisor_pidfd: File,
+    receipt: SupervisorReceipt,
+    control: UnixStream,
+    payload_launch: Option<UnixStream>,
+}
+
+#[derive(Debug)]
+struct ProcessGroupLaunchFailure {
+    supervisor_pid: u32,
+    supervisor_pidfd: File,
+    receipt: SupervisorReceipt,
+    payload_pidfd: Option<File>,
+    control: UnixStream,
+    reason: String,
+}
+
+impl ProcessGroupLaunchSupervisor {
+    fn start() -> Result<Self, String> {
+        let receipt = SupervisorReceipt::new()?;
+        let receipt_address = receipt.address;
+        let (mut control, supervisor_control) = UnixStream::pair()
+            .map_err(|error| format!("cannot create process-group control socket: {error}"))?;
+        let (payload_launch, supervisor_launch) = UnixStream::pair()
+            .map_err(|error| format!("cannot create process-group launch socket: {error}"))?;
+        let control_fd = control.as_raw_fd();
+        let supervisor_control_fd = supervisor_control.as_raw_fd();
+        let payload_launch_fd = payload_launch.as_raw_fd();
+        let supervisor_launch_fd = supervisor_launch.as_raw_fd();
+        // SAFETY: the child closes every unrelated descriptor before entering
+        // a fixed-storage, raw-syscall-only state machine ending in `_exit`.
+        // SYS_fork deliberately bypasses libc at-fork handlers inherited from
+        // the multithreaded harness.
+        let supervisor_pid = unsafe { libc::syscall(libc::SYS_fork) as libc::pid_t };
+        if supervisor_pid == -1 {
+            return Err(format!(
+                "cannot fork process-group supervisor: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if supervisor_pid == 0 {
+            unsafe {
+                libc::close(control_fd);
+                libc::close(payload_launch_fd);
+            }
+            if raw_supervisor_ready_barrier(supervisor_control_fd) != 0 {
+                unsafe { libc::_exit(2) }
+            }
+            if !raw_prepare_supervisor_fds(supervisor_control_fd, supervisor_launch_fd) {
+                unsafe { libc::_exit(2) }
+            }
+            raw_process_group_supervisor(
+                GROUP_SUPERVISOR_CONTROL_FD,
+                GROUP_SUPERVISOR_LAUNCH_FD,
+                receipt_address,
+            );
+        }
+        drop(supervisor_control);
+        drop(supervisor_launch);
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, supervisor_pid, 0) };
+        if pidfd == -1 {
+            let error = std::io::Error::last_os_error();
+            drop(payload_launch);
+            drop(control);
+            return Err(format!(
+                "cannot open process-group supervisor pidfd: {error}"
+            ));
+        }
+        let supervisor_pidfd = unsafe { File::from_raw_fd(pidfd as libc::c_int) };
+        let mut ready = [0u64; GROUP_SUPERVISOR_WIRE_WORDS];
+        if let Err(error) = control.read_exact(wire_bytes_mut(&mut ready)) {
+            drop(payload_launch);
+            drop(control);
+            let _ = wait_supervisor_pidfd(&supervisor_pidfd, true);
+            return Err(format!(
+                "cannot read process-group supervisor readiness: {error}"
+            ));
+        }
+        if ready[0] != GROUP_SUPERVISOR_OK {
+            drop(payload_launch);
+            drop(control);
+            let _ = wait_supervisor_pidfd(&supervisor_pidfd, true);
+            return Err("process-group supervisor did not become ready".into());
+        }
+        let ack = [GROUP_SUPERVISOR_OK, 0, 0, 0, 0, 0];
+        if let Err(error) = control.write_all(wire_bytes(&ack)) {
+            drop(payload_launch);
+            drop(control);
+            let _ = wait_supervisor_pidfd(&supervisor_pidfd, true);
+            return Err(format!(
+                "cannot release process-group supervisor ready barrier: {error}"
+            ));
+        }
+        Ok(Self {
+            supervisor_pid: supervisor_pid as u32,
+            supervisor_pidfd,
+            receipt,
+            control,
+            payload_launch: Some(payload_launch),
+        })
+    }
+
+    fn configure_payload(&self, command: &mut Command) {
+        let control_fd = self.control.as_raw_fd();
+        let launch_fd = self
+            .payload_launch
+            .as_ref()
+            .expect("launch endpoint exists before spawn")
+            .as_raw_fd();
+        unsafe {
+            command.pre_exec(move || {
+                libc::close(control_fd);
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut request = [0u64; GROUP_SUPERVISOR_WIRE_WORDS];
+                request[0] = libc::getpid() as u64;
+                let request_error = raw_write_all(launch_fd, wire_bytes(&request));
+                if request_error != 0 {
+                    return Err(std::io::Error::from_raw_os_error(request_error));
+                }
+                let mut ack = [0u64; GROUP_SUPERVISOR_WIRE_WORDS];
+                let ack_error = raw_read_exact(launch_fd, wire_bytes_mut(&mut ack));
+                libc::close(launch_fd);
+                if ack_error != 0 {
+                    return Err(std::io::Error::from_raw_os_error(ack_error));
+                }
+                if ack[0] != GROUP_SUPERVISOR_OK {
+                    return Err(std::io::Error::from_raw_os_error(ack[1] as i32));
+                }
+                Ok(())
+            });
+        }
+    }
+
+    fn finish(
+        mut self,
+        leader_pid: u32,
+        payload_pidfd: Option<File>,
+    ) -> Result<ProcessGroupIdentity, ProcessGroupLaunchFailure> {
+        drop(self.payload_launch.take());
+        let mut report = [0u64; GROUP_SUPERVISOR_WIRE_WORDS];
+        if let Err(error) = self.control.read_exact(wire_bytes_mut(&mut report)) {
+            return Err(self.into_failure(
+                format!("cannot read process-group supervisor report: {error}"),
+                payload_pidfd,
+            ));
+        }
+        if report[0] != GROUP_SUPERVISOR_OK {
+            return Err(self.into_failure(
+                format!(
+                    "process-group supervisor could not establish its anchor: {}",
+                    std::io::Error::from_raw_os_error(report[1] as i32)
+                ),
+                payload_pidfd,
+            ));
+        }
+        let reported_leader = report[2] as u32;
+        let sentinel_pid = report[3] as u32;
+        let sentinel_start_time_ticks = report[4];
+        if reported_leader != leader_pid {
+            return Err(self.into_failure(format!(
+                "process-group supervisor reported leader {reported_leader}, expected {leader_pid}"
+            ), payload_pidfd));
+        }
+        let sentinel = match read_linux_process_stat(sentinel_pid) {
+            Ok(Some(sentinel)) => sentinel,
+            Ok(None) => {
+                return Err(self.into_failure(
+                    format!("process-group sentinel {sentinel_pid} disappeared"),
+                    payload_pidfd,
+                ));
+            }
+            Err(error) => return Err(self.into_failure(error, payload_pidfd)),
+        };
+        if sentinel.state != b'Z'
+            || sentinel.process_group_id != leader_pid
+            || sentinel.start_time_ticks != sentinel_start_time_ticks
+            || sentinel.cpu_ticks != report[5]
+        {
+            return Err(self.into_failure(format!(
+                "process-group sentinel {sentinel_pid} identity does not match its supervisor report"
+            ), payload_pidfd));
+        }
+        let Some((cpu_anchor, _)) = dagrun::proccpu::anchor_subtree_cpu_seconds(
+            leader_pid,
+            sentinel_pid,
+            sentinel_start_time_ticks,
+        ) else {
+            return Err(self.into_failure(
+                "cannot establish an anchor-aware process-group CPU measurement".into(),
+                payload_pidfd,
+            ));
+        };
+        Ok(ProcessGroupIdentity {
+            leader_pid,
+            payload_pidfd,
+            supervisor_pid: self.supervisor_pid,
+            supervisor_pidfd: self.supervisor_pidfd,
+            receipt: self.receipt,
+            sentinel_pid,
+            sentinel_start_time_ticks,
+            cpu_anchor,
+            control: Some(self.control),
+        })
+    }
+
+    fn into_failure(
+        mut self,
+        reason: String,
+        payload_pidfd: Option<File>,
+    ) -> ProcessGroupLaunchFailure {
+        drop(self.payload_launch.take());
+        ProcessGroupLaunchFailure {
+            supervisor_pid: self.supervisor_pid,
+            supervisor_pidfd: self.supervisor_pidfd,
+            receipt: self.receipt,
+            payload_pidfd,
+            control: self.control,
+            reason,
+        }
+    }
+
+    fn abort(mut self) -> Result<(), String> {
+        drop(self.payload_launch.take());
+        drop(self.control);
+        match wait_supervisor_pidfd(&self.supervisor_pidfd, true) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err("process-group supervisor remained live after abort".into()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// A process group whose ownership was established by the successful
+/// `setpgid(0, 0)` in this child's pre-exec hook. The group number is the
+/// payload child's PID. A supervisor-owned unreaped zombie pins that numeric
+/// group generation until cleanup, payload wait, and release are complete.
+#[derive(Debug)]
+struct ProcessGroupIdentity {
+    leader_pid: u32,
+    payload_pidfd: Option<File>,
+    supervisor_pid: u32,
+    supervisor_pidfd: File,
+    receipt: SupervisorReceipt,
+    sentinel_pid: u32,
+    sentinel_start_time_ticks: u64,
+    cpu_anchor: dagrun::proccpu::ProcessGroupCpuAnchor,
+    control: Option<UnixStream>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LinuxProcessStat {
+    state: u8,
+    process_group_id: u32,
+    start_time_ticks: u64,
+    cpu_ticks: u64,
+}
+
+fn read_linux_process_stat(pid: u32) -> Result<Option<LinuxProcessStat>, String> {
+    let path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let close = bytes
+        .windows(2)
+        .rposition(|window| window == b") ")
+        .ok_or_else(|| format!("{} has a malformed process name", path.display()))?;
+    let fields = std::str::from_utf8(&bytes[close + 2..])
+        .map_err(|error| format!("{} is not UTF-8: {error}", path.display()))?
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let state = fields
+        .first()
+        .and_then(|value| value.as_bytes().first())
+        .copied()
+        .ok_or_else(|| format!("{} has no process state", path.display()))?;
+    let process_group_id = fields
+        .get(2)
+        .ok_or_else(|| format!("{} has no process-group id", path.display()))?
+        .parse::<u32>()
+        .map_err(|error| {
+            format!(
+                "{} has an invalid process-group id: {error}",
+                path.display()
+            )
+        })?;
+    let parse_u64 = |index: usize, label: &str| {
+        fields
+            .get(index)
+            .ok_or_else(|| format!("{} has no {label}", path.display()))?
+            .parse::<u64>()
+            .map_err(|error| format!("{} has an invalid {label}: {error}", path.display()))
+    };
+    let cpu_ticks = (11..=14).try_fold(0u64, |total, index| {
+        total
+            .checked_add(parse_u64(index, "CPU tick field")?)
+            .ok_or_else(|| format!("{} CPU ticks overflowed u64", path.display()))
+    })?;
+    let start_time_ticks = parse_u64(19, "start time")?;
+    Ok(Some(LinuxProcessStat {
+        state,
+        process_group_id,
+        start_time_ticks,
+        cpu_ticks,
+    }))
+}
+
+#[cfg(test)]
+fn live_process_group_members(process_group_id: u32) -> Result<Vec<u32>, String> {
+    let mut members = Vec::new();
+    for entry in fs::read_dir("/proc").map_err(|error| format!("cannot scan /proc: {error}"))? {
+        let entry = entry.map_err(|error| format!("cannot scan /proc entry: {error}"))?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        match read_linux_process_stat(pid) {
+            Ok(Some(stat))
+                if stat.process_group_id == process_group_id
+                    && !matches!(stat.state, b'Z' | b'X') =>
+            {
+                members.push(pid);
+            }
+            Ok(_) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    members.sort_unstable();
+    Ok(members)
+}
+
+fn request_process_group_supervisor(
+    identity: &mut ProcessGroupIdentity,
+    command_kind: u64,
+    argument: u64,
+) -> Result<(), String> {
+    let request = [
+        command_kind,
+        argument,
+        identity.leader_pid as u64,
+        identity.sentinel_pid as u64,
+        identity.sentinel_start_time_ticks,
+        0,
+    ];
+    let control = identity
+        .control
+        .as_mut()
+        .ok_or_else(|| "process-group supervisor control is already closed".to_string())?;
+    control
+        .write_all(wire_bytes(&request))
+        .map_err(|error| format!("cannot write process-group supervisor request: {error}"))?;
+    let mut reply = [0u64; GROUP_SUPERVISOR_WIRE_WORDS];
+    control
+        .read_exact(wire_bytes_mut(&mut reply))
+        .map_err(|error| format!("cannot read process-group supervisor reply: {error}"))?;
+    if reply[0] != GROUP_SUPERVISOR_OK {
+        return Err(format!(
+            "process-group supervisor refused command {command_kind}: {}",
+            std::io::Error::from_raw_os_error(reply[1] as i32)
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ProcessGroupTermination {
+    Completed,
+    Graceful,
+    Immediate,
+}
+
+struct ProcessGroupCleanup {
+    status: Option<ExitStatus>,
+    cpu_usage_usec: Option<u64>,
+    errors: Vec<String>,
+    disposition: ProcessGroupCleanupDisposition,
+}
+
+impl ProcessGroupCleanup {
+    fn new() -> Self {
+        Self {
+            status: None,
+            cpu_usage_usec: None,
+            errors: Vec::new(),
+            disposition: ProcessGroupCleanupDisposition::UnprovenStillLive,
+        }
+    }
+
+    fn retain_reaped(&mut self, reaped: ReapedProcess) {
+        self.status = Some(reaped.status);
+        self.cpu_usage_usec = reaped.cpu_usage_usec;
+        if let Some(error) = reaped.cpu_error {
+            self.errors.push(error);
+        }
+    }
+}
+
+fn reap_payload_by_pidfd(
+    payload_pidfd: &File,
+    leader_pid: u32,
+    blocking: bool,
+) -> Result<Option<ReapedProcess>, Wait4Error> {
+    loop {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+        let options = libc::WEXITED | if blocking { 0 } else { libc::WNOHANG };
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_waitid,
+                libc::P_PIDFD,
+                payload_pidfd.as_raw_fd() as libc::id_t,
+                &mut info as *mut libc::siginfo_t,
+                options,
+                &mut usage as *mut libc::rusage,
+            )
+        };
+        if result == 0 {
+            if unsafe { info.si_pid() } == 0 {
+                return Ok(None);
+            }
+            let signal_status = unsafe { info.si_status() };
+            let raw_status = match info.si_code {
+                libc::CLD_EXITED => signal_status << 8,
+                libc::CLD_KILLED => signal_status,
+                libc::CLD_DUMPED => signal_status | 0x80,
+                code => {
+                    return Err(Wait4Error {
+                        pid: leader_pid,
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("waitid(P_PIDFD) returned unexpected si_code {code}"),
+                        ),
+                    });
+                }
+            };
+            let cpu = rusage_cpu_usage_usec(&usage);
+            return Ok(Some(ReapedProcess {
+                status: ExitStatus::from_raw(raw_status),
+                cpu_usage_usec: cpu.as_ref().ok().copied(),
+                cpu_error: cpu.err(),
+            }));
+        }
+        let source = std::io::Error::last_os_error();
+        if source.kind() != std::io::ErrorKind::Interrupted {
+            return Err(Wait4Error {
+                pid: leader_pid,
+                source,
+            });
+        }
+    }
+}
+
+fn stop_process_group(
+    mut identity: ProcessGroupIdentity,
+    termination: ProcessGroupTermination,
+) -> ProcessGroupCleanup {
+    let leader_pid = identity.leader_pid;
+    let mut cleanup = ProcessGroupCleanup::new();
+    let cleanup_mode = match termination {
+        ProcessGroupTermination::Completed | ProcessGroupTermination::Immediate => {
+            GROUP_CLEANUP_IMMEDIATE
+        }
+        ProcessGroupTermination::Graceful => GROUP_CLEANUP_GRACEFUL,
+    };
+    let group_empty_anchored = match request_process_group_supervisor(
+        &mut identity,
+        GROUP_SUPERVISOR_CLEANUP,
+        cleanup_mode,
+    ) {
+        Ok(()) => true,
+        Err(error) => {
+            cleanup.errors.push(error);
+            false
+        }
+    };
+
+    let initial_reap = match identity.payload_pidfd.as_ref() {
+        Some(payload_pidfd) => {
+            reap_payload_by_pidfd(payload_pidfd, leader_pid, group_empty_anchored)
+        }
+        None if group_empty_anchored => {
+            // The unreaped sentinel still pins this group generation. A
+            // numeric wait is safe only until RELEASE removes that anchor.
+            wait4_process(leader_pid, 0)
+        }
+        None => Ok(None),
+    };
+    match initial_reap {
+        Ok(Some(reaped)) => cleanup.retain_reaped(reaped),
+        Ok(None) => {}
+        Err(error) if error.is_no_child() => {}
+        Err(error) => cleanup.errors.push(error.to_string()),
+    }
+
+    if group_empty_anchored {
+        if let Err(error) =
+            request_process_group_supervisor(&mut identity, GROUP_SUPERVISOR_RELEASE, 0)
+        {
+            cleanup.errors.push(error);
+        }
+    }
+    drop(identity.control.take());
+    let supervisor_exited = match wait_supervisor_pidfd(&identity.supervisor_pidfd, true) {
+        Ok(Some(SupervisorExit::Failure)) => {
+            cleanup.errors.push(format!(
+                "process-group supervisor {} exited unsuccessfully: nonzero status or signal",
+                identity.supervisor_pid
+            ));
+            true
+        }
+        Ok(Some(SupervisorExit::Success | SupervisorExit::StatusUnavailable)) => true,
+        Ok(None) => {
+            cleanup.errors.push(format!(
+                "process-group supervisor {} remained live after cleanup",
+                identity.supervisor_pid
+            ));
+            false
+        }
+        Err(error) => {
+            cleanup.errors.push(error);
+            false
+        }
+    };
+    let released_clean =
+        supervisor_exited && identity.receipt.load() == RawSupervisorState::ReleasedClean;
+    if cleanup.status.is_none() {
+        if let Some(payload_pidfd) = identity.payload_pidfd.as_ref() {
+            match reap_payload_by_pidfd(payload_pidfd, leader_pid, released_clean) {
+                Ok(Some(reaped)) => cleanup.retain_reaped(reaped),
+                Ok(None) => cleanup.errors.push(format!(
+                    "payload {leader_pid} had no exit disposition after supervisor shutdown"
+                )),
+                Err(error) if error.is_no_child() => {}
+                Err(error) => cleanup.errors.push(error.to_string()),
+            }
+        } else {
+            cleanup.errors.push(format!(
+                "payload {leader_pid} has no pidfd for exact post-release reaping"
+            ));
+        }
+    }
+    if !released_clean {
+        cleanup.errors.push(format!(
+            "process-group supervisor {} exited without a ReleasedClean receipt",
+            identity.supervisor_pid
+        ));
+    }
+    cleanup.disposition = if released_clean {
+        ProcessGroupCleanupDisposition::Gone
+    } else {
+        ProcessGroupCleanupDisposition::UnprovenStillLive
+    };
+    cleanup
+}
+
+fn process_output_after_cleanup(
+    identity: ProcessGroupIdentity,
+    timeout: Option<ProcessTimeout>,
+    observed_cpu_usage_usec: Option<u64>,
+    primary_error: Option<String>,
+    termination: ProcessGroupTermination,
+) -> ProcessOutput {
+    let leader_pid = identity.leader_pid;
+    let cleanup = stop_process_group(identity, termination);
+    let cpu_usage_usec = cleanup.cpu_usage_usec.map(|final_usage| {
+        observed_cpu_usage_usec.map_or(final_usage, |seen| seen.max(final_usage))
+    });
+    let mut errors = primary_error.into_iter().collect::<Vec<_>>();
+    errors.extend(cleanup.errors);
+    if cleanup.status.is_none() {
+        errors.push(format!(
+            "process-group leader {} has no waitable exit disposition",
+            leader_pid
+        ));
+    }
+    if cpu_usage_usec.is_none() {
+        errors.push(format!(
+            "process-group leader {} has no final CPU measurement",
+            leader_pid
+        ));
+    }
+    if cleanup.disposition == ProcessGroupCleanupDisposition::UnprovenStillLive {
+        errors.push(format!(
+            "process group {} could not be proven gone",
+            leader_pid
+        ));
+    }
+    if errors.is_empty() {
+        return ProcessOutput::completed(
+            cleanup.status.expect("complete cleanup has a status"),
+            timeout,
+            cpu_usage_usec.expect("complete cleanup has CPU usage"),
+        );
+    }
+    ProcessOutput {
+        status: cleanup.status,
+        timeout,
+        cpu_usage_usec,
+        monitor_error: Some(ProcessMonitoringError {
+            reason: errors.join("; "),
+            errno: None,
+            process_group_id: leader_pid,
+            cleanup: cleanup.disposition,
+        }),
+    }
+}
+
+fn post_spawn_process_error(
+    identity: ProcessGroupIdentity,
+    timeout: Option<ProcessTimeout>,
+    primary_error: String,
+    errno: Option<i32>,
+) -> ProcessOutput {
+    let mut output = process_output_after_cleanup(
+        identity,
+        timeout,
+        None,
+        Some(primary_error),
+        ProcessGroupTermination::Immediate,
+    );
+    if let Some(error) = &mut output.monitor_error {
+        error.errno = errno;
+    }
+    output
+}
+
+fn process_output_after_supervisor_launch_failure(
+    failure: ProcessGroupLaunchFailure,
+    leader_pid: u32,
+) -> ProcessOutput {
+    let ProcessGroupLaunchFailure {
+        supervisor_pid,
+        supervisor_pidfd,
+        receipt,
+        payload_pidfd,
+        control,
+        reason,
+    } = failure;
+    drop(control);
+    let mut cleanup = ProcessGroupCleanup::new();
+    let supervisor_exited = match wait_supervisor_pidfd(&supervisor_pidfd, true) {
+        Ok(Some(SupervisorExit::Success)) => true,
+        Ok(Some(SupervisorExit::Failure | SupervisorExit::StatusUnavailable)) => {
+            cleanup.errors.push(format!(
+                "process-group supervisor {supervisor_pid} exited without a successful status"
+            ));
+            true
+        }
+        Ok(None) => {
+            cleanup.errors.push(format!(
+                "process-group supervisor {supervisor_pid} remained live after launch failure"
+            ));
+            false
+        }
+        Err(error) => {
+            cleanup.errors.push(error);
+            false
+        }
+    };
+    let released_clean = supervisor_exited && receipt.load() == RawSupervisorState::ReleasedClean;
+    match payload_pidfd
+        .as_ref()
+        .map(|pidfd| reap_payload_by_pidfd(pidfd, leader_pid, released_clean))
+        .transpose()
+    {
+        Ok(Some(Some(reaped))) => cleanup.retain_reaped(reaped),
+        Ok(Some(None) | None) => cleanup.errors.push(format!(
+            "payload {leader_pid} had no pidfd exit disposition after supervisor launch failure"
+        )),
+        Err(error) if error.is_no_child() => {}
+        Err(error) => cleanup.errors.push(error.to_string()),
+    }
+    if !released_clean {
+        cleanup.errors.push(format!(
+            "process-group supervisor {supervisor_pid} exited without a ReleasedClean receipt"
+        ));
+    }
+    cleanup.disposition = if released_clean {
+        ProcessGroupCleanupDisposition::Gone
+    } else {
+        ProcessGroupCleanupDisposition::UnprovenStillLive
+    };
+    let mut reasons = vec![reason];
+    reasons.extend(cleanup.errors);
+    ProcessOutput {
+        status: cleanup.status,
+        timeout: None,
+        cpu_usage_usec: cleanup.cpu_usage_usec,
+        monitor_error: Some(ProcessMonitoringError {
+            reason: reasons.join("; "),
+            errno: None,
+            process_group_id: leader_pid,
+            cleanup: cleanup.disposition,
+        }),
+    }
 }
 
 fn require_process_launch_budget(
@@ -3489,38 +5245,106 @@ fn execute_process(
         .stdout(stdout_file)
         .stderr(stderr_file);
     command.envs(env.iter());
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
     require_process_launch_budget(deadline, shared_cpu_budget, "spawn")?;
-    let child = command
-        .spawn()
-        .map_err(|e| format!("cannot execute {program}: {e}"))?;
+    let supervisor = ProcessGroupLaunchSupervisor::start()?;
+    supervisor.configure_payload(&mut command);
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let cleanup_error = supervisor.abort().err();
+            let mut reason = format!("cannot execute {program}: {error}");
+            if let Some(cleanup_error) = cleanup_error {
+                reason.push_str(&format!("; cannot reap launch supervisor: {cleanup_error}"));
+            }
+            return Err(reason);
+        }
+    };
     let pid = child.id();
     let mut next_cpu_poll = Instant::now() + cpu_poll_interval;
+    drop(child);
+    // Successful spawn means the payload completed the pre-exec supervisor
+    // handshake. From here onward every exit path carries executed evidence;
+    // the supervisor retains the group-generation anchor even under ECHILD.
+    let (payload_pidfd, payload_pidfd_error) = match open_process_pidfd(pid, "payload") {
+        Ok(pidfd) => (Some(pidfd), None),
+        Err(error) => (None, Some(error)),
+    };
+    let process_group = match supervisor.finish(pid, payload_pidfd) {
+        Ok(process_group) => process_group,
+        Err(failure) => {
+            return Ok(process_output_after_supervisor_launch_failure(failure, pid));
+        }
+    };
+    if let Some(error) = payload_pidfd_error {
+        return Ok(post_spawn_process_error(process_group, None, error, None));
+    }
     let mut cpu_accounting_missing_since = None;
+    let mut last_cpu_usage_usec = None;
     loop {
-        if let Some((status, cpu_usage_usec)) = wait4_process(pid, libc::WNOHANG)? {
-            let cpu_exhausted = match shared_cpu_budget {
-                Some((budget, member)) => budget.observe(member, cpu_usage_usec)?,
-                None => cpu_budget_usec.is_some_and(|limit| cpu_usage_usec >= limit),
+        let exited = match process_has_exited(&process_group) {
+            Ok(exited) => exited,
+            Err(error) => {
+                let errno = error.source.raw_os_error();
+                return Ok(post_spawn_process_error(
+                    process_group,
+                    None,
+                    error.to_string(),
+                    errno,
+                ));
+            }
+        };
+        if exited {
+            let output = process_output_after_cleanup(
+                process_group,
+                None,
+                None,
+                None,
+                // waitid already proved that the leader exited. Lingering
+                // descendants need the anchored final KILL/scan, not a TERM
+                // grace period intended for a still-running payload.
+                ProcessGroupTermination::Completed,
+            );
+            if output.monitor_error.is_some() {
+                return Ok(output);
+            }
+            let status = output.status.expect("complete cleanup has a status");
+            let cpu_usage_usec = output
+                .cpu_usage_usec
+                .expect("complete cleanup has CPU usage");
+            if let Some((budget, member)) = shared_cpu_budget {
+                if let Err(error) = budget.observe(member, cpu_usage_usec) {
+                    return Ok(ProcessOutput {
+                        status: Some(status),
+                        timeout: None,
+                        cpu_usage_usec: Some(cpu_usage_usec),
+                        monitor_error: Some(ProcessMonitoringError {
+                            reason: error,
+                            errno: None,
+                            process_group_id: pid,
+                            cleanup: ProcessGroupCleanupDisposition::Gone,
+                        }),
+                    });
+                }
+            }
+            let timeout = if shared_cpu_budget.is_none()
+                && cpu_budget_usec.is_some_and(|limit| cpu_usage_usec >= limit)
+            {
+                Some(ProcessTimeout::Cpu)
+            } else {
+                None
             };
-            return Ok(ProcessOutput {
-                status,
-                timeout: cpu_exhausted.then_some(ProcessTimeout::Cpu),
-                cpu_usage_usec,
-            });
+            return Ok(ProcessOutput::completed(status, timeout, cpu_usage_usec));
         }
         let now = Instant::now();
-        let shared_exhausted = shared_cpu_budget
+        let shared_exhausted = match shared_cpu_budget
             .map(|(budget, _)| budget.exhausted())
-            .transpose()?
-            .unwrap_or(false);
+            .transpose()
+        {
+            Ok(exhausted) => exhausted.unwrap_or(false),
+            Err(error) => {
+                return Ok(post_spawn_process_error(process_group, None, error, None));
+            }
+        };
         let (timeout, observed_cpu_usec) = if now >= deadline {
             (Some(ProcessTimeout::Wall), None)
         } else if shared_exhausted {
@@ -3528,11 +5352,28 @@ fn execute_process(
         } else if now >= next_cpu_poll && (cpu_budget_usec.is_some() || shared_cpu_budget.is_some())
         {
             next_cpu_poll = now + cpu_poll_interval;
-            match process_group_cpu_usage_usec(pid)? {
+            let process_cpu = match process_group_cpu_usage_usec(&process_group) {
+                Ok(process_cpu) => process_cpu,
+                Err(error) => {
+                    return Ok(post_spawn_process_error(process_group, None, error, None));
+                }
+            };
+            match process_cpu {
                 Some(used) => {
+                    last_cpu_usage_usec = Some(used);
                     cpu_accounting_missing_since = None;
                     let exhausted = match shared_cpu_budget {
-                        Some((budget, member)) => budget.observe(member, used)?,
+                        Some((budget, member)) => match budget.observe(member, used) {
+                            Ok(exhausted) => exhausted,
+                            Err(error) => {
+                                return Ok(post_spawn_process_error(
+                                    process_group,
+                                    None,
+                                    error,
+                                    None,
+                                ));
+                            }
+                        },
                         None => cpu_budget_usec.is_some_and(|limit| used >= limit),
                     };
                     (exhausted.then_some(ProcessTimeout::Cpu), Some(used))
@@ -3540,9 +5381,13 @@ fn execute_process(
                 None => {
                     let missing_since = cpu_accounting_missing_since.get_or_insert(now);
                     if now.duration_since(*missing_since) >= CELL_CPU_ACCOUNTING_GRACE {
-                        let _ = stop_process_group(pid);
-                        return Err(format!(
-                            "cannot measure live CPU for process group {pid}; stopped it rather than silently disabling its CPU budget"
+                        return Ok(post_spawn_process_error(
+                            process_group,
+                            None,
+                            format!(
+                                "cannot measure live CPU for process group {pid}; stopped it rather than silently disabling its CPU budget"
+                            ),
+                            None,
                         ));
                     }
                     (None, None)
@@ -3552,18 +5397,40 @@ fn execute_process(
             (None, None)
         };
         if let Some(timeout) = timeout {
-            let (status, final_cpu_usage_usec) = stop_process_group(pid)?;
-            let cpu_usage_usec = observed_cpu_usec.map_or(final_cpu_usage_usec, |observed| {
-                observed.max(final_cpu_usage_usec)
-            });
-            if let Some((budget, member)) = shared_cpu_budget {
-                budget.observe(member, cpu_usage_usec)?;
+            let output = process_output_after_cleanup(
+                process_group,
+                Some(timeout),
+                observed_cpu_usec.or(last_cpu_usage_usec),
+                None,
+                ProcessGroupTermination::Graceful,
+            );
+            if output.monitor_error.is_some() {
+                return Ok(output);
             }
-            return Ok(ProcessOutput {
+            let status = output.status.expect("complete cleanup has a status");
+            let cpu_usage_usec = output
+                .cpu_usage_usec
+                .expect("complete cleanup has CPU usage");
+            if let Some((budget, member)) = shared_cpu_budget {
+                if let Err(error) = budget.observe(member, cpu_usage_usec) {
+                    return Ok(ProcessOutput {
+                        status: Some(status),
+                        timeout: Some(timeout),
+                        cpu_usage_usec: Some(cpu_usage_usec),
+                        monitor_error: Some(ProcessMonitoringError {
+                            reason: error,
+                            errno: None,
+                            process_group_id: pid,
+                            cleanup: ProcessGroupCleanupDisposition::Gone,
+                        }),
+                    });
+                }
+            }
+            return Ok(ProcessOutput::completed(
                 status,
-                timeout: Some(timeout),
+                Some(timeout),
                 cpu_usage_usec,
-            });
+            ));
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -3699,9 +5566,11 @@ fn non_product_failure_class(error_kind: Option<&str>) -> Option<FailureClass> {
         Some("infrastructure" | "result-publication") => {
             Some(FailureClass::UnderstoodInfrastructureFailure)
         }
-        Some("incomplete-verification-evidence" | "invalid-backend-evidence") => {
-            Some(FailureClass::NoResult)
-        }
+        Some(
+            "incomplete-verification-evidence"
+            | "invalid-backend-evidence"
+            | "process-cleanup-unproven",
+        ) => Some(FailureClass::NoResult),
         _ => None,
     }
 }
@@ -3795,8 +5664,6 @@ fn partial_verify_attempt(
     spec: &VerifyRunSpec,
     output: &ProcessOutput,
     duration: Duration,
-    error_kind: &str,
-    reason: &str,
 ) -> AttemptResult {
     let stdout = fs::read(&spec.paths.stdout)
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
@@ -3804,15 +5671,58 @@ fn partial_verify_attempt(
     let stderr = fs::read(&spec.paths.stderr)
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default();
+    let (outcome, error_kind, reason) = if let Some(error) = &output.monitor_error {
+        let error_kind = if error.cleanup == ProcessGroupCleanupDisposition::UnprovenStillLive {
+            "process-cleanup-unproven"
+        } else {
+            "incomplete-verification-evidence"
+        };
+        (
+            "ERROR".into(),
+            Some(error_kind.into()),
+            Some(format!(
+                "process group {} monitoring failed after spawn: {}",
+                error.process_group_id, error.reason
+            )),
+        )
+    } else if let Some(timeout) = output.timeout {
+        (
+            "ERROR".into(),
+            Some(timeout.error_kind().into()),
+            Some(format!(
+                "{} Hermit process reached {}",
+                spec.run.comparison_label(),
+                timeout.error_kind()
+            )),
+        )
+    } else if output.success() {
+        ("PASS".into(), None, None)
+    } else {
+        let reason = match (output.status_code(), output.signal()) {
+            (Some(code), _) => format!(
+                "{} Hermit process exited with status {code}",
+                spec.run.comparison_label()
+            ),
+            (_, Some(signal)) => format!(
+                "{} Hermit process was killed by signal {signal}",
+                spec.run.comparison_label()
+            ),
+            _ => format!(
+                "{} Hermit process completed without a disposition",
+                spec.run.comparison_label()
+            ),
+        };
+        ("FAIL".into(), None, Some(reason))
+    };
     let mut attempt = AttemptResult {
         index: spec.execution.attempt.clone(),
-        outcome: "ERROR".into(),
-        error_kind: Some(error_kind.into()),
-        status: output.status.code(),
-        signal: std::os::unix::process::ExitStatusExt::signal(&output.status),
+        outcome,
+        error_kind,
+        status: output.status_code(),
+        signal: output.signal(),
         timed_out: output.timeout.is_some(),
         duration_ms: duration.as_millis(),
-        cpu_usage_usec: Some(output.cpu_usage_usec),
+        cpu_usage_usec: output.cpu_usage_usec,
         observation_sha256: None,
         argv: spec.execution.argv.clone(),
         guest_argv: spec.execution.guest_argv.clone(),
@@ -3837,7 +5747,7 @@ fn partial_verify_attempt(
         first_divergent_right_message: None,
         sabre_path_evidence: None,
         sabre_path_evidence_sha256: None,
-        reason: Some(reason.into()),
+        reason,
     };
     attempt.observation_sha256 = Some(observation_hash(
         &Observation {
@@ -3879,9 +5789,7 @@ fn build_partial_harness_verify_result(
     let attempts = runs
         .into_iter()
         .filter_map(|(spec, execution)| {
-            execution.map(|(output, duration)| {
-                partial_verify_attempt(spec, output, *duration, error_kind, &reason)
-            })
+            execution.map(|(output, duration)| partial_verify_attempt(spec, output, *duration))
         })
         .collect::<Vec<_>>();
     let cpu_usage_usec = attempts
@@ -4034,6 +5942,93 @@ fn build_harness_managed_verify_result(
     })
 }
 
+struct HarnessVerifyPublicationContext<'a> {
+    context: &'a RunContext,
+    cell: &'a SelectedCell,
+    started: Instant,
+    preparation_cpu_usage_usec: u64,
+    run1_spec: &'a VerifyRunSpec,
+    run2_spec: &'a VerifyRunSpec,
+    run1_execution: &'a (ProcessOutput, Duration),
+    run2_execution: &'a (ProcessOutput, Duration),
+}
+
+fn finalize_harness_verify_result(
+    pair: ComparedVerifyPair,
+    retention_budget: &VerifyLogRetentionBudget,
+    results_path: &Path,
+    mut result: CellResult,
+    publication_context: HarnessVerifyPublicationContext<'_>,
+) -> Result<CellResult, RunCellServiceError> {
+    let publication =
+        publish_retained_verify_log_outcome(pair, retention_budget, results_path, &mut result);
+    match publication {
+        RetainedVerifyLogPublicationOutcome::Committed {
+            durability_warning: None,
+            ..
+        } => Ok(result),
+        RetainedVerifyLogPublicationOutcome::Committed {
+            durability_warning: Some(warning),
+            ..
+        } => {
+            let reason = format!(
+                "retained verify-log result row is authoritative but its durability could not be confirmed: {warning}"
+            );
+            let reporting_result = classify_harness_verify_failure(
+                result,
+                FailureClass::UnderstoodInfrastructureFailure,
+                "result-publication",
+                reason.clone(),
+            );
+            Err(RunCellServiceError::PublicationCommittedWithWarning {
+                result: Box::new(reporting_result),
+                reason,
+            })
+        }
+        RetainedVerifyLogPublicationOutcome::RolledBack { reason } => {
+            let reason = format!("retained verify-log publication rolled back: {reason}");
+            let fallback = build_partial_harness_verify_result(
+                publication_context.context,
+                publication_context.cell,
+                PartialHarnessVerifyResultContext {
+                    started: publication_context.started,
+                    preparation_cpu_usage_usec: publication_context.preparation_cpu_usage_usec,
+                    runs: [
+                        (
+                            publication_context.run1_spec,
+                            Some(publication_context.run1_execution),
+                        ),
+                        (
+                            publication_context.run2_spec,
+                            Some(publication_context.run2_execution),
+                        ),
+                    ],
+                    result: None,
+                    failure_class: FailureClass::UnderstoodInfrastructureFailure,
+                    error_kind: "result-publication",
+                    reason,
+                },
+            );
+            Err(RunCellServiceError::evidenced_infrastructure(fallback))
+        }
+        RetainedVerifyLogPublicationOutcome::Indeterminate { reason } => {
+            let reason = format!(
+                "retained verify-log result publication is indeterminate; refusing fallback publication, cleanup, and retry: {reason}"
+            );
+            let reporting_result = classify_harness_verify_failure(
+                result,
+                FailureClass::UnderstoodInfrastructureFailure,
+                "result-publication",
+                reason.clone(),
+            );
+            Err(RunCellServiceError::PublicationIndeterminate {
+                result: Box::new(reporting_result),
+                reason,
+            })
+        }
+    }
+}
+
 fn run_harness_managed_verify_cell(
     context: &RunContext,
     cell: &SelectedCell,
@@ -4057,7 +6052,7 @@ fn run_harness_managed_verify_cell(
         timeouts.wall_seconds,
         Some(process_permits),
     )
-    .map_err(RunCellServiceError::Infrastructure)?;
+    .map_err(|error| preparation_service_error(context, cell, error))?;
     let deadline = execution_deadline_after_preparation(Instant::now(), timeouts.wall_seconds)
         .map_err(RunCellServiceError::Infrastructure)?;
     let cpu_budget_usec = timeouts.cpu_seconds.saturating_mul(1_000_000);
@@ -4171,6 +6166,39 @@ fn run_harness_managed_verify_cell(
             cause,
         ))
     };
+    let monitor_errors = [(&run1_spec, run1_output), (&run2_spec, run2_output)]
+        .into_iter()
+        .filter_map(|(spec, output)| {
+            output.monitor_error.as_ref().map(|error| {
+                retained_verify_log::with_hermit_diagnostic_stderr(
+                    spec,
+                    format!(
+                        "{} process monitoring failed after spawn: {}",
+                        spec.run.comparison_label(),
+                        error.reason
+                    ),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if !monitor_errors.is_empty() {
+        let error_kind = if run1_output.cleanup_is_unproven() || run2_output.cleanup_is_unproven() {
+            "process-cleanup-unproven"
+        } else {
+            "incomplete-verification-evidence"
+        };
+        let result = partial(
+            None,
+            FailureClass::NoResult,
+            error_kind,
+            monitor_errors.join("; "),
+        );
+        return Err(if error_kind == "process-cleanup-unproven" {
+            RunCellServiceError::UncontainedProcess(Box::new(result))
+        } else {
+            RunCellServiceError::evidenced_no_result(result)
+        });
+    }
     for (spec, output) in [(&run1_spec, run1_output), (&run2_spec, run2_output)] {
         if let Some(timeout) = output.timeout {
             let cause = format!(
@@ -4186,10 +6214,9 @@ fn run_harness_managed_verify_cell(
             )));
         }
     }
-    let execution_cpu_usage_usec = run1_output
-        .cpu_usage_usec
-        .checked_add(run2_output.cpu_usage_usec)
-        .ok_or_else(|| no_result("verify-pair CPU usage overflowed u64".into()))?;
+    let execution_cpu_usage_usec =
+        checked_add_cpu_usage(run1_output.cpu_usage_usec, run2_output.cpu_usage_usec)
+            .ok_or_else(|| no_result("verify-pair CPU usage overflowed u64".into()))?;
     if execution_cpu_usage_usec >= cpu_budget_usec {
         return Err(RunCellServiceError::evidenced_no_result(partial(
             Some(ObservedResult::Timeout),
@@ -4203,10 +6230,18 @@ fn run_harness_managed_verify_cell(
     }
 
     let run1 = load_verify_run(&run1_spec).map_err(no_result)?;
-    run1.validate_process_status(&run1_spec, run1_output.status)
+    let run1_status =
+        run1_output.status.as_ref().copied().ok_or_else(|| {
+            no_result("verify run 1 completed without a process disposition".into())
+        })?;
+    run1.validate_process_status(&run1_spec, run1_status)
         .map_err(no_result)?;
     let run2 = load_verify_run(&run2_spec).map_err(no_result)?;
-    run2.validate_process_status(&run2_spec, run2_output.status)
+    let run2_status =
+        run2_output.status.as_ref().copied().ok_or_else(|| {
+            no_result("verify run 2 completed without a process disposition".into())
+        })?;
+    run2.validate_process_status(&run2_spec, run2_status)
         .map_err(no_result)?;
     let pair =
         compare_verify_runs(&run1_spec, run1.clone(), &run2_spec, run2).map_err(no_result)?;
@@ -4222,7 +6257,7 @@ fn run_harness_managed_verify_cell(
             "Hermit binary changed while the verify pair was executing".into(),
         )));
     }
-    let mut result = match build_harness_managed_verify_result(
+    let result = match build_harness_managed_verify_result(
         context,
         cell,
         &dir,
@@ -4247,21 +6282,22 @@ fn run_harness_managed_verify_cell(
             )));
         }
     };
-    let unpublished_result = result.clone();
-    if let Err(error) =
-        publish_retained_verify_log(pair, retention_budget, results_path, &mut result)
-    {
-        let reason = format!("retained verify-log publication failed: {error}");
-        return Err(RunCellServiceError::evidenced_infrastructure(
-            classify_harness_verify_failure(
-                unpublished_result,
-                FailureClass::UnderstoodInfrastructureFailure,
-                "result-publication",
-                reason,
-            ),
-        ));
-    }
-    Ok(result)
+    finalize_harness_verify_result(
+        pair,
+        retention_budget,
+        results_path,
+        result,
+        HarnessVerifyPublicationContext {
+            context,
+            cell,
+            started,
+            preparation_cpu_usage_usec,
+            run1_spec: &run1_spec,
+            run2_spec: &run2_spec,
+            run1_execution: &run1_execution,
+            run2_execution: &run2_execution,
+        },
+    )
 }
 
 pub fn no_result_error_result(
@@ -4281,6 +6317,15 @@ pub enum RunCellServiceError {
     Infrastructure(String),
     EvidencedNoResult(Box<CellResult>),
     EvidencedInfrastructure(Box<CellResult>),
+    UncontainedProcess(Box<CellResult>),
+    PublicationCommittedWithWarning {
+        result: Box<CellResult>,
+        reason: String,
+    },
+    PublicationIndeterminate {
+        result: Box<CellResult>,
+        reason: String,
+    },
 }
 
 impl RunCellServiceError {
@@ -4293,6 +6338,31 @@ impl RunCellServiceError {
     }
 }
 
+impl From<String> for RunCellServiceError {
+    fn from(message: String) -> Self {
+        Self::Infrastructure(message)
+    }
+}
+
+fn preparation_service_error(
+    context: &RunContext,
+    cell: &SelectedCell,
+    error: PreparationError,
+) -> RunCellServiceError {
+    if let Some(output) = error
+        .process
+        .as_ref()
+        .filter(|output| output.cleanup_is_unproven())
+    {
+        let mut result = no_result_error_result(context, cell, error.message.clone());
+        result.error_kind = Some("process-cleanup-unproven".into());
+        result.cpu_usage_usec = output.cpu_usage_usec;
+        result.reason = Some(error.message);
+        return RunCellServiceError::UncontainedProcess(Box::new(result));
+    }
+    RunCellServiceError::Infrastructure(error.message)
+}
+
 impl std::fmt::Display for RunCellServiceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -4300,6 +6370,9 @@ impl std::fmt::Display for RunCellServiceError {
             Self::EvidencedNoResult(result) | Self::EvidencedInfrastructure(result) => {
                 formatter.write_str(result.reason_for_display())
             }
+            Self::UncontainedProcess(result) => formatter.write_str(result.reason_for_display()),
+            Self::PublicationCommittedWithWarning { reason, .. }
+            | Self::PublicationIndeterminate { reason, .. } => formatter.write_str(reason),
         }
     }
 }
@@ -4330,7 +6403,7 @@ pub fn requires_verify_log_retention(cell: &SelectedCell) -> bool {
 
 pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, String> {
     let process_permits = ProcessPermitPool::new(context.scheduled_worker_capacity);
-    run_cell_inner(context, cell, &process_permits)
+    run_cell_inner(context, cell, &process_permits).map_err(|error| error.to_string())
 }
 
 pub fn run_cell_with_services(
@@ -4340,7 +6413,7 @@ pub fn run_cell_with_services(
     retention_budget: Option<&VerifyLogRetentionBudget>,
     results_path: &Path,
 ) -> Result<CellResult, RunCellServiceError> {
-    match verify_execution_route(cell) {
+    let outcome = match verify_execution_route(cell) {
         VerifyExecutionRoute::HarnessManaged => run_harness_managed_verify_cell(
             context,
             cell,
@@ -4357,8 +6430,27 @@ pub fn run_cell_with_services(
         )),
         VerifyExecutionRoute::SabreInternal =>
             run_sabre_internal_verify_cell(context, cell, process_permits),
-        VerifyExecutionRoute::Legacy => run_cell_inner(context, cell, process_permits)
-            .map_err(RunCellServiceError::Infrastructure),
+        VerifyExecutionRoute::Legacy => run_cell_inner(context, cell, process_permits),
+    };
+    let has_unproven_cleanup = |result: &CellResult| {
+        result
+            .attempts
+            .iter()
+            .any(|attempt| attempt.error_kind.as_deref() == Some("process-cleanup-unproven"))
+    };
+    match outcome {
+        Ok(result) if has_unproven_cleanup(&result) => {
+            Err(RunCellServiceError::UncontainedProcess(Box::new(result)))
+        }
+        Err(RunCellServiceError::EvidencedNoResult(result)) if has_unproven_cleanup(&result) => {
+            Err(RunCellServiceError::UncontainedProcess(result))
+        }
+        Err(RunCellServiceError::EvidencedInfrastructure(result))
+            if has_unproven_cleanup(&result) =>
+        {
+            Err(RunCellServiceError::UncontainedProcess(result))
+        }
+        outcome => outcome,
     }
 }
 
@@ -4369,14 +6461,14 @@ fn run_sabre_internal_verify_cell(
 ) -> Result<CellResult, RunCellServiceError> {
     // SaBRe cannot provide the private authoritative ordinary-run INFO sidecar:
     // its plugin DETLOG is available only on the shared stderr stream.
-    run_cell_inner(context, cell, process_permits).map_err(RunCellServiceError::Infrastructure)
+    run_cell_inner(context, cell, process_permits)
 }
 
 fn run_cell_inner(
     context: &RunContext,
     cell: &SelectedCell,
     process_permits: &ProcessPermitPool,
-) -> Result<CellResult, String> {
+) -> Result<CellResult, RunCellServiceError> {
     let dir = cell_artifact_dir(context, cell);
     let started = Instant::now();
     let timeouts = cell_timeouts(context, cell)?;
@@ -4392,7 +6484,8 @@ fn run_cell_inner(
         preparation_deadline,
         timeouts.wall_seconds,
         Some(process_permits),
-    )?;
+    )
+    .map_err(|error| preparation_service_error(context, cell, error))?;
     // Fixture preparation keeps its scaled wall-clock guard above. Post-preparation
     // execution uses its separately measured bound as an aggregate CPU-second budget
     // across all attempts/seeds, so time spent descheduled by a busy host cannot
@@ -4449,7 +6542,7 @@ fn run_cell_inner(
                 .as_ref()
                 .ok_or_else(|| format!("{} chaos has no seeds", cell.id.test))?;
             if seeds.is_empty() {
-                return Err(format!("{} chaos has no seeds", cell.id.test));
+                return Err(format!("{} chaos has no seeds", cell.id.test).into());
             }
             for seed in seeds {
                 let index = format!("seed-{seed}");
@@ -5239,12 +7332,21 @@ enum ResultPublicationFailurePoint {
     TemporaryFileSync,
     BeforeRename,
     ParentDirectorySync,
+    ParentDirectorySyncAndRollbackFailure,
+    ParentDirectorySyncAndAmbiguousBytes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResultPublicationState {
+    Committed,
+    RolledBack,
+    Indeterminate,
 }
 
 #[derive(Debug)]
 struct ResultPublicationFailure {
     message: String,
-    descriptor_visible: bool,
+    state: ResultPublicationState,
 }
 
 fn read_existing_result(path: &Path) -> Result<Option<Vec<u8>>, String> {
@@ -5334,7 +7436,7 @@ fn append_result_with_failure(
 ) -> Result<(), ResultPublicationFailure> {
     let unpublished = |message| ResultPublicationFailure {
         message,
-        descriptor_visible: false,
+        state: ResultPublicationState::RolledBack,
     };
     let retained_verify_log = result
         .validate_retained_verify_log_binding()
@@ -5382,17 +7484,17 @@ fn append_result_with_failure(
     require_plain_directory(parent, "prepared result directory").map_err(|message| {
         ResultPublicationFailure {
             message,
-            descriptor_visible: false,
+            state: ResultPublicationState::RolledBack,
         }
     })?;
     let previous = read_existing_result(path).map_err(|message| ResultPublicationFailure {
         message,
-        descriptor_visible: false,
+        state: ResultPublicationState::RolledBack,
     })?;
     let mut next = previous.clone().unwrap_or_default();
     serde_json::to_writer(&mut next, result).map_err(|error| ResultPublicationFailure {
         message: error.to_string(),
-        descriptor_visible: false,
+        state: ResultPublicationState::RolledBack,
     })?;
     next.push(b'\n');
     let mut temporary = tempfile::Builder::new()
@@ -5404,12 +7506,12 @@ fn append_result_with_failure(
                 "cannot create temporary result file in {}: {error}",
                 parent.display()
             ),
-            descriptor_visible: false,
+            state: ResultPublicationState::RolledBack,
         })?;
     if failure == Some(ResultPublicationFailurePoint::TemporaryWrite) {
         return Err(ResultPublicationFailure {
             message: "injected failure writing the temporary result file".into(),
-            descriptor_visible: false,
+            state: ResultPublicationState::RolledBack,
         });
     }
     temporary
@@ -5417,12 +7519,12 @@ fn append_result_with_failure(
         .and_then(|()| temporary.flush())
         .map_err(|error| ResultPublicationFailure {
             message: format!("cannot write temporary result file: {error}"),
-            descriptor_visible: false,
+            state: ResultPublicationState::RolledBack,
         })?;
     if failure == Some(ResultPublicationFailurePoint::TemporaryFileSync) {
         return Err(ResultPublicationFailure {
             message: "injected failure syncing the temporary result file".into(),
-            descriptor_visible: false,
+            state: ResultPublicationState::RolledBack,
         });
     }
     temporary
@@ -5430,12 +7532,12 @@ fn append_result_with_failure(
         .sync_all()
         .map_err(|error| ResultPublicationFailure {
             message: format!("cannot sync temporary result file: {error}"),
-            descriptor_visible: false,
+            state: ResultPublicationState::RolledBack,
         })?;
     if failure == Some(ResultPublicationFailurePoint::BeforeRename) {
         return Err(ResultPublicationFailure {
             message: "injected failure at result-row publication boundary".into(),
-            descriptor_visible: false,
+            state: ResultPublicationState::RolledBack,
         });
     }
     temporary
@@ -5446,26 +7548,54 @@ fn append_result_with_failure(
                 path.display(),
                 error.error
             ),
-            descriptor_visible: false,
+            state: ResultPublicationState::RolledBack,
         })?;
-    let durable = if failure == Some(ResultPublicationFailurePoint::ParentDirectorySync) {
+    let parent_sync_failure = failure == Some(ResultPublicationFailurePoint::ParentDirectorySync)
+        || failure == Some(ResultPublicationFailurePoint::ParentDirectorySyncAndRollbackFailure)
+        || failure == Some(ResultPublicationFailurePoint::ParentDirectorySyncAndAmbiguousBytes);
+    let durable = if parent_sync_failure {
         Err("injected failure syncing the result directory after result-row rename".to_string())
     } else {
         sync_plain_directory(parent, "result directory")
     };
     if let Err(error) = durable {
-        return match restore_previous_result(path, previous.as_deref()) {
-            Ok(()) => Err(ResultPublicationFailure {
-                message: error,
-                descriptor_visible: false,
-            }),
-            Err(rollback_error) => Err(ResultPublicationFailure {
-                message: format!(
-                    "{error}; result-row rollback also failed and the new row may remain visible: {rollback_error}"
-                ),
-                descriptor_visible: true,
-            }),
+        let rollback = match failure {
+            Some(ResultPublicationFailurePoint::ParentDirectorySyncAndRollbackFailure) => {
+                Err("injected result-row rollback failure".to_string())
+            }
+            Some(ResultPublicationFailurePoint::ParentDirectorySyncAndAmbiguousBytes) => {
+                fs::write(path, b"injected ambiguous result bytes\n").map_err(|write_error| {
+                    format!("cannot inject ambiguous result bytes: {write_error}")
+                })
+            }
+            _ => restore_previous_result(path, previous.as_deref()),
         };
+        let rollback_detail = rollback
+            .err()
+            .map(|rollback_error| format!("; result-row rollback failed: {rollback_error}"))
+            .unwrap_or_default();
+        let (state, observation) = match read_existing_result(path) {
+            Ok(observed) if observed.as_deref() == Some(next.as_slice()) => (
+                ResultPublicationState::Committed,
+                "the exact next result bytes remain visible",
+            ),
+            Ok(observed) if observed == previous => (
+                ResultPublicationState::RolledBack,
+                "the exact previous result bytes are visible",
+            ),
+            Ok(_) => (
+                ResultPublicationState::Indeterminate,
+                "result bytes match neither the exact previous nor exact next state",
+            ),
+            Err(_) => (
+                ResultPublicationState::Indeterminate,
+                "the result file could not be reread",
+            ),
+        };
+        return Err(ResultPublicationFailure {
+            message: format!("{error}{rollback_detail}; {observation}"),
+            state,
+        });
     }
     Ok(())
 }
@@ -6046,10 +8176,605 @@ mod tests {
             .exclusive_captures(),
         )
         .unwrap();
-        assert!(normal.status.success());
+        assert!(normal.success());
         assert!(directory.path().join("normal-marker").is_file());
         assert!(normal_stdout.is_file());
         assert!(normal_stderr.is_file());
+    }
+
+    #[test]
+    fn supervisor_requires_cleanup_wait_release_order() {
+        let supervisor = ProcessGroupLaunchSupervisor::start().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        supervisor.configure_payload(&mut command);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        drop(child);
+        let payload_pidfd = open_process_pidfd(pid, "test payload").unwrap();
+        let mut identity = supervisor.finish(pid, Some(payload_pidfd)).unwrap();
+        assert_eq!(identity.receipt.load(), RawSupervisorState::Running);
+
+        let early_release =
+            request_process_group_supervisor(&mut identity, GROUP_SUPERVISOR_RELEASE, 0)
+                .unwrap_err();
+        assert!(
+            early_release.contains("Invalid argument"),
+            "{early_release}"
+        );
+        assert_eq!(identity.receipt.load(), RawSupervisorState::Running);
+        request_process_group_supervisor(
+            &mut identity,
+            GROUP_SUPERVISOR_CLEANUP,
+            GROUP_CLEANUP_IMMEDIATE,
+        )
+        .unwrap();
+        assert_eq!(identity.receipt.load(), RawSupervisorState::EmptyAnchored);
+        let reaped = wait4_process(pid, 0)
+            .unwrap()
+            .expect("cleanup must leave the payload waitable while anchored");
+        assert_eq!(
+            reaped.status.signal(),
+            Some(libc::SIGKILL),
+            "immediate cleanup must kill the payload"
+        );
+        let repeated_cleanup = request_process_group_supervisor(
+            &mut identity,
+            GROUP_SUPERVISOR_CLEANUP,
+            GROUP_CLEANUP_IMMEDIATE,
+        )
+        .unwrap_err();
+        assert!(repeated_cleanup.contains("already"), "{repeated_cleanup}");
+        assert_eq!(identity.receipt.load(), RawSupervisorState::EmptyAnchored);
+        request_process_group_supervisor(&mut identity, GROUP_SUPERVISOR_RELEASE, 0).unwrap();
+        assert_eq!(identity.receipt.load(), RawSupervisorState::ReleasedClean);
+        drop(identity.control.take());
+        assert_eq!(
+            wait_supervisor_pidfd(&identity.supervisor_pidfd, true).unwrap(),
+            Some(SupervisorExit::Success)
+        );
+        assert!(live_process_group_members(pid).unwrap().is_empty());
+    }
+
+    fn launch_supervised_test_process(script: &str) -> (u32, ProcessGroupIdentity) {
+        let supervisor = ProcessGroupLaunchSupervisor::start().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        supervisor.configure_payload(&mut command);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        drop(child);
+        let payload_pidfd = open_process_pidfd(pid, "test payload").unwrap();
+        let identity = supervisor.finish(pid, Some(payload_pidfd)).unwrap();
+        (pid, identity)
+    }
+
+    fn signal_pidfd(pidfd: &File, signal: libc::c_int) {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "pidfd_send_signal failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    const SAME_SESSION_JOIN_CHILD: &str = "HERMIT_SAME_SESSION_JOIN_CHILD";
+    const SAME_SESSION_JOIN_TARGET: &str = "HERMIT_SAME_SESSION_JOIN_TARGET";
+    const SAME_SESSION_JOIN_RELEASE_FD: &str = "HERMIT_SAME_SESSION_JOIN_RELEASE_FD";
+    const SAME_SESSION_JOIN_ACK_FD: &str = "HERMIT_SAME_SESSION_JOIN_ACK_FD";
+    const SAME_SESSION_JOIN_MARKER: &str = "HERMIT_SAME_SESSION_JOIN_MARKER";
+    const SAME_SESSION_JOIN_TEST: &str =
+        "runner::tests::same_session_process_joining_before_scan_is_killed";
+
+    fn run_same_session_join_child() {
+        let target = std::env::var(SAME_SESSION_JOIN_TARGET)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        let release_fd = std::env::var(SAME_SESSION_JOIN_RELEASE_FD)
+            .unwrap()
+            .parse::<libc::c_int>()
+            .unwrap();
+        let ack_fd = std::env::var(SAME_SESSION_JOIN_ACK_FD)
+            .unwrap()
+            .parse::<libc::c_int>()
+            .unwrap();
+        let marker = PathBuf::from(std::env::var_os(SAME_SESSION_JOIN_MARKER).unwrap());
+        let mut byte = 0u8;
+        assert_eq!(
+            unsafe { libc::read(release_fd, (&mut byte as *mut u8).cast(), 1) },
+            1
+        );
+        assert_eq!(unsafe { libc::setpgid(0, target) }, 0);
+        assert_eq!(
+            unsafe { libc::write(ack_fd, (&byte as *const u8).cast(), 1) },
+            1
+        );
+        thread::sleep(Duration::from_secs(2));
+        fs::write(marker, b"survived").unwrap();
+    }
+
+    #[test]
+    fn same_session_process_joining_before_scan_is_killed() {
+        if std::env::var_os(SAME_SESSION_JOIN_CHILD).is_some() {
+            run_same_session_join_child();
+            return;
+        }
+
+        let (leader_pid, identity) = launch_supervised_test_process("exit 0");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !process_has_exited(&identity).unwrap() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(process_has_exited(&identity).unwrap());
+        let target_session = raw_process_session_id(identity.sentinel_pid).unwrap();
+
+        let mut release = [-1; 2];
+        let mut ack = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(ack.as_mut_ptr()) }, 0);
+        let marker_directory = tempfile::tempdir().unwrap();
+        let marker = marker_directory.path().join("late-marker");
+        let mut joiner = Command::new(std::env::current_exe().unwrap());
+        joiner
+            .args(["--exact", SAME_SESSION_JOIN_TEST, "--nocapture"])
+            .env(SAME_SESSION_JOIN_CHILD, "1")
+            .env(SAME_SESSION_JOIN_TARGET, leader_pid.to_string())
+            .env(SAME_SESSION_JOIN_RELEASE_FD, release[0].to_string())
+            .env(SAME_SESSION_JOIN_ACK_FD, ack[1].to_string())
+            .env(SAME_SESSION_JOIN_MARKER, &marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut joiner = joiner.spawn().unwrap();
+        unsafe {
+            libc::close(release[0]);
+            libc::close(ack[1]);
+        }
+        let joiner_pid = joiner.id();
+        assert_eq!(raw_process_session_id(joiner_pid).unwrap(), target_session);
+        assert_ne!(
+            raw_read_linux_process_stat(joiner_pid)
+                .unwrap()
+                .process_group_id,
+            leader_pid
+        );
+        let byte = 1u8;
+        assert_eq!(
+            unsafe { libc::write(release[1], (&byte as *const u8).cast(), 1) },
+            1
+        );
+        let mut joined = 0u8;
+        assert_eq!(
+            unsafe { libc::read(ack[0], (&mut joined as *mut u8).cast(), 1) },
+            1
+        );
+        unsafe {
+            libc::close(release[1]);
+            libc::close(ack[0]);
+        }
+        assert_eq!(
+            raw_read_linux_process_stat(joiner_pid)
+                .unwrap()
+                .process_group_id,
+            leader_pid
+        );
+
+        let cleanup = stop_process_group(identity, ProcessGroupTermination::Immediate);
+        assert_eq!(cleanup.disposition, ProcessGroupCleanupDisposition::Gone);
+        assert_eq!(joiner.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn supervisor_identity_mismatch_sends_no_signal_and_control_recovers() {
+        let (pid, mut identity) = launch_supervised_test_process("sleep 30");
+        let sentinel_start_time_ticks = identity.sentinel_start_time_ticks;
+        identity.sentinel_start_time_ticks = sentinel_start_time_ticks.saturating_add(1);
+        let stale_start = request_process_group_supervisor(
+            &mut identity,
+            GROUP_SUPERVISOR_CLEANUP,
+            GROUP_CLEANUP_IMMEDIATE,
+        )
+        .unwrap_err();
+        assert!(stale_start.contains("Stale file handle"), "{stale_start}");
+        assert!(!process_has_exited(&identity).unwrap());
+
+        identity.sentinel_start_time_ticks = sentinel_start_time_ticks;
+        identity.leader_pid = pid.saturating_add(1);
+        let stale_group = request_process_group_supervisor(
+            &mut identity,
+            GROUP_SUPERVISOR_CLEANUP,
+            GROUP_CLEANUP_IMMEDIATE,
+        )
+        .unwrap_err();
+        assert!(stale_group.contains("Stale file handle"), "{stale_group}");
+        identity.leader_pid = pid;
+        assert!(!process_has_exited(&identity).unwrap());
+        assert_eq!(identity.receipt.load(), RawSupervisorState::Running);
+
+        let cleanup = stop_process_group(identity, ProcessGroupTermination::Immediate);
+        assert_eq!(cleanup.disposition, ProcessGroupCleanupDisposition::Gone);
+    }
+
+    #[test]
+    fn supervisor_exit_before_release_receipt_is_unproven_and_nonblocking() {
+        let (pid, identity) = launch_supervised_test_process("sleep 30");
+        let payload_pidfd = identity
+            .payload_pidfd
+            .as_ref()
+            .unwrap()
+            .try_clone()
+            .unwrap();
+        signal_pidfd(&identity.supervisor_pidfd, libc::SIGKILL);
+        let started = Instant::now();
+        let cleanup = stop_process_group(identity, ProcessGroupTermination::Immediate);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            cleanup.disposition,
+            ProcessGroupCleanupDisposition::UnprovenStillLive
+        );
+        signal_pidfd(&payload_pidfd, libc::SIGKILL);
+        let _ = reap_payload_by_pidfd(&payload_pidfd, pid, true);
+    }
+
+    #[test]
+    fn empty_anchored_without_release_receipt_is_not_containment_proof() {
+        let (_pid, mut identity) = launch_supervised_test_process("sleep 30");
+        request_process_group_supervisor(
+            &mut identity,
+            GROUP_SUPERVISOR_CLEANUP,
+            GROUP_CLEANUP_IMMEDIATE,
+        )
+        .unwrap();
+        assert_eq!(identity.receipt.load(), RawSupervisorState::EmptyAnchored);
+        signal_pidfd(&identity.supervisor_pidfd, libc::SIGKILL);
+        let cleanup = stop_process_group(identity, ProcessGroupTermination::Immediate);
+        assert_eq!(
+            cleanup.disposition,
+            ProcessGroupCleanupDisposition::UnprovenStillLive
+        );
+    }
+
+    const CONTROL_LOSS_REGRESSION_CHILD: &str = "HERMIT_CONTROL_LOSS_REGRESSION_CHILD";
+
+    fn run_control_loss_regression_child(root: &Path) {
+        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        action.sa_sigaction = libc::SIG_IGN;
+        action.sa_flags = libc::SA_NOCLDWAIT;
+        assert_eq!(unsafe { libc::sigemptyset(&mut action.sa_mask) }, 0);
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) },
+            0
+        );
+
+        let late_marker = root.join("late");
+        let supervisor = ProcessGroupLaunchSupervisor::start().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "(sleep 1; printf survived > \"$LATE_MARKER\") & sleep 30",
+            ])
+            .env("LATE_MARKER", &late_marker);
+        supervisor.configure_payload(&mut command);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        drop(child);
+        let payload_pidfd = open_process_pidfd(pid, "test payload").unwrap();
+        let mut identity = supervisor.finish(pid, Some(payload_pidfd)).unwrap();
+        drop(identity.control.take());
+        let cleanup = stop_process_group(identity, ProcessGroupTermination::Immediate);
+        assert_eq!(cleanup.disposition, ProcessGroupCleanupDisposition::Gone);
+        assert_eq!(cleanup.status, None);
+        assert!(live_process_group_members(pid).unwrap().is_empty());
+        thread::sleep(Duration::from_millis(1_200));
+        assert!(!late_marker.exists());
+    }
+
+    #[test]
+    fn control_loss_with_no_cldwait_uses_released_clean_receipt() {
+        if let Some(root) = std::env::var_os(CONTROL_LOSS_REGRESSION_CHILD) {
+            run_control_loss_regression_child(Path::new(&root));
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runner::tests::control_loss_with_no_cldwait_uses_released_clean_receipt",
+                "--nocapture",
+            ])
+            .env(CONTROL_LOSS_REGRESSION_CHILD, directory.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!directory.path().join("late").exists());
+    }
+
+    #[test]
+    fn supervised_cleanup_survives_unrelated_proc_churn() {
+        let directory = tempfile::tempdir().unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let output = thread::scope(|scope| {
+            let churn = scope.spawn(|| {
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let status = Command::new("/bin/true").status().unwrap();
+                    assert!(status.success());
+                }
+            });
+            let output = execute_process(
+                directory.path(),
+                "/bin/sh",
+                &["-c".into(), "sleep 30".into()],
+                &BTreeMap::new(),
+                &directory.path().join("churn.stdout"),
+                &directory.path().join("churn.stderr"),
+                ProcessExecutionOptions::new(
+                    Instant::now() + Duration::from_millis(150),
+                    None,
+                    None,
+                ),
+            )
+            .unwrap();
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            churn.join().unwrap();
+            output
+        });
+        assert_eq!(output.timeout, Some(ProcessTimeout::Wall));
+        assert!(
+            output
+                .monitor_error
+                .as_ref()
+                .is_none_or(|error| error.cleanup == ProcessGroupCleanupDisposition::Gone),
+            "cleanup lost its group-generation proof: {output:?}"
+        );
+    }
+
+    const ECHILD_REGRESSION_CHILD: &str = "HERMIT_ECHILD_REGRESSION_CHILD";
+
+    fn run_echild_regression_child(root: &Path) {
+        let artifact_dir = root.join("cell");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let context = run_context(root);
+        let cell = ptrace_cell("verify");
+        let mut run1 = build_verify_run_spec(
+            &context,
+            &cell,
+            artifact_dir.clone(),
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run1,
+            15,
+        )
+        .unwrap();
+        let mut run2 = build_verify_run_spec(
+            &context,
+            &cell,
+            artifact_dir,
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run2,
+            15,
+        )
+        .unwrap();
+        retained_verify_log::prepare_verify_run_destinations(&run1, &run2).unwrap();
+        let script = concat!(
+            "printf '%s\\n' \"$$\" > \"$START_MARKER\"; ",
+            "(sleep 2; printf survived > \"$LATE_MARKER\") & ",
+            "sleep 30"
+        );
+        for (spec, label) in [(&mut run1, "run1"), (&mut run2, "run2")] {
+            spec.execution.argv = vec!["/bin/sh".into(), "-c".into(), script.into()];
+            spec.execution.env.insert(
+                "START_MARKER".into(),
+                root.join(format!("{label}.pid"))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            spec.execution.env.insert(
+                "LATE_MARKER".into(),
+                root.join(format!("{label}.late"))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        let permits = ProcessPermitPool::new(ScheduledWorkerCapacity::new(2));
+        let budget = SharedProcessCpuBudget::new(30_000_000);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (run1_execution, run2_execution) = thread::scope(|scope| {
+            let first =
+                scope.spawn(|| execute_verify_run_until(&run1, deadline, &budget, 0, &permits));
+            let second =
+                scope.spawn(|| execute_verify_run_until(&run2, deadline, &budget, 1, &permits));
+            let flip = scope.spawn(|| {
+                let started = Instant::now();
+                while !(root.join("run1.pid").is_file() && root.join("run2.pid").is_file()) {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(5),
+                        "both child start markers were not created"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+                action.sa_sigaction = libc::SIG_IGN;
+                action.sa_flags = libc::SA_NOCLDWAIT;
+                assert_eq!(unsafe { libc::sigemptyset(&mut action.sa_mask) }, 0);
+                assert_eq!(
+                    unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) },
+                    0
+                );
+                for label in ["run1", "run2"] {
+                    let pid = fs::read_to_string(root.join(format!("{label}.pid")))
+                        .unwrap()
+                        .trim()
+                        .parse::<i32>()
+                        .unwrap();
+                    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+                }
+            });
+            flip.join().unwrap();
+            (
+                first.join().unwrap().unwrap(),
+                second.join().unwrap().unwrap(),
+            )
+        });
+        for output in [&run1_execution.0, &run2_execution.0] {
+            let error = output
+                .monitor_error
+                .as_ref()
+                .expect("SIGCHLD auto-reap must surface a post-spawn monitor error");
+            assert_eq!(error.errno, Some(libc::ECHILD));
+            assert_eq!(error.cleanup, ProcessGroupCleanupDisposition::Gone);
+            assert_eq!(output.status, None);
+            assert_eq!(output.cpu_usage_usec, None);
+        }
+        let result = build_partial_harness_verify_result(
+            &context,
+            &cell,
+            PartialHarnessVerifyResultContext {
+                started: Instant::now(),
+                preparation_cpu_usage_usec: 0,
+                runs: [
+                    (&run1, Some(&run1_execution)),
+                    (&run2, Some(&run2_execution)),
+                ],
+                result: None,
+                failure_class: FailureClass::NoResult,
+                error_kind: "incomplete-verification-evidence",
+                reason: "injected ECHILD after both launches".into(),
+            },
+        );
+        assert_eq!(result.attempts.len(), 2);
+        assert!(result.attempts.iter().all(|attempt| {
+            attempt.outcome == "ERROR"
+                && attempt.error_kind.as_deref() == Some("incomplete-verification-evidence")
+                && attempt.status.is_none()
+                && attempt.signal.is_none()
+        }));
+        fs::write(
+            root.join("evidence.json"),
+            serde_json::to_vec(&result).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn post_spawn_echild_retains_two_attempts_and_leaves_no_live_group() {
+        if let Some(root) = std::env::var_os(ECHILD_REGRESSION_CHILD) {
+            run_echild_regression_child(Path::new(&root));
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runner::tests::post_spawn_echild_retains_two_attempts_and_leaves_no_live_group",
+                "--nocapture",
+            ])
+            .env(ECHILD_REGRESSION_CHILD, directory.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let result: CellResult =
+            serde_json::from_slice(&fs::read(directory.path().join("evidence.json")).unwrap())
+                .unwrap();
+        assert_eq!(result.attempts.len(), 2);
+        for label in ["run1", "run2"] {
+            let pid = fs::read_to_string(directory.path().join(format!("{label}.pid")))
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap();
+            assert!(live_process_group_members(pid).unwrap().is_empty());
+        }
+        thread::sleep(Duration::from_millis(2_200));
+        assert!(!directory.path().join("run1.late").exists());
+        assert!(!directory.path().join("run2.late").exists());
+    }
+
+    #[test]
+    fn partial_verify_classifies_real_success_and_cpu_timeout_per_side() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let cell_dir = directory.path().join("results/cell");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&cell_dir).unwrap();
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let mut run1 = build_verify_run_spec(
+            &context,
+            &cell,
+            cell_dir.clone(),
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run1,
+            15,
+        )
+        .unwrap();
+        let mut run2 = build_verify_run_spec(
+            &context,
+            &cell,
+            cell_dir,
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run2,
+            15,
+        )
+        .unwrap();
+        retained_verify_log::prepare_verify_run_destinations(&run1, &run2).unwrap();
+        run1.execution.argv = vec!["/bin/true".into()];
+        run2.execution.argv = vec!["/bin/sh".into(), "-c".into(), "while :; do :; done".into()];
+        let permits = ProcessPermitPool::new(ScheduledWorkerCapacity::new(1));
+        let budget = SharedProcessCpuBudget::new(120_000);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let run1_execution =
+            execute_verify_run_until(&run1, deadline, &budget, 0, &permits).unwrap();
+        let run2_execution =
+            execute_verify_run_until(&run2, deadline, &budget, 1, &permits).unwrap();
+        assert!(run1_execution.0.success());
+        assert_eq!(run1_execution.0.timeout, None);
+        assert_eq!(run2_execution.0.timeout, Some(ProcessTimeout::Cpu));
+
+        let result = build_partial_harness_verify_result(
+            &context,
+            &cell,
+            PartialHarnessVerifyResultContext {
+                started: Instant::now(),
+                preparation_cpu_usage_usec: 0,
+                runs: [
+                    (&run1, Some(&run1_execution)),
+                    (&run2, Some(&run2_execution)),
+                ],
+                result: Some(ObservedResult::Timeout),
+                failure_class: FailureClass::NoResult,
+                error_kind: "cpu-timeout",
+                reason: "verify pair exhausted its aggregate CPU budget".into(),
+            },
+        );
+        assert_eq!(result.attempts.len(), 2);
+        let successful = &result.attempts[0];
+        assert_eq!(successful.outcome, "PASS");
+        assert_eq!(successful.error_kind, None);
+        assert_eq!(successful.status, Some(0));
+        assert_eq!(successful.signal, None);
+        assert!(!successful.timed_out);
+        assert!(successful.cpu_usage_usec.is_some());
+        let timed_out = &result.attempts[1];
+        assert_eq!(timed_out.outcome, "ERROR");
+        assert_eq!(timed_out.error_kind.as_deref(), Some("cpu-timeout"));
+        assert!(timed_out.timed_out);
+        assert!(timed_out.cpu_usage_usec.is_some());
+        assert!(result.cpu_usage_usec.is_some());
     }
 
     #[test]
@@ -6088,17 +8813,19 @@ mod tests {
         fs::write(&run2.paths.stderr, b"run-2 stderr").unwrap();
         let run1_output = (
             ProcessOutput {
-                status: ExitStatus::from_raw(0),
+                status: Some(ExitStatus::from_raw(0)),
                 timeout: Some(ProcessTimeout::Wall),
-                cpu_usage_usec: 11,
+                cpu_usage_usec: Some(11),
+                monitor_error: None,
             },
             Duration::from_millis(17),
         );
         let run2_output = (
             ProcessOutput {
-                status: ExitStatus::from_raw(7 << 8),
+                status: Some(ExitStatus::from_raw(7 << 8)),
                 timeout: Some(ProcessTimeout::Cpu),
-                cpu_usage_usec: 13,
+                cpu_usage_usec: Some(13),
+                monitor_error: None,
             },
             Duration::from_millis(19),
         );
@@ -6181,6 +8908,8 @@ mod tests {
 
     #[test]
     fn concurrent_pair_shares_one_cpu_budget_without_splitting_it_per_run() {
+        const TEST_WALL_GUARD: Duration = Duration::from_secs(15);
+
         fn pair_process(
             root: &Path,
             label: &str,
@@ -6196,13 +8925,9 @@ mod tests {
                 &BTreeMap::new(),
                 &root.join(format!("{label}.stdout")),
                 &root.join(format!("{label}.stderr")),
-                ProcessExecutionOptions::new(
-                    Instant::now() + Duration::from_secs(5),
-                    None,
-                    Some(pool),
-                )
-                .shared_cpu_budget(budget, member)
-                .with_cpu_poll_interval(Duration::from_millis(20)),
+                ProcessExecutionOptions::new(Instant::now() + TEST_WALL_GUARD, None, Some(pool))
+                    .shared_cpu_budget(budget, member)
+                    .with_cpu_poll_interval(Duration::from_millis(20)),
             )
             .unwrap()
         }
@@ -6242,8 +8967,17 @@ mod tests {
             (left.join().unwrap(), right.join().unwrap())
         });
         assert!([left.timeout, right.timeout].contains(&Some(ProcessTimeout::Cpu)));
-        assert!(left.cpu_usage_usec.saturating_add(right.cpu_usage_usec) >= limit);
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            left.cpu_usage_usec
+                .expect("left process must have final CPU usage")
+                .saturating_add(
+                    right
+                        .cpu_usage_usec
+                        .expect("right process must have final CPU usage"),
+                )
+                >= limit
+        );
+        assert!(started.elapsed() < TEST_WALL_GUARD);
 
         let budget = SharedProcessCpuBudget::new(limit);
         let (fast, burner) = thread::scope(|scope| {
@@ -6260,12 +8994,18 @@ mod tests {
             });
             (fast.join().unwrap(), burner.join().unwrap())
         });
-        assert!(fast.status.success());
+        assert!(fast.success());
         assert_eq!(fast.timeout, None);
         assert_eq!(burner.timeout, Some(ProcessTimeout::Cpu));
-        assert!(fast.cpu_usage_usec.saturating_add(burner.cpu_usage_usec) >= limit);
+        let fast_cpu = fast
+            .cpu_usage_usec
+            .expect("completed fast process must have final CPU usage");
+        let burner_cpu = burner
+            .cpu_usage_usec
+            .expect("timed-out burner must have reaped CPU usage");
+        assert!(fast_cpu.saturating_add(burner_cpu) >= limit);
         assert!(
-            burner.cpu_usage_usec > limit / 2,
+            burner_cpu > limit / 2,
             "a fast peer must leave more than half the shared budget available"
         );
 
@@ -7000,13 +9740,19 @@ mod tests {
         };
         let low = measure("low", ":");
         let high = measure("high", "head -c 134217728 /dev/zero | sha256sum >/dev/null");
-        assert!(low.status.success());
-        assert!(high.status.success());
+        assert!(low.success());
+        assert!(high.success());
+        let low_cpu = low
+            .cpu_usage_usec
+            .expect("completed low-work process must have CPU usage");
+        let high_cpu = high
+            .cpu_usage_usec
+            .expect("completed high-work process must have CPU usage");
         assert!(
-            high.cpu_usage_usec > low.cpu_usage_usec.saturating_add(10_000),
+            high_cpu > low_cpu.saturating_add(10_000),
             "adding 128 MiB of descendant hashing did not move CPU usage: low={} high={}",
-            low.cpu_usage_usec,
-            high.cpu_usage_usec
+            low_cpu,
+            high_cpu
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -7038,21 +9784,30 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+        let harness_process_group = u32::try_from(unsafe { libc::getpgrp() }).unwrap();
+        dagrun::proccpu::subtree_cpu_seconds(harness_process_group)
+            .expect("the ordinary shared CPU snapshot must be primed before payload launch");
+
+        let supervisor = ProcessGroupLaunchSupervisor::start().unwrap();
         let mut command = Command::new("/bin/sleep");
         command.arg("3");
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        supervisor.configure_payload(&mut command);
         let child = command.spawn().unwrap();
         let pid = child.id();
         // `stop_process_group` below owns the matching wait4; discard only the
         // std handle so the test exercises the production reaper.
         drop(child);
+        let payload_pidfd = open_process_pidfd(pid, "test payload").unwrap();
+        let identity = supervisor
+            .finish(pid, Some(payload_pidfd))
+            .expect("supervisor must anchor the launched sleeper");
+        let initial_used = process_group_cpu_usage_usec(&identity)
+            .unwrap()
+            .expect("the newly anchored sleeper must be immediately measurable");
+        assert!(
+            initial_used < 100_000,
+            "a newly anchored idle process group used unexpected CPU: {initial_used} usec"
+        );
         let unrelated = bounded_process(
             &root,
             "unrelated",
@@ -7061,14 +9816,15 @@ mod tests {
             5_000_000,
         );
         assert_eq!(unrelated.timeout, Some(ProcessTimeout::Wall));
-        let used = process_group_cpu_usage_usec(pid)
+        let used = process_group_cpu_usage_usec(&identity)
             .unwrap()
             .expect("the launched sleeper must remain measurable");
         assert!(
             used < 100_000,
             "an idle process group unexpectedly included unrelated CPU: {used} usec"
         );
-        stop_process_group(pid).unwrap();
+        let cleanup = stop_process_group(identity, ProcessGroupTermination::Immediate);
+        assert_eq!(cleanup.disposition, ProcessGroupCleanupDisposition::Gone);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -7147,9 +9903,9 @@ mod tests {
                 .with_cpu_poll_interval(Duration::from_secs(5)),
         )
         .unwrap();
-        assert!(output.status.success());
+        assert!(output.success());
         assert_eq!(output.timeout, Some(ProcessTimeout::Cpu));
-        assert!(output.cpu_usage_usec >= 1);
+        assert!(output.cpu_usage_usec.expect("reaped CPU usage") >= 1);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -7202,7 +9958,7 @@ mod tests {
             Duration::from_secs(2),
             200_000,
         );
-        assert!(output.status.success());
+        assert!(output.success());
         assert_eq!(output.timeout, None);
         assert!(
             started.elapsed() >= Duration::from_millis(250),
@@ -7227,7 +9983,7 @@ mod tests {
             100_000,
         );
         assert_eq!(output.timeout, Some(ProcessTimeout::Cpu));
-        assert!(output.cpu_usage_usec >= 100_000);
+        assert!(output.cpu_usage_usec.expect("reaped CPU usage") >= 100_000);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -7247,19 +10003,20 @@ mod tests {
             Duration::from_secs(5),
             limit,
         );
-        assert!(first.status.success());
+        assert!(first.success());
         assert_eq!(first.timeout, None);
-        assert!(first.cpu_usage_usec < limit);
+        let first_cpu = first.cpu_usage_usec.expect("reaped CPU usage");
+        assert!(first_cpu < limit);
         let second = bounded_process(
             &root,
             "second",
             "while :; do :; done",
             Duration::from_secs(5),
-            limit - first.cpu_usage_usec,
+            limit - first_cpu,
         );
         assert_eq!(second.timeout, Some(ProcessTimeout::Cpu));
         assert!(
-            first.cpu_usage_usec.saturating_add(second.cpu_usage_usec) >= limit,
+            first_cpu.saturating_add(second.cpu_usage_usec.expect("reaped CPU usage")) >= limit,
             "second process did not consume the remainder of the shared CPU budget"
         );
         fs::remove_dir_all(root).unwrap();
@@ -7305,7 +10062,7 @@ mod tests {
             },
             test,
             enabled: true,
-            timeout_seconds: 3,
+            timeout_seconds: 10,
             cpu_timeout_seconds: 1,
         };
         let context = RunContext {
@@ -7340,8 +10097,8 @@ mod tests {
             .duration_ms
             .expect("a cell that executed must report measured wall time");
         assert!(
-            (2_000..3_000).contains(&duration_ms),
-            "three sleeping attempts should pass despite exceeding the old one-second wall cap: {duration_ms}ms"
+            (2_000..10_000).contains(&duration_ms),
+            "three sleeping attempts must finish before the test-only wall guard: {duration_ms}ms"
         );
         let attempt_cpu_usage_usec = result.attempts.iter().try_fold(0u64, |total, attempt| {
             checked_add_cpu_usage(Some(total), attempt.cpu_usage_usec)
@@ -9880,7 +12637,7 @@ backends_disabled:
             error.contains("cell exceeded 1 s during fixture preparation"),
             "{error}"
         );
-        let result = infrastructure_error_result(&context, &cell, error);
+        let result = infrastructure_error_result(&context, &cell, error.to_string());
         assert_eq!(result.test, "fixture/test");
         assert_eq!(result.error_kind.as_deref(), Some("infrastructure"));
         assert!(
