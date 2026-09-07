@@ -28,15 +28,19 @@ use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::VerifyLogRetentionBudget;
 use hermit_manifest_plan::runner::VerifyLogRetentionPolicy;
+use hermit_manifest_plan::runner::append_result;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::checked_add_cpu_usage;
 use hermit_manifest_plan::runner::cleanup_verify_log_sources;
 use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::infrastructure_error_result;
 use hermit_manifest_plan::runner::no_result_error_result;
+use hermit_manifest_plan::runner::normalize_result_path;
+use hermit_manifest_plan::runner::prepare_result_directory;
 use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::reopen_retained_verify_log_publication;
 use hermit_manifest_plan::runner::requires_capability;
+use hermit_manifest_plan::runner::requires_verify_log_retention;
 use hermit_manifest_plan::runner::run_cell_with_services;
 use hermit_manifest_plan::runner::structured_test_results;
 use hermit_manifest_plan::runner::write_junit;
@@ -1785,11 +1789,17 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             verdict.evidence
         );
     }
-    let results_path = args.results.clone().unwrap_or_else(|| {
+    let requested_results_path = args.results.clone().unwrap_or_else(|| {
         context
             .result_root
             .join(&context.run_id)
             .join("results.jsonl")
+    });
+    let results_path = normalize_result_path(&requested_results_path).unwrap_or_else(|error| {
+        fail(format!(
+            "cannot resolve result path {}: {error}",
+            requested_results_path.display()
+        ))
     });
     let junit = args
         .junit
@@ -1803,13 +1813,25 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     });
     let process_permits = ProcessPermitPool::new(capacity);
     let retention_artifact_root = context.result_root.join("runs").join(&context.run_id);
-    let retention_budget = VerifyLogRetentionBudget::open_with_artifact_root(
-        &context.result_root,
-        &retention_artifact_root,
-        &results_path,
-        VerifyLogRetentionPolicy::new(DEFAULT_VERIFY_LOG_RETENTION_BUDGET_BYTES),
-    )
-    .unwrap_or_else(|error| fail(format!("cannot initialize verify-log retention: {error}")));
+    let retention_budget = cells
+        .iter()
+        .any(requires_verify_log_retention)
+        .then(|| {
+            let artifact_stable_root = prepare_result_directory(&context.result_root)
+                .map_err(|error| format!("cannot prepare verify-log artifact root: {error}"))?;
+            let results_root = results_path
+                .parent()
+                .ok_or_else(|| "normalized result path has no parent".to_string())?;
+            VerifyLogRetentionBudget::open_with_separate_roots(
+                artifact_stable_root,
+                &retention_artifact_root,
+                results_root,
+                &results_path,
+                VerifyLogRetentionPolicy::new(DEFAULT_VERIFY_LOG_RETENTION_BUDGET_BYTES),
+            )
+        })
+        .transpose()
+        .unwrap_or_else(|error| fail(format!("cannot initialize verify-log retention: {error}")));
     let mut indexed_results = Vec::new();
     let mut attempt_results = vec![Vec::new(); cells.len()];
     let mut failed = false;
@@ -1839,7 +1861,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         &attempt_context,
                         cell,
                         &process_permits,
-                        &retention_budget,
+                        retention_budget.as_ref(),
                         &results_path,
                     ) {
                         Ok(result) => result,
@@ -1849,6 +1871,8 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         Err(RunCellServiceError::Infrastructure(error)) => {
                             infrastructure_error_result(&attempt_context, cell, error)
                         }
+                        Err(RunCellServiceError::EvidencedNoResult(result))
+                        | Err(RunCellServiceError::EvidencedInfrastructure(result)) => *result,
                     }
                 },
                 |result| retryable_cell_outcome(&result.outcome, result.failure_class),
@@ -1882,7 +1906,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         false
                     }
                 }
-            } else if let Err(error) = retention_budget.append_result(&results_path, &result) {
+            } else if let Err(error) = retention_budget.as_ref().map_or_else(
+                || append_result(&results_path, &result),
+                |budget| budget.append_result(&results_path, &result),
+            ) {
                 eprintln!(
                     "ERROR {} ({}/{}): completed cell result could not be published: {error}",
                     result.test,

@@ -974,6 +974,7 @@ pub use retained_verify_log::build_verify_run_spec;
 pub use retained_verify_log::cleanup_verify_log_sources;
 pub use retained_verify_log::compare_verify_runs;
 pub use retained_verify_log::copy_verified_retained_verify_log;
+use retained_verify_log::create_plain_relative_directory;
 pub use retained_verify_log::load_verify_run;
 pub use retained_verify_log::publish_retained_verify_log;
 pub use retained_verify_log::read_verified_retained_verify_log;
@@ -1822,6 +1823,7 @@ impl ProcessPermitPool {
         self.capacity
     }
 
+    #[cfg(test)]
     fn acquire(&self) -> Result<ProcessPermit, String> {
         let (available, wake) = &*self.inner;
         let mut available = available
@@ -1837,6 +1839,34 @@ impl ProcessPermitPool {
             inner: Arc::clone(&self.inner),
             capacity: self.capacity,
         })
+    }
+
+    fn acquire_until(&self, deadline: Instant) -> Result<Option<ProcessPermit>, String> {
+        let (available, wake) = &*self.inner;
+        let mut available = available
+            .lock()
+            .map_err(|_| "global process-permit lock is poisoned".to_string())?;
+        while *available == 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let (next, timed) = wake
+                .wait_timeout(available, remaining)
+                .map_err(|_| "global process-permit lock is poisoned".to_string())?;
+            available = next;
+            if timed.timed_out() && *available == 0 {
+                return Ok(None);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        *available -= 1;
+        Ok(Some(ProcessPermit {
+            inner: Arc::clone(&self.inner),
+            capacity: self.capacity,
+        }))
     }
 }
 
@@ -1907,6 +1937,7 @@ impl RunContext {
         let result_root = std::env::var_os("E2E_RESULT_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join("ignored/e2e"));
+        let result_root = normalize_result_path(&result_root)?;
         let run_id = std::env::var("E2E_RUN_ID").unwrap_or_else(|_| {
             format!(
                 "local-{}-{}",
@@ -3202,6 +3233,7 @@ impl ProcessTimeout {
     }
 }
 
+#[derive(Debug)]
 struct ProcessOutput {
     status: ExitStatus,
     timeout: Option<ProcessTimeout>,
@@ -3391,6 +3423,24 @@ fn stop_process_group(pid: u32) -> Result<(ExitStatus, u64), String> {
     wait4_process(pid, 0)?.ok_or_else(|| format!("blocking wait4({pid}) returned no child"))
 }
 
+fn require_process_launch_budget(
+    deadline: Instant,
+    shared_cpu_budget: Option<(&SharedProcessCpuBudget, usize)>,
+    phase: &str,
+) -> Result<(), String> {
+    if Instant::now() >= deadline {
+        return Err(format!("process wall deadline expired before {phase}"));
+    }
+    if shared_cpu_budget
+        .map(|(budget, _)| budget.exhausted())
+        .transpose()?
+        .unwrap_or(false)
+    {
+        return Err(format!("shared process CPU budget expired before {phase}"));
+    }
+    Ok(())
+}
+
 fn execute_process(
     cwd: &Path,
     program: &str,
@@ -3408,9 +3458,13 @@ fn execute_process(
         process_permits,
         exclusive_captures,
     } = options;
-    let _permit = process_permits
-        .map(ProcessPermitPool::acquire)
-        .transpose()?;
+    let _permit = match process_permits {
+        Some(pool) => Some(pool.acquire_until(deadline)?.ok_or_else(|| {
+            "process did not acquire a launch permit before its wall deadline".to_string()
+        })?),
+        None => None,
+    };
+    require_process_launch_budget(deadline, shared_cpu_budget, "capture creation")?;
     let open_capture = |path: &Path| {
         let mut options = OpenOptions::new();
         options
@@ -3443,6 +3497,7 @@ fn execute_process(
             Ok(())
         });
     }
+    require_process_launch_budget(deadline, shared_cpu_budget, "spawn")?;
     let child = command
         .spawn()
         .map_err(|e| format!("cannot execute {program}: {e}"))?;
@@ -3736,6 +3791,139 @@ struct HarnessVerifyResultContext {
     binary_sha256: Option<String>,
 }
 
+fn partial_verify_attempt(
+    spec: &VerifyRunSpec,
+    output: &ProcessOutput,
+    duration: Duration,
+    error_kind: &str,
+    reason: &str,
+) -> AttemptResult {
+    let stdout = fs::read(&spec.paths.stdout)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let stderr = fs::read(&spec.paths.stderr)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let mut attempt = AttemptResult {
+        index: spec.execution.attempt.clone(),
+        outcome: "ERROR".into(),
+        error_kind: Some(error_kind.into()),
+        status: output.status.code(),
+        signal: std::os::unix::process::ExitStatusExt::signal(&output.status),
+        timed_out: output.timeout.is_some(),
+        duration_ms: duration.as_millis(),
+        cpu_usage_usec: Some(output.cpu_usage_usec),
+        observation_sha256: None,
+        argv: spec.execution.argv.clone(),
+        guest_argv: spec.execution.guest_argv.clone(),
+        env: spec.execution.env.clone(),
+        cwd: spec.execution.cwd.to_string_lossy().into_owned(),
+        shell_command: shell_command(
+            &spec.execution.cwd.to_string_lossy(),
+            &spec.execution.env,
+            &spec.execution.argv,
+        ),
+        stdout,
+        stderr,
+        verification_report: None,
+        verification_report_sha256: None,
+        retained_verify_log: None,
+        runtime: None,
+        first_divergent_scheduler_turn: None,
+        first_divergent_virtual_nanoseconds: None,
+        first_divergent_record: None,
+        first_divergent_syscall: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
+        sabre_path_evidence: None,
+        sabre_path_evidence_sha256: None,
+        reason: Some(reason.into()),
+    };
+    attempt.observation_sha256 = Some(observation_hash(
+        &Observation {
+            status: true,
+            stdout: true,
+            stderr: true,
+            artifacts: Vec::new(),
+        },
+        &attempt,
+        &spec.execution.cell_dir,
+    ));
+    attempt
+}
+
+struct PartialHarnessVerifyResultContext<'a> {
+    started: Instant,
+    preparation_cpu_usage_usec: u64,
+    runs: [(&'a VerifyRunSpec, Option<&'a (ProcessOutput, Duration)>); 2],
+    result: Option<ObservedResult>,
+    failure_class: FailureClass,
+    error_kind: &'a str,
+    reason: String,
+}
+
+fn build_partial_harness_verify_result(
+    context: &RunContext,
+    cell: &SelectedCell,
+    failure: PartialHarnessVerifyResultContext<'_>,
+) -> CellResult {
+    let PartialHarnessVerifyResultContext {
+        started,
+        preparation_cpu_usage_usec,
+        runs,
+        result,
+        failure_class,
+        error_kind,
+        reason,
+    } = failure;
+    let attempts = runs
+        .into_iter()
+        .filter_map(|(spec, execution)| {
+            execution.map(|(output, duration)| {
+                partial_verify_attempt(spec, output, *duration, error_kind, &reason)
+            })
+        })
+        .collect::<Vec<_>>();
+    let cpu_usage_usec = attempts
+        .iter()
+        .try_fold(preparation_cpu_usage_usec, |total, attempt| {
+            total.checked_add(attempt.cpu_usage_usec?)
+        });
+    let first = attempts.first();
+    let mut row = infrastructure_error_result(context, cell, reason.clone());
+    row.outcome = "ERROR".into();
+    row.result = result;
+    row.failure_class = Some(failure_class);
+    row.error_kind = Some(error_kind.into());
+    row.duration_ms = Some(started.elapsed().as_millis());
+    row.cpu_usage_usec = cpu_usage_usec;
+    row.effective_args = first.map_or_else(Vec::new, |attempt| {
+        attempt.argv.iter().skip(1).cloned().collect()
+    });
+    row.argv = first.map_or_else(Vec::new, |attempt| attempt.argv.clone());
+    row.guest_argv = first.map_or_else(Vec::new, |attempt| attempt.guest_argv.clone());
+    row.env = first.map_or_else(|| row.env.clone(), |attempt| attempt.env.clone());
+    row.cwd = first.map_or_else(|| row.cwd.clone(), |attempt| attempt.cwd.clone());
+    row.shell_command = first.map_or_else(String::new, |attempt| attempt.shell_command.clone());
+    row.attempts = attempts;
+    row.reason = Some(reason);
+    row
+}
+
+fn classify_harness_verify_failure(
+    mut row: CellResult,
+    failure_class: FailureClass,
+    error_kind: &str,
+    reason: String,
+) -> CellResult {
+    row.outcome = "ERROR".into();
+    row.result = None;
+    row.failure_class = Some(failure_class);
+    row.error_kind = Some(error_kind.into());
+    row.reason = Some(reason);
+    row
+}
+
 fn build_harness_managed_verify_result(
     context: &RunContext,
     cell: &SelectedCell,
@@ -3909,58 +4097,132 @@ fn run_harness_managed_verify_cell(
         });
         (run1.join(), run2.join())
     });
-    let no_result = |spec: &VerifyRunSpec, cause: String| {
-        RunCellServiceError::NoResult(retained_verify_log::with_hermit_diagnostic_stderr(
-            spec, cause,
+    let run1_execution = match run1_joined {
+        Ok(execution) => execution,
+        Err(_) => Err("verify run 1 worker panicked".into()),
+    };
+    let run2_execution = match run2_joined {
+        Ok(execution) => execution,
+        Err(_) => Err("verify run 2 worker panicked".into()),
+    };
+    if run1_execution.is_err() || run2_execution.is_err() {
+        let mut causes = Vec::new();
+        if let Err(cause) = &run1_execution {
+            causes.push(retained_verify_log::with_hermit_diagnostic_stderr(
+                &run1_spec,
+                cause.clone(),
+            ));
+        }
+        if let Err(cause) = &run2_execution {
+            causes.push(retained_verify_log::with_hermit_diagnostic_stderr(
+                &run2_spec,
+                cause.clone(),
+            ));
+        }
+        let reason = causes.join("; ");
+        return Err(RunCellServiceError::evidenced_no_result(
+            build_partial_harness_verify_result(
+                context,
+                cell,
+                PartialHarnessVerifyResultContext {
+                    started,
+                    preparation_cpu_usage_usec,
+                    runs: [
+                        (&run1_spec, run1_execution.as_ref().ok()),
+                        (&run2_spec, run2_execution.as_ref().ok()),
+                    ],
+                    result: None,
+                    failure_class: FailureClass::NoResult,
+                    error_kind: "incomplete-verification-evidence",
+                    reason,
+                },
+            ),
+        ));
+    }
+    let run1_execution = run1_execution.expect("checked above");
+    let run2_execution = run2_execution.expect("checked above");
+    let run1_output = &run1_execution.0;
+    let run2_output = &run2_execution.0;
+    let partial = |result, failure_class, error_kind, reason| {
+        build_partial_harness_verify_result(
+            context,
+            cell,
+            PartialHarnessVerifyResultContext {
+                started,
+                preparation_cpu_usage_usec,
+                runs: [
+                    (&run1_spec, Some(&run1_execution)),
+                    (&run2_spec, Some(&run2_execution)),
+                ],
+                result,
+                failure_class,
+                error_kind,
+                reason,
+            },
+        )
+    };
+    let no_result = |cause: String| {
+        let cause = retained_verify_log::with_hermit_diagnostic_stderr(&run1_spec, cause);
+        let cause = retained_verify_log::with_hermit_diagnostic_stderr(&run2_spec, cause);
+        RunCellServiceError::evidenced_no_result(partial(
+            None,
+            FailureClass::NoResult,
+            "incomplete-verification-evidence",
+            cause,
         ))
     };
-    let (run1_output, _) = run1_joined
-        .map_err(|_| RunCellServiceError::Infrastructure("verify run 1 worker panicked".into()))?
-        .map_err(|cause| no_result(&run1_spec, cause))?;
-    let (run2_output, _) = run2_joined
-        .map_err(|_| RunCellServiceError::Infrastructure("verify run 2 worker panicked".into()))?
-        .map_err(|cause| no_result(&run2_spec, cause))?;
-    for (spec, output) in [(&run1_spec, &run1_output), (&run2_spec, &run2_output)] {
+    for (spec, output) in [(&run1_spec, run1_output), (&run2_spec, run2_output)] {
         if let Some(timeout) = output.timeout {
             let cause = format!(
                 "{} Hermit process reached {} before terminal producer validation",
                 spec.run.comparison_label(),
                 timeout.error_kind()
             );
-            return Err(no_result(spec, cause));
+            return Err(RunCellServiceError::evidenced_no_result(partial(
+                Some(ObservedResult::Timeout),
+                FailureClass::NoResult,
+                timeout.error_kind(),
+                retained_verify_log::with_hermit_diagnostic_stderr(spec, cause),
+            )));
         }
     }
     let execution_cpu_usage_usec = run1_output
         .cpu_usage_usec
         .checked_add(run2_output.cpu_usage_usec)
-        .ok_or_else(|| {
-            RunCellServiceError::NoResult("verify-pair CPU usage overflowed u64".into())
-        })?;
+        .ok_or_else(|| no_result("verify-pair CPU usage overflowed u64".into()))?;
     if execution_cpu_usage_usec >= cpu_budget_usec {
-        return Err(RunCellServiceError::NoResult(format!(
-            "verify pair exceeded {} CPU s in aggregate",
-            timeouts.cpu_seconds
+        return Err(RunCellServiceError::evidenced_no_result(partial(
+            Some(ObservedResult::Timeout),
+            FailureClass::NoResult,
+            "cpu-timeout",
+            format!(
+                "verify pair exceeded {} CPU s in aggregate",
+                timeouts.cpu_seconds
+            ),
         )));
     }
 
-    let run1 = load_verify_run(&run1_spec).map_err(|cause| no_result(&run1_spec, cause))?;
+    let run1 = load_verify_run(&run1_spec).map_err(no_result)?;
     run1.validate_process_status(&run1_spec, run1_output.status)
-        .map_err(|cause| no_result(&run1_spec, cause))?;
-    let run2 = load_verify_run(&run2_spec).map_err(|cause| no_result(&run2_spec, cause))?;
+        .map_err(no_result)?;
+    let run2 = load_verify_run(&run2_spec).map_err(no_result)?;
     run2.validate_process_status(&run2_spec, run2_output.status)
-        .map_err(|cause| no_result(&run2_spec, cause))?;
-    let pair = compare_verify_runs(&run1_spec, run1.clone(), &run2_spec, run2)
-        .map_err(RunCellServiceError::NoResult)?;
+        .map_err(no_result)?;
+    let pair =
+        compare_verify_runs(&run1_spec, run1.clone(), &run2_spec, run2).map_err(no_result)?;
     let report = pair.comparison().report.clone();
     let binary_sha256 = fs::read(&context.hermit_bin)
         .ok()
         .map(|bytes| hex_digest(&bytes));
     if binary_before.is_some() && binary_before != binary_sha256 {
-        return Err(RunCellServiceError::Infrastructure(
+        return Err(RunCellServiceError::evidenced_infrastructure(partial(
+            None,
+            FailureClass::UnderstoodInfrastructureFailure,
+            "infrastructure",
             "Hermit binary changed while the verify pair was executing".into(),
-        ));
+        )));
     }
-    let mut result = build_harness_managed_verify_result(
+    let mut result = match build_harness_managed_verify_result(
         context,
         cell,
         &dir,
@@ -3974,15 +4236,31 @@ fn run_harness_managed_verify_cell(
             execution_cpu_usage_usec,
             binary_sha256,
         },
-    )
-    .map_err(RunCellServiceError::Infrastructure)?;
-    publish_retained_verify_log(pair, retention_budget, results_path, &mut result).map_err(
-        |error| {
-            RunCellServiceError::Infrastructure(format!(
-                "retained verify-log publication failed: {error}"
-            ))
-        },
-    )?;
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            return Err(RunCellServiceError::evidenced_infrastructure(partial(
+                None,
+                FailureClass::UnderstoodInfrastructureFailure,
+                "infrastructure",
+                error,
+            )));
+        }
+    };
+    let unpublished_result = result.clone();
+    if let Err(error) =
+        publish_retained_verify_log(pair, retention_budget, results_path, &mut result)
+    {
+        let reason = format!("retained verify-log publication failed: {error}");
+        return Err(RunCellServiceError::evidenced_infrastructure(
+            classify_harness_verify_failure(
+                unpublished_result,
+                FailureClass::UnderstoodInfrastructureFailure,
+                "result-publication",
+                reason,
+            ),
+        ));
+    }
     Ok(result)
 }
 
@@ -3997,16 +4275,31 @@ pub fn no_result_error_result(
     result
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum RunCellServiceError {
     NoResult(String),
     Infrastructure(String),
+    EvidencedNoResult(Box<CellResult>),
+    EvidencedInfrastructure(Box<CellResult>),
+}
+
+impl RunCellServiceError {
+    fn evidenced_no_result(result: CellResult) -> Self {
+        Self::EvidencedNoResult(Box::new(result))
+    }
+
+    fn evidenced_infrastructure(result: CellResult) -> Self {
+        Self::EvidencedInfrastructure(Box::new(result))
+    }
 }
 
 impl std::fmt::Display for RunCellServiceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoResult(message) | Self::Infrastructure(message) => formatter.write_str(message),
+            Self::EvidencedNoResult(result) | Self::EvidencedInfrastructure(result) => {
+                formatter.write_str(result.reason_for_display())
+            }
         }
     }
 }
@@ -4030,6 +4323,10 @@ fn verify_execution_route(cell: &SelectedCell) -> VerifyExecutionRoute {
         _ => VerifyExecutionRoute::Legacy,
     }
 }
+/// Whether this cell needs the retained-log transaction service.
+pub fn requires_verify_log_retention(cell: &SelectedCell) -> bool {
+    verify_execution_route(cell) == VerifyExecutionRoute::HarnessManaged
+}
 
 pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult, String> {
     let process_permits = ProcessPermitPool::new(context.scheduled_worker_capacity);
@@ -4040,7 +4337,7 @@ pub fn run_cell_with_services(
     context: &RunContext,
     cell: &SelectedCell,
     process_permits: &ProcessPermitPool,
-    retention_budget: &VerifyLogRetentionBudget,
+    retention_budget: Option<&VerifyLogRetentionBudget>,
     results_path: &Path,
 ) -> Result<CellResult, RunCellServiceError> {
     match verify_execution_route(cell) {
@@ -4048,7 +4345,11 @@ pub fn run_cell_with_services(
             context,
             cell,
             process_permits,
-            retention_budget,
+            retention_budget.ok_or_else(|| {
+                RunCellServiceError::Infrastructure(
+                    "harness-managed verify has no retention service".into(),
+                )
+            })?,
             results_path,
         ),
         VerifyExecutionRoute::DbtRefused => Err(RunCellServiceError::NoResult(
@@ -4878,14 +5179,28 @@ pub fn prepare_result_path_from_root(stable_root: &Path, path: &Path) -> Result<
     prepare_result_path_from_root_with_failure(stable_root, path, None)
 }
 
+pub fn normalize_result_path(path: &Path) -> Result<PathBuf, String> {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!("result path {} contains `..`", path.display()));
+    }
+    let absolute = std::path::absolute(path)
+        .map_err(|error| format!("cannot resolve result path {}: {error}", path.display()))?;
+    if absolute
+        .components()
+        .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(format!(
+            "result path {} does not resolve to a normal absolute path",
+            path.display()
+        ));
+    }
+    Ok(absolute)
+}
 pub fn prepare_result_path(path: &Path) -> Result<(), String> {
-    let absolute_path = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        std::env::current_dir()
-            .map_err(|error| format!("cannot resolve relative result path: {error}"))?
-            .join(path)
-    };
+    let absolute_path = normalize_result_path(path)?;
     let parent = absolute_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -4894,6 +5209,30 @@ pub fn prepare_result_path(path: &Path) -> Result<(), String> {
     prepare_result_path_from_root(&stable_root, &absolute_path)
 }
 
+/// Create and durably sync a non-symlink result directory.
+pub fn prepare_result_directory(path: &Path) -> Result<PathBuf, String> {
+    let absolute_path = normalize_result_path(path)?;
+    let stable_root = nearest_existing_directory(&absolute_path)?;
+    if stable_root == absolute_path {
+        require_plain_directory(&stable_root, "stable result directory")?;
+        return Ok(absolute_path);
+    }
+    let relative = absolute_path.strip_prefix(&stable_root).map_err(|_| {
+        format!(
+            "result directory {} escaped {}",
+            absolute_path.display(),
+            stable_root.display()
+        )
+    })?;
+    create_plain_relative_directory(&stable_root, relative, "result directory")?;
+    sync_relative_directory_chain_with_failure(
+        &stable_root,
+        &absolute_path,
+        "result directory",
+        None,
+    )?;
+    Ok(absolute_path)
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResultPublicationFailurePoint {
     TemporaryWrite,
@@ -5211,16 +5550,38 @@ fn prepare_dirs(root: &Path, dir: &Path) -> Result<(), String> {
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    let source_metadata = fs::symlink_metadata(source).map_err(|e| e.to_string())?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        return Err(format!(
+            "copy source {} is not a non-symlink directory",
+            source.display()
+        ));
+    }
     fs::create_dir_all(destination).map_err(|e| e.to_string())?;
     for entry in fs::read_dir(source).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let target = destination.join(entry.file_name());
-        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "copy source {} contains symlink {}",
+                source.display(),
+                entry.path().display()
+            ));
+        }
+        if metadata.is_dir() {
             copy_tree(&entry.path(), &target)?;
+        } else if metadata.is_file() {
+            fs::copy(entry.path(), &target).map_err(|e| e.to_string())?;
+            fs::set_permissions(&target, metadata.permissions()).map_err(|e| e.to_string())?;
         } else {
-            fs::copy(entry.path(), target).map_err(|e| e.to_string())?;
+            return Err(format!(
+                "copy source {} is not a regular file or directory",
+                entry.path().display()
+            ));
         }
     }
+    fs::set_permissions(destination, source_metadata.permissions()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -5602,6 +5963,220 @@ mod tests {
         assert_eq!(active.load(std::sync::atomic::Ordering::SeqCst), 0);
         let (available, _) = &*pool.inner;
         assert_eq!(*available.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn permit_waiter_does_not_create_captures_or_spawn_after_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = ProcessPermitPool::new(ScheduledWorkerCapacity::new(1));
+        let held = pool.acquire().unwrap();
+        let stdout = directory.path().join("waiter.stdout");
+        let stderr = directory.path().join("waiter.stderr");
+        let marker = directory.path().join("startup-marker");
+
+        let started = Instant::now();
+        let error = execute_process(
+            directory.path(),
+            "/bin/sh",
+            &["-c".into(), "printf launched > startup-marker".into()],
+            &BTreeMap::new(),
+            &stdout,
+            &stderr,
+            ProcessExecutionOptions::new(
+                Instant::now() + Duration::from_millis(50),
+                None,
+                Some(&pool),
+            )
+            .exclusive_captures(),
+        )
+        .unwrap_err();
+        assert!(error.contains("launch permit"), "{error}");
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(!stdout.exists(), "deadline-expired waiter created stdout");
+        assert!(!stderr.exists(), "deadline-expired waiter created stderr");
+        assert!(!marker.exists(), "deadline-expired waiter spawned");
+        drop(held);
+    }
+
+    #[test]
+    fn exhausted_shared_cpu_budget_never_spawns_and_normal_acquire_still_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let pool = ProcessPermitPool::new(ScheduledWorkerCapacity::new(1));
+        let budget = SharedProcessCpuBudget::new(1);
+        assert!(budget.observe(0, 1).unwrap());
+        let stdout = directory.path().join("exhausted.stdout");
+        let stderr = directory.path().join("exhausted.stderr");
+        let marker = directory.path().join("exhausted-marker");
+
+        let error = execute_process(
+            directory.path(),
+            "/bin/sh",
+            &["-c".into(), "printf launched > exhausted-marker".into()],
+            &BTreeMap::new(),
+            &stdout,
+            &stderr,
+            ProcessExecutionOptions::new(
+                Instant::now() + Duration::from_secs(1),
+                None,
+                Some(&pool),
+            )
+            .shared_cpu_budget(&budget, 1)
+            .exclusive_captures(),
+        )
+        .unwrap_err();
+        assert!(error.contains("CPU budget expired"), "{error}");
+        assert!(!stdout.exists(), "CPU-expired waiter created stdout");
+        assert!(!stderr.exists(), "CPU-expired waiter created stderr");
+        assert!(!marker.exists(), "CPU-expired waiter spawned");
+
+        let normal_stdout = directory.path().join("normal.stdout");
+        let normal_stderr = directory.path().join("normal.stderr");
+        let normal = execute_process(
+            directory.path(),
+            "/bin/sh",
+            &["-c".into(), "printf launched > normal-marker".into()],
+            &BTreeMap::new(),
+            &normal_stdout,
+            &normal_stderr,
+            ProcessExecutionOptions::new(
+                Instant::now() + Duration::from_secs(2),
+                None,
+                Some(&pool),
+            )
+            .exclusive_captures(),
+        )
+        .unwrap();
+        assert!(normal.status.success());
+        assert!(directory.path().join("normal-marker").is_file());
+        assert!(normal_stdout.is_file());
+        assert!(normal_stderr.is_file());
+    }
+
+    #[test]
+    fn partial_verify_failure_retains_only_executed_attempts_and_aggregates_cpu() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let cell_dir = directory.path().join("results/cell");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&cell_dir).unwrap();
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let run1 = build_verify_run_spec(
+            &context,
+            &cell,
+            cell_dir.clone(),
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run1,
+            15,
+        )
+        .unwrap();
+        let run2 = build_verify_run_spec(
+            &context,
+            &cell,
+            cell_dir,
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run2,
+            15,
+        )
+        .unwrap();
+        retained_verify_log::prepare_verify_run_destinations(&run1, &run2).unwrap();
+        fs::write(&run1.paths.stdout, b"run-1 stdout").unwrap();
+        fs::write(&run1.paths.stderr, b"run-1 stderr").unwrap();
+        fs::write(&run2.paths.stdout, b"run-2 stdout").unwrap();
+        fs::write(&run2.paths.stderr, b"run-2 stderr").unwrap();
+        let run1_output = (
+            ProcessOutput {
+                status: ExitStatus::from_raw(0),
+                timeout: Some(ProcessTimeout::Wall),
+                cpu_usage_usec: 11,
+            },
+            Duration::from_millis(17),
+        );
+        let run2_output = (
+            ProcessOutput {
+                status: ExitStatus::from_raw(7 << 8),
+                timeout: Some(ProcessTimeout::Cpu),
+                cpu_usage_usec: 13,
+            },
+            Duration::from_millis(19),
+        );
+
+        let one_side = build_partial_harness_verify_result(
+            &context,
+            &cell,
+            PartialHarnessVerifyResultContext {
+                started: Instant::now(),
+                preparation_cpu_usage_usec: 5,
+                runs: [(&run1, Some(&run1_output)), (&run2, None)],
+                result: Some(ObservedResult::Timeout),
+                failure_class: FailureClass::NoResult,
+                error_kind: "wall-timeout",
+                reason: "run 2 never launched".into(),
+            },
+        );
+        assert_eq!(one_side.schema, CELL_RESULT_SCHEMA);
+        assert_eq!(one_side.outcome, "ERROR");
+        assert_eq!(one_side.cpu_usage_usec, Some(16));
+        assert_eq!(one_side.attempts.len(), 1, "no phantom run-2 attempt");
+        assert_eq!(one_side.argv, run1.execution.argv);
+        assert_eq!(one_side.guest_argv, run1.execution.guest_argv);
+        let attempt = &one_side.attempts[0];
+        assert_eq!(attempt.index, "1-run-1");
+        assert_eq!(attempt.status, Some(0));
+        assert_eq!(attempt.signal, None);
+        assert!(attempt.timed_out);
+        assert_eq!(attempt.duration_ms, 17);
+        assert_eq!(attempt.cpu_usage_usec, Some(11));
+        assert_eq!(attempt.stdout, "run-1 stdout");
+        assert_eq!(attempt.stderr, "run-1 stderr");
+        assert!(!attempt.argv.is_empty());
+        assert!(!attempt.guest_argv.is_empty());
+
+        let both_sides = build_partial_harness_verify_result(
+            &context,
+            &cell,
+            PartialHarnessVerifyResultContext {
+                started: Instant::now(),
+                preparation_cpu_usage_usec: 5,
+                runs: [(&run1, Some(&run1_output)), (&run2, Some(&run2_output))],
+                result: None,
+                failure_class: FailureClass::NoResult,
+                error_kind: "incomplete-verification-evidence",
+                reason: "comparison refused".into(),
+            },
+        );
+        assert_eq!(both_sides.cpu_usage_usec, Some(29));
+        assert_eq!(both_sides.attempts.len(), 2);
+        assert_eq!(both_sides.attempts[1].index, "1-run-2");
+        assert_eq!(both_sides.attempts[1].status, Some(7));
+        assert_eq!(both_sides.attempts[1].duration_ms, 19);
+        assert_eq!(both_sides.attempts[1].cpu_usage_usec, Some(13));
+
+        let publication_failure = classify_harness_verify_failure(
+            both_sides,
+            FailureClass::UnderstoodInfrastructureFailure,
+            "result-publication",
+            "injected publication failure".into(),
+        );
+        assert_eq!(publication_failure.schema, CELL_RESULT_SCHEMA);
+        assert_eq!(publication_failure.result, None);
+        assert_eq!(
+            publication_failure.failure_class,
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+        assert_eq!(
+            publication_failure.error_kind.as_deref(),
+            Some("result-publication")
+        );
+        assert_eq!(publication_failure.cpu_usage_usec, Some(29));
+        assert_eq!(publication_failure.attempts.len(), 2);
+        assert!(publication_failure.attempts.iter().all(|attempt| {
+            !attempt.argv.is_empty()
+                && !attempt.guest_argv.is_empty()
+                && attempt.cpu_usage_usec.is_some()
+        }));
     }
 
     #[test]
@@ -6776,6 +7351,31 @@ mod tests {
             "the cell CPU figure must sum every process-owned attempt measurement"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn result_paths_normalize_relative_paths_and_refuse_escape_or_symlinks() {
+        let relative = Path::new("ignored/e2e/probe/results.jsonl");
+        let normalized = normalize_result_path(relative).unwrap();
+        assert!(normalized.is_absolute());
+        assert_eq!(normalized, std::env::current_dir().unwrap().join(relative));
+        let parent_error =
+            normalize_result_path(Path::new("ignored/e2e/../escape.jsonl")).unwrap_err();
+        assert!(parent_error.contains("contains `..`"), "{parent_error}");
+
+        let directory = tempfile::tempdir().unwrap();
+        let in_root = directory.path().join("absolute/results.jsonl");
+        prepare_result_path(&in_root).unwrap();
+        assert!(in_root.is_file());
+
+        let outside = directory.path().join("outside");
+        let linked = directory.path().join("linked");
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        let escaped = linked.join("results.jsonl");
+        let error = prepare_result_path(&escaped).unwrap_err();
+        assert!(error.contains("non-symlink directory"), "{error}");
+        assert!(!outside.join("results.jsonl").exists());
     }
 
     #[test]

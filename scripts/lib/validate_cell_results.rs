@@ -2045,6 +2045,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         fs::create_dir_all(&spec.paths.capture_dir).unwrap();
+        fs::create_dir_all(&spec.paths.summary_dir).unwrap();
         fs::create_dir_all(&spec.paths.workdir).unwrap();
         fs::create_dir_all(&spec.paths.evidence).unwrap();
         fs::write(&spec.paths.stdout, []).unwrap();

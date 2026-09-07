@@ -38,13 +38,26 @@ impl VerifyRun {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifyRunPaths {
     pub workdir: PathBuf,
+    pub environment_dir: PathBuf,
+    pub home: PathBuf,
+    pub xdg_config_home: PathBuf,
+    pub tmp: PathBuf,
+    pub fixture_dir: PathBuf,
+    pub guest_environment_dir: PathBuf,
+    pub guest_home: PathBuf,
+    pub guest_xdg_config_home: PathBuf,
+    pub guest_tmp: PathBuf,
+    pub guest_fixture_dir: PathBuf,
     pub capture_dir: PathBuf,
     pub result: PathBuf,
     pub stdout: PathBuf,
     pub stderr: PathBuf,
     pub diagnostic_stdout: PathBuf,
     pub diagnostic_stderr: PathBuf,
+    pub summary_dir: PathBuf,
     pub summary: PathBuf,
+    pub guest_summary_dir: PathBuf,
+    pub guest_summary: PathBuf,
     pub evidence: PathBuf,
     pub log: PathBuf,
 }
@@ -149,8 +162,28 @@ impl VerifyRunSpec {
             .filter(|arguments| arguments[0] == "--summary-json")
             .map(|arguments| arguments[1].as_str())
             .collect::<Vec<_>>();
-        if summary != [VERIFY_RUN_GUEST_SUMMARY] {
+        if summary != [self.paths.guest_summary.to_string_lossy().as_ref()] {
             return Err("verify run command does not name its unique summary path".into());
+        }
+        let summary_bind = format!(
+            "--bind={}:{}",
+            self.paths.summary_dir.display(),
+            self.paths.guest_summary_dir.display()
+        );
+        if flag_count(&summary_bind) != 1 {
+            return Err(
+                "verify run command does not bind its narrow host summary directory".into(),
+            );
+        }
+        let environment_bind = format!(
+            "--bind={}:{}",
+            self.paths.environment_dir.display(),
+            self.paths.guest_environment_dir.display()
+        );
+        if flag_count(&environment_bind) != 1 {
+            return Err(
+                "verify run command does not bind its private host environment directory".into(),
+            );
         }
         Ok(())
     }
@@ -235,7 +268,7 @@ struct VerifyLogRetentionState {
 #[derive(Clone, Debug)]
 pub struct VerifyLogRetentionBudget {
     policy: VerifyLogRetentionPolicy,
-    stable_root: PathBuf,
+    results_root: PathBuf,
     retention_root: PathBuf,
     results_path: PathBuf,
     state: Arc<Mutex<VerifyLogRetentionState>>,
@@ -270,9 +303,29 @@ impl VerifyLogRetentionBudget {
         policy: VerifyLogRetentionPolicy,
     ) -> Result<Self, String> {
         let stable_root = stable_root.into();
+        Self::open_with_separate_roots(
+            stable_root.clone(),
+            artifact_root,
+            stable_root,
+            results_path,
+            policy,
+        )
+    }
+
+    /// Open accounting with independently contained artifact and result roots.
+    pub fn open_with_separate_roots(
+        stable_root: impl Into<PathBuf>,
+        artifact_root: impl Into<PathBuf>,
+        results_root: impl Into<PathBuf>,
+        results_path: impl Into<PathBuf>,
+        policy: VerifyLogRetentionPolicy,
+    ) -> Result<Self, String> {
+        let stable_root = stable_root.into();
         let retention_root = artifact_root.into();
+        let results_root = results_root.into();
         let results_path = results_path.into();
         require_plain_directory(&stable_root, "stable verify-log result root")?;
+        require_plain_directory(&results_root, "stable verify-log result-row root")?;
         if retention_root != stable_root {
             let relative =
                 checked_relative_path(&stable_root, &retention_root, "verify-log artifact root")?;
@@ -286,7 +339,7 @@ impl VerifyLogRetentionBudget {
         }
         require_plain_directory(&retention_root, "verify-log artifact root")?;
         let results = check_file_path_below(
-            &stable_root,
+            &results_root,
             &results_path,
             "retained verify-log result-row destination",
         )?;
@@ -297,10 +350,10 @@ impl VerifyLogRetentionBudget {
             ));
         }
         let accounted_compressed_bytes =
-            scan_existing_verify_log_bytes(&stable_root, &retention_root, &results_path, policy)?;
+            scan_existing_verify_log_bytes(&results_root, &retention_root, &results_path, policy)?;
         Ok(Self {
             policy,
-            stable_root,
+            results_root,
             retention_root,
             results_path,
             state: Arc::new(Mutex::new(VerifyLogRetentionState {
@@ -389,12 +442,12 @@ impl VerifyLogRetentionBudget {
 
     fn require_results_path(&self, results_path: &Path) -> Result<(), String> {
         let expected = check_file_path_below(
-            &self.stable_root,
+            &self.results_root,
             &self.results_path,
             "configured result-row destination",
         )?;
         let actual =
-            check_file_path_below(&self.stable_root, results_path, "result-row destination")?;
+            check_file_path_below(&self.results_root, results_path, "result-row destination")?;
         if expected.normalized != actual.normalized {
             return Err(format!(
                 "result-row destination {} does not match configured path {}",
@@ -442,7 +495,11 @@ const VERIFY_RUN_STDOUT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const VERIFY_RUN_STDERR_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const VERIFY_RUN_SUMMARY_MAX_BYTES: u64 = 1024 * 1024;
 const VERIFY_RUN_DIAGNOSTIC_TAIL_MAX_BYTES: u64 = 64 * 1024;
-const VERIFY_RUN_GUEST_SUMMARY: &str = "/test/.hermit-summary.json";
+const VERIFY_RUN_GUEST_ENVIRONMENT_DIR: &str = "/tmp/.hermit-e2e-environment";
+const VERIFY_RUN_GUEST_SUMMARY_DIR: &str = "/tmp/.hermit-e2e-summary";
+const LITEINST_RUNTIME_ENV: &str = "HERMIT_LITEINST_RUNTIME";
+const HERMIT_INSTALL_DIR_ENV: &str = "HERMIT_INSTALL_DIR";
+const LITEINST_RUNTIME_FILE: &str = "libreverie_liteinst.so";
 
 #[derive(Clone, Copy, Debug)]
 struct VerifyRunReadLimits {
@@ -465,21 +522,41 @@ pub fn verify_run_paths(
     run: VerifyRun,
 ) -> Result<VerifyRunPaths, String> {
     let workdir = fixed_workdir_source_for_attempt(cell_dir, attempt)?.join(run.directory_name());
+    let environment_dir = cell_dir
+        .join("environment")
+        .join(attempt)
+        .join(run.directory_name());
+    let guest_environment_dir = PathBuf::from(VERIFY_RUN_GUEST_ENVIRONMENT_DIR);
     let capture_dir = cell_dir
         .join("captures")
         .join("verify")
         .join(attempt)
         .join(run.directory_name());
+    let summary_dir = capture_dir.join("summary");
+    let guest_summary_dir = PathBuf::from(VERIFY_RUN_GUEST_SUMMARY_DIR);
     let evidence = capture_dir.join("evidence");
-    let summary = workdir.join(".hermit-summary.json");
+    let summary = summary_dir.join("run-summary.json");
     Ok(VerifyRunPaths {
         workdir,
+        home: environment_dir.join("home"),
+        xdg_config_home: environment_dir.join("xdg-config"),
+        tmp: environment_dir.join("tmp"),
+        fixture_dir: environment_dir.join("fixtures"),
+        guest_home: guest_environment_dir.join("home"),
+        guest_xdg_config_home: guest_environment_dir.join("xdg-config"),
+        guest_tmp: guest_environment_dir.join("tmp"),
+        guest_fixture_dir: guest_environment_dir.join("fixtures"),
+        guest_environment_dir,
+        environment_dir,
         result: capture_dir.join("result.json"),
         stdout: capture_dir.join("stdout"),
         stderr: capture_dir.join("stderr"),
         diagnostic_stdout: capture_dir.join("hermit.stdout"),
         diagnostic_stderr: capture_dir.join("hermit.stderr"),
+        guest_summary: guest_summary_dir.join("run-summary.json"),
+        guest_summary_dir,
         summary,
+        summary_dir,
         log: evidence.join(RUN_EVIDENCE_INFO_ARTIFACT),
         evidence,
         capture_dir,
@@ -507,8 +584,10 @@ pub(super) fn prepare_verify_run_destinations(
     let artifact_dir = &run1.execution.cell_dir;
     let candidates = [
         ("run-1 work directory", &run1.paths.workdir),
+        ("run-1 environment directory", &run1.paths.environment_dir),
         ("run-1 capture directory", &run1.paths.capture_dir),
         ("run-2 work directory", &run2.paths.workdir),
+        ("run-2 environment directory", &run2.paths.environment_dir),
         ("run-2 capture directory", &run2.paths.capture_dir),
     ];
     let mut normalized = BTreeSet::new();
@@ -545,6 +624,37 @@ pub(super) fn prepare_verify_run_destinations(
         fs::create_dir(path)
             .map_err(|error| format!("cannot create {description} {}: {error}", path.display()))?;
         sync_plain_directory(&parent, &format!("{description} parent"))?;
+    }
+    for spec in [run1, run2] {
+        fs::create_dir(&spec.paths.summary_dir).map_err(|error| {
+            format!(
+                "cannot create private verify-run summary directory {}: {error}",
+                spec.paths.summary_dir.display()
+            )
+        })?;
+        sync_plain_directory(&spec.paths.capture_dir, "verify-run capture directory")?;
+    }
+
+    for spec in [run1, run2] {
+        for name in ["home", "xdg-config", "tmp", "fixtures"] {
+            let source = artifact_dir.join(name);
+            let destination = spec.paths.environment_dir.join(name);
+            if source.is_dir() {
+                copy_tree(&source, &destination).map_err(|error| {
+                    format!(
+                        "cannot seed private verify-run {name} {}: {error}",
+                        destination.display()
+                    )
+                })?;
+            } else {
+                fs::create_dir(&destination).map_err(|error| {
+                    format!(
+                        "cannot create private verify-run {name} {}: {error}",
+                        destination.display()
+                    )
+                })?;
+            }
+        }
     }
 
     for (description, path) in [
@@ -1346,7 +1456,7 @@ fn require_plain_parent_chain(
     Ok(())
 }
 
-fn create_plain_relative_directory(
+pub(super) fn create_plain_relative_directory(
     artifact_dir: &Path,
     relative: &Path,
     description: &str,
@@ -2545,7 +2655,7 @@ fn verify_retention_paths_do_not_alias(
 ) -> Result<(), String> {
     let mut paths = vec![
         check_file_path_below(
-            &retention_budget.stable_root,
+            &retention_budget.results_root,
             results_path,
             "result-row destination",
         )?,
@@ -3364,6 +3474,96 @@ pub fn cleanup_verify_log_sources(
     )
 }
 
+fn liteinst_revision_path(runtime: &Path) -> PathBuf {
+    let mut revision = runtime.as_os_str().to_os_string();
+    revision.push(".revision");
+    PathBuf::from(revision)
+}
+
+fn require_plain_liteinst_resource(path: &Path, description: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {description} {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+        return Err(format!(
+            "{description} {} is not a nonempty, non-symlink regular file",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn discover_liteinst_runtime(context: &RunContext) -> Result<Option<[PathBuf; 2]>, String> {
+    let explicit = std::env::var_os(LITEINST_RUNTIME_ENV);
+    if explicit.as_ref().is_some_and(|value| value.is_empty()) {
+        return Err(format!("{LITEINST_RUNTIME_ENV} is empty"));
+    }
+    let mut candidates = Vec::new();
+    if let Some(explicit) = explicit {
+        candidates.push(PathBuf::from(explicit));
+    } else {
+        let binary_dir = context
+            .hermit_bin
+            .parent()
+            .ok_or_else(|| "Hermit executable has no parent directory".to_string())?;
+        candidates.push(binary_dir.join(LITEINST_RUNTIME_FILE));
+        candidates.push(binary_dir.join("deps").join(LITEINST_RUNTIME_FILE));
+        if let Some(install) = std::env::var_os(HERMIT_INSTALL_DIR_ENV) {
+            if install.is_empty() {
+                return Err(format!("{HERMIT_INSTALL_DIR_ENV} is empty"));
+            }
+            candidates.push(
+                PathBuf::from(install)
+                    .join("rsrcs")
+                    .join(LITEINST_RUNTIME_FILE),
+            );
+        }
+        if let Some(target_dir) = binary_dir.parent() {
+            candidates.push(
+                target_dir
+                    .join("install_pkg/rsrcs")
+                    .join(LITEINST_RUNTIME_FILE),
+            );
+        }
+    }
+
+    for candidate in candidates {
+        let candidate = if candidate.is_absolute() {
+            candidate
+        } else {
+            context.root.join(candidate)
+        };
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect LiteInst runtime {}: {error}",
+                    candidate.display()
+                ));
+            }
+            Ok(_) => {}
+        }
+        require_plain_liteinst_resource(&candidate, "LiteInst runtime")?;
+        let revision = liteinst_revision_path(&candidate);
+        require_plain_liteinst_resource(&revision, "LiteInst runtime revision")?;
+        return Ok(Some([candidate, revision]));
+    }
+    Ok(None)
+}
+
+fn readonly_identity_mount_argument(path: &Path) -> Result<String, String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| format!("LiteInst resource path is not UTF-8: {}", path.display()))?;
+    if path.contains(',') {
+        return Err(format!(
+            "LiteInst resource path contains unsupported mount delimiter: {path}"
+        ));
+    }
+    Ok(format!(
+        "--mount=type=bind,source={path},target={path},readonly"
+    ))
+}
+
 /// Build one independently scheduled ordinary run for a supported verify cell.
 ///
 /// Both members use the same prepared guest and validation image, while their
@@ -3411,7 +3611,39 @@ pub fn build_verify_run_spec(
     let mode_recipe = &cell.test.modes["verify"];
     let attempt_label = attempt.to_string();
     let paths = verify_run_paths(&dir, &attempt_label, run)?;
-    let env = execution_cell_env(context, &dir, true);
+    let liteinst_runtime = if backend == "liteinst" {
+        discover_liteinst_runtime(context)?
+    } else {
+        None
+    };
+    let mut env = execution_cell_env(context, &paths.environment_dir, false);
+    if let Some([runtime, _]) = &liteinst_runtime {
+        env.insert(
+            LITEINST_RUNTIME_ENV.into(),
+            runtime.to_string_lossy().into_owned(),
+        );
+    }
+    let guest_env = execution_cell_env(context, &paths.guest_environment_dir, false);
+    let shared_fixture_dir = dir.join("fixtures");
+    let guest_argv = guest_argv
+        .into_iter()
+        .map(
+            |argument| match Path::new(&argument).strip_prefix(&shared_fixture_dir) {
+                Ok(relative)
+                    if relative
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_))) =>
+                {
+                    paths
+                        .guest_fixture_dir
+                        .join(relative)
+                        .to_string_lossy()
+                        .into_owned()
+                }
+                _ => argument,
+            },
+        )
+        .collect::<Vec<_>>();
     let expected_policy = VerifyRunPolicy {
         detlog_io_buffers: mode_recipe.compare_io_buffers != Some(false),
         virtualize_time: true,
@@ -3432,7 +3664,7 @@ pub fn build_verify_run_spec(
     }
     argv.extend([
         "--summary-json".into(),
-        VERIFY_RUN_GUEST_SUMMARY.into(),
+        paths.guest_summary.to_string_lossy().into_owned(),
         "--run-evidence-dir".into(),
         paths.evidence.to_string_lossy().into_owned(),
         "--run-result-json".into(),
@@ -3441,15 +3673,31 @@ pub fn build_verify_run_spec(
         paths.stdout.to_string_lossy().into_owned(),
         "--guest-stderr".into(),
         paths.stderr.to_string_lossy().into_owned(),
-        format!(
-            "--mount=type=bind,source={},target={}",
-            paths.workdir.to_string_lossy(),
-            HERMETIC_TEST_WORKDIR
-        ),
-        "--workdir".into(),
-        HERMETIC_TEST_WORKDIR.into(),
     ]);
-    append_guest_env_args(&mut argv, &env, true);
+    append_guest_env_args(&mut argv, &guest_env, false);
+    if let Some(runtime) = &liteinst_runtime {
+        for path in runtime {
+            if path.starts_with("/tmp") {
+                argv.push(readonly_identity_mount_argument(path)?);
+            }
+        }
+    }
+    argv.push(format!(
+        "--bind={}:{}",
+        paths.environment_dir.display(),
+        paths.guest_environment_dir.display()
+    ));
+    argv.push(format!(
+        "--bind={}:{}",
+        paths.summary_dir.display(),
+        paths.guest_summary_dir.display()
+    ));
+    append_execution_root_args(
+        &mut argv,
+        context.isolated_workdir.as_deref(),
+        mode_recipe.workdir.as_deref(),
+        Some(&paths.workdir),
+    );
     argv.push("--".into());
     argv.extend(guest_argv.clone());
 
@@ -3513,6 +3761,7 @@ mod tests {
             &run1.stderr,
             &run1.diagnostic_stdout,
             &run1.diagnostic_stderr,
+            &run1.summary_dir,
             &run1.summary,
             &run2.workdir,
             &run2.log,
@@ -3521,6 +3770,7 @@ mod tests {
             &run2.stderr,
             &run2.diagnostic_stdout,
             &run2.diagnostic_stderr,
+            &run2.summary_dir,
             &run2.summary,
         ] {
             assert!(
@@ -3533,6 +3783,19 @@ mod tests {
                 "{} used host /tmp",
                 path.display()
             );
+        }
+        assert_eq!(run1.guest_summary_dir, run2.guest_summary_dir);
+        assert_eq!(
+            run1.guest_summary_dir,
+            Path::new(VERIFY_RUN_GUEST_SUMMARY_DIR)
+        );
+        for paths in [&run1, &run2] {
+            assert!(paths.guest_summary_dir.starts_with("/tmp"));
+            assert_eq!(
+                paths.guest_summary,
+                paths.guest_summary_dir.join("run-summary.json")
+            );
+            assert_eq!(paths.summary, paths.summary_dir.join("run-summary.json"));
         }
         assert!(verify_run_paths(cell, "../escape", VerifyRun::Run1).is_err());
     }
@@ -3564,6 +3827,439 @@ mod tests {
             .unwrap_err();
             assert!(error.contains(expected), "{label}: {error}");
         }
+    }
+
+    #[test]
+    fn harness_managed_verify_preserves_workdir_precedence() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let cell_dir = directory.path().join("results/cell");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&cell_dir).unwrap();
+        let mut cell = ptrace_cell("verify");
+        cell.test.modes.get_mut("verify").unwrap().workdir = Some("/manifest".into());
+
+        let mut isolated_context = run_context(&root);
+        isolated_context.isolated_workdir = Some(PathBuf::from("/test"));
+        let isolated = build_verify_run_spec(
+            &isolated_context,
+            &cell,
+            cell_dir.clone(),
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run1,
+            15,
+        )
+        .unwrap();
+        assert!(
+            isolated
+                .execution
+                .argv
+                .iter()
+                .any(|argument| argument == "--mount=type=tmpfs,target=/test")
+        );
+        assert!(
+            isolated
+                .execution
+                .argv
+                .windows(2)
+                .any(|arguments| { arguments[0] == "--workdir" && arguments[1] == "/test" })
+        );
+        let isolated_fallback = format!(
+            "--bind={}:{FIXED_GUEST_WORKDIR}",
+            isolated.paths.workdir.display()
+        );
+        assert!(!isolated.execution.argv.contains(&isolated_fallback));
+        assert!(
+            !isolated
+                .execution
+                .argv
+                .iter()
+                .any(|argument| argument.contains("/manifest"))
+        );
+
+        let context = run_context(&root);
+        let requested = build_verify_run_spec(
+            &context,
+            &cell,
+            cell_dir.clone(),
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run1,
+            15,
+        )
+        .unwrap();
+        assert!(
+            requested
+                .execution
+                .argv
+                .windows(2)
+                .any(|arguments| { arguments[0] == "--workdir" && arguments[1] == "/manifest" })
+        );
+        let requested_fallback = format!(
+            "--bind={}:{FIXED_GUEST_WORKDIR}",
+            requested.paths.workdir.display()
+        );
+        assert!(!requested.execution.argv.contains(&requested_fallback));
+        assert!(
+            !requested
+                .execution
+                .argv
+                .iter()
+                .any(|argument| argument.starts_with("--mount=type=tmpfs"))
+        );
+
+        cell.test.modes.get_mut("verify").unwrap().workdir = None;
+        let fallback1 = build_verify_run_spec(
+            &context,
+            &cell,
+            cell_dir.clone(),
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run1,
+            15,
+        )
+        .unwrap();
+        let fallback2 = build_verify_run_spec(
+            &context,
+            &cell,
+            cell_dir,
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run2,
+            15,
+        )
+        .unwrap();
+        let bind1 = format!(
+            "--bind={}:{}",
+            fallback1.paths.workdir.display(),
+            FIXED_GUEST_WORKDIR
+        );
+        let bind2 = format!(
+            "--bind={}:{}",
+            fallback2.paths.workdir.display(),
+            FIXED_GUEST_WORKDIR
+        );
+        assert_ne!(fallback1.paths.workdir, fallback2.paths.workdir);
+        assert!(fallback1.execution.argv.contains(&bind1));
+        assert!(fallback2.execution.argv.contains(&bind2));
+        assert_ne!(bind1, bind2);
+    }
+
+    #[test]
+    fn verify_pair_environment_and_fixtures_are_private_mode_preserving_copies() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let cell_dir = directory.path().join("results/cell");
+        fs::create_dir_all(&root).unwrap();
+        for name in ["home", "xdg-config", "tmp", "fixtures"] {
+            fs::create_dir_all(cell_dir.join(name)).unwrap();
+            fs::write(cell_dir.join(name).join("seed"), name.as_bytes()).unwrap();
+        }
+        fs::set_permissions(cell_dir.join("fixtures"), fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(
+            cell_dir.join("fixtures/seed"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        let shared_guest = cell_dir.join("fixtures/seed");
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let run1 = build_verify_run_spec(
+            &context,
+            &cell,
+            cell_dir.clone(),
+            vec![shared_guest.to_string_lossy().into_owned()],
+            1,
+            VerifyRun::Run1,
+            15,
+        )
+        .unwrap();
+        let run2 = build_verify_run_spec(
+            &context,
+            &cell,
+            cell_dir.clone(),
+            vec![shared_guest.to_string_lossy().into_owned()],
+            1,
+            VerifyRun::Run2,
+            15,
+        )
+        .unwrap();
+        prepare_verify_run_destinations(&run1, &run2).unwrap();
+
+        for (left, right) in [
+            (&run1.paths.workdir, &run2.paths.workdir),
+            (&run1.paths.home, &run2.paths.home),
+            (&run1.paths.xdg_config_home, &run2.paths.xdg_config_home),
+            (&run1.paths.tmp, &run2.paths.tmp),
+            (&run1.paths.fixture_dir, &run2.paths.fixture_dir),
+        ] {
+            assert_ne!(left, right);
+            for path in [left, right] {
+                let relative = path.strip_prefix(&cell_dir).unwrap();
+                assert!(
+                    relative
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_)))
+                );
+            }
+        }
+        for (left, right) in [
+            (&run1.paths.guest_home, &run2.paths.guest_home),
+            (
+                &run1.paths.guest_xdg_config_home,
+                &run2.paths.guest_xdg_config_home,
+            ),
+            (&run1.paths.guest_tmp, &run2.paths.guest_tmp),
+            (&run1.paths.guest_fixture_dir, &run2.paths.guest_fixture_dir),
+        ] {
+            assert_eq!(left, right);
+            for path in [left, right] {
+                assert!(path.starts_with("/tmp"));
+                assert!(path.components().all(|component| matches!(
+                    component,
+                    Component::RootDir | Component::Normal(_)
+                )));
+            }
+        }
+        assert_eq!(
+            run1.paths.guest_environment_dir,
+            run2.paths.guest_environment_dir
+        );
+        assert_eq!(
+            run1.paths.guest_environment_dir,
+            Path::new(VERIFY_RUN_GUEST_ENVIRONMENT_DIR)
+        );
+        for spec in [&run1, &run2] {
+            assert_eq!(
+                spec.execution.env.get("HOME").map(String::as_str),
+                Some(spec.paths.home.to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                spec.execution
+                    .env
+                    .get("XDG_CONFIG_HOME")
+                    .map(String::as_str),
+                Some(spec.paths.xdg_config_home.to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                spec.execution.env.get("E2E_TMPDIR").map(String::as_str),
+                Some(spec.paths.tmp.to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                spec.execution
+                    .env
+                    .get("E2E_FIXTURE_DIR")
+                    .map(String::as_str),
+                Some(spec.paths.fixture_dir.to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                spec.execution.guest_argv,
+                [spec.paths.guest_fixture_dir.join("seed").to_string_lossy()]
+            );
+            for name in ["home", "xdg-config", "tmp", "fixtures"] {
+                assert_eq!(
+                    fs::read(spec.paths.environment_dir.join(name).join("seed")).unwrap(),
+                    name.as_bytes()
+                );
+            }
+            assert_eq!(
+                fs::metadata(&spec.paths.fixture_dir)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o750
+            );
+            assert_eq!(
+                fs::metadata(spec.paths.fixture_dir.join("seed"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+            let environment_bind = format!(
+                "--bind={}:{}",
+                spec.paths.environment_dir.display(),
+                spec.paths.guest_environment_dir.display()
+            );
+            assert!(spec.execution.argv.contains(&environment_bind));
+            assert!(
+                !spec
+                    .execution
+                    .argv
+                    .iter()
+                    .any(|argument| { argument == "--tmp" || argument.starts_with("--tmp=") })
+            );
+            for host_path in [
+                &spec.paths.home,
+                &spec.paths.xdg_config_home,
+                &spec.paths.tmp,
+                &spec.paths.fixture_dir,
+            ] {
+                let relative = host_path.strip_prefix(&spec.paths.environment_dir).unwrap();
+                assert!(!relative.as_os_str().is_empty());
+                assert!(
+                    relative
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_)))
+                );
+            }
+            for guest_path in [
+                &spec.paths.guest_home,
+                &spec.paths.guest_xdg_config_home,
+                &spec.paths.guest_tmp,
+                &spec.paths.guest_fixture_dir,
+                Path::new(&spec.execution.guest_argv[0]),
+            ] {
+                let relative = guest_path
+                    .strip_prefix(&spec.paths.guest_environment_dir)
+                    .unwrap();
+                assert!(!relative.as_os_str().is_empty());
+                assert!(
+                    relative
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_)))
+                );
+            }
+            assert_minimal_guest_env(
+                &spec.execution.argv,
+                &spec.paths.guest_environment_dir.to_string_lossy(),
+                &spec.paths.guest_tmp.to_string_lossy(),
+                "1",
+            );
+        }
+        assert_eq!(run1.execution.guest_argv, run2.execution.guest_argv);
+        fs::write(run1.paths.home.join("run-1-marker"), b"private").unwrap();
+        assert!(!run2.paths.home.join("run-1-marker").exists());
+        fs::write(run1.paths.fixture_dir.join("seed"), b"mutated").unwrap();
+        assert_eq!(
+            fs::read(run2.paths.fixture_dir.join("seed")).unwrap(),
+            b"fixtures"
+        );
+    }
+
+    #[test]
+    fn liteinst_runtime_is_identity_mounted_read_only_without_physical_copies() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let cell_dir = directory.path().join("results/cell");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&cell_dir).unwrap();
+        let runtime = root.join(LITEINST_RUNTIME_FILE);
+        let revision = liteinst_revision_path(&runtime);
+        fs::write(&runtime, b"runtime-bytes").unwrap();
+        fs::write(&revision, b"8c8c0a57649c9ffbf8a7a14291a64320f64b935f\n").unwrap();
+        let before = fs::metadata(&runtime).unwrap();
+
+        let context = run_context(&root);
+        let mut cell = ptrace_cell("verify");
+        cell.id.backend = Some("liteinst".into());
+        let run1 = build_verify_run_spec(
+            &context,
+            &cell,
+            cell_dir.clone(),
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run1,
+            15,
+        )
+        .unwrap();
+        let run2 = build_verify_run_spec(
+            &context,
+            &cell,
+            cell_dir,
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run2,
+            15,
+        )
+        .unwrap();
+
+        let expected_mounts = [
+            readonly_identity_mount_argument(&runtime).unwrap(),
+            readonly_identity_mount_argument(&revision).unwrap(),
+        ];
+        for spec in [&run1, &run2] {
+            assert_eq!(
+                spec.execution.env.get(LITEINST_RUNTIME_ENV),
+                Some(&runtime.to_string_lossy().into_owned())
+            );
+            let mounts = spec
+                .execution
+                .argv
+                .iter()
+                .filter(|argument| argument.starts_with("--mount="))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(mounts, expected_mounts);
+            assert!(!spec.execution.argv.windows(2).any(|arguments| {
+                arguments[0] == "--env"
+                    && arguments[1].starts_with(&format!("{LITEINST_RUNTIME_ENV}="))
+            }));
+        }
+        assert_eq!(run1.execution.guest_argv, run2.execution.guest_argv);
+        prepare_verify_run_destinations(&run1, &run2).unwrap();
+        for spec in [&run1, &run2] {
+            assert!(
+                !spec
+                    .paths
+                    .environment_dir
+                    .join(LITEINST_RUNTIME_FILE)
+                    .exists()
+            );
+        }
+        let after = fs::metadata(&runtime).unwrap();
+        assert_eq!(
+            (before.dev(), before.ino(), before.len()),
+            (after.dev(), after.ino(), after.len())
+        );
+        assert_eq!(fs::read(&runtime).unwrap(), b"runtime-bytes");
+        assert_eq!(
+            fs::read(&revision).unwrap(),
+            b"8c8c0a57649c9ffbf8a7a14291a64320f64b935f\n"
+        );
+    }
+
+    #[test]
+    fn verify_pair_private_fixture_copy_refuses_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let cell_dir = directory.path().join("results/cell");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(cell_dir.join("fixtures")).unwrap();
+        fs::write(&outside, b"preserved").unwrap();
+        std::os::unix::fs::symlink(&outside, cell_dir.join("fixtures/escape")).unwrap();
+        let context = run_context(&root);
+        let cell = ptrace_cell("verify");
+        let run1 = build_verify_run_spec(
+            &context,
+            &cell,
+            cell_dir.clone(),
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run1,
+            15,
+        )
+        .unwrap();
+        let run2 = build_verify_run_spec(
+            &context,
+            &cell,
+            cell_dir,
+            vec!["/bin/true".into()],
+            1,
+            VerifyRun::Run2,
+            15,
+        )
+        .unwrap();
+
+        let error = prepare_verify_run_destinations(&run1, &run2).unwrap_err();
+        assert!(error.contains("contains symlink"), "{error}");
+        assert_eq!(fs::read(&outside).unwrap(), b"preserved");
+        assert!(!run1.paths.fixture_dir.join("escape").exists());
+        assert!(!run2.paths.fixture_dir.join("escape").exists());
     }
 
     #[test]
@@ -3609,7 +4305,23 @@ mod tests {
                 args[0] == "--run-evidence-dir" && args[1] == spec.paths.evidence.to_string_lossy()
             }));
             assert!(argv.windows(2).any(|args| {
-                args[0] == "--summary-json" && args[1] == VERIFY_RUN_GUEST_SUMMARY
+                args[0] == "--summary-json" && args[1] == spec.paths.guest_summary.to_string_lossy()
+            }));
+            assert!(argv.iter().any(|argument| {
+                argument
+                    == &format!(
+                        "--bind={}:{}",
+                        spec.paths.summary_dir.display(),
+                        spec.paths.guest_summary_dir.display()
+                    )
+            }));
+            assert!(argv.iter().any(|argument| {
+                argument
+                    == &format!(
+                        "--bind={}:{}",
+                        spec.paths.environment_dir.display(),
+                        spec.paths.guest_environment_dir.display()
+                    )
             }));
             for (flag, path) in [
                 ("--run-result-json", &spec.paths.result),
@@ -3628,14 +4340,13 @@ mod tests {
             );
             assert!(argv.iter().any(|arg| {
                 arg == &format!(
-                    "--mount=type=bind,source={},target={}",
-                    spec.paths.workdir.display(),
-                    HERMETIC_TEST_WORKDIR
+                    "--bind={}:{FIXED_GUEST_WORKDIR}",
+                    spec.paths.workdir.display()
                 )
             }));
             assert!(
                 argv.windows(2)
-                    .any(|args| { args[0] == "--workdir" && args[1] == HERMETIC_TEST_WORKDIR })
+                    .any(|args| { args[0] == "--workdir" && args[1] == FIXED_GUEST_WORKDIR })
             );
             assert!(!argv.iter().any(|arg| {
                 matches!(
@@ -3645,7 +4356,15 @@ mod tests {
             }));
             assert!(spec.paths.workdir.starts_with(&cell_dir));
             assert!(!spec.paths.evidence.exists());
-            assert_minimal_guest_env(argv, &cell_dir.to_string_lossy(), "/test", "8");
+            assert_minimal_guest_env(
+                argv,
+                &spec.paths.guest_environment_dir.to_string_lossy(),
+                &spec.paths.guest_tmp.to_string_lossy(),
+                "8",
+            );
+            assert!(spec.paths.home.is_dir());
+            assert!(spec.paths.xdg_config_home.is_dir());
+            assert!(spec.paths.fixture_dir.is_dir());
         }
         let error = prepare_verify_run_destinations(&run1, &run2).unwrap_err();
         assert!(error.contains("no-clobber"), "{error}");
@@ -3681,10 +4400,10 @@ mod tests {
             "/bin/sh".into(),
             "-c".into(),
             concat!(
-                "test \"$PWD\" = /test || exit 91; ",
+                "test \"$PWD\" = /tmp/test || exit 91; ",
                 "test ! -e verify-pair-marker || exit 92; ",
                 "printf same > verify-pair-marker; ",
-                "printf '/test\\nexact-stdout'; ",
+                "printf '/tmp/test\\nexact-stdout'; ",
                 "printf exact-stderr >&2"
             )
             .into(),
@@ -3716,9 +4435,8 @@ mod tests {
             assert!(spec.execution.argv.iter().any(|argument| {
                 argument
                     == &format!(
-                        "--mount=type=bind,source={},target={}",
-                        spec.paths.workdir.display(),
-                        HERMETIC_TEST_WORKDIR
+                        "--bind={}:{FIXED_GUEST_WORKDIR}",
+                        spec.paths.workdir.display()
                     )
             }));
         }
@@ -3746,8 +4464,18 @@ mod tests {
             });
             (run1.join().unwrap().unwrap(), run2.join().unwrap().unwrap())
         });
-        assert_eq!(run1_output.status.code(), Some(0));
-        assert_eq!(run2_output.status.code(), Some(0));
+        assert_eq!(
+            run1_output.status.code(),
+            Some(0),
+            "run 1 diagnostics: {}",
+            String::from_utf8_lossy(&fs::read(&run1_spec.paths.diagnostic_stderr).unwrap())
+        );
+        assert_eq!(
+            run2_output.status.code(),
+            Some(0),
+            "run 2 diagnostics: {}",
+            String::from_utf8_lossy(&fs::read(&run2_spec.paths.diagnostic_stderr).unwrap())
+        );
         for workdir in [&run1_spec.paths.workdir, &run2_spec.paths.workdir] {
             assert_eq!(
                 fs::read(workdir.join("verify-pair-marker")).unwrap(),
@@ -3762,7 +4490,7 @@ mod tests {
                 observation.result.disposition,
                 GuestDisposition::Exited { code: 0 }
             );
-            assert_eq!(observation.stdout, b"/test\nexact-stdout");
+            assert_eq!(observation.stdout, b"/tmp/test\nexact-stdout");
             assert_eq!(observation.stderr, b"exact-stderr");
             assert_eq!(fs::read(&spec.paths.stdout).unwrap(), observation.stdout);
             assert_eq!(fs::read(&spec.paths.stderr).unwrap(), observation.stderr);
@@ -3922,6 +4650,7 @@ mod tests {
     ) {
         let paths = &spec.paths;
         fs::create_dir_all(&paths.evidence).unwrap();
+        fs::create_dir_all(&paths.summary_dir).unwrap();
         fs::create_dir_all(&paths.workdir).unwrap();
         fs::write(&paths.stdout, stdout).unwrap();
         fs::write(&paths.stderr, stderr).unwrap();
@@ -5175,6 +5904,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("no result-row descriptor"), "{error}");
+    }
+
+    #[test]
+    fn separate_result_root_does_not_broaden_artifact_containment() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_stable_root = directory.path().join("artifacts");
+        let results_root = directory.path().join("custom/results");
+        fs::create_dir(&artifact_stable_root).unwrap();
+        fs::create_dir_all(&results_root).unwrap();
+        let results_path = results_root.join("results.jsonl");
+        prepare_result_path(&results_path).unwrap();
+        let artifact_root = artifact_stable_root.join("runs/run-id");
+
+        let budget = VerifyLogRetentionBudget::open_with_separate_roots(
+            &artifact_stable_root,
+            &artifact_root,
+            &results_root,
+            &results_path,
+            VerifyLogRetentionPolicy::new(u64::MAX),
+        )
+        .unwrap();
+        assert_eq!(budget.results_root, results_root);
+        assert_eq!(budget.retention_root, artifact_root);
+        assert!(budget.retention_root.is_dir());
+        assert!(!budget.results_path.starts_with(&artifact_stable_root));
+
+        let escaped_artifact = directory.path().join("outside/run-id");
+        let error = VerifyLogRetentionBudget::open_with_separate_roots(
+            &artifact_stable_root,
+            &escaped_artifact,
+            &results_root,
+            &results_path,
+            VerifyLogRetentionPolicy::new(u64::MAX),
+        )
+        .unwrap_err();
+        assert!(error.contains("outside cell artifact directory"), "{error}");
+        assert!(!escaped_artifact.exists());
     }
 
     #[test]
