@@ -215,8 +215,27 @@ with open(sys.argv[1], encoding="utf-8") as source:
     "executed_tests": 2,
     "filtered_tests": 7,
     "results": [
-        {"id": "suite$passes", "result": "pass", "attempts": 1, "attempt_results": None},
-        {"id": "suite$recovers", "result": "pass", "attempts": 2, "attempt_results": None},
+        {
+            "id": "suite$passes",
+            "result": "pass",
+            "attempts": 1,
+            "attempt_results": [
+                {"attempt": 1, "outcome": "passed", "detail": None}
+            ],
+        },
+        {
+            "id": "suite$recovers",
+            "result": "pass",
+            "attempts": 2,
+            "attempt_results": [
+                {
+                    "attempt": 1,
+                    "outcome": "failed",
+                    "detail": "nextest reported a failed attempt without per-attempt accounting",
+                },
+                {"attempt": 2, "outcome": "passed", "detail": None},
+            ],
+        },
     ],
     }
 PYEOF
@@ -281,7 +300,13 @@ assert report["results"] == [
         "id": "suite$fails",
         "result": "fail",
         "attempts": 1,
-        "attempt_results": None,
+        "attempt_results": [
+            {
+                "attempt": 1,
+                "outcome": "failed",
+                "detail": "nextest reported a failed attempt without per-attempt accounting",
+            }
+        ],
     },
 ]
 PYEOF

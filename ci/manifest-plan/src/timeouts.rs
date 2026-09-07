@@ -14,6 +14,12 @@ pub const DEFAULT_TEST_CPU_TIMEOUT_SECONDS: u64 = 22;
 pub const DEFAULT_TEST_WALL_TIMEOUT_SECONDS: u64 = 57;
 /// Nextest's own wall deadline follows the per-attempt wrapper by this much.
 pub const NEXTEST_WRAPPER_BACKUP_SECONDS: u64 = 5;
+/// Maximum number of attempts admitted by each production Nextest node.
+pub const NEXTEST_MAX_ATTEMPTS: u64 = 1;
+/// Fixed CPU allowance for runner setup and teardown outside individual tests.
+pub const NEXTEST_NODE_CPU_OVERHEAD_SECONDS: u64 = 60;
+/// Largest per-machine CPU multiplier supported by the committed outer-node bounds.
+pub const NEXTEST_OUTER_CPU_SUPPORTED_MULTIPLIER: f64 = 1.5;
 pub const TEST_CPU_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER";
 pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER";
 
@@ -237,6 +243,24 @@ pub fn scale_timeout_seconds(base: u64, multiplier: f64, name: &str) -> Result<u
         ));
     }
     Ok((scaled as u64).max(1))
+}
+
+/// Derive the outer CPU backup for a Nextest node from its exact selected population.
+///
+/// This is an ordering bound, not an estimate of expected demand: every selected test may use its
+/// complete per-attempt CPU allowance at the largest supported machine multiplier before the node
+/// backup is allowed to fire.
+pub fn nextest_outer_cpu_backup_seconds(selected_tests: u64) -> Result<u64, String> {
+    let per_attempt = scale_timeout_seconds(
+        DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+        NEXTEST_OUTER_CPU_SUPPORTED_MULTIPLIER,
+        "Nextest supported CPU multiplier",
+    )?;
+    selected_tests
+        .checked_mul(NEXTEST_MAX_ATTEMPTS)
+        .and_then(|value| value.checked_mul(per_attempt))
+        .and_then(|value| value.checked_add(NEXTEST_NODE_CPU_OVERHEAD_SECONDS))
+        .ok_or_else(|| "Nextest outer CPU backup overflowed".to_string())
 }
 
 pub fn resolve_test_timeouts(

@@ -14,6 +14,9 @@ readonly REPO_ROOT
 readonly HERMIT_BIN=${HERMIT_BIN:-"$REPO_ROOT/target/debug/hermit"}
 readonly HERMIT_APPLICATION_TIMEOUT=${HERMIT_APPLICATION_TIMEOUT:-120}
 
+readonly APPLICATION_PRODUCT_FAILURE_EXIT_CODE=1
+readonly APPLICATION_INFRASTRUCTURE_EXIT_CODE=74
+readonly APPLICATION_NO_RESULT_EXIT_CODE=125
 function require_commands {
     local command
 
@@ -85,7 +88,7 @@ function run_hermit_verify {
                 if (($# < 2)) || [[ ! $2 =~ ^[1-9][0-9]*$ ]]; then
                     printf '%s: PATH-CONTRACT: --require-absolute-arg needs a positive guest argument position\n' \
                         "$label" >&2
-                    return 1
+                    return "$APPLICATION_INFRASTRUCTURE_EXIT_CODE"
                 fi
                 required_absolute_args+=("$2")
                 shift 2
@@ -97,7 +100,7 @@ function run_hermit_verify {
             *)
                 printf '%s: PATH-CONTRACT: expected helper options followed by --, got %s\n' \
                     "$label" "$1" >&2
-                return 1
+                return "$APPLICATION_INFRASTRUCTURE_EXIT_CODE"
                 ;;
         esac
     done
@@ -105,7 +108,7 @@ function run_hermit_verify {
     local -a guest_argv=("$@")
     if ((${#guest_argv[@]} == 0)); then
         printf '%s: PATH-CONTRACT: missing guest command after --\n' "$label" >&2
-        return 1
+        return "$APPLICATION_INFRASTRUCTURE_EXIT_CODE"
     fi
 
     local position index path_arg
@@ -114,13 +117,13 @@ function run_hermit_verify {
         if ((index >= ${#guest_argv[@]})); then
             printf '%s: PATH-CONTRACT: guest argument position %s is not present\n' \
                 "$label" "$position" >&2
-            return 1
+            return "$APPLICATION_INFRASTRUCTURE_EXIT_CODE"
         fi
         path_arg=${guest_argv[index]}
         if [[ $path_arg != /* ]]; then
             printf '%s: PATH-CONTRACT: guest argument %s must be absolute because the guest cwd is /tmp: %s\n' \
                 "$label" "$position" "$path_arg" >&2
-            return 1
+            return "$APPLICATION_INFRASTRUCTURE_EXIT_CODE"
         fi
     done
 
@@ -162,12 +165,16 @@ function run_hermit_verify {
         --verify --verify-strict --verify-json "$verdict_file" -- \
         "${guest_argv[@]}" >"$stdout_file" 2>"$stderr_file" || status=$?
 
-    local failure=""
+    local failure="" failure_status=$APPLICATION_PRODUCT_FAILURE_EXIT_CODE
     if [[ ! -s $verdict_file ]]; then
         # No typed verdict at all. Hermit stamps a no-result report BEFORE the
         # runs are compared, so an absent/empty file means it never reached even
         # that point: a launch refusal, not a comparison outcome.
         failure="REFUSED: no --verify-json report was written (Hermit exited $status before stamping a verdict)"
+        case "$status" in
+            124|130|143) failure_status=$status ;;
+            *) failure_status=$APPLICATION_NO_RESULT_EXIT_CODE ;;
+        esac
     else
         local parity counts_left counts_right verdict_name infrastructure_kind infrastructure_count
         parity=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("bitwise_parity"))' "$verdict_file" 2>/dev/null || echo ERROR)
@@ -178,16 +185,20 @@ function run_hermit_verify {
         counts_right=$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])).get("compared_log_messages") or {}; print(c.get("right",0))' "$verdict_file" 2>/dev/null || echo ERROR)
 
         if [[ $parity == ERROR || $verdict_name == ERROR ]]; then
-            failure="NO-RESULT: --verify-json report is not parseable JSON"
+            failure="INFRASTRUCTURE ERROR: --verify-json report is not parseable JSON"
+            failure_status=$APPLICATION_INFRASTRUCTURE_EXIT_CODE
         elif [[ $verdict_name == infrastructure_error ]]; then
             failure="INFRASTRUCTURE ERROR: kind=$infrastructure_kind count=$infrastructure_count"
+            failure_status=$APPLICATION_INFRASTRUCTURE_EXIT_CODE
         elif [[ $verdict_name == no_result ]]; then
             failure="NO-RESULT: verification reached no verdict (verdict=no_result)"
+            failure_status=$APPLICATION_NO_RESULT_EXIT_CODE
         elif [[ $counts_left == 0 || $counts_right == 0 ]]; then
             # A strict configuration that compared nothing is not parity. This is
             # the check that keeps a vacuously-matching selection from reading as
             # L2 -- the same rule as "test result: ok with zero executed tests".
             failure="NO-RESULT: compared 0 log messages (left=$counts_left right=$counts_right); a strict configuration is not evidence the comparison had data"
+            failure_status=$APPLICATION_NO_RESULT_EXIT_CODE
         elif [[ $parity != True ]]; then
             failure="DIVERGED: bitwise_parity=$parity verdict=$verdict_name (a stripped match does NOT earn L2)"
         fi
@@ -205,7 +216,7 @@ function run_hermit_verify {
         printf 'stderr:\n' >&2
         cat "$stderr_file" >&2
         rm -f -- "$stdout_file" "$stderr_file" "$verdict_file"
-        return 1
+        return "$failure_status"
     fi
 
     # The guest's own exit code is checked only AFTER the typed verdict, and is
@@ -216,7 +227,7 @@ function run_hermit_verify {
         printf 'stderr:\n' >&2
         cat "$stderr_file" >&2
         rm -f -- "$stdout_file" "$stderr_file" "$verdict_file"
-        return "$status"
+        return "$APPLICATION_PRODUCT_FAILURE_EXIT_CODE"
     fi
 
     cat "$stdout_file"

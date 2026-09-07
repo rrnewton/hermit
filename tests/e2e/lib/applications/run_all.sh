@@ -15,12 +15,24 @@ executed_tests=0
 current_test=''
 declare -a test_results=()
 
+function structured_outcome_for_status {
+    case "$1" in
+        0) printf 'pass\n' ;;
+        74) printf 'infrastructure_error\n' ;;
+        125) printf 'no_result\n' ;;
+        124) printf 'wall_timeout\n' ;;
+        130|143) printf 'cancelled\n' ;;
+        *) printf 'fail\n' ;;
+    esac
+}
+
 function publish_test_counts {
-    local status=$? count_status
+    local status=$? count_status outcome
     trap - EXIT
     set +e
     if ((status != 0)) && [[ -n $current_test ]]; then
-        test_results+=("applications/$current_test" fail 1)
+        outcome=$(structured_outcome_for_status "$status")
+        test_results+=("applications/$current_test" "$outcome" 1)
     fi
     "$COUNTS_WRITER" "$executed_tests" 0 "${test_results[@]}"
     count_status=$?
@@ -29,6 +41,17 @@ function publish_test_counts {
     fi
     exit "$status"
 }
+
+if [[ ${1:-} == --self-test && $# -eq 1 ]]; then
+    [[ $(structured_outcome_for_status 1) == fail ]]
+    [[ $(structured_outcome_for_status 124) == wall_timeout ]]
+    [[ $(structured_outcome_for_status 130) == cancelled ]]
+    [[ $(structured_outcome_for_status 143) == cancelled ]]
+    [[ $(structured_outcome_for_status 74) == infrastructure_error ]]
+    [[ $(structured_outcome_for_status 125) == no_result ]]
+    printf 'applications run_all: typed outcome self-test PASS\n'
+    exit 0
+fi
 
 trap publish_test_counts EXIT
 

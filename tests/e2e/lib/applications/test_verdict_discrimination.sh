@@ -67,8 +67,17 @@ function expect {
         run_hermit_verify "$name" "${invocation[@]}" 2>&1) || rc=$?
     unset FAKE_REPORT FAKE_STATUS
 
+    local expected_rc
+    case "$want" in
+        PASS) expected_rc=0 ;;
+        DIVERGED) expected_rc=1 ;;
+        REFUSED|NO-RESULT) expected_rc=125 ;;
+        PATH-CONTRACT|"INFRASTRUCTURE ERROR") expected_rc=74 ;;
+        *) printf 'test bug: no expected exit code for %s\n' "$want" >&2; return 1 ;;
+    esac
+
     if [[ $want == PASS ]]; then
-        if ((rc == 0)); then
+        if ((rc == expected_rc)); then
             printf '  ok   %-28s PASS as expected\n' "$name"
         else
             printf '  FAIL %-28s expected PASS, got rc=%s:\n%s\n' "$name" "$rc" "$out"
@@ -77,8 +86,9 @@ function expect {
         return
     fi
 
-    if ((rc == 0)); then
-        printf '  FAIL %-28s expected refusal (%s) but it PASSED\n' "$name" "$want"
+    if ((rc != expected_rc)); then
+        printf '  FAIL %-28s expected %s at rc=%s, got rc=%s\n' \
+            "$name" "$want" "$expected_rc" "$rc"
         failures=$((failures + 1))
     elif [[ $out != *"$want"* ]]; then
         printf '  FAIL %-28s expected reason %s, got:\n%s\n' "$name" "$want" "$out"
@@ -127,6 +137,9 @@ expect null-compared NO-RESULT \
 expect no-result-stamp NO-RESULT \
     '{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null,"guest_exit_code":null,"guest_signal":null}' 1
 
+expect infrastructure-error "INFRASTRUCTURE ERROR" \
+    '{"verified":false,"bitwise_parity":false,"verdict":"infrastructure_error","comparison":null,"compared_log_messages":null,"infrastructure_error":{"kind":"log-read","count":1},"guest_exit_code":null,"guest_signal":null}' 1
+
 # A real comparison that failed.
 expect diverged DIVERGED \
     '{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical"},"compared_log_messages":{"left":1200,"right":1199},"guest_exit_code":0,"guest_signal":null}' 1
@@ -134,8 +147,8 @@ expect diverged DIVERGED \
 # Launch refusal: no report written at all. Distinct from a no-result report.
 expect launch-refusal REFUSED '' 1
 
-# Malformed report must not be read as anything.
-expect malformed-json NO-RESULT 'not json at all' 0
+# Malformed evidence is a harness failure, not a product comparison result.
+expect malformed-json "INFRASTRUCTURE ERROR" 'not json at all' 0
 
 printf '\n'
 if ((failures != 0)); then

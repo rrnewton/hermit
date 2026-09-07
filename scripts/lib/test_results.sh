@@ -18,6 +18,10 @@ TEST_RESULTS_PASSED=
 TEST_RESULTS_FAILED=
 # shellcheck disable=SC2034
 TEST_RESULTS_FIRST_FAILURE=
+# shellcheck disable=SC2034
+TEST_RESULTS_FIRST_FAILURE_OUTCOME=
+# shellcheck disable=SC2034
+TEST_RESULTS_FIRST_FAILURE_DETAIL=
 
 load_test_results() { # <path>
     local path=$1 canonical fields
@@ -26,6 +30,8 @@ load_test_results() { # <path>
     TEST_RESULTS_PASSED=
     TEST_RESULTS_FAILED=
     TEST_RESULTS_FIRST_FAILURE=
+    TEST_RESULTS_FIRST_FAILURE_OUTCOME=
+    TEST_RESULTS_FIRST_FAILURE_DETAIL=
     [[ -s $path ]] || return 1
     canonical=$("$TEST_RESULTS_READER" summary "$path") || return 1
     fields=$(jq -er '
@@ -35,11 +41,14 @@ load_test_results() { # <path>
             .passed_tests,
             .failed_tests,
             (.first_failed_test // "")
+            ,(.first_failed_outcome // "")
+            ,(.first_failed_detail // "")
           ]
         | @tsv
     ' <<<"$canonical") || return 1
     # shellcheck disable=SC2034 # The caller consumes these exported shell values.
     IFS=$'\t' read -r \
         TEST_RESULTS_EXECUTED TEST_RESULTS_FILTERED TEST_RESULTS_PASSED \
-        TEST_RESULTS_FAILED TEST_RESULTS_FIRST_FAILURE <<<"$fields"
+        TEST_RESULTS_FAILED TEST_RESULTS_FIRST_FAILURE TEST_RESULTS_FIRST_FAILURE_OUTCOME \
+        TEST_RESULTS_FIRST_FAILURE_DETAIL <<<"$fields"
 }

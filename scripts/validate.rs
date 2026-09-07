@@ -119,6 +119,7 @@ use dagrun::model::RunResult;
 use dagrun::model::Step;
 use dagrun::model::StepOutcome;
 use dagrun::TestResult;
+use dagrun::TestAttemptResult;
 use dagrun::TestAttemptOutcome;
 use dagrun::TestResults;
 use dagrun::container_core_budget;
@@ -132,6 +133,10 @@ use dagrun::scheduler::monotonic_now_ns;
 use dagrun::scheduler::RunCpuBudget;
 use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
 use hermit_manifest_plan::ledger::HistoryRow;
+use hermit_manifest_plan::runner::CELL_RESULT_SCHEMA;
+use hermit_manifest_plan::runner::CellResult;
+use hermit_manifest_plan::runner::ObservedResult;
+use hermit_manifest_plan::runner::structured_test_results;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::Population;
 use hermit_manifest_plan::runner::Selection;
@@ -143,7 +148,11 @@ use hermit_manifest_plan::service_result::ScorecardWriteback;
 use hermit_manifest_plan::service_result::ValidationServiceResult;
 use hermit_manifest_plan::timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS;
 use hermit_manifest_plan::timeouts::DEFAULT_TEST_WALL_TIMEOUT_SECONDS;
+use hermit_manifest_plan::timeouts::NEXTEST_MAX_ATTEMPTS;
+use hermit_manifest_plan::timeouts::NEXTEST_NODE_CPU_OVERHEAD_SECONDS;
+use hermit_manifest_plan::timeouts::NEXTEST_OUTER_CPU_SUPPORTED_MULTIPLIER;
 use hermit_manifest_plan::timeouts::NEXTEST_WRAPPER_BACKUP_SECONDS;
+use hermit_manifest_plan::timeouts::nextest_outer_cpu_backup_seconds;
 use hermit_manifest_plan::timeouts::scale_timeout_seconds;
 use hermit_manifest_plan::timeouts::timeout_multiplier_from_env;
 use hermit_manifest_plan::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV;
@@ -1562,6 +1571,7 @@ fn self_test() -> Result<(), String> {
             executed_tests: None,
             filtered_tests: None,
             test_results: None,
+        test_results_error: None,
             returncode: Some(if ok { 0 } else { 1 }),
             oomed: false,
             oom_kills: 0,
@@ -4174,7 +4184,10 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
         "trap publish_counts EXIT",
         "EXECUTED=$((EXECUTED + 1))",
         "RESULTS+=(\"envelope/$id\" pass 1)",
-        "RESULTS+=(\"envelope/$CURRENT_TEST\" fail 1)",
+        "case \"$status\" in 124) outcome=wall_timeout",
+        "125) outcome=no_result",
+        "130|143) outcome=cancelled",
+        "RESULTS+=(\"envelope/$CURRENT_TEST\" \"$outcome\" 1)",
         "./ci/write-structured-test-counts.sh \"$EXECUTED\" 0 \"${RESULTS[@]}\"",
     ] {
         if !envelope.cmd.contains(fixture) {
@@ -8327,7 +8340,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     let ordinary_observed = barrier.join("ordinary.observed");
     ordinary.deps = vec!["compatprep.fixtures".into()];
     ordinary.cmd = format!(
-        "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active}; i=0; while test ! -e {first} || test ! -e {second}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}; printf '%s\\n' '{{\"schema\":2,\"executed_tests\":0,\"filtered_tests\":0,\"results\":[]}}' > \"$DAGRUN_TEST_COUNTS_PATH\"",
+        "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active}; i=0; while test ! -e {first} || test ! -e {second}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}; printf '%s\\n' '{{\"schema\":3,\"executed_tests\":0,\"filtered_tests\":0,\"results\":[]}}' > \"$DAGRUN_TEST_COUNTS_PATH\"",
         tag = validate_plan::shell_quote(&ordinary.tag()),
         active = validate_plan::shell_quote(&barrier.join("ordinary.active").to_string_lossy()),
         first = validate_plan::shell_quote(&barrier.join("0.active").to_string_lossy()),
@@ -8683,18 +8696,41 @@ fn test_attempt_outcome_name(outcome: TestAttemptOutcome) -> &'static str {
         TestAttemptOutcome::WallTimeout => "wall_timeout",
         TestAttemptOutcome::Cancelled => "cancelled",
         TestAttemptOutcome::InfrastructureError => "infrastructure_error",
+        TestAttemptOutcome::NoResult => "no_result",
     }
 }
 
-fn terminal_test_attempt(result: &TestResult) -> Option<&dagrun::TestAttemptResult> {
-    result.attempt_results.as_ref()?.last()
+fn terminal_test_result(
+    id: impl Into<String>,
+    passed: bool,
+    attempts: u64,
+    failure_detail: &str,
+) -> Result<TestResult, String> {
+    let attempts = (1..=attempts)
+        .map(|attempt| {
+            let terminal_pass = passed && attempt == attempts;
+            TestAttemptResult::new(
+                attempt,
+                if terminal_pass {
+                    TestAttemptOutcome::Passed
+                } else {
+                    TestAttemptOutcome::Failed
+                },
+                (!terminal_pass).then(|| failure_detail.to_string()),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    TestResult::with_attempt_results(id.into(), passed, attempts)
 }
 
 fn test_results_have_product_failure(results: Option<&[TestResult]>) -> bool {
     results.is_some_and(|results| {
         results.iter().any(|result| {
-            terminal_test_attempt(result)
-                .is_some_and(|attempt| attempt.outcome == TestAttemptOutcome::Failed)
+            !result.passed && result.attempt_results.as_ref().is_some_and(|attempts| {
+                attempts
+                    .iter()
+                    .any(|attempt| attempt.outcome == TestAttemptOutcome::Failed)
+            })
         })
     })
 }
@@ -8702,14 +8738,17 @@ fn test_results_have_product_failure(results: Option<&[TestResult]>) -> bool {
 fn test_results_have_no_result(results: Option<&[TestResult]>) -> bool {
     results.is_some_and(|results| {
         results.iter().any(|result| {
-            terminal_test_attempt(result).is_some_and(|attempt| {
-                matches!(
-                    attempt.outcome,
-                    TestAttemptOutcome::CpuTimeout
-                        | TestAttemptOutcome::WallTimeout
-                        | TestAttemptOutcome::Cancelled
-                        | TestAttemptOutcome::InfrastructureError
-                )
+            !result.passed && result.attempt_results.as_ref().is_some_and(|attempts| {
+                attempts.iter().any(|attempt| {
+                    matches!(
+                        attempt.outcome,
+                        TestAttemptOutcome::CpuTimeout
+                            | TestAttemptOutcome::WallTimeout
+                            | TestAttemptOutcome::Cancelled
+                            | TestAttemptOutcome::InfrastructureError
+                            | TestAttemptOutcome::NoResult
+                    )
+                })
             })
         })
     })
@@ -8736,9 +8775,13 @@ fn typed_test_results_json(results: &[TestResult]) -> serde_json::Value {
 }
 
 fn outcome_is_no_result(outcome: &StepOutcome) -> bool {
-    !outcome.aborted
+    !outcome.ok && !outcome.aborted
         && !test_results_have_product_failure(outcome.test_results.as_deref())
-        && (outcome.returncode == Some(NO_RESULT_EXIT_CODE)
+        && (outcome.test_results_error.is_some()
+            || outcome.cpu_timed_out
+            || outcome.timed_out
+            || outcome.oomed
+            || outcome.returncode == Some(NO_RESULT_EXIT_CODE)
             || test_results_have_no_result(outcome.test_results.as_deref()))
 }
 
@@ -8911,6 +8954,7 @@ fn summary_listing_bracket() -> Result<String, String> {
         executed_tests: None,
         filtered_tests: None,
         test_results: None,
+        test_results_error: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,
@@ -10086,28 +10130,24 @@ fn validate_live_nextest_cpu_ordering<'a>(
             .iter()
             .filter(|step| step.cmd.contains("run-nextest-counted.sh"))
         {
-            let values = step
-                .cmd
-                .split_whitespace()
-                .filter_map(|word| word.strip_prefix("NEXTEST_EXPECTED_EXECUTED="))
-                .map(|value| {
-                    value.parse::<u64>().map_err(|error| {
-                        format!(
-                            "{} has invalid NEXTEST_EXPECTED_EXECUTED={value:?}: {error}",
-                            step.tag()
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let selected = match values.as_slice() {
-                [value] if *value > 0 => *value,
-                _ => {
-                    return Err(format!(
-                        "{} must declare exactly one positive NEXTEST_EXPECTED_EXECUTED",
-                        step.tag()
-                    ));
-                }
-            };
+            let declared = step.env.get("NEXTEST_EXPECTED_EXECUTED").ok_or_else(|| {
+                format!(
+                    "{} must declare one positive NEXTEST_EXPECTED_EXECUTED in Step.env",
+                    step.tag()
+                )
+            })?;
+            let selected = declared.parse::<u64>().map_err(|error| {
+                format!(
+                    "{} has invalid Step.env NEXTEST_EXPECTED_EXECUTED={declared:?}: {error}",
+                    step.tag()
+                )
+            })?;
+            if selected == 0 {
+                return Err(format!(
+                    "{} declares zero NEXTEST_EXPECTED_EXECUTED in Step.env",
+                    step.tag()
+                ));
+            }
             let per_attempt = scale_timeout_seconds(
                 DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
                 inner_multiplier,
@@ -10319,40 +10359,69 @@ struct NodeAttempt {
     /// Terminal per-test results written by a controlled runner for this exact attempt.
     /// `None` means no typed result file was published; an empty vector is measured zero.
     test_results: Option<Vec<dagrun::TestResult>>,
+    /// Required structured-result refusal for this attempt, when present.
+    test_results_error: Option<String>,
+    /// Closed step-level attempt cause retained for synthesized compatibility results.
+    test_outcome: Option<TestAttemptOutcome>,
 }
 
 fn attempt_is_no_result(attempt: &NodeAttempt) -> bool {
-    attempt.execution == AttemptExecution::Completed
+    attempt.ok == Some(false)
+        && attempt.execution == AttemptExecution::Completed
         && !attempt.aborted
-        && !test_results_have_product_failure(attempt.test_results.as_deref())
-        && (attempt.returncode == Some(NO_RESULT_EXIT_CODE)
-            || test_results_have_no_result(attempt.test_results.as_deref()))
+        && matches!(
+            attempt.test_outcome,
+            Some(
+                TestAttemptOutcome::CpuTimeout
+                    | TestAttemptOutcome::WallTimeout
+                    | TestAttemptOutcome::Cancelled
+                    | TestAttemptOutcome::InfrastructureError
+                    | TestAttemptOutcome::NoResult
+            )
+        )
 }
 
 fn terminal_test_cause_details(outcomes: &[StepOutcome], attempts: &[NodeAttempt]) -> Vec<String> {
     let mut detail = Vec::new();
     for outcome in outcomes {
         let node_attempts_exist = attempts.iter().any(|attempt| attempt.tag == outcome.tag);
-        let results = terminal_attempt(outcome, attempts)
+        let recorded_attempt = terminal_attempt(outcome, attempts);
+        let result_error = recorded_attempt
+            .and_then(|attempt| attempt.test_results_error.as_deref())
+            .or_else(|| (!node_attempts_exist).then_some(outcome.test_results_error.as_deref()).flatten());
+        if let Some(error) = result_error {
+            detail.push(format!(
+                "node {}: structured test results refused: {error}",
+                outcome.tag
+            ));
+        }
+        let results = recorded_attempt
             .and_then(|attempt| attempt.test_results.as_deref())
             .or_else(|| (!node_attempts_exist).then_some(outcome.test_results.as_deref()).flatten());
         let Some(results) = results else { continue };
         for result in results {
-            let Some(attempt) = terminal_test_attempt(result) else { continue };
-            if attempt.outcome == TestAttemptOutcome::Passed {
+            if result.passed {
                 continue;
             }
-            detail.push(format!(
-                "node {} test {} attempt {}: {}: {}",
-                outcome.tag,
-                result.id,
-                attempt.attempt,
-                test_attempt_outcome_name(attempt.outcome),
-                attempt
-                    .detail
-                    .as_deref()
-                    .unwrap_or("typed runner omitted required detail")
-            ));
+            let Some(test_attempts) = result.attempt_results.as_ref() else {
+                continue;
+            };
+            for attempt in test_attempts {
+                if attempt.outcome == TestAttemptOutcome::Passed {
+                    continue;
+                }
+                detail.push(format!(
+                    "node {} test {} attempt {}: {}: {}",
+                    outcome.tag,
+                    result.id,
+                    attempt.attempt,
+                    test_attempt_outcome_name(attempt.outcome),
+                    attempt
+                        .detail
+                        .as_deref()
+                        .unwrap_or("typed runner omitted required detail")
+                ));
+            }
         }
     }
     detail
@@ -10414,6 +10483,29 @@ fn completed_node_count(outcomes: &[StepOutcome], attempts: &[NodeAttempt]) -> u
         })
         .count()
 }
+fn step_test_attempt_outcome(outcome: &StepOutcome) -> TestAttemptOutcome {
+    if outcome.ok {
+        TestAttemptOutcome::Passed
+    } else if outcome.aborted {
+        TestAttemptOutcome::Cancelled
+    } else if test_results_have_product_failure(outcome.test_results.as_deref()) {
+        TestAttemptOutcome::Failed
+    } else if outcome.cpu_timed_out {
+        TestAttemptOutcome::CpuTimeout
+    } else if outcome.timed_out {
+        TestAttemptOutcome::WallTimeout
+    } else if outcome.test_results_error.is_some() {
+        TestAttemptOutcome::InfrastructureError
+    } else if outcome_is_no_result(outcome)
+        || outcome.returncode.is_none()
+        || reason_is_oom(&outcome.reason)
+    {
+        TestAttemptOutcome::NoResult
+    } else {
+        TestAttemptOutcome::Failed
+    }
+}
+
 
 /// Record one attempt the scheduler REPORTED.
 fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
@@ -10437,6 +10529,8 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
             .then(|| outcome.reason.clone()),
         failure_class,
         test_results: outcome.test_results.clone(),
+        test_results_error: outcome.test_results_error.clone(),
+        test_outcome: Some(step_test_attempt_outcome(outcome)),
     }
 }
 
@@ -10461,6 +10555,8 @@ fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
         failure_class: Some(FailureClass::NoResult),
         failure_detail: Some("no completion payload was reported for this node".into()),
         test_results: None,
+        test_results_error: None,
+        test_outcome: None,
     }
 }
 
@@ -11140,6 +11236,21 @@ mod nextest_timeout_tests {
             .expect_err("a tightened outer CPU cap must not preempt the inner test cap");
         assert!(error.contains(&tag), "{error}");
         assert!(error.contains("outer CPU backup"), "{error}");
+
+        let mut inline_only = portable.clone();
+        let step = inline_only
+            .steps
+            .iter_mut()
+            .find(|step| step.cmd.contains("run-nextest-counted.sh"))
+            .expect("portable DAG has a Nextest node");
+        let declared = step
+            .env
+            .remove("NEXTEST_EXPECTED_EXECUTED")
+            .expect("production Nextest node has a typed count");
+        step.cmd = format!("NEXTEST_EXPECTED_EXECUTED={declared} {}", step.cmd);
+        let error = validate_live_nextest_cpu_ordering([&inline_only], 1.0)
+            .expect_err("an inline command assignment must not replace the typed Step.env count");
+        assert!(error.contains("Step.env"), "{error}");
     }
 }
 
@@ -11165,9 +11276,6 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
     const DEFAULT_TEST_CAP_S: i64 = DEFAULT_TEST_WALL_TIMEOUT_SECONDS as i64;
     const NEXTEST_TERMINATION_GRACE_S: i64 = 2;
     const MANIFEST_TERMINATION_GRACE_S: i64 = 10;
-    const NEXTEST_MAX_ATTEMPTS: u64 = 1;
-    const NEXTEST_NODE_CPU_OVERHEAD_S: u64 = 60;
-    const NEXTEST_OUTER_CPU_SUPPORTED_MULTIPLIER: f64 = 1.5;
 
     fn require_live_nextest_output(tag: &str, command: &str) -> Result<(), String> {
         let Some(wrapper) = command.find("run-nextest-counted.sh") else {
@@ -11202,29 +11310,26 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         }
     }
 
-    fn declared_nextest_count(tag: &str, command: &str) -> Result<u64, String> {
-        let values = command
-            .split_whitespace()
-            .filter_map(|word| word.strip_prefix("NEXTEST_EXPECTED_EXECUTED="))
-            .map(|value| {
-                value.parse::<u64>().map_err(|error| {
-                    format!(
-                        "retry bounds: {tag} has invalid NEXTEST_EXPECTED_EXECUTED={value:?}: {error}"
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        match values.as_slice() {
-            [value] if *value > 0 => Ok(*value),
-            [] => Err(format!(
-                "retry bounds: {tag} must declare one positive NEXTEST_EXPECTED_EXECUTED"
-            )),
-            [0] => Err(format!(
-                "retry bounds: {tag} declares zero NEXTEST_EXPECTED_EXECUTED"
-            )),
-            _ => Err(format!(
-                "retry bounds: {tag} declares NEXTEST_EXPECTED_EXECUTED more than once"
-            )),
+    fn declared_nextest_count(
+        tag: &str,
+        environment: &BTreeMap<String, String>,
+    ) -> Result<u64, String> {
+        let value = environment.get("NEXTEST_EXPECTED_EXECUTED").ok_or_else(|| {
+            format!(
+                "retry bounds: {tag} must declare one positive NEXTEST_EXPECTED_EXECUTED in Step.env"
+            )
+        })?;
+        let parsed = value.parse::<u64>().map_err(|error| {
+            format!(
+                "retry bounds: {tag} has invalid Step.env NEXTEST_EXPECTED_EXECUTED={value:?}: {error}"
+            )
+        })?;
+        if parsed == 0 {
+            Err(format!(
+                "retry bounds: {tag} declares zero NEXTEST_EXPECTED_EXECUTED in Step.env"
+            ))
+        } else {
+            Ok(parsed)
         }
     }
 
@@ -11348,7 +11453,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             .filter(|step| step.cmd.contains("run-nextest-counted.sh"))
         {
             require_live_nextest_output(&step.tag(), &step.cmd)?;
-            let selected_tests = declared_nextest_count(&step.tag(), &step.cmd)?;
+            let selected_tests = declared_nextest_count(&step.tag(), &step.env)?;
             if step.cmd.split_whitespace().any(|word| {
                 word == "--retries" || word.starts_with("--retries=")
             }) {
@@ -11357,19 +11462,13 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
                     step.tag()
                 ));
             }
-            let supported_inner = nextest_outer_cpu_required(
-                &step.tag(),
-                selected_tests,
-                NEXTEST_OUTER_CPU_SUPPORTED_MULTIPLIER,
-            )?;
-            let expected_declared = supported_inner
-                .checked_add(NEXTEST_NODE_CPU_OVERHEAD_S)
-                .ok_or_else(|| format!("retry bounds: {} CPU backup overflowed", step.tag()))?;
+            let expected_declared = nextest_outer_cpu_backup_seconds(selected_tests)
+                .map_err(|error| format!("retry bounds: {}: {error}", step.tag()))?;
             let actual_declared = u64::try_from(step.cpu_timeout)
                 .map_err(|_| format!("retry bounds: {} has no positive CPU backup", step.tag()))?;
             if actual_declared != expected_declared {
                 return Err(format!(
-                    "retry bounds: {} declares {actual_declared}s CPU, expected {selected_tests} tests x {NEXTEST_MAX_ATTEMPTS} attempt(s) x {}s at {NEXTEST_OUTER_CPU_SUPPORTED_MULTIPLIER}x + {NEXTEST_NODE_CPU_OVERHEAD_S}s overhead = {expected_declared}s",
+                    "retry bounds: {} declares {actual_declared}s CPU, expected {selected_tests} tests x {NEXTEST_MAX_ATTEMPTS} attempt(s) x {}s at {NEXTEST_OUTER_CPU_SUPPORTED_MULTIPLIER}x + {NEXTEST_NODE_CPU_OVERHEAD_SECONDS}s overhead = {expected_declared}s",
                     step.tag(),
                     DEFAULT_TEST_CPU_TIMEOUT_SECONDS
                 ));
@@ -12182,19 +12281,19 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             }
             attempt.test_results = Some(if attempt.attempt == 1 {
                 vec![
-                    dagrun::TestResult::new("hermit::fixture$hard_failure".into(), false, 1)
+                    terminal_test_result("hermit::fixture$hard_failure", false, 1, "hard failure")
                         .map_err(|error| format!("end-of-run summary: {error}"))?,
-                    dagrun::TestResult::new(
-                        "hermit::fixture$recovered_on_retry".into(), false, 1,
+                    terminal_test_result(
+                        "hermit::fixture$recovered_on_retry", false, 1, "first attempt failed",
                     )
                     .map_err(|error| format!("end-of-run summary: {error}"))?,
                 ]
             } else {
                 vec![
-                    dagrun::TestResult::new("hermit::fixture$hard_failure".into(), false, 1)
+                    terminal_test_result("hermit::fixture$hard_failure", false, 1, "hard failure")
                         .map_err(|error| format!("end-of-run summary: {error}"))?,
-                    dagrun::TestResult::new(
-                        "hermit::fixture$recovered_on_retry".into(), true, 1,
+                    terminal_test_result(
+                        "hermit::fixture$recovered_on_retry", true, 1, "not used",
                     )
                     .map_err(|error| format!("end-of-run summary: {error}"))?,
                 ]
@@ -12239,8 +12338,10 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         inner_retry.tag = "fixture.nextest_inner".into();
         inner_retry.retry_class = None;
         inner_retry.test_results = Some(vec![
-            dagrun::TestResult::new("hermit::fixture$inner_retry".into(), true, 2)
-                .map_err(|error| format!("end-of-run summary: {error}"))?,
+            terminal_test_result(
+                "hermit::fixture$inner_retry", true, 2, "first attempt failed",
+            )
+            .map_err(|error| format!("end-of-run summary: {error}"))?,
         ]);
         let inner_nodes = BTreeSet::from([inner_retry.tag.clone()]);
         let (inner_observations, inner_errors) =
@@ -12555,12 +12656,17 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     let e2e_attempts = tmp.join("e2e-attempts");
     let e2e_log = tmp.join("e2e-attempts.log");
     let structured_counts = serde_json::json!({
-        "schema": 2,
+        "schema": 3,
         "executed_tests": 2,
         "filtered_tests": 0,
         "results": [
-            {"id": "failing-cell", "result": "fail", "attempts": 2},
-            {"id": "passing-peer", "result": "pass", "attempts": 1},
+            {"id": "failing-cell", "result": "fail", "attempts": 2, "attempt_results": [
+                {"attempt": 1, "outcome": "failed", "detail": "manifest attempt failed"},
+                {"attempt": 2, "outcome": "failed", "detail": "manifest attempt failed"}
+            ]},
+            {"id": "passing-peer", "result": "pass", "attempts": 1, "attempt_results": [
+                {"attempt": 1, "outcome": "passed", "detail": null}
+            ]},
         ],
     })
     .to_string();
@@ -12610,8 +12716,8 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         || e2e_node_attempts.len() != 1
         || e2e_results
             != Some(&vec![
-                dagrun::TestResult::new("failing-cell".into(), false, 2)?,
-                dagrun::TestResult::new("passing-peer".into(), true, 1)?,
+                terminal_test_result("failing-cell", false, 2, "manifest attempt failed")?,
+                terminal_test_result("passing-peer", true, 1, "not used")?,
             ])
         || recorded_attempts.lines().collect::<Vec<_>>() != ["run"]
     {
@@ -14131,20 +14237,54 @@ fn compat_test_results(
                 latest.attempt
             ));
         }
-        let passed = match latest_result {
-            Some("pass") => true,
-            Some("fail") => false,
-            _ => {
-                return Err(format!(
-                    "structured compatibility result {label} latest attempt {} has no pass/fail verdict",
-                    latest.attempt
-                ));
-            }
-        };
-        let attempt_count = u64::try_from(latest.attempt).map_err(|_| {
-            format!("structured compatibility attempts overflowed for {label}")
-        })?;
-        results.push(TestResult::new(label.to_string(), passed, attempt_count)?);
+        let passed = latest_result == Some("pass");
+        let mut matching_attempts = attempts
+            .iter()
+            .filter(|attempt| attempt.tag == tag)
+            .collect::<Vec<_>>();
+        matching_attempts.sort_by_key(|attempt| attempt.attempt);
+        let typed_attempts = matching_attempts
+            .into_iter()
+            .map(|attempt| {
+                if !attempt.reported || attempt.execution != AttemptExecution::Completed {
+                    return Err(format!(
+                        "structured compatibility result {label} attempt {} has no completed report",
+                        attempt.attempt
+                    ));
+                }
+                let typed_outcome = attempt.test_outcome.ok_or_else(|| {
+                    format!(
+                        "structured compatibility result {label} attempt {} has no typed cause",
+                        attempt.attempt
+                    )
+                })?;
+                let detail = if typed_outcome == TestAttemptOutcome::Passed {
+                    None
+                } else {
+                    let detail = attempt
+                        .failure_detail
+                        .as_deref()
+                        .filter(|detail| !detail.trim().is_empty())
+                        .or_else(|| {
+                            (!attempt.reason.trim().is_empty()).then_some(attempt.reason.as_str())
+                        })
+                        .ok_or_else(|| {
+                            format!(
+                                "structured compatibility result {label} attempt {} has no failure reason",
+                                attempt.attempt
+                            )
+                        })?;
+                    Some(detail.to_string())
+                };
+                let outcome = typed_outcome;
+                TestAttemptResult::new(attempt.attempt as u64, outcome, detail)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        results.push(TestResult::with_attempt_results(
+            label.to_string(),
+            passed,
+            typed_attempts,
+        )?);
     }
     let executed = u64::try_from(results.len())
         .map_err(|_| "structured compatibility result count does not fit u64".to_string())?;
@@ -14251,6 +14391,7 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         executed_tests,
         filtered_tests: Some(0),
         test_results: None,
+        test_results_error: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -14304,6 +14445,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         executed_tests,
         filtered_tests,
         test_results: None,
+        test_results_error: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -14337,8 +14479,8 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
 
     let mut exact = outcome("test.exact", false, Some(2), Some(0));
     exact.test_results = Some(vec![
-        TestResult::new("case-a".into(), true, 1)?,
-        TestResult::new("case-b".into(), false, 2)?,
+        terminal_test_result("case-a", true, 1, "not used")?,
+        terminal_test_result("case-b", false, 2, "fixture failure")?,
     ]);
     if libtest_counts(std::slice::from_ref(&exact)) != (Some(2), Some(1), Some(0)) {
         return Err("typed libtest counts: exact per-test results did not report one pass".into());
@@ -14353,8 +14495,8 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
 
     let mut mixed_failure = outcome("test.mixed-failure", false, Some(2), Some(1));
     mixed_failure.test_results = Some(vec![
-        TestResult::new("mixed-pass".into(), true, 1)?,
-        TestResult::new("mixed-fail".into(), false, 1)?,
+        terminal_test_result("mixed-pass", true, 1, "not used")?,
+        terminal_test_result("mixed-fail", false, 1, "fixture failure")?,
     ]);
     let successful_count_only = outcome("test.successful-count-only", true, Some(3), Some(2));
     if libtest_counts(&[mixed_failure, successful_count_only])
@@ -14386,14 +14528,58 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         || compat.filtered_tests != 0
         || compat_rows
             != &vec![
-                TestResult::new("pass-case".into(), true, 1)?,
-                TestResult::new("fail-case".into(), false, 2)?,
+                terminal_test_result("pass-case", true, 1, "not used")?,
+                terminal_test_result("fail-case", false, 2, "test failure")?,
             ]
     {
         return Err(format!(
             "typed libtest counts: compatibility results lost a verdict or attempt: {compat:?}"
         ));
     }
+    let mut compat_cpu = outcome("compat.cpu-timeout", false, None, None);
+    compat_cpu.cpu_timed_out = true;
+    compat_cpu.reason = "CPU TIMEOUT: used 22.1s > 22s".into();
+    let mut compat_wall = outcome("compat.wall-timeout", false, None, None);
+    compat_wall.timed_out = true;
+    compat_wall.reason = "WALL TIMEOUT: ran 57.1s > 57s".into();
+    let mut compat_infra = outcome("compat.infrastructure", false, None, None);
+    compat_infra.test_results_error = Some("current result file is malformed".into());
+    compat_infra.reason =
+        "STRUCTURED TEST RESULTS REFUSED: current result file is malformed".into();
+    let mut compat_none = outcome("compat.no-result", false, None, None);
+    compat_none.returncode = Some(NO_RESULT_EXIT_CODE);
+    compat_none.reason = "runner produced no usable result".into();
+    let typed_compat_outcomes = [
+        compat_cpu.clone(),
+        compat_wall.clone(),
+        compat_infra.clone(),
+        compat_none.clone(),
+    ];
+    let typed_compat_attempts = typed_compat_outcomes
+        .iter()
+        .map(|outcome| reported_attempt(outcome, 1))
+        .collect::<Vec<_>>();
+    let typed_compat =
+        compat_test_results(&typed_compat_outcomes, &typed_compat_attempts, "compat.")?;
+    let typed_compat_causes = typed_compat
+        .results
+        .unwrap()
+        .into_iter()
+        .map(|result| result.attempt_results.unwrap()[0].outcome)
+        .collect::<Vec<_>>();
+    if typed_compat_causes
+        != [
+            TestAttemptOutcome::CpuTimeout,
+            TestAttemptOutcome::WallTimeout,
+            TestAttemptOutcome::InfrastructureError,
+            TestAttemptOutcome::NoResult,
+        ]
+    {
+        return Err(format!(
+            "typed libtest counts: compatibility causes were coarsened: {typed_compat_causes:?}"
+        ));
+    }
+
     if run_test_counts(
         &[
             full[0].clone(),
@@ -14502,51 +14688,170 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
 }
 
 fn typed_test_cause_propagation_bracket() -> Result<(), String> {
+    let cell = |
+        name: &str,
+        outcome: &str,
+        result: Option<ObservedResult>,
+        failure_class: FailureClass,
+        error_kind: &str,
+        reason: &str,
+    | CellResult {
+        schema: CELL_RESULT_SCHEMA,
+        run_id: "typed-cause-fixture".into(),
+        machine_shortname: "fixture-host".into(),
+        kernel_version: "fixture-kernel".into(),
+        host_capabilities: BTreeMap::new(),
+        attempt: 1,
+        run_index: None,
+        hermit_sha: "fixture-sha".into(),
+        source_tree_dirty: false,
+        binary_sha256: Some("fixture-binary".into()),
+        binary_build_sha: Some("fixture-sha".into()),
+        test_sha256: "fixture-test".into(),
+        test: format!("fixture::{name}"),
+        category: "fixture".into(),
+        lane: "portable".into(),
+        mode: "verify".into(),
+        backend: Some("kvm".into()),
+        classification: "required".into(),
+        outcome: outcome.into(),
+        result,
+        failure_class: Some(failure_class),
+        error_kind: Some(error_kind.into()),
+        timeout_seconds: 57,
+        execution_cpu_timeout_seconds: Some(22),
+        execution_wall_timeout_seconds: Some(57),
+        duration_ms: Some(1),
+        cpu_usage_usec: Some(1),
+        runtime: None,
+        log_level: None,
+        effective_args: Vec::new(),
+        argv: vec!["hermit".into()],
+        guest_argv: vec!["guest".into()],
+        env: BTreeMap::new(),
+        cwd: "/fixture".into(),
+        shell_command: "hermit run -- guest".into(),
+        relaxations: Vec::new(),
+        execution_path: None,
+        diversity: None,
+        attempts: Vec::new(),
+        first_divergent_scheduler_turn: None,
+        first_divergent_virtual_nanoseconds: None,
+        first_divergent_record: None,
+        first_divergent_syscall: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
+        reason: Some(reason.into()),
+        artifact_dir: "/fixture/artifacts".into(),
+    };
     let cases = [
-        (TestAttemptOutcome::Failed, "failed", Verdict::Fail, FinalValidateStatus::Failed),
+        (
+            TestAttemptOutcome::Failed,
+            "failed",
+            Verdict::Fail,
+            FinalValidateStatus::Failed,
+            cell(
+                "failed",
+                "FAIL",
+                Some(ObservedResult::CrashError),
+                FailureClass::ProductFailure,
+                "guest-exit",
+                "guest exited 7",
+            ),
+        ),
         (
             TestAttemptOutcome::CpuTimeout,
             "cpu_timeout",
             Verdict::NoResult,
             FinalValidateStatus::CouldNotRun,
+            cell(
+                "cpu_timeout",
+                "FAIL",
+                Some(ObservedResult::Timeout),
+                FailureClass::NoResult,
+                "cpu-timeout",
+                "cell exceeded 22 CPU s",
+            ),
         ),
         (
             TestAttemptOutcome::WallTimeout,
             "wall_timeout",
             Verdict::NoResult,
             FinalValidateStatus::CouldNotRun,
+            cell(
+                "wall_timeout",
+                "FAIL",
+                Some(ObservedResult::Timeout),
+                FailureClass::NoResult,
+                "wall-timeout",
+                "cell exceeded 57 wall s backstop",
+            ),
         ),
         (
             TestAttemptOutcome::Cancelled,
             "cancelled",
             Verdict::NoResult,
             FinalValidateStatus::CouldNotRun,
+            cell(
+                "cancelled",
+                "ERROR",
+                None,
+                FailureClass::NoResult,
+                "cancelled",
+                "cancelled by signal 15",
+            ),
         ),
         (
             TestAttemptOutcome::InfrastructureError,
             "infrastructure_error",
             Verdict::NoResult,
             FinalValidateStatus::CouldNotRun,
+            cell(
+                "infrastructure_error",
+                "ERROR",
+                None,
+                FailureClass::UnderstoodInfrastructureFailure,
+                "accounting-error",
+                "cpu.stat was unreadable",
+            ),
+        ),
+        (
+            TestAttemptOutcome::NoResult,
+            "no_result",
+            Verdict::NoResult,
+            FinalValidateStatus::CouldNotRun,
+            cell(
+                "no_result",
+                "ERROR",
+                None,
+                FailureClass::NoResult,
+                "incomplete-verification-evidence",
+                "KVM guest execution failed: guest exception vector 13",
+            ),
         ),
     ];
+    let case_count = cases.len();
     let directory = tempfile::tempdir()
         .map_err(|error| format!("typed test causes: cannot create fixture directory: {error}"))?;
     let mut distinct_results = BTreeSet::new();
-    for (attempt_outcome, name, verdict, status) in cases {
-        let source = TestResults::current(
-            1,
-            0,
-            vec![TestResult::with_attempt_results(
-                format!("fixture::{name}"),
-                false,
-                vec![dagrun::TestAttemptResult::new(
-                    1,
-                    attempt_outcome,
-                    Some(format!("{name} fixture cause")),
-                )?],
-            )?],
-        )?;
+    for (attempt_outcome, name, verdict, status, cell) in cases {
+        let jsonl = serde_json::to_string(&cell)
+            .map_err(|error| format!("typed test causes: cannot serialize {name}: {error}"))?;
+        let parsed_cell = serde_json::from_str::<CellResult>(&jsonl)
+            .map_err(|error| format!("typed test causes: cannot parse {name}: {error}"))?;
+        let source = structured_test_results(&[vec![parsed_cell]])?;
         let parsed = TestResults::from_json_slice(&source.to_current_json()?)?;
+        let typed_attempt = parsed.results.as_ref().unwrap()[0]
+            .attempt_results
+            .as_ref()
+            .unwrap()[0]
+            .clone();
+        if typed_attempt.outcome != attempt_outcome {
+            return Err(format!(
+                "typed test causes: {name} became {:?}, expected {attempt_outcome:?}",
+                typed_attempt.outcome
+            ));
+        }
         let outcome = StepOutcome {
             tag: "test.typed-cause".into(),
             ok: false,
@@ -14555,6 +14860,7 @@ fn typed_test_cause_propagation_bracket() -> Result<(), String> {
             executed_tests: Some(parsed.executed_tests),
             filtered_tests: Some(parsed.filtered_tests),
             test_results: parsed.results,
+            test_results_error: None,
             returncode: Some(1),
             oomed: false,
             oom_kills: 0,
@@ -14583,8 +14889,9 @@ fn typed_test_cause_propagation_bracket() -> Result<(), String> {
             std::slice::from_ref(&outcome),
             std::slice::from_ref(&attempt),
         );
+        let detail = typed_attempt.detail.as_deref().unwrap();
         let expected_cause = format!(
-            "node test.typed-cause test fixture::{name} attempt 1: {name}: {name} fixture cause"
+            "node test.typed-cause test fixture::{name} [kvm/verify] attempt 1: {name}: {detail}"
         );
         if cause != [expected_cause.clone()] {
             return Err(format!(
@@ -14604,6 +14911,7 @@ fn typed_test_cause_propagation_bracket() -> Result<(), String> {
             COULD_NOT_RUN_EXIT_CODE
         };
         let mut summary = RunSummary::new(verdict, exit_code, "self-test", cause);
+        summary.commit = "0123456789012345678901234567890123456789".into();
         summary.nodes_executed = 1;
         summary.executed_tests = Some(1);
         summary.passed_tests = Some(0);
@@ -14627,11 +14935,198 @@ fn typed_test_cause_propagation_bracket() -> Result<(), String> {
         }
         distinct_results.insert(bytes);
     }
-    if distinct_results.len() != cases.len() {
+    let missing_error = "required structured test results were not written to /fixture/counts.json";
+    let missing_outcome = StepOutcome {
+        tag: "test.missing-results".into(),
+        ok: false,
+        duration_s: 1.0,
+        summary: String::new(),
+        executed_tests: None,
+        filtered_tests: None,
+        test_results: None,
+        test_results_error: Some(missing_error.into()),
+        returncode: Some(0),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
+        reason: format!("STRUCTURED TEST RESULTS REFUSED: {missing_error}"),
+        aborted: false,
+    };
+    if outcome_is_failure(&missing_outcome) || !outcome_is_no_result(&missing_outcome) {
+        return Err("typed test causes: missing required result became a product failure".into());
+    }
+    let missing_attempt = reported_attempt(&missing_outcome, 1);
+    let missing_gate = ledger_gate_with_attempts(
+        &missing_outcome,
+        std::slice::from_ref(&missing_attempt),
+    );
+    if missing_gate["result"] != "no_result"
+        || missing_gate["failure_class"] != "no_result"
+        || missing_gate["attempts"][0]["result"] != "no_result"
+    {
+        return Err(format!(
+            "typed test causes: missing required result did not survive the ledger: {missing_gate}"
+        ));
+    }
+    let missing_detail = terminal_test_cause_details(
+        std::slice::from_ref(&missing_outcome),
+        std::slice::from_ref(&missing_attempt),
+    );
+    let expected_missing_detail =
+        format!("node test.missing-results: structured test results refused: {missing_error}");
+    if missing_detail != [expected_missing_detail.clone()] {
+        return Err(format!(
+            "typed test causes: missing required result lost its exact cause: {missing_detail:?}"
+        ));
+    }
+    let mut missing_summary = RunSummary::new(
+        Verdict::NoResult,
+        COULD_NOT_RUN_EXIT_CODE,
+        "self-test",
+        missing_detail,
+    );
+    missing_summary.commit = "0123456789012345678901234567890123456789".into();
+    missing_summary.nodes_executed = 1;
+    missing_summary.selection_mode = Some("full".into());
+    let missing_path = directory.path().join("missing-results.json");
+    write_validation_service_result(&missing_path, &missing_summary)?;
+    let missing_service = ValidationServiceResult::from_json_slice(
+        &std::fs::read(&missing_path)
+            .map_err(|error| format!("typed test causes: cannot read missing result: {error}"))?,
+    )?;
+    if missing_service.final_validate_status != FinalValidateStatus::CouldNotRun
+        || missing_service.detail.as_deref() != Some([expected_missing_detail].as_slice())
+    {
+        return Err(format!(
+            "typed test causes: missing required result did not reach service detail: {missing_service:?}"
+        ));
+    }
+
+    let mixed_product = cell(
+        "mixed",
+        "FAIL",
+        Some(ObservedResult::CrashError),
+        FailureClass::ProductFailure,
+        "guest-exit",
+        "attempt 1 guest exited 7",
+    );
+    let mut mixed_no_result = cell(
+        "mixed",
+        "ERROR",
+        None,
+        FailureClass::NoResult,
+        "incomplete-verification-evidence",
+        "attempt 2 KVM guest exception vector 13",
+    );
+    mixed_no_result.attempt = 2;
+    let mixed = structured_test_results(&[vec![mixed_product, mixed_no_result]])?;
+    let mixed_attempts = mixed.results.as_ref().unwrap()[0]
+        .attempt_results
+        .as_ref()
+        .unwrap();
+    if mixed_attempts
+        .iter()
+        .map(|attempt| attempt.outcome)
+        .collect::<Vec<_>>()
+        != [TestAttemptOutcome::Failed, TestAttemptOutcome::NoResult]
+    {
+        return Err(format!(
+            "typed test causes: mixed retry lost its attempt causes: {mixed_attempts:?}"
+        ));
+    }
+    let mixed_outcome = StepOutcome {
+        tag: "test.mixed-cause".into(),
+        ok: false,
+        duration_s: 2.0,
+        summary: String::new(),
+        executed_tests: Some(mixed.executed_tests),
+        filtered_tests: Some(mixed.filtered_tests),
+        test_results: mixed.results,
+        test_results_error: None,
+        returncode: Some(NO_RESULT_EXIT_CODE),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
+        reason: "mixed retry exhausted".into(),
+        aborted: false,
+    };
+    if !outcome_is_failure(&mixed_outcome) || outcome_is_no_result(&mixed_outcome) {
+        return Err(
+            "typed test causes: an earlier product failure lost precedence over later no_result"
+                .into(),
+        );
+    }
+    let mixed_detail = terminal_test_cause_details(std::slice::from_ref(&mixed_outcome), &[]);
+    if mixed_detail.len() != 2
+        || !mixed_detail[0].contains("attempt 1: failed: ")
+        || !mixed_detail[1].contains("attempt 2: no_result: ")
+    {
+        return Err(format!(
+            "typed test causes: mixed retry did not retain both causes: {mixed_detail:?}"
+        ));
+    }
+
+    let recovered = TestResult::with_attempt_results(
+        "fixture::recovered [kvm/verify]".into(),
+        true,
+        vec![
+            TestAttemptResult::new(
+                1,
+                TestAttemptOutcome::CpuTimeout,
+                Some("attempt 1 exceeded its CPU-time bound".into()),
+            )?,
+            TestAttemptResult::new(2, TestAttemptOutcome::Passed, None)?,
+        ],
+    )?;
+    let mut recovered_outcome = mixed_outcome.clone();
+    recovered_outcome.tag = "test.recovered-cause".into();
+    recovered_outcome.ok = true;
+    recovered_outcome.returncode = Some(0);
+    recovered_outcome.reason = "runner passed after retry".into();
+    recovered_outcome.test_results = Some(vec![recovered]);
+    if outcome_is_failure(&recovered_outcome)
+        || outcome_is_no_result(&recovered_outcome)
+        || step_test_attempt_outcome(&recovered_outcome) != TestAttemptOutcome::Passed
+        || !terminal_test_cause_details(std::slice::from_ref(&recovered_outcome), &[]).is_empty()
+    {
+        return Err(
+            "typed test causes: a recovered CPU timeout changed the terminal pass".into(),
+        );
+    }
+
+    recovered_outcome.ok = false;
+    recovered_outcome.returncode = Some(0);
+    recovered_outcome.reason = "STRUCTURED TEST RESULTS REFUSED: current result is malformed".into();
+    recovered_outcome.test_results_error = Some("current result is malformed".into());
+    if outcome_is_failure(&recovered_outcome)
+        || !outcome_is_no_result(&recovered_outcome)
+        || step_test_attempt_outcome(&recovered_outcome)
+            != TestAttemptOutcome::InfrastructureError
+        || terminal_test_cause_details(std::slice::from_ref(&recovered_outcome), &[])
+            != ["node test.recovered-cause: structured test results refused: current result is malformed"]
+    {
+        return Err(
+            "typed test causes: a recovered timeout overrode an outer infrastructure error".into(),
+        );
+    }
+
+    recovered_outcome.cpu_timed_out = true;
+    if step_test_attempt_outcome(&recovered_outcome) != TestAttemptOutcome::CpuTimeout {
+        return Err("typed test causes: outer CPU timeout did not outrank missing structured evidence".into());
+    }
+    recovered_outcome.cpu_timed_out = false;
+    recovered_outcome.timed_out = true;
+    if step_test_attempt_outcome(&recovered_outcome) != TestAttemptOutcome::WallTimeout {
+        return Err("typed test causes: outer wall timeout did not outrank missing structured evidence".into());
+    }
+
+    if distinct_results.len() != case_count {
         return Err("typed test causes: mutating the cause did not change every service result".into());
     }
     println!(
-        "  typed test causes: ordinary failure, CPU timeout, wall timeout, cancellation, and infrastructure error survive runner JSON through ledger, service JSON, and terminal output"
+        "  typed test causes: ordinary failure, CPU timeout, wall timeout, cancellation, infrastructure error, and no_result survive CellResult JSONL through ledger, service JSON, and terminal output"
     );
     Ok(())
 }
@@ -14749,6 +15244,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         executed_tests: Some(1),
         filtered_tests: Some(0),
         test_results: None,
+        test_results_error: None,
         returncode: Some(1),
         oomed: false,
         oom_kills: 0,
@@ -15657,6 +16153,7 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         executed_tests: None,
         filtered_tests: None,
         test_results: None,
+        test_results_error: None,
         returncode,
         oomed: false,
         oom_kills: 0,
@@ -15696,6 +16193,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         executed_tests: None,
         filtered_tests: None,
         test_results: None,
+        test_results_error: None,
         returncode: Some(returncode),
         oomed: false,
         oom_kills: 0,
@@ -19714,6 +20212,7 @@ fn stop_test_seam(
         executed_tests: None,
         filtered_tests: None,
         test_results: None,
+        test_results_error: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,
@@ -19908,6 +20407,12 @@ mod e2e_attempt_tests {
         );
         assert_eq!(validation_step_identity(&ordinary), ValidationStepIdentity::Other);
         assert!(!ordinary.env.contains_key("E2E_ATTEMPT"));
+    }
+
+    #[test]
+    fn typed_cell_causes_reach_the_terminal_service_result() {
+        typed_test_cause_propagation_bracket()
+            .expect("typed CellResult causes must survive every reporting boundary");
     }
 
 }

@@ -225,6 +225,30 @@ fn suite_population(
     Ok(population.max(test_count))
 }
 
+fn nextest_terminal_result(
+    id: String,
+    passed: bool,
+    attempts: u64,
+) -> Result<TestResult, String> {
+    let rows = (1..=attempts)
+        .map(|attempt| {
+            let terminal_pass = passed && attempt == attempts;
+            TestAttemptResult::new(
+                attempt,
+                if terminal_pass {
+                    TestAttemptOutcome::Passed
+                } else {
+                    TestAttemptOutcome::Failed
+                },
+                (!terminal_pass).then(|| {
+                    "nextest reported a failed attempt without per-attempt accounting".to_string()
+                }),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    TestResult::with_attempt_results(id, passed, rows)
+}
+
 fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
     let mut results = BTreeMap::new();
     let mut expected_attempts = Vec::new();
@@ -343,7 +367,7 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
                         passed: event == "ok" && attempt == attempts,
                     });
                 }
-                let result = TestResult::new(id.clone(), event == "ok", attempts)?;
+                let result = nextest_terminal_result(id.clone(), event == "ok", attempts)?;
                 if results.insert(id.clone(), result).is_some() {
                     return Err(format!(
                         "nextest-test-results line {line_number}: duplicate terminal test id {id:?}"
@@ -582,6 +606,18 @@ fn parse_u64(value: String, name: &str) -> Result<u64, String> {
         .map_err(|error| format!("nextest-test-results {name}: {error}"))
 }
 
+fn validate_status_against_results(status: u64, failed: u64) -> Result<(), String> {
+    match (status == 0, failed == 0) {
+        (true, true) | (false, false) => Ok(()),
+        (true, false) => Err(format!(
+            "nextest-test-results: successful nextest status disagrees with {failed} failed typed result(s)"
+        )),
+        (false, true) => Err(format!(
+            "nextest-test-results: unsuccessful nextest status {status} has zero failed typed result(s); refusing to publish an all-pass record for an unsuccessful runner"
+        )),
+    }
+}
+
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let Some(first) = args.next() else {
@@ -636,11 +672,7 @@ fn run() -> Result<(), String> {
         .executed_tests
         .checked_sub(passed)
         .ok_or_else(|| "nextest-test-results: passed count exceeds executed count".to_string())?;
-    if status == 0 && failed != 0 {
-        return Err(format!(
-            "nextest-test-results: successful nextest status disagrees with {failed} failed typed result(s)"
-        ));
-    }
+    validate_status_against_results(status, failed)?;
     let (classified_results, cpu_report) = match (attempt_records, binary_map, cpu_report) {
         (Some(records), Some(binary_map), Some(output)) => {
             let binary_map = read_binary_map(Path::new(&binary_map))?;
@@ -648,9 +680,9 @@ fn run() -> Result<(), String> {
             let results = classified_test_results(&parsed, &binary_map, &report)?;
             (results, Some((report, output)))
         }
-        // Compatibility for parser-only callers. Production run-nextest-counted always supplies
-        // the three CPU arguments, so its current rows carry classified attempts; `null` states
-        // honestly that an older caller supplied no per-attempt accounting.
+        // Parser-only callers retain the cause reported by nextest. Production
+        // run-nextest-counted supplies the CPU records and can classify timeouts
+        // and accounting failures more precisely.
         (None, None, None) => (parsed.results.clone(), None),
         _ => unreachable!("argument pairing was checked above"),
     };
@@ -859,8 +891,8 @@ mod tests {
         assert_eq!(
             parsed.results,
             vec![
-                TestResult::new("hermit$shared_case".into(), true, 2).unwrap(),
-                TestResult::new("hermit::hermit$shared_case".into(), true, 1).unwrap(),
+                nextest_terminal_result("hermit$shared_case".into(), true, 2).unwrap(),
+                nextest_terminal_result("hermit::hermit$shared_case".into(), true, 1).unwrap(),
             ]
         );
         let map = BinaryMap {
@@ -938,8 +970,8 @@ mod tests {
         assert_eq!(
             parse_event_text(events).unwrap().results,
             vec![
-                TestResult::new("alpha$case".into(), true, 1).unwrap(),
-                TestResult::new("beta::tool$case".into(), true, 1).unwrap(),
+                nextest_terminal_result("alpha$case".into(), true, 1).unwrap(),
+                nextest_terminal_result("beta::tool$case".into(), true, 1).unwrap(),
             ]
         );
     }
@@ -957,8 +989,8 @@ mod tests {
         assert_eq!(
             parse_event_text(events).unwrap().results,
             vec![
-                TestResult::new("pkg@stress-1$case".into(), true, 1).unwrap(),
-                TestResult::new("pkg@stress-2$case".into(), true, 1).unwrap(),
+                nextest_terminal_result("pkg@stress-1$case".into(), true, 1).unwrap(),
+                nextest_terminal_result("pkg@stress-2$case".into(), true, 1).unwrap(),
             ]
         );
     }
@@ -1402,5 +1434,17 @@ mod tests {
             .identity_for_executable(Path::new("/tmp/substituted-binary"))
             .unwrap_err();
         assert!(error.contains("absent from the typed inventory"), "{error}");
+    }
+
+    #[test]
+    fn nextest_exit_status_and_typed_terminal_rows_must_agree() {
+        assert_eq!(validate_status_against_results(0, 0), Ok(()));
+        assert_eq!(validate_status_against_results(100, 2), Ok(()));
+        assert!(validate_status_against_results(0, 1)
+            .unwrap_err()
+            .contains("successful nextest status disagrees"));
+        let error = validate_status_against_results(100, 0).unwrap_err();
+        assert!(error.contains("unsuccessful nextest status 100"), "{error}");
+        assert!(error.contains("zero failed typed result"), "{error}");
     }
 }

@@ -210,6 +210,30 @@ def main() -> int:
             "allowlist admits `evidence` and does NOT admit the planted key",
         )
 
+        original_expectation = rm.expectation
+        rm.expectation = lambda _backend, name, _verify: (
+            ("gap", "configured gap") if name == "gap" else ("pass", "")
+        )
+        try:
+            blocked_rows, blocked_executed, blocked_filtered = rm.blocked_backend_rows(
+                "dbt", ["required", "gap"], False, False, "backend unavailable"
+            )
+        finally:
+            rm.expectation = original_expectation
+        check(
+            blocked_executed == 1
+            and blocked_filtered == 1
+            and [row["result"] for row in blocked_rows] == ["BLOCKED", "GAP"],
+            "a required unavailable backend publishes BLOCKED/no_result evidence",
+        )
+        check(
+            rm.matrix_exit_code(0, 1) == 125
+            and rm.matrix_exit_code(1, 1) == 1
+            and rm.matrix_exit_code(0, 0) == 0,
+            "backend parity exits no-result only when no product failure outranks it",
+        )
+
+
         # The scheduler must consume a producer-owned file, not a line that a
         # test can counterfeit on stdout. The file is exact, atomic and absent
         # when no scheduler-owned destination was provided.
@@ -223,11 +247,37 @@ def main() -> int:
                         "test_name": "passes",
                         "backend": "dbt",
                         "result": "PASS",
+                        "detail": "matched",
                     },
                     {
                         "test_name": "fails",
                         "backend": "dbt",
                         "result": "FAIL",
+                        "detail": "detail text",
+                    },
+                    {
+                        "test_name": "cannot-run",
+                        "backend": "dbt",
+                        "result": "ERROR",
+                        "detail": "launcher refused",
+                    },
+                    {
+                        "test_name": "blocked",
+                        "backend": "dbt",
+                        "result": "BLOCKED",
+                        "detail": "host policy blocks CPUID interception",
+                    },
+                    {
+                        "test_name": "timed-out",
+                        "backend": "dbt",
+                        "result": "TIMEOUT",
+                        "detail": "run 1 timed out",
+                    },
+                    {
+                        "test_name": "missing-verification-report",
+                        "backend": "dbt",
+                        "result": "NO_RESULT",
+                        "detail": "verify produced no usable current typed verification report",
                     },
                     {
                         "test_name": "configured-gap",
@@ -235,7 +285,7 @@ def main() -> int:
                         "result": "GAP",
                     },
                 ],
-                2,
+                6,
                 1,
                 "strict",
             )
@@ -247,19 +297,77 @@ def main() -> int:
         check(
             json.loads(counts.read_text(encoding="utf-8"))
             == {
-                "schema": 2,
-                "executed_tests": 2,
+                "schema": 3,
+                "executed_tests": 6,
                 "filtered_tests": 1,
                 "results": [
                     {
                         "id": "backend-parity/passes [dbt/strict]",
                         "result": "pass",
                         "attempts": 1,
+                        "attempt_results": [
+                            {"attempt": 1, "outcome": "passed", "detail": None}
+                        ],
                     },
                     {
                         "id": "backend-parity/fails [dbt/strict]",
                         "result": "fail",
                         "attempts": 1,
+                        "attempt_results": [
+                            {
+                                "attempt": 1,
+                                "outcome": "failed",
+                                "detail": "detail text",
+                            }
+                        ],
+                    },
+                    {
+                        "id": "backend-parity/cannot-run [dbt/strict]",
+                        "result": "fail",
+                        "attempts": 1,
+                        "attempt_results": [
+                            {
+                                "attempt": 1,
+                                "outcome": "infrastructure_error",
+                                "detail": "launcher refused",
+                            }
+                        ],
+                    },
+                    {
+                        "id": "backend-parity/blocked [dbt/strict]",
+                        "result": "fail",
+                        "attempts": 1,
+                        "attempt_results": [
+                            {
+                                "attempt": 1,
+                                "outcome": "no_result",
+                                "detail": "host policy blocks CPUID interception",
+                            }
+                        ],
+                    },
+                    {
+                        "id": "backend-parity/timed-out [dbt/strict]",
+                        "result": "fail",
+                        "attempts": 1,
+                        "attempt_results": [
+                            {
+                                "attempt": 1,
+                                "outcome": "wall_timeout",
+                                "detail": "run 1 timed out",
+                            }
+                        ],
+                    },
+                    {
+                        "id": "backend-parity/missing-verification-report [dbt/strict]",
+                        "result": "fail",
+                        "attempts": 1,
+                        "attempt_results": [
+                            {
+                                "attempt": 1,
+                                "outcome": "no_result",
+                                "detail": "verify produced no usable current typed verification report",
+                            }
+                        ],
                     },
                 ],
             },

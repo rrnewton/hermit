@@ -27,6 +27,7 @@ use serde::Deserialize;
 
 use crate::runner::E2E_KERNEL_VERSION_ENV;
 use crate::runner::E2E_MACHINE_SHORTNAME_ENV;
+use crate::timeouts::nextest_outer_cpu_backup_seconds;
 use crate::validation_dag_static::NEXTEST_EXPECTED_COUNTS;
 use crate::validation_dag_static::StructuredResultProducerKind;
 
@@ -810,7 +811,19 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             expected_counts.remove(tag.as_str()),
             step.env.get("NEXTEST_EXPECTED_EXECUTED"),
         ) {
-            (Some(expected_count), Some(actual)) if actual == &expected_count.to_string() => {}
+            (Some(expected_count), Some(actual)) if actual == &expected_count.to_string() => {
+                let expected_cpu_timeout = i64::try_from(
+                    nextest_outer_cpu_backup_seconds(expected_count)
+                        .map_err(|error| format!("{tag}: {error}"))?,
+                )
+                .map_err(|error| format!("{tag} Nextest CPU backup does not fit i64: {error}"))?;
+                if step.cpu_timeout != expected_cpu_timeout {
+                    return Err(format!(
+                        "{tag} declares {}s CPU, expected the formula-derived backup of {expected_cpu_timeout}s for {expected_count} selected tests",
+                        step.cpu_timeout
+                    ));
+                }
+            }
             (Some(expected_count), Some(actual)) => {
                 return Err(format!(
                     "{tag} expects {expected_count} Nextest tests but declares {actual:?}"
@@ -1198,14 +1211,14 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 ("privileged-only-build.privileged_tests_on_host", 7200),
                 ("privileged-only-cpuid.faulting_on_host", 7200),
                 ("privileged-only-pmu.preemption_on_host", 7200),
-                ("privileged-only-test.pmu_buck_chaos_cases_on_host", 7200),
+                ("privileged-only-test.pmu_buck_chaos_cases_on_host", 258),
                 ("privileged-build.manifest_guests_on_host", 7200),
                 ("privileged-only-e2e.manifest_applications_on_host", 7200),
                 (
                     "privileged-only-e2e.manifest_backend_parity_c_on_host",
                     7200,
                 ),
-                ("privileged-only-test.cli_kvm_on_host", 7200),
+                ("privileged-only-test.cli_kvm_on_host", 852),
             ]
             .into_iter()
             .map(|(tag, cpu)| (tag.to_string(), cpu))
@@ -1765,6 +1778,19 @@ mod tests {
             let error = assert_structured_result_producers(&changed).unwrap_err();
             assert!(error.contains(tag), "{error}");
         }
+
+        let mut stale_cpu_backup = committed.clone();
+        let step = stale_cpu_backup
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.regular_crates")
+            .unwrap();
+        step.cpu_timeout -= 1;
+        let error = assert_structured_result_producers(&stale_cpu_backup).unwrap_err();
+        assert!(
+            error.contains("test.regular_crates") && error.contains("formula-derived backup"),
+            "{error}"
+        );
 
         let mut inline_count = committed.clone();
         inline_count

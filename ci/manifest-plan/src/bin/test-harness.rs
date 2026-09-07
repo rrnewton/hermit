@@ -13,8 +13,6 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 
-use dagrun::TestResult;
-use dagrun::TestResults;
 use hermit_manifest_plan::cli_help::is_help_flag;
 use hermit_manifest_plan::runner::CellResult;
 use hermit_manifest_plan::runner::FailureClass;
@@ -26,13 +24,13 @@ use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::append_result;
 use hermit_manifest_plan::runner::cell_result_after_retries;
-use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::checked_add_cpu_usage;
 use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::infrastructure_error_result;
 use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::run_cell;
+use hermit_manifest_plan::runner::structured_test_results;
 use hermit_manifest_plan::runner::write_junit;
 use hermit_manifest_plan::stress_series::HostCapabilities;
 #[cfg(test)]
@@ -223,7 +221,7 @@ fn print_command_help(command: &str) -> bool {
     if matches!(environment, CommandEnvironment::Run) {
         println!(
             "\nInternal runner protocol:\n  \
-             DAGRUN_TEST_COUNTS_PATH=<PATH>       Write schema-2 test counts for dagrun"
+             DAGRUN_TEST_COUNTS_PATH=<PATH>       Write current typed test results for dagrun"
         );
     }
     true
@@ -331,42 +329,6 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
         }
     }
     args
-}
-
-fn structured_test_results(histories: &[Vec<CellResult>]) -> Result<TestResults, String> {
-    let rows = histories
-        .iter()
-        .map(|history| {
-            let (result, attempts) = cell_result_and_attempts_after_retries(history)?;
-            Ok((result.outcome != "HOST-INAPPLICABLE").then(|| {
-                (
-                    format!(
-                        "{} [{}/{}]",
-                        result.test,
-                        result.backend.as_deref().unwrap_or("native"),
-                        result.mode
-                    ),
-                    result.outcome == "PASS",
-                    attempts,
-                )
-            }))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    structured_test_results_from_rows(rows.into_iter().flatten())
-}
-
-fn structured_test_results_from_rows(
-    rows: impl IntoIterator<Item = (String, bool, u64)>,
-) -> Result<TestResults, String> {
-    let rows = rows
-        .into_iter()
-        .map(|(id, passed, attempts)| TestResult::new(id, passed, attempts))
-        .collect::<Result<Vec<_>, _>>()?;
-    TestResults::current(
-        u64::try_from(rows.len()).map_err(|_| "cell result count does not fit u64")?,
-        0,
-        rows,
-    )
 }
 
 fn accumulate_cell_cpu_usage(
@@ -2077,7 +2039,6 @@ mod tests {
     use super::run_with_retry;
     use super::scheduled_worker_capacity;
     use super::shell_quote_one;
-    use super::structured_test_results_from_rows;
     use super::unique_plan_rows;
 
     #[test]
@@ -2140,40 +2101,6 @@ mod tests {
         accumulate_cell_cpu_usage(&mut total, &mut measurements, "ERROR", None);
         assert_eq!(measurements, 3);
         assert_eq!(total, None);
-    }
-
-    #[test]
-    fn structured_test_results_are_machine_readable_and_exact_on_failure() {
-        let path = std::env::temp_dir().join(format!(
-            "hermit-manifest-counts-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        structured_test_results_from_rows([
-            ("suite$passes".into(), true, 1),
-            ("suite$fails".into(), false, 2),
-        ])
-        .unwrap()
-        .write_current(&path)
-        .unwrap();
-        let counts: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        std::fs::remove_file(path).unwrap();
-        assert_eq!(
-            counts,
-            serde_json::json!({
-                "schema": 3,
-                "executed_tests": 2,
-                "filtered_tests": 0,
-                "results": [
-                    {"id": "suite$passes", "result": "pass", "attempts": 1, "attempt_results": null},
-                    {"id": "suite$fails", "result": "fail", "attempts": 2, "attempt_results": null},
-                ],
-            })
-        );
     }
 
     #[test]

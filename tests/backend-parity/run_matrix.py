@@ -28,6 +28,7 @@ VERIFICATION_REPORT_BIN = Path(
 )
 BACKENDS = ("ptrace", "dbt", "kvm")
 RUNS = 3
+NO_RESULT_EXIT_CODE = 125
 
 DBT_PRIVATE_TMP_SCRIPT = """\
 private_tmp=$1
@@ -984,31 +985,31 @@ def capture_ptrace_reference(
     expected_stdout: bytes | None,
     host_tmp: Path,
     host_capabilities: dict[str, dict[str, object]],
-) -> tuple[bytes | None, str, bool]:
+) -> tuple[bytes | None, str, str | None]:
     """Capture the plain-run ptrace stdout used as the cross-backend reference."""
     reference = run_with_timeout(
         hermit_command(hermit, "ptrace", guest, name, strict, host_tmp)
     )
     if reference is None:
-        return None, "ptrace reference timed out", False
+        return None, "ptrace reference timed out", "TIMEOUT"
     if reference.returncode != expected_status:
         diagnostic = reference.stderr.decode(errors="replace").strip()
         if cpuid_policy_is_blocked("ptrace", name, host_capabilities):
-            return None, CPUID_BLOCK_REASON, True
+            return None, CPUID_BLOCK_REASON, "BLOCKED"
         return (
             None,
             f"ptrace reference exited {reference.returncode}, expected "
             f"{expected_status}: {diagnostic[-300:]}",
-            False,
+            "NO_RESULT",
         )
     if expected_stdout is not None and reference.stdout != expected_stdout:
         return (
             None,
             f"ptrace reference stdout={reference.stdout!r}, "
             f"expected={expected_stdout!r}",
-            False,
+            "NO_RESULT",
         )
-    return reference.stdout, "", False
+    return reference.stdout, "", None
 
 
 # Two distinct `--verify` success witnesses, and they are NOT the same assurance:
@@ -1238,7 +1239,7 @@ def run_case_verify(
         evidence.update(observed_evidence)
         evidence[COMPARISON_TIER_COLUMN] = COMPARISON_TIER_SELF_VERIFY_ONLY
     if result is None:
-        return "FAIL", "verify run timed out", time.monotonic() - started
+        return "TIMEOUT", "verify run timed out", time.monotonic() - started
     if observed_evidence and observed_evidence["infrastructure_error"]:
         return (
             "ERROR",
@@ -1261,7 +1262,7 @@ def run_case_verify(
         )
     if observed_evidence is None:
         return (
-            "FAIL",
+            "NO_RESULT",
             "verify produced no usable current typed verification report: "
             f"{diagnostic[-300:]}",
             time.monotonic() - started,
@@ -1340,7 +1341,7 @@ def run_case(
     started = time.monotonic()
     reference_stdout: bytes | None = None
     reference_problem = ""
-    reference_blocked = False
+    reference_status: str | None = None
     requires_ptrace_reference = backend == "dbt" and name == "random_sources"
     requires_exact_stdout_parity = exact_stdout_parity_contract(
         backend, name, expected_stdout
@@ -1350,7 +1351,7 @@ def run_case(
         (
             reference_stdout,
             reference_problem,
-            reference_blocked,
+            reference_status,
         ) = capture_ptrace_reference(
             hermit,
             fixtures.expose_tmp_paths("ptrace", reference_guest, reference_tmp),
@@ -1363,19 +1364,11 @@ def run_case(
         )
         if evidence is not None:
             evidence.update(stdout_parity_evidence(None, reference_stdout))
-        if reference_blocked:
-            return "BLOCKED", reference_problem, time.monotonic() - started
-        # Preserve the pre-existing DBT random-stream contract even when the
-        # caller explicitly disables scorecard output.  General stdout parity
-        # may remain UNMEASURED when its reference is unavailable; this named
-        # functional comparison may not.
-        if requires_ptrace_reference and reference_stdout is None:
-            return "FAIL", reference_problem, time.monotonic() - started
-        if requires_exact_stdout_parity and reference_stdout is None:
-            # The requested comparison itself is part of this cell's contract.
-            # A missing side or comparator failure is RED, not an unmeasured
-            # success: no equality verdict exists to support a green row.
-            return "FAIL", reference_problem, time.monotonic() - started
+        if reference_status is not None:
+            # The candidate cannot be judged without its ptrace operand. Preserve
+            # whether that operand timed out, was blocked, or failed to produce
+            # a usable reference instead of charging the candidate a product failure.
+            return reference_status, reference_problem, time.monotonic() - started
     ptrace_random = (
         root_random_output(reference_stdout)
         if backend == "dbt" and name == "random_sources" and reference_stdout is not None
@@ -1393,7 +1386,7 @@ def run_case(
         )
         result = run_with_timeout(command)
         if result is None:
-            return "FAIL", f"run {iteration + 1} timed out", time.monotonic() - started
+            return "TIMEOUT", f"run {iteration + 1} timed out", time.monotonic() - started
 
         # Record the candidate before interpreting its status or expected output.
         # A real stdout divergence must leave unequal operands and parity=0 in
@@ -1556,6 +1549,30 @@ def write_results(path: Path, results: list[dict[str, str]]) -> None:
     print(f"TRACKING: wrote {len(results)} result row(s) to {path}")
 
 
+def structured_attempt_result(result: dict[str, str]) -> dict[str, object]:
+    status = result["result"]
+    if status in {"PASS", "XPASS"}:
+        return {"attempt": 1, "outcome": "passed", "detail": None}
+    outcomes = {
+        "FAIL": "failed",
+        "ERROR": "infrastructure_error",
+        "BLOCKED": "no_result",
+        "NO_RESULT": "no_result",
+        "TIMEOUT": "wall_timeout",
+    }
+    if status not in outcomes:
+        raise MatrixError(
+            f"structured backend-parity result has unsupported status {status!r}"
+        )
+    detail = result.get("detail")
+    if not isinstance(detail, str) or not detail.strip() or detail != detail.strip():
+        raise MatrixError(
+            f"structured backend-parity {status} result requires nonempty trimmed detail"
+        )
+    return {"attempt": 1, "outcome": outcomes[status], "detail": detail}
+
+
+
 def write_structured_test_results(
     results: list[dict[str, str]], executed: int, filtered: int, mode: str
 ) -> None:
@@ -1577,6 +1594,7 @@ def write_structured_test_results(
             ),
             "result": "pass" if result["result"] in {"PASS", "XPASS"} else "fail",
             "attempts": 1,
+            "attempt_results": [structured_attempt_result(result)],
         }
         for result in terminal
     ]
@@ -1585,7 +1603,7 @@ def write_structured_test_results(
     path = Path(configured)
     temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     payload = {
-        "schema": 2,
+        "schema": 3,
         "executed_tests": executed,
         "filtered_tests": filtered,
         "results": rows,
@@ -1715,8 +1733,10 @@ def append_parent_scorecard(
             "XPASS": "pass",
             "FAIL": "fail",
             "ERROR": "error",
+            "TIMEOUT": "error",
             "GAP": "gap",
             "BLOCKED": "skip",
+            "NO_RESULT": "error",
         }[status]
         # PASS/FAIL is the whole test's outcome, not a stdout comparison.  The
         # parity boolean is derived solely from the two hashes captured above.
@@ -1934,6 +1954,44 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def blocked_backend_rows(
+    backend: str, names: list[str], verify: bool, probe_gaps: bool, reason: str
+) -> tuple[list[dict[str, str]], int, int]:
+    """Represent a required unavailable backend without inventing a product failure."""
+    rows: list[dict[str, str]] = []
+    executed = 0
+    filtered = 0
+    for name in names:
+        expected, gap_reason = expectation(backend, name, verify)
+        if expected == "gap" and not probe_gaps:
+            status = "GAP"
+            detail = gap_reason
+            filtered += 1
+        else:
+            status = "BLOCKED"
+            detail = reason
+            executed += 1
+        rows.append(
+            {
+                "test_name": name,
+                "backend": backend,
+                "expectation": expected,
+                "result": status,
+                "seconds": "0.000",
+                "detail": detail,
+            }
+        )
+    return rows, executed, filtered
+
+
+def matrix_exit_code(product_failures: int, no_results: int) -> int:
+    if product_failures:
+        return 1
+    if no_results:
+        return NO_RESULT_EXIT_CODE
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     names = validate_catalog()
@@ -1986,6 +2044,7 @@ def main() -> int:
     host_capabilities = read_host_capabilities(hermit)
     results: list[dict[str, str]] = []
     failures = 0
+    no_results = 0
     executed_cases = 0
     filtered_cases = 0
     with tempfile.TemporaryDirectory(prefix="hermit-backend-parity-") as tempdir:
@@ -1995,7 +2054,13 @@ def main() -> int:
             if block:
                 print(f"BLOCKED {backend}: {block}")
                 if args.require_backend:
-                    failures += 1
+                    blocked_rows, blocked_executed, blocked_filtered = blocked_backend_rows(
+                        backend, names, args.verify, args.probe_gaps, block
+                    )
+                    results.extend(blocked_rows)
+                    executed_cases += blocked_executed
+                    filtered_cases += blocked_filtered
+                    no_results += 1
                 continue
 
             for name in names:
@@ -2044,7 +2109,9 @@ def main() -> int:
                         "evidence": evidence,
                     }
                 )
-                if status == "ERROR" or (not is_gap and status == "FAIL"):
+                if status in {"ERROR", "TIMEOUT", "NO_RESULT", "BLOCKED"}:
+                    no_results += 1
+                elif not is_gap and status == "FAIL":
                     failures += 1
 
     if args.output:
@@ -2059,7 +2126,7 @@ def main() -> int:
     )
     mode = "verify" if args.verify else "strict" if strict else "repeat"
     write_structured_test_results(results, executed_cases, filtered_cases, mode)
-    return 1 if failures else 0
+    return matrix_exit_code(failures, no_results)
 
 
 if __name__ == "__main__":

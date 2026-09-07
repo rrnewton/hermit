@@ -54,10 +54,15 @@ publish_test_results() {
 }
 
 write_current_test_results() { # <command-status>
-  local status=$1
+  local status=$1 outcome=fail
   local -a rows=("${test_results[@]}")
   if ((status != 0)) && [[ -n "$current_test" ]]; then
-    rows+=("$current_test" fail 1)
+    case "$status" in
+      125) outcome=no_result ;;
+      124) outcome=wall_timeout ;;
+      130|143) outcome=cancelled ;;
+    esac
+    rows+=("$current_test" "$outcome" 1)
   fi
   "$results_writer" "$executed" "$filtered" "${rows[@]}"
 }
@@ -78,10 +83,36 @@ self_test_typed_results() {
     .executed_tests == 2
     and .filtered_tests == 3
     and .results == [
-      {"attempts": 1, "id": "suite$passes", "result": "pass"},
-      {"attempts": 1, "id": "suite$fails", "result": "fail"}
+      {
+        "attempt_results": [{"attempt": 1, "detail": null, "outcome": "passed"}],
+        "attempts": 1,
+        "id": "suite$passes",
+        "result": "pass"
+      },
+      {
+        "attempt_results": [{
+          "attempt": 1,
+          "detail": "generic test runner reported a failed attempt",
+          "outcome": "failed"
+        }],
+        "attempts": 1,
+        "id": "suite$fails",
+        "result": "fail"
+      }
     ]
   ' <<<"$canonical" >/dev/null || return 1
+  current_test='suite$times-out'
+  DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" write_current_test_results 124 || return 1
+  jq -e '.results[1].attempt_results[0].outcome == "wall_timeout"' \
+    "$scratch/results.json" >/dev/null || return 1
+  current_test='suite$cancelled'
+  DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" write_current_test_results 143 || return 1
+  jq -e '.results[1].attempt_results[0].outcome == "cancelled"' \
+    "$scratch/results.json" >/dev/null || return 1
+  current_test='suite$no-result'
+  DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" write_current_test_results 125 || return 1
+  jq -e '.results[1].attempt_results[0].outcome == "no_result"' \
+    "$scratch/results.json" >/dev/null || return 1
   printf 'test-fail-closed: typed test-result self-test PASS\n'
 }
 

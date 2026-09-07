@@ -20,6 +20,10 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use dagrun::TestAttemptOutcome;
+use dagrun::TestAttemptResult;
+use dagrun::TestResult;
+use dagrun::TestResults;
 use detcore_model::summary::PathEvidence;
 use serde::Deserialize;
 use serde::Serialize;
@@ -1310,10 +1314,13 @@ impl CellResult {
     pub fn require_current_classification(&self) -> Result<(), String> {
         match self.outcome.as_str() {
             "PASS" => {
-                if self.result != Some(ObservedResult::Pass) || self.failure_class.is_some() {
+                if self.result != Some(ObservedResult::Pass)
+                    || self.failure_class.is_some()
+                    || self.error_kind.is_some()
+                {
                     return Err(format!(
-                        "PASS result must carry result=pass and no failure_class, got result={:?} failure_class={:?}",
-                        self.result, self.failure_class
+                        "PASS result must carry result=pass, no failure_class, and no error_kind, got result={:?} failure_class={:?} error_kind={:?}",
+                        self.result, self.failure_class, self.error_kind
                     ));
                 }
             }
@@ -1369,6 +1376,39 @@ impl CellResult {
                 }
             },
             other => return Err(format!("unknown cell outcome {other:?}")),
+        }
+        match self.error_kind.as_deref() {
+            Some("cpu-timeout" | "wall-timeout")
+                if self.result == Some(ObservedResult::Timeout)
+                    && self.failure_class == Some(FailureClass::NoResult) => {}
+            Some("cpu-timeout" | "wall-timeout") => {
+                return Err(format!(
+                    "{} result carries timeout error_kind={:?} without result=timeout and failure_class=no_result",
+                    self.outcome, self.error_kind
+                ));
+            }
+            Some("cancelled")
+                if self.outcome == "ERROR"
+                    && self.result.is_none()
+                    && self.failure_class == Some(FailureClass::NoResult) => {}
+            Some("cancelled") => {
+                return Err(format!(
+                    "{} result carries error_kind=cancelled without result=null and failure_class=no_result",
+                    self.outcome
+                ));
+            }
+            _ => {}
+        }
+        if self.result == Some(ObservedResult::Timeout)
+            && !matches!(
+                self.error_kind.as_deref(),
+                Some("cpu-timeout" | "wall-timeout")
+            )
+        {
+            return Err(format!(
+                "{} result=timeout must carry exactly error_kind=cpu-timeout or wall-timeout, got {:?}",
+                self.outcome, self.error_kind
+            ));
         }
         Ok(())
     }
@@ -1653,6 +1693,131 @@ pub fn cell_result_and_attempts_after_retries(
         .map(|result| result.attempt)
         .ok_or_else(|| "cell result has no attempts".to_string())?;
     Ok((selected, attempts))
+}
+
+fn structured_attempt_detail(result: &CellResult) -> Result<String, String> {
+    let reason = result
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "cell result attempt {} has no nonempty reason for its non-PASS outcome",
+                result.attempt
+            )
+        })?;
+    let failure_class = result
+        .failure_class
+        .map(FailureClass::as_str)
+        .unwrap_or("none");
+    let observed_result = result.result.map(ObservedResult::as_str).unwrap_or("none");
+    let error_kind = result.error_kind.as_deref().unwrap_or("none");
+    Ok(format!(
+        "failure_class={failure_class}; result={observed_result}; error_kind={error_kind}; reason={reason}"
+    ))
+}
+
+fn structured_attempt(result: &CellResult) -> Result<TestAttemptResult, String> {
+    result.require_current_classification()?;
+    let outcome = match result.error_kind.as_deref() {
+        Some("cpu-timeout") => {
+            if result.failure_class != Some(FailureClass::NoResult)
+                || result.result != Some(ObservedResult::Timeout)
+            {
+                return Err(format!(
+                    "cell result attempt {} carries cpu-timeout without timeout/no_result classification",
+                    result.attempt
+                ));
+            }
+            TestAttemptOutcome::CpuTimeout
+        }
+        Some("wall-timeout") => {
+            if result.failure_class != Some(FailureClass::NoResult)
+                || result.result != Some(ObservedResult::Timeout)
+            {
+                return Err(format!(
+                    "cell result attempt {} carries wall-timeout without timeout/no_result classification",
+                    result.attempt
+                ));
+            }
+            TestAttemptOutcome::WallTimeout
+        }
+        Some("cancelled") => {
+            if result.failure_class != Some(FailureClass::NoResult)
+                || result.result.is_some()
+                || result.outcome != "ERROR"
+            {
+                return Err(format!(
+                    "cell result attempt {} carries cancelled without ERROR/result=null/no_result classification",
+                    result.attempt
+                ));
+            }
+            TestAttemptOutcome::Cancelled
+        }
+        _ => match result.failure_class {
+            None if result.outcome == "PASS" => TestAttemptOutcome::Passed,
+            Some(FailureClass::ProductFailure) => TestAttemptOutcome::Failed,
+            Some(FailureClass::UnderstoodInfrastructureFailure) => {
+                TestAttemptOutcome::InfrastructureError
+            }
+            Some(FailureClass::UnderstoodPrerequisiteFailure | FailureClass::NoResult) => {
+                TestAttemptOutcome::NoResult
+            }
+            None => {
+                return Err(format!(
+                    "cell result attempt {} has no typed terminal classification",
+                    result.attempt
+                ));
+            }
+        },
+    };
+    let detail = if outcome == TestAttemptOutcome::Passed {
+        None
+    } else {
+        Some(structured_attempt_detail(result)?)
+    };
+    TestAttemptResult::new(result.attempt, outcome, detail)
+}
+
+/// Convert the complete JSONL cell histories into the scheduler's current
+/// structured test-result contract without discarding their typed causes.
+///
+/// One [`CellResult`] row is one outer test-harness attempt. The selected row
+/// decides the terminal pass/fail bit, while every row in the validated history
+/// contributes one classified attempt. Current writers must never emit the
+/// schema-3 forbidden value `attempt_results: null`.
+pub fn structured_test_results(histories: &[Vec<CellResult>]) -> Result<TestResults, String> {
+    let rows = histories
+        .iter()
+        .map(|history| {
+            let selected = cell_result_after_retries(history)?;
+            if selected.outcome == "HOST-INAPPLICABLE" {
+                return Ok(None);
+            }
+            let attempts = history
+                .iter()
+                .map(structured_attempt)
+                .collect::<Result<Vec<_>, _>>()?;
+            TestResult::with_attempt_results(
+                format!(
+                    "{} [{}/{}]",
+                    selected.test,
+                    selected.backend.as_deref().unwrap_or("native"),
+                    selected.mode
+                ),
+                selected.outcome == "PASS",
+                attempts,
+            )
+            .map(Some)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let rows = rows.into_iter().flatten().collect::<Vec<_>>();
+    TestResults::current(
+        u64::try_from(rows.len()).map_err(|_| "cell result count does not fit u64")?,
+        0,
+        rows,
+    )
 }
 
 fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
@@ -6565,7 +6730,197 @@ backends_disabled:
         timeout.outcome = "ERROR".into();
         timeout.result = Some(ObservedResult::Timeout);
         timeout.failure_class = Some(FailureClass::NoResult);
+        timeout.error_kind = Some("cpu-timeout".into());
         timeout.require_current_classification().unwrap();
+    }
+
+    #[test]
+    fn structured_cell_results_preserve_each_current_attempt_cause() {
+        let case = |test: &str,
+                    outcome: &str,
+                    result: Option<ObservedResult>,
+                    failure_class: Option<FailureClass>,
+                    error_kind: Option<&str>,
+                    reason: Option<&str>| {
+            let mut row = cell_result_that_located_nothing();
+            row.test = test.into();
+            row.backend = Some("kvm".into());
+            row.outcome = outcome.into();
+            row.result = result;
+            row.failure_class = failure_class;
+            row.error_kind = error_kind.map(str::to_string);
+            row.reason = reason.map(str::to_string);
+            row
+        };
+        let rows = [
+            case("pass", "PASS", Some(ObservedResult::Pass), None, None, None),
+            case(
+                "ordinary",
+                "FAIL",
+                Some(ObservedResult::CrashError),
+                Some(FailureClass::ProductFailure),
+                None,
+                Some("guest exited 7"),
+            ),
+            case(
+                "cpu",
+                "FAIL",
+                Some(ObservedResult::Timeout),
+                Some(FailureClass::NoResult),
+                Some("cpu-timeout"),
+                Some("cell exceeded 22 CPU s"),
+            ),
+            case(
+                "wall",
+                "FAIL",
+                Some(ObservedResult::Timeout),
+                Some(FailureClass::NoResult),
+                Some("wall-timeout"),
+                Some("cell exceeded 57 wall s backstop"),
+            ),
+            case(
+                "cancelled",
+                "ERROR",
+                None,
+                Some(FailureClass::NoResult),
+                Some("cancelled"),
+                Some("cancelled by signal 15"),
+            ),
+            case(
+                "infrastructure",
+                "ERROR",
+                None,
+                Some(FailureClass::UnderstoodInfrastructureFailure),
+                Some("infrastructure"),
+                Some("cpu.stat was unreadable"),
+            ),
+            case(
+                "kvm-vector13",
+                "ERROR",
+                None,
+                Some(FailureClass::NoResult),
+                Some("incomplete-verification-evidence"),
+                Some("KVM guest execution failed: guest exception vector 13"),
+            ),
+        ];
+        let jsonl = rows
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        let histories = jsonl
+            .lines()
+            .map(|line| vec![serde_json::from_str::<CellResult>(line).unwrap()])
+            .collect::<Vec<_>>();
+        let report = structured_test_results(&histories).unwrap();
+        let bytes = report.to_current_json().unwrap();
+        let reparsed = TestResults::from_json_slice(&bytes).unwrap();
+        let attempts = reparsed
+            .results
+            .unwrap()
+            .into_iter()
+            .map(|row| row.attempt_results.unwrap()[0].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attempts.iter().map(|row| row.outcome).collect::<Vec<_>>(),
+            vec![
+                TestAttemptOutcome::Passed,
+                TestAttemptOutcome::Failed,
+                TestAttemptOutcome::CpuTimeout,
+                TestAttemptOutcome::WallTimeout,
+                TestAttemptOutcome::Cancelled,
+                TestAttemptOutcome::InfrastructureError,
+                TestAttemptOutcome::NoResult,
+            ]
+        );
+        assert_eq!(attempts[0].detail, None);
+        assert!(
+            attempts[1]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("failure_class=product_failure")
+        );
+        assert!(
+            attempts[2]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("error_kind=cpu-timeout")
+        );
+        assert!(
+            attempts[5]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("cpu.stat was unreadable")
+        );
+        let no_result = attempts[6].detail.as_deref().unwrap();
+        assert!(no_result.contains("failure_class=no_result"));
+        assert!(no_result.contains("error_kind=incomplete-verification-evidence"));
+        assert!(no_result.contains("KVM guest execution failed: guest exception vector 13"));
+
+        for missing in [None, Some("   ")] {
+            let row = case(
+                "missing-reason",
+                "FAIL",
+                Some(ObservedResult::CrashError),
+                Some(FailureClass::ProductFailure),
+                None,
+                missing,
+            );
+            let error = structured_test_results(&[vec![row]])
+                .expect_err("a current non-pass without a nonempty reason must be refused");
+            assert!(error.contains("nonempty reason"), "{error}");
+        }
+
+        let pass_with_error = case(
+            "contradictory-pass",
+            "PASS",
+            Some(ObservedResult::Pass),
+            None,
+            Some("infrastructure"),
+            None,
+        );
+        let error = pass_with_error
+            .require_current_classification()
+            .unwrap_err();
+        assert!(error.contains("no error_kind"), "{error}");
+
+        let timeout_without_kind = case(
+            "ambiguous-timeout",
+            "ERROR",
+            Some(ObservedResult::Timeout),
+            Some(FailureClass::NoResult),
+            Some("timeout"),
+            Some("timed out"),
+        );
+        let error = timeout_without_kind
+            .require_current_classification()
+            .unwrap_err();
+        assert!(
+            error.contains("exactly error_kind=cpu-timeout or wall-timeout"),
+            "{error}"
+        );
+
+        for observed in [ObservedResult::Timeout, ObservedResult::Oom] {
+            let cancelled = case(
+                "contradictory-cancellation",
+                "ERROR",
+                Some(observed),
+                Some(FailureClass::NoResult),
+                Some("cancelled"),
+                Some("cancelled by signal 15"),
+            );
+            let error = cancelled.require_current_classification().unwrap_err();
+            assert!(error.contains("result=null"), "{error}");
+        }
+        assert!(
+            !String::from_utf8(bytes)
+                .unwrap()
+                .contains("attempt_results\":null")
+        );
     }
 
     #[test]

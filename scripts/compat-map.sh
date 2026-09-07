@@ -97,7 +97,7 @@ load_rr_results() { # <result-file> <command-status>
         rr_reason=""
     elif ((command_status == 0)); then
         rr_status="unknown"
-        rr_reason="exit 0 disagrees with $TEST_RESULTS_FAILED typed failure(s)"
+        rr_reason="exit 0 disagrees with $TEST_RESULTS_FAILED typed failure(s); first failure: $TEST_RESULTS_FIRST_FAILURE [$TEST_RESULTS_FIRST_FAILURE_OUTCOME]: $TEST_RESULTS_FIRST_FAILURE_DETAIL"
     else
         rr_status="aborted"
         rr_reason="command exited nonzero"
@@ -117,6 +117,10 @@ rr_result_summary() { # <catalogued-case-count>
         printf 'ABORTED at exit %s after %s passed; %s failed, %s filtered (of %d cases)' \
             "${rr_exit:-?}" "${rr_pass:-?}" "${rr_fail:-?}" "${rr_filtered:-?}" \
             "$case_count"
+        if ((rr_fail > 0)); then
+            printf '; first failure: %s [%s]: %s' "$TEST_RESULTS_FIRST_FAILURE" \
+                "$TEST_RESULTS_FIRST_FAILURE_OUTCOME" "$TEST_RESULTS_FIRST_FAILURE_DETAIL"
+        fi
     elif [[ $rr_status == unknown ]]; then
         printf 'unknown: %s; command exit %s (of %d cases)' \
             "$rr_reason" "${rr_exit:-?}" "$case_count"
@@ -141,13 +145,13 @@ self_test_typed_results() {
         && $rr_filtered == 7 && $rr_exit == 1 \
         && $rr_reason == 'command exited nonzero' ]] || return 1
     [[ $(rr_result_summary 212) == \
-        'ABORTED at exit 1 after 1 passed; 1 failed, 7 filtered (of 212 cases)' ]] \
+        'ABORTED at exit 1 after 1 passed; 1 failed, 7 filtered (of 212 cases); first failure: rr_suite$fails [failed]: generic test runner reported a failed attempt' ]] \
         || return 1
 
     load_rr_results "$scratch/results.json" 0 || return 1
     [[ $rr_status == unknown && $rr_pass == 1 && $rr_fail == 1 \
         && $rr_filtered == 7 && $rr_exit == 0 \
-        && $rr_reason == 'exit 0 disagrees with 1 typed failure(s)' ]] || return 1
+        && $rr_reason == 'exit 0 disagrees with 1 typed failure(s); first failure: rr_suite$fails [failed]: generic test runner reported a failed attempt' ]] || return 1
 
     # shellcheck disable=SC2016 # `$` is part of the stable test identity.
     DAGRUN_TEST_COUNTS_PATH="$scratch/results.json" \
@@ -433,6 +437,12 @@ build_json() {
     if [[ $rr_status == executed || $rr_status == aborted ]]; then
         printf ', "passed": %s, "failed": %s, "filtered": %s' \
             "${rr_pass:-null}" "${rr_fail:-null}" "${rr_filtered:-null}"
+        if ((rr_fail > 0)); then
+            printf ', "first_failed_test": %s, "first_failed_outcome": %s, "first_failed_detail": %s' \
+                "$(json_str "$TEST_RESULTS_FIRST_FAILURE")" \
+                "$(json_str "$TEST_RESULTS_FIRST_FAILURE_OUTCOME")" \
+                "$(json_str "$TEST_RESULTS_FIRST_FAILURE_DETAIL")"
+        fi
         if [[ $rr_status == aborted ]]; then
             printf ', "command_exit": %s' "${rr_exit:-null}"
         fi
