@@ -10386,10 +10386,20 @@ fn terminal_test_cause_details(outcomes: &[StepOutcome], attempts: &[NodeAttempt
     for outcome in outcomes {
         let node_attempts_exist = attempts.iter().any(|attempt| attempt.tag == outcome.tag);
         let recorded_attempt = terminal_attempt(outcome, attempts);
+        let primary_reason = recorded_attempt
+            .map(|attempt| attempt.reason.as_str())
+            .or_else(|| {
+                (!node_attempts_exist).then_some(outcome.reason.as_str())
+            })
+            .filter(|reason| !reason.is_empty());
         let result_error = recorded_attempt
             .and_then(|attempt| attempt.test_results_error.as_deref())
             .or_else(|| (!node_attempts_exist).then_some(outcome.test_results_error.as_deref()).flatten());
         if let Some(error) = result_error {
+            let refusal_reason = format!("STRUCTURED TEST RESULTS REFUSED: {error}");
+            if let Some(reason) = primary_reason.filter(|reason| *reason != refusal_reason) {
+                detail.push(format!("node {}: {reason}", outcome.tag));
+            }
             detail.push(format!(
                 "node {}: structured test results refused: {error}",
                 outcome.tag
@@ -14674,6 +14684,9 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
         "aborted": outcome.aborted,
         "real_seconds": outcome.duration_s,
     });
+    if let Some(error) = &outcome.test_results_error {
+        gate["test_results_error"] = serde_json::json!(error);
+    }
     if let Some(test_results) = outcome.test_results.as_deref() {
         gate["test_results"] = typed_test_results_json(test_results);
     }
@@ -14963,7 +14976,11 @@ fn typed_test_cause_propagation_bracket() -> Result<(), String> {
     );
     if missing_gate["result"] != "no_result"
         || missing_gate["failure_class"] != "no_result"
+        || missing_gate["failure_detail"] != missing_outcome.reason
+        || missing_gate["test_results_error"] != missing_error
         || missing_gate["attempts"][0]["result"] != "no_result"
+        || missing_gate["attempts"][0]["failure_detail"] != missing_outcome.reason
+        || missing_gate["attempts"][0]["test_results_error"] != missing_error
     {
         return Err(format!(
             "typed test causes: missing required result did not survive the ledger: {missing_gate}"
@@ -15100,10 +15117,20 @@ fn typed_test_cause_propagation_bracket() -> Result<(), String> {
     recovered_outcome.returncode = Some(0);
     recovered_outcome.reason = "STRUCTURED TEST RESULTS REFUSED: current result is malformed".into();
     recovered_outcome.test_results_error = Some("current result is malformed".into());
+    let recovered_error_attempt = reported_attempt(&recovered_outcome, 1);
+    let recovered_error_gate = ledger_gate_with_attempts(
+        &recovered_outcome,
+        std::slice::from_ref(&recovered_error_attempt),
+    );
     if outcome_is_failure(&recovered_outcome)
         || !outcome_is_no_result(&recovered_outcome)
         || step_test_attempt_outcome(&recovered_outcome)
             != TestAttemptOutcome::InfrastructureError
+        || recovered_error_gate["reason"] != recovered_outcome.reason
+        || recovered_error_gate["failure_detail"] != recovered_outcome.reason
+        || recovered_error_gate["test_results_error"] != "current result is malformed"
+        || recovered_error_gate["attempts"][0]["test_results_error"]
+            != "current result is malformed"
         || terminal_test_cause_details(std::slice::from_ref(&recovered_outcome), &[])
             != ["node test.recovered-cause: structured test results refused: current result is malformed"]
     {
@@ -15112,21 +15139,125 @@ fn typed_test_cause_propagation_bracket() -> Result<(), String> {
         );
     }
 
-    recovered_outcome.cpu_timed_out = true;
-    if step_test_attempt_outcome(&recovered_outcome) != TestAttemptOutcome::CpuTimeout {
-        return Err("typed test causes: outer CPU timeout did not outrank missing structured evidence".into());
-    }
-    recovered_outcome.cpu_timed_out = false;
-    recovered_outcome.timed_out = true;
-    if step_test_attempt_outcome(&recovered_outcome) != TestAttemptOutcome::WallTimeout {
-        return Err("typed test causes: outer wall timeout did not outrank missing structured evidence".into());
+    let malformed_error =
+        "malformed structured test results /fixture/counts.json: structured-test-results-json: expected value";
+    let timeout_collisions = [
+        (
+            "cpu-missing",
+            TestAttemptOutcome::CpuTimeout,
+            "CPU-TIMEOUT >22s cpu",
+            missing_error,
+            true,
+            false,
+        ),
+        (
+            "cpu-malformed",
+            TestAttemptOutcome::CpuTimeout,
+            "CPU-TIMEOUT >22s cpu",
+            malformed_error,
+            true,
+            false,
+        ),
+        (
+            "wall-missing",
+            TestAttemptOutcome::WallTimeout,
+            "TIMEOUT >57s",
+            missing_error,
+            false,
+            true,
+        ),
+        (
+            "wall-malformed",
+            TestAttemptOutcome::WallTimeout,
+            "TIMEOUT >57s",
+            malformed_error,
+            false,
+            true,
+        ),
+    ];
+    for (name, expected_outcome, outer_reason, evidence_error, cpu_timed_out, timed_out) in
+        timeout_collisions
+    {
+        let collision = StepOutcome {
+            tag: format!("test.{name}"),
+            ok: false,
+            duration_s: 58.0,
+            summary: String::new(),
+            executed_tests: None,
+            filtered_tests: None,
+            test_results: None,
+            test_results_error: Some(evidence_error.into()),
+            returncode: Some(-9),
+            oomed: false,
+            oom_kills: 0,
+            timed_out,
+            cpu_timed_out,
+            reason: outer_reason.into(),
+            aborted: false,
+        };
+        if step_test_attempt_outcome(&collision) != expected_outcome {
+            return Err(format!(
+                "typed test causes: {name} lost its outer timeout classification"
+            ));
+        }
+        let attempt = reported_attempt(&collision, 1);
+        let gate = ledger_gate_with_attempts(&collision, std::slice::from_ref(&attempt));
+        if gate["reason"] != outer_reason
+            || gate["failure_detail"] != outer_reason
+            || gate["test_results_error"] != evidence_error
+            || gate["attempts"][0]["reason"] != outer_reason
+            || gate["attempts"][0]["failure_detail"] != outer_reason
+            || gate["attempts"][0]["test_results_error"] != evidence_error
+        {
+            return Err(format!(
+                "typed test causes: {name} did not retain both causes in the ledger: {gate}"
+            ));
+        }
+        let expected_detail = vec![
+            format!("node test.{name}: {outer_reason}"),
+            format!("node test.{name}: structured test results refused: {evidence_error}"),
+        ];
+        let detail = terminal_test_cause_details(
+            std::slice::from_ref(&collision),
+            std::slice::from_ref(&attempt),
+        );
+        if detail != expected_detail {
+            return Err(format!(
+                "typed test causes: {name} did not render primary then secondary cause: {detail:?}"
+            ));
+        }
+        let mut summary = RunSummary::new(
+            Verdict::NoResult,
+            COULD_NOT_RUN_EXIT_CODE,
+            "self-test",
+            detail,
+        );
+        summary.commit = "0123456789012345678901234567890123456789".into();
+        summary.nodes_executed = 1;
+        summary.selection_mode = Some("full".into());
+        let path = directory.path().join(format!("{name}.json"));
+        write_validation_service_result(&path, &summary)?;
+        let service = ValidationServiceResult::from_json_slice(
+            &std::fs::read(&path)
+                .map_err(|error| format!("typed test causes: cannot read {name} result: {error}"))?,
+        )?;
+        let terminal = run_summary_lines(&summary, std::time::Instant::now());
+        if service.detail.as_deref() != Some(expected_detail.as_slice())
+            || expected_detail
+                .iter()
+                .any(|cause| !terminal.iter().any(|line| line == &format!("   {cause}")))
+        {
+            return Err(format!(
+                "typed test causes: {name} lost one cause in service or terminal output: service={service:?} terminal={terminal:?}"
+            ));
+        }
     }
 
     if distinct_results.len() != case_count {
         return Err("typed test causes: mutating the cause did not change every service result".into());
     }
     println!(
-        "  typed test causes: ordinary failure, CPU timeout, wall timeout, cancellation, infrastructure error, and no_result survive CellResult JSONL through ledger, service JSON, and terminal output"
+        "  typed test causes: ordinary failure, CPU timeout, wall timeout, cancellation, infrastructure error, no_result, and timeout-plus-evidence collisions survive CellResult JSONL through ledger, service JSON, and terminal output"
     );
     Ok(())
 }
@@ -15176,6 +15307,9 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
                 "environmental_verdict": environmental_verdict,
                 "environmental_refuted_shape": environmental_refuted_shape,
             });
+            if let Some(error) = &a.test_results_error {
+                attempt["test_results_error"] = serde_json::json!(error);
+            }
             if let Some(test_results) = a.test_results.as_deref() {
                 attempt["test_results"] = typed_test_results_json(test_results);
             }
@@ -15217,6 +15351,13 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
             gate.as_object_mut()
                 .expect("ledger gate must remain a JSON object")
                 .remove("failure_detail");
+        }
+        if let Some(error) = &attempt.test_results_error {
+            gate["test_results_error"] = serde_json::json!(error);
+        } else {
+            gate.as_object_mut()
+                .expect("ledger gate must remain a JSON object")
+                .remove("test_results_error");
         }
         if let Some(test_results) = attempt.test_results.as_deref() {
             gate["test_results"] = typed_test_results_json(test_results);
