@@ -19,6 +19,7 @@ use dagrun::io::dag_from_json;
 use dagrun::io::dag_to_json;
 use dagrun::model::DagConfig;
 use dagrun::model::DagManifest;
+use dagrun::model::ResultManifest;
 use dagrun::model::Step;
 use dagrun::model::result_manifest_owner;
 use dagrun::select_steps_by_labels;
@@ -26,6 +27,8 @@ use serde::Deserialize;
 
 use crate::runner::E2E_KERNEL_VERSION_ENV;
 use crate::runner::E2E_MACHINE_SHORTNAME_ENV;
+use crate::validation_dag_static::NEXTEST_EXPECTED_COUNTS;
+use crate::validation_dag_static::StructuredResultProducerKind;
 
 pub const OUTPUT: &str = "ci/dag/validate.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
@@ -248,7 +251,14 @@ fn normalize_step(step: &mut Step, root: &Path, run_state: &Path) -> Result<(), 
     let run_state = run_state
         .to_str()
         .ok_or_else(|| "generator scratch path is not valid UTF-8".to_string())?;
-    step.result_manifests = Some(Vec::new());
+    step.result_manifests = Some(
+        step.result_manifests
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|manifest| matches!(manifest, ResultManifest::StructuredTestResults(_)))
+            .collect(),
+    );
     step.cmd = step
         .cmd
         .replace(run_state, "$VALIDATE_RUN_STATE")
@@ -659,6 +669,13 @@ fn refresh_generated_partitions(
 
 fn attach_result_ownership(cfg: &mut DagConfig, cells: &[DagManifest]) {
     for step in &mut cfg.steps {
+        let structured = step
+            .result_manifests
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|manifest| matches!(manifest, ResultManifest::StructuredTestResults(_)))
+            .collect::<Vec<_>>();
         let mut owned = if let Some(selector) = &step.manifest {
             cells
                 .iter()
@@ -681,8 +698,163 @@ fn attach_result_ownership(cfg: &mut DagConfig, cells: &[DagManifest]) {
             );
         }
         owned.sort_by_key(result_identity);
-        step.result_manifests = Some(owned);
+        let mut manifests = owned
+            .into_iter()
+            .map(ResultManifest::ManifestCell)
+            .collect::<Vec<_>>();
+        manifests.extend(structured);
+        step.result_manifests = Some(manifests);
     }
+}
+
+fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
+    let mut expected = BTreeMap::<&str, StructuredResultProducerKind>::new();
+    for kind in StructuredResultProducerKind::ALL {
+        for tag in kind.tags() {
+            if expected.insert(tag, kind).is_some() {
+                return Err(format!(
+                    "structured result producer registry declares {tag} more than once"
+                ));
+            }
+        }
+    }
+    if expected.len() != 88 {
+        return Err(format!(
+            "structured result producer registry has {} entries, expected 88",
+            expected.len()
+        ));
+    }
+
+    let mut expected_counts = NEXTEST_EXPECTED_COUNTS
+        .iter()
+        .copied()
+        .collect::<BTreeMap<_, _>>();
+    if expected_counts.len() != 23 {
+        return Err(format!(
+            "Nextest expected-count registry has {} entries, expected 23",
+            expected_counts.len()
+        ));
+    }
+
+    let mut seen_by_kind = BTreeMap::<StructuredResultProducerKind, usize>::new();
+    for step in &cfg.steps {
+        let tag = step.tag();
+        let command_kinds = StructuredResultProducerKind::ALL
+            .into_iter()
+            .filter_map(|kind| {
+                let occurrences = step.cmd.matches(kind.command_marker()).count();
+                (occurrences != 0).then_some((kind, occurrences))
+            })
+            .collect::<Vec<_>>();
+        let command_kind = match command_kinds.as_slice() {
+            [] => None,
+            [(kind, 1)] => Some(*kind),
+            [(kind, occurrences)] => {
+                return Err(format!(
+                    "{tag} invokes the {kind:?} structured result producer {occurrences} times; expected exactly once"
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "{tag} invokes more than one structured result producer: {command_kinds:?}"
+                ));
+            }
+        };
+        if step.cmd.contains("NEXTEST_EXPECTED_EXECUTED") {
+            return Err(format!(
+                "{tag} declares NEXTEST_EXPECTED_EXECUTED in command text instead of typed step environment"
+            ));
+        }
+        let declared = step
+            .structured_test_results_manifest()
+            .map_err(|error| format!("{tag}: {error}"))?;
+        match (expected.remove(tag.as_str()), command_kind, declared) {
+            (Some(expected_kind), Some(actual_kind), Some(manifest)) => {
+                if actual_kind != expected_kind {
+                    return Err(format!(
+                        "{tag} is registered as {expected_kind:?} but invokes {actual_kind:?}"
+                    ));
+                }
+                if manifest.owner != tag {
+                    return Err(format!(
+                        "{tag} declares structured result owner {:?}",
+                        manifest.owner
+                    ));
+                }
+                *seen_by_kind.entry(expected_kind).or_default() += 1;
+            }
+            (Some(expected_kind), None, _) => {
+                return Err(format!(
+                    "{tag} is registered as {expected_kind:?} but no longer invokes that writer"
+                ));
+            }
+            (Some(expected_kind), Some(actual_kind), None) => {
+                return Err(format!(
+                    "{tag} invokes {actual_kind:?} and is registered as {expected_kind:?}, but omits its structured result declaration"
+                ));
+            }
+            (None, Some(actual_kind), _) => {
+                return Err(format!(
+                    "{tag} invokes unregistered structured result producer {actual_kind:?}"
+                ));
+            }
+            (None, None, Some(_)) => {
+                return Err(format!(
+                    "{tag} declares structured results but invokes no registered writer"
+                ));
+            }
+            (None, None, None) => {}
+        }
+
+        match (
+            expected_counts.remove(tag.as_str()),
+            step.env.get("NEXTEST_EXPECTED_EXECUTED"),
+        ) {
+            (Some(expected_count), Some(actual)) if actual == &expected_count.to_string() => {}
+            (Some(expected_count), Some(actual)) => {
+                return Err(format!(
+                    "{tag} expects {expected_count} Nextest tests but declares {actual:?}"
+                ));
+            }
+            (Some(expected_count), None) => {
+                return Err(format!(
+                    "{tag} omits NEXTEST_EXPECTED_EXECUTED={expected_count}"
+                ));
+            }
+            (None, Some(actual)) => {
+                return Err(format!(
+                    "{tag} declares unexpected NEXTEST_EXPECTED_EXECUTED={actual:?}"
+                ));
+            }
+            (None, None) => {}
+        }
+    }
+    if !expected.is_empty() {
+        return Err(format!(
+            "registered structured result producers are absent from the DAG: {}",
+            expected.keys().copied().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !expected_counts.is_empty() {
+        return Err(format!(
+            "Nextest expected-count steps are absent from the DAG: {}",
+            expected_counts
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let actual_group_counts = StructuredResultProducerKind::ALL
+        .into_iter()
+        .map(|kind| seen_by_kind.get(&kind).copied().unwrap_or_default())
+        .collect::<Vec<_>>();
+    if actual_group_counts != [52, 33, 1, 1, 1] {
+        return Err(format!(
+            "structured result producer group counts changed: {actual_group_counts:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn result_identity(result: &DagManifest) -> String {
@@ -767,6 +939,7 @@ fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
 }
 
 fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
+    assert_structured_result_producers(cfg)?;
     if cfg.steps.len() != 1382 {
         return Err(format!(
             "superset has {} steps, expected 1382",
@@ -960,8 +1133,8 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         let actual_result_ids = selected
             .steps
             .iter()
-            .flat_map(Step::effective_result_manifests)
-            .map(result_identity)
+            .flat_map(|step| step.effective_result_manifests().into_owned())
+            .map(|result| result_identity(&result))
             .collect::<BTreeSet<_>>();
         if actual_result_ids != expected_result_ids {
             return Err(format!(
@@ -1119,7 +1292,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         if step.timeout <= 0 || step.cpu_timeout <= 0 {
             return Err(format!("{} omits an explicit wall/CPU budget", step.tag()));
         }
-        for result in step.effective_result_manifests() {
+        for result in step.effective_result_manifests().iter() {
             let identity = result_identity(result);
             if !known_results.contains(&identity) {
                 return Err(format!("{} owns unknown result {identity}", step.tag()));
@@ -1191,7 +1364,12 @@ mod tests {
     fn owner(result_manifests: Vec<DagManifest>) -> Step {
         let text = r#"{"description":"","steps":[{"group":"e2e","job":"owner","cmd":"true","timeout":1,"cpu_timeout":1,"hint":{"rss_baseline_bytes":1,"hard_mem_max_bytes":1}}]}"#;
         let mut step = dag_from_json(text).unwrap().steps.remove(0);
-        step.result_manifests = Some(result_manifests);
+        step.result_manifests = Some(
+            result_manifests
+                .into_iter()
+                .map(ResultManifest::ManifestCell)
+                .collect(),
+        );
         step
     }
 
@@ -1427,5 +1605,241 @@ mod tests {
             error.contains("hosted-portable label has 250 direct steps"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn structured_result_registry_is_exact_and_bijective() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        assert_structured_result_producers(&committed).unwrap();
+
+        for kind in StructuredResultProducerKind::ALL {
+            let tag = kind.tags()[0];
+            let mut missing = committed.clone();
+            missing
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .unwrap()
+                .result_manifests
+                .as_mut()
+                .unwrap()
+                .retain(|manifest| !matches!(manifest, ResultManifest::StructuredTestResults(_)));
+            let error = assert_structured_result_producers(&missing).unwrap_err();
+            assert!(error.contains(tag) && error.contains("omits"), "{error}");
+
+            let mut changed_writer = committed.clone();
+            let step = changed_writer
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .unwrap();
+            step.cmd = step
+                .cmd
+                .replace(kind.command_marker(), "removed-structured-result-writer");
+            let error = assert_structured_result_producers(&changed_writer).unwrap_err();
+            assert!(
+                error.contains(tag) && error.contains("no longer invokes"),
+                "{error}"
+            );
+        }
+
+        let template = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.regular_crates")
+            .unwrap()
+            .result_manifests
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|manifest| matches!(manifest, ResultManifest::StructuredTestResults(_)))
+            .unwrap()
+            .clone();
+
+        let mut extra = committed.clone();
+        let extra_step = extra
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "quick.run_smoke")
+            .unwrap();
+        let mut extra_manifest = template.clone();
+        let ResultManifest::StructuredTestResults(declaration) = &mut extra_manifest else {
+            unreachable!()
+        };
+        declaration.owner = extra_step.tag();
+        extra_step
+            .result_manifests
+            .as_mut()
+            .unwrap()
+            .push(extra_manifest);
+        let error = assert_structured_result_producers(&extra).unwrap_err();
+        assert!(
+            error.contains("quick.run_smoke") && error.contains("declares"),
+            "{error}"
+        );
+
+        let mut duplicate = committed.clone();
+        duplicate
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.regular_crates")
+            .unwrap()
+            .result_manifests
+            .as_mut()
+            .unwrap()
+            .push(template.clone());
+        let error = assert_structured_result_producers(&duplicate).unwrap_err();
+        assert!(error.contains("more than once"), "{error}");
+
+        let mut wrong_owner = committed.clone();
+        let ResultManifest::StructuredTestResults(declaration) = wrong_owner
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.regular_crates")
+            .unwrap()
+            .result_manifests
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|manifest| matches!(manifest, ResultManifest::StructuredTestResults(_)))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        declaration.owner = "other.step".into();
+        let error = assert_structured_result_producers(&wrong_owner).unwrap_err();
+        assert!(error.contains("owner 'other.step'"), "{error}");
+    }
+
+    #[test]
+    fn structured_result_wire_contract_refuses_wrong_schema_and_path() {
+        let committed =
+            canonical_text(&dag_from_json(include_str!("../../dag/validate.json")).unwrap());
+        let declaration = |field: &str, value: serde_json::Value| {
+            let mut document: serde_json::Value = serde_json::from_str(&committed).unwrap();
+            let steps = document["steps"].as_array_mut().unwrap();
+            let step = steps
+                .iter_mut()
+                .find(|step| step["group"] == "test" && step["job"] == "regular_crates")
+                .unwrap();
+            let manifest = step["result_manifests"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|manifest| manifest["kind"] == "structured-test-results")
+                .unwrap();
+            manifest[field] = value;
+            serde_json::to_string(&document).unwrap()
+        };
+        let wrong_schema = declaration("schema", serde_json::Value::from(99));
+        let error = dag_from_json(&wrong_schema).unwrap_err().to_string();
+        assert!(error.contains("schema") && error.contains("99"), "{error}");
+        let wrong_path = declaration("path_env", serde_json::Value::from("OTHER"));
+        let error = dag_from_json(&wrong_path).unwrap_err().to_string();
+        assert!(error.contains("path_env"), "{error}");
+    }
+
+    #[test]
+    fn structured_result_counts_and_ownership_survive_generation_transforms() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        for (tag, mutation) in [
+            ("test.regular_crates", None),
+            ("test.cli", Some("999")),
+            ("quick.run_smoke", Some("1")),
+        ] {
+            let mut changed = committed.clone();
+            let step = changed
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .unwrap();
+            match mutation {
+                Some(value) => {
+                    step.env
+                        .insert("NEXTEST_EXPECTED_EXECUTED".into(), value.into());
+                }
+                None => {
+                    step.env.remove("NEXTEST_EXPECTED_EXECUTED");
+                }
+            }
+            let error = assert_structured_result_producers(&changed).unwrap_err();
+            assert!(error.contains(tag), "{error}");
+        }
+
+        let mut inline_count = committed.clone();
+        inline_count
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.cli")
+            .unwrap()
+            .cmd
+            .insert_str(0, "NEXTEST_EXPECTED_EXECUTED=71 ");
+        let error = assert_structured_result_producers(&inline_count).unwrap_err();
+        assert!(
+            error.contains("test.cli") && error.contains("command text"),
+            "{error}"
+        );
+
+        let mut duplicate_writer = committed.clone();
+        duplicate_writer
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.regular_crates")
+            .unwrap()
+            .cmd
+            .push_str("; ./ci/run-nextest-counted.sh -p duplicate");
+        let error = assert_structured_result_producers(&duplicate_writer).unwrap_err();
+        assert!(
+            error.contains("test.regular_crates") && error.contains("2 times"),
+            "{error}"
+        );
+        let mut normalized = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.regular_crates")
+            .unwrap()
+            .clone();
+        let before_normalize = normalized
+            .result_manifests
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|manifest| matches!(manifest, ResultManifest::StructuredTestResults(_)))
+            .cloned()
+            .collect::<Vec<_>>();
+        normalize_step(&mut normalized, Path::new("/repo"), Path::new("/run-state")).unwrap();
+        let after_normalize = normalized
+            .result_manifests
+            .as_deref()
+            .unwrap_or_default()
+            .to_vec();
+        assert_eq!(before_normalize, after_normalize);
+        assert!(normalized.effective_result_manifests().is_empty());
+
+        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        let mut reattached = committed.clone();
+        let before = reattached
+            .steps
+            .iter()
+            .map(|step| (step.tag(), step.result_manifests.clone()))
+            .collect::<BTreeMap<_, _>>();
+        attach_result_ownership(&mut reattached, &cells);
+        for step in &reattached.steps {
+            let before_structured = before[&step.tag()]
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter(|manifest| matches!(manifest, ResultManifest::StructuredTestResults(_)))
+                .collect::<Vec<_>>();
+            let after_structured = step
+                .result_manifests
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter(|manifest| matches!(manifest, ResultManifest::StructuredTestResults(_)))
+                .collect::<Vec<_>>();
+            assert_eq!(before_structured, after_structured, "{}", step.tag());
+        }
+        assert_structured_result_producers(&reattached).unwrap();
     }
 }
