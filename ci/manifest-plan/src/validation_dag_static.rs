@@ -18,8 +18,214 @@ use dagrun::model::CmdType;
 use dagrun::model::DagConfig;
 use dagrun::model::DagManifest;
 use dagrun::model::ResourceHint;
+use dagrun::model::ResultManifest;
 use dagrun::model::Step;
 use dagrun::model::StepClass;
+use dagrun::model::StructuredTestResultsManifest;
+
+/// The controlled writer a static validation step invokes.
+///
+/// This is authored metadata, not command-string inference. The generator audits
+/// the command independently so adding or removing a writer cannot silently leave
+/// this declaration stale.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum StructuredResultProducerKind {
+    Nextest,
+    TestHarness,
+    BackendParity,
+    Envelope,
+    Applications,
+}
+
+impl StructuredResultProducerKind {
+    pub(super) const ALL: [Self; 5] = [
+        Self::Nextest,
+        Self::TestHarness,
+        Self::BackendParity,
+        Self::Envelope,
+        Self::Applications,
+    ];
+
+    pub(super) const fn command_marker(self) -> &'static str {
+        match self {
+            Self::Nextest => "run-nextest-counted.sh",
+            Self::TestHarness => "target/debug/test-harness run",
+            Self::BackendParity => "tests/backend-parity/run_matrix.py",
+            Self::Envelope => "write-structured-test-counts.sh",
+            Self::Applications => "tests/e2e/lib/applications/run_all.sh",
+        }
+    }
+
+    pub(super) const fn tags(self) -> &'static [&'static str] {
+        match self {
+            Self::Nextest => NEXTEST_RESULT_PRODUCERS,
+            Self::TestHarness => TEST_HARNESS_RESULT_PRODUCERS,
+            Self::BackendParity => BACKEND_PARITY_RESULT_PRODUCERS,
+            Self::Envelope => ENVELOPE_RESULT_PRODUCERS,
+            Self::Applications => APPLICATION_RESULT_PRODUCERS,
+        }
+    }
+}
+
+pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
+    "liteinst.strict",
+    "privileged-only-test.cli_kvm",
+    "privileged-only-test.cli_kvm_on_host",
+    "privileged-only-test.pmu_buck_chaos_cases",
+    "privileged-only-test.pmu_buck_chaos_cases_on_host",
+    "privileged-test.cli_kvm",
+    "privileged-test.pmu_buck_chaos_cases",
+    "quick.detcore_unit",
+    "super.chaos_hello_race_verification_diagnostic",
+    "super.dbt_failed_exec_recovery_diagnostic",
+    "super.dbt_guest_stderr_isolation_diagnostic",
+    "super.dbt_pipe_backpressure_diagnostic",
+    "super.dbt_strict_blocked_stdin_teardown_diagnostic",
+    "super.dbt_unsupported_syscall_aggregation_diagnostic",
+    "super.full_leveldb_strict_determinism",
+    "super.ipc_determinism_diagnostic",
+    "super.liteinst_python3_verify_diagnostics",
+    "super.managed_jvm_strict_verify_diagnostics",
+    "super.network_syscall_determinism_diagnostic",
+    "super.pmu_analyze_hello_race_stress_calibrated_skid",
+    "super.pmu_buck_chaos_cases",
+    "super.post_fork_scheduling_diagnostics",
+    "super.pselect_signal_interruption_diagnostic",
+    "super.random_source_determinism_diagnostic",
+    "super.record_replay_matrix_diagnostic",
+    "super.relaxed_hermit_flag_matrix",
+    "super.sqlite_veryquick_strict_determinism",
+    "super.threaded_integration_matrix_diagnostic",
+    "super.weekly_ignored_portable_chaos_cases",
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore",
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore",
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore",
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore",
+    "super.weekly_portable_chaos_cases",
+    "super.weekly_relaxed_default_mode_cases",
+    "test.app_strict_verify",
+    "test.arbitrary_binaries",
+    "test.cli",
+    "test.cli_on_host",
+    "test.command_strict_verify",
+    "test.detcore_misc",
+    "test.detcore_parallel",
+    "test.detcore_unit",
+    "test.hermit_integration",
+    "test.hermit_modes",
+    "test.hermit_modes_on_host",
+    "test.hermit_unit",
+    "test.ignored_syscall_regressions",
+    "test.liteinst_strict",
+    "test.regular_crates",
+    "test.rr_suite_contract",
+    "test.sabre_examples",
+];
+
+pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
+    "e2e.manifest_applications",
+    "e2e.manifest_applications_on_host",
+    "e2e.manifest_backend_parity_c",
+    "e2e.manifest_backend_parity_c_on_host",
+    "e2e.manifest_bin_c",
+    "e2e.manifest_bin_c_on_host",
+    "e2e.manifest_c_programs",
+    "e2e.manifest_c_programs_on_host",
+    "e2e.manifest_chaos_c",
+    "e2e.manifest_chaos_c_on_host",
+    "e2e.manifest_data_handling",
+    "e2e.manifest_data_handling_on_host",
+    "e2e.manifest_debugger_c",
+    "e2e.manifest_debugger_c_on_host",
+    "e2e.manifest_determinism_stress",
+    "e2e.manifest_determinism_stress_c",
+    "e2e.manifest_determinism_stress_c_on_host",
+    "e2e.manifest_determinism_stress_on_host",
+    "e2e.manifest_language_runtimes",
+    "e2e.manifest_language_runtimes_on_host",
+    "e2e.manifest_shared_futex_c",
+    "e2e.manifest_shared_futex_c_on_host",
+    "e2e.manifest_system_utils",
+    "e2e.manifest_system_utils_on_host",
+    "e2e.manifest_util_c",
+    "e2e.manifest_util_c_on_host",
+    "privileged-e2e.manifest_applications",
+    "privileged-e2e.manifest_backend_parity_c",
+    "privileged-only-e2e.manifest_applications",
+    "privileged-only-e2e.manifest_applications_on_host",
+    "privileged-only-e2e.manifest_backend_parity_c",
+    "privileged-only-e2e.manifest_backend_parity_c_on_host",
+    "quick.e2e_verify",
+];
+
+pub(super) const BACKEND_PARITY_RESULT_PRODUCERS: &[&str] = &["test.dbt_parity"];
+pub(super) const ENVELOPE_RESULT_PRODUCERS: &[&str] = &["test.envelope_levels"];
+pub(super) const APPLICATION_RESULT_PRODUCERS: &[&str] = &["test.applications_e2e"];
+
+/// Exact historical populations from the last split-DAG source. These are
+/// independent of Nextest's output parser and make an empty or narrowed run
+/// refuse rather than minting a smaller successful population.
+pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
+    ("test.regular_crates", 392),
+    ("test.hermit_unit", 490),
+    ("test.detcore_unit", 652),
+    ("test.detcore_misc", 27),
+    ("test.detcore_parallel", 5),
+    ("test.hermit_integration", 138),
+    ("test.arbitrary_binaries", 3),
+    ("test.cli", 71),
+    ("test.liteinst_strict", 23),
+    ("test.sabre_examples", 5),
+    ("test.hermit_modes", 18),
+    ("test.app_strict_verify", 6),
+    ("test.command_strict_verify", 9),
+    ("test.ignored_syscall_regressions", 2),
+    ("test.rr_suite_contract", 1),
+    ("privileged-test.pmu_buck_chaos_cases", 6),
+    ("privileged-test.cli_kvm", 24),
+    ("test.cli_on_host", 71),
+    ("test.hermit_modes_on_host", 18),
+    ("privileged-only-test.pmu_buck_chaos_cases", 6),
+    ("privileged-only-test.cli_kvm", 24),
+    ("privileged-only-test.pmu_buck_chaos_cases_on_host", 6),
+    ("privileged-only-test.cli_kvm_on_host", 24),
+];
+
+pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
+    for (tags, kind) in [
+        (
+            NEXTEST_RESULT_PRODUCERS,
+            StructuredResultProducerKind::Nextest,
+        ),
+        (
+            TEST_HARNESS_RESULT_PRODUCERS,
+            StructuredResultProducerKind::TestHarness,
+        ),
+        (
+            BACKEND_PARITY_RESULT_PRODUCERS,
+            StructuredResultProducerKind::BackendParity,
+        ),
+        (
+            ENVELOPE_RESULT_PRODUCERS,
+            StructuredResultProducerKind::Envelope,
+        ),
+        (
+            APPLICATION_RESULT_PRODUCERS,
+            StructuredResultProducerKind::Applications,
+        ),
+    ] {
+        if tags.contains(&tag) {
+            return Some(kind);
+        }
+    }
+    None
+}
+
+fn expected_nextest_count(tag: &str) -> Option<u64> {
+    NEXTEST_EXPECTED_COUNTS
+        .iter()
+        .find_map(|(candidate, count)| (*candidate == tag).then_some(*count))
+}
 
 #[derive(Clone, Copy)]
 struct ManifestSpec {
@@ -98,6 +304,25 @@ struct StaticStepSpec {
 
 impl StaticStepSpec {
     fn materialize(self) -> Step {
+        let tag = format!("{}.{}", self.group, self.job);
+        let producer = structured_result_producer_kind(&tag);
+        let mut env = self
+            .env
+            .iter()
+            .map(|(name, value)| ((*name).into(), (*value).into()))
+            .collect::<BTreeMap<String, String>>();
+        if let Some(expected) = expected_nextest_count(&tag) {
+            assert_eq!(
+                producer,
+                Some(StructuredResultProducerKind::Nextest),
+                "{tag} has an expected Nextest count but is not a declared Nextest producer"
+            );
+            assert!(
+                env.insert("NEXTEST_EXPECTED_EXECUTED".into(), expected.to_string())
+                    .is_none(),
+                "{tag} declares NEXTEST_EXPECTED_EXECUTED twice"
+            );
+        }
         Step {
             group: self.group.into(),
             job: self.job.into(),
@@ -110,13 +335,17 @@ impl StaticStepSpec {
             integration_test_binaries: self
                 .integration_test_binaries
                 .map(|values| values.iter().map(|value| (*value).into()).collect()),
-            result_manifests: None,
+            result_manifests: Some(
+                producer
+                    .map(|_| {
+                        vec![ResultManifest::StructuredTestResults(
+                            StructuredTestResultsManifest::current(tag.clone()),
+                        )]
+                    })
+                    .unwrap_or_default(),
+            ),
             deps: self.deps.iter().map(|value| (*value).into()).collect(),
-            env: self
-                .env
-                .iter()
-                .map(|(name, value)| ((*name).into(), (*value).into()))
-                .collect(),
+            env,
             hint: self.hint.materialize(),
             networkonly: self.networkonly,
             engine_only: self.engine_only,
@@ -2540,7 +2769,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Run the six measured-passing Buck chaos cases under PMU preemption"########,
         description: r########"The six enabled cases passed direct measurement on the privileged host. chaos_buck_nanosleep_parallel remains ignored because an interrupted nanosleep reports EINTR; chaos_buck_mem_race remains ignored because it produced no verdict within 300 seconds. Both remain visible in super.pmu_buck_chaos_cases. Depending on pmu.preemption keeps this coverage in the existing privileged PMU partition without changing quick or portable-only."########,
         labels: &[r########"full"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; NEXTEST_EXPECTED_EXECUTED=6 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit "$status""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit "$status""########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"hermit_modes"########]),
@@ -2691,7 +2920,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"All 24 run_kvm_ CLI tests"########,
         description: r########"Runs all KVM-specific hermit CLI tests on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource."########,
         labels: &[r########"full"########, r########"kvm"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] | length == 24' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; NEXTEST_EXPECTED_EXECUTED=24 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] | length == 24' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
@@ -4016,7 +4245,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Run the six measured-passing Buck chaos cases under PMU preemption"########,
         description: r########"The six enabled cases passed direct measurement on the privileged host. chaos_buck_nanosleep_parallel remains ignored because an interrupted nanosleep reports EINTR; chaos_buck_mem_race remains ignored because it produced no verdict within 300 seconds. Both remain visible in super.pmu_buck_chaos_cases. Depending on pmu.preemption keeps this coverage in the existing privileged PMU partition without changing quick or portable-only."########,
         labels: &[r########"privileged"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; NEXTEST_EXPECTED_EXECUTED=6 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit "$status""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit "$status""########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"hermit_modes"########]),
@@ -4133,7 +4362,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"All 24 run_kvm_ CLI tests"########,
         description: r########"Runs all KVM-specific hermit CLI tests on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource."########,
         labels: &[r########"privileged"########, r########"kvm"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] | length == 24' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; NEXTEST_EXPECTED_EXECUTED=24 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] | length == 24' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
@@ -5594,7 +5823,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Run the six measured-passing Buck chaos cases under PMU preemption"########,
         description: r########"The six enabled cases passed direct measurement on the privileged host. chaos_buck_nanosleep_parallel remains ignored because an interrupted nanosleep reports EINTR; chaos_buck_mem_race remains ignored because it produced no verdict within 300 seconds. Both remain visible in super.pmu_buck_chaos_cases. Depending on pmu.preemption keeps this coverage in the existing privileged PMU partition without changing quick or portable-only."########,
         labels: &[r########"hosted-privileged"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; NEXTEST_EXPECTED_EXECUTED=6 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit "$status""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; status=0; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test hermit_modes -j 1 -E 'test(/^(chaos_buck_getpid|chaos_buck_uname|chaos_buck_sysinfo|chaos_buck_wait_on_child|chaos_buck_clone|chaos_buck_hello_alarm)$/)' || status=$?; exit "$status""########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"hermit_modes"########]),
@@ -5730,7 +5959,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"All 24 run_kvm_ CLI tests"########,
         description: r########"Runs all KVM-specific hermit CLI tests on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource."########,
         labels: &[r########"hosted-privileged"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] | length == 24' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; NEXTEST_EXPECTED_EXECUTED=24 ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] | length == 24' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
