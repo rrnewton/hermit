@@ -124,6 +124,40 @@ fn write_executable(path: &Path, contents: &str) {
         .unwrap_or_else(|error| panic!("make {} executable: {error}", path.display()));
 }
 
+fn repository_short_head(root: &Path) -> String {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .expect("read repository HEAD");
+    assert!(
+        output.status.success(),
+        "git rev-parse failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("Git HEAD is UTF-8")
+        .trim()
+        .to_owned()
+}
+
+fn write_source_bound_fake_hermit(path: &Path, git_sha: &str) {
+    let version = serde_json::json!({
+        "schema": 1,
+        "version": "artifact-test",
+        "build_date": null,
+        "git_sha": git_sha,
+        "features": {"dbt": false, "e9patch": false, "sabre": false},
+    });
+    write_executable(
+        path,
+        &format!(
+            "#!/bin/sh\nif [ \"$#\" -eq 2 ] && [ \"$1\" = version ] && [ \"$2\" = --json ]; then\n  printf '%s\\n' '{}'\nelse\n  printf 'expected-identity\\n'\nfi\n",
+            version
+        ),
+    );
+}
+
 fn run_artifact_consumer(root: &Path, pointer: &Path, marker: &Path) -> Output {
     Command::new(root.join("ci/run-with-hermit-e2e-artifact.sh"))
         .env("HERMIT_E2E_ARTIFACT_POINTER", pointer)
@@ -142,7 +176,7 @@ fn run_artifact_consumer(root: &Path, pointer: &Path, marker: &Path) -> Output {
 fn copy_binary_only_bundle(source: &Path, destination: &Path) {
     fs::create_dir_all(destination)
         .unwrap_or_else(|error| panic!("create {}: {error}", destination.display()));
-    for name in ["hermit", "hermit.sha256", "kind"] {
+    for name in ["hermit", "manifest.json"] {
         fs::copy(source.join(name), destination.join(name)).unwrap_or_else(|error| {
             panic!("copy {} into {}: {error}", name, destination.display())
         });
@@ -222,7 +256,7 @@ fn immutable_artifact_controls_a_real_integration_consumer() {
     let pointer = temporary.join("target/ci/hermit-e2e-artifact.path");
     fs::create_dir_all(mutable.parent().expect("mutable binary has a parent"))
         .expect("create mutable target directory");
-    write_executable(&mutable, "#!/bin/sh\nprintf 'expected-identity\\n'\n");
+    write_source_bound_fake_hermit(&mutable, &repository_short_head(&root));
 
     let published = Command::new(root.join("ci/publish-hermit-e2e-artifact.sh"))
         .args([mutable.as_path(), bundles.as_path(), pointer.as_path()])
@@ -257,13 +291,10 @@ fn immutable_artifact_controls_a_real_integration_consumer() {
     for (state, expected_reason) in [
         (
             "absent",
-            "published Hermit is missing, empty, or non-executable",
+            "published artifact file set does not match its manifest",
         ),
-        (
-            "nonexec",
-            "published Hermit is missing, empty, or non-executable",
-        ),
-        ("wrong-hash", "published Hermit hash mismatch"),
+        ("nonexec", "published artifact mode mismatch for hermit"),
+        ("wrong-hash", "published artifact size mismatch for hermit"),
     ] {
         let fake_bundle = temporary.join(state).join(
             bundle
