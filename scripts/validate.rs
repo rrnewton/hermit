@@ -10997,6 +10997,7 @@ const PINNED_ROOT_RR_CONTRACT_TEST_STEPS: &[&str] = &["test.rr_suite_contract"];
 const PINNED_ROOT_IGNORED_SYSCALL_TEST_STEPS: &[&str] =
     &["test.ignored_syscall_regressions"];
 const PINNED_ROOT_SABRE_TEST_STEPS: &[&str] = &["test.sabre_examples"];
+const PINNED_ROOT_HERMIT_MODES_TEST_STEPS: &[&str] = &["test.hermit_modes"];
 const PINNED_ROOT_PRIVILEGED_TEST_STEPS: &[&str] = &[
     "cpuid.faulting",
     "pmu.preemption",
@@ -11020,6 +11021,7 @@ fn pinned_root_test_step(step: &Step, compat: Option<CompatMode>) -> bool {
         || PINNED_ROOT_RR_CONTRACT_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_IGNORED_SYSCALL_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_SABRE_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_HERMIT_MODES_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_PRIVILEGED_TEST_STEPS.contains(&step.tag().as_str())
         || (compat == Some(CompatMode::PortableStrict)
             && (step.group == "compat"
@@ -11434,6 +11436,12 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
                     "test",
                     "sabre_examples",
                     "HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test sabre_examples -j 1",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
+                    "test",
+                    "hermit_modes",
+                    "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test hermit_modes -j 1 -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify",
                     vec!["build.e2e_artifact".into(), "setup.nextest".into()],
                 ),
                 step(
@@ -11866,6 +11874,28 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
             "pinned-root bracket: test.sabre_examples lost its image wrapper, /test gate or in-image artifact dependency: {sabre_examples:?}"
         ));
     }
+    let hermit_modes = by_tag
+        .get("test.hermit_modes")
+        .ok_or("pinned-root bracket: test.hermit_modes disappeared")?;
+    if !hermit_modes.cmd.contains("run-in-pinned-root.sh")
+        || hermit_modes
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
+        || !hermit_modes
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+        || hermit_modes
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact")
+    {
+        return Err(format!(
+            "pinned-root bracket: test.hermit_modes lost its image wrapper, /test gate or in-image artifact dependency: {hermit_modes:?}"
+        ));
+    }
     for tag in ["privileged-cpuid.faulting", "privileged-pmu.preemption"] {
         let test = by_tag
             .get(tag)
@@ -12286,7 +12316,7 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
             "pinned-root bracket: sequential lanes must fetch once then reuse the cache: first_fetches={first_fetches} second_fetches={second_fetches} second={second_step:?}"
         ));
     }
-    Ok("pinned root: scheduled manifest cells, portable strict compatibility probes, the application, arbitrary-binary, strict-command, rr-suite contract and SaBRe example test nodes, the DBT parity matrix, 2 in-process Detcore test nodes, 3 ordinary unit-test nodes, 2 privileged checks, 3 quick guest checks, the working-envelope check and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
+    Ok("pinned root: scheduled manifest cells, portable strict compatibility probes, the application, arbitrary-binary, strict-command, rr-suite contract, SaBRe example and Hermit mode test nodes, the DBT parity matrix, 2 in-process Detcore test nodes, 3 ordinary unit-test nodes, 2 privileged checks, 3 quick guest checks, the working-envelope check and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
 }
 
 // --------------------------------------------------------------------------- interruption

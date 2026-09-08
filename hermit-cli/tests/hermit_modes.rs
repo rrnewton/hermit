@@ -366,12 +366,22 @@ fn workloads() -> &'static Workloads {
 }
 
 fn hermit_command(base_env: &str) -> Command {
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    hermit_command_with_execution_root(base_env, requested.as_deref())
+        .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"))
+}
+
+fn hermit_command_with_execution_root(
+    base_env: &str,
+    requested_workdir: Option<&OsStr>,
+) -> Result<Command, String> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
         .arg("run")
         .arg(format!("--base-env={base_env}"))
-        .args(["--no-virtualize-cpuid", "--max-timeslice=disabled"]);
-    command
+        .args(["--no-virtualize-cpuid", "--max-timeslice=disabled"])
+        .args(execution_root_args(requested_workdir)?);
+    Ok(command)
 }
 
 fn verify_guest_command(
@@ -398,7 +408,9 @@ fn verify_guest_command(
             "--base-env=minimal",
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
-        ])
+        ]);
+    configure_execution_root(&mut command);
+    command
         .arg(format!("--tmp={}", tmp.display()))
         .arg("/tmp/guest");
     command
@@ -500,7 +512,7 @@ fn run_buck_chaos_workload(name: &str) {
 }
 
 #[test]
-fn buck_chaos_pinned_root_arguments_are_exact_and_fail_closed() {
+fn pinned_root_arguments_are_exact_and_fail_closed() {
     assert!(execution_root_args(None).unwrap().is_empty());
     assert_eq!(
         execution_root_args(Some(OsStr::new("/test"))).unwrap(),
@@ -511,6 +523,21 @@ fn buck_chaos_pinned_root_arguments_are_exact_and_fail_closed() {
     );
     let error = execution_root_args(Some(OsStr::new("/tmp"))).unwrap_err();
     assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
+
+    let command = hermit_command_with_execution_root("minimal", Some(OsStr::new("/test")))
+        .expect("the documented workdir request should build a command");
+    let args: Vec<_> = command.get_args().collect();
+    assert!(args.windows(2).any(|args| {
+        args == [
+            OsStr::new("--mount=type=tmpfs,target=/test"),
+            OsStr::new("--workdir=/test"),
+        ]
+    }));
+    assert!(
+        hermit_command_with_execution_root("minimal", Some(OsStr::new("/tmp")))
+            .unwrap_err()
+            .contains("HERMIT_E2E_EMPTY_WORKDIR must be /test")
+    );
 }
 
 macro_rules! buck_chaos_tests {
@@ -640,9 +667,16 @@ fn run_bounded_sabre_strict_verify(program: &Path, args: &[&str], label: &str) {
 
     let _guard = hermit_run_lock();
     let mut command = Command::new(hermit_binary);
+    command.env("HERMIT_SABRE_BINARY", &loader).args([
+        "run",
+        "--backend",
+        "sabre",
+        "--strict",
+        "--verify",
+    ]);
+    configure_execution_root(&mut command);
     command
-        .env("HERMIT_SABRE_BINARY", &loader)
-        .args(["run", "--backend", "sabre", "--strict", "--verify", "--"])
+        .arg("--")
         .arg(program)
         .args(args)
         .process_group(0)
@@ -1011,9 +1045,9 @@ fn no_hardware_stacktrace_signal() {
         "--base-env=minimal",
         "--no-virtualize-cpuid",
         "--max-timeslice=disabled",
-        "--",
-        "/bin/date",
     ]);
+    configure_execution_root(&mut command);
+    command.args(["--", "/bin/date"]);
     let rendered = format!("{command:?}");
     let output = command
         .output()
@@ -1198,7 +1232,8 @@ fn verify_strict_info_reports_typed_memory_parity_on_landed_fixture() {
     compile_c(&repository.join("tests/c/print_memaddrs.c"), &guest);
     let report = tmp.path().join("verify.json");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
         .args([
             "--log=info",
             "run",
@@ -1214,8 +1249,10 @@ fn verify_strict_info_reports_typed_memory_parity_on_landed_fixture() {
             "--base-env=minimal",
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
-            "--",
-        ])
+        ]);
+    configure_execution_root(&mut command);
+    let output = command
+        .arg("--")
         .arg(&guest)
         .output()
         .expect("failed to run strict INFO verification");
@@ -1309,7 +1346,9 @@ int main(void) {
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
         ])
-        .arg(format!("--tmp={}", tmp.path().display()))
+        .arg(format!("--tmp={}", tmp.path().display()));
+    configure_execution_root(&mut command);
+    command
         .arg("/tmp/guest")
         .env("VERIFY_HOST_ONLY", "unexpected");
     command_output(command, "verify configuration");
@@ -1320,18 +1359,18 @@ fn hello_race_chaos_verify() {
     let _guard = hermit_run_lock();
     let workload = &workloads().hello_race;
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
-    command
-        .args([
-            "run",
-            "--verify",
-            "--verify-allow=both",
-            "--chaos",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-            "--env=HERMIT_MODE=chaos",
-        ])
-        .arg(&workload.path);
+    command.args([
+        "run",
+        "--verify",
+        "--verify-allow=both",
+        "--chaos",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--env=HERMIT_MODE=chaos",
+    ]);
+    configure_execution_root(&mut command);
+    command.arg("--").arg(&workload.path);
     let rendered = format!("{command:?}");
     let output = command
         .output()

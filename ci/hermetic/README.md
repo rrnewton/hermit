@@ -104,6 +104,11 @@ and Hermit binary built there. Every ptrace and SaBRe guest invocation receives
 the private `/test` mount and `/test` working directory; the controller keeps
 its retained comparison logs in the guest-visible target directory.
 
+The portable `test.hermit_modes` node also runs in the pinned root. Its shared
+Hermit command and each direct guest invocation apply the same exact `/test`
+request. The separately selected PMU Buck cases retain that contract on the
+privileged lane.
+
 The privileged CPUID-faulting check, PMU preemption check, and the six selected
 PMU Buck chaos cases run in the pinned root as well, with their test executable
 built there. The CPUID check uses the same in-process Detcore helper that enters
