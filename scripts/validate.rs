@@ -1123,6 +1123,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "300",
                 "./scripts/validate.rs",
                 ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION,
+                SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION,
                 "--only",
                 "portable",
                 "pre.submodules",
