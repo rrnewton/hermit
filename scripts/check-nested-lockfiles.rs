@@ -226,6 +226,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Output;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
 
     use super::*;
 
@@ -245,6 +250,318 @@ mod tests {
             .current_dir(root)
             .output()
             .expect("run split-validate dry-run")
+    }
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone, Copy, Debug)]
+    enum FetchMutation {
+        None,
+        OmitPreparation,
+        OmitResolution,
+        OmitLockedFetch,
+    }
+
+    struct ProductionFixture {
+        base: PathBuf,
+        root: PathBuf,
+        fake_bin: PathBuf,
+        journal: PathBuf,
+    }
+
+    impl Drop for ProductionFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn source_repo_root() -> PathBuf {
+        Path::new(file!())
+            .canonicalize()
+            .expect("checker source path")
+            .parent()
+            .and_then(Path::parent)
+            .expect("checker lives under the repository scripts directory")
+            .to_owned()
+    }
+
+    fn write_executable(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create executable parent");
+        }
+        fs::write(path, contents).expect("write executable fixture");
+        let mut permissions = fs::metadata(path).expect("fixture metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("make fixture executable");
+    }
+
+    fn replace_exactly_once(source: &str, needle: &str, replacement: &str) -> String {
+        assert_eq!(
+            source.matches(needle).count(),
+            1,
+            "production mutation target must occur exactly once"
+        );
+        source.replacen(needle, replacement, 1)
+    }
+
+    fn production_fixture(mutation: FetchMutation) -> ProductionFixture {
+        let source_root = source_repo_root();
+        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let base = env::temp_dir().join(format!(
+            "split-validate-generated-fetch-{}-{sequence}",
+            std::process::id()
+        ));
+        let root = base.join("repo");
+        let fake_bin = base.join("bin");
+        let journal = base.join("journal");
+        fs::create_dir_all(root.join("ci/hermetic")).expect("create fixture repository");
+        fs::create_dir_all(root.join("liteinst-runtime-build"))
+            .expect("create nested workspace fixture");
+        fs::create_dir_all(&fake_bin).expect("create fake binary directory");
+
+        let mut split = fs::read_to_string(source_root.join("ci/hermetic/run-split-validate.sh"))
+            .expect("read production split validator");
+        let mut prepare = fs::read_to_string(source_root.join("ci/prepare-rust-scripts.sh"))
+            .expect("read production rust-script producer");
+        match mutation {
+            FetchMutation::None => {}
+            FetchMutation::OmitPreparation => {
+                split = replace_exactly_once(
+                    &split,
+                    "        CARGO_HOME=\"$cargo_home\" ./ci/prepare-rust-scripts.sh --fetch-only\n",
+                    "        : # mutation control: generated workspace preparation omitted\n",
+                );
+            }
+            FetchMutation::OmitResolution => {
+                let block = r#"    if ! cargo generate-lockfile --manifest-path "$workspace_manifest" >"$output" 2>&1; then
+        report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
+            'resolve dependencies for' || exit $?
+    fi
+    cat "$output"
+"#;
+                prepare = replace_exactly_once(
+                    &prepare,
+                    block,
+                    "    # mutation control: generated workspace resolution omitted\n",
+                );
+            }
+            FetchMutation::OmitLockedFetch => {
+                let block = r#"    if ! cargo fetch --locked --manifest-path "$workspace_manifest" >"$output" 2>&1; then
+        report_cargo_failure 'the generated rust-script workspace' "$workspace_manifest" "$output" \
+            'fetch dependencies for' || exit $?
+    fi
+    cat "$output"
+"#;
+                prepare = replace_exactly_once(
+                    &prepare,
+                    block,
+                    "    # mutation control: generated workspace locked fetch omitted\n",
+                );
+            }
+        }
+        write_executable(&root.join("ci/hermetic/run-split-validate.sh"), &split);
+        write_executable(&root.join("ci/prepare-rust-scripts.sh"), &prepare);
+
+        fs::write(
+            root.join("ci/portable-shards.json"),
+            r#"{
+  "preflight_nodes": [],
+  "check_nodes": [],
+  "build_debug_nodes": [],
+  "build_dbt_nodes": [],
+  "build_aux_nodes": [],
+  "debug_shards": [{"slug": "unit", "nodes": ["fixture.node"]}],
+  "release_shards": [],
+  "strict_compat_nodes": [],
+  "e2e_nodes": [],
+  "final_nodes": []
+}
+"#,
+        )
+        .expect("write shard fixture");
+        fs::write(root.join("ci/expected-e2e-plan.json"), "{}\n").expect("write plan fixture");
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n")
+            .expect("write root manifest fixture");
+        fs::write(
+            root.join("liteinst-runtime-build/Cargo.toml"),
+            "[workspace]\nmembers = []\n",
+        )
+        .expect("write nested manifest fixture");
+        fs::write(
+            root.join("fixture.rs"),
+            "#!/usr/bin/env -S rust-script --force\nfn main() {}\n",
+        )
+        .expect("write tracked rust-script fixture");
+
+        write_executable(
+            &root.join("ci/hermetic/assert-no-network.sh"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf 'network-probe\n' >>"${FIXTURE_JOURNAL:?}"
+[[ ${1:-} == --expect-network ]]
+"#,
+        );
+        write_executable(
+            &root.join("ci/hermetic/run-in-pinned-root.sh"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+cargo_home=
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --cargo-home) cargo_home=$2; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[[ -f $cargo_home/generated-workspace-resolved ]] || {
+    printf 'offline-missing-generated-resolution\n' >>"${FIXTURE_JOURNAL:?}"
+    exit 91
+}
+[[ -f $cargo_home/generated-workspace-fetched ]] || {
+    printf 'offline-missing-generated-fetch\n' >>"${FIXTURE_JOURNAL:?}"
+    exit 92
+}
+printf 'offline-consumer\n' >>"${FIXTURE_JOURNAL:?}"
+"#,
+        );
+        write_executable(
+            &fake_bin.join("rust-script"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == --version ]]; then
+    echo 'rust-script 0.35.0'
+    exit 0
+fi
+package_dir=
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --package) shift ;;
+        --pkg-path) package_dir=$2; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[[ -n $package_dir ]]
+mkdir -p "$package_dir"
+printf '[package]\nname = "fixture"\nversion = "0.0.0"\nedition = "2021"\n' >"$package_dir/Cargo.toml"
+printf 'fn main() {}\n' >"$package_dir/main.rs"
+printf 'rust-script-package\n' >>"${FIXTURE_JOURNAL:?}"
+"#,
+        );
+        write_executable(
+            &fake_bin.join("rustc"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf 'rustc 1.90.0 (fixture)\nbinary: rustc\ncommit-hash: fixture\n'
+"#,
+        );
+        write_executable(
+            &fake_bin.join("cargo"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+command_name=${1:-}
+shift || true
+manifest=
+locked=0
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --manifest-path) manifest=$2; shift 2 ;;
+        --locked) locked=1; shift ;;
+        *) shift ;;
+    esac
+done
+case $command_name in
+    metadata)
+        printf 'generated-metadata\n' >>"${FIXTURE_JOURNAL:?}"
+        printf '{"packages":[{}]}\n'
+        ;;
+    generate-lockfile)
+        [[ $manifest == */hermit-rust-script-packages.*/Cargo.toml ]]
+        : >"${manifest%/*}/Cargo.lock"
+        : >"${CARGO_HOME:?}/generated-workspace-resolved"
+        printf 'generated-resolve\n' >>"${FIXTURE_JOURNAL:?}"
+        ;;
+    fetch)
+        [[ $locked -eq 1 ]]
+        mkdir -p "${CARGO_HOME:?}/registry"
+        if [[ $manifest == */hermit-rust-script-packages.*/Cargo.toml ]]; then
+            [[ -f ${manifest%/*}/Cargo.lock ]]
+            [[ -f $CARGO_HOME/generated-workspace-resolved ]]
+            : >"$CARGO_HOME/generated-workspace-fetched"
+            printf 'generated-locked-fetch\n' >>"${FIXTURE_JOURNAL:?}"
+        else
+            printf 'committed-locked-fetch:%s\n' "$manifest" >>"${FIXTURE_JOURNAL:?}"
+        fi
+        ;;
+    *)
+        printf 'unexpected fake cargo command: %s\n' "$command_name" >&2
+        exit 93
+        ;;
+esac
+"#,
+        );
+
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .expect("initialize fixture repository");
+        assert!(init.success());
+        let add = Command::new("git")
+            .args(["add", "fixture.rs"])
+            .current_dir(&root)
+            .status()
+            .expect("stage rust-script fixture");
+        assert!(add.success());
+        let commit = Command::new("git")
+            .args([
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ])
+            .current_dir(&root)
+            .status()
+            .expect("commit rust-script fixture");
+        assert!(commit.success());
+
+        ProductionFixture {
+            base,
+            root,
+            fake_bin,
+            journal,
+        }
+    }
+
+    fn run_production_fixture(mutation: FetchMutation) -> (Output, String) {
+        let fixture = production_fixture(mutation);
+        let path = env::join_paths(
+            std::iter::once(fixture.fake_bin.clone())
+                .chain(env::split_paths(&env::var_os("PATH").expect("test PATH"))),
+        )
+        .expect("join fixture PATH");
+        let output = Command::new(fixture.root.join("ci/hermetic/run-split-validate.sh"))
+            .args(["--out", "phase-output", "--shards", "unit"])
+            .current_dir(&fixture.root)
+            .env("PATH", path)
+            .env(
+                "HERMIT_REAL_RUST_SCRIPT",
+                fixture.fake_bin.join("rust-script"),
+            )
+            .env("FIXTURE_JOURNAL", &fixture.journal)
+            .output()
+            .expect("run production split validator fixture");
+        let journal = fs::read_to_string(&fixture.journal).unwrap_or_default();
+        (output, journal)
+    }
+
+    fn journal_position(journal: &str, event: &str) -> usize {
+        journal
+            .lines()
+            .position(|line| line == event)
+            .unwrap_or_else(|| panic!("missing {event:?} in fixture journal:\n{journal}"))
     }
 
     #[test]
@@ -294,6 +611,7 @@ mod tests {
         );
         assert!(stdout.contains("-- fetch phase would run"));
         assert!(stdout.contains("-- offline phase would run"));
+        assert!(stdout.contains("./ci/prepare-rust-scripts.sh --fetch-only"));
     }
 
     #[test]
@@ -309,6 +627,7 @@ mod tests {
         assert!(stdout.contains("FETCH phase"));
         assert!(stdout.contains("-- fetch phase would run"));
         assert!(stdout.contains("cargo fetch --locked"));
+        assert!(stdout.contains("./ci/prepare-rust-scripts.sh --fetch-only"));
         assert!(!stdout.contains("OFFLINE phase"));
         assert!(!stdout.contains("-- offline phase would run"));
     }
@@ -331,11 +650,54 @@ mod tests {
     }
 
     #[test]
+    fn production_split_resolves_and_fetches_generated_workspace_before_offline_use() {
+        let (output, journal) = run_production_fixture(FetchMutation::None);
+        assert!(
+            output.status.success(),
+            "production split fixture failed:\nstdout:\n{}\nstderr:\n{}\njournal:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            journal
+        );
+
+        let network = journal_position(&journal, "network-probe");
+        let metadata = journal_position(&journal, "generated-metadata");
+        let resolve = journal_position(&journal, "generated-resolve");
+        let fetch = journal_position(&journal, "generated-locked-fetch");
+        let offline = journal_position(&journal, "offline-consumer");
+        assert!(
+            network < metadata && metadata < resolve && resolve < fetch && fetch < offline,
+            "generated workspace preparation must finish before the offline consumer:\n{journal}"
+        );
+    }
+
+    #[test]
+    fn production_split_fails_if_any_generated_workspace_fetch_call_is_removed() {
+        for mutation in [
+            FetchMutation::OmitPreparation,
+            FetchMutation::OmitResolution,
+            FetchMutation::OmitLockedFetch,
+        ] {
+            let (output, journal) = run_production_fixture(mutation);
+            assert!(
+                !output.status.success(),
+                "{mutation:?} unexpectedly reached a successful offline consumer:\n{journal}"
+            );
+            assert!(
+                !journal.lines().any(|line| line == "offline-consumer"),
+                "{mutation:?} reached the offline consumer without complete generated-workspace preparation:\n{journal}"
+            );
+        }
+    }
+
+    #[test]
     fn hermetic_dry_run_refuses_both_phase_only_flags() {
         let output = split_validate_dry_run(&["--fetch-only", "--offline-only"]);
         assert_eq!(output.status.code(), Some(2));
-        assert!(String::from_utf8_lossy(&output.stderr)
-            .contains("--fetch-only and --offline-only cannot be combined"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("--fetch-only and --offline-only cannot be combined")
+        );
     }
 
     #[test]

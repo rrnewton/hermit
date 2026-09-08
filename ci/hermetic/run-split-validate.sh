@@ -2,9 +2,9 @@
 # Run local validate as TWO PHASES separated by a network boundary:
 #
 #   FETCH phase   -- on the host, WITH network, and it does nothing but
-#                    download. Locked fetches for every Cargo workspace used by
-#                    the offline phase populate one CARGO_HOME and produce no
-#                    build output at all.
+#                    download. Locked fetches for every Cargo workspace and the
+#                    generated rust-script workspace used by the offline phase
+#                    populate one CARGO_HOME and produce no build output at all.
 #
 #   OFFLINE phase -- inside the nix-pinned root, with NO network. BUILD AND TEST
 #                    BOTH RUN HERE, against the fetched cache and the pinned
@@ -274,6 +274,7 @@ if [[ $dry -eq 1 ]]; then
         for manifest in "${FETCH_MANIFESTS[@]}"; do
             echo "   CARGO_HOME=$cargo_home cargo fetch --locked --manifest-path $manifest"
         done
+        echo "   CARGO_HOME=$cargo_home ./ci/prepare-rust-scripts.sh --fetch-only"
     fi
     if [[ $do_offline -eq 1 ]]; then
         echo
@@ -325,6 +326,7 @@ if [[ $do_fetch -eq 1 ]]; then
         for manifest in "${FETCH_MANIFESTS[@]}"; do
             CARGO_HOME="$cargo_home" cargo fetch --locked --manifest-path "$manifest"
         done
+        CARGO_HOME="$cargo_home" ./ci/prepare-rust-scripts.sh --fetch-only
     )
     echo ":::: FETCH PHASE complete -- every byte checked against its Cargo.lock"
 fi
