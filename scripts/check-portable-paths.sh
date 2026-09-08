@@ -82,6 +82,20 @@ self_test() {
         return 1
     fi
 
+    printf '%s\n' '# Measured on devbig-portability-test' >"$fixture"
+    if scan_file "$fixture" >/dev/null; then
+        echo "portability self-test failed to reject a literal measurement host" >&2
+        rm -f "$fixture"
+        return 1
+    fi
+
+    printf '%s\n' '# Measured on the host recorded in docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts"' >"$fixture"
+    scan_file "$fixture" >/dev/null || {
+        echo "portability self-test rejected the documented measurement-host reference" >&2
+        rm -f "$fixture"
+        return 1
+    }
+
     is_excluded ci/compat-envelope/cells.json || {
         echo "portability self-test failed to exclude literal compatibility evidence" >&2
         rm -f "$fixture"

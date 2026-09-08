@@ -62,8 +62,9 @@ fi
 # but the message below announced a compile failure and pointed at
 # `cargo clippy`, which cannot reproduce it and does not mention the submodule.
 #
-# Measured 2026-09-04 on devbig014: this fired on a diff touching NO RUST AT ALL
-# -- a Python CI helper plus a Makefile line -- with
+# Measured 2026-09-04 on the host recorded for this check in
+# docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts": this fired on a
+# diff touching NO RUST AT ALL -- a Python CI helper plus a Makefile line -- with
 # "error: no matching package named `dagrun` found". The remedy was
 # `git submodule update --init agent-utils`, which the message never named.
 #

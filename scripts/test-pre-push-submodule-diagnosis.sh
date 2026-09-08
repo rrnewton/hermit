@@ -3,13 +3,14 @@
 # distinction, with no cargo run: the checker is stubbed so only the hook's own
 # branch selection is under test.
 #
-# The defect, measured 2026-09-04 on devbig014: in a fresh detached worktree the
-# submodules are unpopulated, Cargo cannot resolve a path dependency whose
-# directory is absent, and the hook announced "the working tree does not compile
-# in the default feature configuration" pointing at `cargo clippy`. It fired on a
-# diff touching no Rust at all and never named the submodule. A clean detached
-# worktree is the landing procedure CLAUDE.md prescribes, so the documented safe
-# path reliably produced a misleading failure.
+# The defect was measured 2026-09-04 on the host recorded for this check in
+# docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts". In a fresh
+# detached worktree the submodules are unpopulated, Cargo cannot resolve a path
+# dependency whose directory is absent, and the hook announced "the working tree
+# does not compile in the default feature configuration" pointing at
+# `cargo clippy`. It fired on a diff touching no Rust at all and never named the
+# submodule. A clean detached worktree is the landing procedure CLAUDE.md
+# prescribes, so the documented safe path reliably produced a misleading failure.
 #
 # ⚠️ BOTH DIRECTIONS. A hook that always blamed the submodule would pass the
 # first case and hide every real compile failure, which is worse than the bug.
