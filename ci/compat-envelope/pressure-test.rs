@@ -53,6 +53,11 @@ use dagrun::scheduler::BoxedCgroups;
 use dagrun::scheduler::run_dag_boxed_deadline;
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use hermit_manifest_plan::canonical_verdict::ComparedLogMessages;
+use hermit_manifest_plan::canonical_verdict::ComparedLogScope;
+use hermit_manifest_plan::canonical_verdict::ComparisonReport;
+use hermit_manifest_plan::canonical_verdict::LogCompareStrictness;
+use hermit_manifest_plan::canonical_verdict::RecordEnvelopeReport;
 use hermit_manifest_plan::canonical_verdict::RuntimeStats;
 use hermit_manifest_plan::canonical_verdict::Verdict;
 use hermit_manifest_plan::canonical_verdict::VerificationReport;
@@ -8646,40 +8651,61 @@ fn self_test(root: &Path) -> Result<(), String> {
     descriptor_row.first_divergent_right_message = None;
     descriptor_row.attempts[0].outcome = "PASS".into();
     descriptor_row.attempts[0].status = Some(0);
-    let embedded_report = serde_json::to_string(&json!({
-        "verified": true,
-        "bitwise_parity": true,
-        "verdict": "matched",
-        "infrastructure_error": null,
-        "comparison": {
-            "strictness": "canonical",
-            "display_name": "BitwiseInfoV1",
-            "compare_logs": true,
-            "compare_io_buffers": true,
-            "log_scope": "info",
-            "record_envelope": "all_records_v1",
-            "virtualize_time": true,
-            "strip_lines": false,
-            "canonicalize_addresses": true,
-            "full_trace": true,
-            "exact_remainder": true,
-            "stripped_prefixes": ["real-wall-clock-prefix/v1"],
-            "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
-            "ignore_lines": false,
-            "skip_commit": false,
-            "skip_detlog": false
-        },
-        "compared_log_messages": {"left": 1, "right": 1},
-        "guest_exit_code": 0,
-        "guest_signal": null,
-        "first_divergent_scheduler_turn": null,
-        "first_divergent_virtual_nanoseconds": null,
-        "first_divergent_record": null,
-        "first_divergent_syscall": null,
-        "first_divergent_left_message": null,
-        "first_divergent_right_message": null
-    }))
+    let embedded_report = serde_json::to_string(&VerificationReport {
+        verified: true,
+        bitwise_parity: true,
+        verdict: Verdict::Matched,
+        no_result_reason: None,
+        infrastructure_error: None,
+        comparison: Some(ComparisonReport {
+            strictness: LogCompareStrictness::Canonical,
+            display_name: Some("BitwiseInfoV1".into()),
+            compare_logs: true,
+            compare_io_buffers: Some(true),
+            log_scope: Some(ComparedLogScope::Info),
+            record_envelope: RecordEnvelopeReport::AllRecordsV1,
+            virtualize_time: Some(true),
+            strip_lines: Some(false),
+            canonicalize_addresses: Some(true),
+            full_trace: Some(true),
+            exact_remainder: Some(true),
+            stripped_prefixes: Some(vec!["real-wall-clock-prefix/v1".into()]),
+            canonicalizations: Some(vec![
+                "host-address-to-first-appearance-ordinal/v1".into(),
+            ]),
+            ignore_lines: Some(false),
+            skip_commit: Some(false),
+            skip_detlog: Some(false),
+        }),
+        compared_log_messages: Some(ComparedLogMessages { left: 1, right: 1 }),
+        dbt_counted_branches: None,
+        runtime: None,
+        guest_exit_code: Some(0),
+        guest_signal: None,
+        first_divergent_scheduler_turn: None,
+        first_divergent_virtual_nanoseconds: None,
+        first_divergent_record: None,
+        first_divergent_syscall: None,
+        first_divergent_left_message: None,
+        first_divergent_right_message: None,
+    })
     .map_err(|error| format!("cannot encode embedded verification fixture: {error}"))?;
+    let mut missing_reason: JsonValue = serde_json::from_str(&embedded_report)
+        .map_err(|error| format!("cannot decode embedded verification fixture: {error}"))?;
+    missing_reason
+        .as_object_mut()
+        .expect("typed verification report is an object")
+        .remove("no_result_reason");
+    let missing_reason_error = validate_verification_report(
+        missing_reason,
+        "schema-5 missing-no_result_reason self-test",
+    )
+    .expect_err("a schema-5 report without no_result_reason was accepted");
+    if !missing_reason_error.contains("no_result_reason") {
+        return Err(format!(
+            "schema-5 report missing no_result_reason was not refused precisely: {missing_reason_error}"
+        ));
+    }
     descriptor_row.attempts[0].verification_report_sha256 =
         Some(format!("{:x}", Sha256::digest(embedded_report.as_bytes())));
     descriptor_row.attempts[0].verification_report = Some(embedded_report.clone());
