@@ -107,10 +107,11 @@ performance-counter probe rather than a Hermit guest, so it has no guest working
 directory to change. Each selected Buck chaos case gives its Hermit guest a
 private `/test` mount and `/test` working directory.
 
-The regular workspace crates and Detcore library and binary unit tests also run
-in the pinned root and consume its build artifact. Most of these are ordinary
-unit tests with no Hermit guest. The `detcore-testutils` cases included in the
-regular-crates node use the same `/test` request for their in-process tracees.
+The regular workspace crates, Hermit library and binary unit tests, and Detcore
+library and binary unit tests also run in the pinned root and consume its build
+artifact. Most of these are ordinary unit tests with no Hermit guest. The
+`detcore-testutils` cases included in the regular-crates node use the same
+`/test` request for their in-process tracees.
 
 This does not complete the every-test contract. Other host integration tests
 still need their Hermit invocations audited and staged.
