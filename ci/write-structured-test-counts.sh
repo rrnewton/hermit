@@ -41,7 +41,7 @@ function self_test {
             'suite$passes' pass 1 'suite$fails' fail 2
     # shellcheck disable=SC2016 # `$` is part of the expected JSON string.
     [[ $(<"$scratch/counts.json") == \
-        '{"executed_tests":2,"filtered_tests":2,"results":[{"attempts":1,"id":"suite$passes","result":"pass"},{"attempts":2,"id":"suite$fails","result":"fail"}],"schema":2}' ]] || status=1
+        '{"executed_tests":2,"filtered_tests":2,"results":[{"attempt_results":[{"attempt":1,"detail":null,"outcome":"passed"}],"attempts":1,"id":"suite$passes","result":"pass"},{"attempt_results":[{"attempt":1,"detail":"test runner retried after this non-passing attempt","outcome":"failed"},{"attempt":2,"detail":"test runner reported a failed terminal result","outcome":"failed"}],"attempts":2,"id":"suite$fails","result":"fail"}],"schema":3}' ]] || status=1
     output=$(unset DAGRUN_TEST_COUNTS_PATH; PATH="$scratch/no-rust-script" \
         write_structured_test_results 1 0 anything pass 1) \
         || status=1

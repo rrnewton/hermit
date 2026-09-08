@@ -916,7 +916,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_applications"
         }
@@ -2221,7 +2221,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_backend_parity_c"
         }
@@ -2328,7 +2328,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_bin_c"
         }
@@ -5208,7 +5208,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_c_programs"
         }
@@ -5274,7 +5274,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_chaos_c"
         }
@@ -5368,7 +5368,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_data_handling"
         }
@@ -5448,7 +5448,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_debugger_c"
         }
@@ -5584,7 +5584,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_determinism_stress_c"
         }
@@ -5678,7 +5678,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_determinism_stress"
         }
@@ -5926,7 +5926,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_language_runtimes"
         }
@@ -5978,7 +5978,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_shared_futex_c"
         }
@@ -6443,7 +6443,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_system_utils"
         }
@@ -6495,7 +6495,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_util_c"
         }
@@ -6544,7 +6544,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.applications_e2e"
         }
@@ -6687,7 +6687,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.regular_crates"
         }
@@ -6731,7 +6731,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.hermit_unit"
         }
@@ -6775,7 +6775,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.detcore_unit"
         }
@@ -6819,7 +6819,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.detcore_misc"
         }
@@ -6863,7 +6863,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.detcore_parallel"
         }
@@ -6907,7 +6907,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.hermit_integration"
         }
@@ -6997,7 +6997,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.arbitrary_binaries"
         }
@@ -7043,7 +7043,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.cli"
         }
@@ -7089,7 +7089,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.cli_on_host"
         }
@@ -7137,7 +7137,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.liteinst_strict"
         }
@@ -7185,7 +7185,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.sabre_examples"
         }
@@ -7231,7 +7231,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.hermit_modes"
         }
@@ -7276,7 +7276,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.hermit_modes_on_host"
         }
@@ -7323,7 +7323,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.app_strict_verify"
         }
@@ -7370,7 +7370,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.command_strict_verify"
         }
@@ -7417,7 +7417,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.ignored_syscall_regressions"
         }
@@ -7465,7 +7465,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.rr_suite_contract"
         }
@@ -7512,7 +7512,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.dbt_parity"
         }
@@ -7554,7 +7554,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "test.envelope_levels"
         }
@@ -7694,7 +7694,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "privileged-test.pmu_buck_chaos_cases"
         }
@@ -7783,7 +7783,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "privileged-e2e.manifest_applications"
         }
@@ -7847,7 +7847,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "privileged-e2e.manifest_backend_parity_c"
         }
@@ -7894,7 +7894,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "privileged-test.cli_kvm"
         }
@@ -10465,7 +10465,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "quick.e2e_verify"
         }
@@ -10508,7 +10508,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "quick.detcore_unit"
         }
@@ -10708,7 +10708,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.relaxed_hermit_flag_matrix"
         }
@@ -10747,7 +10747,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore"
         }
@@ -10786,7 +10786,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore"
         }
@@ -10825,7 +10825,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore"
         }
@@ -10864,7 +10864,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore"
         }
@@ -10903,7 +10903,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.pselect_signal_interruption_diagnostic"
         }
@@ -10942,7 +10942,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.record_replay_matrix_diagnostic"
         }
@@ -10981,7 +10981,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.managed_jvm_strict_verify_diagnostics"
         }
@@ -11020,7 +11020,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.post_fork_scheduling_diagnostics"
         }
@@ -11059,7 +11059,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.network_syscall_determinism_diagnostic"
         }
@@ -11098,7 +11098,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.ipc_determinism_diagnostic"
         }
@@ -11137,7 +11137,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.random_source_determinism_diagnostic"
         }
@@ -11176,7 +11176,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.threaded_integration_matrix_diagnostic"
         }
@@ -11215,7 +11215,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.liteinst_python3_verify_diagnostics"
         }
@@ -11254,7 +11254,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.chaos_hello_race_verification_diagnostic"
         }
@@ -11293,7 +11293,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.dbt_pipe_backpressure_diagnostic"
         }
@@ -11332,7 +11332,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.dbt_failed_exec_recovery_diagnostic"
         }
@@ -11371,7 +11371,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.dbt_unsupported_syscall_aggregation_diagnostic"
         }
@@ -11410,7 +11410,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.dbt_strict_blocked_stdin_teardown_diagnostic"
         }
@@ -11449,7 +11449,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.dbt_guest_stderr_isolation_diagnostic"
         }
@@ -11488,7 +11488,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.weekly_relaxed_default_mode_cases"
         }
@@ -11527,7 +11527,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.weekly_portable_chaos_cases"
         }
@@ -11566,7 +11566,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.weekly_ignored_portable_chaos_cases"
         }
@@ -11605,7 +11605,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.pmu_buck_chaos_cases"
         }
@@ -11644,7 +11644,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.pmu_analyze_hello_race_stress_calibrated_skid"
         }
@@ -11716,7 +11716,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.full_leveldb_strict_determinism"
         }
@@ -11755,7 +11755,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "super.sqlite_veryquick_strict_determinism"
         }
@@ -11891,7 +11891,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "privileged-only-test.pmu_buck_chaos_cases"
         }
@@ -11946,7 +11946,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "privileged-only-e2e.manifest_applications"
         }
@@ -12009,7 +12009,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "privileged-only-e2e.manifest_backend_parity_c"
         }
@@ -12055,7 +12055,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "privileged-only-test.cli_kvm"
         }
@@ -12232,7 +12232,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "liteinst.strict"
         }
@@ -12880,7 +12880,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_applications_on_host"
         }
@@ -14180,7 +14180,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_backend_parity_c_on_host"
         }
@@ -14248,7 +14248,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_bin_c_on_host"
         }
@@ -17123,7 +17123,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_c_programs_on_host"
         }
@@ -17184,7 +17184,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_chaos_c_on_host"
         }
@@ -17273,7 +17273,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_data_handling_on_host"
         }
@@ -17348,7 +17348,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_debugger_c_on_host"
         }
@@ -17479,7 +17479,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_determinism_stress_c_on_host"
         }
@@ -17568,7 +17568,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_determinism_stress_on_host"
         }
@@ -17811,7 +17811,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_language_runtimes_on_host"
         }
@@ -17858,7 +17858,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_shared_futex_c_on_host"
         }
@@ -18318,7 +18318,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_system_utils_on_host"
         }
@@ -18365,7 +18365,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "e2e.manifest_util_c_on_host"
         }
@@ -18674,7 +18674,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "privileged-only-test.pmu_buck_chaos_cases_on_host"
         }
@@ -18761,7 +18761,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "privileged-only-e2e.manifest_applications_on_host"
         }
@@ -18820,7 +18820,7 @@
         },
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "privileged-only-e2e.manifest_backend_parity_c_on_host"
         }
@@ -18861,7 +18861,7 @@
       "result_manifests": [
         {
           "kind": "structured-test-results",
-          "schema": 2,
+          "schema": 3,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "privileged-only-test.cli_kvm_on_host"
         }

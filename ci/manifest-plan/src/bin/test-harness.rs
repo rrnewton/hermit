@@ -13,6 +13,8 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 
+use dagrun::TestAttemptOutcome;
+use dagrun::TestAttemptResult;
 use dagrun::TestResult;
 use dagrun::TestResults;
 use hermit_manifest_plan::cli_help::is_help_flag;
@@ -26,7 +28,6 @@ use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::append_result;
 use hermit_manifest_plan::runner::cell_result_after_retries;
-use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::checked_add_cpu_usage;
 use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::infrastructure_error_result;
@@ -333,34 +334,109 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
     args
 }
 
+fn structured_attempt_result(result: &CellResult) -> Result<TestAttemptResult, String> {
+    let outcome = match (
+        result.outcome.as_str(),
+        result.error_kind.as_deref(),
+        result.failure_class,
+    ) {
+        ("PASS", _, _) => TestAttemptOutcome::Passed,
+        (_, Some("cpu-timeout"), _) => TestAttemptOutcome::CpuTimeout,
+        (_, Some("wall-timeout"), _) => TestAttemptOutcome::WallTimeout,
+        (
+            _,
+            _,
+            Some(
+                FailureClass::UnderstoodInfrastructureFailure
+                | FailureClass::UnderstoodPrerequisiteFailure,
+            ),
+        ) => TestAttemptOutcome::InfrastructureError,
+        (_, _, Some(FailureClass::NoResult)) => TestAttemptOutcome::NoResult,
+        _ => TestAttemptOutcome::Failed,
+    };
+    let detail = (outcome != TestAttemptOutcome::Passed).then(|| {
+        result
+            .reason
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::trim)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "test harness recorded {}{}",
+                    result.outcome,
+                    result
+                        .error_kind
+                        .as_deref()
+                        .map(|kind| format!(" ({kind})"))
+                        .unwrap_or_default()
+                )
+            })
+    });
+    TestAttemptResult::new(result.attempt, outcome, detail)
+}
+
+#[cfg(test)]
+fn complete_result(id: String, passed: bool, attempts: u64) -> Result<TestResult, String> {
+    let attempt_results = (1..=attempts)
+        .map(|attempt| {
+            let terminal_pass = passed && attempt == attempts;
+            TestAttemptResult::new(
+                attempt,
+                if terminal_pass {
+                    TestAttemptOutcome::Passed
+                } else {
+                    TestAttemptOutcome::Failed
+                },
+                (!terminal_pass).then(|| "test harness recorded a non-passing attempt".into()),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    TestResult::with_attempt_results(id, passed, attempt_results)
+}
+
 fn structured_test_results(histories: &[Vec<CellResult>]) -> Result<TestResults, String> {
     let rows = histories
         .iter()
-        .map(|history| {
-            let (result, attempts) = cell_result_and_attempts_after_retries(history)?;
-            Ok((result.outcome != "HOST-INAPPLICABLE").then(|| {
-                (
-                    format!(
-                        "{} [{}/{}]",
-                        result.test,
-                        result.backend.as_deref().unwrap_or("native"),
-                        result.mode
-                    ),
-                    result.outcome == "PASS",
-                    attempts,
-                )
-            }))
+        .filter_map(|history| {
+            let selected = match cell_result_after_retries(history) {
+                Ok(selected) => selected,
+                Err(error) => return Some(Err(error)),
+            };
+            if selected.outcome == "HOST-INAPPLICABLE" {
+                return None;
+            }
+            let attempts = match history
+                .iter()
+                .map(structured_attempt_result)
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(attempts) => attempts,
+                Err(error) => return Some(Err(error)),
+            };
+            Some(TestResult::with_attempt_results(
+                format!(
+                    "{} [{}/{}]",
+                    selected.test,
+                    selected.backend.as_deref().unwrap_or("native"),
+                    selected.mode
+                ),
+                selected.outcome == "PASS",
+                attempts,
+            ))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    structured_test_results_from_rows(rows.into_iter().flatten())
+    let executed = u64::try_from(rows.len()).map_err(|_| "cell result count does not fit u64")?;
+    TestResults::current(executed, 0, rows)
 }
 
+#[cfg(test)]
 fn structured_test_results_from_rows(
     rows: impl IntoIterator<Item = (String, bool, u64)>,
 ) -> Result<TestResults, String> {
     let rows = rows
         .into_iter()
-        .map(|(id, passed, attempts)| TestResult::new(id, passed, attempts))
+        .map(|(id, passed, attempts)| complete_result(id, passed, attempts))
         .collect::<Result<Vec<_>, _>>()?;
     TestResults::current(
         u64::try_from(rows.len()).map_err(|_| "cell result count does not fit u64")?,
@@ -2160,12 +2236,21 @@ mod tests {
         assert_eq!(
             counts,
             serde_json::json!({
-                "schema": 2,
+                "schema": 3,
                 "executed_tests": 2,
                 "filtered_tests": 0,
                 "results": [
-                    {"id": "suite$passes", "result": "pass", "attempts": 1},
-                    {"id": "suite$fails", "result": "fail", "attempts": 2},
+                    {"id": "suite$passes", "result": "pass", "attempts": 1,
+                     "attempt_results": [
+                         {"attempt": 1, "outcome": "passed", "detail": null},
+                     ]},
+                    {"id": "suite$fails", "result": "fail", "attempts": 2,
+                     "attempt_results": [
+                         {"attempt": 1, "outcome": "failed",
+                          "detail": "test harness recorded a non-passing attempt"},
+                         {"attempt": 2, "outcome": "failed",
+                          "detail": "test harness recorded a non-passing attempt"},
+                     ]},
                 ],
             })
         );

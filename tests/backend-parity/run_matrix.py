@@ -1569,23 +1569,36 @@ def write_structured_test_results(
             "structured DBT results disagree with the executed-case count: "
             f"{len(terminal)} terminal row(s), {executed} executed case(s)"
         )
-    rows = [
-        {
+    rows = []
+    for result in terminal:
+        passed = result["result"] in {"PASS", "XPASS"}
+        outcome = (
+            "passed"
+            if passed
+            else "infrastructure_error"
+            if result["result"] == "ERROR"
+            else "failed"
+        )
+        detail = None if passed else str(
+            result.get("detail") or f"backend parity reported {result['result']}"
+        ).strip()
+        rows.append({
             "id": (
                 f"backend-parity/{result['test_name']} "
                 f"[{result['backend']}/{mode}]"
             ),
-            "result": "pass" if result["result"] in {"PASS", "XPASS"} else "fail",
+            "result": "pass" if passed else "fail",
             "attempts": 1,
-        }
-        for result in terminal
-    ]
+            "attempt_results": [
+                {"attempt": 1, "outcome": outcome, "detail": detail}
+            ],
+        })
     if len({row["id"] for row in rows}) != len(rows):
         raise MatrixError("structured DBT results contain a duplicate test identity")
     path = Path(configured)
     temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     payload = {
-        "schema": 2,
+        "schema": 3,
         "executed_tests": executed,
         "filtered_tests": filtered,
         "results": rows,

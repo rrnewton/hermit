@@ -12,6 +12,8 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
+use dagrun::TestAttemptOutcome;
+use dagrun::TestAttemptResult;
 use dagrun::TestResult;
 use dagrun::TestResults;
 
@@ -28,6 +30,27 @@ fn parse_u64(value: String, field: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
         .map_err(|error| format!("structured-test-results-{field}: {error}"))
+}
+
+fn complete_result(id: String, passed: bool, attempts: u64) -> Result<TestResult, String> {
+    let mut attempt_results = Vec::new();
+    for attempt in 1..attempts {
+        attempt_results.push(TestAttemptResult::new(
+            attempt,
+            TestAttemptOutcome::Failed,
+            Some("test runner retried after this non-passing attempt".into()),
+        )?);
+    }
+    attempt_results.push(if passed {
+        TestAttemptResult::new(attempts, TestAttemptOutcome::Passed, None)?
+    } else {
+        TestAttemptResult::new(
+            attempts,
+            TestAttemptOutcome::Failed,
+            Some("test runner reported a failed terminal result".into()),
+        )?
+    });
+    TestResult::with_attempt_results(id, passed, attempt_results)
 }
 
 fn write(mut args: impl Iterator<Item = String>) -> Result<(), String> {
@@ -65,7 +88,7 @@ fn write(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             }
         };
         let attempts = parse_u64(fields[2].clone(), "attempts")?;
-        results.push(TestResult::new(fields[0].clone(), passed, attempts)?);
+        results.push(complete_result(fields[0].clone(), passed, attempts)?);
     }
     let report = TestResults::current(executed_tests, filtered_tests, results)?;
     if output == "-" {
@@ -204,8 +227,8 @@ mod tests {
         assert_eq!(
             report.results.unwrap(),
             vec![
-                TestResult::new("suite$pass".into(), true, 1).unwrap(),
-                TestResult::new("suite$fail".into(), false, 2).unwrap(),
+                complete_result("suite$pass".into(), true, 1).unwrap(),
+                complete_result("suite$fail".into(), false, 2).unwrap(),
             ]
         );
         fs::remove_file(path).unwrap();
@@ -250,9 +273,9 @@ mod tests {
             3,
             4,
             vec![
-                TestResult::new("suite$one".into(), true, 1).unwrap(),
-                TestResult::new("suite$two".into(), false, 2).unwrap(),
-                TestResult::new("suite$three".into(), false, 1).unwrap(),
+                complete_result("suite$one".into(), true, 1).unwrap(),
+                complete_result("suite$two".into(), false, 2).unwrap(),
+                complete_result("suite$three".into(), false, 1).unwrap(),
             ],
         )
         .unwrap();

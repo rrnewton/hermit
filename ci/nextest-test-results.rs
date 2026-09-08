@@ -13,6 +13,8 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
+use dagrun::TestAttemptOutcome;
+use dagrun::TestAttemptResult;
 use dagrun::TestResult;
 use dagrun::TestResults;
 use serde_json::Value;
@@ -202,6 +204,27 @@ fn suite_population(
     Ok(population.max(test_count))
 }
 
+fn complete_result(id: String, passed: bool, attempts: u64) -> Result<TestResult, String> {
+    let mut attempt_results = Vec::new();
+    for attempt in 1..attempts {
+        attempt_results.push(TestAttemptResult::new(
+            attempt,
+            TestAttemptOutcome::Failed,
+            Some("nextest retried after this non-passing attempt".into()),
+        )?);
+    }
+    attempt_results.push(if passed {
+        TestAttemptResult::new(attempts, TestAttemptOutcome::Passed, None)?
+    } else {
+        TestAttemptResult::new(
+            attempts,
+            TestAttemptOutcome::Failed,
+            Some("nextest reported a failed terminal test event".into()),
+        )?
+    });
+    TestResult::with_attempt_results(id, passed, attempt_results)
+}
+
 fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
     let mut results = BTreeMap::new();
     // Test rows carry package/binary but not target kind. Keep every currently
@@ -311,7 +334,7 @@ fn parse_event_text(text: &str) -> Result<ParsedEvents, String> {
                     &suite.identity.kind,
                     suite.identity.stress_index,
                 );
-                let result = TestResult::new(id.clone(), event == "ok", attempts)?;
+                let result = complete_result(id.clone(), event == "ok", attempts)?;
                 if results.insert(id.clone(), result).is_some() {
                     return Err(format!(
                         "nextest-test-results line {line_number}: duplicate terminal test id {id:?}"
@@ -509,8 +532,8 @@ mod tests {
         assert_eq!(
             parsed.results,
             vec![
-                TestResult::new("hermit$shared_case".into(), true, 2).unwrap(),
-                TestResult::new("hermit::hermit$shared_case".into(), true, 1).unwrap(),
+                complete_result("hermit$shared_case".into(), true, 2).unwrap(),
+                complete_result("hermit::hermit$shared_case".into(), true, 1).unwrap(),
             ]
         );
     }
@@ -541,8 +564,8 @@ mod tests {
         assert_eq!(
             parse_event_text(events).unwrap().results,
             vec![
-                TestResult::new("alpha$case".into(), true, 1).unwrap(),
-                TestResult::new("beta::tool$case".into(), true, 1).unwrap(),
+                complete_result("alpha$case".into(), true, 1).unwrap(),
+                complete_result("beta::tool$case".into(), true, 1).unwrap(),
             ]
         );
     }
@@ -560,8 +583,8 @@ mod tests {
         assert_eq!(
             parse_event_text(events).unwrap().results,
             vec![
-                TestResult::new("pkg@stress-1$case".into(), true, 1).unwrap(),
-                TestResult::new("pkg@stress-2$case".into(), true, 1).unwrap(),
+                complete_result("pkg@stress-1$case".into(), true, 1).unwrap(),
+                complete_result("pkg@stress-2$case".into(), true, 1).unwrap(),
             ]
         );
     }

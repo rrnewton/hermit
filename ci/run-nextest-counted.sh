@@ -86,12 +86,20 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as source:
     report = json.load(source)
     assert report == {
-    "schema": 2,
+    "schema": 3,
     "executed_tests": 2,
     "filtered_tests": 7,
     "results": [
-        {"id": "suite$passes", "result": "pass", "attempts": 1},
-        {"id": "suite$recovers", "result": "pass", "attempts": 2},
+        {"id": "suite$passes", "result": "pass", "attempts": 1,
+         "attempt_results": [
+             {"attempt": 1, "outcome": "passed", "detail": None},
+         ]},
+        {"id": "suite$recovers", "result": "pass", "attempts": 2,
+         "attempt_results": [
+             {"attempt": 1, "outcome": "failed",
+              "detail": "nextest retried after this non-passing attempt"},
+             {"attempt": 2, "outcome": "passed", "detail": None},
+         ]},
     ],
     }
 PYEOF
@@ -152,7 +160,11 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as source:
     report = json.load(source)
 assert report["results"] == [
-    {"id": "suite$fails", "result": "fail", "attempts": 1},
+    {"id": "suite$fails", "result": "fail", "attempts": 1,
+     "attempt_results": [
+         {"attempt": 1, "outcome": "failed",
+          "detail": "nextest reported a failed terminal test event"},
+     ]},
 ]
 PYEOF
 
@@ -177,7 +189,7 @@ PYEOF
     [[ $got == *$'running 0 tests\ntest result: FAILED. 0 passed; 0 failed; 0 ignored; 0 filtered out' ]] || return 1
     [[ $got != *'test result: ok.'* ]] || return 1
     [[ $(<"$scratch/wrapper-counts.json") == \
-        '{"executed_tests":0,"filtered_tests":0,"results":[],"schema":2}' ]] || return 1
+        '{"executed_tests":0,"filtered_tests":0,"results":[],"schema":3}' ]] || return 1
     grep -q 'period = "86s"' "$scratch/scaled-nextest.toml" || return 1
     if compgen -G "$scratch/hermit-nextest-config.*.toml" >/dev/null; then
         printf 'run-nextest-counted: temporary nextest config leaked\n' >&2

@@ -118,6 +118,8 @@ use dagrun::model::DagManifest;
 use dagrun::model::RunResult;
 use dagrun::model::Step;
 use dagrun::model::StepOutcome;
+use dagrun::TestAttemptOutcome;
+use dagrun::TestAttemptResult;
 use dagrun::TestResult;
 use dagrun::TestResults;
 use dagrun::container_core_budget;
@@ -1549,6 +1551,7 @@ fn self_test() -> Result<(), String> {
             executed_tests: None,
             filtered_tests: None,
             test_results: None,
+            test_results_error: None,
             returncode: Some(if ok { 0 } else { 1 }),
             oomed: false,
             oom_kills: 0,
@@ -2422,6 +2425,7 @@ fn self_test() -> Result<(), String> {
     rebase_freshness_message_bracket()?;
     test_node_coverage_bracket()?;
     typed_libtest_count_bracket()?;
+    println!("  {}", structured_test_count_transport_bracket()?);
     ledger_gate_origin_bracket()?;
     requalification_plan_bracket(&root)?;
     tool_root_split_bracket()?;
@@ -8205,7 +8209,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     let ordinary_observed = barrier.join("ordinary.observed");
     ordinary.deps = vec!["compatprep.fixtures".into()];
     ordinary.cmd = format!(
-        "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active}; i=0; while test ! -e {first} || test ! -e {second}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}; printf '%s\\n' '{{\"schema\":2,\"executed_tests\":0,\"filtered_tests\":0,\"results\":[]}}' > \"$DAGRUN_TEST_COUNTS_PATH\"",
+        "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active}; i=0; while test ! -e {first} || test ! -e {second}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}; printf '%s\\n' '{{\"schema\":3,\"executed_tests\":0,\"filtered_tests\":0,\"results\":[]}}' > \"$DAGRUN_TEST_COUNTS_PATH\"",
         tag = validate_plan::shell_quote(&ordinary.tag()),
         active = validate_plan::shell_quote(&barrier.join("ordinary.active").to_string_lossy()),
         first = validate_plan::shell_quote(&barrier.join("0.active").to_string_lossy()),
@@ -8726,6 +8730,7 @@ fn summary_listing_bracket() -> Result<String, String> {
         executed_tests: None,
         filtered_tests: None,
         test_results: None,
+        test_results_error: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,
@@ -11705,18 +11710,18 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
             }
             attempt.test_results = Some(if attempt.attempt == 1 {
                 vec![
-                    dagrun::TestResult::new("hermit::fixture$hard_failure".into(), false, 1)
+                    complete_test_result("hermit::fixture$hard_failure".into(), false, 1)
                         .map_err(|error| format!("end-of-run summary: {error}"))?,
-                    dagrun::TestResult::new(
+                    complete_test_result(
                         "hermit::fixture$recovered_on_retry".into(), false, 1,
                     )
                     .map_err(|error| format!("end-of-run summary: {error}"))?,
                 ]
             } else {
                 vec![
-                    dagrun::TestResult::new("hermit::fixture$hard_failure".into(), false, 1)
+                    complete_test_result("hermit::fixture$hard_failure".into(), false, 1)
                         .map_err(|error| format!("end-of-run summary: {error}"))?,
-                    dagrun::TestResult::new(
+                    complete_test_result(
                         "hermit::fixture$recovered_on_retry".into(), true, 1,
                     )
                     .map_err(|error| format!("end-of-run summary: {error}"))?,
@@ -11762,7 +11767,7 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         inner_retry.tag = "fixture.nextest_inner".into();
         inner_retry.retry_class = None;
         inner_retry.test_results = Some(vec![
-            dagrun::TestResult::new("hermit::fixture$inner_retry".into(), true, 2)
+            complete_test_result("hermit::fixture$inner_retry".into(), true, 2)
                 .map_err(|error| format!("end-of-run summary: {error}"))?,
         ]);
         let inner_nodes = BTreeSet::from([inner_retry.tag.clone()]);
@@ -12078,12 +12083,12 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     let e2e_attempts = tmp.join("e2e-attempts");
     let e2e_log = tmp.join("e2e-attempts.log");
     let structured_counts = serde_json::json!({
-        "schema": 2,
+        "schema": 3,
         "executed_tests": 2,
         "filtered_tests": 0,
         "results": [
-            {"id": "failing-cell", "result": "fail", "attempts": 2},
-            {"id": "passing-peer", "result": "pass", "attempts": 1},
+            {"id": "failing-cell", "result": "fail", "attempts": 2, "attempt_results": [{"attempt": 1, "outcome": "failed", "detail": "fixture retry"}, {"attempt": 2, "outcome": "failed", "detail": "fixture terminal failure"}]},
+            {"id": "passing-peer", "result": "pass", "attempts": 1, "attempt_results": [{"attempt": 1, "outcome": "passed", "detail": null}]},
         ],
     })
     .to_string();
@@ -12133,8 +12138,23 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         || e2e_node_attempts.len() != 1
         || e2e_results
             != Some(&vec![
-                dagrun::TestResult::new("failing-cell".into(), false, 2)?,
-                dagrun::TestResult::new("passing-peer".into(), true, 1)?,
+                TestResult::with_attempt_results(
+                    "failing-cell".into(),
+                    false,
+                    vec![
+                        TestAttemptResult::new(1, TestAttemptOutcome::Failed, Some("fixture retry".into()))?,
+                        TestAttemptResult::new(2, TestAttemptOutcome::Failed, Some("fixture terminal failure".into()))?,
+                    ],
+                )?,
+                TestResult::with_attempt_results(
+                    "passing-peer".into(),
+                    true,
+                    vec![TestAttemptResult::new(
+                        1,
+                        TestAttemptOutcome::Passed,
+                        None,
+                    )?],
+                )?,
             ])
         || recorded_attempts.lines().collect::<Vec<_>>() != ["run"]
     {
@@ -13561,6 +13581,59 @@ fn libtest_counts(outcomes: &[StepOutcome]) -> (Option<i64>, Option<i64>, Option
     )
 }
 
+fn complete_test_result(id: String, passed: bool, attempts: u64) -> Result<TestResult, String> {
+    let attempt_results = (1..=attempts)
+        .map(|attempt| {
+            let terminal_pass = passed && attempt == attempts;
+            TestAttemptResult::new(
+                attempt,
+                if terminal_pass {
+                    TestAttemptOutcome::Passed
+                } else {
+                    TestAttemptOutcome::Failed
+                },
+                (!terminal_pass).then(|| "controlled runner recorded a non-passing attempt".into()),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    TestResult::with_attempt_results(id, passed, attempt_results)
+}
+
+fn compatibility_attempt_result(
+    attempt: &NodeAttempt,
+    terminal: &StepOutcome,
+    is_terminal: bool,
+) -> Result<TestAttemptResult, String> {
+    let outcome = match attempt_result(attempt) {
+        Some("pass") => TestAttemptOutcome::Passed,
+        Some("no_result") => TestAttemptOutcome::NoResult,
+        Some("fail") if is_terminal && terminal.cpu_timed_out => TestAttemptOutcome::CpuTimeout,
+        Some("fail") if is_terminal && terminal.timed_out => TestAttemptOutcome::WallTimeout,
+        Some("fail") => match attempt.failure_class {
+            Some(FailureClass::UnderstoodInfrastructureFailure | FailureClass::UnderstoodPrerequisiteFailure) => {
+                TestAttemptOutcome::InfrastructureError
+            }
+            Some(FailureClass::NoResult) => TestAttemptOutcome::NoResult,
+            _ => TestAttemptOutcome::Failed,
+        },
+        _ => TestAttemptOutcome::InfrastructureError,
+    };
+    let detail = (outcome != TestAttemptOutcome::Passed).then(|| {
+        attempt
+            .failure_detail
+            .as_deref()
+            .or(attempt.retry_detail.as_deref())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::trim)
+            .map(str::to_string)
+            .or_else(|| (!attempt.reason.trim().is_empty()).then(|| attempt.reason.trim().into()))
+            .unwrap_or_else(|| format!("compatibility step attempt {} did not pass", attempt.attempt))
+    });
+    let number = u64::try_from(attempt.attempt)
+        .map_err(|_| "structured compatibility attempt does not fit u64".to_string())?;
+    TestAttemptResult::new(number, outcome, detail)
+}
+
 fn compat_test_results(
     outcomes: &[StepOutcome],
     attempts: &[NodeAttempt],
@@ -13633,10 +13706,16 @@ fn compat_test_results(
                 ));
             }
         };
-        let attempt_count = u64::try_from(latest.attempt).map_err(|_| {
-            format!("structured compatibility attempts overflowed for {label}")
-        })?;
-        results.push(TestResult::new(label.to_string(), passed, attempt_count)?);
+        let attempt_results = attempts
+            .iter()
+            .filter(|attempt| attempt.tag == tag)
+            .map(|attempt| compatibility_attempt_result(attempt, outcome, attempt.attempt == latest.attempt))
+            .collect::<Result<Vec<_>, _>>()?;
+        results.push(TestResult::with_attempt_results(
+            label.to_string(),
+            passed,
+            attempt_results,
+        )?);
     }
     let executed = u64::try_from(results.len())
         .map_err(|_| "structured compatibility result count does not fit u64".to_string())?;
@@ -13663,6 +13742,14 @@ fn run_test_counts(
     }
 
     let prefix = compat_prefix.ok_or("compatibility mode has no committed tag prefix")?;
+    // Selection can retain the profile's compatibility metadata after removing
+    // every compatibility node. That is no measurement, not a measured empty
+    // corpus. Preserve the base UNKNOWN/known state; the separate compatibility
+    // completeness check still reports a missing planned population by name.
+    if !outcomes.iter().any(|outcome| outcome.tag.starts_with(prefix)) {
+        return Ok((base_executed, base_passed, base_filtered));
+    }
+
     let compatibility = compat_test_results(outcomes, attempts, prefix)?;
     let compat_executed = i64::try_from(compatibility.executed_tests)
         .map_err(|_| "structured compatibility executed count does not fit i64".to_string())?;
@@ -13696,6 +13783,21 @@ fn run_test_counts(
         None => compat_filtered,
     });
     Ok((executed, passed, filtered))
+}
+
+fn test_count_summary_detail(
+    executed_tests: Option<i64>,
+    passed_tests: Option<i64>,
+    filtered_tests: Option<i64>,
+) -> String {
+    match executed_tests {
+        Some(n) => format!(
+            "{n} test(s) executed, {} passed, {} filtered (aggregated from typed step outcomes)",
+            passed_tests.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
+            filtered_tests.map(|f| f.to_string()).unwrap_or_else(|| "unknown".into())
+        ),
+        None => "executed_tests is UNKNOWN — this row is a NON-VERDICT and cannot qualify a receipt, whatever the exit code says".into(),
+    }
 }
 
 /// Derive the per-node coverage obligation from dagrun's structured test counts.
@@ -13743,6 +13845,7 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         executed_tests,
         filtered_tests: Some(0),
         test_results: None,
+        test_results_error: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -13796,6 +13899,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         executed_tests,
         filtered_tests,
         test_results: None,
+        test_results_error: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -13826,11 +13930,22 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
     if libtest_counts(&[outcome("build.only", true, None, None)]) != (None, None, None) {
         return Err("typed libtest counts: unknown bannerless output was coerced".into());
     }
+    if run_test_counts(
+        &[outcome("pre.failed", false, None, None)],
+        &[],
+        Some(CompatMode::PortableStrict),
+        Some("compat."),
+    )? != (None, None, None)
+    {
+        return Err(
+            "typed libtest counts: an unexecuted compatibility population manufactured a measured zero".into(),
+        );
+    }
 
     let mut exact = outcome("test.exact", false, Some(2), Some(0));
     exact.test_results = Some(vec![
-        TestResult::new("case-a".into(), true, 1)?,
-        TestResult::new("case-b".into(), false, 2)?,
+        complete_test_result("case-a".into(), true, 1)?,
+        complete_test_result("case-b".into(), false, 2)?,
     ]);
     if libtest_counts(std::slice::from_ref(&exact)) != (Some(2), Some(1), Some(0)) {
         return Err("typed libtest counts: exact per-test results did not report one pass".into());
@@ -13845,8 +13960,8 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
 
     let mut mixed_failure = outcome("test.mixed-failure", false, Some(2), Some(1));
     mixed_failure.test_results = Some(vec![
-        TestResult::new("mixed-pass".into(), true, 1)?,
-        TestResult::new("mixed-fail".into(), false, 1)?,
+        complete_test_result("mixed-pass".into(), true, 1)?,
+        complete_test_result("mixed-fail".into(), false, 1)?,
     ]);
     let successful_count_only = outcome("test.successful-count-only", true, Some(3), Some(2));
     if libtest_counts(&[mixed_failure, successful_count_only])
@@ -13878,8 +13993,23 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         || compat.filtered_tests != 0
         || compat_rows
             != &vec![
-                TestResult::new("pass-case".into(), true, 1)?,
-                TestResult::new("fail-case".into(), false, 2)?,
+                TestResult::with_attempt_results(
+                    "pass-case".into(),
+                    true,
+                    vec![TestAttemptResult::new(
+                        1,
+                        TestAttemptOutcome::Passed,
+                        None,
+                    )?],
+                )?,
+                TestResult::with_attempt_results(
+                    "fail-case".into(),
+                    false,
+                    vec![
+                        TestAttemptResult::new(1, TestAttemptOutcome::Failed, Some("test failure".into()))?,
+                        TestAttemptResult::new(2, TestAttemptOutcome::Failed, Some("test failure".into()))?,
+                    ],
+                )?,
             ]
     {
         return Err(format!(
@@ -13954,6 +14084,173 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         "  typed libtest counts: exact 873/873/350 pass; retained count-only failure stayed unknown; mixed typed failure aggregated exactly; typed mutation moved 1 -> 2; direct compatibility rows joined the outer denominator without hiding an unknown pass count; compatibility rows carried terminal verdicts and latest attempt ordinals; fail-then-unreported refused; 0/0/0 preserved"
     );
     Ok(())
+}
+
+/// Exercise the real scheduler-to-summary path with and without its mandatory
+/// typed result while optional per-step logging is disabled.
+fn structured_test_count_transport_bracket() -> Result<String, String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "validate-structured-count-transport-{}-{}",
+        std::process::id(),
+        epoch_now()
+    ));
+    std::fs::create_dir(&tmp).map_err(|error| {
+        format!(
+            "structured count transport: cannot create {}: {error}",
+            tmp.display()
+        )
+    })?;
+    let log = tmp.join("validate.log");
+    std::fs::write(&log, []).map_err(|error| {
+        format!(
+            "structured count transport: cannot create {}: {error}",
+            log.display()
+        )
+    })?;
+
+    let prior_log_dir = std::env::var_os(dagrun::LOG_DIR_ENV);
+    let prior_no_logs = std::env::var_os(dagrun::NO_LOGS_ENV);
+    unsafe {
+        // These are the two controls that exposed the old coupling. Required
+        // results must travel independently of optional RunEvidence.
+        std::env::set_var(dagrun::LOG_DIR_ENV, "/dev/null");
+        std::env::set_var(dagrun::NO_LOGS_ENV, "1");
+    }
+
+    let result = (|| -> Result<(), String> {
+        let declaration = |owner: &str| {
+            dagrun::model::ResultManifest::StructuredTestResults(
+                dagrun::model::StructuredTestResultsManifest::current(owner),
+            )
+        };
+        let mut typed = step_with_caps(
+            "test",
+            "three",
+            "three typed test results",
+            r#"printf '%s\n' '{"schema":3,"executed_tests":3,"filtered_tests":2,"results":[{"id":"suite$a","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}]},{"id":"suite$b","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}]},{"id":"suite$c","result":"pass","attempts":1,"attempt_results":[{"attempt":1,"outcome":"passed","detail":null}]}]}' > "$DAGRUN_TEST_COUNTS_PATH"; printf '%s\n' 'running 3 tests' 'test result: ok. 3 passed; 0 failed; 0 ignored; 2 filtered out'"#.into(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
+        );
+        typed.result_manifests = Some(vec![declaration("test.three")]);
+        let typed_result = run_lane_once(
+            &DagConfig {
+                steps: vec![typed],
+                ..Default::default()
+            },
+            1,
+            true,
+            0,
+            None,
+            &log,
+            None,
+            false,
+        );
+        let typed_counts =
+            run_test_counts(&typed_result.outcomes, &typed_result.attempts, None, None)?;
+        if !typed_result.complete
+            || !typed_result.ok
+            || typed_counts != (Some(3), Some(3), Some(2))
+        {
+            return Err(format!(
+                "structured count transport: three-test producer did not aggregate as 3/3/2: outcomes={:?}",
+                typed_result.outcomes
+            ));
+        }
+        if test_count_summary_detail(typed_counts.0, typed_counts.1, typed_counts.2)
+            != "3 test(s) executed, 3 passed, 2 filtered (aggregated from typed step outcomes)"
+        {
+            return Err("structured count transport: final summary did not report 3/3/2".into());
+        }
+
+        let mut banner_only = step_with_caps(
+            "test",
+            "banner_only",
+            "banner without a typed result",
+            "printf '%s\\n' 'running 3 tests' 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 filtered out'".into(),
+            Vec::new(),
+            30,
+            30,
+            64 * 1024 * 1024,
+        );
+        banner_only.result_manifests = Some(vec![declaration("test.banner_only")]);
+        let unknown = run_lane_once(
+            &DagConfig {
+                steps: vec![banner_only],
+                ..Default::default()
+            },
+            1,
+            true,
+            0,
+            None,
+            &log,
+            None,
+            false,
+        );
+        let missing_result_refusal = unknown
+            .outcomes
+            .first()
+            .is_some_and(|outcome| {
+                !outcome.ok && outcome.reason.contains("STRUCTURED TEST RESULTS REFUSED")
+            });
+        if unknown.outcomes.len() != 1
+            || !missing_result_refusal
+            || run_test_counts(
+                &unknown.outcomes,
+                &unknown.attempts,
+                Some(CompatMode::PortableStrict),
+                Some("compat."),
+            )? != (None, None, None)
+        {
+            return Err(format!(
+                "structured count transport: missing typed result did not remain UNKNOWN: outcomes={:?}",
+                unknown.outcomes
+            ));
+        }
+        if !test_count_summary_detail(None, None, None).contains("executed_tests is UNKNOWN") {
+            return Err(
+                "structured count transport: final summary collapsed UNKNOWN into a number"
+                    .into(),
+            );
+        }
+        if tmp.join("validate.log.dagrun").exists() {
+            return Err(
+                "structured count transport: DAGRUN_NO_STEP_LOGS=1 created optional evidence"
+                    .into(),
+            );
+        }
+        Ok(())
+    })();
+
+    for (name, prior) in [
+        (dagrun::LOG_DIR_ENV, prior_log_dir),
+        (dagrun::NO_LOGS_ENV, prior_no_logs),
+    ] {
+        unsafe {
+            match prior {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+    let cleanup = std::fs::remove_dir_all(&tmp).map_err(|error| {
+        format!(
+            "structured count transport: cannot remove {}: {error}",
+            tmp.display()
+        )
+    });
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(
+            "structured count transport: typed 3/3/2 reached the summary with optional logs disabled; a banner without a typed result remained UNKNOWN"
+                .into(),
+        ),
+        (Err(problem), Ok(())) => Err(problem),
+        (Ok(()), Err(cleanup_problem)) => Err(cleanup_problem),
+        (Err(problem), Err(cleanup_problem)) => {
+            Err(format!("{problem}; cleanup also failed: {cleanup_problem}"))
+        }
+    }
 }
 
 fn set_gate_failure_evidence(gate: &mut serde_json::Value, failed: bool) {
@@ -14093,6 +14390,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         executed_tests: Some(1),
         filtered_tests: Some(0),
         test_results: None,
+        test_results_error: None,
         returncode: Some(1),
         oomed: false,
         oom_kills: 0,
@@ -15001,6 +15299,7 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         executed_tests: None,
         filtered_tests: None,
         test_results: None,
+        test_results_error: None,
         returncode,
         oomed: false,
         oom_kills: 0,
@@ -15040,6 +15339,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         executed_tests: None,
         filtered_tests: None,
         test_results: None,
+        test_results_error: None,
         returncode: Some(returncode),
         oomed: false,
         oom_kills: 0,
@@ -15951,6 +16251,7 @@ fn nextest_test_observations(
                 id,
                 passed,
                 attempts: inner_attempts,
+                attempt_results: _,
             } = result;
             let Ok(inner_attempts) = usize::try_from(*inner_attempts) else {
                 errors.push(format!(
@@ -18820,18 +19121,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
                 .into(),
         );
     }
-    match executed_tests {
-        Some(n) => detail.push(format!(
-            "{n} test(s) executed, {} passed, {} filtered (aggregated from typed step outcomes)",
-            passed_tests.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
-            filtered_tests.map(|f| f.to_string()).unwrap_or_else(|| "unknown".into())
-        )),
-        None => detail.push(
-            "executed_tests is UNKNOWN — this row is a NON-VERDICT and cannot qualify a receipt, \
-             whatever the exit code says"
-                .into(),
-        ),
-    }
+    detail.push(test_count_summary_detail(executed_tests, passed_tests, filtered_tests));
     let individual_test_results_complete = test_summary_errors.is_empty();
     detail.extend(test_summary_errors);
     if args.allow_local_off_the_record_run {
@@ -18913,6 +19203,7 @@ fn stop_test_seam(
         executed_tests: None,
         filtered_tests: None,
         test_results: None,
+        test_results_error: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,

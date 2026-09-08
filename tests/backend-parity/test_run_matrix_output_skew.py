@@ -247,7 +247,7 @@ def main() -> int:
         check(
             json.loads(counts.read_text(encoding="utf-8"))
             == {
-                "schema": 2,
+                "schema": 3,
                 "executed_tests": 2,
                 "filtered_tests": 1,
                 "results": [
@@ -255,11 +255,18 @@ def main() -> int:
                         "id": "backend-parity/passes [dbt/strict]",
                         "result": "pass",
                         "attempts": 1,
+                        "attempt_results": [
+                            {"attempt": 1, "outcome": "passed", "detail": None}
+                        ],
                     },
                     {
                         "id": "backend-parity/fails [dbt/strict]",
                         "result": "fail",
                         "attempts": 1,
+                        "attempt_results": [
+                            {"attempt": 1, "outcome": "failed",
+                             "detail": "backend parity reported FAIL"}
+                        ],
                     },
                 ],
             },
