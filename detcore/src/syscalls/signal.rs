@@ -17,6 +17,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls;
+use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Timespec;
@@ -28,6 +29,9 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
+use crate::syscalls::threads::KernelSigaction;
+use crate::syscalls::threads::KernelSigset;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::alarm_remaining;
 use crate::tool_global::notify_signal_pending;
@@ -107,11 +111,56 @@ fn warn_appropriated_signal(signum: i32, handler: u64) {
     }
 }
 
-// NB: note kernel has different notation of sigaction, we cannot
-// use libc's sigaction here unfortunately. See:
+// NB: the kernel uses an eight-byte signal mask in its raw signal syscalls on
+// x86_64. `libc::sigset_t` is the 128-byte userspace wrapper type and must not
+// be used to access these buffers. See:
 // https://elixir.bootlin.com/linux/latest/source/include/uapi/asm-generic/signal.h#L75
-const SA_MASK_OFFET: usize = 3 * std::mem::size_of::<u64>();
-const KERNEL_SIGSET_SIZE: usize = std::mem::size_of::<u64>();
+fn validate_kernel_sigset_size(sigsetsize: usize) -> Result<(), Errno> {
+    if sigsetsize == KERNEL_SIGSET_SIZE {
+        Ok(())
+    } else {
+        Err(Errno::EINVAL)
+    }
+}
+
+fn without_perf_event_signal(mask: KernelSigset) -> KernelSigset {
+    let bit = (reverie::PERF_EVENT_SIGNAL as u32) - 1;
+    mask & !(1_u64 << bit)
+}
+
+/// Read one raw kernel signal mask while preserving the kernel's user-access check.
+///
+/// `safeptrace::Stopped::read` deliberately uses `PTRACE_PEEKDATA` for reads of
+/// eight bytes or less. That operation can read a `PROT_NONE` page, unlike the
+/// kernel's `copy_from_user`, so using `MemoryAccess::read_value` alone would
+/// turn an `EFAULT` from a raw signal syscall into success. An invalid `how`
+/// value makes `rt_sigprocmask` copy exactly the kernel-sized input and then
+/// return `EINVAL` without changing the mask. Use that as a permission probe,
+/// then read the already-validated word while the guest is stopped.
+pub(super) async fn read_kernel_sigset<G, T>(
+    guest: &mut G,
+    address: Addr<'_, libc::sigset_t>,
+) -> Result<KernelSigset, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let validation = syscalls::RtSigprocmask::new()
+        .with_how(-1)
+        .with_set(Some(address))
+        .with_oldset(None)
+        .with_sigsetsize(KERNEL_SIGSET_SIZE);
+    match guest.inject(validation).await {
+        Err(Errno::EINVAL) => {}
+        Err(errno) => return Err(errno.into()),
+        Ok(_) => {
+            // Both Linux and the KVM syscall implementation reject an unknown
+            // operation. Success means the backend did not validate the probe.
+            return Err(Errno::EIO.into());
+        }
+    }
+    Ok(guest.memory().read_value(address.cast())?)
+}
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#663)
@@ -298,17 +347,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         // Invalid arguments return immediately from the kernel and therefore are
         // not signal-only waits.
-        if call.sigsetsize() != KERNEL_SIGSET_SIZE {
-            return Err(Errno::EINVAL.into());
-        }
+        validate_kernel_sigset_size(call.sigsetsize())?;
         let Some(mask_addr) = call.mask() else {
             return Err(Errno::EFAULT.into());
         };
 
-        let temporary_mask: u64 = guest
-            .memory()
-            .read_value(mask_addr.cast())
-            .map_err(|_| Errno::EFAULT)?;
+        let temporary_mask = read_kernel_sigset(guest, mask_addr).await?;
         let mut stack = guest.stack().await;
         let pending_addr = stack.push(0_u64);
         let pending_guard = stack.commit()?;
@@ -338,33 +382,56 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtSigaction,
     ) -> Result<i64, Error> {
+        // Linux rejects an invalid size before inspecting either user pointer.
+        // Preserve that EINVAL-before-EFAULT ordering even for the signal that
+        // Hermit reserves for deterministic preemption.
+        validate_kernel_sigset_size(call.sigsetsize())?;
+
+        // Copy the complete kernel object before inspecting the signal number or
+        // writing old_action. This preserves Linux's action-before-old_action
+        // pointer ordering, including when both arguments alias.
+        let kernel_action = call
+            .action()
+            .map(|action| {
+                let action: Addr<'_, KernelSigaction> = action.cast();
+                guest.memory().read_value(action)
+            })
+            .transpose()?;
+
         // Both appropriated signals are reported here, at the one point where the
         // guest states its expectation. SIGTRAP falls through to the ordinary
         // path below (its handler really is installed; ptrace just eats the
         // signal), so this must run before the SIGSTKFLT early return.
-        if let Some(action) = call.action() {
-            let handler = guest
-                .memory()
-                .read_value(AddrMut::<u64>::from_raw(action.as_raw()).unwrap())
-                .unwrap_or(0);
-            warn_appropriated_signal(call.signum(), handler);
+        if let Some(action) = kernel_action {
+            warn_appropriated_signal(call.signum(), action.handler);
         }
 
         // PERF_EVENT_SIGNAL is reserved.
         if call.signum() == reverie::PERF_EVENT_SIGNAL as i32 {
             // The go runtime attempts to register this (unused) signal handler.  We will never
             // deliver signals of this kind to the guest, so we just turn this action into a noop
-            // rather than returning `Err(Errno::EINVAL.into())`.
+            // rather than returning `Err(Errno::EINVAL.into())`. Preserve that established
+            // policy while still honoring the raw syscall's pointer accesses: the virtual old
+            // disposition is the default action, never Reverie's private preemption handler.
+            if let Some(old_action) = call.old_action() {
+                guest
+                    .memory()
+                    .write_value(old_action.cast(), &KernelSigaction::default())?;
+            }
             return Ok(0);
         }
-        Ok(if let Some(action) = call.action() {
-            let mut memory = guest.memory();
-            let sa_mask: AddrMut<libc::sigset_t> =
-                AddrMut::from_raw(SA_MASK_OFFET + action.as_raw()).unwrap();
-            let mut mask = memory.read_value(sa_mask)?;
-            unsafe { libc::sigdelset(&mut mask as *mut _, reverie::PERF_EVENT_SIGNAL as i32) };
-            memory.write_value(sa_mask, &mask)?;
-            guest.inject(call).await?
+        Ok(if let Some(kernel_action) = kernel_action {
+            // The kernel treats `action` as input. Sanitize a private copy instead
+            // of writing through the guest pointer: the input may be read-only,
+            // and changing it would make the syscall wrapper observable.
+            let mut kernel_action = kernel_action;
+            kernel_action.mask = without_perf_event_signal(kernel_action.mask);
+            let mut stack = guest.stack().await;
+            let sanitized_action = stack.push(kernel_action);
+            let _stack_guard = stack.commit()?;
+            guest
+                .inject(call.with_action(Some(sanitized_action.cast())))
+                .await?
         } else {
             guest.inject(call).await?
         })
@@ -378,18 +445,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtSigprocmask,
     ) -> Result<i64, Error> {
+        // The kernel checks sigsetsize before copying from either user pointer.
+        validate_kernel_sigset_size(call.sigsetsize())?;
+
         if call.how() != libc::SIG_BLOCK && call.how() != libc::SIG_SETMASK {
             Ok(guest.inject_with_retry(call).await?)
         } else if let Some(set) = call.set() {
-            let memory = guest.memory();
+            let set_mask = read_kernel_sigset(guest, set).await?;
             let mut stack = guest.stack().await;
-            let mut set_mask = memory.read_value(set)?;
-            unsafe { libc::sigdelset(&mut set_mask as *mut _, reverie::PERF_EVENT_SIGNAL as i32) };
-            let new_set = stack.push(set_mask);
-            stack.commit()?;
+            let new_set = stack.push(without_perf_event_signal(set_mask));
+            let _stack_guard = stack.commit()?;
             let modified_call = syscalls::RtSigprocmask::new()
                 .with_how(call.how())
-                .with_set(Some(new_set))
+                .with_set(Some(new_set.cast()))
                 .with_oldset(call.oldset())
                 .with_sigsetsize(call.sigsetsize());
             // Keep returning to the handler so post_handler_hook can run, but
@@ -409,6 +477,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::RtSigtimedwait,
     ) -> Result<i64, Error> {
+        // Linux rejects an invalid mask width before inspecting its pointers.
+        validate_kernel_sigset_size(call.sigsetsize())?;
+        // Linux keeps this entry snapshot for the whole wait. The retry helper
+        // currently injects from the caller's pointer again, so another thread
+        // can change the set between retries. Fixing that requires sharing one
+        // scratch-stack guard with the helper's zero-timeout object; do not hide
+        // that remaining difference by treating this validation read as a snapshot.
+
         let dettid = guest.thread_state().dettid;
 
         let maybe_timeout = if let Some(timeout) = call.timeout() {
@@ -640,6 +716,28 @@ mod tests {
             tv_sec: seconds,
             tv_usec: micros,
         }
+    }
+
+    #[test]
+    fn raw_kernel_signal_masks_are_exactly_one_u64() {
+        assert_eq!(KERNEL_SIGSET_SIZE, 8);
+        assert_eq!(std::mem::size_of::<KernelSigset>(), 8);
+        assert!(std::mem::size_of::<libc::sigset_t>() > KERNEL_SIGSET_SIZE);
+    }
+
+    #[test]
+    fn raw_signal_size_validation_rejects_before_pointer_processing() {
+        assert_eq!(validate_kernel_sigset_size(7), Err(Errno::EINVAL));
+        assert_eq!(validate_kernel_sigset_size(8), Ok(()));
+        assert_eq!(validate_kernel_sigset_size(16), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn reserved_signal_is_removed_from_the_kernel_sized_mask_only() {
+        let reserved = 1_u64 << (reverie::PERF_EVENT_SIGNAL as u32 - 1);
+        let usr1 = 1_u64 << (libc::SIGUSR1 as u32 - 1);
+        assert_eq!(without_perf_event_signal(reserved | usr1), usr1);
+        assert_eq!(without_perf_event_signal(usr1), usr1);
     }
 
     #[test]
