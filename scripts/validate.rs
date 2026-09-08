@@ -8039,7 +8039,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     if args.level == Level::Quick && args.focused.is_none() {
         let hermit = "target/debug/hermit";
         let marker = "hermit-validation-smoke";
-        let run_args = "run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled";
+        let run_args = "run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test";
         let mut steps = pre;
         steps.push(nextest_setup_node(root, gate)?);
         let mut add = |job: &str, desc: &str, cmd: String, deps: Vec<String>, t: i64, mem: i64| {
@@ -8056,7 +8056,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             format!("timeout 30s {hermit} {run_args} --verify -- /bin/echo {marker}"),
             vec!["quick.build".into()], 120, 4 * 1024 * 1024 * 1024);
         add("record_replay_smoke", "Hermit record/replay smoke test",
-            format!("timeout 30s {hermit} record start --verify -- /bin/echo {marker}"),
+            format!("timeout 30s {hermit} record start --base-env=minimal --mount=type=tmpfs,target=/test --workdir=/test --verify -- /bin/echo {marker}"),
             vec!["quick.build".into()], 180, 4 * 1024 * 1024 * 1024);
         let cfg = validate_plan::config_from(steps, "quick smoke suite");
         return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
@@ -10837,13 +10837,16 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.liteinst_runtime_release",
     // compiles the guest programs the cells execute under hermit
     "build.manifest_guests",
+    // builds the Hermit and test-harness binaries used by the quick guest
+    // checks; its host copy still feeds quick.e2e_metadata and unit tests
+    "quick.build",
     // focused LiteInst builds have their own tags but produce the same two
     // executable inputs as the full-plan release/runtime nodes
     "liteinst.hermit_release",
     "liteinst.runtime",
 ];
 
-/// Dedicated LiteInst test nodes that run inside the pinned root.
+/// Dedicated non-manifest test nodes that run inside the pinned root.
 ///
 /// `test.cli` deliberately remains absent: it is a mixed CLI suite whose
 /// LiteInst cases share a binary with unrelated host-side checks. Moving that
@@ -10851,10 +10854,18 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
 /// focused LiteInst suites have explicit identities and can be moved without
 /// changing any other test's execution environment.
 const PINNED_ROOT_LITEINST_TEST_STEPS: &[&str] = &["test.liteinst_strict", "liteinst.strict"];
+const PINNED_ROOT_QUICK_TEST_STEPS: &[&str] = &[
+    "quick.run_smoke",
+    "quick.verify_smoke",
+    "quick.record_replay_smoke",
+];
+const PINNED_ROOT_ENVELOPE_TEST_STEPS: &[&str] = &["test.envelope_levels"];
 
 fn pinned_root_test_step(step: &Step) -> bool {
     validation_step_identity(step) == ValidationStepIdentity::ManifestRun
         || PINNED_ROOT_LITEINST_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_QUICK_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_ENVELOPE_TEST_STEPS.contains(&step.tag().as_str())
 }
 
 // ⚠️ e2e.metadata IS DELIBERATELY ABSENT FROM THAT LIST, AND THE REASON CORRECTS MY OWN
@@ -11035,9 +11046,10 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 continue;
             }
             // Scheduled manifest cells use this environment gate to add the
-            // guest's tmpfs /test. The dedicated LiteInst tests construct the
-            // same mount and working-directory arguments directly, and carry
-            // the gate here so the plan records the same contract.
+            // guest's tmpfs /test. The dedicated LiteInst, quick smoke and
+            // working-envelope tests construct the same mount and
+            // working-directory arguments directly, and carry the gate here so
+            // the plan records the same contract.
             step.env
                 .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
             // Point the cell at the in-image producers. Depending on the host copies
@@ -11057,7 +11069,8 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
             // The fused privileged build node is a host-side assertion over the
             // host artifact. Keep that edge, and also wait for the artifact built
             // in the pinned root that this wrapped cell will actually execute.
-            if producer_tags.contains("build.e2e_artifact")
+            if validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+                && producer_tags.contains("build.e2e_artifact")
                 && !step
                     .deps
                     .iter()
@@ -11146,6 +11159,12 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
                         "build.liteinst_runtime_release".into(),
                         "setup.nextest".into(),
                     ],
+                ),
+                step(
+                    "test",
+                    "envelope_levels",
+                    "HERMIT=target/debug/hermit; ARGS='run --base-env=minimal --mount=type=tmpfs,target=/test --workdir=/test'; true",
+                    vec!["build.workspace".into()],
                 ),
                 step(
                     "liteinst",
@@ -11332,6 +11351,32 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
             ));
         }
     }
+
+    let envelope = by_tag
+        .get("test.envelope_levels")
+        .ok_or("pinned-root bracket: test.envelope_levels disappeared")?;
+    if !envelope.cmd.contains("run-in-pinned-root.sh")
+        || !envelope.cmd.contains("--base-env=minimal")
+        || !envelope.cmd.contains("--mount=type=tmpfs,target=/test")
+        || !envelope.cmd.contains("--workdir=/test")
+        || envelope.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+        || !envelope
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.workspace_in_pinned_root")
+        || envelope
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.workspace")
+        || envelope
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+    {
+        return Err(format!(
+            "pinned-root bracket: test.envelope_levels lost its image wrapper, minimal environment, /test arguments or in-image build dependency: {envelope:?}"
+        ));
+    }
     for (producer_tag, dependency_tag) in [
         (
             "build.liteinst_runtime_release_in_pinned_root",
@@ -11368,6 +11413,7 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
         &focused_args,
         &std::env::temp_dir().join("validate-pinned-root-liteinst-plan"),
     )?;
+    configure_prebuilt_rust_scripts(&mut focused, false)?;
     apply_pinned_root(&mut focused, root, false)?;
     let focused_by_tag: BTreeMap<String, &Step> = focused
         .cfg
@@ -11399,6 +11445,106 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
         if !focused_by_tag.contains_key(required) {
             return Err(format!(
                 "pinned-root bracket: actual focused LiteInst plan omitted {required}"
+            ));
+        }
+    }
+
+    let quick_args = parse_argv(&[
+        ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+        "quick".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("pinned-root bracket: quick parser exited {code}"))?;
+    let mut quick = build_plan(
+        root,
+        &quick_args,
+        &std::env::temp_dir().join("validate-pinned-root-quick-plan"),
+    )?;
+    configure_prebuilt_rust_scripts(&mut quick, false)?;
+    apply_pinned_root(&mut quick, root, false)?;
+    let quick_by_tag: BTreeMap<String, &Step> = quick
+        .cfg
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step))
+        .collect();
+    let quick_build = quick_by_tag
+        .get("quick.build_in_pinned_root")
+        .ok_or("pinned-root bracket: quick build has no in-image copy")?;
+    if !quick_build.cmd.contains("run-in-pinned-root.sh")
+        || !quick_build
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.rust_scripts_in_pinned_root")
+    {
+        return Err(format!(
+            "pinned-root bracket: quick build is not bound to the image and its Rust-script producer: {quick_build:?}"
+        ));
+    }
+    let host_quick_build = quick_by_tag
+        .get("quick.build")
+        .ok_or("pinned-root bracket: host quick build disappeared")?;
+    if host_quick_build.cmd.contains("run-in-pinned-root.sh") {
+        return Err(format!(
+            "pinned-root bracket: host quick build was moved instead of copied: {host_quick_build:?}"
+        ));
+    }
+    for tag in ["quick.e2e_metadata", "quick.detcore_unit"] {
+        let host = quick_by_tag
+            .get(tag)
+            .ok_or_else(|| format!("pinned-root bracket: host quick step {tag} disappeared"))?;
+        if host.cmd.contains("run-in-pinned-root.sh")
+            || !host
+                .deps
+                .iter()
+                .any(|dependency| dependency == "quick.build")
+            || host
+                .deps
+                .iter()
+                .any(|dependency| dependency == "quick.build_in_pinned_root")
+        {
+            return Err(format!(
+                "pinned-root bracket: {tag} no longer consumes the host quick build: {host:?}"
+            ));
+        }
+    }
+    for tag in [
+        "quick.e2e_verify",
+        "quick.run_smoke",
+        "quick.verify_smoke",
+        "quick.record_replay_smoke",
+    ] {
+        let test = quick_by_tag
+            .get(tag)
+            .ok_or_else(|| format!("pinned-root bracket: {tag} disappeared"))?;
+        if !test.cmd.contains("run-in-pinned-root.sh")
+            || test.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+            || !test
+                .deps
+                .iter()
+                .any(|dependency| dependency == "quick.build_in_pinned_root")
+            || test
+                .deps
+                .iter()
+                .any(|dependency| dependency == "quick.build")
+        {
+            return Err(format!(
+                "pinned-root bracket: quick guest test {tag} lost its image wrapper, /test gate or in-image build dependency: {test:?}"
+            ));
+        }
+    }
+    for tag in [
+        "quick.run_smoke",
+        "quick.verify_smoke",
+        "quick.record_replay_smoke",
+    ] {
+        let command = &quick_by_tag[tag].cmd;
+        if !command.contains("--base-env=minimal")
+            || !command.contains("--mount=type=tmpfs,target=/test")
+            || !command.contains("--workdir=/test")
+        {
+            return Err(format!(
+                "pinned-root bracket: quick guest test {tag} lost minimal environment or /test arguments: {command}"
             ));
         }
     }
@@ -11474,7 +11620,7 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
             "pinned-root bracket: sequential lanes must fetch once then reuse the cache: first_fetches={first_fetches} second_fetches={second_fetches} second={second_step:?}"
         ));
     }
-    Ok("pinned root: scheduled manifest cells and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
+    Ok("pinned root: scheduled manifest cells, 3 quick guest checks, the working-envelope check and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
 }
 
 // --------------------------------------------------------------------------- interruption
