@@ -81,25 +81,65 @@ fi
 # submodules are optional (see the parent's checkout-optional-submodules
 # target), so an unpopulated one does not imply a broken build. Testing this
 # first would refuse pushes from trees that lint perfectly well.
-unpopulated=$(git -C "$root" submodule status 2>/dev/null | awk '/^-/ {print $2}')
-if [[ -n "$unpopulated" ]]; then
+# Only agent-utils is required by the default workspace checker today:
+# ci/manifest-plan/Cargo.toml resolves dagrun through agent-utils/rs/dagrun.
+# third-party/rr is runtime input for ignored rr tests and an unpopulated rr
+# checkout does not stop `cargo clippy --workspace --all-targets`. Treating every
+# unpopulated submodule as causal hides a real compiler error whenever an
+# unrelated optional submodule happens to be absent.
+required_checker_submodules=(agent-utils)
+
+submodule_state_status=0
+submodule_state=$(git -C "$root" submodule status 2>&1) || submodule_state_status=$?
+if [[ $submodule_state_status -ne 0 ]]; then
+    {
+        echo
+        echo "pre-push REFUSED: the build check failed, and the hook could not"
+        echo "inspect submodule state to determine whether a missing required"
+        echo "submodule prevented the check from running."
+        echo
+        echo "state: CHECK FAILED; SUBMODULE DIAGNOSIS FAILED"
+        echo
+        echo "git submodule status reported:"
+        printf '%s\n' "$submodule_state"
+        echo
+        echo "Fix the submodule-state error, then push again. The hook will not"
+        echo "call this a compile failure when its own diagnosis did not run."
+        echo
+        echo "To push anyway: git push --no-verify"
+        echo
+    } >&2
+    exit 1
+fi
+
+unpopulated=()
+while read -r state submodule _rest; do
+    [[ $state == -* ]] || continue
+    for required in "${required_checker_submodules[@]}"; do
+        if [[ $submodule == "$required" ]]; then
+            unpopulated+=("$submodule")
+        fi
+    done
+done <<<"$submodule_state"
+
+if [[ ${#unpopulated[@]} -ne 0 ]]; then
     {
         echo
         echo "pre-push REFUSED: the working tree COULD NOT BE CHECKED, because"
         echo "these submodules are not populated:"
         echo
-        while read -r submodule; do
-            [[ -n "$submodule" ]] && echo "    $submodule"
-        done <<<"$unpopulated"
+        for submodule in "${unpopulated[@]}"; do
+            echo "    $submodule"
+        done
         echo
         echo "state: NOT LINTED -- this is not a compile failure and says nothing"
         echo "about whether your change compiles. Cargo cannot resolve a path"
         echo "dependency whose directory is absent, so it stops before linting."
         echo
         echo "remedy:"
-        while read -r submodule; do
-            [[ -n "$submodule" ]] && echo "    git submodule update --init $submodule"
-        done <<<"$unpopulated"
+        for submodule in "${unpopulated[@]}"; do
+            echo "    git submodule update --init $submodule"
+        done
         echo
         echo "then push again. A fresh detached worktree -- the landing procedure"
         echo "CLAUDE.md prescribes -- always starts in this state."
