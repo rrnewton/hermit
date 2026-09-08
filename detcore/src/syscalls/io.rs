@@ -21,6 +21,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls;
+use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::MemoryAccess;
@@ -42,6 +43,7 @@ use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::signal::read_kernel_sigset;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
 use crate::types::DetTid;
@@ -483,8 +485,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if argument.sigsetsize != KERNEL_SIGSET_SIZE {
                     return Err(Errno::EINVAL.into());
                 }
-                let mask_addr = AddrMut::<u64>::from_raw(argument.sigmask).ok_or(Errno::EFAULT)?;
-                let mask: u64 = guest.memory().read_value(mask_addr.cast())?;
+                let mask_addr =
+                    Addr::<libc::sigset_t>::from_raw(argument.sigmask).ok_or(Errno::EFAULT)?;
+                let mask = read_kernel_sigset(guest, mask_addr).await?;
                 Some(sanitize_ppoll_signal_mask(mask))
             } else {
                 None
@@ -895,7 +898,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if call.sigsetsize() != KERNEL_SIGSET_SIZE {
                     return Err(Errno::EINVAL.into());
                 }
-                let signal_mask: u64 = guest.memory().read_value(signal_mask.cast())?;
+                let signal_mask = read_kernel_sigset(guest, signal_mask).await?;
                 let mut stack = guest.stack().await;
                 let signal_mask = stack.push(sanitize_ppoll_signal_mask(signal_mask)).cast();
                 signal_mask_guard = Some(stack.commit()?);
@@ -925,7 +928,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if call.sigsetsize() != KERNEL_SIGSET_SIZE {
                     return Err(Errno::EINVAL.into());
                 }
-                let signal_mask: u64 = guest.memory().read_value(signal_mask.cast())?;
+                let signal_mask = read_kernel_sigset(guest, signal_mask).await?;
                 Some(sanitize_ppoll_signal_mask(signal_mask))
             }
             None => None,

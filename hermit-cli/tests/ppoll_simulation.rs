@@ -96,6 +96,77 @@ fn ppoll_readonly_zero_timeout_preserves_ready_result() {
 }
 
 #[test]
+fn ppoll_nonsequentialized_kernel_wait_checks_mask_access() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join("ppoll-inaccessible-kernel-wait-mask");
+    fs::create_dir_all(&build_root).expect("failed to create ppoll guest build directory");
+    let guest = build_root.join("ppoll_simulation");
+
+    let mut compile = Command::new("cc");
+    compile
+        .args([
+            "-O0", "-g", "-pthread", "-std=c11", "-Wall", "-Wextra", "-Werror",
+        ])
+        .arg(repository.join("tests/c/ppoll_simulation.c"))
+        .arg("-o")
+        .arg(&guest);
+    command_output(compile, "ppoll inaccessible-mask guest compilation");
+
+    let mut native = Command::new("timeout");
+    native
+        .args(["--kill-after", "5s", "30s"])
+        .arg(&guest)
+        .arg("inaccessible-mask-kernel-wait");
+    let native_output = command_output(native, "native inaccessible-mask ppoll");
+    let native_stdout = String::from_utf8_lossy(&native_output.stdout);
+    let native_stderr = String::from_utf8_lossy(&native_output.stderr);
+    assert!(
+        native_stdout.contains("ppoll-simulation-ok"),
+        "native inaccessible-mask ppoll omitted its success marker\nstdout:\n{native_stdout}\nstderr:\n{native_stderr}",
+    );
+
+    let verdict_directory =
+        tempfile::tempdir().expect("failed to create inaccessible-mask verdict directory");
+    let verdict = verdict_directory.path().join("verify.json");
+    let mut verify = Command::new("timeout");
+    verify
+        .args(["--kill-after", "5s", "30s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "--backend=ptrace",
+            "run",
+            "--no-sequentialize-threads",
+            "--verify",
+            "--verify-strict",
+        ])
+        .arg(format!("--verify-json={}", verdict.display()))
+        .args(["--base-env=minimal", "--"])
+        .arg(&guest)
+        .arg("inaccessible-mask-kernel-wait");
+    let verify_output = command_output(
+        verify,
+        "nonsequentialized ptrace inaccessible-mask ppoll verification",
+    );
+    let verify_stdout = String::from_utf8_lossy(&verify_output.stdout);
+    let verify_stderr = String::from_utf8_lossy(&verify_output.stderr);
+    assert!(
+        verify_stdout.contains("Determinism verified")
+            || verify_stderr.contains("Determinism verified"),
+        "Hermit omitted its inaccessible-mask ppoll determinism marker\nstdout:\n{verify_stdout}\nstderr:\n{verify_stderr}",
+    );
+    let verdict =
+        fs::read_to_string(&verdict).expect("failed to read inaccessible-mask ppoll verdict");
+    assert!(
+        verdict.contains("\"bitwise_parity\":true"),
+        "inaccessible-mask ppoll did not meet canonical INFO parity: {verdict}",
+    );
+}
+
+#[test]
 fn ppoll_waits_use_nonblocking_probes_and_verify() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
