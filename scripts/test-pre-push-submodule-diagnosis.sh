@@ -31,7 +31,7 @@ git -C "$repo" config user.name test
 # Which message it then chooses is the whole subject of this test.
 cat > "$repo/scripts/check-default-build-warnings.sh" <<'STUB'
 #!/usr/bin/env bash
-echo "stub checker: deliberate failure" >&2
+echo 'error: function `unused_for_test` is never used' >&2
 exit 1
 STUB
 chmod +x "$repo/scripts/check-default-build-warnings.sh"
@@ -50,37 +50,72 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 # ---- direction 2 first: no submodules at all, so a stub failure is a genuine
 # ---- compile failure and must be reported as one.
 out=$(run_hook)
+hook_status=$?
+[[ $hook_status -ne 0 ]] || fail "a genuine checker failure must refuse the push"
 [[ $out == *"does not compile in the default feature"* ]] ||
     fail "a genuine checker failure must still report as a compile failure; got: $out"
 [[ $out != *"COULD NOT BE CHECKED"* ]] ||
     fail "a genuine compile failure was relabelled as could-not-check"
 
-# ---- direction 1: an UNINITIALISED submodule recorded in the index. This is
-# ---- exactly what `git submodule status` prefixes with '-' in a fresh worktree.
+# ---- mixed direction: an OPTIONAL uninitialised submodule must not hide a
+# ---- genuine checker failure. third-party/rr is not needed by the default
+# ---- workspace clippy command.
 cat > "$repo/.gitmodules" <<'MODULES'
+[submodule "third-party/rr"]
+	path = third-party/rr
+	url = https://example.invalid/rr.git
+MODULES
+git -C "$repo" add .gitmodules
+git -C "$repo" update-index --add --cacheinfo "160000,$head,third-party/rr"
+git -C "$repo" commit -qm "record an optional uninitialised submodule"
+
+out=$(run_hook)
+hook_status=$?
+[[ $hook_status -ne 0 ]] || fail "a genuine failure with optional rr absent must refuse"
+[[ $out == *"does not compile in the default feature"* ]] ||
+    fail "optional rr absence hid a genuine compile failure; got: $out"
+[[ $out != *"COULD NOT BE CHECKED"* ]] ||
+    fail "optional rr absence was incorrectly treated as the checker failure"
+
+# ---- direction 1: a REQUIRED uninitialised submodule recorded in the index.
+# ---- This is exactly what `git submodule status` prefixes with '-' in a fresh
+# ---- worktree. Keep optional rr absent too so this case proves the diagnosis
+# ---- names only the required submodule.
+cat >> "$repo/.gitmodules" <<'MODULES'
 [submodule "agent-utils"]
 	path = agent-utils
 	url = https://example.invalid/agent-utils.git
 MODULES
 git -C "$repo" add .gitmodules
 git -C "$repo" update-index --add --cacheinfo "160000,$head,agent-utils"
-git -C "$repo" commit -qm "record an uninitialised submodule"
+git -C "$repo" commit -qm "record a required uninitialised submodule"
 
-[[ $(git -C "$repo" submodule status | grep -c '^-') -eq 1 ]] ||
-    fail "fixture did not produce an uninitialised submodule"
+[[ $(git -C "$repo" submodule status | grep -c '^-') -eq 2 ]] ||
+    fail "fixture did not produce both uninitialised submodules"
 
 out=$(run_hook)
+hook_status=$?
+[[ $hook_status -ne 0 ]] || fail "could-not-check must still refuse the push"
 [[ $out == *"COULD NOT BE CHECKED"* ]] ||
     fail "an unpopulated submodule must not be reported as a compile failure; got: $out"
 [[ $out == *"agent-utils"* ]] ||
     fail "the message must name the submodule"
+[[ $out != *"third-party/rr"* ]] ||
+    fail "the message must not blame an unrelated optional submodule"
 [[ $out == *"git submodule update --init agent-utils"* ]] ||
     fail "the message must give the exact remedy"
 [[ $out != *"does not compile in the default feature"* ]] ||
     fail "the misleading compile-failure message must be suppressed"
 
-# ---- and it still refuses: the tree was not checked, so the push must not pass.
-( cd "$repo" && printf '%s\n' "$stdin_line" | bash "$HOOK" origin https://example.invalid ) >/dev/null 2>&1
-[[ $? -ne 0 ]] || fail "could-not-check must still refuse the push, not allow it"
+# ---- diagnosis failure: an unreadable submodule state is neither proof that
+# ---- compilation failed nor permission to push.
+printf '[broken\n' > "$repo/.gitmodules"
+out=$(run_hook)
+hook_status=$?
+[[ $hook_status -ne 0 ]] || fail "failed submodule diagnosis must refuse the push"
+[[ $out == *"SUBMODULE DIAGNOSIS FAILED"* ]] ||
+    fail "failed git submodule status must be reported explicitly; got: $out"
+[[ $out != *"does not compile in the default feature"* ]] ||
+    fail "failed diagnosis was incorrectly relabelled as a compile failure"
 
 echo "PASS: pre-push names an unpopulated submodule, and still reports a real compile failure as one"
