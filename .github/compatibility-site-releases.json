@@ -1,7 +1,37 @@
 {
-  "latest_identity": "74aa0520de2ab80d4da1180c0784ad945c3ee47d05ad6f71c3bb10865af89c51",
+  "latest_identity": "2d3bb8ddf0d669274a7d6580586a2b735ace7f64e0df98c7e4ec55fc747d754b",
   "release_repository": "rrnewton/hermit",
   "releases": [
+    {
+      "archive_bytes": 38079050,
+      "archive_member_count": 152,
+      "archive_sha256": "26a7e79a6921fe4a3103e85e62ba0aef6f1ce1c3bc0adaeb8804de6c75156168",
+      "artifacts_sha256": "e73e7243608d09403a572211deb3d3023ea0f45c899264f2ea054870a774657b",
+      "asset": "compatibility-website-2d3bb8ddf0d669274a7d6580586a2b735ace7f64e0df98c7e4ec55fc747d754b.tar.gz",
+      "build_sha256": "00b5cb80f3831bad310833911afbc803710a091d0cdce065cd0232e21fbb098a",
+      "content_tree_sha256": "028267de8530023f72a99af4b1c73d97b0a4b4237076eced960a4e7d47d45a71",
+      "counts": {
+        "current_validation_run_row_count": 101,
+        "green_cell_count": 770,
+        "in_manifest_cell_count": 5744,
+        "never_measured_cell_count": 4929,
+        "physical_row_count": 37352,
+        "red_cell_count": 30,
+        "represented_run_count": 43535,
+        "selected_by_full_custom_command_count": 3,
+        "test_count": 359,
+        "validation_history_row_count": 113
+      },
+      "directories": ["assets", "cells", "data", "runs", "tests"],
+      "file_bytes": 69138198,
+      "file_count": 146,
+      "identity": "2d3bb8ddf0d669274a7d6580586a2b735ace7f64e0df98c7e4ec55fc747d754b",
+      "manifest_tree_sha256": "461f7a1c1b73b22230d3225ee99c7e971b2ff8fa83fcf3bac5d9ec6f6de7a5bc",
+      "mode_sha256": "fda398a2fa76db699d801a1834f4253238dae5b6c8a0dd73d55c5020375bec53",
+      "recursive_identity_sha256": "1d245fc47eec43e82a75fcd780d09a09e729c9f01fee5f839be65818cf84ac33",
+      "release_title": "Compatibility website snapshot 2d3bb8ddf0d669274a7d6580586a2b735ace7f64e0df98c7e4ec55fc747d754b",
+      "tag": "compatibility-website-2d3bb8ddf0d669274a7d6580586a2b735ace7f64e0df98c7e4ec55fc747d754b"
+    },
     {
       "archive_bytes": 13947577,
       "archive_member_count": 100,
