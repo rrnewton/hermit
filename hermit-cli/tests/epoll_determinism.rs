@@ -9,6 +9,8 @@
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
 
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -19,6 +21,8 @@ use std::sync::MutexGuard;
 use std::sync::OnceLock;
 
 const RUNS: usize = 5;
+const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
+const HERMETIC_TEST_WORKDIR: &str = "/test";
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 static EPOLL_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -42,6 +46,26 @@ fn command_output(mut command: Command, label: &str) -> Output {
         String::from_utf8_lossy(&output.stderr),
     );
     output
+}
+
+fn execution_root_args(requested: Option<&OsStr>) -> Result<Vec<OsString>, String> {
+    match requested {
+        None => Ok(Vec::new()),
+        Some(value) if value == OsStr::new(HERMETIC_TEST_WORKDIR) => Ok(vec![
+            "--mount=type=tmpfs,target=/test".into(),
+            "--workdir=/test".into(),
+        ]),
+        Some(value) => Err(format!(
+            "{ISOLATED_WORKDIR_ENV} must be {HERMETIC_TEST_WORKDIR}, got {value:?}"
+        )),
+    }
+}
+
+fn configure_execution_root(command: &mut Command) {
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    let args = execution_root_args(requested.as_deref())
+        .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
+    command.args(args);
 }
 
 fn epoll_guest() -> &'static Path {
@@ -77,17 +101,21 @@ fn epoll_guest() -> &'static Path {
 }
 
 fn run_scenario(scenario: &str, run: usize) -> Vec<u8> {
+    let guest = epoll_guest();
     let mut command = Command::new(hermit_test::hermit_binary());
-    command
-        .args([
-            "run",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-            "--max-timeslice=disabled",
-            "--",
-        ])
-        .arg(epoll_guest())
-        .arg(scenario);
+    command.current_dir(
+        guest
+            .parent()
+            .expect("epoll guest should have a build directory"),
+    );
+    command.args([
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+    ]);
+    configure_execution_root(&mut command);
+    command.arg("--").arg(guest).arg(scenario);
 
     let output = command_output(command, &format!("{scenario} epoll run {run}/{RUNS}"));
     let expected_success = format!("{scenario} success\n");
@@ -117,8 +145,14 @@ fn assert_scenario_is_deterministic(scenario: &str) {
 
 fn assert_scenario_reaches_l2(scenario: &str) {
     let _guard = hermit_run_lock();
+    let guest = epoll_guest();
     let mut command = Command::new("timeout");
     command
+        .current_dir(
+            guest
+                .parent()
+                .expect("epoll guest should have a build directory"),
+        )
         .args(["--kill-after", "10s", "60s"])
         .arg(hermit_test::hermit_binary())
         .args([
@@ -128,10 +162,9 @@ fn assert_scenario_reaches_l2(scenario: &str) {
             "--verify",
             "--no-virtualize-cpuid",
             "--preemption-timeout=disabled",
-            "--",
-        ])
-        .arg(epoll_guest())
-        .arg(scenario);
+        ]);
+    configure_execution_root(&mut command);
+    command.arg("--").arg(guest).arg(scenario);
 
     let output = command_output(command, &format!("{scenario} strict verification"));
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -140,6 +173,21 @@ fn assert_scenario_reaches_l2(scenario: &str) {
         stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),
         "{scenario} exited 0 without Hermit's determinism marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+}
+
+#[test]
+#[ignore = "validate: fixed /test argument contract"]
+fn pinned_root_arguments_are_exact_and_fail_closed() {
+    assert!(execution_root_args(None).unwrap().is_empty());
+    assert_eq!(
+        execution_root_args(Some(OsStr::new("/test"))).unwrap(),
+        [
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+    let error = execution_root_args(Some(OsStr::new("/tmp"))).unwrap_err();
+    assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
 }
 
 #[test]

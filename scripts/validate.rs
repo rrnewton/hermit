@@ -10969,6 +10969,8 @@ const PINNED_ROOT_APPLICATION_TEST_STEPS: &[&str] = &["test.applications_e2e"];
 const PINNED_ROOT_ARBITRARY_BINARY_TEST_STEPS: &[&str] = &["test.arbitrary_binaries"];
 const PINNED_ROOT_COMMAND_TEST_STEPS: &[&str] = &["test.command_strict_verify"];
 const PINNED_ROOT_RR_CONTRACT_TEST_STEPS: &[&str] = &["test.rr_suite_contract"];
+const PINNED_ROOT_IGNORED_SYSCALL_TEST_STEPS: &[&str] =
+    &["test.ignored_syscall_regressions"];
 const PINNED_ROOT_PRIVILEGED_TEST_STEPS: &[&str] = &[
     "cpuid.faulting",
     "pmu.preemption",
@@ -10988,6 +10990,7 @@ fn pinned_root_test_step(step: &Step, compat: Option<CompatMode>) -> bool {
         || PINNED_ROOT_ARBITRARY_BINARY_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_COMMAND_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_RR_CONTRACT_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_IGNORED_SYSCALL_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_PRIVILEGED_TEST_STEPS.contains(&step.tag().as_str())
         || (compat == Some(CompatMode::PortableStrict)
             && (step.group == "compat"
@@ -11387,6 +11390,12 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
                     vec!["build.e2e_artifact".into(), "setup.nextest".into()],
                 ),
                 step(
+                    "test",
+                    "ignored_syscall_regressions",
+                    "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test epoll_determinism --test rcx_canonicalization -j 1 -- --ignored",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
                     "privileged-build",
                     "privileged_tests",
                     "cargo test -p hermit-detcore --test tests_misc --no-run && ./ci/publish-hermit-e2e-artifact.sh",
@@ -11768,6 +11777,30 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
     {
         return Err(format!(
             "pinned-root bracket: test.rr_suite_contract lost its image wrapper, /test gate or in-image artifact dependency: {rr_suite_contract:?}"
+        ));
+    }
+    let ignored_syscall_regressions = by_tag
+        .get("test.ignored_syscall_regressions")
+        .ok_or("pinned-root bracket: test.ignored_syscall_regressions disappeared")?;
+    if !ignored_syscall_regressions
+        .cmd
+        .contains("run-in-pinned-root.sh")
+        || ignored_syscall_regressions
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
+        || !ignored_syscall_regressions
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+        || ignored_syscall_regressions
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact")
+    {
+        return Err(format!(
+            "pinned-root bracket: test.ignored_syscall_regressions lost its image wrapper, /test gate or in-image artifact dependency: {ignored_syscall_regressions:?}"
         ));
     }
     for tag in ["privileged-cpuid.faulting", "privileged-pmu.preemption"] {
