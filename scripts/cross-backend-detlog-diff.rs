@@ -547,7 +547,10 @@ fn compare_captures(
 }
 
 fn comparison_exit_code(summary: &LogDiffSummary) -> i32 {
-    if summary.refused || summary.compared_left == 0 || summary.compared_right == 0 {
+    if summary.refusal_reason.is_some()
+        || summary.compared_left == 0
+        || summary.compared_right == 0
+    {
         2
     } else if summary.diff_found {
         1
@@ -588,8 +591,8 @@ fn report_comparison(left: &Capture, right: &Capture, comparison: &CanonicalComp
             1
         }
         _ => {
-            if summary.refused {
-                eprintln!("\nREFUSAL: a captured log is truncated; no result was produced.");
+            if let Some(reason) = summary.refusal_reason.as_deref() {
+                eprintln!("\nREFUSAL: {reason}");
             } else {
                 eprintln!(
                     "\nREFUSAL: the comparison selected {} | {} INFO records; both sides must contain evidence.",
@@ -852,7 +855,9 @@ fn run_self_test() {
     )
     .expect("truncation is a typed refusal, not a parser error");
     check(
-        refused.refused && comparison_exit_code(&refused) == 2,
+        refused.refusal_reason.as_deref().is_some_and(|reason| {
+            reason.contains("truncated at the configured size bound")
+        }) && comparison_exit_code(&refused) == 2,
         "shared comparator did not refuse a truncated input",
     );
 
