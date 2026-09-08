@@ -10,9 +10,9 @@
 # This entrypoint is the shared local/GitHub execution path for the centralized
 # portable and privileged CI plans. Each gate is an independently boxed node
 # with explicit dependencies and resource limits (see ci/dag/README.md).
-# Portable execution asks scripts/validate.rs for the constructed DAG so its
-# corpus-derived strict-compatibility expansion is shared by local, hosted, and
-# validate callers; privileged currently needs no generated expansion.
+# Execution asks scripts/validate.rs for the constructed DAG so its typed result
+# declarations and portable corpus-derived strict-compatibility expansion are
+# shared by local, hosted, and validate callers.
 #
 # Usage:
 #   ci/run-dag.sh <lane> [runner-args...]
@@ -66,20 +66,26 @@ else
     fi
 fi
 
-# Portable strict compatibility is generated from the canonical corpus during
-# validate plan construction. Raw portable execution must consume that same
-# constructed graph: executing portable.json directly would reach the
-# fail-closed test.strict_compat marker instead of the 189 compat.* steps.
+# Structured result ownership is attached during validate plan construction for
+# both lanes. Portable strict compatibility is also generated from the canonical
+# corpus there. Raw lane execution must consume that same constructed graph:
+# executing portable.json directly would reach the fail-closed test.strict_compat
+# marker instead of the 189 compat.* steps, while executing either raw graph
+# would bypass the structured-result declarations.
 # This exports data only; the single dagrun invocation below remains the only
 # scheduler.
 generated_dir=
-if [[ -z ${RUN_DAG_FILE_OVERRIDE:-} && $lane == portable ]]; then
+if [[ -z ${RUN_DAG_FILE_OVERRIDE:-} && ( $lane == portable || $lane == privileged ) ]]; then
     mkdir -p "$ROOT_DIR/target/validation" || exit 2
     generated_dir=$(mktemp -d "$ROOT_DIR/target/validation/run-dag.XXXXXX") || exit 2
     trap 'rm -rf -- "$generated_dir"' EXIT
-    dag="$generated_dir/portable.json"
-    if ! ./scripts/validate.rs portable-only --write-constructed-dag "$dag" >/dev/null; then
-        echo "run-dag.sh: validate could not construct the portable DAG" >&2
+    dag="$generated_dir/$lane.json"
+    level="${lane}-only"
+    if [[ $lane == privileged ]]; then
+        level=--privileged-only
+    fi
+    if ! ./scripts/validate.rs "$level" --write-constructed-dag "$dag" >/dev/null; then
+        echo "run-dag.sh: validate could not construct the $lane DAG" >&2
         exit 2
     fi
 fi
@@ -91,13 +97,12 @@ fi
 # from its source, which is exactly how a runner missing an enforcement guard (the
 # historical cpu_timeout gap) can run while we believe we are boxed.
 #
-# The staleness axis is SOURCE-INVOKED vs PREBUILT-BINARY, not Rust vs Python. The
-# resolver enforces that: it defaults to the source-invoked Python entrypoint,
-# selects the Rust engine ONLY on explicit DAGRUN_ENGINE=rust (never a
-# silent fallback), and LOGS the winning engine + its exact path on every run. So
-# invoking it here keeps hermit's execution path deterministic, tracked, and
-# self-describing in the logs. Rust is reached the same way through the resolver
-# once it is invoked source-first (rust-script), not via a prebuilt-binary shortcut.
+# The staleness axis is SOURCE-INVOKED vs PREBUILT-BINARY, not Rust vs Python.
+# This entrypoint selects the tracked Rust engine by default because Hermit's
+# constructed DAG declares structured test results and the Python scheduler
+# deliberately refuses that execution contract. An explicit DAGRUN_ENGINE or
+# DAGRUN_BIN remains diagnostic override surface; either engine still logs its
+# exact selection and never silently falls back.
 find_runner() {
     if [[ -n ${DAGRUN_BIN:-} ]]; then
         printf '%s\n' "$DAGRUN_BIN"
@@ -128,6 +133,10 @@ runner=$(find_runner) || {
     echo "            Build it with: (cd agent-utils && ./setup) or set DAGRUN_BIN." >&2
     exit 2
 }
+
+if [[ -z ${DAGRUN_BIN:-} && -z ${DAGRUN_ENGINE:-} ]]; then
+    export DAGRUN_ENGINE=rust
+fi
 
 # A leading non-`run` verb (list/ascii/dot/json) is passed straight through; the
 # common case is `run` with scheduling flags.

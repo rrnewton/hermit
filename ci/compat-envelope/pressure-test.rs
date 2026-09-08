@@ -37,10 +37,12 @@ use dagrun::model::CmdType;
 use dagrun::model::DEFAULT_CPU_TIMEOUT_MULTIPLIER;
 use dagrun::model::DagConfig;
 use dagrun::model::ResourceHint;
+use dagrun::model::ResultManifest;
 use dagrun::model::RunResult;
 use dagrun::model::Step;
 use dagrun::model::StepClass;
 use dagrun::model::StepOutcome;
+use dagrun::model::StructuredTestResultsManifest;
 use dagrun::model::effective_cpu_count;
 use dagrun::model::effective_cpu_timeout;
 use dagrun::cgroup::aggregate_slice_max_cpus;
@@ -2947,7 +2949,9 @@ fn write_plan_after_scorecard_check(
                 cmdtype: CmdType::Unknown,
                 manifest: None,
                 integration_test_binaries: None,
-                result_manifests: None,
+                result_manifests: Some(vec![ResultManifest::StructuredTestResults(
+                    StructuredTestResultsManifest::current(tag.clone()),
+                )]),
                 labels: Vec::new(),
                 deps,
                 // Requalification evidence must exercise the same hermetic
@@ -6303,6 +6307,22 @@ fn self_test(root: &Path) -> Result<(), String> {
             })
     {
         return Err("disabled-backend plan lost its population identity".into());
+    }
+    for step in disabled_batch_dag.steps.iter().filter(|step| step.group == "cell") {
+        let manifest = step
+            .structured_test_results_manifest()
+            .map_err(|error| format!("pressure cell {}: {error}", step.tag()))?
+            .ok_or_else(|| {
+                format!(
+                    "pressure cell {} omitted its structured result declaration",
+                    step.tag()
+                )
+            })?;
+        if manifest.owner != step.tag() {
+            return Err(format!(
+                "pressure cell {} declared owner {:?}", step.tag(), manifest.owner
+            ));
+        }
     }
     let mut green_backend_args = vec![
         "--results".to_string(),
