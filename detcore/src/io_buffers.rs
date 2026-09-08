@@ -164,6 +164,29 @@ where
     Ok(out)
 }
 
+/// Return the guest `iovec` array described by a vectored I/O syscall.
+///
+/// Keep the family in one match so adding a syscall variant cannot update the
+/// log direction without also making its complete, return-value-bounded iovec
+/// prefix available to [`extents`].
+fn iovec_extent_arguments(call: &Syscall) -> Option<(usize, usize)> {
+    match call {
+        Syscall::Readv(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.len())),
+        Syscall::Preadv(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.iov_len())),
+        Syscall::Preadv2(call) => Some((
+            call.iov().map_or(0, |p| p.as_raw()),
+            usize::try_from(call.iov_len()).unwrap_or(usize::MAX),
+        )),
+        Syscall::Writev(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.len())),
+        Syscall::Pwritev(call) => Some((call.iov().map_or(0, |p| p.as_raw()), call.iov_len())),
+        Syscall::Pwritev2(call) => Some((
+            call.iov().map_or(0, |p| p.as_raw()),
+            usize::try_from(call.iov_len()).unwrap_or(usize::MAX),
+        )),
+        _ => None,
+    }
+}
+
 /// Read a `msghdr` out of the guest and walk the iovecs it points at.
 fn msghdr_extents<G, T>(
     guest: &mut G,
@@ -263,6 +286,7 @@ pub(crate) const HASHED_SYSCALLS: &[reverie::syscalls::Sysno] = &[
     reverie::syscalls::Sysno::recvmmsg,
     reverie::syscalls::Sysno::readv,
     reverie::syscalls::Sysno::preadv,
+    reverie::syscalls::Sysno::preadv2,
     // Bytes the guest produced.
     reverie::syscalls::Sysno::write,
     reverie::syscalls::Sysno::pwrite64,
@@ -270,6 +294,7 @@ pub(crate) const HASHED_SYSCALLS: &[reverie::syscalls::Sysno] = &[
     reverie::syscalls::Sysno::sendmsg,
     reverie::syscalls::Sysno::writev,
     reverie::syscalls::Sysno::pwritev,
+    reverie::syscalls::Sysno::pwritev2,
     // Rewritten in place across the whole array.
     reverie::syscalls::Sysno::poll,
     reverie::syscalls::Sysno::ppoll,
@@ -297,6 +322,9 @@ where
     if ret <= 0 && ret_gates_output(call) {
         return Ok(Vec::new());
     }
+    if let Some((iov_addr, iov_count)) = iovec_extent_arguments(call) {
+        return iovec_extents(guest, iov_addr, iov_count, ret);
+    }
     let raw = |a: Option<AddrMut<'_, u8>>| a.map(|p| p.as_raw() as u64);
     Ok(match call {
         // Bytes the kernel produced.
@@ -321,11 +349,6 @@ where
         Syscall::Recvmmsg(c) => {
             mmsghdr_extents(guest, c.mmsg().map_or(0, |p| p.as_raw()), c.vlen(), ret)?
         }
-        Syscall::Readv(c) => iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.len(), ret)?,
-        Syscall::Preadv(c) => {
-            iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.iov_len(), ret)?
-        }
-
         // Bytes the guest produced. These never reach stdout/stderr for a QEMU
         // boot -- measured, all 234,872 writes went to fds 7/12/14/11/13/4/8/19/23
         // and none to fd 1 or 2 -- so `--verify`'s stdout/stderr comparison does
@@ -334,13 +357,6 @@ where
         Syscall::Pwrite64(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.len(), ret),
         Syscall::Sendto(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.size(), ret),
         Syscall::Sendmsg(c) => msghdr_extents(guest, c.msg().map_or(0, |p| p.as_raw()), ret)?,
-        Syscall::Writev(c) => {
-            iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.len(), ret)?
-        }
-        Syscall::Pwritev(c) => {
-            iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.iov_len(), ret)?
-        }
-
         // Rewritten in place across the WHOLE array: `poll` sets `revents` on
         // every entry, not just on the `ret` that were ready, so the extent is
         // the array and not a prefix of it -- and it is reached even when
@@ -366,7 +382,8 @@ fn direction(call: &Syscall) -> Direction {
         | Syscall::Sendto(_)
         | Syscall::Sendmsg(_)
         | Syscall::Writev(_)
-        | Syscall::Pwritev(_) => Direction::Out,
+        | Syscall::Pwritev(_)
+        | Syscall::Pwritev2(_) => Direction::Out,
         _ => Direction::In,
     }
 }
@@ -670,5 +687,31 @@ mod tests {
     fn direction_separates_kernel_produced_from_guest_produced() {
         assert_eq!(Direction::In.as_str(), "in");
         assert_eq!(Direction::Out.as_str(), "out");
+
+        assert_eq!(
+            direction(&Syscall::Preadv2(syscalls::Preadv2::new())),
+            Direction::In
+        );
+        assert_eq!(
+            direction(&Syscall::Pwritev2(syscalls::Pwritev2::new())),
+            Direction::Out
+        );
+    }
+
+    #[test]
+    fn vectored_v2_calls_are_hashed_over_their_complete_iovec_prefix() {
+        for sysno in [syscalls::Sysno::preadv2, syscalls::Sysno::pwritev2] {
+            assert!(
+                HASHED_SYSCALLS.contains(&sysno),
+                "{sysno:?} must remain in strict io-buffer observation"
+            );
+        }
+
+        let iov = Addr::from_raw(0x2000);
+        let read = Syscall::Preadv2(syscalls::Preadv2::new().with_iov(iov).with_iov_len(3));
+        let write = Syscall::Pwritev2(syscalls::Pwritev2::new().with_iov(iov).with_iov_len(3));
+
+        assert_eq!(iovec_extent_arguments(&read), Some((0x2000, 3)));
+        assert_eq!(iovec_extent_arguments(&write), Some((0x2000, 3)));
     }
 }
