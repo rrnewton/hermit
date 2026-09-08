@@ -99,6 +99,11 @@ The focused `test.rr_suite_contract` node also runs in the pinned root. Its one
 selected test checks scratch-directory creation and cleanup and does not launch
 a Hermit guest, so it has no guest working directory to change.
 
+The `test.sabre_examples` node runs in the pinned root and uses the SaBRe loader
+and Hermit binary built there. Every ptrace and SaBRe guest invocation receives
+the private `/test` mount and `/test` working directory; the controller keeps
+its retained comparison logs in the guest-visible target directory.
+
 The privileged CPUID-faulting check, PMU preemption check, and the six selected
 PMU Buck chaos cases run in the pinned root as well, with their test executable
 built there. The CPUID check uses the same in-process Detcore helper that enters
