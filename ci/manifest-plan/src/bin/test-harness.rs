@@ -1760,6 +1760,15 @@ impl DispatchState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
+enum ParallelEvent {
+    Claim(Option<usize>),
+    Enqueued(usize),
+    Acknowledged(usize),
+    Dequeued(usize),
+}
+
 /// Execute `count` independent items with at most `jobs` workers, delivering
 /// each emitted value to `consume` immediately and waiting for its
 /// acknowledgement before the worker may continue.
@@ -1771,15 +1780,16 @@ impl DispatchState {
 /// not start before the prior attempt is flushed.
 ///
 /// Claiming and catastrophic halting share one mutex. Consequently each index
-/// is either already in flight when the first abort is observed or is never
+/// is either already in flight when the first abort is emitted or is never
 /// started. The halt hook runs after that scheduling boundary and before the
 /// potentially slow consumer, and an abort acknowledgement is always false.
-fn for_each_parallel<T: Send>(
+fn for_each_parallel_observed<T: Send>(
     count: usize,
     capacity: ScheduledWorkerCapacity,
     execute: impl Fn(usize, &mut dyn FnMut(DirectedCompletion<T>, bool) -> bool) + Sync,
     mut halt: impl FnMut(&str),
     mut consume: impl FnMut(usize, T, bool, CompletionDirective) -> bool,
+    #[cfg(test)] observe: impl Fn(ParallelEvent) + Sync,
 ) -> Option<String> {
     if count == 0 {
         return None;
@@ -1793,20 +1803,43 @@ fn for_each_parallel<T: Send>(
             let sender = sender.clone();
             let execute = &execute;
             let dispatch = &dispatch;
+            #[cfg(test)]
+            let observe = &observe;
             scope.spawn(move || {
                 loop {
                     let index = dispatch
                         .lock()
                         .expect("parallel dispatch lock is not poisoned")
                         .claim(count);
+                    #[cfg(test)]
+                    observe(ParallelEvent::Claim(index));
                     let Some(index) = index else {
                         break;
                     };
-                    let mut emit = |value, will_retry| {
+                    let mut emit = |completion: DirectedCompletion<T>, will_retry| {
+                        let DirectedCompletion { value, directive } = completion;
+                        let directive = {
+                            let mut state = dispatch
+                                .lock()
+                                .expect("parallel dispatch lock is not poisoned");
+                            match directive {
+                                CompletionDirective::AbortRun(reason) => {
+                                    let (reason, _) = state.halt(reason);
+                                    CompletionDirective::AbortRun(reason)
+                                }
+                                directive => match &state.halted {
+                                    Some(reason) => CompletionDirective::AbortRun(reason.clone()),
+                                    None => directive,
+                                },
+                            }
+                        };
+                        let value = DirectedCompletion { value, directive };
                         let (ack_sender, ack_receiver) = mpsc::sync_channel(0);
                         if sender.send((index, value, will_retry, ack_sender)).is_err() {
                             return false;
                         }
+                        #[cfg(test)]
+                        observe(ParallelEvent::Enqueued(index));
                         ack_receiver.recv().unwrap_or(false)
                     };
                     execute(index, &mut emit);
@@ -1814,32 +1847,36 @@ fn for_each_parallel<T: Send>(
             });
         }
         drop(sender);
+        let mut halt_notified = false;
         for (index, completion, will_retry, ack_sender) in receiver {
+            #[cfg(test)]
+            observe(ParallelEvent::Dequeued(index));
             let DirectedCompletion { value, directive } = completion;
-            let (directive, newly_halted) = {
+            let directive = {
                 let mut state = dispatch
                     .lock()
                     .expect("parallel dispatch lock is not poisoned");
                 match directive {
                     CompletionDirective::AbortRun(reason) => {
-                        let (reason, newly_halted) = state.halt(reason);
-                        (CompletionDirective::AbortRun(reason), newly_halted)
+                        CompletionDirective::AbortRun(state.halt(reason).0)
                     }
                     directive => match &state.halted {
-                        Some(reason) => (CompletionDirective::AbortRun(reason.clone()), false),
-                        None => (directive, false),
+                        Some(reason) => CompletionDirective::AbortRun(reason.clone()),
+                        None => directive,
                     },
                 }
             };
-            if newly_halted {
-                let CompletionDirective::AbortRun(reason) = &directive else {
-                    unreachable!("only an abort directive can halt dispatch")
-                };
-                halt(reason);
+            if !halt_notified {
+                if let CompletionDirective::AbortRun(reason) = &directive {
+                    halt(reason);
+                    halt_notified = true;
+                }
             }
             let aborting = matches!(directive, CompletionDirective::AbortRun(_));
             let acknowledged = consume(index, value, will_retry, directive);
             let _ = ack_sender.send(acknowledged && !aborting);
+            #[cfg(test)]
+            observe(ParallelEvent::Acknowledged(index));
         }
     });
     dispatch
@@ -1847,6 +1884,23 @@ fn for_each_parallel<T: Send>(
         .expect("parallel dispatch lock is not poisoned")
         .halted
 }
+fn for_each_parallel<T: Send>(
+    count: usize,
+    capacity: ScheduledWorkerCapacity,
+    execute: impl Fn(usize, &mut dyn FnMut(DirectedCompletion<T>, bool) -> bool) + Sync,
+    halt: impl FnMut(&str),
+    consume: impl FnMut(usize, T, bool, CompletionDirective) -> bool,
+) -> Option<String> {
+    #[cfg(test)]
+    {
+        for_each_parallel_observed(count, capacity, execute, halt, consume, |_| {})
+    }
+    #[cfg(not(test))]
+    {
+        for_each_parallel_observed(count, capacity, execute, halt, consume)
+    }
+}
+
 /// Retry only a completed product failure. Re-running a named infrastructure,
 /// prerequisite, or no-result condition duplicates evidence without changing
 /// the cause, and was doubling every affected row.
@@ -2309,6 +2363,7 @@ mod tests {
     use super::PINNED_COMMAND_PREFIX;
     use super::PINNED_COMMAND_SEPARATOR;
     use super::PREBUILT_COMMAND_PREFIX;
+    use super::ParallelEvent;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
     use super::audit_validation_levels_policy;
@@ -2317,6 +2372,7 @@ mod tests {
     use super::command_runs_exactly;
     use super::expected_plan_document;
     use super::for_each_parallel;
+    use super::for_each_parallel_observed;
     use super::host_inapplicable_reason;
     use super::parse;
     use super::publish_completed_cell_result;
@@ -2718,6 +2774,120 @@ mod tests {
             assert_eq!(executions.load(Ordering::SeqCst), 1);
             assert_eq!(raw_cleanups.load(Ordering::SeqCst), 0);
             assert_eq!(outer_appends.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn queued_abort_is_latched_before_an_earlier_ack_can_enable_a_later_claim() {
+        const CAUSE: &str = "queued fatal completion";
+        let consumer_at_first = Barrier::new(2);
+        let abort_queued = Barrier::new(2);
+        let post_ack_claim = Barrier::new(2);
+        let abort_is_queued = AtomicUsize::new(0);
+        let post_ack_observed = AtomicUsize::new(0);
+        let executions = [
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        ];
+        let halt_calls = AtomicUsize::new(0);
+        let raw_cleanups = AtomicUsize::new(0);
+        let outer_appends = AtomicUsize::new(0);
+        let observed = Mutex::new(Vec::new());
+
+        let abort_reason = for_each_parallel_observed(
+            executions.len(),
+            ScheduledWorkerCapacity::new(2),
+            |index, emit| {
+                run_with_retry(
+                    1,
+                    |_| {
+                        executions[index].fetch_add(1, Ordering::SeqCst);
+                        match index {
+                            0 => DirectedCompletion::publish(index),
+                            1 => {
+                                consumer_at_first.wait();
+                                DirectedCompletion::abort_run(index, CAUSE.into())
+                            }
+                            2 => DirectedCompletion::publish(index),
+                            _ => unreachable!(),
+                        }
+                    },
+                    |_| true,
+                    emit,
+                );
+            },
+            |reason| {
+                assert_eq!(reason, CAUSE);
+                halt_calls.fetch_add(1, Ordering::SeqCst);
+            },
+            |index, value, will_retry, directive| {
+                assert!(will_retry, "both first attempts would retry after an ACK");
+                let disposition = publish_completed_cell_result(
+                    RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA,
+                    directive.clone(),
+                    || {
+                        raw_cleanups.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    || {
+                        outer_appends.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                );
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((index, value, directive, disposition));
+                true
+            },
+            |event| match event {
+                ParallelEvent::Dequeued(0) => {
+                    consumer_at_first.wait();
+                    abort_queued.wait();
+                }
+                ParallelEvent::Enqueued(1) => {
+                    abort_is_queued.store(1, Ordering::SeqCst);
+                    abort_queued.wait();
+                }
+                ParallelEvent::Acknowledged(0) => {
+                    post_ack_claim.wait();
+                }
+                ParallelEvent::Claim(candidate)
+                    if abort_is_queued.load(Ordering::SeqCst) == 1
+                        && candidate.is_none_or(|index| index >= 2)
+                        && post_ack_observed
+                            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok() =>
+                {
+                    post_ack_claim.wait();
+                }
+                _ => {}
+            },
+        );
+
+        assert_eq!(abort_reason.as_deref(), Some(CAUSE));
+        assert_eq!(halt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(post_ack_observed.load(Ordering::SeqCst), 1);
+        assert_eq!(executions[0].load(Ordering::SeqCst), 1);
+        assert_eq!(executions[1].load(Ordering::SeqCst), 1);
+        assert_eq!(
+            executions[2].load(Ordering::SeqCst),
+            0,
+            "index 2 was claimed after the abort had already been queued"
+        );
+        assert_eq!(raw_cleanups.load(Ordering::SeqCst), 0);
+        assert_eq!(outer_appends.load(Ordering::SeqCst), 0);
+        let mut observed = observed.into_inner().unwrap();
+        observed.sort_by_key(|(index, _, _, _)| *index);
+        assert_eq!(observed.len(), 2);
+        for (index, value, directive, disposition) in observed {
+            assert_eq!(index, value);
+            assert_eq!(directive, CompletionDirective::AbortRun(CAUSE.into()));
+            assert_eq!(
+                disposition,
+                CellPublicationDisposition::Suppressed(CAUSE.into())
+            );
         }
     }
 

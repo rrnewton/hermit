@@ -45,7 +45,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `test-allocator`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify, test-allocator.",
+      "_why": "@generated: Cargo package `test-allocator`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-manifest-plan, hermit-verify, test-allocator.",
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
@@ -67,6 +67,7 @@
         "e2e.manifest_util_c_on_host",
         "lint.clippy",
         "lint.rustfmt",
+        "setup.manifest_plan",
         "test.app_strict_verify",
         "test.applications_e2e",
         "test.arbitrary_binaries",
@@ -93,7 +94,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
+      "_why": "@generated: Cargo package `hermit-detcore`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-manifest-plan, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
@@ -115,6 +116,7 @@
         "e2e.manifest_util_c_on_host",
         "lint.clippy",
         "lint.rustfmt",
+        "setup.manifest_plan",
         "test.app_strict_verify",
         "test.applications_e2e",
         "test.arbitrary_binaries",
@@ -142,7 +144,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-dbt`; reverse-dependent closure: detcore-dbt, hermit.",
+      "_why": "@generated: Cargo package `detcore-dbt`; reverse-dependent closure: detcore-dbt, hermit, hermit-manifest-plan.",
       "e2e_backends": [
         "dbt"
       ],
@@ -154,6 +156,7 @@
         "e2e.manifest_backend_parity_c_on_host",
         "lint.clippy",
         "lint.rustfmt",
+        "setup.manifest_plan",
         "test.app_strict_verify",
         "test.arbitrary_binaries",
         "test.cli_on_host",
@@ -243,7 +246,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `detcore-testutils`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-verify.",
+      "_why": "@generated: Cargo package `detcore-testutils`; reverse-dependent closure: detcore-dbt, detcore-sabre, detcore-testutils, hermetic_infra_hermit_tests, hermit, hermit-detcore, hermit-manifest-plan, hermit-verify.",
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
@@ -265,6 +268,7 @@
         "e2e.manifest_util_c_on_host",
         "lint.clippy",
         "lint.rustfmt",
+        "setup.manifest_plan",
         "test.app_strict_verify",
         "test.applications_e2e",
         "test.arbitrary_binaries",
@@ -310,7 +314,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit`; reverse-dependent closure: hermit.",
+      "_why": "@generated: Cargo package `hermit`; reverse-dependent closure: hermit, hermit-manifest-plan.",
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
@@ -332,6 +336,7 @@
         "e2e.manifest_util_c_on_host",
         "lint.clippy",
         "lint.rustfmt",
+        "setup.manifest_plan",
         "test.app_strict_verify",
         "test.applications_e2e",
         "test.arbitrary_binaries",
@@ -344,6 +349,7 @@
         "test.hermit_unit",
         "test.ignored_syscall_regressions",
         "test.liteinst_strict",
+        "test.regular_crates",
         "test.rr_suite_contract",
         "test.sabre_examples",
         "test.strict_compat"
@@ -401,7 +407,7 @@
       ]
     },
     {
-      "_why": "@generated: Cargo package `hermit-resources`; reverse-dependent closure: detcore-dbt, hermit, hermit-resources.",
+      "_why": "@generated: Cargo package `hermit-resources`; reverse-dependent closure: detcore-dbt, hermit, hermit-manifest-plan, hermit-resources.",
       "e2e_all": true,
       "nodes": [
         "build.runtime_release",
@@ -423,6 +429,7 @@
         "e2e.manifest_util_c_on_host",
         "lint.clippy",
         "lint.rustfmt",
+        "setup.manifest_plan",
         "test.app_strict_verify",
         "test.applications_e2e",
         "test.arbitrary_binaries",

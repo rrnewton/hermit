@@ -31,6 +31,10 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use dagrun::ManualCpuCgroup;
+#[cfg(test)]
+use dagrun::ManualCpuCgroupStatus;
+use dagrun::SharedCpuCgroupParent;
 use dagrun::TestAttemptOutcome;
 use dagrun::TestAttemptResult;
 use dagrun::TestResult;
@@ -97,7 +101,6 @@ use crate::timeouts::validate_timeout_seconds;
 const BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 const CELL_CPU_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const CELL_CPU_ACCOUNTING_GRACE: Duration = Duration::from_secs(1);
 pub const CELL_RESULT_SCHEMA: u64 = 4;
 pub const RETAINED_VERIFY_LOG_CELL_RESULT_SCHEMA: u64 = 5;
 pub const DEFAULT_VERIFY_LOG_RETENTION_BUDGET_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -1116,12 +1119,12 @@ pub struct AttemptResult {
     pub timed_out: bool,
     #[serde(default)]
     pub duration_ms: u128,
-    /// CPU consumed by the launched process group.
+    /// CPU consumed by the mandatory per-run cgroup.
     ///
-    /// Completed commands use `wait4`; a CPU timeout retains the last live
-    /// process-group observation when that is larger. It is not inferred from
-    /// wall time and remains attributable when cells execute concurrently or
-    /// move their work outside the enclosing DAG cgroup.
+    /// Live enforcement and final aggregate accounting use cgroup cpu.stat;
+    /// waitid's leader usage is retained when larger. This is not inferred from
+    /// wall time and remains attributable when descendants change process group
+    /// or session.
     #[serde(default)]
     pub cpu_usage_usec: Option<u64>,
     pub observation_sha256: Option<String>,
@@ -3396,9 +3399,9 @@ struct SharedProcessCpuBudgetState {
 /// One live CPU allowance shared by the two concurrent members of a verify pair.
 ///
 /// The committed cell budget describes the complete test, not each Hermit child.
-/// Each child therefore contributes its process-group counter to this one sum.
+/// Each child therefore contributes its run-cgroup counter to this one sum.
 /// Once the sum reaches the limit, both monitors observe `exhausted` and reap
-/// their own process groups; neither child receives a second copy of the budget.
+/// their own run cgroups; neither child receives a second copy of the budget.
 struct SharedProcessCpuBudget {
     limit_usec: u64,
     state: Mutex<SharedProcessCpuBudgetState>,
@@ -3592,27 +3595,24 @@ fn wait4_process(pid: u32, options: libc::c_int) -> Result<Option<ReapedProcess>
     }
 }
 
-/// Live user-plus-system CPU consumed by one process group, including CPU from
-/// children already reaped by a still-live member.
+/// Live aggregate CPU consumed by every process in the mandatory per-run cgroup.
 ///
-/// `wait4` is the authoritative final measurement, but it becomes available
-/// only after the process exits and therefore cannot enforce a budget. Reuse
-/// dagrun's process-group reader: its one short-lived snapshot is shared by all
-/// concurrent cells, rather than making every cell enumerate the host's entire
-/// `/proc` tree on every poll.
-fn process_group_cpu_usage_usec(identity: &ProcessGroupIdentity) -> Result<Option<u64>, String> {
-    dagrun::proccpu::anchored_subtree_cpu_seconds(identity.cpu_anchor)
-        .map(|seconds| {
-            let usec = seconds * 1_000_000.0;
-            if !usec.is_finite() || usec.is_sign_negative() || usec > u64::MAX as f64 {
-                return Err(format!(
-                    "process group {} returned invalid live CPU seconds {seconds}",
-                    identity.leader_pid
-                ));
-            }
-            Ok(usec as u64)
-        })
-        .transpose()
+/// The supervisor-owned zombie still pins the numeric process-group generation,
+/// but cgroup membership is the run boundary and cpu.stat includes descendants
+/// that changed process group or session.
+fn run_cgroup_cpu_usage_usec(identity: &ProcessGroupIdentity) -> Result<u64, String> {
+    dagrun::proccpu::anchored_subtree_cpu_seconds(identity.cpu_anchor).ok_or_else(|| {
+        format!(
+            "process-group generation {} lost its supervisor anchor",
+            identity.leader_pid
+        )
+    })?;
+    identity.cgroup.cpu_usage_usec().map_err(|error| {
+        format!(
+            "cannot read live CPU use from mandatory cgroup {}: {error}",
+            identity.cgroup.path().display()
+        )
+    })
 }
 
 const GROUP_SUPERVISOR_CLEANUP: u64 = 1;
@@ -3630,7 +3630,8 @@ enum RawSupervisorState {
     Initializing = 0,
     Running = 1,
     EmptyAnchored = 2,
-    ReleasedClean = 3,
+    CgroupFinalized = 3,
+    ReleasedClean = 4,
 }
 
 #[derive(Debug)]
@@ -3677,11 +3678,18 @@ impl SupervisorReceipt {
             value if value == RawSupervisorState::EmptyAnchored as u8 => {
                 RawSupervisorState::EmptyAnchored
             }
+            value if value == RawSupervisorState::CgroupFinalized as u8 => {
+                RawSupervisorState::CgroupFinalized
+            }
             value if value == RawSupervisorState::ReleasedClean as u8 => {
                 RawSupervisorState::ReleasedClean
             }
             _ => RawSupervisorState::Initializing,
         }
+    }
+
+    fn mark_cgroup_finalized(&self) {
+        raw_store_supervisor_state(self.address, RawSupervisorState::CgroupFinalized);
     }
 }
 
@@ -3769,6 +3777,24 @@ fn wire_bytes_mut(words: &mut [u64; GROUP_SUPERVISOR_WIRE_WORDS]) -> &mut [u8] {
 fn raw_store_supervisor_state(address: usize, state: RawSupervisorState) {
     unsafe { &*(address as *const std::sync::atomic::AtomicU8) }
         .store(state as u8, std::sync::atomic::Ordering::Release);
+}
+
+fn raw_load_supervisor_state(address: usize) -> RawSupervisorState {
+    let phase = unsafe { &*(address as *const std::sync::atomic::AtomicU8) }
+        .load(std::sync::atomic::Ordering::Acquire);
+    match phase {
+        value if value == RawSupervisorState::Running as u8 => RawSupervisorState::Running,
+        value if value == RawSupervisorState::EmptyAnchored as u8 => {
+            RawSupervisorState::EmptyAnchored
+        }
+        value if value == RawSupervisorState::CgroupFinalized as u8 => {
+            RawSupervisorState::CgroupFinalized
+        }
+        value if value == RawSupervisorState::ReleasedClean as u8 => {
+            RawSupervisorState::ReleasedClean
+        }
+        _ => RawSupervisorState::Initializing,
+    }
 }
 
 fn raw_sleep_poll_interval() {
@@ -4132,37 +4158,19 @@ fn raw_cleanup_owned_group(
     }
 }
 
-fn raw_confirm_owned_group_empty(leader_pid: u32, sentinel_pid: u32, start_time_ticks: u64) -> i32 {
-    for _ in 0..500 {
-        let anchor = raw_anchor_matches(leader_pid, sentinel_pid, start_time_ticks);
-        if anchor != 0 {
-            return anchor;
-        }
-        match raw_group_has_non_zombie(leader_pid, sentinel_pid) {
-            0 => return 0,
-            1 => return libc::EBUSY,
-            error if error == -libc::EAGAIN => raw_sleep_poll_interval(),
-            error => return -error,
-        }
-    }
-    libc::ETIMEDOUT
-}
-
-fn raw_autonomous_group_cleanup(
-    leader_pid: u32,
-    sentinel_pid: u32,
-    start_time_ticks: u64,
-    receipt_address: usize,
-) {
-    if raw_cleanup_owned_group(leader_pid, sentinel_pid, start_time_ticks, false, false) == 0
-        && raw_reap_sentinel(sentinel_pid) == 0
-    {
-        raw_store_supervisor_state(receipt_address, RawSupervisorState::ReleasedClean);
-        return;
-    }
-    // A hard identity mismatch can never authorize a numeric signal or anchor
-    // release. Keep the supervisor alive and retain the anchor fail-closed.
+fn raw_wait_for_cgroup_proof_and_release(sentinel_pid: u32, receipt_address: usize) {
     loop {
+        if raw_load_supervisor_state(receipt_address) == RawSupervisorState::CgroupFinalized
+            && raw_reap_sentinel(sentinel_pid) == 0
+        {
+            raw_store_supervisor_state(receipt_address, RawSupervisorState::ReleasedClean);
+            return;
+        }
+        // Control EOF is not containment evidence. Keep the exact group
+        // generation pinned until the parent publishes successful cgroup.kill,
+        // populated=0, stable accounting, and exact-child removal. If that
+        // proof never arrives, the enclosing dagrun cgroup remains the sole
+        // authority allowed to kill this supervisor.
         raw_sleep_poll_interval();
     }
 }
@@ -4295,13 +4303,8 @@ fn raw_process_group_supervisor(
     unsafe { libc::close(launch_fd) };
     if error != 0 || report_error != 0 || ack_error != 0 {
         if sentinel_pid != 0 {
-            if let Some(stat) = stat {
-                raw_autonomous_group_cleanup(
-                    leader_pid,
-                    sentinel_pid,
-                    stat.start_time_ticks,
-                    receipt_address,
-                );
+            if stat.is_some() {
+                raw_wait_for_cgroup_proof_and_release(sentinel_pid, receipt_address);
             } else {
                 unsafe { libc::kill(sentinel_pid as libc::pid_t, libc::SIGKILL) };
                 let _ = raw_reap_sentinel(sentinel_pid);
@@ -4319,12 +4322,7 @@ fn raw_process_group_supervisor(
         let mut command = [0u64; GROUP_SUPERVISOR_WIRE_WORDS];
         let read_error = raw_read_exact(control_fd, wire_bytes_mut(&mut command));
         if read_error != 0 {
-            raw_autonomous_group_cleanup(
-                leader_pid,
-                sentinel_pid,
-                stat.start_time_ticks,
-                receipt_address,
-            );
+            raw_wait_for_cgroup_proof_and_release(sentinel_pid, receipt_address);
             unsafe { libc::_exit(0) }
         }
         let identity_error = if command[2] as u32 != leader_pid
@@ -4359,13 +4357,10 @@ fn raw_process_group_supervisor(
                 state = RawSupervisorState::EmptyAnchored;
                 raw_store_supervisor_state(receipt_address, state);
             }
-        } else if reply_error == 0
-            && command[0] == GROUP_SUPERVISOR_RELEASE
-            && state == RawSupervisorState::EmptyAnchored
-        {
-            reply_error =
-                raw_confirm_owned_group_empty(leader_pid, sentinel_pid, stat.start_time_ticks);
-            if reply_error == 0 {
+        } else if reply_error == 0 && command[0] == GROUP_SUPERVISOR_RELEASE {
+            if raw_load_supervisor_state(receipt_address) != RawSupervisorState::CgroupFinalized {
+                reply_error = libc::EPERM;
+            } else {
                 reply_error = raw_reap_sentinel(sentinel_pid);
             }
             if reply_error == 0 {
@@ -4383,12 +4378,7 @@ fn raw_process_group_supervisor(
         let reply = [u64::from(reply_error == 0), reply_error as u64, 0, 0, 0, 0];
         if raw_write_all(control_fd, wire_bytes(&reply)) != 0 {
             if state != RawSupervisorState::ReleasedClean {
-                raw_autonomous_group_cleanup(
-                    leader_pid,
-                    sentinel_pid,
-                    stat.start_time_ticks,
-                    receipt_address,
-                );
+                raw_wait_for_cgroup_proof_and_release(sentinel_pid, receipt_address);
             }
             unsafe { libc::_exit(0) }
         }
@@ -4475,7 +4465,32 @@ fn open_process_pidfd(pid: u32, role: &str) -> Result<File, String> {
     Ok(unsafe { File::from_raw_fd(descriptor as libc::c_int) })
 }
 
+fn create_payload_cgroup() -> Result<ManualCpuCgroup, String> {
+    let parent = SharedCpuCgroupParent::current()
+        .map_err(|error| format!("mandatory per-run cgroup containment is unavailable: {error}"))?;
+    parent
+        .create_child("manifest-run")
+        .map_err(|error| format!("cannot establish mandatory per-run cgroup containment: {error}"))
+}
+
+fn finalize_payload_cgroup(cgroup: &ManualCpuCgroup) -> Result<u64, String> {
+    cgroup.kill_and_cleanup().map_err(|error| {
+        format!(
+            "mandatory per-run cgroup finalization failed for {}: {error}",
+            cgroup.path().display()
+        )
+    })
+}
+
+fn append_cgroup_cleanup_error(primary: String, cgroup: &ManualCpuCgroup) -> String {
+    match finalize_payload_cgroup(cgroup) {
+        Ok(_) => primary,
+        Err(cleanup) => format!("{primary}; {cleanup}"),
+    }
+}
+
 struct ProcessGroupLaunchSupervisor {
+    cgroup: ManualCpuCgroup,
     supervisor_pid: u32,
     supervisor_pidfd: File,
     receipt: SupervisorReceipt,
@@ -4485,6 +4500,7 @@ struct ProcessGroupLaunchSupervisor {
 
 #[derive(Debug)]
 struct ProcessGroupLaunchFailure {
+    cgroup: Box<ManualCpuCgroup>,
     supervisor_pid: u32,
     supervisor_pidfd: File,
     receipt: SupervisorReceipt,
@@ -4501,6 +4517,7 @@ impl ProcessGroupLaunchSupervisor {
             .map_err(|error| format!("cannot create process-group control socket: {error}"))?;
         let (payload_launch, supervisor_launch) = UnixStream::pair()
             .map_err(|error| format!("cannot create process-group launch socket: {error}"))?;
+        let cgroup = create_payload_cgroup()?;
         let control_fd = control.as_raw_fd();
         let supervisor_control_fd = supervisor_control.as_raw_fd();
         let payload_launch_fd = payload_launch.as_raw_fd();
@@ -4511,10 +4528,11 @@ impl ProcessGroupLaunchSupervisor {
         // the multithreaded harness.
         let supervisor_pid = unsafe { libc::syscall(libc::SYS_fork) as libc::pid_t };
         if supervisor_pid == -1 {
-            return Err(format!(
+            let reason = format!(
                 "cannot fork process-group supervisor: {}",
                 std::io::Error::last_os_error()
-            ));
+            );
+            return Err(append_cgroup_cleanup_error(reason, &cgroup));
         }
         if supervisor_pid == 0 {
             unsafe {
@@ -4538,38 +4556,49 @@ impl ProcessGroupLaunchSupervisor {
         let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, supervisor_pid, 0) };
         if pidfd == -1 {
             let error = std::io::Error::last_os_error();
+            let reason = append_cgroup_cleanup_error(
+                format!("cannot open process-group supervisor pidfd: {error}"),
+                &cgroup,
+            );
             drop(payload_launch);
             drop(control);
-            return Err(format!(
-                "cannot open process-group supervisor pidfd: {error}"
-            ));
+            return Err(reason);
         }
         let supervisor_pidfd = unsafe { File::from_raw_fd(pidfd as libc::c_int) };
         let mut ready = [0u64; GROUP_SUPERVISOR_WIRE_WORDS];
         if let Err(error) = control.read_exact(wire_bytes_mut(&mut ready)) {
+            let reason = append_cgroup_cleanup_error(
+                format!("cannot read process-group supervisor readiness: {error}"),
+                &cgroup,
+            );
             drop(payload_launch);
             drop(control);
             let _ = wait_supervisor_pidfd(&supervisor_pidfd, true);
-            return Err(format!(
-                "cannot read process-group supervisor readiness: {error}"
-            ));
+            return Err(reason);
         }
         if ready[0] != GROUP_SUPERVISOR_OK {
             drop(payload_launch);
+            let reason = append_cgroup_cleanup_error(
+                "process-group supervisor did not become ready".into(),
+                &cgroup,
+            );
             drop(control);
             let _ = wait_supervisor_pidfd(&supervisor_pidfd, true);
-            return Err("process-group supervisor did not become ready".into());
+            return Err(reason);
         }
         let ack = [GROUP_SUPERVISOR_OK, 0, 0, 0, 0, 0];
         if let Err(error) = control.write_all(wire_bytes(&ack)) {
             drop(payload_launch);
             drop(control);
+            let reason = append_cgroup_cleanup_error(
+                format!("cannot release process-group supervisor ready barrier: {error}"),
+                &cgroup,
+            );
             let _ = wait_supervisor_pidfd(&supervisor_pidfd, true);
-            return Err(format!(
-                "cannot release process-group supervisor ready barrier: {error}"
-            ));
+            return Err(reason);
         }
         Ok(Self {
+            cgroup,
             supervisor_pid: supervisor_pid as u32,
             supervisor_pidfd,
             receipt,
@@ -4578,7 +4607,13 @@ impl ProcessGroupLaunchSupervisor {
         })
     }
 
-    fn configure_payload(&self, command: &mut Command) {
+    fn configure_payload(&self, command: &mut Command) -> Result<(), String> {
+        // Command runs pre_exec hooks in registration order. The cgroup write
+        // therefore succeeds in the payload child before setpgid, the launch
+        // handshake, or exec; this supervisor process remains in the parent.
+        self.cgroup.attach_command(command).map_err(|error| {
+            format!("cannot attach payload to mandatory per-run cgroup: {error}")
+        })?;
         let control_fd = self.control.as_raw_fd();
         let launch_fd = self
             .payload_launch
@@ -4608,6 +4643,7 @@ impl ProcessGroupLaunchSupervisor {
                 }
                 Ok(())
             });
+            Ok(())
         }
     }
 
@@ -4666,11 +4702,12 @@ impl ProcessGroupLaunchSupervisor {
             sentinel_start_time_ticks,
         ) else {
             return Err(self.into_failure(
-                "cannot establish an anchor-aware process-group CPU measurement".into(),
+                "cannot establish exact supervisor-generation proof".into(),
                 payload_pidfd,
             ));
         };
         Ok(ProcessGroupIdentity {
+            cgroup: self.cgroup,
             leader_pid,
             payload_pidfd,
             supervisor_pid: self.supervisor_pid,
@@ -4690,6 +4727,7 @@ impl ProcessGroupLaunchSupervisor {
     ) -> ProcessGroupLaunchFailure {
         drop(self.payload_launch.take());
         ProcessGroupLaunchFailure {
+            cgroup: Box::new(self.cgroup),
             supervisor_pid: self.supervisor_pid,
             supervisor_pidfd: self.supervisor_pidfd,
             receipt: self.receipt,
@@ -4700,12 +4738,29 @@ impl ProcessGroupLaunchSupervisor {
     }
 
     fn abort(mut self) -> Result<(), String> {
+        let cgroup_finalization = finalize_payload_cgroup(&self.cgroup);
+        if cgroup_finalization.is_ok() {
+            self.receipt.mark_cgroup_finalized();
+        }
         drop(self.payload_launch.take());
         drop(self.control);
-        match wait_supervisor_pidfd(&self.supervisor_pidfd, true) {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => Err("process-group supervisor remained live after abort".into()),
-            Err(error) => Err(error),
+
+        let supervisor = wait_supervisor_pidfd(&self.supervisor_pidfd, cgroup_finalization.is_ok());
+        let mut errors = Vec::new();
+        if let Err(error) = cgroup_finalization {
+            errors.push(error);
+        }
+        match supervisor {
+            Ok(Some(_)) => {}
+            Ok(None) => errors.push(
+                "process-group supervisor retained its anchor for outer cgroup cleanup".into(),
+            ),
+            Err(error) => errors.push(error),
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
         }
     }
 }
@@ -4716,6 +4771,7 @@ impl ProcessGroupLaunchSupervisor {
 /// group generation until cleanup, payload wait, and release are complete.
 #[derive(Debug)]
 struct ProcessGroupIdentity {
+    cgroup: ManualCpuCgroup,
     leader_pid: u32,
     payload_pidfd: Option<File>,
     supervisor_pid: u32,
@@ -4872,10 +4928,19 @@ impl ProcessGroupCleanup {
 
     fn retain_reaped(&mut self, reaped: ReapedProcess) {
         self.status = Some(reaped.status);
-        self.cpu_usage_usec = reaped.cpu_usage_usec;
+        if let Some(cpu_usage_usec) = reaped.cpu_usage_usec {
+            self.retain_cpu_usage(cpu_usage_usec);
+        }
         if let Some(error) = reaped.cpu_error {
             self.errors.push(error);
         }
+    }
+
+    fn retain_cpu_usage(&mut self, cpu_usage_usec: u64) {
+        self.cpu_usage_usec = Some(
+            self.cpu_usage_usec
+                .map_or(cpu_usage_usec, |observed| observed.max(cpu_usage_usec)),
+        );
     }
 }
 
@@ -4934,9 +4999,10 @@ fn reap_payload_by_pidfd(
     }
 }
 
-fn stop_process_group(
+fn stop_process_group_observed(
     mut identity: ProcessGroupIdentity,
     termination: ProcessGroupTermination,
+    #[cfg(test)] after_group_observation: impl FnOnce(&ProcessGroupIdentity),
 ) -> ProcessGroupCleanup {
     let leader_pid = identity.leader_pid;
     let mut cleanup = ProcessGroupCleanup::new();
@@ -4958,11 +5024,24 @@ fn stop_process_group(
         }
     };
 
-    let initial_reap = match identity.payload_pidfd.as_ref() {
-        Some(payload_pidfd) => {
-            reap_payload_by_pidfd(payload_pidfd, leader_pid, group_empty_anchored)
+    #[cfg(test)]
+    after_group_observation(&identity);
+
+    let cgroup_finalized = match finalize_payload_cgroup(&identity.cgroup) {
+        Ok(cpu_usage_usec) => {
+            cleanup.retain_cpu_usage(cpu_usage_usec);
+            identity.receipt.mark_cgroup_finalized();
+            true
         }
-        None if group_empty_anchored => {
+        Err(error) => {
+            cleanup.errors.push(error);
+            false
+        }
+    };
+
+    let initial_reap = match identity.payload_pidfd.as_ref() {
+        Some(payload_pidfd) => reap_payload_by_pidfd(payload_pidfd, leader_pid, cgroup_finalized),
+        None if cgroup_finalized => {
             // The unreaped sentinel still pins this group generation. A
             // numeric wait is safe only until RELEASE removes that anchor.
             wait4_process(leader_pid, 0)
@@ -4976,7 +5055,7 @@ fn stop_process_group(
         Err(error) => cleanup.errors.push(error.to_string()),
     }
 
-    if group_empty_anchored {
+    if cgroup_finalized {
         if let Err(error) =
             request_process_group_supervisor(&mut identity, GROUP_SUPERVISOR_RELEASE, 0)
         {
@@ -4984,35 +5063,37 @@ fn stop_process_group(
         }
     }
     drop(identity.control.take());
-    let supervisor_exited = match wait_supervisor_pidfd(&identity.supervisor_pidfd, true) {
-        Ok(Some(SupervisorExit::Failure)) => {
-            cleanup.errors.push(format!(
-                "process-group supervisor {} exited unsuccessfully: nonzero status or signal",
+    let supervisor_exited =
+        match wait_supervisor_pidfd(&identity.supervisor_pidfd, cgroup_finalized) {
+            Ok(Some(SupervisorExit::Failure)) => {
+                cleanup.errors.push(format!(
+                    "process-group supervisor {} exited unsuccessfully: nonzero status or signal",
+                    identity.supervisor_pid
+                ));
+                true
+            }
+            Ok(Some(SupervisorExit::Success | SupervisorExit::StatusUnavailable)) => true,
+            Ok(None) => {
+                cleanup.errors.push(format!(
+                "process-group supervisor {} retained its exact anchor for outer cgroup cleanup",
                 identity.supervisor_pid
             ));
-            true
-        }
-        Ok(Some(SupervisorExit::Success | SupervisorExit::StatusUnavailable)) => true,
-        Ok(None) => {
-            cleanup.errors.push(format!(
-                "process-group supervisor {} remained live after cleanup",
-                identity.supervisor_pid
-            ));
-            false
-        }
-        Err(error) => {
-            cleanup.errors.push(error);
-            false
-        }
-    };
-    let released_clean =
-        supervisor_exited && identity.receipt.load() == RawSupervisorState::ReleasedClean;
+                false
+            }
+            Err(error) => {
+                cleanup.errors.push(error);
+                false
+            }
+        };
+    let released_clean = cgroup_finalized
+        && supervisor_exited
+        && identity.receipt.load() == RawSupervisorState::ReleasedClean;
     if cleanup.status.is_none() {
         if let Some(payload_pidfd) = identity.payload_pidfd.as_ref() {
-            match reap_payload_by_pidfd(payload_pidfd, leader_pid, released_clean) {
+            match reap_payload_by_pidfd(payload_pidfd, leader_pid, cgroup_finalized) {
                 Ok(Some(reaped)) => cleanup.retain_reaped(reaped),
                 Ok(None) => cleanup.errors.push(format!(
-                    "payload {leader_pid} had no exit disposition after supervisor shutdown"
+                    "payload {leader_pid} had no exit disposition after cgroup finalization"
                 )),
                 Err(error) if error.is_no_child() => {}
                 Err(error) => cleanup.errors.push(error.to_string()),
@@ -5025,9 +5106,14 @@ fn stop_process_group(
     }
     if !released_clean {
         cleanup.errors.push(format!(
-            "process-group supervisor {} exited without a ReleasedClean receipt",
+            "run cgroup was not finalized with supervisor {} ReleasedClean",
             identity.supervisor_pid
         ));
+    }
+    if group_empty_anchored && !cgroup_finalized {
+        cleanup
+            .errors
+            .push("numeric process-group emptiness is not accepted as containment proof".into());
     }
     cleanup.disposition = if released_clean {
         ProcessGroupCleanupDisposition::Gone
@@ -5035,6 +5121,29 @@ fn stop_process_group(
         ProcessGroupCleanupDisposition::UnprovenStillLive
     };
     cleanup
+}
+
+fn stop_process_group(
+    identity: ProcessGroupIdentity,
+    termination: ProcessGroupTermination,
+) -> ProcessGroupCleanup {
+    #[cfg(test)]
+    {
+        stop_process_group_observed(identity, termination, |_| {})
+    }
+    #[cfg(not(test))]
+    {
+        stop_process_group_observed(identity, termination)
+    }
+}
+
+#[cfg(test)]
+fn stop_process_group_after_group_observation(
+    identity: ProcessGroupIdentity,
+    termination: ProcessGroupTermination,
+    after_group_observation: impl FnOnce(&ProcessGroupIdentity),
+) -> ProcessGroupCleanup {
+    stop_process_group_observed(identity, termination, after_group_observation)
 }
 
 fn process_output_after_cleanup(
@@ -5059,14 +5168,13 @@ fn process_output_after_cleanup(
     }
     if cpu_usage_usec.is_none() {
         errors.push(format!(
-            "process-group leader {} has no final CPU measurement",
+            "run cgroup for leader {} has no final CPU measurement",
             leader_pid
         ));
     }
     if cleanup.disposition == ProcessGroupCleanupDisposition::UnprovenStillLive {
         errors.push(format!(
-            "process group {} could not be proven gone",
-            leader_pid
+            "run cgroup for leader {leader_pid} was not proven gone"
         ));
     }
     if errors.is_empty() {
@@ -5113,6 +5221,7 @@ fn process_output_after_supervisor_launch_failure(
     leader_pid: u32,
 ) -> ProcessOutput {
     let ProcessGroupLaunchFailure {
+        cgroup,
         supervisor_pid,
         supervisor_pidfd,
         receipt,
@@ -5120,9 +5229,20 @@ fn process_output_after_supervisor_launch_failure(
         control,
         reason,
     } = failure;
-    drop(control);
     let mut cleanup = ProcessGroupCleanup::new();
-    let supervisor_exited = match wait_supervisor_pidfd(&supervisor_pidfd, true) {
+    let cgroup_finalized = match finalize_payload_cgroup(&cgroup) {
+        Ok(cpu_usage_usec) => {
+            cleanup.retain_cpu_usage(cpu_usage_usec);
+            receipt.mark_cgroup_finalized();
+            true
+        }
+        Err(error) => {
+            cleanup.errors.push(error);
+            false
+        }
+    };
+    drop(control);
+    let supervisor_exited = match wait_supervisor_pidfd(&supervisor_pidfd, cgroup_finalized) {
         Ok(Some(SupervisorExit::Success)) => true,
         Ok(Some(SupervisorExit::Failure | SupervisorExit::StatusUnavailable)) => {
             cleanup.errors.push(format!(
@@ -5132,7 +5252,7 @@ fn process_output_after_supervisor_launch_failure(
         }
         Ok(None) => {
             cleanup.errors.push(format!(
-                "process-group supervisor {supervisor_pid} remained live after launch failure"
+                "process-group supervisor {supervisor_pid} retained its anchor for outer cgroup cleanup"
             ));
             false
         }
@@ -5141,10 +5261,12 @@ fn process_output_after_supervisor_launch_failure(
             false
         }
     };
-    let released_clean = supervisor_exited && receipt.load() == RawSupervisorState::ReleasedClean;
+    let released_clean = cgroup_finalized
+        && supervisor_exited
+        && receipt.load() == RawSupervisorState::ReleasedClean;
     match payload_pidfd
         .as_ref()
-        .map(|pidfd| reap_payload_by_pidfd(pidfd, leader_pid, released_clean))
+        .map(|pidfd| reap_payload_by_pidfd(pidfd, leader_pid, cgroup_finalized))
         .transpose()
     {
         Ok(Some(Some(reaped))) => cleanup.retain_reaped(reaped),
@@ -5156,7 +5278,7 @@ fn process_output_after_supervisor_launch_failure(
     }
     if !released_clean {
         cleanup.errors.push(format!(
-            "process-group supervisor {supervisor_pid} exited without a ReleasedClean receipt"
+            "run cgroup was not finalized with supervisor {supervisor_pid} ReleasedClean"
         ));
     }
     cleanup.disposition = if released_clean {
@@ -5247,10 +5369,19 @@ fn execute_process(
     command.envs(env.iter());
     require_process_launch_budget(deadline, shared_cpu_budget, "spawn")?;
     let supervisor = ProcessGroupLaunchSupervisor::start()?;
-    supervisor.configure_payload(&mut command);
+    if let Err(error) = supervisor.configure_payload(&mut command) {
+        drop(command);
+        let cleanup_error = supervisor.abort().err();
+        let mut reason = error;
+        if let Some(cleanup_error) = cleanup_error {
+            reason.push_str(&format!("; launch cleanup failed: {cleanup_error}"));
+        }
+        return Err(reason);
+    }
     let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
+            drop(command);
             let cleanup_error = supervisor.abort().err();
             let mut reason = format!("cannot execute {program}: {error}");
             if let Some(cleanup_error) = cleanup_error {
@@ -5262,6 +5393,9 @@ fn execute_process(
     let pid = child.id();
     let mut next_cpu_poll = Instant::now() + cpu_poll_interval;
     drop(child);
+    // Drop the parent-held cgroup.procs descriptor before finalization begins.
+    drop(command);
+
     // Successful spawn means the payload completed the pre-exec supervisor
     // handshake. From here onward every exit path carries executed evidence;
     // the supervisor retains the group-generation anchor even under ECHILD.
@@ -5278,7 +5412,6 @@ fn execute_process(
     if let Some(error) = payload_pidfd_error {
         return Ok(post_spawn_process_error(process_group, None, error, None));
     }
-    let mut cpu_accounting_missing_since = None;
     let mut last_cpu_usage_usec = None;
     loop {
         let exited = match process_has_exited(&process_group) {
@@ -5300,8 +5433,9 @@ fn execute_process(
                 None,
                 None,
                 // waitid already proved that the leader exited. Lingering
-                // descendants need the anchored final KILL/scan, not a TERM
-                // grace period intended for a still-running payload.
+                // descendants need immediate defensive process-group cleanup
+                // followed by authoritative cgroup finalization, not a TERM
+                // grace period intended for a still-running leader.
                 ProcessGroupTermination::Completed,
             );
             if output.monitor_error.is_some() {
@@ -5352,47 +5486,23 @@ fn execute_process(
         } else if now >= next_cpu_poll && (cpu_budget_usec.is_some() || shared_cpu_budget.is_some())
         {
             next_cpu_poll = now + cpu_poll_interval;
-            let process_cpu = match process_group_cpu_usage_usec(&process_group) {
-                Ok(process_cpu) => process_cpu,
+            let used = match run_cgroup_cpu_usage_usec(&process_group) {
+                Ok(used) => used,
                 Err(error) => {
                     return Ok(post_spawn_process_error(process_group, None, error, None));
                 }
             };
-            match process_cpu {
-                Some(used) => {
-                    last_cpu_usage_usec = Some(used);
-                    cpu_accounting_missing_since = None;
-                    let exhausted = match shared_cpu_budget {
-                        Some((budget, member)) => match budget.observe(member, used) {
-                            Ok(exhausted) => exhausted,
-                            Err(error) => {
-                                return Ok(post_spawn_process_error(
-                                    process_group,
-                                    None,
-                                    error,
-                                    None,
-                                ));
-                            }
-                        },
-                        None => cpu_budget_usec.is_some_and(|limit| used >= limit),
-                    };
-                    (exhausted.then_some(ProcessTimeout::Cpu), Some(used))
-                }
-                None => {
-                    let missing_since = cpu_accounting_missing_since.get_or_insert(now);
-                    if now.duration_since(*missing_since) >= CELL_CPU_ACCOUNTING_GRACE {
-                        return Ok(post_spawn_process_error(
-                            process_group,
-                            None,
-                            format!(
-                                "cannot measure live CPU for process group {pid}; stopped it rather than silently disabling its CPU budget"
-                            ),
-                            None,
-                        ));
+            last_cpu_usage_usec = Some(used);
+            let exhausted = match shared_cpu_budget {
+                Some((budget, member)) => match budget.observe(member, used) {
+                    Ok(exhausted) => exhausted,
+                    Err(error) => {
+                        return Ok(post_spawn_process_error(process_group, None, error, None));
                     }
-                    (None, None)
-                }
-            }
+                },
+                None => cpu_budget_usec.is_some_and(|limit| used >= limit),
+            };
+            (exhausted.then_some(ProcessTimeout::Cpu), Some(used))
         } else {
             (None, None)
         };
@@ -8187,19 +8297,25 @@ mod tests {
         let supervisor = ProcessGroupLaunchSupervisor::start().unwrap();
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "sleep 30"]);
-        supervisor.configure_payload(&mut command);
+        supervisor.configure_payload(&mut command).unwrap();
         let child = command.spawn().unwrap();
         let pid = child.id();
         drop(child);
+        drop(command);
         let payload_pidfd = open_process_pidfd(pid, "test payload").unwrap();
         let mut identity = supervisor.finish(pid, Some(payload_pidfd)).unwrap();
         assert_eq!(identity.receipt.load(), RawSupervisorState::Running);
+        assert!(cgroup_contains_pid(&identity.cgroup, pid));
+        assert!(
+            !cgroup_contains_pid(&identity.cgroup, identity.supervisor_pid),
+            "only the payload pre_exec hook may enter the run cgroup"
+        );
 
         let early_release =
             request_process_group_supervisor(&mut identity, GROUP_SUPERVISOR_RELEASE, 0)
                 .unwrap_err();
         assert!(
-            early_release.contains("Invalid argument"),
+            early_release.contains("Operation not permitted"),
             "{early_release}"
         );
         assert_eq!(identity.receipt.load(), RawSupervisorState::Running);
@@ -8210,14 +8326,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(identity.receipt.load(), RawSupervisorState::EmptyAnchored);
-        let reaped = wait4_process(pid, 0)
-            .unwrap()
-            .expect("cleanup must leave the payload waitable while anchored");
-        assert_eq!(
-            reaped.status.signal(),
-            Some(libc::SIGKILL),
-            "immediate cleanup must kill the payload"
-        );
         let repeated_cleanup = request_process_group_supervisor(
             &mut identity,
             GROUP_SUPERVISOR_CLEANUP,
@@ -8226,6 +8334,20 @@ mod tests {
         .unwrap_err();
         assert!(repeated_cleanup.contains("already"), "{repeated_cleanup}");
         assert_eq!(identity.receipt.load(), RawSupervisorState::EmptyAnchored);
+
+        let cgroup_path = identity.cgroup.path().to_owned();
+        finalize_payload_cgroup(&identity.cgroup).unwrap();
+        assert!(!cgroup_path.exists());
+        identity.receipt.mark_cgroup_finalized();
+        assert_eq!(identity.receipt.load(), RawSupervisorState::CgroupFinalized);
+        let reaped = wait4_process(pid, 0)
+            .unwrap()
+            .expect("cgroup finalization must leave the payload waitable while anchored");
+        assert_eq!(
+            reaped.status.signal(),
+            Some(libc::SIGKILL),
+            "immediate cleanup must kill the payload"
+        );
         request_process_group_supervisor(&mut identity, GROUP_SUPERVISOR_RELEASE, 0).unwrap();
         assert_eq!(identity.receipt.load(), RawSupervisorState::ReleasedClean);
         drop(identity.control.take());
@@ -8240,10 +8362,11 @@ mod tests {
         let supervisor = ProcessGroupLaunchSupervisor::start().unwrap();
         let mut command = Command::new("/bin/sh");
         command.args(["-c", script]);
-        supervisor.configure_payload(&mut command);
+        supervisor.configure_payload(&mut command).unwrap();
         let child = command.spawn().unwrap();
         let pid = child.id();
         drop(child);
+        drop(command);
         let payload_pidfd = open_process_pidfd(pid, "test payload").unwrap();
         let identity = supervisor.finish(pid, Some(payload_pidfd)).unwrap();
         (pid, identity)
@@ -8301,6 +8424,82 @@ mod tests {
         );
         thread::sleep(Duration::from_secs(2));
         fs::write(marker, b"survived").unwrap();
+    }
+    struct SameSessionJoiner {
+        child: std::process::Child,
+        pid: u32,
+        release_fd: libc::c_int,
+        ack_fd: libc::c_int,
+    }
+
+    fn spawn_same_session_joiner(
+        leader_pid: u32,
+        marker: &Path,
+        cgroup: Option<&ManualCpuCgroup>,
+    ) -> SameSessionJoiner {
+        let mut release = [-1; 2];
+        let mut ack = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(ack.as_mut_ptr()) }, 0);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", SAME_SESSION_JOIN_TEST, "--nocapture"])
+            .env(SAME_SESSION_JOIN_CHILD, "1")
+            .env(SAME_SESSION_JOIN_TARGET, leader_pid.to_string())
+            .env(SAME_SESSION_JOIN_RELEASE_FD, release[0].to_string())
+            .env(SAME_SESSION_JOIN_ACK_FD, ack[1].to_string())
+            .env(SAME_SESSION_JOIN_MARKER, marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(cgroup) = cgroup {
+            cgroup.attach_command(&mut command).unwrap();
+        }
+        let child = command.spawn().unwrap();
+        drop(command);
+        unsafe {
+            libc::close(release[0]);
+            libc::close(ack[1]);
+        }
+        let pid = child.id();
+        SameSessionJoiner {
+            child,
+            pid,
+            release_fd: release[1],
+            ack_fd: ack[0],
+        }
+    }
+
+    fn release_and_confirm_group_join(joiner: &SameSessionJoiner, leader_pid: u32) {
+        let byte = 1u8;
+        assert_eq!(
+            unsafe { libc::write(joiner.release_fd, (&byte as *const u8).cast(), 1) },
+            1
+        );
+        let mut joined = 0u8;
+        assert_eq!(
+            unsafe { libc::read(joiner.ack_fd, (&mut joined as *mut u8).cast(), 1) },
+            1
+        );
+        unsafe {
+            libc::close(joiner.release_fd);
+            libc::close(joiner.ack_fd);
+        }
+        assert_eq!(joined, byte);
+        assert_eq!(
+            raw_read_linux_process_stat(joiner.pid)
+                .unwrap()
+                .process_group_id,
+            leader_pid
+        );
+    }
+
+    fn cgroup_contains_pid(cgroup: &ManualCpuCgroup, pid: u32) -> bool {
+        let pid = pid.to_string();
+        fs::read_to_string(cgroup.path().join("cgroup.procs"))
+            .unwrap()
+            .split_whitespace()
+            .any(|member| member == pid)
     }
 
     #[test]
@@ -8376,6 +8575,56 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_membership_is_the_boundary_after_final_group_observation() {
+        let (leader_pid, identity) = launch_supervised_test_process("exit 0");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !process_has_exited(&identity).unwrap() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(process_has_exited(&identity).unwrap());
+        let target_session = raw_process_session_id(identity.sentinel_pid).unwrap();
+
+        let marker_directory = tempfile::tempdir().unwrap();
+        let inside_marker = marker_directory.path().join("inside-marker");
+        let outside_marker = marker_directory.path().join("outside-marker");
+        let mut inside =
+            spawn_same_session_joiner(leader_pid, &inside_marker, Some(&identity.cgroup));
+        let mut outside = spawn_same_session_joiner(leader_pid, &outside_marker, None);
+        assert_eq!(raw_process_session_id(inside.pid).unwrap(), target_session);
+        assert_eq!(raw_process_session_id(outside.pid).unwrap(), target_session);
+        assert!(cgroup_contains_pid(&identity.cgroup, inside.pid));
+        assert!(!cgroup_contains_pid(&identity.cgroup, outside.pid));
+        let cgroup_path = identity.cgroup.path().to_owned();
+
+        let cleanup = stop_process_group_after_group_observation(
+            identity,
+            ProcessGroupTermination::Immediate,
+            |identity| {
+                assert_eq!(identity.receipt.load(), RawSupervisorState::EmptyAnchored);
+                release_and_confirm_group_join(&inside, leader_pid);
+                release_and_confirm_group_join(&outside, leader_pid);
+            },
+        );
+
+        assert_eq!(cleanup.disposition, ProcessGroupCleanupDisposition::Gone);
+        assert!(
+            !cgroup_path.exists(),
+            "the exact run cgroup survived cleanup"
+        );
+        assert_eq!(inside.child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(!inside_marker.exists());
+        assert!(outside.child.wait().unwrap().success());
+        assert_eq!(fs::read(&outside_marker).unwrap(), b"survived");
+        assert!(
+            live_process_group_members(leader_pid)
+                .unwrap()
+                .iter()
+                .all(|pid| *pid != outside.pid),
+            "outside participant did not exit normally"
+        );
+    }
+
+    #[test]
     fn supervisor_identity_mismatch_sends_no_signal_and_control_recovers() {
         let (pid, mut identity) = launch_supervised_test_process("sleep 30");
         let sentinel_start_time_ticks = identity.sentinel_start_time_ticks;
@@ -8408,7 +8657,7 @@ mod tests {
 
     #[test]
     fn supervisor_exit_before_release_receipt_is_unproven_and_nonblocking() {
-        let (pid, identity) = launch_supervised_test_process("sleep 30");
+        let (_pid, identity) = launch_supervised_test_process("sleep 30");
         let payload_pidfd = identity
             .payload_pidfd
             .as_ref()
@@ -8423,8 +8672,10 @@ mod tests {
             cleanup.disposition,
             ProcessGroupCleanupDisposition::UnprovenStillLive
         );
-        signal_pidfd(&payload_pidfd, libc::SIGKILL);
-        let _ = reap_payload_by_pidfd(&payload_pidfd, pid, true);
+        assert_eq!(
+            wait_supervisor_pidfd(&payload_pidfd, true).unwrap(),
+            Some(SupervisorExit::StatusUnavailable)
+        );
     }
 
     #[test]
@@ -8446,6 +8697,8 @@ mod tests {
     }
 
     const CONTROL_LOSS_REGRESSION_CHILD: &str = "HERMIT_CONTROL_LOSS_REGRESSION_CHILD";
+    const CONTROL_LOSS_REGRESSION_TEST: &str =
+        "runner::tests::control_eof_without_cgroup_proof_retains_anchor_for_outer_kill";
 
     fn run_control_loss_regression_child(root: &Path) {
         let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
@@ -8466,38 +8719,109 @@ mod tests {
                 "(sleep 1; printf survived > \"$LATE_MARKER\") & sleep 30",
             ])
             .env("LATE_MARKER", &late_marker);
-        supervisor.configure_payload(&mut command);
+        supervisor.configure_payload(&mut command).unwrap();
         let child = command.spawn().unwrap();
         let pid = child.id();
         drop(child);
+        drop(command);
         let payload_pidfd = open_process_pidfd(pid, "test payload").unwrap();
         let mut identity = supervisor.finish(pid, Some(payload_pidfd)).unwrap();
+        let supervisor_start_time = read_linux_process_stat(identity.supervisor_pid)
+            .unwrap()
+            .unwrap()
+            .start_time_ticks;
+        let inner_cgroup = identity.cgroup.path().to_owned();
+
         drop(identity.control.take());
-        let cleanup = stop_process_group(identity, ProcessGroupTermination::Immediate);
-        assert_eq!(cleanup.disposition, ProcessGroupCleanupDisposition::Gone);
-        assert_eq!(cleanup.status, None);
-        assert!(live_process_group_members(pid).unwrap().is_empty());
-        thread::sleep(Duration::from_millis(1_200));
-        assert!(!late_marker.exists());
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            wait_supervisor_pidfd(&identity.supervisor_pidfd, false).unwrap(),
+            None,
+            "control EOF released the supervisor without cgroup proof"
+        );
+        assert_eq!(identity.receipt.load(), RawSupervisorState::Running);
+        let sentinel = read_linux_process_stat(identity.sentinel_pid)
+            .unwrap()
+            .expect("control EOF released the sentinel");
+        assert_eq!(sentinel.state, b'Z');
+        assert_eq!(sentinel.process_group_id, pid);
+        assert_eq!(
+            sentinel.start_time_ticks,
+            identity.sentinel_start_time_ticks
+        );
+        fs::write(
+            root.join("abandoned"),
+            format!(
+                "{} {} {} {} {}\n",
+                identity.supervisor_pid,
+                supervisor_start_time,
+                identity.sentinel_pid,
+                identity.sentinel_start_time_ticks,
+                inner_cgroup.display()
+            ),
+        )
+        .unwrap();
     }
 
     #[test]
-    fn control_loss_with_no_cldwait_uses_released_clean_receipt() {
+    fn control_eof_without_cgroup_proof_retains_anchor_for_outer_kill() {
         if let Some(root) = std::env::var_os(CONTROL_LOSS_REGRESSION_CHILD) {
             run_control_loss_regression_child(Path::new(&root));
             return;
         }
+
         let directory = tempfile::tempdir().unwrap();
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "runner::tests::control_loss_with_no_cldwait_uses_released_clean_receipt",
-                "--nocapture",
-            ])
-            .env(CONTROL_LOSS_REGRESSION_CHILD, directory.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
+        let parent = SharedCpuCgroupParent::current().unwrap();
+        let outer = parent.create_child("control-loss-outer").unwrap();
+        let outer_path = outer.path().to_owned();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", CONTROL_LOSS_REGRESSION_TEST, "--nocapture"])
+            .env(CONTROL_LOSS_REGRESSION_CHILD, directory.path());
+        outer.attach_command(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        assert!(child.wait().unwrap().success());
+
+        let evidence = fs::read_to_string(directory.path().join("abandoned")).unwrap();
+        let mut fields = evidence.split_whitespace();
+        let supervisor_pid = fields.next().unwrap().parse::<u32>().unwrap();
+        let supervisor_start_time = fields.next().unwrap().parse::<u64>().unwrap();
+        let sentinel_pid = fields.next().unwrap().parse::<u32>().unwrap();
+        let sentinel_start_time = fields.next().unwrap().parse::<u64>().unwrap();
+        let inner_cgroup = PathBuf::from(fields.next().unwrap());
+        assert!(fields.next().is_none());
+        assert!(inner_cgroup.starts_with(&outer_path));
+        assert!(inner_cgroup.is_dir());
+
+        let supervisor = read_linux_process_stat(supervisor_pid)
+            .unwrap()
+            .expect("supervisor died after control EOF without proof");
+        assert_eq!(supervisor.start_time_ticks, supervisor_start_time);
+        let sentinel = read_linux_process_stat(sentinel_pid)
+            .unwrap()
+            .expect("sentinel was released after control EOF without proof");
+        assert_eq!(sentinel.state, b'Z');
+        assert_eq!(sentinel.start_time_ticks, sentinel_start_time);
+        let supervisor_pidfd = open_process_pidfd(supervisor_pid, "abandoned supervisor").unwrap();
+
+        outer.kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while outer.status().unwrap() == ManualCpuCgroupStatus::Populated
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(outer.status().unwrap(), ManualCpuCgroupStatus::Empty);
+        assert_eq!(
+            wait_supervisor_pidfd(&supervisor_pidfd, true).unwrap(),
+            Some(SupervisorExit::StatusUnavailable)
+        );
+        fs::remove_dir(&inner_cgroup).unwrap();
+        outer.kill_and_cleanup().unwrap();
+        assert!(!inner_cgroup.exists());
+        assert!(!outer_path.exists());
+        thread::sleep(Duration::from_millis(1_200));
         assert!(!directory.path().join("late").exists());
     }
 
@@ -8636,7 +8960,10 @@ mod tests {
             assert_eq!(error.errno, Some(libc::ECHILD));
             assert_eq!(error.cleanup, ProcessGroupCleanupDisposition::Gone);
             assert_eq!(output.status, None);
-            assert_eq!(output.cpu_usage_usec, None);
+            assert!(
+                output.cpu_usage_usec.is_some(),
+                "the finalized run cgroup must retain CPU evidence despite ECHILD"
+            );
         }
         let result = build_partial_harness_verify_result(
             &context,
@@ -9791,19 +10118,18 @@ mod tests {
         let supervisor = ProcessGroupLaunchSupervisor::start().unwrap();
         let mut command = Command::new("/bin/sleep");
         command.arg("3");
-        supervisor.configure_payload(&mut command);
+        supervisor.configure_payload(&mut command).unwrap();
         let child = command.spawn().unwrap();
         let pid = child.id();
         // `stop_process_group` below owns the matching wait4; discard only the
         // std handle so the test exercises the production reaper.
         drop(child);
+        drop(command);
         let payload_pidfd = open_process_pidfd(pid, "test payload").unwrap();
         let identity = supervisor
             .finish(pid, Some(payload_pidfd))
             .expect("supervisor must anchor the launched sleeper");
-        let initial_used = process_group_cpu_usage_usec(&identity)
-            .unwrap()
-            .expect("the newly anchored sleeper must be immediately measurable");
+        let initial_used = run_cgroup_cpu_usage_usec(&identity).unwrap();
         assert!(
             initial_used < 100_000,
             "a newly anchored idle process group used unexpected CPU: {initial_used} usec"
@@ -9816,12 +10142,10 @@ mod tests {
             5_000_000,
         );
         assert_eq!(unrelated.timeout, Some(ProcessTimeout::Wall));
-        let used = process_group_cpu_usage_usec(&identity)
-            .unwrap()
-            .expect("the launched sleeper must remain measurable");
+        let used = run_cgroup_cpu_usage_usec(&identity).unwrap();
         assert!(
             used < 100_000,
-            "an idle process group unexpectedly included unrelated CPU: {used} usec"
+            "an idle run cgroup unexpectedly included unrelated CPU: {used} usec"
         );
         let cleanup = stop_process_group(identity, ProcessGroupTermination::Immediate);
         assert_eq!(cleanup.disposition, ProcessGroupCleanupDisposition::Gone);
