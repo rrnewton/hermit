@@ -11723,7 +11723,42 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
                 ]
             });
         }
-        let nextest_nodes = BTreeSet::from(["fixture.environmental".to_string()]);
+        let mut configured_nextest = step(
+            "environmental",
+            "./ci/run-nextest-counted.sh cargo nextest run -p fixture",
+        );
+        configured_nextest.result_manifests = Some(vec![
+            dagrun::model::ResultManifest::StructuredTestResults(
+                dagrun::model::StructuredTestResultsManifest::current(
+                    "fixture.environmental",
+                ),
+            ),
+        ]);
+        let unconfigured_nextest = step(
+            "unconfigured",
+            "./ci/run-nextest-counted.sh cargo nextest run -p fixture",
+        );
+        let explicitly_unconfigured_nextest = {
+            let mut step = step(
+                "explicitly_unconfigured",
+                "./ci/run-nextest-counted.sh cargo nextest run -p fixture",
+            );
+            step.result_manifests = Some(Vec::new());
+            step
+        };
+        let nextest_nodes = configured_nextest_nodes(
+            [
+                &configured_nextest,
+                &unconfigured_nextest,
+                &explicitly_unconfigured_nextest,
+            ]
+            .into_iter(),
+        )?;
+        if nextest_nodes != BTreeSet::from(["fixture.environmental".to_string()]) {
+            return Err(format!(
+                "end-of-run summary: nextest result configuration selected the wrong nodes: {nextest_nodes:?}"
+            ));
+        }
         let (observations, typed_errors) =
             nextest_test_observations(&nextest_attempts, &nextest_nodes);
         if !typed_errors.is_empty() || observations.len() != 4 {
@@ -11740,6 +11775,17 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         {
             return Err(format!(
                 "end-of-run summary: missing typed nextest results did not fail by node and attempt: {missing_errors:?}"
+            ));
+        }
+        let mut unconfigured_missing = missing_results[0].clone();
+        unconfigured_missing.tag = "fixture.unconfigured".into();
+        let (_, unconfigured_errors) = nextest_test_observations(
+            std::slice::from_ref(&unconfigured_missing),
+            &nextest_nodes,
+        );
+        if !unconfigured_errors.is_empty() {
+            return Err(format!(
+                "end-of-run summary: an unconfigured nextest node was reported as a missing typed-result producer: {unconfigured_errors:?}"
             ));
         }
         let mut unknown = RunSummary::new(Verdict::Pass, 0, "self-test", missing_errors);
@@ -12210,8 +12256,9 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     match (result, cleanup) {
         (Ok(()), Ok(())) => Ok(
             "scheduler accounting: complete and allowed-failure plans accepted; fail-fast, \
-             skipped, aborted, one-shot outer execution, inner manifest retry identity, and \
-             terminal failure/incompleteness summary bracketed"
+             skipped, aborted, one-shot outer execution, configured/unconfigured nextest result \
+             reporting, inner manifest retry identity, and terminal failure/incompleteness \
+             summary bracketed"
                 .into(),
         ),
         (Err(problem), Ok(())) => Err(problem),
@@ -15921,11 +15968,24 @@ fn inner_retry_occurrences_for_test(
         .count()
 }
 
+/// Select nextest steps configured to publish structured test results.
+fn configured_nextest_nodes<'a>(
+    steps: impl Iterator<Item = &'a Step>,
+) -> Result<BTreeSet<String>, String> {
+    let mut nodes = BTreeSet::new();
+    for step in steps.filter(|step| step.cmd.contains("run-nextest-counted.sh")) {
+        if step.structured_test_results_manifest()?.is_some() {
+            nodes.insert(step.tag());
+        }
+    }
+    Ok(nodes)
+}
+
 /// Read terminal nextest results from the exact scheduler attempt that received them.
 ///
-/// A completed nextest step with no structured result is an error, not an empty
-/// test population. Human output remains presentation and cannot manufacture a
-/// functional test result.
+/// A completed nextest step configured to publish structured results but missing
+/// them is an error, not an empty test population. Human output remains
+/// presentation and cannot manufacture a functional test result.
 fn nextest_test_observations(
     attempts: &[NodeAttempt],
     nextest_nodes: &BTreeSet<String>,
@@ -18706,16 +18766,21 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         .filter(|o| outcome_is_failure(o))
         .map(|o| o.tag.clone())
         .collect();
-    let nextest_nodes = plan
-        .cfg
-        .steps
-        .iter()
-        .chain(plan.second.iter().flat_map(|config| config.steps.iter()))
-        .filter(|step| step.cmd.contains("run-nextest-counted.sh"))
-        .map(Step::tag)
-        .collect::<BTreeSet<_>>();
     let (mut test_observations, mut test_summary_errors) =
-        nextest_test_observations(&attempts, &nextest_nodes);
+        match configured_nextest_nodes(
+            plan.cfg
+                .steps
+                .iter()
+                .chain(plan.second.iter().flat_map(|config| config.steps.iter())),
+        ) {
+            Ok(nextest_nodes) => nextest_test_observations(&attempts, &nextest_nodes),
+            Err(error) => (
+                Vec::new(),
+                vec![format!(
+                    "individual nextest results are UNKNOWN because their configuration is invalid: {error}"
+                )],
+            ),
+        };
     match read_log_since_settled(&log_path, 0) {
         Some(log) => test_observations.extend(dbt_parity_test_observations(&log)),
         None => {
