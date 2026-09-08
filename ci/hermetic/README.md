@@ -93,6 +93,10 @@ and `/test` as their working directory. The mixed `test.cli` node remains on
 the host because moving it
 would also move unrelated CLI tests.
 
+The focused `test.rr_suite_contract` node also runs in the pinned root. Its one
+selected test checks scratch-directory creation and cleanup and does not launch
+a Hermit guest, so it has no guest working directory to change.
+
 This does not complete the every-test contract. Other host integration tests
 still need their Hermit invocations audited and staged.
 
