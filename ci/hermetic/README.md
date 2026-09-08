@@ -78,19 +78,18 @@ dedicated `test.liteinst_strict` node, and the focused
 `--liteinst-compat-only` path also run in the pinned root. The DBT parity matrix
 runs there as well, as do `test.detcore_misc` and `test.detcore_parallel`.
 The in-process Detcore test helper applies the pinned-root `/test` request
-inside each tracee before its test closure runs. Their executable
+inside each tracee before its test closure runs. Portable strict compatibility
+is expanded into its ordinary direct `compat.*` nodes before those nodes and
+their fixture preparation are moved into the pinned root; it does not start a
+second validation scheduler. Their executable
 inputs are built there. The direct quick smoke commands, the working-envelope
 probes, and every Hermit invocation owned by `liteinst_advanced` request
 `--base-env=minimal`, a private tmpfs at `/test`, and `/test` as their working
 directory. The mixed `test.cli` node remains on the host because moving it
 would also move unrelated CLI tests.
 
-This does not complete the every-test contract. The remaining execution
-boundaries need separate designs:
-
-- `test.strict_compat` invokes validation again; moving it requires a nested
-  validation design that preserves the one host scheduler and does not start a
-  second pinned-root container around an already-contained command.
+This does not complete the every-test contract. Other host integration tests
+still need their Hermit invocations audited and staged.
 
 The exact environment retained on top of `--base-env=minimal` is a separate
 policy decision; this change does not alter it.

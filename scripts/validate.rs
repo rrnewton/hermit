@@ -2933,7 +2933,8 @@ cleared-caps refusal names {} starved step(s)",
             }
         }
         for step in pinned_full.cfg.steps.iter().filter(|step| {
-            step.tag().ends_with("_in_pinned_root") || pinned_root_test_step(step)
+            step.tag().ends_with("_in_pinned_root")
+                || pinned_root_test_step(step, pinned_full.compat)
         }) {
             if !step
                 .cmd
@@ -2944,6 +2945,51 @@ cleared-caps refusal names {} starved step(s)",
                     step.tag(), step.cmd
                 ));
             }
+        }
+        let compat_steps: Vec<&Step> = pinned_full
+            .cfg
+            .steps
+            .iter()
+            .filter(|step| step.group == "compat")
+            .collect();
+        let expected_compat = validate_corpus::STRICT_COMPAT_TOTAL
+            - validate_corpus::portable_super_only().len();
+        let host_hermit = root.join("target/ci/hermit-strict");
+        if compat_steps.len() != expected_compat
+            || compat_steps.iter().any(|step| {
+                !step.cmd.contains("run-in-pinned-root.sh")
+                    || !step.cmd.contains("/src/target/ci/hermit-strict")
+                    || step.cmd.contains(host_hermit.to_string_lossy().as_ref())
+                    || step
+                        .env
+                        .get("HERMIT_E2E_EMPTY_WORKDIR")
+                        .map(String::as_str)
+                        != Some("/test")
+            })
+        {
+            return Err(format!(
+                "full-plan bracket: portable strict compatibility did not produce {expected_compat} pinned-root probes with /src paths and the /test gate"
+            ));
+        }
+        let compat_prep = pinned_full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "compatprep.fixtures")
+            .ok_or("full-plan bracket: compatibility fixture preparation disappeared")?;
+        if !compat_prep.cmd.contains("run-in-pinned-root.sh")
+            || !compat_prep
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.runtime_release_in_pinned_root")
+            || compat_prep
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.runtime_release")
+        {
+            return Err(format!(
+                "full-plan bracket: compatibility fixtures lost their pinned root or in-image release dependency: {compat_prep:?}"
+            ));
         }
         let liteinst = pinned_full
             .cfg
@@ -10864,13 +10910,19 @@ const PINNED_ROOT_DBT_TEST_STEPS: &[&str] = &["test.dbt_parity"];
 const PINNED_ROOT_DETCORE_TEST_STEPS: &[&str] =
     &["test.detcore_misc", "test.detcore_parallel"];
 
-fn pinned_root_test_step(step: &Step) -> bool {
+fn pinned_root_test_step(step: &Step, compat: Option<CompatMode>) -> bool {
     validation_step_identity(step) == ValidationStepIdentity::ManifestRun
         || PINNED_ROOT_LITEINST_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_QUICK_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_ENVELOPE_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_DBT_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_DETCORE_TEST_STEPS.contains(&step.tag().as_str())
+        || (compat == Some(CompatMode::PortableStrict)
+            && (step.group == "compat"
+                || matches!(
+                    step.tag().as_str(),
+                    "compatprep.fixtures" | "compatprep.hermit_release"
+                )))
 }
 
 // ⚠️ e2e.metadata IS DELIBERATELY ABSENT FROM THAT LIST, AND THE REASON CORRECTS MY OWN
@@ -10886,9 +10938,14 @@ fn pinned_root_test_step(step: &Step) -> bool {
 
 
 
-fn pinned_root_command(root: &Path, out: &Path, step: &Step) -> String {
+fn pinned_root_command(
+    root: &Path,
+    out: &Path,
+    step: &Step,
+    compat: Option<CompatMode>,
+) -> String {
     let mut env_names: BTreeSet<&str> = PINNED_ROOT_FORWARDED_ENV.iter().copied().collect();
-    if pinned_root_test_step(step) {
+    if pinned_root_test_step(step, compat) {
         env_names.insert("DAGRUN_TEST_COUNTS_PATH");
     }
     env_names.extend(step.env.keys().map(String::as_str));
@@ -10907,6 +10964,13 @@ fn pinned_root_command(root: &Path, out: &Path, step: &Step) -> String {
     for name in env_names {
         argv.extend(["--env".into(), name.into()]);
     }
+    let command = if compat == Some(CompatMode::PortableStrict)
+        && (step.group == "compat" || step.tag() == "compatprep.fixtures")
+    {
+        step.cmd.replace(root.to_string_lossy().as_ref(), "/src")
+    } else {
+        step.cmd.clone()
+    };
     argv.extend([
         "--".into(),
         "bash".into(),
@@ -10915,7 +10979,7 @@ fn pinned_root_command(root: &Path, out: &Path, step: &Step) -> String {
          /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\""
             .into(),
         "bash".into(),
-        step.cmd.clone(),
+        command,
     ]);
     validate_plan::shell_join(argv)
 }
@@ -10935,6 +10999,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
         return Ok(());
     }
     let out = root.join("ignored/hermetic/split");
+    let compat = plan.compat;
     for (index, cfg) in std::iter::once(&mut plan.cfg)
         .chain(plan.second.iter_mut())
         .enumerate()
@@ -11036,7 +11101,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
             }
             twin.env
                 .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
-            twin.cmd = pinned_root_command(root, &out, &twin);
+            twin.cmd = pinned_root_command(root, &out, &twin, compat);
             if index == 0 {
                 twin.deps.push(PINNED_ROOT_FETCH_TAG.into());
             }
@@ -11047,7 +11112,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
         cfg.steps.extend(twins);
 
         for step in &mut cfg.steps {
-            if !pinned_root_test_step(step) {
+            if !pinned_root_test_step(step, compat) {
                 continue;
             }
             // Scheduled manifest cells use this environment gate to add the
@@ -11093,7 +11158,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 step.deps
                     .push("build.rust_scripts_in_pinned_root".into());
             }
-            step.cmd = pinned_root_command(root, &out, step);
+            step.cmd = pinned_root_command(root, &out, step, compat);
             if index == 0 && !step.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG) {
                 step.deps.push(PINNED_ROOT_FETCH_TAG.into());
             }
@@ -11132,6 +11197,24 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
                     "strict_compat",
                     STRICT_COMPAT_PLACEHOLDER_COMMAND,
                     vec![],
+                ),
+                step(
+                    "compatprep",
+                    "hermit_release",
+                    "cargo build --release -p hermit --features third-party-backends",
+                    vec![],
+                ),
+                step(
+                    "compatprep",
+                    "fixtures",
+                    "/repo/tests/compat/prepare_real_compat_fixtures.sh /repo/target/validation/strict-compat/real-compat-fixtures",
+                    vec!["compatprep.hermit_release".into()],
+                ),
+                step(
+                    "compat",
+                    "echo",
+                    "/repo/target/ci/hermit-strict run --strict --verify --base-env=minimal --mount=type=tmpfs,target=/test --workdir=/test -- /bin/echo </dev/null",
+                    vec!["compatprep.fixtures".into()],
                 ),
                 step("lint", "clippy", "cargo clippy --workspace", vec![]),
                 step("test", "hermit_integration", "./ci/run-nextest-counted.sh -p hermit", vec![]),
@@ -11216,6 +11299,7 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
             ],
             "pinned-root bracket",
         ),
+        compat: Some(CompatMode::PortableStrict),
         ..Default::default()
     };
     apply_pinned_root(&mut plan, Path::new("/repo"), false)?;
@@ -11447,6 +11531,69 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
                 "pinned-root bracket: {tag} lost its image wrapper, /test gate or in-image artifact dependency: {test:?}"
             ));
         }
+    }
+    let compat_prep = by_tag
+        .get("compatprep.fixtures")
+        .ok_or("pinned-root bracket: compatprep.fixtures disappeared")?;
+    if !compat_prep.cmd.contains("run-in-pinned-root.sh")
+        || !compat_prep.cmd.contains(
+            "/src/tests/compat/prepare_real_compat_fixtures.sh /src/target/validation/strict-compat/real-compat-fixtures",
+        )
+        || compat_prep.cmd.contains(
+            "/repo/tests/compat/prepare_real_compat_fixtures.sh /repo/target/validation/strict-compat/real-compat-fixtures",
+        )
+        || compat_prep.deps.len() != 3
+        || !compat_prep
+            .deps
+            .iter()
+            .any(|dependency| dependency == "compatprep.hermit_release")
+        || !compat_prep
+            .deps
+            .iter()
+            .any(|dependency| dependency == PINNED_ROOT_FETCH_TAG)
+        || !compat_prep
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.rust_scripts_in_pinned_root")
+    {
+        return Err(format!(
+            "pinned-root bracket: compatibility fixture preparation lost its wrapper, /src paths or in-image release dependency: {compat_prep:?}"
+        ));
+    }
+    let compat_release = by_tag
+        .get("compatprep.hermit_release")
+        .ok_or("pinned-root bracket: compatprep.hermit_release disappeared")?;
+    if !compat_release.cmd.contains("run-in-pinned-root.sh")
+        || by_tag.contains_key("compatprep.hermit_release_in_pinned_root")
+    {
+        return Err(format!(
+            "pinned-root bracket: focused compatibility release build was not moved exactly once into the pinned root: {compat_release:?}"
+        ));
+    }
+    let compat = by_tag
+        .get("compat.echo")
+        .ok_or("pinned-root bracket: compat.echo disappeared")?;
+    if !compat.cmd.contains("run-in-pinned-root.sh")
+        || !compat.cmd.contains("/src/target/ci/hermit-strict")
+        || compat.cmd.contains("/repo/target/ci/hermit-strict")
+        || compat.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+        || compat.deps.len() != 3
+        || !compat
+            .deps
+            .iter()
+            .any(|dependency| dependency == "compatprep.fixtures")
+        || !compat
+            .deps
+            .iter()
+            .any(|dependency| dependency == PINNED_ROOT_FETCH_TAG)
+        || !compat
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.rust_scripts_in_pinned_root")
+    {
+        return Err(format!(
+            "pinned-root bracket: portable strict compatibility probe lost its wrapper, /src Hermit path, /test gate or fixture dependency: {compat:?}"
+        ));
     }
     for (producer_tag, dependency_tag) in [
         (
@@ -11691,7 +11838,7 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
             "pinned-root bracket: sequential lanes must fetch once then reuse the cache: first_fetches={first_fetches} second_fetches={second_fetches} second={second_step:?}"
         ));
     }
-    Ok("pinned root: scheduled manifest cells, the DBT parity matrix, 2 in-process Detcore test nodes, 3 quick guest checks, the working-envelope check and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
+    Ok("pinned root: scheduled manifest cells, portable strict compatibility probes, the DBT parity matrix, 2 in-process Detcore test nodes, 3 quick guest checks, the working-envelope check and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
 }
 
 // --------------------------------------------------------------------------- interruption
