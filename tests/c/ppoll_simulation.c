@@ -298,6 +298,45 @@ static int run_masked_fail_closed(void) {
   return 0;
 }
 
+static int run_inaccessible_mask_kernel_wait(void) {
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    perror("sysconf page size");
+    return 1;
+  }
+  void* mask_page = mmap(NULL, (size_t)page_size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mask_page == MAP_FAILED) {
+    perror("mmap inaccessible ppoll mask");
+    return 1;
+  }
+  if (mprotect(mask_page, (size_t)page_size, PROT_NONE) != 0) {
+    int saved_errno = errno;
+    munmap(mask_page, (size_t)page_size);
+    errno = saved_errno;
+    perror("mprotect inaccessible ppoll mask");
+    return 1;
+  }
+
+  struct timespec timeout = {.tv_sec = 0, .tv_nsec = 1};
+  errno = 0;
+  long result = syscall(SYS_ppoll, NULL, 0, &timeout, mask_page,
+                        sizeof(uint64_t));
+  int observed_errno = errno;
+  if (munmap(mask_page, (size_t)page_size) != 0) {
+    perror("munmap inaccessible ppoll mask");
+    return 1;
+  }
+  if (result != -1 || observed_errno != EFAULT) {
+    fprintf(stderr,
+            "inaccessible ppoll mask did not return EFAULT: result=%ld "
+            "errno=%d\n",
+            result, observed_errno);
+    return 1;
+  }
+  return 0;
+}
+
 static int run_default_workload(void) {
   int pipefd[2];
   if (pipe(pipefd) != 0 || write(pipefd[1], "r", 1) != 1) {
@@ -399,7 +438,8 @@ int main(int argc, char** argv) {
   if (argc != 2) {
     fprintf(stderr,
             "usage: %s [raw-timeout-copyout|masked-readonly-timeout|"
-            "masked-readonly-zero-timeout|masked-fail-closed|record-replay]\n",
+            "masked-readonly-zero-timeout|masked-fail-closed|"
+            "inaccessible-mask-kernel-wait|record-replay]\n",
             argv[0]);
     return 2;
   }
@@ -438,10 +478,18 @@ int main(int argc, char** argv) {
     }
     return result;
   }
+  if (strcmp(argv[1], "inaccessible-mask-kernel-wait") == 0) {
+    int result = run_inaccessible_mask_kernel_wait();
+    if (result == 0) {
+      puts("ppoll-simulation-ok");
+    }
+    return result;
+  }
 
   fprintf(stderr,
           "usage: %s [raw-timeout-copyout|masked-readonly-timeout|"
-          "masked-readonly-zero-timeout|masked-fail-closed|record-replay]\n",
+          "masked-readonly-zero-timeout|masked-fail-closed|"
+          "inaccessible-mask-kernel-wait|record-replay]\n",
           argv[0]);
   return 2;
 }
