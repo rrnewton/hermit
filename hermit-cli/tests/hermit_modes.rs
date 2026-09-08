@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -26,6 +28,8 @@ use hermit::Verdict;
 
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 static WORKLOADS: OnceLock<Workloads> = OnceLock::new();
+const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
+const HERMETIC_TEST_WORKDIR: &str = "/test";
 
 #[derive(Debug)]
 struct Workload {
@@ -80,6 +84,26 @@ fn hermit_run_lock() -> MutexGuard<'static, ()> {
     HERMIT_RUN_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn execution_root_args(requested: Option<&OsStr>) -> Result<Vec<OsString>, String> {
+    match requested {
+        None => Ok(Vec::new()),
+        Some(value) if value == OsStr::new(HERMETIC_TEST_WORKDIR) => Ok(vec![
+            "--mount=type=tmpfs,target=/test".into(),
+            "--workdir=/test".into(),
+        ]),
+        Some(value) => Err(format!(
+            "{ISOLATED_WORKDIR_ENV} must be {HERMETIC_TEST_WORKDIR}, got {value:?}"
+        )),
+    }
+}
+
+fn configure_execution_root(command: &mut Command) {
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    let args = execution_root_args(requested.as_deref())
+        .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
+    command.args(args);
 }
 
 fn compile_c(source: &Path, output: &Path) {
@@ -456,6 +480,12 @@ fn run_buck_chaos_workload(name: &str) {
         .unwrap_or_else(|| panic!("unknown Buck chaos workload: {name}"));
     let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
     command
+        .current_dir(
+            workload
+                .path
+                .parent()
+                .expect("Buck chaos workload should have a build directory"),
+        )
         .args([
             "run",
             "--verify",
@@ -463,11 +493,24 @@ fn run_buck_chaos_workload(name: &str) {
             "--base-env=empty",
             "--max-timeslice=1000000",
             "--env=HERMIT_MODE=chaos",
-            "--",
-        ])
-        .arg(&workload.path)
-        .args(workload.args);
+        ]);
+    configure_execution_root(&mut command);
+    command.arg("--").arg(&workload.path).args(workload.args);
     command_output(command, &format!("Buck chaos mode for {}", workload.name));
+}
+
+#[test]
+fn buck_chaos_pinned_root_arguments_are_exact_and_fail_closed() {
+    assert!(execution_root_args(None).unwrap().is_empty());
+    assert_eq!(
+        execution_root_args(Some(OsStr::new("/test"))).unwrap(),
+        [
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+    let error = execution_root_args(Some(OsStr::new("/tmp"))).unwrap_err();
+    assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
 }
 
 macro_rules! buck_chaos_tests {

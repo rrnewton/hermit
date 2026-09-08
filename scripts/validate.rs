@@ -2982,6 +2982,27 @@ cleared-caps refusal names {} starved step(s)",
                 ));
             }
         }
+        let pmu_buck = pinned_full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "privileged-test.pmu_buck_chaos_cases")
+            .ok_or("full-plan bracket: post-fusion PMU Buck chaos test disappeared")?;
+        if !pmu_buck.cmd.contains("run-in-pinned-root.sh")
+            || pmu_buck
+                .env
+                .get("HERMIT_E2E_EMPTY_WORKDIR")
+                .map(String::as_str)
+                != Some("/test")
+            || !pmu_buck
+                .deps
+                .iter()
+                .any(|dependency| dependency == "privileged-pmu.preemption")
+        {
+            return Err(format!(
+                "full-plan bracket: post-fusion privileged-test.pmu_buck_chaos_cases lost its image wrapper, /test gate or PMU dependency: {pmu_buck:?}"
+            ));
+        }
         for step in pinned_full.cfg.steps.iter().filter(|step| {
             step.tag().ends_with("_in_pinned_root")
                 || pinned_root_test_step(step, pinned_full.compat)
@@ -10974,8 +10995,10 @@ const PINNED_ROOT_IGNORED_SYSCALL_TEST_STEPS: &[&str] =
 const PINNED_ROOT_PRIVILEGED_TEST_STEPS: &[&str] = &[
     "cpuid.faulting",
     "pmu.preemption",
+    "test.pmu_buck_chaos_cases",
     "privileged-cpuid.faulting",
     "privileged-pmu.preemption",
+    "privileged-test.pmu_buck_chaos_cases",
 ];
 
 fn pinned_root_test_step(step: &Step, compat: Option<CompatMode>) -> bool {
@@ -12032,6 +12055,24 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
                 "pinned-root bracket: focused privileged test {tag} lost its image wrapper, /test gate or in-image privileged-test dependency: {test:?}"
             ));
         }
+    }
+    let pmu_buck = privileged_by_tag
+        .get("test.pmu_buck_chaos_cases")
+        .ok_or("pinned-root bracket: focused PMU Buck chaos test disappeared")?;
+    if !pmu_buck.cmd.contains("run-in-pinned-root.sh")
+        || pmu_buck
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
+        || !pmu_buck
+            .deps
+            .iter()
+            .any(|dependency| dependency == "pmu.preemption")
+    {
+        return Err(format!(
+            "pinned-root bracket: focused test.pmu_buck_chaos_cases lost its image wrapper, /test gate or PMU dependency: {pmu_buck:?}"
+        ));
     }
 
     let quick_args = parse_argv(&[
