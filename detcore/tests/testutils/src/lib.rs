@@ -8,8 +8,10 @@
 
 //! Testing utilities.
 
+use std::ffi::OsStr;
 use std::io;
 use std::num::NonZeroU64;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -31,6 +33,35 @@ use tracing_subscriber::fmt::MakeWriter;
 
 /// How many runs for each test when confirming determinism.
 static TEST_REPS: u64 = 3;
+
+const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
+const HERMETIC_TEST_WORKDIR: &str = "/test";
+
+fn requested_test_workdir(value: Option<&OsStr>) -> Result<Option<&'static Path>, String> {
+    match value {
+        None => Ok(None),
+        Some(value) if value == OsStr::new(HERMETIC_TEST_WORKDIR) => {
+            Ok(Some(Path::new(HERMETIC_TEST_WORKDIR)))
+        }
+        Some(value) => Err(format!(
+            "{ISOLATED_WORKDIR_ENV} must be {HERMETIC_TEST_WORKDIR}, got {value:?}"
+        )),
+    }
+}
+
+fn enter_requested_test_workdir() {
+    let value = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    let workdir =
+        requested_test_workdir(value.as_deref()).unwrap_or_else(|error| panic!("{error}"));
+    if let Some(workdir) = workdir {
+        std::env::set_current_dir(workdir).unwrap_or_else(|error| {
+            panic!(
+                "cannot enter requested test workdir {}: {error}",
+                workdir.display()
+            )
+        });
+    }
+}
 
 fn test_trace_level() -> String {
     std::env::var("DETCORE_TEST_RUST_LOG").unwrap_or_else(|_| {
@@ -534,6 +565,10 @@ where
     // allocations. This only has an effect if the global allocator has been set
     // to test_allocator.
     let f = move || {
+        // The in-process Detcore tests do not cross the Hermit CLI, so the
+        // pinned-root marker must be applied inside the tracee before the test
+        // closure runs. The outer container owns the private /test tmpfs.
+        enter_requested_test_workdir();
         test_allocator::GLOBAL
             // Try to skip to an arbitrary fixed offset that's likely to be far
             // past all the memory we've allocated so far.
@@ -780,8 +815,49 @@ fn check_output(output: &Output, logs: Vec<String>, dts: &mut DetTestState) {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    use reverie::ExitStatus;
+
     use super::BufWriter;
+    use super::HERMETIC_TEST_WORKDIR;
+    use super::ISOLATED_WORKDIR_ENV;
     use super::install_global_test_subscriber;
+    use super::requested_test_workdir;
+    use super::test_fn_with_config;
+
+    #[test]
+    fn isolated_workdir_request_is_exact_and_fail_closed() {
+        std::assert_eq!(requested_test_workdir(None).unwrap(), None);
+        std::assert_eq!(
+            requested_test_workdir(Some(OsStr::new("/test"))).unwrap(),
+            Some(Path::new("/test"))
+        );
+        assert!(
+            requested_test_workdir(Some(OsStr::new("/tmp")))
+                .unwrap_err()
+                .contains("HERMIT_E2E_EMPTY_WORKDIR must be /test")
+        );
+    }
+
+    #[test]
+    fn isolated_workdir_reaches_the_in_process_guest_when_requested() {
+        if std::env::var_os(ISOLATED_WORKDIR_ENV).is_none() {
+            return;
+        }
+        let (output, ()) = test_fn_with_config::<(), _>(
+            || println!("{}", std::env::current_dir().unwrap().display()),
+            (),
+            true,
+        )
+        .unwrap();
+        std::assert_eq!(output.status, ExitStatus::Exited(0));
+        std::assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            HERMETIC_TEST_WORKDIR
+        );
+    }
 
     #[test]
     fn global_test_filter_applies_on_spawned_threads() {

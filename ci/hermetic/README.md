@@ -76,7 +76,9 @@ identical contract.
 The quick suite's guest-running checks, the working-envelope measurement, the
 dedicated `test.liteinst_strict` node, and the focused
 `--liteinst-compat-only` path also run in the pinned root. The DBT parity matrix
-runs there as well. Their executable
+runs there as well, as do `test.detcore_misc` and `test.detcore_parallel`.
+The in-process Detcore test helper applies the pinned-root `/test` request
+inside each tracee before its test closure runs. Their executable
 inputs are built there. The direct quick smoke commands, the working-envelope
 probes, and every Hermit invocation owned by `liteinst_advanced` request
 `--base-env=minimal`, a private tmpfs at `/test`, and `/test` as their working
@@ -86,9 +88,6 @@ would also move unrelated CLI tests.
 This does not complete the every-test contract. The remaining execution
 boundaries need separate designs:
 
-- `test.detcore_misc` and `test.detcore_parallel` execute guests in-process, so
-  there is no Hermit CLI boundary at which to apply the mount and working
-  directory.
 - `test.strict_compat` invokes validation again; moving it requires a nested
   validation design that preserves the one host scheduler and does not start a
   second pinned-root container around an already-contained command.
