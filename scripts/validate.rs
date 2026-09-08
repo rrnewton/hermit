@@ -114,9 +114,11 @@ use dagrun::io::dag_to_json;
 use dagrun::model::CmdType;
 use dagrun::model::DagConfig;
 use dagrun::model::DagManifest;
+use dagrun::model::ResultManifest;
 use dagrun::model::RunResult;
 use dagrun::model::Step;
 use dagrun::model::StepOutcome;
+use dagrun::model::StructuredTestResultsManifest;
 use dagrun::TestResult;
 use dagrun::TestResults;
 use dagrun::container_core_budget;
@@ -1404,6 +1406,7 @@ fn self_test() -> Result<(), String> {
     println!("  {}", portable_strict_compat_outer_dag_bracket(&repo_root())?);
     println!("  {}", raw_run_dag_strict_compat_bracket(&repo_root())?);
     shard_coverage_resource_policy_bracket(&repo_root())?;
+    println!("  {}", structured_result_declaration_bracket()?);
     println!(
         "  {}",
         submodule_failure_service_result_bracket(&repo_root())?
@@ -6424,6 +6427,322 @@ const RUST_SCRIPT_COMMAND_PREFIX: &str = "export PATH=\"$PWD/ci/rust-script-bin:
     export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; \
     export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ";
 
+/// The controlled writer a validation step invokes.
+///
+/// This is authored metadata, not command-string inference. The independent
+/// command audit below makes a newly added or removed writer fail closed until
+/// this registry changes with it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StructuredResultProducerKind {
+    Nextest,
+    TestHarness,
+    BackendParity,
+    Envelope,
+    Applications,
+}
+
+impl StructuredResultProducerKind {
+    const ALL: [Self; 5] = [
+        Self::Nextest,
+        Self::TestHarness,
+        Self::BackendParity,
+        Self::Envelope,
+        Self::Applications,
+    ];
+
+    const fn command_marker(self) -> &'static str {
+        match self {
+            Self::Nextest => "run-nextest-counted.sh",
+            Self::TestHarness => "target/debug/test-harness run",
+            Self::BackendParity => "tests/backend-parity/run_matrix.py",
+            Self::Envelope => "write-structured-test-counts.sh",
+            Self::Applications => "tests/e2e/lib/applications/run_all.sh",
+        }
+    }
+
+    const fn tags(self) -> &'static [&'static str] {
+        match self {
+            Self::Nextest => NEXTEST_RESULT_PRODUCERS,
+            Self::TestHarness => TEST_HARNESS_RESULT_PRODUCERS,
+            Self::BackendParity => BACKEND_PARITY_RESULT_PRODUCERS,
+            Self::Envelope => ENVELOPE_RESULT_PRODUCERS,
+            Self::Applications => APPLICATION_RESULT_PRODUCERS,
+        }
+    }
+}
+
+const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
+    "liteinst.strict",
+    "privileged-only-test.cli_kvm",
+    "privileged-only-test.cli_kvm_on_host",
+    "privileged-only-test.pmu_buck_chaos_cases",
+    "privileged-only-test.pmu_buck_chaos_cases_on_host",
+    "privileged-test.cli_kvm",
+    "privileged-test.pmu_buck_chaos_cases",
+    "quick.detcore_unit",
+    "super.chaos_hello_race_verification_diagnostic",
+    "super.dbt_failed_exec_recovery_diagnostic",
+    "super.dbt_guest_stderr_isolation_diagnostic",
+    "super.dbt_pipe_backpressure_diagnostic",
+    "super.dbt_strict_blocked_stdin_teardown_diagnostic",
+    "super.dbt_unsupported_syscall_aggregation_diagnostic",
+    "super.full_leveldb_strict_determinism",
+    "super.ipc_determinism_diagnostic",
+    "super.liteinst_python3_verify_diagnostics",
+    "super.managed_jvm_strict_verify_diagnostics",
+    "super.network_syscall_determinism_diagnostic",
+    "super.pmu_analyze_hello_race_stress_calibrated_skid",
+    "super.pmu_buck_chaos_cases",
+    "super.post_fork_scheduling_diagnostics",
+    "super.pselect_signal_interruption_diagnostic",
+    "super.random_source_determinism_diagnostic",
+    "super.record_replay_matrix_diagnostic",
+    "super.relaxed_hermit_flag_matrix",
+    "super.sqlite_veryquick_strict_determinism",
+    "super.threaded_integration_matrix_diagnostic",
+    "super.weekly_ignored_portable_chaos_cases",
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore",
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore",
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore",
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore",
+    "super.weekly_portable_chaos_cases",
+    "super.weekly_relaxed_default_mode_cases",
+    "test.app_strict_verify",
+    "test.arbitrary_binaries",
+    "test.cli",
+    "test.cli_kvm",
+    "test.cli_on_host",
+    "test.command_strict_verify",
+    "test.detcore_misc",
+    "test.detcore_parallel",
+    "test.detcore_unit",
+    "test.hermit_integration",
+    "test.hermit_modes",
+    "test.hermit_modes_on_host",
+    "test.hermit_unit",
+    "test.ignored_syscall_regressions",
+    "test.liteinst_strict",
+    "test.pmu_buck_chaos_cases",
+    "test.regular_crates",
+    "test.rr_suite_contract",
+    "test.sabre_examples",
+];
+
+const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
+    "e2e.manifest_applications",
+    "e2e.manifest_applications_on_host",
+    "e2e.manifest_backend_parity_c",
+    "e2e.manifest_backend_parity_c_on_host",
+    "e2e.manifest_bin_c",
+    "e2e.manifest_bin_c_on_host",
+    "e2e.manifest_c_programs",
+    "e2e.manifest_c_programs_on_host",
+    "e2e.manifest_chaos_c",
+    "e2e.manifest_chaos_c_on_host",
+    "e2e.manifest_data_handling",
+    "e2e.manifest_data_handling_on_host",
+    "e2e.manifest_debugger_c",
+    "e2e.manifest_debugger_c_on_host",
+    "e2e.manifest_determinism_stress",
+    "e2e.manifest_determinism_stress_c",
+    "e2e.manifest_determinism_stress_c_on_host",
+    "e2e.manifest_determinism_stress_on_host",
+    "e2e.manifest_language_runtimes",
+    "e2e.manifest_language_runtimes_on_host",
+    "e2e.manifest_shared_futex_c",
+    "e2e.manifest_shared_futex_c_on_host",
+    "e2e.manifest_system_utils",
+    "e2e.manifest_system_utils_on_host",
+    "e2e.manifest_util_c",
+    "e2e.manifest_util_c_on_host",
+    "privileged-e2e.manifest_applications",
+    "privileged-e2e.manifest_backend_parity_c",
+    "privileged-only-e2e.manifest_applications",
+    "privileged-only-e2e.manifest_applications_on_host",
+    "privileged-only-e2e.manifest_backend_parity_c",
+    "privileged-only-e2e.manifest_backend_parity_c_on_host",
+    "quick.e2e_verify",
+];
+
+const BACKEND_PARITY_RESULT_PRODUCERS: &[&str] = &["test.dbt_parity"];
+const ENVELOPE_RESULT_PRODUCERS: &[&str] = &["test.envelope_levels"];
+const APPLICATION_RESULT_PRODUCERS: &[&str] = &["test.applications_e2e"];
+
+fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
+    StructuredResultProducerKind::ALL
+        .into_iter()
+        .find(|kind| kind.tags().contains(&tag))
+}
+
+/// Bind every structured-count writer to dagrun's typed path channel and make
+/// absence authoritative for every other step. Existing manifest-cell result
+/// ownership is retained in the multi-manifest declaration.
+fn declare_structured_result_producers(plan: &mut Plan) -> Result<(), String> {
+    for cfg in std::iter::once(&mut plan.cfg).chain(plan.second.iter_mut()) {
+        for step in &mut cfg.steps {
+            let tag = step.tag();
+            let command_kinds = StructuredResultProducerKind::ALL
+                .into_iter()
+                .filter_map(|kind| {
+                    let occurrences = step.cmd.matches(kind.command_marker()).count();
+                    (occurrences != 0).then_some((kind, occurrences))
+                })
+                .collect::<Vec<_>>();
+            let command_kind = match command_kinds.as_slice() {
+                [] => None,
+                [(kind, 1)] => Some(*kind),
+                [(kind, occurrences)] => {
+                    return Err(format!(
+                        "{tag} invokes the {kind:?} structured result producer {occurrences} times; expected exactly once"
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "{tag} invokes more than one structured result producer: {command_kinds:?}"
+                    ));
+                }
+            };
+            let registered = structured_result_producer_kind(&tag);
+            let existing = step
+                .structured_test_results_manifest()
+                .map_err(|error| format!("{tag}: {error}"))?
+                .cloned();
+
+            let dynamic_pressure_cell = step.group == "cell"
+                && existing.is_some()
+                && command_kind == Some(StructuredResultProducerKind::TestHarness);
+            match (registered, command_kind, existing.as_ref()) {
+                (Some(expected), Some(actual), _) if expected == actual => {}
+                (Some(expected), Some(actual), _) => {
+                    return Err(format!(
+                        "{tag} is registered as {expected:?} but invokes {actual:?}"
+                    ));
+                }
+                (Some(expected), None, _) => {
+                    return Err(format!(
+                        "{tag} is registered as {expected:?} but no longer invokes that writer"
+                    ));
+                }
+                (None, Some(_), Some(_)) if dynamic_pressure_cell => {}
+                (None, Some(actual), _) => {
+                    return Err(format!(
+                        "{tag} invokes unregistered structured result producer {actual:?}"
+                    ));
+                }
+                (None, None, Some(_)) => {
+                    return Err(format!(
+                        "{tag} declares structured results but invokes no registered writer"
+                    ));
+                }
+                (None, None, None) => {}
+            }
+
+            let mut declarations = step
+                .effective_result_manifests()
+                .iter()
+                .cloned()
+                .map(ResultManifest::ManifestCell)
+                .collect::<Vec<_>>();
+            if registered.is_some() {
+                declarations.push(ResultManifest::StructuredTestResults(
+                    StructuredTestResultsManifest::current(tag.clone()),
+                ));
+            } else if let Some(existing) = existing {
+                declarations.push(ResultManifest::StructuredTestResults(existing));
+            }
+            step.result_manifests = Some(declarations);
+        }
+    }
+    Ok(())
+}
+
+fn structured_result_declaration_bracket() -> Result<String, String> {
+    let make_step = |job: &str, cmd: &str| {
+        step_with_caps(
+            "fixture",
+            job,
+            "structured result declaration fixture",
+            cmd.into(),
+            Vec::new(),
+            30,
+            30,
+            1024 * 1024,
+        )
+    };
+    let selector = DagManifest {
+        lane: "portable".into(),
+        category: "applications".into(),
+        test: None,
+        mode: None,
+        backend: None,
+    };
+    let mut producer = make_step(
+        "manifest_applications",
+        "target/debug/test-harness run --lane portable --category applications",
+    );
+    producer.group = "e2e".into();
+    producer.job = "manifest_applications".into();
+    producer.manifest = Some(selector.clone());
+    let ordinary = make_step("ordinary", "true");
+    let mut plan = Plan {
+        cfg: validate_plan::config_from(
+            vec![producer, ordinary],
+            "structured result declaration bracket",
+        ),
+        ..Default::default()
+    };
+    declare_structured_result_producers(&mut plan)?;
+    let producer = &plan.cfg.steps[0];
+    let manifest = producer
+        .structured_test_results_manifest()
+        .map_err(|error| format!("structured result declaration: {error}"))?
+        .ok_or("structured result declaration: registered producer has no declaration")?;
+    if manifest.owner != producer.tag()
+        || producer.effective_result_manifests().as_ref() != [selector]
+        || plan.cfg.steps[1].result_manifests.as_deref() != Some(&[])
+    {
+        return Err(format!(
+            "structured result declaration: typed ownership or explicit absence changed: {:?}",
+            plan.cfg.steps
+        ));
+    }
+
+    let mut unknown_writer = Plan {
+        cfg: validate_plan::config_from(
+            vec![make_step(
+                "unknown_writer",
+                "./ci/run-nextest-counted.sh -p fixture",
+            )],
+            "unregistered structured writer bracket",
+        ),
+        ..Default::default()
+    };
+    if !declare_structured_result_producers(&mut unknown_writer)
+        .is_err_and(|error| error.contains("unregistered structured result producer"))
+    {
+        return Err("structured result declaration: unregistered writer did not refuse".into());
+    }
+
+    let mut stale_registration = Plan {
+        cfg: validate_plan::config_from(
+            vec![{
+                let mut step = make_step("manifest_applications", "true");
+                step.group = "e2e".into();
+                step
+            }],
+            "stale structured writer bracket",
+        ),
+        ..Default::default()
+    };
+    if !declare_structured_result_producers(&mut stale_registration)
+        .is_err_and(|error| error.contains("no longer invokes that writer"))
+    {
+        return Err("structured result declaration: stale registration did not refuse".into());
+    }
+
+    Ok("structured results: registered writer and manifest ownership declared; non-producer absence authoritative; unregistered and stale writers refused".into())
+}
+
 fn rust_script_producer_step() -> Step {
     let mut step = step_with_caps(
         "build",
@@ -9367,9 +9686,71 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
         ));
     }
     inspect("real runner json output", &output.stdout)?;
+    let real_stderr = String::from_utf8_lossy(&output.stderr);
+    if !real_stderr.contains("[dagrun] engine=rust") {
+        return Err(format!(
+            "raw run-dag: default entrypoint did not select the structured-capable Rust engine: {real_stderr}"
+        ));
+    }
+
+    let python_marker = fixture.path().join("python-run-marker");
+    let mut structured_step = step_with_caps(
+        "fixture",
+        "structured",
+        "structured result engine fixture",
+        format!("touch {}", validate_plan::shell_quote(&python_marker.to_string_lossy())),
+        Vec::new(),
+        30,
+        30,
+        1024 * 1024,
+    );
+    structured_step.result_manifests = Some(vec![ResultManifest::StructuredTestResults(
+        StructuredTestResultsManifest::current("fixture.structured"),
+    )]);
+    let structured_dag = fixture.path().join("structured.json");
+    std::fs::write(
+        &structured_dag,
+        format!(
+            "{}\n",
+            dag_to_json(&validate_plan::config_from(
+                vec![structured_step],
+                "structured result engine fixture",
+            ))
+        ),
+    )
+    .map_err(|error| format!("raw run-dag: cannot write structured fixture: {error}"))?;
+    // This deliberately exercises a second runner from inside validate's own
+    // self-test DAG. Permit that nesting only for this inert marker fixture so
+    // the Python engine reaches its structured-result preflight refusal.
+    let python = Command::new(root.join("ci/run-dag.sh"))
+        .args([
+            "portable",
+            "--allow-cgroup-failure",
+            "--allow-unwise-nest-dagruns",
+            "-q",
+        ])
+        .current_dir(root)
+        .env_remove("DAGRUN_BIN")
+        .env("DAGRUN_ENGINE", "python")
+        .env("RUN_DAG_FILE_OVERRIDE", &structured_dag)
+        .output()
+        .map_err(|error| format!("raw run-dag: cannot launch Python refusal fixture: {error}"))?;
+    let python_stderr = String::from_utf8_lossy(&python.stderr);
+    if python.status.success()
+        || !python_stderr.contains("[dagrun] engine=python")
+        || !python_stderr.contains("REFUSING to run before any node starts")
+        || !python_stderr.contains("Python runner does not implement structured test-result capture")
+        || python_marker.exists()
+    {
+        return Err(format!(
+            "raw run-dag: explicit Python engine did not refuse structured results before execution: status={} marker={} stderr={python_stderr}",
+            python.status,
+            python_marker.exists(),
+        ));
+    }
 
     Ok(format!(
-        "raw run-dag: default workflow run and real json parser received {}/{} direct strict-compat nodes; marker exit 125 absent",
+        "raw run-dag: default Rust workflow and real json parser received {}/{} direct strict-compat nodes; explicit Python refused structured results before execution; marker exit 125 absent",
         validate_corpus::STRICT_COMPAT_TOTAL - validate_corpus::portable_super_only().len(),
         validate_corpus::STRICT_COMPAT_TOTAL - validate_corpus::portable_super_only().len() + 1,
     ))
@@ -13507,13 +13888,20 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
     let mut e2e_step = step("manifest_attempt", &e2e_cmd);
     e2e_step.group = "e2e".into();
     e2e_step.job = "manifest_attempt".into();
-    e2e_step.manifest = Some(DagManifest {
+    let e2e_manifest = DagManifest {
         lane: "portable".into(),
         category: "applications".into(),
         test: None,
         mode: None,
         backend: None,
-    });
+    };
+    e2e_step.manifest = Some(e2e_manifest.clone());
+    e2e_step.result_manifests = Some(vec![
+        ResultManifest::ManifestCell(e2e_manifest),
+        ResultManifest::StructuredTestResults(StructuredTestResultsManifest::current(
+            "e2e.manifest_attempt",
+        )),
+    ]);
     let e2e_retry = run_lane_once(
         &DagConfig { steps: vec![e2e_step], ..Default::default() },
         1,
@@ -13560,8 +13948,12 @@ fn scheduler_accounting_bracket() -> Result<String, String> {
         validate_plan::shell_quote(&structured_counts),
         validate_plan::shell_quote(&ordinary_attempts.to_string_lossy()),
     );
+    let mut ordinary_step = step("ordinary_structured", &ordinary_cmd);
+    ordinary_step.result_manifests = Some(vec![ResultManifest::StructuredTestResults(
+        StructuredTestResultsManifest::current("fixture.ordinary_structured"),
+    )]);
     let ordinary_retry = run_lane_once(
-        &DagConfig { steps: vec![step("ordinary_structured", &ordinary_cmd)], ..Default::default() },
+        &DagConfig { steps: vec![ordinary_step], ..Default::default() },
         1,
         true,
         0,
@@ -18374,11 +18766,6 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             vec![format!("cannot cd to repo root {}", root.display())],
         );
     }
-    // Receipt-bearing runs accept test counts only through dagrun's structured
-    // per-step file. Human-readable output remains diagnostic, but a command
-    // that merely prints a libtest-looking banner cannot manufacture evidence
-    // that tests executed.
-    unsafe { std::env::set_var("DAGRUN_REQUIRE_STRUCTURED_TEST_COUNTS", "1") };
     let discovered_parent = find_parent(&root);
     let parent = std::env::var_os(PARENT_ENV)
         .filter(|value| !value.is_empty())
@@ -18861,6 +19248,15 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
                 ],
             );
         }
+    }
+
+    if let Err(error) = declare_structured_result_producers(&mut plan) {
+        return RunSummary::refused(
+            2,
+            &plan.profile,
+            "structured result declaration",
+            vec![error],
+        );
     }
 
     assign_fail_fast_families(&mut plan);
