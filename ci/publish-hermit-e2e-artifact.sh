@@ -84,11 +84,17 @@ function valid_payload_path {
 }
 
 function file_record {
-    local path=$1 file=$2 mode size hash
+    local path=$1 file=$2 dereference=${3:-0} mode size hash
     valid_payload_path "$path" || fail "artifact path is not portable and unambiguous: $path"
-    [[ -f $file && ! -L $file ]] || fail "artifact payload is not a regular file: $file"
-    mode=$(stat -c '%a' -- "$file")
-    size=$(stat -c '%s' -- "$file")
+    if ((dereference)); then
+        [[ -f $file ]] || fail "source artifact payload does not resolve to a regular file: $file"
+        mode=$(stat -Lc '%a' -- "$file")
+        size=$(stat -Lc '%s' -- "$file")
+    else
+        [[ -f $file && ! -L $file ]] || fail "artifact payload is not a regular file: $file"
+        mode=$(stat -c '%a' -- "$file")
+        size=$(stat -c '%s' -- "$file")
+    fi
     hash=$(sha256sum -- "$file" | cut -d' ' -f1)
     jq -cn \
         --arg path "$path" \
@@ -99,7 +105,7 @@ function file_record {
 }
 
 function tree_records {
-    local root=$1 prefix=$2 output=$3 list relative
+    local root=$1 prefix=$2 output=$3 dereference=${4:-0} list relative
     list=$(mktemp)
     TREE_RECORD_TEMPS+=("$list")
     (
@@ -107,7 +113,46 @@ function tree_records {
         find -L . -type f -printf '%P\0' | LC_ALL=C sort -z
     ) >"$list" || fail "cannot enumerate resource bundle: $root"
     while IFS= read -r -d '' relative; do
-        file_record "$prefix/$relative" "$root/$relative"
+        file_record "$prefix/$relative" "$root/$relative" "$dereference"
+    done <"$list" >"$output"
+}
+
+function source_link_records {
+    local root=$1 allowed_root=$2 output=$3 list relative link target resolved identity unsupported
+
+    unsupported=$(find "$root" ! \( -type d -o -type f -o -type l \) -print -quit) ||
+        fail "cannot inspect source install bundle object types: $root"
+    [[ -z $unsupported ]] ||
+        fail "source install bundle contains an unsupported filesystem object: $unsupported"
+
+    list=$(mktemp)
+    TREE_RECORD_TEMPS+=("$list")
+    (
+        cd "$root"
+        find . -type l -printf '%P\0' | LC_ALL=C sort -z
+    ) >"$list" || fail "cannot enumerate source install symlinks: $root"
+    while IFS= read -r -d '' relative; do
+        valid_payload_path "$relative" ||
+            fail "source install symlink path is not portable and unambiguous: $relative"
+        link="$root/$relative"
+        target=$(readlink -- "$link") ||
+            fail "cannot read source install symlink: $link"
+        resolved=$(readlink -e -- "$link") ||
+            fail "source install bundle contains a broken symlink: $link -> $target"
+        case "$resolved" in
+            "$allowed_root" | "$allowed_root"/*) ;;
+            *) fail "source install symlink escapes materialization root: $link -> $target" ;;
+        esac
+        [[ -f $resolved && ! -L $resolved ]] ||
+            fail "source install symlink does not resolve to a regular file: $link -> $target"
+        identity=$(stat -Lc '%d:%i' -- "$resolved") ||
+            fail "cannot identify source install symlink target: $link -> $target"
+        jq -cn \
+            --arg path "$relative" \
+            --arg target "$target" \
+            --arg resolved "$resolved" \
+            --arg identity "$identity" \
+            '{path: $path, target: $target, resolved: $resolved, identity: $identity}'
     done <"$list" >"$output"
 }
 
@@ -130,6 +175,7 @@ source_binary=$1
 bundle_root=$2
 pointer=$3
 source_install=${4:-}
+source_install_root=
 kind=binary-only
 [[ -z $source_install ]] || kind=complete
 
@@ -141,6 +187,8 @@ command -v sha256sum >/dev/null || fail "sha256sum is required"
 if [[ $kind == complete ]]; then
     [[ -d $source_install && ! -L $source_install ]] ||
         fail "source install bundle is missing or is a symlink: $source_install"
+    source_install=$(cd "$source_install" && pwd -P)
+    source_install_root=$(cd "$(dirname "$source_install")" && pwd -P)
 fi
 
 require_clean_source_state
@@ -154,13 +202,15 @@ stage="$bundle_root/.tmp-$$"
 pointer_tmp="$pointer.tmp-$$"
 before_records=$(mktemp)
 after_records=$(mktemp)
+links_before=$(mktemp)
+links_after=$(mktemp)
 file_records=$(mktemp)
 version_before=$(mktemp)
 version_after=$(mktemp)
 TREE_RECORD_TEMPS=()
 function cleanup {
     rm -rf "$stage"
-    rm -f "$pointer_tmp" "$before_records" "$after_records" "$file_records" \
+    rm -f "$pointer_tmp" "$before_records" "$after_records" "$links_before" "$links_after" "$file_records" \
         "$version_before" "$version_after" "${TREE_RECORD_TEMPS[@]}"
 }
 trap cleanup EXIT
@@ -190,22 +240,27 @@ published_binary_hash_final=$(sha256sum -- "$stage/hermit" | cut -d' ' -f1)
 file_record hermit "$stage/hermit" >"$file_records"
 
 if [[ $kind == complete ]]; then
+    source_link_records "$source_install" "$source_install_root" "$links_before"
     require_complete_resources "$source_install"
-    tree_records "$source_install" install "$before_records"
+    tree_records "$source_install" install "$before_records" 1
     [[ -s $before_records ]] || fail "source install bundle contains no regular files: $source_install"
     mkdir -p "$stage/install"
-    cp -aL "$source_install/." "$stage/install/"
-    tree_records "$source_install" install "$after_records"
+    cp -aL -- "$source_install/." "$stage/install/" ||
+        fail "cannot materialize source install bundle: $source_install"
+    source_link_records "$source_install" "$source_install_root" "$links_after"
+    cmp -s "$links_before" "$links_after" ||
+        fail "source install symlink targets changed during publication: $source_install"
+    tree_records "$source_install" install "$after_records" 1
     cmp -s "$before_records" "$after_records" ||
         fail "source install bundle changed during publication: $source_install"
-    tree_records "$stage/install" install "$stage/resource-records.jsonl"
-    cmp -s "$before_records" "$stage/resource-records.jsonl" ||
-        fail "published resource metadata or bytes do not match source bundle: $source_install"
-    require_complete_resources "$stage/install"
     [[ -z $(find "$stage/install" -type l -print -quit) ]] ||
         fail "published resource bundle retained a symlink instead of an immutable copy: $stage/install"
     [[ -z $(find "$stage/install" ! -type d ! -type f -print -quit) ]] ||
         fail "published resource bundle contains an unsupported filesystem object: $stage/install"
+    tree_records "$stage/install" install "$stage/resource-records.jsonl"
+    cmp -s "$before_records" "$stage/resource-records.jsonl" ||
+        fail "published resource metadata or bytes do not match source bundle: $source_install"
+    require_complete_resources "$stage/install"
     cat "$stage/resource-records.jsonl" >>"$file_records"
     rm -f "$stage/resource-records.jsonl"
 fi

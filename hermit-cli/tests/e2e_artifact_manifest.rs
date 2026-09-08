@@ -10,6 +10,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -140,21 +141,28 @@ impl Fixture {
         commit_all(&source, "Hermit fixture");
 
         let short_head = git_text(&source, &["rev-parse", "--short=12", "HEAD"]);
-        let binary = scratch.join("hermit");
+        let release = scratch.join("release");
+        let binary = release.join("hermit");
         let raw_version = write_fake_hermit(&binary, &short_head);
-        let install = scratch.join("install");
-        for name in [
-            "libdetcore_dbt.so",
-            "libdetcore_sabre.so",
-            "libreverie_dbt_client.so",
-            "libreverie_liteinst.so",
-        ] {
+        let install = scratch.join("install_pkg");
+        for name in ["libreverie_dbt_client.so", "libreverie_liteinst.so"] {
             write_file(
                 &install.join("rsrcs").join(name),
                 format!("fixture {name}\n").as_bytes(),
                 0o644,
             );
         }
+        for name in ["libdetcore_dbt.so", "libdetcore_sabre.so"] {
+            let library = release.join(name);
+            write_file(&library, format!("fixture {name}\n").as_bytes(), 0o644);
+            symlink(
+                Path::new("../../release").join(name),
+                install.join("rsrcs").join(name),
+            )
+            .unwrap_or_else(|error| panic!("link fixture {name}: {error}"));
+        }
+        symlink("../release/hermit", install.join("hermit"))
+            .expect("link fixture install_pkg/hermit");
         for name in ["dynamorio/bin64/drrun", "sabre", "e9patch", "e9tool"] {
             write_file(
                 &install.join("rsrcs").join(name),
@@ -324,8 +332,32 @@ fn artifact_manifest_binds_source_version_and_every_payload_file() {
         .map(|entry| entry["path"].as_str().expect("file path is a string"))
         .collect();
     assert!(paths.contains(&"hermit"));
+    assert!(paths.contains(&"install/hermit"));
+    assert!(paths.contains(&"install/rsrcs/libdetcore_dbt.so"));
+    assert!(paths.contains(&"install/rsrcs/libdetcore_sabre.so"));
     assert!(paths.contains(&"install/rsrcs/libreverie_liteinst.so"));
     assert!(paths.contains(&"install/rsrcs/libreverie_liteinst.so.revision"));
+    for path in [
+        "install/hermit",
+        "install/rsrcs/libdetcore_dbt.so",
+        "install/rsrcs/libdetcore_sabre.so",
+    ] {
+        let file_type = fs::symlink_metadata(bundle.join(path))
+            .unwrap_or_else(|error| panic!("stat materialized {path}: {error}"))
+            .file_type();
+        assert!(
+            file_type.is_file(),
+            "published {path} was not a regular file"
+        );
+        assert!(
+            !file_type.is_symlink(),
+            "published {path} remained a symlink"
+        );
+    }
+    assert_eq!(
+        sha256_file(&bundle.join("install/rsrcs/libdetcore_dbt.so")),
+        sha256_file(&fixture.scratch.join("release/libdetcore_dbt.so"))
+    );
     for entry in manifest["files"].as_array().unwrap() {
         assert!(entry["mode"].as_str().is_some());
         assert!(entry["size"].as_u64().is_some());
@@ -536,4 +568,100 @@ fn artifact_manifest_binds_source_version_and_every_payload_file() {
     );
 
     fs::remove_dir_all(&fixture.scratch).expect("remove artifact-manifest fixture");
+}
+
+#[test]
+fn publisher_rejects_unsafe_or_changed_install_symlinks() {
+    let fixture = Fixture::new();
+    let link = fixture.install.join("rsrcs/test-link");
+
+    symlink("missing-target", &link).expect("create broken fixture symlink");
+    assert_refused(
+        fixture.publish(
+            &fixture.binary,
+            &fixture.scratch.join("broken-link-bundles"),
+            &fixture.scratch.join("broken-link.path"),
+        ),
+        "source install bundle contains a broken symlink",
+    );
+    fs::remove_file(&link).expect("remove broken fixture symlink");
+
+    let outside = temporary_directory();
+    let outside_file = outside.join("outside-resource");
+    write_file(&outside_file, b"outside\n", 0o644);
+    symlink(&outside_file, &link).expect("create escaping fixture symlink");
+    assert_refused(
+        fixture.publish(
+            &fixture.binary,
+            &fixture.scratch.join("escaping-link-bundles"),
+            &fixture.scratch.join("escaping-link.path"),
+        ),
+        "source install symlink escapes materialization root",
+    );
+    fs::remove_file(&link).expect("remove escaping fixture symlink");
+    fs::remove_dir_all(&outside).expect("remove escaping target fixture");
+
+    let special = fixture.scratch.join("special-target");
+    let mkfifo = Command::new("mkfifo")
+        .arg(&special)
+        .output()
+        .expect("create special target fixture");
+    assert!(
+        mkfifo.status.success(),
+        "mkfifo failed: {}",
+        String::from_utf8_lossy(&mkfifo.stderr)
+    );
+    symlink("../../special-target", &link).expect("create special-target fixture symlink");
+    assert_refused(
+        fixture.publish(
+            &fixture.binary,
+            &fixture.scratch.join("special-link-bundles"),
+            &fixture.scratch.join("special-link.path"),
+        ),
+        "source install symlink does not resolve to a regular file",
+    );
+    fs::remove_file(&link).expect("remove special-target fixture symlink");
+    fs::remove_file(&special).expect("remove special target fixture");
+
+    let changing_link = fixture.install.join("rsrcs/libdetcore_dbt.so");
+    let alternate_target = fixture.scratch.join("release/libdetcore_dbt-alternate.so");
+    write_file(&alternate_target, b"alternate detcore DBT\n", 0o644);
+    let wrapper_dir = fixture.scratch.join("command-wrappers");
+    let cp_wrapper = wrapper_dir.join("cp");
+    write_file(
+        &cp_wrapper,
+        br##"#!/bin/sh
+set -eu
+rm -f -- "$HERMIT_TEST_MUTATING_LINK"
+ln -s -- "$HERMIT_TEST_MUTATING_TARGET" "$HERMIT_TEST_MUTATING_LINK"
+exec /bin/cp "$@"
+"##,
+        0o755,
+    );
+    let path = format!(
+        "{}:{}",
+        wrapper_dir.display(),
+        std::env::var("PATH").expect("test PATH is present")
+    );
+    let changed = Command::new(&fixture.publisher)
+        .args([
+            fixture.binary.as_path(),
+            fixture.scratch.join("changed-link-bundles").as_path(),
+            fixture.scratch.join("changed-link.path").as_path(),
+            fixture.install.as_path(),
+        ])
+        .env("PATH", path)
+        .env("HERMIT_TEST_MUTATING_LINK", &changing_link)
+        .env(
+            "HERMIT_TEST_MUTATING_TARGET",
+            "../../release/libdetcore_dbt-alternate.so",
+        )
+        .output()
+        .expect("run publisher with a changing symlink target");
+    assert_refused(
+        changed,
+        "source install symlink targets changed during publication",
+    );
+
+    fs::remove_dir_all(&fixture.scratch).expect("remove symlink-policy fixture");
 }
