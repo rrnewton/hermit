@@ -1,9 +1,11 @@
 # Hermetic validate - pinned root
 
-The canonical validate driver stays on the host and runs its build and test DAG
-nodes in the pinned root. This directory contains that runner, its locked fetch
-phase, and the v3 per-cell isolation contract. The older whole-split invocation
-remains available as an explicit diagnostic path.
+The canonical validate driver stays on the host. Its scheduled manifest cells
+and dedicated LiteInst validation nodes run in the pinned root; other nodes
+remain on the host until their execution boundaries can satisfy the same
+contract. This directory contains that runner, its locked fetch phase, and the
+v3 per-cell isolation contract. The older whole-split invocation remains
+available as an explicit diagnostic path.
 
 ## What this is
 
@@ -67,6 +69,28 @@ receives null; a shell derives `PWD=/test` from `getcwd(2)`. No cell requires
 inherited `PWD`. Record and replay now accept the same base-environment, mount,
 and working-directory controls as `hermit run`, so replay cells obey the
 identical contract.
+
+The dedicated `test.liteinst_strict` node and the focused
+`--liteinst-compat-only` path also run in the pinned root. Their release Hermit
+and LiteInst runtime are built there, and every Hermit invocation owned by
+`liteinst_advanced` requests `--base-env=minimal`, a private tmpfs at `/test`,
+and `/test` as its working directory. The mixed `test.cli` node remains on the
+host because moving it would also move unrelated CLI tests.
+
+This does not complete the every-test contract. The remaining execution
+boundaries need separate designs:
+
+- DBT-backed tests need DBT to support the requested guest working directory;
+  it currently refuses `--workdir` and guest mounts.
+- `test.detcore_misc` and `test.detcore_parallel` execute guests in-process, so
+  there is no Hermit CLI boundary at which to apply the mount and working
+  directory.
+- `test.strict_compat` invokes validation again; moving it requires a nested
+  validation design that preserves the one host scheduler and does not start a
+  second pinned-root container around an already-contained command.
+
+The exact environment retained on top of `--base-env=minimal` is a separate
+policy decision; this change does not alter it.
 
 The mount mechanism has a standalone control measurement, not an integrated
 Hermit-harness result. Two hundred live

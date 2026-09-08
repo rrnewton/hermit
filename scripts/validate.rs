@@ -2362,7 +2362,7 @@ fn self_test() -> Result<(), String> {
         validate_receipt::self_test()?,
         validate_runtime::self_test()?,
         prebuilt_rust_script_plan_bracket()?,
-        pinned_root_plan_bracket()?,
+        pinned_root_plan_bracket(&root)?,
     ] {
         println!("  {line}");
     }
@@ -2933,8 +2933,7 @@ cleared-caps refusal names {} starved step(s)",
             }
         }
         for step in pinned_full.cfg.steps.iter().filter(|step| {
-            step.tag().ends_with("_in_pinned_root")
-                || validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+            step.tag().ends_with("_in_pinned_root") || pinned_root_test_step(step)
         }) {
             if !step
                 .cmd
@@ -2945,6 +2944,30 @@ cleared-caps refusal names {} starved step(s)",
                     step.tag(), step.cmd
                 ));
             }
+        }
+        let liteinst = pinned_full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.liteinst_strict")
+            .ok_or("full-plan bracket: test.liteinst_strict disappeared")?;
+        if !liteinst.cmd.contains("run-in-pinned-root.sh")
+            || !liteinst.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
+            || !liteinst
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+            || !liteinst.deps.iter().any(|dependency| {
+                dependency == "build.liteinst_runtime_release_in_pinned_root"
+            })
+            || liteinst
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.liteinst_runtime_release")
+        {
+            return Err(format!(
+                "full-plan bracket: test.liteinst_strict is not bound to its in-image artifact and runtime producers: {liteinst:?}"
+            ));
         }
         for tag in [
             "privileged-e2e.manifest_applications",
@@ -10767,8 +10790,7 @@ fn propagate_verbosity(plan: &mut Plan, verbosity: i64) {
     }
 }
 
-/// The steps that run inside the pinned root: the scheduled E2E manifest cells,
-/// and nothing else.
+/// The build steps whose output runs inside the pinned root.
 ///
 /// ⚠️ THIS IS AN ALLOW-LIST BY DELIBERATE CHOICE, AND THE EARLIER DENY-LIST IS WHY.
 /// The first version wrapped everything except three preflight steps, which moved
@@ -10783,9 +10805,6 @@ fn propagate_verbosity(plan: &mut Plan, verbosity: i64) {
 /// A deny-list also has to be complete to be safe, and nothing enumerates which
 /// steps depend on a host facility. An allow-list is wrong in the safe direction: a
 /// step nobody classified keeps running exactly where it runs today.
-/// The build steps whose OUTPUT IS EXECUTED inside the pinned root, and which must
-/// therefore be BUILT there.
-///
 /// ⚠️ THE RULE IS "AN OUTPUT THAT EXECUTES IN THE CONTAINER MUST BE BUILT IN THE
 /// CONTAINER", AND IT IS NOT A PREFERENCE. Measured 2026-08-27, same container, same
 /// mount, two binaries:
@@ -10813,9 +10832,30 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.runtime_release",
     // packages the above into the artifact the cell command requires
     "build.e2e_artifact",
+    // stages the LiteInst runtime beside the release Hermit binary used by
+    // test.liteinst_strict inside the pinned root
+    "build.liteinst_runtime_release",
     // compiles the guest programs the cells execute under hermit
     "build.manifest_guests",
+    // focused LiteInst builds have their own tags but produce the same two
+    // executable inputs as the full-plan release/runtime nodes
+    "liteinst.hermit_release",
+    "liteinst.runtime",
 ];
+
+/// Dedicated LiteInst test nodes that run inside the pinned root.
+///
+/// `test.cli` deliberately remains absent: it is a mixed CLI suite whose
+/// LiteInst cases share a binary with unrelated host-side checks. Moving that
+/// whole node would exceed the LiteInst slice. The dedicated full-plan and
+/// focused LiteInst suites have explicit identities and can be moved without
+/// changing any other test's execution environment.
+const PINNED_ROOT_LITEINST_TEST_STEPS: &[&str] = &["test.liteinst_strict", "liteinst.strict"];
+
+fn pinned_root_test_step(step: &Step) -> bool {
+    validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+        || PINNED_ROOT_LITEINST_TEST_STEPS.contains(&step.tag().as_str())
+}
 
 // ⚠️ e2e.metadata IS DELIBERATELY ABSENT FROM THAT LIST, AND THE REASON CORRECTS MY OWN
 // FIRST DRAFT. I had listed it because it RUNS test-harness, but running a tool is not
@@ -10832,7 +10872,7 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
 
 fn pinned_root_command(root: &Path, out: &Path, step: &Step) -> String {
     let mut env_names: BTreeSet<&str> = PINNED_ROOT_FORWARDED_ENV.iter().copied().collect();
-    if validation_step_identity(step) == ValidationStepIdentity::ManifestRun {
+    if pinned_root_test_step(step) {
         env_names.insert("DAGRUN_TEST_COUNTS_PATH");
     }
     env_names.extend(step.env.keys().map(String::as_str));
@@ -10991,13 +11031,13 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
         cfg.steps.extend(twins);
 
         for step in &mut cfg.steps {
-            if validation_step_identity(step) != ValidationStepIdentity::ManifestRun {
+            if !pinned_root_test_step(step) {
                 continue;
             }
-            // The selected E2E population has no naked or DBT cells. Every
-            // scheduled Hermit attempt therefore accepts this exact tmpfs gate;
-            // the harness refuses an unsupported mode/backend instead of
-            // silently running it outside /test.
+            // Scheduled manifest cells use this environment gate to add the
+            // guest's tmpfs /test. The dedicated LiteInst tests construct the
+            // same mount and working-directory arguments directly, and carry
+            // the gate here so the plan records the same contract.
             step.env
                 .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
             // Point the cell at the in-image producers. Depending on the host copies
@@ -11045,7 +11085,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
     Ok(())
 }
 
-fn pinned_root_plan_bracket() -> Result<String, String> {
+fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
     let step = |group: &str, job: &str, cmd: &str, deps: Vec<String>| {
         step_with_caps(group, job, "fixture", cmd.into(), deps, 30, 30, 1024 * 1024)
     };
@@ -11077,8 +11117,54 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
                 ),
                 step("lint", "clippy", "cargo clippy --workspace", vec![]),
                 step("test", "hermit_integration", "./ci/run-nextest-counted.sh -p hermit", vec![]),
+                step("setup", "nextest", "cargo nextest show-config version", vec![]),
+                step(
+                    "test",
+                    "cli",
+                    "./ci/run-nextest-counted.sh -p hermit --test cli",
+                    vec!["build.liteinst_runtime_release".into(), "setup.nextest".into()],
+                ),
                 // A producer whose output the cells execute: wrapped by the rule.
                 step("build", "workspace", "cargo build --workspace", vec![]),
+                step(
+                    "build",
+                    "e2e_artifact",
+                    "./ci/publish-hermit-e2e-artifact.sh",
+                    vec!["build.workspace".into()],
+                ),
+                step(
+                    "build",
+                    "liteinst_runtime_release",
+                    "./scripts/stage-liteinst-runtime.sh release",
+                    vec!["build.e2e_artifact".into()],
+                ),
+                step(
+                    "test",
+                    "liteinst_strict",
+                    "./ci/run-nextest-counted.sh -p hermit --test liteinst_advanced",
+                    vec![
+                        "build.liteinst_runtime_release".into(),
+                        "setup.nextest".into(),
+                    ],
+                ),
+                step(
+                    "liteinst",
+                    "hermit_release",
+                    "cargo build --release -p hermit",
+                    vec![],
+                ),
+                step(
+                    "liteinst",
+                    "runtime",
+                    "./scripts/stage-liteinst-runtime.sh release",
+                    vec!["liteinst.hermit_release".into()],
+                ),
+                step(
+                    "liteinst",
+                    "strict",
+                    "./ci/run-nextest-counted.sh -p hermit --test liteinst_advanced",
+                    vec!["liteinst.runtime".into(), "setup.nextest".into()],
+                ),
             ],
             "pinned-root bracket",
         ),
@@ -11109,6 +11195,8 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
         "test.strict_compat",
         "lint.clippy",
         "test.hermit_integration",
+        "test.cli",
+        "setup.nextest",
         "pre.submodules",
         PIN_GATE_TAG,
     ] {
@@ -11220,6 +11308,101 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
         ));
     }
 
+    for (test_tag, producer_tag) in [
+        (
+            "test.liteinst_strict",
+            "build.liteinst_runtime_release_in_pinned_root",
+        ),
+        ("liteinst.strict", "liteinst.runtime_in_pinned_root"),
+    ] {
+        let test = by_tag
+            .get(test_tag)
+            .ok_or_else(|| format!("pinned-root bracket: {test_tag} disappeared"))?;
+        if !test.cmd.contains("run-in-pinned-root.sh")
+            || !test.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
+            || test.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+            || !test.deps.iter().any(|dependency| dependency == producer_tag)
+            || test
+                .deps
+                .iter()
+                .any(|dependency| dependency == producer_tag.trim_end_matches("_in_pinned_root"))
+        {
+            return Err(format!(
+                "pinned-root bracket: dedicated LiteInst test {test_tag} lost its image wrapper, /test gate, count path or in-image runtime dependency: {test:?}"
+            ));
+        }
+    }
+    for (producer_tag, dependency_tag) in [
+        (
+            "build.liteinst_runtime_release_in_pinned_root",
+            "build.e2e_artifact_in_pinned_root",
+        ),
+        (
+            "liteinst.runtime_in_pinned_root",
+            "liteinst.hermit_release_in_pinned_root",
+        ),
+    ] {
+        let producer = by_tag
+            .get(producer_tag)
+            .ok_or_else(|| format!("pinned-root bracket: {producer_tag} disappeared"))?;
+        if !producer.cmd.contains("run-in-pinned-root.sh")
+            || !producer
+                .deps
+                .iter()
+                .any(|dependency| dependency == dependency_tag)
+        {
+            return Err(format!(
+                "pinned-root bracket: LiteInst producer {producer_tag} is not in the image or lost its in-image dependency {dependency_tag}: {producer:?}"
+            ));
+        }
+    }
+
+    let focused_args = parse_argv(&[
+        ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+        "--liteinst-compat-only".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("pinned-root bracket: focused LiteInst parser exited {code}"))?;
+    let mut focused = build_plan(
+        root,
+        &focused_args,
+        &std::env::temp_dir().join("validate-pinned-root-liteinst-plan"),
+    )?;
+    apply_pinned_root(&mut focused, root, false)?;
+    let focused_by_tag: BTreeMap<String, &Step> = focused
+        .cfg
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step))
+        .collect();
+    let focused_test = focused_by_tag
+        .get("liteinst.strict")
+        .ok_or("pinned-root bracket: focused LiteInst test disappeared")?;
+    if !focused_test.cmd.contains("run-in-pinned-root.sh")
+        || !focused_test
+            .deps
+            .iter()
+            .any(|dependency| dependency == "liteinst.runtime_in_pinned_root")
+        || focused_test
+            .deps
+            .iter()
+            .any(|dependency| dependency == "liteinst.runtime")
+    {
+        return Err(format!(
+            "pinned-root bracket: actual focused LiteInst test is not bound to its in-image runtime: {focused_test:?}"
+        ));
+    }
+    for required in [
+        "liteinst.hermit_release_in_pinned_root",
+        "liteinst.runtime_in_pinned_root",
+    ] {
+        if !focused_by_tag.contains_key(required) {
+            return Err(format!(
+                "pinned-root bracket: actual focused LiteInst plan omitted {required}"
+            ));
+        }
+    }
+
     let mut nested = Plan {
         cfg: validate_plan::config_from(
             vec![step("e2e", "manifest_nested", "echo already-inside", vec![])],
@@ -11291,7 +11474,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
             "pinned-root bracket: sequential lanes must fetch once then reuse the cache: first_fetches={first_fetches} second_fetches={second_fetches} second={second_step:?}"
         ));
     }
-    Ok("pinned root: scheduled manifest cells wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; 6 non-producer steps verified still on the host; 1 locked fetch added".into())
+    Ok("pinned root: scheduled manifest cells and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
 }
 
 // --------------------------------------------------------------------------- interruption
