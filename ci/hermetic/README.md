@@ -86,12 +86,14 @@ second validation scheduler. `test.applications_e2e`,
 application helper replaces its ordinary private `/tmp` workdir with a private
 `/test` mount when the pinned-root marker is present; the scheduled
 arbitrary-binary run matrix and strict-command suite apply the same marker to
-each Hermit command. Their executable inputs are built there. The direct quick
+each Hermit command. The ignored epoll and register-canonicalization regression
+tests do the same, and launch Hermit from their guest-artifact directories so
+verification's private summary remains visible when a source checkout itself
+is under host `/tmp`. Their executable inputs are built there. The direct quick
 smoke commands, the working-envelope probes, and every Hermit invocation owned
 by `liteinst_advanced` request `--base-env=minimal`, a private tmpfs at `/test`,
 and `/test` as their working directory. The mixed `test.cli` node remains on
-the host because moving it
-would also move unrelated CLI tests.
+the host because moving it would also move unrelated CLI tests.
 
 The focused `test.rr_suite_contract` node also runs in the pinned root. Its one
 selected test checks scratch-directory creation and cleanup and does not launch
