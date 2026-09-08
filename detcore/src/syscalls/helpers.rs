@@ -33,6 +33,7 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::syscalls::threads::KernelSigaction;
+use crate::syscalls::threads::KernelSigset;
 use crate::syscalls::threads::WaitSignalDisposition;
 use crate::syscalls::threads::block_signals_for_disposition;
 use crate::syscalls::threads::blocked_signal_mask;
@@ -361,7 +362,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             None
         };
         let blocked_mask_addr = stack.push(blocked_mask);
-        let old_mask_addr = stack.reserve::<libc::sigset_t>();
+        let old_mask_addr = stack.reserve::<KernelSigset>();
         let action_addr = stack.reserve::<KernelSigaction>();
         let _mask_guard = stack.commit()?;
         let guest_signal_mask =

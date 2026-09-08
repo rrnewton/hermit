@@ -531,17 +531,22 @@ fn child_wait_can_retry_after_stale(spec: ChildWaitSpec) -> bool {
     !matches!(spec.selector, ChildWaitSelector::Exact(_))
 }
 
-fn signal_is_blocked(mask: &libc::sigset_t, signal: SigWrapper) -> bool {
-    unsafe { libc::sigismember(mask, signal.0 as libc::c_int) == 1 }
+pub(super) type KernelSigset = u64;
+pub(super) const KERNEL_SIGSET_SIZE: usize = std::mem::size_of::<KernelSigset>();
+
+fn signal_is_blocked(mask: &KernelSigset, signal: SigWrapper) -> bool {
+    let raw_signal = signal.raw();
+    (1..=KernelSigset::BITS as i32).contains(&raw_signal)
+        && mask & (1_u64 << (raw_signal as u32 - 1)) != 0
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(super) struct KernelSigaction {
-    handler: u64,
-    flags: u64,
-    restorer: u64,
-    mask: u64,
+    pub(super) handler: u64,
+    pub(super) flags: u64,
+    pub(super) restorer: u64,
+    pub(super) mask: KernelSigset,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -564,7 +569,7 @@ fn signal_has_uncatchable_default_disposition(signal: SigWrapper) -> bool {
 pub(super) async fn wait_signal_disposition<G, T>(
     guest: &mut G,
     status: ResumeStatus,
-    guest_signal_mask: &libc::sigset_t,
+    guest_signal_mask: &KernelSigset,
     action_addr: AddrMut<'_, KernelSigaction>,
     inspect_action: bool,
 ) -> Result<Option<WaitSignalDisposition>, Error>
@@ -614,20 +619,28 @@ where
     Ok(None)
 }
 
-pub(super) fn blocked_signal_mask() -> libc::sigset_t {
-    let mut blocked_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+pub(super) fn blocked_signal_mask() -> KernelSigset {
+    // Preserve libc's definition of the blockable set (notably its reserved
+    // NPTL signals) while converting the result to the kernel's one-word ABI.
+    let mut libc_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe {
-        libc::sigfillset(&mut blocked_mask);
-        libc::sigdelset(&mut blocked_mask, reverie::PERF_EVENT_SIGNAL as i32);
+        libc::sigfillset(&mut libc_mask);
+        libc::sigdelset(&mut libc_mask, reverie::PERF_EVENT_SIGNAL as i32);
     }
-    blocked_mask
+    (1..=KernelSigset::BITS as i32).fold(0, |mask, raw_signal| {
+        if unsafe { libc::sigismember(&libc_mask, raw_signal) } == 1 {
+            mask | (1_u64 << (raw_signal as u32 - 1))
+        } else {
+            mask
+        }
+    })
 }
 
 pub(super) async fn block_signals_for_disposition<G, T>(
     guest: &mut G,
-    blocked_mask_addr: Addr<'_, libc::sigset_t>,
-    old_mask_addr: AddrMut<'_, libc::sigset_t>,
-) -> Result<libc::sigset_t, Error>
+    blocked_mask_addr: Addr<'_, KernelSigset>,
+    old_mask_addr: AddrMut<'_, KernelSigset>,
+) -> Result<KernelSigset, Error>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -638,17 +651,17 @@ where
             (!guest
                 .config()
                 .backend_requires_thread_directed_process_signals)
-                .then_some(blocked_mask_addr),
+                .then_some(blocked_mask_addr.cast()),
         )
-        .with_oldset(Some(old_mask_addr))
-        .with_sigsetsize(std::mem::size_of::<u64>());
+        .with_oldset(Some(old_mask_addr.cast()))
+        .with_sigsetsize(KERNEL_SIGSET_SIZE);
     guest.inject_with_retry(block_signals).await?;
     Ok(guest.memory().read_value(old_mask_addr)?)
 }
 
 pub(super) async fn restore_signals_after_disposition<G, T>(
     guest: &mut G,
-    old_mask_addr: AddrMut<'_, libc::sigset_t>,
+    old_mask_addr: AddrMut<'_, KernelSigset>,
 ) -> Result<(), Error>
 where
     G: Guest<Detcore<T>>,
@@ -658,11 +671,12 @@ where
         .config()
         .backend_requires_thread_directed_process_signals
     {
+        let old_mask: Addr<'_, KernelSigset> = old_mask_addr.into();
         let restore_signals = syscalls::RtSigprocmask::new()
             .with_how(libc::SIG_SETMASK)
-            .with_set(Some(old_mask_addr.into()))
+            .with_set(Some(old_mask.cast()))
             .with_oldset(None)
-            .with_sigsetsize(std::mem::size_of::<u64>());
+            .with_sigsetsize(KERNEL_SIGSET_SIZE);
         guest.inject_with_retry(restore_signals).await?;
     }
     Ok(())
@@ -1618,7 +1632,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let blocked_mask = blocked_signal_mask();
                 let mut stack = guest.stack().await;
                 let blocked_mask_addr = stack.push(blocked_mask);
-                let old_mask_addr = stack.reserve::<libc::sigset_t>();
+                let old_mask_addr = stack.reserve::<KernelSigset>();
                 let action_addr = stack.reserve::<KernelSigaction>();
                 let _mask_guard = stack.commit()?;
                 let guest_signal_mask =
@@ -1898,7 +1912,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let blocked_mask = blocked_signal_mask();
             let mut stack = guest.stack().await;
             let blocked_mask_addr = stack.push(blocked_mask);
-            let old_mask_addr = stack.reserve::<libc::sigset_t>();
+            let old_mask_addr = stack.reserve::<KernelSigset>();
             let action_addr = stack.reserve::<KernelSigaction>();
             let _mask_guard = stack.commit()?;
             let guest_signal_mask =
@@ -2556,6 +2570,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_blocked_mask_preserves_libc_signal_membership() {
+        let mask = blocked_signal_mask();
+        let mut libc_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigfillset(&mut libc_mask);
+            libc::sigdelset(&mut libc_mask, reverie::PERF_EVENT_SIGNAL as i32);
+        }
+        for raw_signal in 1..=KernelSigset::BITS as i32 {
+            assert_eq!(
+                signal_is_blocked(&mask, SigWrapper(raw_signal)),
+                unsafe { libc::sigismember(&libc_mask, raw_signal) == 1 },
+                "signal {raw_signal} membership changed while converting to the kernel ABI"
+            );
+        }
+    }
 
     #[test]
     fn linux_default_dispositions_that_do_not_interrupt_child_waits() {
