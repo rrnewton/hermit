@@ -87,10 +87,10 @@ The cross-tab includes all **5744** tracked cells; no row is omitted. The curren
 
 | Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `green` | 0 | 695 | 0 | 6 | 6 | 707 |
+| `green` | 0 | 693 | 0 | 6 | 8 | 707 |
 | `red` | 64 | 91 | 0 | 0 | 33 | 188 |
 | `not-applicable` | 4848 | 0 | 0 | 0 | 1 | 4849 |
-| **Total** | **4912** | **786** | **0** | **6** | **40** | **5744** |
+| **Total** | **4912** | **784** | **0** | **6** | **42** | **5744** |
 
 Cells whose stored `measurement` is not `never-measured` are shown individually so status and measurement remain visible together.
 
@@ -581,7 +581,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `c-programs/proc-fd-link-aliases` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/proc-fdinfo` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `c-programs/proc-locks` | `verify` | `kvm` | `green` | `measured-and-passed` |
-| `c-programs/proc-locks` | `verify` | `ptrace` | `green` | `measured-and-passed` |
+| `c-programs/proc-locks` | `verify` | `ptrace` | `green` | `diverged` |
 | `c-programs/proc-locks` | `verify` | `sabre` | `green` | `measured-and-passed` |
 | `c-programs/process-mrelease-enosys` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `c-programs/process-mrelease-enosys` | `verify` | `kvm` | `green` | `measured-and-passed` |
@@ -909,7 +909,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `system-utils/record-getpid` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/record-getpid` | `verify` | `liteinst` | `red` | `measured-and-passed` |
 | `system-utils/record-getpid` | `verify` | `ptrace` | `green` | `measured-and-passed` |
-| `system-utils/record-getpid` | `verify` | `sabre` | `green` | `measured-and-passed` |
+| `system-utils/record-getpid` | `verify` | `sabre` | `green` | `diverged` |
 | `system-utils/shm-coherency-identity` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `system-utils/shuf-permutation` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `system-utils/shuf-permutation` | `verify` | `ptrace` | `green` | `measured-and-passed` |
