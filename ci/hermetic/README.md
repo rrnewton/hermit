@@ -92,8 +92,10 @@ verification's private summary remains visible when a source checkout itself
 is under host `/tmp`. Their executable inputs are built there. The direct quick
 smoke commands, the working-envelope probes, and every Hermit invocation owned
 by `liteinst_advanced` request `--base-env=minimal`, a private tmpfs at `/test`,
-and `/test` as their working directory. The mixed `test.cli` node remains on
-the host because moving it would also move unrelated CLI tests.
+and `/test` as their working directory. `test.hermit_integration`, `test.cli`,
+and `test.app_strict_verify` run in the pinned root as well. The portable CLI
+selection retains its existing KVM and DBT exclusions; the selected KVM CLI
+tests run in the pinned root on the privileged lane.
 
 The focused `test.rr_suite_contract` node also runs in the pinned root. Its one
 selected test checks scratch-directory creation and cleanup and does not launch
@@ -150,6 +152,9 @@ Validate has **two phases with a network boundary between them**:
 |---|---|---|---|
 | **fetch** | the host | **yes** | `cargo fetch --locked` into a `CARGO_HOME`. Downloads only; produces no build output. |
 | **build and test** | the pinned root | **no** | each host-scheduled DAG node runs against that cache and the pinned toolchain. |
+
+Pinned test nodes use the image's `cargo-nextest` directly and do not depend on
+the host `setup.nextest` node or its network-install fallback.
 
 The network window is deliberately a **pure download**. That matters because
 `cargo fetch --locked` cannot introduce variance: every byte it writes is

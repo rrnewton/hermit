@@ -69,6 +69,8 @@
 //! separate directories with distinct absolute paths and byte-comparing the
 //! resulting artifacts, exactly as the `javac` L1 test does.
 
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::io::Seek;
@@ -90,6 +92,109 @@ const HERMIT_VERIFY_TIMEOUT: &str = "120s";
 
 /// Grace period before `timeout(1)` escalates from SIGTERM to SIGKILL.
 const HERMIT_VERIFY_KILL_AFTER: &str = "10s";
+const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
+const HERMETIC_TEST_WORKDIR: &str = "/test";
+
+fn guest_execution_args(
+    requested: Option<&OsStr>,
+    ordinary_base_env: Option<&str>,
+) -> Result<Vec<OsString>, String> {
+    match requested {
+        None => Ok(ordinary_base_env
+            .map(|base_env| OsString::from(format!("--base-env={base_env}")))
+            .into_iter()
+            .collect()),
+        Some(value) if value == OsStr::new(HERMETIC_TEST_WORKDIR) => Ok(vec![
+            "--base-env=minimal".into(),
+            "--mount=type=tmpfs,target=/test".into(),
+            "--workdir=/test".into(),
+        ]),
+        Some(value) => Err(format!(
+            "{ISOLATED_WORKDIR_ENV} must be {HERMETIC_TEST_WORKDIR}, got {value:?}"
+        )),
+    }
+}
+
+fn configure_guest_execution(command: &mut Command, ordinary_base_env: Option<&str>) {
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    let args = guest_execution_args(requested.as_deref(), ordinary_base_env)
+        .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
+    command.args(args);
+}
+
+fn guest_execution_args_with_directory(
+    requested: Option<&OsStr>,
+    directory: &Path,
+) -> Result<Vec<OsString>, String> {
+    match requested {
+        None => Ok(Vec::new()),
+        Some(value) if value == OsStr::new(HERMETIC_TEST_WORKDIR) => Ok(vec![
+            "--base-env=minimal".into(),
+            format!(
+                "--mount=type=bind,source={},target={HERMETIC_TEST_WORKDIR}",
+                directory.display()
+            )
+            .into(),
+            format!("--workdir={HERMETIC_TEST_WORKDIR}").into(),
+        ]),
+        Some(value) => Err(format!(
+            "{ISOLATED_WORKDIR_ENV} must be {HERMETIC_TEST_WORKDIR}, got {value:?}"
+        )),
+    }
+}
+
+fn configure_guest_execution_with_directory(command: &mut Command, directory: &Path) {
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
+    let args = guest_execution_args_with_directory(requested.as_deref(), directory)
+        .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}"));
+    command.args(args);
+}
+
+#[test]
+#[ignore = "validate: fixed /test argument contract"]
+fn pinned_root_arguments_are_exact_and_fail_closed() {
+    assert!(guest_execution_args(None, None).unwrap().is_empty());
+    assert_eq!(
+        guest_execution_args(None, Some("minimal")).unwrap(),
+        [OsString::from("--base-env=minimal")]
+    );
+    assert_eq!(
+        guest_execution_args(Some(OsStr::new("/test")), None).unwrap(),
+        [
+            OsString::from("--base-env=minimal"),
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+    assert_eq!(
+        guest_execution_args(Some(OsStr::new("/test")), Some("minimal")).unwrap(),
+        [
+            OsString::from("--base-env=minimal"),
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+    let error = guest_execution_args(Some(OsStr::new("/tmp")), None).unwrap_err();
+    assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
+
+    let directory = Path::new("/host/private-project");
+    assert!(
+        guest_execution_args_with_directory(None, directory)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        guest_execution_args_with_directory(Some(OsStr::new("/test")), directory).unwrap(),
+        [
+            OsString::from("--base-env=minimal"),
+            OsString::from("--mount=type=bind,source=/host/private-project,target=/test"),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+    let error =
+        guest_execution_args_with_directory(Some(OsStr::new("/tmp")), directory).unwrap_err();
+    assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
+}
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#657)
@@ -239,10 +344,9 @@ fn assert_l2_under_strict_verify(program: &Path, args: &[&str]) {
             // weakening determinism (they do not disable strict mode).
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
-            "--",
-        ])
-        .arg(program)
-        .args(args);
+        ]);
+    configure_guest_execution(&mut command, None);
+    command.arg("--").arg(program).args(args);
 
     let rendered = format!("{command:?}");
     let output = run_hermit_command(command);
@@ -437,15 +541,16 @@ print(hermit_bound_probe.VALUE + sum(range(1000)))
             "--verify-strict",
         ])
         .arg(format!("--verify-json={}", report_path.display()))
-        .arg("--base-env=minimal")
         .arg(format!("--env=HOME={}", positive_home.path().display()))
         .args([
             // The test does not assert CPUID or PMU behavior; these flags keep
             // it portable without weakening strict determinism.
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
-            "--",
-        ])
+        ]);
+    configure_guest_execution(&mut command, Some("minimal"));
+    command
+        .arg("--")
         .arg(program)
         .args(["-I", "-B", "-c"])
         .arg(guest);
@@ -534,10 +639,9 @@ fn assert_l2_jvm_under_strict_verify(program: &Path, args: &[&str]) {
             // Relax only CPUID virtualization; keep RCB preemption on so the
             // JVM's internal threads make progress (see the doc comment).
             "--no-virtualize-cpuid",
-            "--",
-        ])
-        .arg(program)
-        .args(args);
+        ]);
+    configure_guest_execution(&mut command, None);
+    command.arg("--").arg(program).args(args);
 
     let rendered = format!("{command:?}");
     let output = run_hermit_command(command);
@@ -806,10 +910,9 @@ fn run_once_under_strict(program: &Path, args: &[&str]) -> Output {
             "--strict",
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
-            "--",
-        ])
-        .arg(program)
-        .args(args);
+        ]);
+    configure_guest_execution(&mut command, None);
+    command.arg("--").arg(program).args(args);
 
     run_hermit_command(command)
 }
@@ -1073,8 +1176,13 @@ fn run_make_under_strict(make: &Path, project_dir: &Path) -> Output {
             "--strict",
             "--no-virtualize-cpuid",
             "--max-timeslice=disabled",
-            "--",
-        ])
+        ]);
+    // This test needs its generated Makefile and returns build outputs to the
+    // controller. Its private temporary project is therefore the /test mount,
+    // rather than an empty tmpfs that would hide the fixture.
+    configure_guest_execution_with_directory(&mut command, project_dir);
+    command
+        .arg("--")
         .arg(make)
         .args(["-B", "app"])
         .current_dir(project_dir);

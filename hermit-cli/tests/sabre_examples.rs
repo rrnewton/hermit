@@ -31,6 +31,7 @@ fn execution_root_args(requested: Option<&OsStr>) -> Result<Vec<OsString>, Strin
     match requested {
         None => Ok(Vec::new()),
         Some(value) if value == OsStr::new(HERMETIC_TEST_WORKDIR) => Ok(vec![
+            "--base-env=minimal".into(),
             "--mount=type=tmpfs,target=/test".into(),
             "--workdir=/test".into(),
         ]),
@@ -51,6 +52,7 @@ fn sabre_pinned_root_arguments_are_exact_and_fail_closed() {
     assert_eq!(
         execution_root_args(Some(OsStr::new("/test"))).unwrap(),
         [
+            OsString::from("--base-env=minimal"),
             OsString::from("--mount=type=tmpfs,target=/test"),
             OsString::from("--workdir=/test"),
         ]
@@ -69,6 +71,7 @@ fn sabre_pinned_root_arguments_are_exact_and_fail_closed() {
     )
     .unwrap();
     let args: Vec<_> = command.get_args().collect();
+    assert!(args.contains(&OsStr::new("--base-env=minimal")));
     assert!(args.windows(2).any(|args| {
         args == [
             OsStr::new("--mount=type=tmpfs,target=/test"),

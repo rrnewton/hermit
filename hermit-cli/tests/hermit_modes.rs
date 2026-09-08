@@ -106,6 +106,14 @@ fn configure_execution_root(command: &mut Command) {
     command.args(args);
 }
 
+fn minimal_execution_root_args(requested: Option<&OsStr>) -> Result<Vec<OsString>, String> {
+    let mut args = execution_root_args(requested)?;
+    if requested.is_some() {
+        args.insert(0, "--base-env=minimal".into());
+    }
+    Ok(args)
+}
+
 fn compile_c(source: &Path, output: &Path) {
     let mut command = Command::new("cc");
     command
@@ -524,6 +532,16 @@ fn pinned_root_arguments_are_exact_and_fail_closed() {
     let error = execution_root_args(Some(OsStr::new("/tmp"))).unwrap_err();
     assert!(error.contains("HERMIT_E2E_EMPTY_WORKDIR must be /test"));
 
+    assert!(minimal_execution_root_args(None).unwrap().is_empty());
+    assert_eq!(
+        minimal_execution_root_args(Some(OsStr::new("/test"))).unwrap(),
+        [
+            OsString::from("--base-env=minimal"),
+            OsString::from("--mount=type=tmpfs,target=/test"),
+            OsString::from("--workdir=/test"),
+        ]
+    );
+
     let command = hermit_command_with_execution_root("minimal", Some(OsStr::new("/test")))
         .expect("the documented workdir request should build a command");
     let args: Vec<_> = command.get_args().collect();
@@ -667,6 +685,7 @@ fn run_bounded_sabre_strict_verify(program: &Path, args: &[&str], label: &str) {
 
     let _guard = hermit_run_lock();
     let mut command = Command::new(hermit_binary);
+    let requested = std::env::var_os(ISOLATED_WORKDIR_ENV);
     command.env("HERMIT_SABRE_BINARY", &loader).args([
         "run",
         "--backend",
@@ -674,7 +693,10 @@ fn run_bounded_sabre_strict_verify(program: &Path, args: &[&str], label: &str) {
         "--strict",
         "--verify",
     ]);
-    configure_execution_root(&mut command);
+    command.args(
+        minimal_execution_root_args(requested.as_deref())
+            .unwrap_or_else(|error| panic!("PATH-CONTRACT: {error}")),
+    );
     command
         .arg("--")
         .arg(program)

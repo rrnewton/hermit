@@ -189,6 +189,7 @@ fn fused_privileged_test_build_command() -> String {
 
 const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     "CARGO_BUILD_JOBS",
+    "CI",
     STEP_STARTED_MONOTONIC_NS_ENV,
     "E2E_BUILD_ROOT",
     E2E_KERNEL_VERSION_ENV,
@@ -2907,6 +2908,20 @@ cleared-caps refusal names {} starved step(s)",
         // the dependency that fusion rewrites through gate.manifest.
         let mut pinned_full = build_plan(&root, &full_args, &tmp)?;
         apply_pinned_root(&mut pinned_full, &root, false)?;
+        for step in pinned_full
+            .cfg
+            .steps
+            .iter()
+            .filter(|step| pinned_root_test_step(step, pinned_full.compat))
+        {
+            if step.deps.iter().any(|dependency| dependency == "setup.nextest") {
+                return Err(format!(
+                    "full-plan bracket: pinned-root test {} still depends on host setup.nextest: {:?}",
+                    step.tag(),
+                    step.deps
+                ));
+            }
+        }
         let deps_of = |tag: &str| {
             pinned_full
                 .cfg
@@ -2954,7 +2969,11 @@ cleared-caps refusal names {} starved step(s)",
                 privileged_test_producer.deps
             ));
         }
-        for tag in ["privileged-cpuid.faulting", "privileged-pmu.preemption"] {
+        for tag in [
+            "privileged-cpuid.faulting",
+            "privileged-pmu.preemption",
+            "privileged-test.cli_kvm",
+        ] {
             let test = pinned_full
                 .cfg
                 .steps
@@ -2964,11 +2983,11 @@ cleared-caps refusal names {} starved step(s)",
                     format!("full-plan bracket: post-fusion pinned-root test {tag} disappeared")
                 })?;
             if !test.cmd.contains("run-in-pinned-root.sh")
-                || test
-                    .env
-                    .get("HERMIT_E2E_EMPTY_WORKDIR")
-                    .map(String::as_str)
-                    != Some("/test")
+                || (tag == "privileged-test.cli_kvm"
+                    && (!test.cmd.contains("--env CI")
+                        || !test.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
+                        || !test.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")))
+                || test.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
                 || !test.deps.iter().any(|dependency| {
                     dependency == "privileged-build.privileged_tests_in_pinned_root"
                 })
@@ -2979,6 +2998,82 @@ cleared-caps refusal names {} starved step(s)",
             {
                 return Err(format!(
                     "full-plan bracket: post-fusion {tag} lost its image wrapper, /test gate or in-image privileged-test dependency: {test:?}"
+                ));
+            }
+        }
+        for (tag, required_producers, host_producers) in [
+            (
+                "test.hermit_integration",
+                &["build.e2e_artifact_in_pinned_root"][..],
+                &["build.e2e_artifact"][..],
+            ),
+            (
+                "test.cli",
+                &[
+                    "build.e2e_artifact_in_pinned_root",
+                    "build.liteinst_runtime_release_in_pinned_root",
+                ][..],
+                &["build.e2e_artifact", "build.liteinst_runtime_release"][..],
+            ),
+            (
+                "test.app_strict_verify",
+                &["build.e2e_artifact_in_pinned_root"][..],
+                &["build.e2e_artifact"][..],
+            ),
+        ] {
+            let test = pinned_full
+                .cfg
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .ok_or_else(|| {
+                    format!("full-plan bracket: post-fusion pinned-root test {tag} disappeared")
+                })?;
+            if !test.cmd.contains("run-in-pinned-root.sh")
+                || !test.cmd.contains("--env CI")
+                || !test.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
+                || !test.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")
+                || test.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+                || required_producers
+                    .iter()
+                    .any(|producer| !test.deps.iter().any(|dependency| dependency == *producer))
+                || host_producers
+                    .iter()
+                    .any(|producer| test.deps.iter().any(|dependency| dependency == *producer))
+            {
+                return Err(format!(
+                    "full-plan bracket: post-fusion {tag} lost its image wrapper, /test gate, count path or in-image producer dependency: {test:?}"
+                ));
+            }
+        }
+        let portable_cli = pinned_full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.cli")
+            .expect("test.cli checked above");
+        for excluded in [
+            "--skip run_kvm_",
+            "--skip backend_accepted_in_global_position",
+            "--skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them",
+            "--skip run_dbt_strict_returns_with_blocked_stdin_source",
+            "--skip run_dbt_verifies_pipe_backpressure",
+            "--skip run_dbt_keeps_diagnostics_out_of_guest_stderr",
+            "--skip run_dbt_recovers_after_failed_exec",
+            "--skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls",
+            "--skip run_dbt_verifies_queued_self_signals",
+            "--skip run_dbt_verifies_self_prlimit",
+            "--skip run_dbt_verifies_shell_process_lifecycle",
+            "--skip run_dbt_verifies_simple_env_shebang",
+            "--skip run_liteinst_rejects_non_fork_clone",
+            "--skip run_liteinst_handles_inherited_ignored_sigchld",
+            "--skip run_liteinst_verifies_forked_guest",
+            "--skip run_liteinst_verifies_raw_fork_guest",
+        ] {
+            if !portable_cli.cmd.contains(excluded) {
+                return Err(format!(
+                    "full-plan bracket: pinned-root test.cli lost the existing DBT/KVM exclusion {excluded:?}: {}",
+                    portable_cli.cmd
                 ));
             }
         }
@@ -4446,10 +4541,23 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
         "DAGRUN_TEST_COUNTS_PATH)",
         "destination=/dagrun-test-counts",
         "DAGRUN_TEST_COUNTS_PATH=/dagrun-test-counts/$counts_file",
+        "for cache in registry git",
+        "source=$cargo_home/$cache,destination=/build/.cargo/$cache",
+        "-e CARGO_HOME=\"$cargo_home_in\"",
     ] {
         if !pinned_root_wrapper.contains(fixture) {
             return Err(format!(
                 "verbosity: pinned-root wrapper lost structured count mapping {fixture:?}"
+            ));
+        }
+    }
+    for forbidden in [
+        "source=$cargo_home,destination=/cargo",
+        "-e CARGO_HOME=/cargo",
+    ] {
+        if pinned_root_wrapper.contains(forbidden) {
+            return Err(format!(
+                "verbosity: pinned-root wrapper restored the host Cargo home mount {forbidden:?}"
             ));
         }
     }
@@ -10969,12 +11077,6 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
 ];
 
 /// Dedicated non-manifest test nodes that run inside the pinned root.
-///
-/// `test.cli` deliberately remains absent: it is a mixed CLI suite whose
-/// LiteInst cases share a binary with unrelated host-side checks. Moving that
-/// whole node would exceed the LiteInst slice. The dedicated full-plan and
-/// focused LiteInst suites have explicit identities and can be moved without
-/// changing any other test's execution environment.
 const PINNED_ROOT_LITEINST_TEST_STEPS: &[&str] = &["test.liteinst_strict", "liteinst.strict"];
 const PINNED_ROOT_QUICK_TEST_STEPS: &[&str] = &[
     "quick.run_smoke",
@@ -10998,6 +11100,11 @@ const PINNED_ROOT_IGNORED_SYSCALL_TEST_STEPS: &[&str] =
     &["test.ignored_syscall_regressions"];
 const PINNED_ROOT_SABRE_TEST_STEPS: &[&str] = &["test.sabre_examples"];
 const PINNED_ROOT_HERMIT_MODES_TEST_STEPS: &[&str] = &["test.hermit_modes"];
+const PINNED_ROOT_PORTABLE_TEST_STEPS: &[&str] = &[
+    "test.hermit_integration",
+    "test.cli",
+    "test.app_strict_verify",
+];
 const PINNED_ROOT_PRIVILEGED_TEST_STEPS: &[&str] = &[
     "cpuid.faulting",
     "pmu.preemption",
@@ -11005,6 +11112,8 @@ const PINNED_ROOT_PRIVILEGED_TEST_STEPS: &[&str] = &[
     "privileged-cpuid.faulting",
     "privileged-pmu.preemption",
     "privileged-test.pmu_buck_chaos_cases",
+    "test.cli_kvm",
+    "privileged-test.cli_kvm",
 ];
 
 fn pinned_root_test_step(step: &Step, compat: Option<CompatMode>) -> bool {
@@ -11022,6 +11131,7 @@ fn pinned_root_test_step(step: &Step, compat: Option<CompatMode>) -> bool {
         || PINNED_ROOT_IGNORED_SYSCALL_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_SABRE_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_HERMIT_MODES_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_PORTABLE_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_PRIVILEGED_TEST_STEPS.contains(&step.tag().as_str())
         || (compat == Some(CompatMode::PortableStrict)
             && (step.group == "compat"
@@ -11242,6 +11352,10 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                     }
                 })
                 .collect();
+            // cargo-nextest is part of the pinned image. A pinned test must
+            // not wait for the host setup node, whose fallback installs it
+            // over the network and makes host tool state a test prerequisite.
+            step.deps.retain(|dep| dep != "setup.nextest");
             // The fused privileged build node is a host-side assertion over the
             // host artifact. Keep that edge, and also wait for the artifact built
             // in the pinned root that this wrapped cell will actually execute.
@@ -11323,13 +11437,28 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
                     vec!["compatprep.fixtures".into()],
                 ),
                 step("lint", "clippy", "cargo clippy --workspace", vec![]),
-                step("test", "hermit_integration", "./ci/run-nextest-counted.sh -p hermit", vec![]),
+                step(
+                    "test",
+                    "hermit_integration",
+                    "./ci/run-nextest-counted.sh -p hermit",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
                 step("setup", "nextest", "cargo nextest show-config version", vec![]),
                 step(
                     "test",
                     "cli",
                     "./ci/run-nextest-counted.sh -p hermit --test cli",
-                    vec!["build.liteinst_runtime_release".into(), "setup.nextest".into()],
+                    vec![
+                        "build.e2e_artifact".into(),
+                        "build.liteinst_runtime_release".into(),
+                        "setup.nextest".into(),
+                    ],
+                ),
+                step(
+                    "test",
+                    "app_strict_verify",
+                    "./ci/run-nextest-counted.sh -p hermit --test app_strict_verify",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
                 ),
                 // A producer whose output the cells execute: wrapped by the rule.
                 step("build", "workspace", "cargo build --workspace", vec![]),
@@ -11463,6 +11592,12 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
                     vec!["privileged-build.privileged_tests".into()],
                 ),
                 step(
+                    "privileged-test",
+                    "cli_kvm",
+                    "./ci/run-nextest-counted.sh -p hermit --test cli -E 'test(/^run_kvm_/)'",
+                    vec!["privileged-build.privileged_tests".into()],
+                ),
+                step(
                     "liteinst",
                     "hermit_release",
                     "cargo build --release -p hermit",
@@ -11487,6 +11622,20 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
         ..Default::default()
     };
     apply_pinned_root(&mut plan, Path::new("/repo"), false)?;
+    for step in plan
+        .cfg
+        .steps
+        .iter()
+        .filter(|step| pinned_root_test_step(step, plan.compat))
+    {
+        if step.deps.iter().any(|dependency| dependency == "setup.nextest") {
+            return Err(format!(
+                "pinned-root bracket: test {} still depends on host setup.nextest: {:?}",
+                step.tag(),
+                step.deps
+            ));
+        }
+    }
     let by_tag: BTreeMap<String, &Step> =
         plan.cfg.steps.iter().map(|step| (step.tag(), step)).collect();
     let fetch = by_tag
@@ -11510,8 +11659,6 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
         "gate.manifest",
         "test.strict_compat",
         "lint.clippy",
-        "test.hermit_integration",
-        "test.cli",
         "setup.nextest",
         "pre.submodules",
         PIN_GATE_TAG,
@@ -11621,6 +11768,73 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
     {
         return Err(format!(
             "pinned-root bracket: the scheduled cell does not consume the in-image rust-script producer: producer={rust_script_twin:?} cell={wrapped:?}"
+        ));
+    }
+
+    for (tag, required_producers, host_producers) in [
+        (
+            "test.hermit_integration",
+            &["build.e2e_artifact_in_pinned_root"][..],
+            &["build.e2e_artifact"][..],
+        ),
+        (
+            "test.cli",
+            &[
+                "build.e2e_artifact_in_pinned_root",
+                "build.liteinst_runtime_release_in_pinned_root",
+            ][..],
+            &["build.e2e_artifact", "build.liteinst_runtime_release"][..],
+        ),
+        (
+            "test.app_strict_verify",
+            &["build.e2e_artifact_in_pinned_root"][..],
+            &["build.e2e_artifact"][..],
+        ),
+    ] {
+        let test = by_tag
+            .get(tag)
+            .ok_or_else(|| format!("pinned-root bracket: {tag} disappeared"))?;
+        if !test.cmd.contains("run-in-pinned-root.sh")
+            || !test.cmd.contains("--env CI")
+            || !test.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
+            || !test.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")
+            || test.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+            || required_producers
+                .iter()
+                .any(|producer| !test.deps.iter().any(|dependency| dependency == *producer))
+            || host_producers
+                .iter()
+                .any(|producer| test.deps.iter().any(|dependency| dependency == *producer))
+        {
+            return Err(format!(
+                "pinned-root bracket: portable test {tag} lost its image wrapper, /test gate, count path or in-image producer dependency: {test:?}"
+            ));
+        }
+    }
+
+    let fused_cli_kvm = by_tag
+        .get("privileged-test.cli_kvm")
+        .ok_or("pinned-root bracket: fused privileged-test.cli_kvm disappeared")?;
+    if !fused_cli_kvm.cmd.contains("run-in-pinned-root.sh")
+        || !fused_cli_kvm.cmd.contains("--env CI")
+        || !fused_cli_kvm.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
+        || !fused_cli_kvm.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")
+        || fused_cli_kvm
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
+        || !fused_cli_kvm
+            .deps
+            .iter()
+            .any(|dependency| dependency == "privileged-build.privileged_tests_in_pinned_root")
+        || fused_cli_kvm
+            .deps
+            .iter()
+            .any(|dependency| dependency == "privileged-build.privileged_tests")
+    {
+        return Err(format!(
+            "pinned-root bracket: fused privileged-test.cli_kvm lost its image wrapper, /test gate, count path or in-image producer dependency: {fused_cli_kvm:?}"
         ));
     }
 
@@ -12099,7 +12313,7 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
             "pinned-root bracket: focused privileged-test producer is not in the image: {privileged_producer:?}"
         ));
     }
-    for tag in ["cpuid.faulting", "pmu.preemption"] {
+    for tag in ["cpuid.faulting", "pmu.preemption", "test.cli_kvm"] {
         let test = privileged_by_tag.get(tag).ok_or_else(|| {
             format!(
                 "pinned-root bracket: focused privileged test {tag} disappeared; available={:?}",
@@ -12107,11 +12321,11 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
             )
         })?;
         if !test.cmd.contains("run-in-pinned-root.sh")
-            || test
-                .env
-                .get("HERMIT_E2E_EMPTY_WORKDIR")
-                .map(String::as_str)
-                != Some("/test")
+            || (tag == "test.cli_kvm"
+                && (!test.cmd.contains("--env CI")
+                    || !test.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
+                    || !test.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")))
+            || test.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
             || !test
                 .deps
                 .iter()
@@ -12316,7 +12530,7 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
             "pinned-root bracket: sequential lanes must fetch once then reuse the cache: first_fetches={first_fetches} second_fetches={second_fetches} second={second_step:?}"
         ));
     }
-    Ok("pinned root: scheduled manifest cells, portable strict compatibility probes, the application, arbitrary-binary, strict-command, rr-suite contract, SaBRe example and Hermit mode test nodes, the DBT parity matrix, 2 in-process Detcore test nodes, 3 ordinary unit-test nodes, 2 privileged checks, 3 quick guest checks, the working-envelope check and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
+    Ok("pinned root: scheduled manifest cells, portable strict compatibility probes, the application, arbitrary-binary, strict-command, rr-suite contract, SaBRe example, Hermit mode, Hermit integration, CLI and application strict-verify test nodes, the DBT parity matrix, 2 in-process Detcore test nodes, 3 ordinary unit-test nodes, the selected KVM CLI tests, 2 privileged checks, 3 quick guest checks, the working-envelope check and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
 }
 
 // --------------------------------------------------------------------------- interruption
