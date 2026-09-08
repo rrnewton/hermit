@@ -10860,12 +10860,14 @@ const PINNED_ROOT_QUICK_TEST_STEPS: &[&str] = &[
     "quick.record_replay_smoke",
 ];
 const PINNED_ROOT_ENVELOPE_TEST_STEPS: &[&str] = &["test.envelope_levels"];
+const PINNED_ROOT_DBT_TEST_STEPS: &[&str] = &["test.dbt_parity"];
 
 fn pinned_root_test_step(step: &Step) -> bool {
     validation_step_identity(step) == ValidationStepIdentity::ManifestRun
         || PINNED_ROOT_LITEINST_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_QUICK_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_ENVELOPE_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_DBT_TEST_STEPS.contains(&step.tag().as_str())
 }
 
 // ⚠️ e2e.metadata IS DELIBERATELY ABSENT FROM THAT LIST, AND THE REASON CORRECTS MY OWN
@@ -11141,6 +11143,12 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
                 step("build", "workspace", "cargo build --workspace", vec![]),
                 step(
                     "build",
+                    "runtime_release",
+                    "cargo build --release --workspace",
+                    vec![],
+                ),
+                step(
+                    "build",
                     "e2e_artifact",
                     "./ci/publish-hermit-e2e-artifact.sh",
                     vec!["build.workspace".into()],
@@ -11165,6 +11173,12 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
                     "envelope_levels",
                     "HERMIT=target/debug/hermit; ARGS='run --base-env=minimal --mount=type=tmpfs,target=/test --workdir=/test'; true",
                     vec!["build.workspace".into()],
+                ),
+                step(
+                    "test",
+                    "dbt_parity",
+                    "python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbt --strict --require-backend --no-parent-scorecard",
+                    vec!["build.runtime_release".into()],
                 ),
                 step(
                     "liteinst",
@@ -11375,6 +11389,24 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
     {
         return Err(format!(
             "pinned-root bracket: test.envelope_levels lost its image wrapper, minimal environment, /test arguments or in-image build dependency: {envelope:?}"
+        ));
+    }
+    let dbt = by_tag
+        .get("test.dbt_parity")
+        .ok_or("pinned-root bracket: test.dbt_parity disappeared")?;
+    if !dbt.cmd.contains("run-in-pinned-root.sh")
+        || dbt.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+        || !dbt
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.runtime_release_in_pinned_root")
+        || dbt
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.runtime_release")
+    {
+        return Err(format!(
+            "pinned-root bracket: test.dbt_parity lost its image wrapper, /test gate or in-image release dependency: {dbt:?}"
         ));
     }
     for (producer_tag, dependency_tag) in [
@@ -11620,7 +11652,7 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
             "pinned-root bracket: sequential lanes must fetch once then reuse the cache: first_fetches={first_fetches} second_fetches={second_fetches} second={second_step:?}"
         ));
     }
-    Ok("pinned root: scheduled manifest cells, 3 quick guest checks, the working-envelope check and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
+    Ok("pinned root: scheduled manifest cells, the DBT parity matrix, 3 quick guest checks, the working-envelope check and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
 }
 
 // --------------------------------------------------------------------------- interruption

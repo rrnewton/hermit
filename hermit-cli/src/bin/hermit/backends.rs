@@ -452,6 +452,13 @@ fn apply_exact_environment(command: &mut StdCommand, environment: &BTreeMap<OsSt
     }
     command.envs(environment);
 }
+
+#[cfg(feature = "dbt")]
+fn apply_dbt_workdir(command: &mut StdCommand, workdir: Option<&Path>) {
+    if let Some(workdir) = workdir {
+        command.current_dir(workdir);
+    }
+}
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review inherited DBT policy descriptors and bounded reports.
 #[cfg(feature = "dbt")]
@@ -801,6 +808,7 @@ pub(super) fn run_dbt(
     log_file: Option<&Path>,
     config: &Config,
     mut environment: BTreeMap<OsString, OsString>,
+    workdir: Option<&Path>,
     verification_stdin: Option<std::fs::File>,
 ) -> Result<ExitStatus, Error> {
     if let Some(path) = verify_json.filter(|_| verify) {
@@ -874,6 +882,7 @@ pub(super) fn run_dbt(
     environment.insert(detcore_dbt::DETCONFIG_ENV.into(), config_json.into());
     apply_exact_environment(&mut guest, &environment);
     guest.args(&prepared.args);
+    apply_dbt_workdir(&mut guest, workdir);
 
     // The Detcore RPC handler can wait on the scheduler. Keep the scheduler
     // and coordinator service on independent executor threads so a synchronous
@@ -1186,6 +1195,7 @@ pub(super) fn run_dbt(
     _log_file: Option<&Path>,
     _config: &Config,
     _environment: BTreeMap<OsString, OsString>,
+    _workdir: Option<&Path>,
     _verification_stdin: Option<std::fs::File>,
 ) -> Result<ExitStatus, Error> {
     Err(Error::msg("DBT support was not included in this build"))
@@ -1460,6 +1470,17 @@ pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, E
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn dbt_workdir_reaches_the_dynamorio_guest_command() {
+        let mut command = std::process::Command::new("/bin/true");
+        super::apply_dbt_workdir(&mut command, Some(std::path::Path::new("/test")));
+        assert_eq!(
+            command.get_current_dir(),
+            Some(std::path::Path::new("/test"))
+        );
+    }
+
     #[cfg(feature = "dbt")]
     /// A behavioural pin, not a text match: require every record returned by
     /// Reverie's authenticated decoder to reach the comparison log. The decoder

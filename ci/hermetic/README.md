@@ -50,8 +50,10 @@ The pinned-root path selects one canonical execution root for every Hermit cell:
 fresh private `tmpfs` mounted at `/test`, with the guest working directory set
 to `/test`. The outer podman root supplies an empty `/test` mountpoint; each
 verify, replay, chaos, or custom invocation overlays its own tmpfs there.
-A naked or DBT invocation fails closed because those paths cannot apply the
-mount. The default working directory and relative scratch namespace therefore
+A naked invocation fails closed because it cannot apply the mount. DBT uses
+the outer pinned root's private `/test` tmpfs and passes that directory through
+the DynamoRIO launcher; it does not claim to apply Hermit's mount namespace.
+The default working directory and relative scratch namespace therefore
 cannot observe files or directory metadata written by sibling cells, even when every
 cell uses the same relative names. The pinned-root validation nodes keep `/src`
 writable and shared for build products and repository fixtures;
@@ -73,7 +75,8 @@ identical contract.
 
 The quick suite's guest-running checks, the working-envelope measurement, the
 dedicated `test.liteinst_strict` node, and the focused
-`--liteinst-compat-only` path also run in the pinned root. Their executable
+`--liteinst-compat-only` path also run in the pinned root. The DBT parity matrix
+runs there as well. Their executable
 inputs are built there. The direct quick smoke commands, the working-envelope
 probes, and every Hermit invocation owned by `liteinst_advanced` request
 `--base-env=minimal`, a private tmpfs at `/test`, and `/test` as their working
@@ -83,8 +86,6 @@ would also move unrelated CLI tests.
 This does not complete the every-test contract. The remaining execution
 boundaries need separate designs:
 
-- DBT-backed tests need DBT to support the requested guest working directory;
-  it currently refuses `--workdir` and guest mounts.
 - `test.detcore_misc` and `test.detcore_parallel` execute guests in-process, so
   there is no Hermit CLI boundary at which to apply the mount and working
   directory.
