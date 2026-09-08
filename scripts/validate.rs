@@ -10910,6 +10910,7 @@ const PINNED_ROOT_DBT_TEST_STEPS: &[&str] = &["test.dbt_parity"];
 const PINNED_ROOT_DETCORE_TEST_STEPS: &[&str] =
     &["test.detcore_misc", "test.detcore_parallel"];
 const PINNED_ROOT_APPLICATION_TEST_STEPS: &[&str] = &["test.applications_e2e"];
+const PINNED_ROOT_ARBITRARY_BINARY_TEST_STEPS: &[&str] = &["test.arbitrary_binaries"];
 
 fn pinned_root_test_step(step: &Step, compat: Option<CompatMode>) -> bool {
     validation_step_identity(step) == ValidationStepIdentity::ManifestRun
@@ -10919,6 +10920,7 @@ fn pinned_root_test_step(step: &Step, compat: Option<CompatMode>) -> bool {
         || PINNED_ROOT_DBT_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_DETCORE_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_APPLICATION_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_ARBITRARY_BINARY_TEST_STEPS.contains(&step.tag().as_str())
         || (compat == Some(CompatMode::PortableStrict)
             && (step.group == "compat"
                 || matches!(
@@ -11287,6 +11289,12 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
                     vec!["build.e2e_artifact".into()],
                 ),
                 step(
+                    "test",
+                    "arbitrary_binaries",
+                    "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test arbitrary_binaries -j 1",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
                     "liteinst",
                     "hermit_release",
                     "cargo build --release -p hermit",
@@ -11560,6 +11568,28 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
     {
         return Err(format!(
             "pinned-root bracket: test.applications_e2e lost its image wrapper, /test gate or in-image artifact dependency: {applications:?}"
+        ));
+    }
+    let arbitrary_binaries = by_tag
+        .get("test.arbitrary_binaries")
+        .ok_or("pinned-root bracket: test.arbitrary_binaries disappeared")?;
+    if !arbitrary_binaries.cmd.contains("run-in-pinned-root.sh")
+        || arbitrary_binaries
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
+        || !arbitrary_binaries
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+        || arbitrary_binaries
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact")
+    {
+        return Err(format!(
+            "pinned-root bracket: test.arbitrary_binaries lost its image wrapper, /test gate or in-image artifact dependency: {arbitrary_binaries:?}"
         ));
     }
     let compat_prep = by_tag
@@ -11868,7 +11898,7 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
             "pinned-root bracket: sequential lanes must fetch once then reuse the cache: first_fetches={first_fetches} second_fetches={second_fetches} second={second_step:?}"
         ));
     }
-    Ok("pinned root: scheduled manifest cells, portable strict compatibility probes, the application test node, the DBT parity matrix, 2 in-process Detcore test nodes, 3 quick guest checks, the working-envelope check and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
+    Ok("pinned root: scheduled manifest cells, portable strict compatibility probes, the application and arbitrary-binary test nodes, the DBT parity matrix, 2 in-process Detcore test nodes, 3 quick guest checks, the working-envelope check and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
 }
 
 // --------------------------------------------------------------------------- interruption
