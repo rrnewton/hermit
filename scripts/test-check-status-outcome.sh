@@ -47,7 +47,14 @@ fi
 # exit. Probing alone left exactly that window open; see
 # scripts/authority-available.sh.
 export DEV_HERMIT_PARENT="$_authority_dir"
-trap 'rm -rf "$_authority_dir"' EXIT
+tmp=""
+cleanup() {
+    local paths=()
+    [[ -n ${_authority_dir:-} ]] && paths+=("$_authority_dir")
+    [[ -n ${tmp:-} ]] && paths+=("$tmp")
+    [[ ${#paths[@]} -eq 0 ]] || rm -rf -- "${paths[@]}"
+}
+trap cleanup EXIT
 
 check() {
     local expected=$1 status=$2 conclusion=$3 python_result shell_result
@@ -101,7 +108,6 @@ for rollup in "[$older,$newer,$wrong_head]" "[$wrong_head,$newer,$older]"; do
 done
 mkdir -p "$ROOT_DIR/ignored"
 tmp=$(mktemp -d "$ROOT_DIR/ignored/check-status-outcome.XXXXXX")
-trap 'rm -rf -- "$tmp"' EXIT
 
 # Prove that local and fetched authority bytes must match the reviewed digest.
 # The source fixture lives under the checkout because Hermit replaces /tmp in
@@ -217,5 +223,17 @@ jq -e '
     .main.outcome == "PASSED" and
     .main.green == true
 ' <<<"$dag_health" >/dev/null
+
+# Exercise the same cleanup used on every early exit, then prove neither
+# temporary tree survived. Installing a second EXIT trap used to replace the
+# first one and leak the materialized authority directory on every passing run.
+authority_dir_for_cleanup_check=$_authority_dir
+fixture_dir_for_cleanup_check=$tmp
+cleanup
+[[ ! -e $authority_dir_for_cleanup_check && ! -e $fixture_dir_for_cleanup_check ]] || {
+    echo "test-check-status-outcome.sh: cleanup left a temporary directory behind" >&2
+    exit 1
+}
+trap - EXIT
 
 echo "PASS: lazy content pin and real classify-required-check, pr_status, and pr-dag-health consumers"
