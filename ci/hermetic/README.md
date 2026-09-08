@@ -103,6 +103,11 @@ same in-process Detcore helper that enters `/test` before its tracee closure
 runs. The PMU check executes the repository's performance-counter probe rather
 than a Hermit guest, so it has no guest working directory to change.
 
+The regular workspace crates and Detcore library and binary unit tests also run
+in the pinned root and consume its build artifact. Most of these are ordinary
+unit tests with no Hermit guest. The `detcore-testutils` cases included in the
+regular-crates node use the same `/test` request for their in-process tracees.
+
 This does not complete the every-test contract. Other host integration tests
 still need their Hermit invocations audited and staged.
 

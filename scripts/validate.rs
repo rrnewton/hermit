@@ -10964,6 +10964,7 @@ const PINNED_ROOT_ENVELOPE_TEST_STEPS: &[&str] = &["test.envelope_levels"];
 const PINNED_ROOT_DBT_TEST_STEPS: &[&str] = &["test.dbt_parity"];
 const PINNED_ROOT_DETCORE_TEST_STEPS: &[&str] =
     &["test.detcore_misc", "test.detcore_parallel"];
+const PINNED_ROOT_UNIT_TEST_STEPS: &[&str] = &["test.regular_crates", "test.detcore_unit"];
 const PINNED_ROOT_APPLICATION_TEST_STEPS: &[&str] = &["test.applications_e2e"];
 const PINNED_ROOT_ARBITRARY_BINARY_TEST_STEPS: &[&str] = &["test.arbitrary_binaries"];
 const PINNED_ROOT_COMMAND_TEST_STEPS: &[&str] = &["test.command_strict_verify"];
@@ -10982,6 +10983,7 @@ fn pinned_root_test_step(step: &Step, compat: Option<CompatMode>) -> bool {
         || PINNED_ROOT_ENVELOPE_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_DBT_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_DETCORE_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_UNIT_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_APPLICATION_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_ARBITRARY_BINARY_TEST_STEPS.contains(&step.tag().as_str())
         || PINNED_ROOT_COMMAND_TEST_STEPS.contains(&step.tag().as_str())
@@ -11350,6 +11352,18 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
                 ),
                 step(
                     "test",
+                    "regular_crates",
+                    "./ci/run-nextest-counted.sh --workspace --exclude hermit-detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
+                    "test",
+                    "detcore_unit",
+                    "./ci/run-nextest-counted.sh -p hermit-detcore --lib --bins",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
+                    "test",
                     "applications_e2e",
                     "./ci/run-with-hermit-e2e-artifact.sh --require-install ./tests/e2e/lib/applications/run_all.sh",
                     vec!["build.e2e_artifact".into()],
@@ -11621,6 +11635,30 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
         ));
     }
     for tag in PINNED_ROOT_DETCORE_TEST_STEPS {
+        let test = by_tag
+            .get(*tag)
+            .ok_or_else(|| format!("pinned-root bracket: {tag} disappeared"))?;
+        if !test.cmd.contains("run-in-pinned-root.sh")
+            || test
+                .env
+                .get("HERMIT_E2E_EMPTY_WORKDIR")
+                .map(String::as_str)
+                != Some("/test")
+            || !test
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+            || test
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.e2e_artifact")
+        {
+            return Err(format!(
+                "pinned-root bracket: {tag} lost its image wrapper, /test gate or in-image artifact dependency: {test:?}"
+            ));
+        }
+    }
+    for tag in PINNED_ROOT_UNIT_TEST_STEPS {
         let test = by_tag
             .get(*tag)
             .ok_or_else(|| format!("pinned-root bracket: {tag} disappeared"))?;
@@ -12134,7 +12172,7 @@ fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
             "pinned-root bracket: sequential lanes must fetch once then reuse the cache: first_fetches={first_fetches} second_fetches={second_fetches} second={second_step:?}"
         ));
     }
-    Ok("pinned root: scheduled manifest cells, portable strict compatibility probes, the application, arbitrary-binary, strict-command and rr-suite contract test nodes, the DBT parity matrix, 2 in-process Detcore test nodes, 2 privileged checks, 3 quick guest checks, the working-envelope check and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
+    Ok("pinned root: scheduled manifest cells, portable strict compatibility probes, the application, arbitrary-binary, strict-command and rr-suite contract test nodes, the DBT parity matrix, 2 in-process Detcore test nodes, 2 ordinary unit-test nodes, 2 privileged checks, 3 quick guest checks, the working-envelope check and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
 }
 
 // --------------------------------------------------------------------------- interruption
