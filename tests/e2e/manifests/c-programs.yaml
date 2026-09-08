@@ -2542,12 +2542,14 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         guest_args:
           ptrace:
             - pipe-order
+          kvm:
+            - pipe-order
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -2978,12 +2980,14 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         guest_args:
           ptrace:
             - threads
+          kvm:
+            - threads
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -6949,14 +6953,16 @@ test:
         backends_enabled:
           - ptrace
           - sabre
+          - kvm
         guest_args:
           ptrace:
+            - README.md
+          kvm:
             - README.md
           sabre:
             - README.md
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
         ci: false
@@ -7985,12 +7991,14 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         guest_args:
           ptrace:
             - itimer-delivery
+          kvm:
+            - itimer-delivery
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
       naked:
@@ -8676,14 +8684,16 @@ test:
         backends_enabled:
           - ptrace
           - liteinst
+          - kvm
         guest_args:
           ptrace:
+            - v4-us
+          kvm:
             - v4-us
           liteinst:
             - v4-us
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
-          kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
       naked:
         ci: false

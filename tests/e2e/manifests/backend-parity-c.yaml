@@ -5442,14 +5442,16 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - kvm
         guest_args:
           ptrace:
+            - workdir
+          kvm:
             - workdir
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: DBT does not enter the per-cell /test mount namespace
-          kvm: KVM verification does not yet compare canonical non-vacuous INFO evidence
           sabre: Canonical SaBRe verification has not been qualified for this environment-control fixture
           liteinst: LiteInst canonical verification remains blocked by guest-visible startup mapping identity
       naked:
