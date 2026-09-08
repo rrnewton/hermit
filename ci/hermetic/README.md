@@ -81,15 +81,16 @@ The in-process Detcore test helper applies the pinned-root `/test` request
 inside each tracee before its test closure runs. Portable strict compatibility
 is expanded into its ordinary direct `compat.*` nodes before those nodes and
 their fixture preparation are moved into the pinned root; it does not start a
-second validation scheduler. `test.applications_e2e` and
-`test.arbitrary_binaries` run there too. The application helper replaces its
-ordinary private `/tmp` workdir with a private `/test` mount when the
-pinned-root marker is present; the scheduled arbitrary-binary run matrix
-applies the same marker to each Hermit command. Their executable
-inputs are built there. The direct quick smoke commands, the working-envelope
-probes, and every Hermit invocation owned by `liteinst_advanced` request
-`--base-env=minimal`, a private tmpfs at `/test`, and `/test` as their working
-directory. The mixed `test.cli` node remains on the host because moving it
+second validation scheduler. `test.applications_e2e`,
+`test.arbitrary_binaries`, and `test.command_strict_verify` run there too. The
+application helper replaces its ordinary private `/tmp` workdir with a private
+`/test` mount when the pinned-root marker is present; the scheduled
+arbitrary-binary run matrix and strict-command suite apply the same marker to
+each Hermit command. Their executable inputs are built there. The direct quick
+smoke commands, the working-envelope probes, and every Hermit invocation owned
+by `liteinst_advanced` request `--base-env=minimal`, a private tmpfs at `/test`,
+and `/test` as their working directory. The mixed `test.cli` node remains on
+the host because moving it
 would also move unrelated CLI tests.
 
 This does not complete the every-test contract. Other host integration tests
