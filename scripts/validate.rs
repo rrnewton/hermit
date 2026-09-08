@@ -8039,7 +8039,7 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
         planned_test_nodes: test_nodes_of(&cfg),
         cfg,
         profile: "generated-validation-dag".into(),
-        selection_mode: "generator".into(),
+        selection_mode: "generator",
         cacheable: false,
         ..Default::default()
     })
@@ -9560,24 +9560,21 @@ fn manifest_node_vacuity_profile_bracket(
         .iter()
         .map(|step| (step.tag(), step.deps.clone()))
         .collect::<BTreeMap<_, _>>();
-    for consumer in [committed_scorecard_tag] {
-        if !before
-            .get(consumer)
-            .is_some_and(|deps| deps.iter().any(|dep| dep == withheld_tag))
-        {
-            return Err(format!(
-                "node vacuity: {label} result consumer {consumer} does not depend on {withheld_tag}"
-            ));
-        }
+    let consumer = committed_scorecard_tag;
+    if !before
+        .get(consumer)
+        .is_some_and(|deps| deps.iter().any(|dep| dep == withheld_tag))
+    {
+        return Err(format!(
+            "node vacuity: {label} result consumer {consumer} does not depend on {withheld_tag}"
+        ));
     }
     let mut expected = before.clone();
     expected.remove(withheld_tag);
-    for consumer in [committed_scorecard_tag] {
-        let deps = expected
-            .get_mut(consumer)
-            .ok_or_else(|| format!("node vacuity: {label} lost result consumer {consumer}"))?;
-        deps.retain(|dep| dep != withheld_tag);
-    }
+    let deps = expected
+        .get_mut(consumer)
+        .ok_or_else(|| format!("node vacuity: {label} lost result consumer {consumer}"))?;
+    deps.retain(|dep| dep != withheld_tag);
     let mut actual = Plan {
         cfg: DagConfig {
             steps,
@@ -10561,9 +10558,9 @@ fn outcome_failure_class(outcome: &StepOutcome) -> Option<FailureClass> {
         None
     } else if test_results_have_product_failure(outcome.test_results.as_deref()) {
         Some(FailureClass::ProductFailure)
-    } else if outcome_is_oom(outcome) {
-        Some(FailureClass::UnderstoodInfrastructureFailure)
-    } else if test_results_have_infrastructure_failure(outcome.test_results.as_deref()) {
+    } else if outcome_is_oom(outcome)
+        || test_results_have_infrastructure_failure(outcome.test_results.as_deref())
+    {
         Some(FailureClass::UnderstoodInfrastructureFailure)
     } else if outcome_is_no_result(outcome)
         || outcome.returncode.is_none()
@@ -10618,9 +10615,9 @@ fn step_test_attempt_outcome(outcome: &StepOutcome) -> TestAttemptOutcome {
         TestAttemptOutcome::CpuTimeout
     } else if outcome.timed_out {
         TestAttemptOutcome::WallTimeout
-    } else if outcome.test_results_error.is_some() {
-        TestAttemptOutcome::InfrastructureError
-    } else if test_results_have_infrastructure_failure(outcome.test_results.as_deref()) {
+    } else if outcome.test_results_error.is_some()
+        || test_results_have_infrastructure_failure(outcome.test_results.as_deref())
+    {
         TestAttemptOutcome::InfrastructureError
     } else if outcome_is_no_result(outcome)
         || outcome.returncode.is_none()
