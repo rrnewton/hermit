@@ -8983,6 +8983,23 @@ fn print_compat_summary(
     )
 }
 
+/// Summarize compatibility only when the selected run actually reached a
+/// compatibility node. Selection can retain profile metadata after pruning
+/// every node with the profile's prefix. That state is unmeasured (`None`), not
+/// an exactly measured empty matrix (`Some(... measured = 0)`). Once even one
+/// selected compatibility node has an outcome, a zero measured denominator is
+/// real and the completeness refusal must remain active.
+fn selected_compat_summary(
+    mode: CompatMode,
+    prefix: &str,
+    outcomes: &[StepOutcome],
+) -> Option<(usize, usize, Vec<String>, BTreeSet<String>)> {
+    outcomes
+        .iter()
+        .any(|outcome| outcome.tag.starts_with(prefix))
+        .then(|| print_compat_summary(mode, prefix, outcomes))
+}
+
 /// The real summary body, with its two policy tables passed in.
 ///
 /// Production calls it through [`print_compat_summary`] with the REAL tables, so nothing is
@@ -13746,7 +13763,10 @@ fn run_test_counts(
     // every compatibility node. That is no measurement, not a measured empty
     // corpus. Preserve the base UNKNOWN/known state; the separate compatibility
     // completeness check still reports a missing planned population by name.
-    if !outcomes.iter().any(|outcome| outcome.tag.starts_with(prefix)) {
+    if !outcomes
+        .iter()
+        .any(|outcome| outcome.tag.starts_with(prefix))
+    {
         return Ok((base_executed, base_passed, base_filtered));
     }
 
@@ -13939,6 +13959,38 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
     {
         return Err(
             "typed libtest counts: an unexecuted compatibility population manufactured a measured zero".into(),
+        );
+    }
+
+    if selected_compat_summary(
+        CompatMode::PortableStrict,
+        "compat.",
+        &[outcome("pre.failed", false, None, None)],
+    )
+    .is_some()
+    {
+        return Err(
+            "typed libtest counts: compatibility metadata without a selected compatibility row was reported as measured"
+                .into(),
+        );
+    }
+    let mut selected_unmeasured = outcome("compat.selected", false, None, None);
+    selected_unmeasured.returncode = None;
+    selected_unmeasured.reason = "no completion payload".into();
+    let Some((_, measured, _, _)) = selected_compat_summary(
+        CompatMode::PortableStrict,
+        "compat.",
+        &[selected_unmeasured],
+    ) else {
+        return Err(
+            "typed libtest counts: a selected compatibility row disappeared from completeness accounting"
+                .into(),
+        );
+    };
+    if measured != 0 || verdict_refusals(Some(measured), 0, None).is_empty() {
+        return Err(
+            "typed libtest counts: a selected compatibility row with no completed measurement did not retain the measured-zero refusal"
+                .into(),
         );
     }
 
@@ -18642,26 +18694,32 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         let prefix = plan
             .compat_prefix
             .expect("compatibility plans carry their committed tag prefix");
-        let (passed, measured, blocking, nonblocking) =
-            print_compat_summary(mode, prefix, &outcomes);
-        compat_blocking = blocking.len();
-        compat_nonblocking = nonblocking;
-        compat_measured = Some(measured);
-        let floor = match mode {
-            CompatMode::Sabre => Some(validate_corpus::SABRE_COMPAT_EXPECTED),
-            CompatMode::Rr => Some(validate_corpus::RR_COMPAT_EXPECTED),
-            CompatMode::Strict | CompatMode::PortableStrict | CompatMode::E9patch => None,
-        };
-        if let Some(f) = floor {
-            if passed < f {
-                println!("❌ {} ratchet: {passed}/{measured} passing, floor {f} — BELOW FLOOR", mode.display_name());
-                ok = false;
-            } else {
-                println!("✅ {} ratchet: {passed}/{measured} passing, floor {f} — met", mode.display_name());
+        if let Some((passed, measured, blocking, nonblocking)) =
+            selected_compat_summary(mode, prefix, &outcomes)
+        {
+            compat_blocking = blocking.len();
+            compat_nonblocking = nonblocking;
+            compat_measured = Some(measured);
+            let floor = match mode {
+                CompatMode::Sabre => Some(validate_corpus::SABRE_COMPAT_EXPECTED),
+                CompatMode::Rr => Some(validate_corpus::RR_COMPAT_EXPECTED),
+                CompatMode::Strict | CompatMode::PortableStrict | CompatMode::E9patch => None,
+            };
+            if let Some(f) = floor {
+                if passed < f {
+                    println!("❌ {} ratchet: {passed}/{measured} passing, floor {f} — BELOW FLOOR", mode.display_name());
+                    ok = false;
+                } else {
+                    println!("✅ {} ratchet: {passed}/{measured} passing, floor {f} — met", mode.display_name());
+                }
             }
-        }
-        if !blocking.is_empty() {
-            println!("❌ {} blocking failures ({}): {}", mode.display_name(), blocking.len(), blocking.join(", "));
+            if !blocking.is_empty() {
+                println!("❌ {} blocking failures ({}): {}", mode.display_name(), blocking.len(), blocking.join(", "));
+            }
+        } else {
+            println!(
+                "COMPATIBILITY SUMMARY: measurement unavailable — the selected run contained no {prefix} nodes"
+            );
         }
     }
 
