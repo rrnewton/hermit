@@ -97,6 +97,12 @@ The focused `test.rr_suite_contract` node also runs in the pinned root. Its one
 selected test checks scratch-directory creation and cleanup and does not launch
 a Hermit guest, so it has no guest working directory to change.
 
+The privileged CPUID-faulting check and PMU preemption check run in the pinned
+root as well, with their test executable built there. The CPUID check uses the
+same in-process Detcore helper that enters `/test` before its tracee closure
+runs. The PMU check executes the repository's performance-counter probe rather
+than a Hermit guest, so it has no guest working directory to change.
+
 This does not complete the every-test contract. Other host integration tests
 still need their Hermit invocations audited and staged.
 
