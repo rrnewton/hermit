@@ -3104,19 +3104,23 @@ done
 supervisor=
 parent_tgid=$(sed -n 's/^Tgid:[[:space:]]*//p' "/proc/$PPID/status")
 printf 'self=%s parent=%s parent_tgid=%s\n' "$$" "$PPID" "$parent_tgid" > "$HERMIT_FATAL_TOPOLOGY"
-for status in /proc/[0-9]*/status; do
-  candidate=${status#/proc/}
-  candidate=${candidate%/status}
-  candidate_parent=$(sed -n 's/^PPid:[[:space:]]*//p' "$status")
-  [ "$candidate_parent" = "$parent_tgid" ] || continue
-  descriptor=$(readlink "/proc/$candidate/fd/198")
-  printf 'candidate=%s fd198=%s\n' "$candidate" "$descriptor" >> "$HERMIT_FATAL_TOPOLOGY"
-  if [ "$candidate" != "$$" ] && [ -r "/proc/$candidate/fdinfo/198" ]; then
+while [ -z "$supervisor" ]; do
+  for status in /proc/[0-9]*/status; do
+    candidate=${status#/proc/}
+    candidate=${candidate%/status}
+    candidate_parent=$(sed -n 's/^PPid:[[:space:]]*//p' "$status")
+    [ "$candidate_parent" = "$parent_tgid" ] || continue
+    [ "$candidate" != "$$" ] || continue
+    [ -r "/proc/$candidate/fdinfo/198" ] || continue
+    descriptor=$(readlink "/proc/$candidate/fd/198")
+    printf 'candidate=%s fd198=%s\n' "$candidate" "$descriptor" >> "$HERMIT_FATAL_TOPOLOGY"
     supervisor=$candidate
     break
+  done
+  if [ -z "$supervisor" ]; then
+    sleep 0.01
   fi
 done
-[ -n "$supervisor" ] || exit 91
 printf '%s\n' "$supervisor" > "$HERMIT_FATAL_SUPERVISOR_PID"
 while [ ! -e "$HERMIT_FATAL_RELEASE" ]; do sleep 0.01; done
 exit 0
