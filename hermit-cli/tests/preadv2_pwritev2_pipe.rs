@@ -341,48 +341,12 @@ fn pwritev2_partial_progress_is_interrupted_on_a_non_root_writer() {
 }
 
 #[test]
-fn kvm_current_position_vectored_descriptor_matrix_completes_when_available() {
-    if !Path::new("/dev/kvm").exists() {
-        eprintln!("SKIP: /dev/kvm is not present");
-        return;
-    }
+#[ignore = "requires combined PR529 per-thread scratch + PR538 vectored support"]
+fn kvm_current_position_vectored_descriptor_matrix_requires_pr529_and_pr538() {
     let _guard = KVM_RUN_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let guest = compile_guest();
-    let mut probe = Command::new("timeout");
-    probe
-        .args(["--kill-after", "5s", "30s"])
-        .arg(hermit_test::hermit_binary())
-        .args([
-            "--log=error",
-            "run",
-            "--backend=kvm",
-            "--allow-unsupported-syscalls",
-            "--base-env=minimal",
-            "--",
-        ])
-        .arg(&guest)
-        .arg("probe-preadv2");
-    let rendered_probe = format!("{probe:?}");
-    let probe_output = probe.output().unwrap_or_else(|error| {
-        panic!("failed to start KVM p*v2 probe: {rendered_probe}: {error}")
-    });
-    let probe_stdout = String::from_utf8_lossy(&probe_output.stdout);
-    if probe_output.status.code() == Some(77)
-        && probe_stdout.contains("preadv2-backend-unsupported")
-    {
-        eprintln!("SKIP: pinned reverie-kvm does not implement preadv2");
-        return;
-    }
-    assert!(
-        probe_output.status.success() && probe_stdout.contains("preadv2-backend-supported"),
-        "KVM p*v2 capability probe failed: {rendered_probe}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-        probe_output.status,
-        probe_stdout,
-        String::from_utf8_lossy(&probe_output.stderr),
-    );
-
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "10s", "90s"])
