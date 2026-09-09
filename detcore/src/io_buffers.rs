@@ -263,6 +263,7 @@ pub(crate) const HASHED_SYSCALLS: &[reverie::syscalls::Sysno] = &[
     reverie::syscalls::Sysno::recvmmsg,
     reverie::syscalls::Sysno::readv,
     reverie::syscalls::Sysno::preadv,
+    reverie::syscalls::Sysno::preadv2,
     // Bytes the guest produced.
     reverie::syscalls::Sysno::write,
     reverie::syscalls::Sysno::pwrite64,
@@ -270,6 +271,7 @@ pub(crate) const HASHED_SYSCALLS: &[reverie::syscalls::Sysno] = &[
     reverie::syscalls::Sysno::sendmsg,
     reverie::syscalls::Sysno::writev,
     reverie::syscalls::Sysno::pwritev,
+    reverie::syscalls::Sysno::pwritev2,
     // Rewritten in place across the whole array.
     reverie::syscalls::Sysno::poll,
     reverie::syscalls::Sysno::ppoll,
@@ -325,6 +327,12 @@ where
         Syscall::Preadv(c) => {
             iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.iov_len(), ret)?
         }
+        Syscall::Preadv2(c) => iovec_extents(
+            guest,
+            c.iov().map_or(0, |p| p.as_raw()),
+            usize::try_from(c.iov_len()).unwrap_or(usize::MAX),
+            ret,
+        )?,
 
         // Bytes the guest produced. These never reach stdout/stderr for a QEMU
         // boot -- measured, all 234,872 writes went to fds 7/12/14/11/13/4/8/19/23
@@ -340,6 +348,12 @@ where
         Syscall::Pwritev(c) => {
             iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.iov_len(), ret)?
         }
+        Syscall::Pwritev2(c) => iovec_extents(
+            guest,
+            c.iov().map_or(0, |p| p.as_raw()),
+            usize::try_from(c.iov_len()).unwrap_or(usize::MAX),
+            ret,
+        )?,
 
         // Rewritten in place across the WHOLE array: `poll` sets `revents` on
         // every entry, not just on the `ret` that were ready, so the extent is
@@ -366,7 +380,8 @@ fn direction(call: &Syscall) -> Direction {
         | Syscall::Sendto(_)
         | Syscall::Sendmsg(_)
         | Syscall::Writev(_)
-        | Syscall::Pwritev(_) => Direction::Out,
+        | Syscall::Pwritev(_)
+        | Syscall::Pwritev2(_) => Direction::Out,
         _ => Direction::In,
     }
 }
@@ -670,5 +685,12 @@ mod tests {
     fn direction_separates_kernel_produced_from_guest_produced() {
         assert_eq!(Direction::In.as_str(), "in");
         assert_eq!(Direction::Out.as_str(), "out");
+
+        let preadv2 = Syscall::Preadv2(syscalls::Preadv2::new());
+        let pwritev2 = Syscall::Pwritev2(syscalls::Pwritev2::new());
+        assert_eq!(direction(&preadv2), Direction::In);
+        assert_eq!(direction(&pwritev2), Direction::Out);
+        assert!(HASHED_SYSCALLS.contains(&syscalls::Sysno::preadv2));
+        assert!(HASHED_SYSCALLS.contains(&syscalls::Sysno::pwritev2));
     }
 }

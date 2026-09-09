@@ -2350,8 +2350,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Preadv2,
     ) -> Result<i64, Error> {
+        let offset = vectored_offset(call.pos_l(), call.pos_h());
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
-            let offset = vectored_offset(call.pos_l(), call.pos_h());
             if offset < -1 {
                 return Err(Errno::EINVAL.into());
             }
@@ -2374,18 +2374,41 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::ENOSYS.into());
         }
 
-        let resource = guest
-            .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.resource())?;
+        let (fd_type, physically_nonblocking, logically_nonblocking, open_file_id, resource) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.ty(),
+                    detfd.physically_nonblocking(),
+                    detfd.is_nonblocking(),
+                    detfd.open_file_id(),
+                    detfd.resource(),
+                )
+            })?;
 
         if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::R);
+            let mut request = guest.thread_state().mk_request(resource, Permission::R);
+            if should_tag_sabre_internal_pipe_io(
+                guest.config().discover_live_file_metadata,
+                fd_type,
+                physically_nonblocking,
+                logically_nonblocking,
+            ) {
+                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+            }
             resource_request(guest, request).await;
         }
 
-        let res = self
-            .record_or_replay_preserving_tool_errors(guest, call)
-            .await;
+        let res = if offset == -1
+            && physically_nonblocking
+            && fd_type == FdType::Pipe
+            && !logically_nonblocking
+        {
+            self.execute_blocking_pipe_preadv2(guest, call, open_file_id)
+                .await
+        } else {
+            self.record_or_replay_preserving_tool_errors(guest, call)
+                .await
+        };
         resource_release_all(guest).await;
         res
     }
@@ -2455,8 +2478,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Pwritev2,
     ) -> Result<i64, Error> {
+        let offset = vectored_offset(call.pos_l(), call.pos_h());
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
-            let offset = vectored_offset(call.pos_l(), call.pos_h());
             if offset < -1 {
                 return Err(Errno::EINVAL.into());
             }
@@ -2471,8 +2494,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource(), detfd.stat().map(|stat| stat.inode))
+        let (
+            fd_type,
+            physically_nonblocking,
+            logically_nonblocking,
+            open_file_id,
+            resource,
+            raw_ino,
+        ) = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            (
+                detfd.ty(),
+                detfd.physically_nonblocking(),
+                detfd.is_nonblocking(),
+                detfd.open_file_id(),
+                detfd.resource(),
+                detfd.stat().map(|stat| stat.inode),
+            )
         })?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
@@ -2489,13 +2526,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
 
         if let Some(resource) = resource {
-            let request = guest.thread_state().mk_request(resource, Permission::W);
+            let mut request = guest.thread_state().mk_request(resource, Permission::W);
+            if should_tag_sabre_internal_pipe_io(
+                guest.config().discover_live_file_metadata,
+                fd_type,
+                physically_nonblocking,
+                logically_nonblocking,
+            ) {
+                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+            }
             resource_request(guest, request).await;
         }
 
-        let result = self
-            .record_or_replay_preserving_tool_errors(guest, call)
-            .await;
+        let result = if offset == -1
+            && physically_nonblocking
+            && fd_type == FdType::Pipe
+            && !logically_nonblocking
+        {
+            self.execute_blocking_pipe_pwritev2(guest, call, open_file_id)
+                .await
+        } else {
+            self.record_or_replay_preserving_tool_errors(guest, call)
+                .await
+        };
 
         if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
             let inode = raw_ino.expect("virtualized metadata requires stat data for tracked fds");
