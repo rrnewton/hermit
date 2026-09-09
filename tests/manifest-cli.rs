@@ -84,6 +84,26 @@ fn repo_root() -> PathBuf {
 }
 
 fn shell_quote(value: &str) -> String {
+    if value.bytes().any(|byte| !(b' '..=b'~').contains(&byte)) {
+        let mut quoted = String::from("$'");
+        for byte in value.bytes() {
+            match byte {
+                b'\\' => quoted.push_str("\\\\"),
+                b'\'' => quoted.push_str("\\'"),
+                b'\n' => quoted.push_str("\\n"),
+                b'\r' => quoted.push_str("\\r"),
+                b'\t' => quoted.push_str("\\t"),
+                b' '..=b'~' => quoted.push(char::from(byte)),
+                _ => {
+                    quoted.push_str("\\x");
+                    quoted.push(char::from(b"0123456789abcdef"[(byte >> 4) as usize]));
+                    quoted.push(char::from(b"0123456789abcdef"[(byte & 0x0f) as usize]));
+                }
+            }
+        }
+        quoted.push('\'');
+        return quoted;
+    }
     if !value.is_empty()
         && value
             .bytes()
@@ -1166,33 +1186,35 @@ guest_args:
     );
 
     let direct_string: Value = r#"
-direct: 'printf "%s|%s" "$0" "${1-unset}"'
+direct: 'printf "%s\0" "$0" "$@"'
 "#
     .parse()
     .unwrap();
     let (_, direct_guest) = setup_prefix(&direct_string, "fixture");
     let no_args = guest_with_args(&direct_string, &direct_guest, &[]);
-    assert_eq!(no_args, "sh -c 'printf \"%s|%s\" \"$0\" \"${1-unset}\"'");
+    assert_eq!(no_args, "sh -c 'printf \"%s\\0\" \"$0\" \"$@\"'");
+    assert_eq!(no_args.lines().count(), 1);
     let output = Command::new("sh").arg("-c").arg(&no_args).output().unwrap();
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"sh|unset");
+    assert_eq!(output.stdout, b"sh\0");
 
     let direct_guest = guest_with_args(
         &direct_string,
         &direct_guest,
-        &["first".into(), "second".into()],
+        &["".into(), "tab\tinside".into(), "line\ninside".into()],
     );
     assert_eq!(
         direct_guest,
-        "sh -c 'printf \"%s|%s\" \"$0\" \"${1-unset}\"' -- first second"
+        "sh -c 'printf \"%s\\0\" \"$0\" \"$@\"' -- '' $'tab\\tinside' $'line\\ninside'"
     );
+    assert_eq!(direct_guest.lines().count(), 1);
     let output = Command::new("sh")
         .arg("-c")
         .arg(&direct_guest)
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"--|first");
+    assert_eq!(output.stdout, b"--\0\0tab\tinside\0line\ninside\0");
     println!("manifest-cli self-test: PASS");
     ExitCode::SUCCESS
 }

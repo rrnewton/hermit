@@ -71,6 +71,26 @@ fn repo_root() -> PathBuf {
 }
 
 fn shell_quote(value: &str) -> String {
+    if value.bytes().any(|byte| !(b' '..=b'~').contains(&byte)) {
+        let mut quoted = String::from("$'");
+        for byte in value.bytes() {
+            match byte {
+                b'\\' => quoted.push_str("\\\\"),
+                b'\'' => quoted.push_str("\\'"),
+                b'\n' => quoted.push_str("\\n"),
+                b'\r' => quoted.push_str("\\r"),
+                b'\t' => quoted.push_str("\\t"),
+                b' '..=b'~' => quoted.push(char::from(byte)),
+                _ => {
+                    quoted.push_str("\\x");
+                    quoted.push(char::from(b"0123456789abcdef"[(byte >> 4) as usize]));
+                    quoted.push(char::from(b"0123456789abcdef"[(byte & 0x0f) as usize]));
+                }
+            }
+        }
+        quoted.push('\'');
+        return quoted;
+    }
     if !value.is_empty()
         && value
             .bytes()
@@ -802,40 +822,131 @@ test:
     }
 
     #[test]
-    fn string_direct_guest_arguments_begin_at_one() {
-        let tests = manifest(
+    fn string_direct_commands_are_one_line_and_preserve_exact_arguments() {
+        let without_args = manifest(
             r#"
 test:
-  - id: c-programs/direct-string
-    direct: 'printf "%s|%s" "$0" "${1-unset}"'
+  - id: c-programs/direct-string-empty
+    direct: 'printf "%s\0" "$0" "$@"'
     modes:
-      verify:
-        backends_enabled: [ptrace]
+      naked:
+        backends_enabled: [native]
+        runs: 3
+        guest_args:
+          native: []
 "#,
         );
-        let (_, guest) = setup_prefix(&tests[0].2, "c-programs/direct-string");
-        let no_args = guest_with_args(&tests[0].2, &guest, &[]);
-        assert_eq!(no_args, "sh -c 'printf \"%s|%s\" \"$0\" \"${1-unset}\"'");
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&no_args)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        assert_eq!(output.stdout, b"sh|unset");
-
-        let guest = guest_with_args(&tests[0].2, &guest, &["first".into(), "second".into()]);
+        let (_, guest) = setup_prefix(&without_args[0].2, "c-programs/direct-string-empty");
         assert_eq!(
-            guest,
-            "sh -c 'printf \"%s|%s\" \"$0\" \"${1-unset}\"' -- first second"
+            guest_with_args(&without_args[0].2, &guest, &[]),
+            "sh -c 'printf \"%s\\0\" \"$0\" \"$@\"'"
         );
-        let output = std::process::Command::new("sh")
+        let commands = commands_for_test(&without_args[0].2, "c-programs", 15);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].lines().count(), commands.len());
+        let empty_dir =
+            std::env::temp_dir().join(format!("manifest-direct-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty_dir);
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        let output = std::process::Command::new("bash")
             .arg("-c")
-            .arg(&guest)
+            .arg(&commands[0])
+            .current_dir(&empty_dir)
             .output()
             .unwrap();
         assert!(output.status.success());
-        assert_eq!(output.stdout, b"--|first");
+        assert_eq!(output.stdout, b"sh\0sh\0sh\0");
+        std::fs::remove_dir_all(empty_dir).unwrap();
+
+        let with_args = manifest(
+            r#"
+test:
+  - id: c-programs/direct-string-arguments
+    direct: 'printf "%s\0" "$0" "$@"'
+    modes:
+      naked:
+        backends_enabled: [native]
+        runs: 3
+        guest_args:
+          native: ['', "tab\tinside", "line\ninside"]
+"#,
+        );
+        let (_, guest) = setup_prefix(&with_args[0].2, "c-programs/direct-string-arguments");
+        assert_eq!(
+            guest_with_args(
+                &with_args[0].2,
+                &guest,
+                &["".into(), "tab\tinside".into(), "line\ninside".into()]
+            ),
+            "sh -c 'printf \"%s\\0\" \"$0\" \"$@\"' -- '' $'tab\\tinside' $'line\\ninside'"
+        );
+        let commands = commands_for_test(&with_args[0].2, "c-programs", 15);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].lines().count(), commands.len());
+        let args_dir =
+            std::env::temp_dir().join(format!("manifest-direct-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&args_dir);
+        std::fs::create_dir_all(&args_dir).unwrap();
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&commands[0])
+            .current_dir(&args_dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout,
+            b"--\0\0tab\tinside\0line\ninside\0--\0\0tab\tinside\0line\ninside\0--\0\0tab\tinside\0line\ninside\0"
+        );
+        std::fs::remove_dir_all(args_dir).unwrap();
+    }
+
+    #[test]
+    fn program_commands_are_one_line_and_preserve_exact_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let work = std::env::temp_dir().join(format!("manifest-program-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let script = work.join("argv.sh");
+        std::fs::write(
+            &script,
+            b"#!/usr/bin/env bash\ncase \"$1\" in --prepare) exit 0;; --run) shift; printf '%s\\0' \"$@\";; *) exit 2;; esac\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let tests = manifest(&format!(
+            r#"
+test:
+  - id: c-programs/program-arguments
+    program: {}
+    modes:
+      naked:
+        backends_enabled: [native]
+        runs: 3
+        guest_args:
+          native: ['', "tab\tinside", "line\ninside"]
+"#,
+            script.display()
+        ));
+        let commands = commands_for_test(&tests[0].2, "c-programs", 15);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].lines().count(), commands.len());
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&commands[0])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout,
+            b"\0tab\tinside\0line\ninside\0\0tab\tinside\0line\ninside\0\0tab\tinside\0line\ninside\0"
+        );
+        std::fs::remove_dir_all(work).unwrap();
     }
 
     #[test]
