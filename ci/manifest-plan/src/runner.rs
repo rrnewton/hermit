@@ -775,9 +775,9 @@ fn validate_mode_with_cpu(
         ));
     }
     for backend in recipe.guest_args.keys() {
-        if !enabled.contains(backend.as_str()) {
+        if !enabled.contains(backend.as_str()) && !disabled.contains(backend.as_str()) {
             return Err(format!(
-                "{id}: {mode} guest_args names disabled backend {backend}"
+                "{id}: {mode} guest_args names backend {backend} outside backends_enabled/backends_disabled"
             ));
         }
     }
@@ -4455,6 +4455,52 @@ mod tests {
             infrastructure_error_result(&context, &cell, "fixture".into()).classification,
             "required"
         );
+    }
+
+    #[test]
+    fn disabled_population_uses_only_its_explicit_guest_arguments() {
+        let mut test = recipe(true);
+        let mode = test.modes.get_mut("verify").unwrap();
+        mode.guest_args.insert(
+            "ptrace".into(),
+            vec!["ptrace-scenario".into(), "ptrace-detail".into()],
+        );
+        mode.guest_args
+            .insert("kvm".into(), vec!["kvm-scenario".into()]);
+        validate_mode("fixture/test", "verify", mode, 60).unwrap();
+
+        let set = ManifestSet {
+            documents: Vec::new(),
+            tests: BTreeMap::from([(
+                test.id.clone(),
+                ("fixture".into(), 60, DEFAULT_TEST_CPU_TIMEOUT_SECONDS, test),
+            )]),
+        };
+        let cells = set
+            .select(&Selection {
+                population: Some(Population::Disabled),
+                test: Some("fixture/test".into()),
+                mode: Some("verify".into()),
+                backend: Some("kvm".into()),
+                ..Selection::default()
+            })
+            .unwrap();
+        assert_eq!(cells.len(), 1);
+        assert!(!cells[0].enabled);
+
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-disabled-guest-args-bracket-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let context = run_context(&root);
+        let guest = prepare_test(&context, &cells[0], &root.join("results/cell")).unwrap();
+        assert_eq!(guest, ["/bin/true", "kvm-scenario"]);
+        assert!(
+            !guest.iter().any(|arg| arg == "ptrace-scenario"),
+            "an unselected backend must not inherit a selected sibling's arguments"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

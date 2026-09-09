@@ -480,14 +480,16 @@ fn guest_args_tsv(tests: &[(String, i64, Value)]) -> Vec<String> {
         mode_names.sort_unstable();
         for mode in mode_names {
             let spec = &modes[mode];
-            let backends = match spec.get("backends_enabled") {
-                Some(value) => {
-                    string_array(Some(value), &format!("{id}.modes.{mode}.backends_enabled"))
-                }
-                None => continue,
+            let Some(by_backend) = spec.get("guest_args") else {
+                continue;
             };
+            let by_backend = by_backend.as_table().unwrap_or_else(|| {
+                fail(format!("{id}.modes.{mode}.guest_args must be a table"))
+            });
+            let mut backends = by_backend.keys().map(String::as_str).collect::<Vec<_>>();
+            backends.sort_unstable();
             for backend in backends {
-                let args = mode_guest_args(spec, mode, &backend, &id);
+                let args = mode_guest_args(spec, mode, backend, &id);
                 if args.is_empty() {
                     continue;
                 }
@@ -679,9 +681,12 @@ test:
     modes:
       verify:
         backends_enabled: [ptrace, liteinst]
+        backends_disabled:
+          kvm: not selected for ordinary validation
         guest_args:
           ptrace: [multi, value with spaces]
           liteinst: [edge]
+          kvm: [kvm-edge]
 "#;
 
     /// POSITIVE side: a declared argument vector must reach the guest word, and
@@ -776,6 +781,7 @@ test:
         assert_eq!(
             lines,
             vec![
+                "c-programs/example\tverify\tkvm\tkvm-edge",
                 "c-programs/example\tverify\tliteinst\tedge",
                 "c-programs/example\tverify\tptrace\tmulti\tvalue with spaces",
             ]

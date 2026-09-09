@@ -219,8 +219,11 @@ test:
           kvm: [multi]
 ```
 
-Every `guest_args` key must name an enabled backend. Omitted backends receive
-no guest arguments.
+Every `guest_args` key must name a backend listed in either `backends_enabled`
+or `backends_disabled`. This lets an explicit `--probe-disabled` run give an
+unselected backend its own scenario arguments without selecting that backend
+for ordinary validation. Omitted backends receive no guest arguments, and a
+backend never inherits another backend's arguments.
 
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for

@@ -2545,6 +2545,8 @@ test:
         guest_args:
           ptrace:
             - pipe-order
+          kvm:
+            - pipe-order
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
@@ -2980,6 +2982,8 @@ test:
           - ptrace
         guest_args:
           ptrace:
+            - threads
+          kvm:
             - threads
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
@@ -6952,6 +6956,8 @@ test:
         guest_args:
           ptrace:
             - README.md
+          kvm:
+            - README.md
           sabre:
             - README.md
         backends_disabled:
@@ -7988,6 +7994,8 @@ test:
         guest_args:
           ptrace:
             - itimer-delivery
+          kvm:
+            - itimer-delivery
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
@@ -8678,6 +8686,8 @@ test:
           - liteinst
         guest_args:
           ptrace:
+            - v4-us
+          kvm:
             - v4-us
           liteinst:
             - v4-us
