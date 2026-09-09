@@ -195,7 +195,7 @@ fi
 # The intervening commit changes only reverie-kvm runtime behavior and its
 # static-ELF tests. The measured native DBT build budget carries unchanged;
 # fresh Hermit validation is still required for the KVM runtime change.
-expected_pin=8c8c0a57649c9ffbf8a7a14291a64320f64b935f
+expected_pin=c632c111619cb47922a72235b3e1130b91355603
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

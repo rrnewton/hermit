@@ -222,8 +222,8 @@ fi
 # The intervening commit changes only reverie-kvm runtime behavior and its
 # static-ELF tests. The measured native DBT build budget carries unchanged;
 # fresh Hermit validation is still required for the KVM runtime change.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8c8c0a57649c9ffbf8a7a14291a64320f64b935f ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 8c8c0a57649c9ffbf8a7a14291a64320f64b935f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c632c111619cb47922a72235b3e1130b91355603 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c632c111619cb47922a72235b3e1130b91355603 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
