@@ -38,31 +38,6 @@ static ssize_t call_pwritev2(int fd, const struct iovec *iov, int count,
   return syscall(SYS_pwritev2, fd, iov, count, (uint64_t)offset, 0UL, flags);
 }
 
-static int probe_preadv2_backend_support(void) {
-  int fd = open("/etc/ld.so.cache", O_RDONLY);
-  if (fd < 0) {
-    perror("preadv2 backend probe open");
-    return 1;
-  }
-  unsigned char byte = 0;
-  struct iovec iov = {.iov_base = &byte, .iov_len = 1};
-  errno = 0;
-  ssize_t count = call_preadv2(fd, &iov, 1, 0, 0);
-  int saved_errno = errno;
-  close(fd);
-  if (count < 0 && saved_errno == ENOSYS) {
-    puts("preadv2-backend-unsupported");
-    return 77;
-  }
-  if (count != 1) {
-    fprintf(stderr, "preadv2 backend probe failed: count=%zd errno=%d\n",
-            count, saved_errno);
-    return 1;
-  }
-  puts("preadv2-backend-supported");
-  return 0;
-}
-
 static int read_exact(int fd, char *buffer, size_t length) {
   size_t offset = 0;
   while (offset < length) {
@@ -991,9 +966,6 @@ static int check_pwritev2_fd_replacement(void) {
 }
 
 int main(int argc, char **argv) {
-  if (argc > 1 && strcmp(argv[1], "probe-preadv2") == 0) {
-    return probe_preadv2_backend_support();
-  }
   if (argc > 1 && strcmp(argv[1], "fd-replacement") == 0) {
     return check_pwritev2_fd_replacement() == 0 ? 0 : 1;
   }
