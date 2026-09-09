@@ -54,6 +54,7 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::Priority;
 use crate::stat::*;
+use crate::syscalls::helpers::VectoredIoSnapshot;
 use crate::types::*;
 
 /// The detcore tool and its per-process state.
@@ -1666,6 +1667,11 @@ pub struct ThreadState<T> {
     /// Counting various events.
     pub stats: ThreadStats,
 
+    /// Iovec metadata imported before a logically blocking vectored operation yielded.
+    /// Retries and post-syscall I/O evidence use this snapshot instead of mutable caller memory.
+    #[serde(skip)]
+    pub(crate) pending_iovec_snapshot: Option<VectoredIoSnapshot>,
+
     /// In chaos mode with --replay-preemptions-from, we hold a list of our future preemption points.
     pub preemption_points: Option<ThreadHistoryIterator>,
 
@@ -2087,6 +2093,7 @@ impl<T> ThreadState<T> {
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
             pedigree: Pedigree::new(), // Root thread.
             stats: ThreadStats::new(),
+            pending_iovec_snapshot: None,
             file_metadata: Arc::new(Mutex::new(file_metadata)),
             discover_live_file_metadata: cfg.discover_live_file_metadata,
             timer_slack_ns: DEFAULT_TIMER_SLACK_NS,

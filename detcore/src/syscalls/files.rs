@@ -2208,9 +2208,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
 
-        let result = if physically_nonblocking && fd_type == FdType::Pipe && !logically_nonblocking
+        let result = if physically_nonblocking
+            && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
+            && !logically_nonblocking
         {
-            self.execute_blocking_pipe_writev(guest, call, open_file_id)
+            self.execute_blocking_writev(guest, call, open_file_id, fd_type)
                 .await
         } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
@@ -2259,12 +2261,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::ENOSYS.into());
         }
 
-        let (fd_type, physically_nonblocking, logically_nonblocking, resource) =
+        let (fd_type, physically_nonblocking, logically_nonblocking, open_file_id, resource) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
                     detfd.ty(),
                     detfd.physically_nonblocking(),
                     detfd.is_nonblocking(),
+                    detfd.open_file_id(),
                     detfd.resource(),
                 )
             })?;
@@ -2283,6 +2286,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let res = if physically_nonblocking
+            && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
+            && !logically_nonblocking
+        {
+            self.execute_blocking_readv(guest, call, open_file_id, fd_type)
+                .await
+        } else if physically_nonblocking
             && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
         {
             self.execute_nonblockable_fd_syscall(guest, call).await
@@ -2400,10 +2409,10 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let res = if offset == -1
             && physically_nonblocking
-            && fd_type == FdType::Pipe
+            && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
             && !logically_nonblocking
         {
-            self.execute_blocking_pipe_preadv2(guest, call, open_file_id)
+            self.execute_blocking_preadv2(guest, call, open_file_id, fd_type)
                 .await
         } else {
             self.record_or_replay_preserving_tool_errors(guest, call)
@@ -2540,10 +2549,10 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let result = if offset == -1
             && physically_nonblocking
-            && fd_type == FdType::Pipe
+            && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
             && !logically_nonblocking
         {
-            self.execute_blocking_pipe_pwritev2(guest, call, open_file_id)
+            self.execute_blocking_pwritev2(guest, call, open_file_id, fd_type)
                 .await
         } else {
             self.record_or_replay_preserving_tool_errors(guest, call)

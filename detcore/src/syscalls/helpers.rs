@@ -55,12 +55,12 @@ const MAX_RW_COUNT: usize = 0x7fff_f000;
 const PIPE_BUF: usize = 4096;
 
 #[derive(Clone, Copy)]
-enum BlockingPipeVectoredWrite {
+enum BlockingVectoredWrite {
     Writev(syscalls::Writev),
     Pwritev2(syscalls::Pwritev2),
 }
 
-impl BlockingPipeVectoredWrite {
+impl BlockingVectoredWrite {
     fn fd(self) -> i32 {
         match self {
             Self::Writev(call) => call.fd(),
@@ -112,9 +112,68 @@ impl BlockingPipeVectoredWrite {
     }
 }
 
-struct VectoredIoSnapshot {
-    iovecs: Vec<(usize, usize)>,
-    target: usize,
+#[derive(Clone, Copy)]
+enum BlockingVectoredRead {
+    Readv(syscalls::Readv),
+    Preadv2(syscalls::Preadv2),
+}
+
+impl BlockingVectoredRead {
+    fn fd(self) -> i32 {
+        match self {
+            Self::Readv(call) => call.fd(),
+            Self::Preadv2(call) => call.fd(),
+        }
+    }
+
+    fn iov_addr(self) -> Option<usize> {
+        match self {
+            Self::Readv(call) => call.iov().map(|address| address.as_raw()),
+            Self::Preadv2(call) => call.iov().map(|address| address.as_raw()),
+        }
+    }
+
+    fn iov_count(self) -> Result<usize, Errno> {
+        match self {
+            Self::Readv(call) => Ok(call.len()),
+            Self::Preadv2(call) => usize::try_from(call.iov_len()).map_err(|_| Errno::EINVAL),
+        }
+    }
+
+    fn flags(self) -> i32 {
+        match self {
+            Self::Readv(_) => 0,
+            Self::Preadv2(call) => call.flags(),
+        }
+    }
+
+    fn sysno(self) -> Sysno {
+        match self {
+            Self::Readv(_) => Sysno::readv,
+            Self::Preadv2(_) => Sysno::preadv2,
+        }
+    }
+
+    fn with_iov(self, iov_addr: usize, count: usize) -> Self {
+        let iov = Addr::from_raw(iov_addr);
+        match self {
+            Self::Readv(call) => Self::Readv(call.with_iov(iov).with_len(count)),
+            Self::Preadv2(call) => Self::Preadv2(call.with_iov(iov).with_iov_len(count as u64)),
+        }
+    }
+
+    fn into_syscall(self) -> Syscall {
+        match self {
+            Self::Readv(call) => Syscall::Readv(call),
+            Self::Preadv2(call) => Syscall::Preadv2(call),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VectoredIoSnapshot {
+    pub(crate) iovecs: Vec<(usize, usize)>,
+    pub(crate) target: usize,
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -345,47 +404,50 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#547)
-    /// Complete a logically blocking pipe writev after Hermit has made the pipe physically
-    /// nonblocking. A positive short write is an implementation artifact here: without
-    /// O_NONBLOCK, Linux blocks until the full vector is written unless a signal or error
-    /// interrupts it. Atomic vectors retain a private iovec snapshot for every retry; larger
-    /// vectors advance an exact iovec suffix while preserving the original syscall identity.
-    pub async fn execute_blocking_pipe_writev<G: Guest<Self>>(
+    /// Complete a logically blocking writev after Hermit has made its descriptor physically
+    /// nonblocking. Every retry uses the same imported iovec snapshot. Pipes additionally
+    /// preserve their `PIPE_BUF` atomicity and complete non-atomic partial writes.
+    pub async fn execute_blocking_writev<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Writev,
         expected_open_file: OpenFileId,
+        fd_type: FdType,
     ) -> Result<i64, Error> {
-        self.execute_blocking_pipe_vectored_write(
+        self.execute_blocking_vectored_write(
             guest,
-            BlockingPipeVectoredWrite::Writev(call),
+            BlockingVectoredWrite::Writev(call),
             expected_open_file,
+            fd_type,
         )
         .await
     }
 
-    /// Complete a current-position pwritev2 on a logically blocking pipe while
+    /// Complete a current-position pwritev2 on a logically blocking descriptor while
     /// preserving its syscall identity, flags, offset sentinel, iovec snapshot,
-    /// and Linux partial-write behavior across deterministic polling turns.
-    pub async fn execute_blocking_pipe_pwritev2<G: Guest<Self>>(
+    /// and descriptor-specific partial-write behavior across deterministic polling turns.
+    pub async fn execute_blocking_pwritev2<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Pwritev2,
         expected_open_file: OpenFileId,
+        fd_type: FdType,
     ) -> Result<i64, Error> {
-        self.execute_blocking_pipe_vectored_write(
+        self.execute_blocking_vectored_write(
             guest,
-            BlockingPipeVectoredWrite::Pwritev2(call),
+            BlockingVectoredWrite::Pwritev2(call),
             expected_open_file,
+            fd_type,
         )
         .await
     }
 
-    async fn execute_blocking_pipe_vectored_write<G: Guest<Self>>(
+    async fn execute_blocking_vectored_write<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: BlockingPipeVectoredWrite,
+        call: BlockingVectoredWrite,
         expected_open_file: OpenFileId,
+        fd_type: FdType,
     ) -> Result<i64, Error> {
         // Every backend provides at least 512 bytes of tool scratch. Linux's
         // own fast-iovec path is smaller; this covers common vectors.
@@ -396,7 +458,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // positive short write requires Detcore to retain state across a
         // scheduler turn.
         let first_result = self
-            .execute_pipe_vectored_attempt(guest, call.into_syscall())
+            .execute_vectored_attempt(guest, call.into_syscall())
             .await;
         if call.flags() & libc::RWF_NOWAIT != 0 {
             return first_result;
@@ -415,6 +477,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // redirect a retry by editing the caller's iovec array.
         let count = call.iov_count()?;
         let snapshot = snapshot_vectored_iovecs(&guest.memory(), call.iov_addr(), count)?;
+        guest.thread_state_mut().pending_iovec_snapshot = Some(snapshot.clone());
         if first_written >= snapshot.target {
             return Ok(first_written as i64);
         }
@@ -426,22 +489,28 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
         }
 
-        let atomic_pipe_write = snapshot.target <= PIPE_BUF;
+        let complete_partial_write = fd_type == FdType::Pipe;
+        if first_written > 0 && !complete_partial_write {
+            return Ok(first_written as i64);
+        }
+        let atomic_pipe_write = complete_partial_write && snapshot.target <= PIPE_BUF;
         if atomic_pipe_write && first_written > 0 {
             return Ok(first_written as i64);
         }
 
         tracing::trace!(
-            "NonblockableSyscall: polling a physically nonblocking pipe for {}",
+            "NonblockableSyscall: polling a physically nonblocking {} for {}",
+            nonblocking_fd_kind(fd_type),
             call.into_syscall().name()
         );
         let mut resources =
-            pipe_vectored_resources(guest.thread_state().dettid, call.into_syscall().name());
+            restartable_io_resources(guest.thread_state().dettid, call.into_syscall().name());
         resources.poll_attempt = 1;
         tracing::trace!(
-            "Retry #{} for {}blocking pipe {} after EAGAIN: {}",
+            "Retry #{} for {}blocking {} {} after EAGAIN: {}",
             resources.poll_attempt,
             if atomic_pipe_write { "atomic " } else { "" },
+            nonblocking_fd_kind(fd_type),
             call.into_syscall().name(),
             call.into_syscall().display(&guest.memory())
         );
@@ -531,12 +600,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             };
             let result = self
-                .execute_pipe_vectored_write_attempt(
-                    guest,
-                    call,
-                    &attempt_iovecs,
-                    atomic_scratch_iov,
-                )
+                .execute_vectored_write_attempt(guest, call, &attempt_iovecs, atomic_scratch_iov)
                 .await;
             match result {
                 Ok(written) if written > 0 => {
@@ -554,7 +618,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if written_total >= snapshot.target {
                         break Ok(written_total as i64);
                     }
-                    if atomic_pipe_write {
+                    if !complete_partial_write || atomic_pipe_write {
                         break Ok(written_total as i64);
                     }
                 }
@@ -568,9 +632,10 @@ impl<T: RecordOrReplay> Detcore<T> {
 
             resources.poll_attempt += 1;
             tracing::trace!(
-                "Retry #{} for {}blocking pipe {} after EAGAIN: {}",
+                "Retry #{} for {}blocking {} {} after EAGAIN: {}",
                 resources.poll_attempt,
                 if atomic_pipe_write { "atomic " } else { "" },
+                nonblocking_fd_kind(fd_type),
                 call.into_syscall().name(),
                 call.into_syscall().display(&guest.memory())
             );
@@ -581,13 +646,48 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
-    /// Retry a current-position preadv2 on a logically blocking pipe without
+    /// Retry a logically blocking readv after Detcore made its descriptor physically
+    /// nonblocking, preserving the imported iovec across every scheduler turn.
+    pub async fn execute_blocking_readv<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readv,
+        expected_open_file: OpenFileId,
+        fd_type: FdType,
+    ) -> Result<i64, Error> {
+        self.execute_blocking_vectored_read(
+            guest,
+            BlockingVectoredRead::Readv(call),
+            expected_open_file,
+            fd_type,
+        )
+        .await
+    }
+
+    /// Retry a current-position preadv2 on a logically blocking descriptor without
     /// exposing the O_NONBLOCK that Detcore installed on the physical fd.
-    pub async fn execute_blocking_pipe_preadv2<G: Guest<Self>>(
+    pub async fn execute_blocking_preadv2<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Preadv2,
         expected_open_file: OpenFileId,
+        fd_type: FdType,
+    ) -> Result<i64, Error> {
+        self.execute_blocking_vectored_read(
+            guest,
+            BlockingVectoredRead::Preadv2(call),
+            expected_open_file,
+            fd_type,
+        )
+        .await
+    }
+
+    async fn execute_blocking_vectored_read<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: BlockingVectoredRead,
+        expected_open_file: OpenFileId,
+        fd_type: FdType,
     ) -> Result<i64, Error> {
         const STACK_IOVECS: usize = 32;
 
@@ -595,7 +695,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // not read the iovec array before the kernel has checked fd validity,
         // access mode, offset, and flags.
         let first_result = self
-            .execute_pipe_vectored_attempt(guest, Syscall::Preadv2(call))
+            .execute_vectored_attempt(guest, call.into_syscall())
             .await;
         match first_result {
             Err(error @ Error::Errno(Errno::EAGAIN)) if call.flags() & libc::RWF_NOWAIT != 0 => {
@@ -605,25 +705,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             result => return result,
         }
 
-        let count = usize::try_from(call.iov_len()).map_err(|_| Errno::EINVAL)?;
-        let snapshot = snapshot_vectored_iovecs(
-            &guest.memory(),
-            call.iov().map(|address| address.as_raw()),
-            count,
-        )?;
+        let snapshot =
+            snapshot_vectored_iovecs(&guest.memory(), call.iov_addr(), call.iov_count()?)?;
+        guest.thread_state_mut().pending_iovec_snapshot = Some(snapshot.clone());
         if snapshot.target == 0 {
             return Err(Errno::EAGAIN.into());
         }
         let attempt_iovecs = remaining_vectored_iovecs(&snapshot.iovecs, 0, snapshot.target)?;
 
-        let mut resources = pipe_vectored_resources(guest.thread_state().dettid, call.name());
+        let mut resources =
+            restartable_io_resources(guest.thread_state().dettid, call.into_syscall().name());
         resources.poll_attempt = 1;
         tracing::trace!(
-            "Retry #{} for blocking pipe preadv2: {}",
+            "Retry #{} for blocking {} {}: {}",
             resources.poll_attempt,
-            call.display(&guest.memory())
+            nonblocking_fd_kind(fd_type),
+            call.into_syscall().name(),
+            call.into_syscall().display(&guest.memory())
         );
-        record_retry_event(guest, call).await;
+        record_retry_event(guest, call.into_syscall()).await;
 
         let blocked_mask = blocked_signal_mask();
         let mut stack = guest.stack().await;
@@ -673,23 +773,25 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .unwrap_or(false)
             {
                 break self
-                    .refuse_unserviceable_operation(guest, Sysno::preadv2, Errno::EOPNOTSUPP)
+                    .refuse_unserviceable_operation(guest, call.sysno(), Errno::EOPNOTSUPP)
                     .await;
             }
 
             let attempt = self
-                .execute_pipe_preadv2_attempt(guest, call, &attempt_iovecs, stack_iov)
+                .execute_vectored_read_attempt(guest, call, &attempt_iovecs, stack_iov)
                 .await;
             if !matches!(attempt, Err(Error::Errno(Errno::EAGAIN))) {
                 break attempt;
             }
             resources.poll_attempt += 1;
             tracing::trace!(
-                "Retry #{} for blocking pipe preadv2: {}",
+                "Retry #{} for blocking {} {}: {}",
                 resources.poll_attempt,
-                call.display(&guest.memory())
+                nonblocking_fd_kind(fd_type),
+                call.into_syscall().name(),
+                call.into_syscall().display(&guest.memory())
             );
-            record_retry_event(guest, call).await;
+            record_retry_event(guest, call.into_syscall()).await;
         };
 
         restore_signals_after_disposition(guest, old_mask_addr).await?;
@@ -729,25 +831,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         tracing::trace!(
             "NonblockableSyscall: converting to nonblocking syscall (internal polling): write"
         );
-        let mut resources = Resources::new(guest.thread_state().dettid);
-        resources.insert(ResourceID::InternalIOPolling, Permission::W);
-        resources.fyi(call.name());
+        let mut resources = restartable_io_resources(guest.thread_state().dettid, call.name());
         let subtool = self.cfg.recordreplay_modes.then_some(self);
         let mut current = call;
         let mut written_total = 0usize;
 
-        loop {
-            if resources.poll_attempt > 0
-                && matches!(
-                    resource_request(guest, resources.clone()).await,
-                    ResumeStatus::Signaled(_)
+        let blocked_mask = blocked_signal_mask();
+        let mut stack = guest.stack().await;
+        let blocked_mask_addr = stack.push(blocked_mask);
+        let old_mask_addr = stack.reserve::<libc::sigset_t>();
+        let action_addr = stack.reserve::<KernelSigaction>();
+        let _mask_guard = stack.commit()?;
+        let guest_signal_mask =
+            block_signals_for_disposition(guest, blocked_mask_addr, old_mask_addr).await?;
+
+        let result = loop {
+            if resources.poll_attempt > 0 {
+                let status = resource_request(guest, resources.clone()).await;
+                let disposition = match wait_signal_disposition(
+                    guest,
+                    status.clone(),
+                    &guest_signal_mask,
+                    action_addr,
+                    true,
                 )
-            {
-                break if written_total > 0 {
-                    Ok(written_total as i64)
-                } else {
-                    Err(call.signal_interrupt_errno().into())
+                .await
+                {
+                    Ok(disposition) => disposition,
+                    Err(error) => break Err(error),
                 };
+                if matches!(status, ResumeStatus::Signaled(_))
+                    && let Some(result) = interrupted_write_result(written_total, disposition)
+                {
+                    break result;
+                }
             }
 
             if resources.poll_attempt > 0
@@ -817,21 +934,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.display(&guest.memory())
             );
             record_retry_event(guest, call).await;
-        }
+        };
+
+        restore_signals_after_disposition(guest, old_mask_addr).await?;
+        result
     }
 
-    async fn execute_pipe_vectored_write_attempt<G: Guest<Self>>(
+    async fn execute_vectored_write_attempt<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: BlockingPipeVectoredWrite,
+        call: BlockingVectoredWrite,
         iovecs: &[(usize, usize)],
         stack_iov: Option<usize>,
     ) -> Result<i64, Error> {
         if let Some(stack_iov) = stack_iov {
             let scratch_call = call.with_iov(stack_iov, iovecs.len()).into_syscall();
-            return self
-                .execute_pipe_vectored_attempt(guest, scratch_call)
-                .await;
+            return self.execute_vectored_attempt(guest, scratch_call).await;
         }
 
         let mapping_len = iovecs
@@ -887,9 +1005,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let scratch_call = call
             .with_iov(scratch_iov.as_raw(), iovecs.len())
             .into_syscall();
-        let result = self
-            .execute_pipe_vectored_attempt(guest, scratch_call)
-            .await;
+        let result = self.execute_vectored_attempt(guest, scratch_call).await;
         guest
             .inject_with_retry(Syscall::Munmap(
                 syscalls::Munmap::new()
@@ -901,20 +1017,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
-    async fn execute_pipe_preadv2_attempt<G: Guest<Self>>(
+    async fn execute_vectored_read_attempt<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: syscalls::Preadv2,
+        call: BlockingVectoredRead,
         iovecs: &[(usize, usize)],
         stack_iov: Option<usize>,
     ) -> Result<i64, Error> {
         if let Some(stack_iov) = stack_iov {
-            let scratch_call = call
-                .with_iov(Addr::from_raw(stack_iov))
-                .with_iov_len(iovecs.len() as u64);
-            return self
-                .execute_pipe_vectored_attempt(guest, Syscall::Preadv2(scratch_call))
-                .await;
+            let scratch_call = call.with_iov(stack_iov, iovecs.len()).into_syscall();
+            return self.execute_vectored_attempt(guest, scratch_call).await;
         }
 
         let mapping_len = iovecs
@@ -968,11 +1080,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let scratch_call = call
-            .with_iov(Some(scratch_iov))
-            .with_iov_len(iovecs.len() as u64);
-        let result = self
-            .execute_pipe_vectored_attempt(guest, Syscall::Preadv2(scratch_call))
-            .await;
+            .with_iov(scratch_iov.as_raw(), iovecs.len())
+            .into_syscall();
+        let result = self.execute_vectored_attempt(guest, scratch_call).await;
         guest
             .inject_with_retry(Syscall::Munmap(
                 syscalls::Munmap::new()
@@ -984,7 +1094,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
-    async fn execute_pipe_vectored_attempt<G: Guest<Self>>(
+    async fn execute_vectored_attempt<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: Syscall,
@@ -1334,12 +1444,21 @@ fn interrupted_write_result(
     }
 }
 
-fn pipe_vectored_resources(dettid: DetTid, name: &'static str) -> Resources {
+fn restartable_io_resources(dettid: DetTid, name: &'static str) -> Resources {
     let mut resources = Resources::new(dettid);
     resources.insert(ResourceID::InternalIOPolling, Permission::W);
     resources.fyi(name);
     resources.set_signal_interrupt_errno(Errno::ERESTARTSYS);
     resources
+}
+
+fn nonblocking_fd_kind(fd_type: FdType) -> &'static str {
+    match fd_type {
+        FdType::Pipe => "pipe",
+        FdType::Socket => "socket",
+        FdType::Eventfd => "eventfd",
+        _ => "descriptor",
+    }
 }
 
 #[async_trait]
@@ -2086,7 +2205,7 @@ mod tests {
     fn pipe_writev_requests_signal_disposition() {
         let dettid = DetTid::from_raw(42);
         let call = reverie::syscalls::Writev::new();
-        let request = pipe_vectored_resources(dettid, call.name());
+        let request = restartable_io_resources(dettid, call.name());
 
         assert_eq!(
             request.signal_interrupt_errno(),
@@ -2107,7 +2226,7 @@ mod tests {
             .with_pos_h(0xfeed_face)
             .with_flags(libc::RWF_NOWAIT);
 
-        let retry = BlockingPipeVectoredWrite::Pwritev2(call)
+        let retry = BlockingVectoredWrite::Pwritev2(call)
             .with_iov(retry_iov, 2)
             .into_syscall();
         let Syscall::Pwritev2(retry) = retry else {
