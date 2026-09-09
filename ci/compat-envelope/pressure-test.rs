@@ -1820,7 +1820,9 @@ fn series_run_index(dir_name: &str) -> u64 {
 ///
 /// It sends the typed cell results to `series.py append-cells`, so outcome,
 /// coordinates, source depth, ancestry and compression have one implementation.
-/// The writer refuses the batch whole if any result cannot be represented.
+/// The writer rejects untyped comparison cells while retaining other valid
+/// observations from the campaign. Other malformed input still refuses the
+/// batch whole.
 fn collect_series_result_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries = fs::read_dir(path)
         .map_err(|e| format!("cannot read pressure result directory {}: {e}", path.display()))?;
@@ -1961,10 +1963,11 @@ fn emit_series(results: &Path, checkout: &Path) -> Result<(), String> {
         .wait()
         .map_err(|e| format!("series append did not terminate readably: {e}"))?;
     if !status.success() {
-        // The linter refused, and it refused the batch whole. Do not paper over
-        // it: nothing was written and the caller needs to know which row is bad.
+        // A nonzero status keeps every rejected cell visible to the caller.
+        // append-cells can still have retained independent valid rows, so do
+        // not claim that the whole batch was rolled back.
         return Err(format!(
-            "the series writer REFUSED the batch (exit {:?}); nothing was written",
+            "the series writer rejected one or more cell results (exit {:?}); valid completed rows, if any, were retained",
             status.code()
         ));
     }
