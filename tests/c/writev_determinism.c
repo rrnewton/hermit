@@ -1272,10 +1272,10 @@ int main(int argc, char **argv) {
   // These two cases interrupt a writer that is blocked on a full pipe with a
   // signal and require Linux's positive partial byte count back. Measured
   // 2026-09-01 through `bin/safehermit` on ptrace with `--strict`: BOTH of them
-  // hang under Hermit, natively both return 0. The vectored one runs entirely on
-  // `execute_blocking_pipe_writev`, which is unchanged pre-existing code, so this
-  // is a gap in the shared `InternalIOPolling` retry loop rather than anything
-  // the scalar completion path introduced -- the loop's `ResumeStatus::Signaled`
+  // hang under Hermit, natively both return 0. The vectored one now runs through
+  // the same current-position pipe retry used by writev and pwritev2, so this
+  // remains a gap in `InternalIOPolling` rather than something introduced by
+  // either vectored syscall wrapper -- the loop's `ResumeStatus::Signaled`
   // check does not fire for a signal delivered to a thread parked in it, so the
   // write never returns.
   //

@@ -50,6 +50,73 @@ use crate::types::OpenFileId;
 use crate::types::SchedEvent;
 use crate::types::SyscallPhase;
 
+const MAX_VECTORED_IOVECS: usize = libc::UIO_MAXIOV as usize;
+const MAX_RW_COUNT: usize = 0x7fff_f000;
+const PIPE_BUF: usize = 4096;
+
+#[derive(Clone, Copy)]
+enum BlockingPipeVectoredWrite {
+    Writev(syscalls::Writev),
+    Pwritev2(syscalls::Pwritev2),
+}
+
+impl BlockingPipeVectoredWrite {
+    fn fd(self) -> i32 {
+        match self {
+            Self::Writev(call) => call.fd(),
+            Self::Pwritev2(call) => call.fd(),
+        }
+    }
+
+    fn iov_addr(self) -> Option<usize> {
+        match self {
+            Self::Writev(call) => call.iov().map(|address| address.as_raw()),
+            Self::Pwritev2(call) => call.iov().map(|address| address.as_raw()),
+        }
+    }
+
+    fn iov_count(self) -> Result<usize, Errno> {
+        match self {
+            Self::Writev(call) => Ok(call.len()),
+            Self::Pwritev2(call) => usize::try_from(call.iov_len()).map_err(|_| Errno::EINVAL),
+        }
+    }
+
+    fn flags(self) -> i32 {
+        match self {
+            Self::Writev(_) => 0,
+            Self::Pwritev2(call) => call.flags(),
+        }
+    }
+
+    fn sysno(self) -> Sysno {
+        match self {
+            Self::Writev(_) => Sysno::writev,
+            Self::Pwritev2(_) => Sysno::pwritev2,
+        }
+    }
+
+    fn with_iov(self, iov_addr: usize, count: usize) -> Self {
+        let iov = Addr::from_raw(iov_addr);
+        match self {
+            Self::Writev(call) => Self::Writev(call.with_iov(iov).with_len(count)),
+            Self::Pwritev2(call) => Self::Pwritev2(call.with_iov(iov).with_iov_len(count as u64)),
+        }
+    }
+
+    fn into_syscall(self) -> Syscall {
+        match self {
+            Self::Writev(call) => Syscall::Writev(call),
+            Self::Pwritev2(call) => Syscall::Pwritev2(call),
+        }
+    }
+}
+
+struct VectoredIoSnapshot {
+    iovecs: Vec<(usize, usize)>,
+    target: usize,
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#2373)
@@ -282,63 +349,104 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// nonblocking. A positive short write is an implementation artifact here: without
     /// O_NONBLOCK, Linux blocks until the full vector is written unless a signal or error
     /// interrupts it. Atomic vectors retain a private iovec snapshot for every retry; larger
-    /// vectors advance a positive short-write remainder through scalar writes.
+    /// vectors advance an exact iovec suffix while preserving the original syscall identity.
     pub async fn execute_blocking_pipe_writev<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Writev,
         expected_open_file: OpenFileId,
     ) -> Result<i64, Error> {
-        const MAX_IOVECS: usize = 1024;
-        // Linux limits a single vectored transfer to INT_MAX rounded down to a page.
-        const MAX_RW_COUNT: usize = 0x7fff_f000;
-        // Linux guarantees pipe writes through this size are atomic.
-        const PIPE_BUF: usize = 4096;
+        self.execute_blocking_pipe_vectored_write(
+            guest,
+            BlockingPipeVectoredWrite::Writev(call),
+            expected_open_file,
+        )
+        .await
+    }
+
+    /// Complete a current-position pwritev2 on a logically blocking pipe while
+    /// preserving its syscall identity, flags, offset sentinel, iovec snapshot,
+    /// and Linux partial-write behavior across deterministic polling turns.
+    pub async fn execute_blocking_pipe_pwritev2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pwritev2,
+        expected_open_file: OpenFileId,
+    ) -> Result<i64, Error> {
+        self.execute_blocking_pipe_vectored_write(
+            guest,
+            BlockingPipeVectoredWrite::Pwritev2(call),
+            expected_open_file,
+        )
+        .await
+    }
+
+    async fn execute_blocking_pipe_vectored_write<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: BlockingPipeVectoredWrite,
+        expected_open_file: OpenFileId,
+    ) -> Result<i64, Error> {
         // Every backend provides at least 512 bytes of tool scratch. Linux's
         // own fast-iovec path is smaller; this covers common vectors.
         const STACK_IOVECS: usize = 32;
 
-        let Some(iov_addr) = call.iov() else {
-            return self.execute_nonblockable_fd_syscall(guest, call).await;
-        };
-        if call.len() == 0 || call.len() > MAX_IOVECS {
-            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        // Let Linux validate the descriptor, access mode, flags, iovec count,
+        // and iovec pointer in its own order. Only a physical EAGAIN or a
+        // positive short write requires Detcore to retain state across a
+        // scheduler turn.
+        let first_result = self
+            .execute_pipe_vectored_attempt(guest, call.into_syscall())
+            .await;
+        if call.flags() & libc::RWF_NOWAIT != 0 {
+            return first_result;
         }
 
-        let iovecs: Vec<(usize, usize)> = {
-            let mut raw_iovecs = vec![
-                libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                };
-                call.len()
-            ];
-            guest.memory().read_values(iov_addr, &mut raw_iovecs)?;
-            raw_iovecs
-                .into_iter()
-                .map(|iovec| (iovec.iov_base as usize, iovec.iov_len))
-                .collect()
+        let first_written = match first_result {
+            Ok(0) => return Ok(0),
+            Ok(written) if written > 0 => usize::try_from(written).map_err(|_| Errno::EIO)?,
+            Ok(_) => return Err(Errno::EIO.into()),
+            Err(Error::Errno(Errno::EAGAIN)) => 0,
+            Err(error) => return Err(error),
         };
-        let requested = iovecs.iter().try_fold(0usize, |total, (_, length)| {
-            total.checked_add(*length).ok_or(Errno::EINVAL)
-        })?;
-        if requested > isize::MAX as usize {
-            return Err(Errno::EINVAL.into());
+
+        // Linux has now established that the fd and operation are valid. Copy
+        // the descriptors before yielding so another guest thread cannot
+        // redirect a retry by editing the caller's iovec array.
+        let count = call.iov_count()?;
+        let snapshot = snapshot_vectored_iovecs(&guest.memory(), call.iov_addr(), count)?;
+        if first_written >= snapshot.target {
+            return Ok(first_written as i64);
         }
-        let target = requested.min(MAX_RW_COUNT);
-        if target == 0 {
-            return self.execute_nonblockable_fd_syscall(guest, call).await;
+        if snapshot.target == 0 {
+            return if first_written > 0 {
+                Ok(first_written as i64)
+            } else {
+                Err(Errno::EAGAIN.into())
+            };
         }
 
-        let atomic_pipe_write = target <= PIPE_BUF;
+        let atomic_pipe_write = snapshot.target <= PIPE_BUF;
+        if atomic_pipe_write && first_written > 0 {
+            return Ok(first_written as i64);
+        }
 
         tracing::trace!(
-            "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev"
+            "NonblockableSyscall: polling a physically nonblocking pipe for {}",
+            call.into_syscall().name()
         );
-        let mut resources = pipe_writev_resources(guest.thread_state().dettid, call);
-        let subtool = self.cfg.recordreplay_modes.then_some(self);
-        let mut current = Syscall::Writev(call);
-        let mut written_total = 0usize;
+        let mut resources =
+            pipe_vectored_resources(guest.thread_state().dettid, call.into_syscall().name());
+        resources.poll_attempt = 1;
+        tracing::trace!(
+            "Retry #{} for {}blocking pipe {} after EAGAIN: {}",
+            resources.poll_attempt,
+            if atomic_pipe_write { "atomic " } else { "" },
+            call.into_syscall().name(),
+            call.into_syscall().display(&guest.memory())
+        );
+        record_retry_event(guest, call.into_syscall()).await;
+        let mut written_total = first_written;
 
         // Keep ordinary signals pending while the scheduler and the target-side
         // disposition check decide whether a wakeup interrupts this write. The
@@ -346,12 +454,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // target's current disposition.
         let blocked_mask = blocked_signal_mask();
         let mut stack = guest.stack().await;
-        let atomic_scratch_iov = if atomic_pipe_write && iovecs.len() <= STACK_IOVECS {
+        let atomic_scratch_iov = if atomic_pipe_write && snapshot.iovecs.len() <= STACK_IOVECS {
             let mut raw_iovecs = [libc::iovec {
                 iov_base: std::ptr::null_mut(),
                 iov_len: 0,
             }; STACK_IOVECS];
-            for (raw, (base, length)) in raw_iovecs.iter_mut().zip(&iovecs) {
+            for (raw, (base, length)) in raw_iovecs.iter_mut().zip(&snapshot.iovecs) {
                 raw.iov_base = *base as *mut libc::c_void;
                 raw.iov_len = *length;
             }
@@ -384,7 +492,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Err(error) => break Err(error),
             };
             if matches!(status, ResumeStatus::Signaled(_))
-                && let Some(result) = interrupted_write_result(&call, written_total, disposition)
+                && let Some(result) = interrupted_write_result(written_total, disposition)
             {
                 break result;
             }
@@ -400,61 +508,58 @@ impl<T: RecordOrReplay> Detcore<T> {
                 break if written_total > 0 {
                     Ok(written_total as i64)
                 } else {
-                    self.refuse_unserviceable_operation(guest, Sysno::writev, Errno::EOPNOTSUPP)
+                    self.refuse_unserviceable_operation(guest, call.sysno(), Errno::EOPNOTSUPP)
                         .await
                 };
             }
 
-            let result = if atomic_pipe_write {
-                self.execute_atomic_pipe_writev_attempt(guest, call, &iovecs, atomic_scratch_iov)
-                    .await
+            let consumed = if atomic_pipe_write { 0 } else { written_total };
+            let limit = if atomic_pipe_write {
+                snapshot.target
             } else {
-                match subtool {
-                    Some(detcore) => {
-                        detcore
-                            .record_or_replay_preserving_tool_errors(guest, current)
-                            .await
-                    }
-                    None => guest.inject_with_retry(current).await.map_err(Error::from),
+                snapshot.target - written_total
+            };
+            let attempt_iovecs = match remaining_vectored_iovecs(&snapshot.iovecs, consumed, limit)
+            {
+                Ok(iovecs) if !iovecs.is_empty() => iovecs,
+                Ok(_) => break Ok(written_total as i64),
+                Err(error) => {
+                    break finish_partial_record_or_replay_write(
+                        written_total as i64,
+                        error.into(),
+                    );
                 }
             };
+            let result = self
+                .execute_pipe_vectored_write_attempt(
+                    guest,
+                    call,
+                    &attempt_iovecs,
+                    atomic_scratch_iov,
+                )
+                .await;
             match result {
                 Ok(written) if written > 0 => {
                     let written = match usize::try_from(written) {
                         Ok(written) => written,
                         Err(_) => break Err(Errno::EIO.into()),
                     };
+                    if written > snapshot.target - written_total {
+                        break Err(Errno::EIO.into());
+                    }
                     written_total = match written_total.checked_add(written) {
                         Some(written_total) => written_total,
                         None => break Err(Errno::EIO.into()),
                     };
-                    if written_total >= target {
+                    if written_total >= snapshot.target {
                         break Ok(written_total as i64);
                     }
                     if atomic_pipe_write {
                         break Ok(written_total as i64);
                     }
-                    current = match remaining_writev_segment(
-                        call.fd(),
-                        &iovecs,
-                        written_total,
-                        target - written_total,
-                    ) {
-                        Ok(Some(write)) => Syscall::Write(write),
-                        Ok(None) => break Ok(written_total as i64),
-                        Err(_) => break Ok(written_total as i64),
-                    };
                 }
                 Ok(0) => break Ok(written_total as i64),
-                Err(Error::Errno(Errno::EAGAIN)) => {
-                    if !atomic_pipe_write && matches!(current, Syscall::Writev(_)) {
-                        current = match remaining_writev_segment(call.fd(), &iovecs, 0, target) {
-                            Ok(Some(write)) => Syscall::Write(write),
-                            Ok(None) => break Ok(0),
-                            Err(error) => break Err(error.into()),
-                        };
-                    }
-                }
+                Err(Error::Errno(Errno::EAGAIN)) => {}
                 Err(error) => {
                     break finish_partial_record_or_replay_write(written_total as i64, error);
                 }
@@ -463,9 +568,125 @@ impl<T: RecordOrReplay> Detcore<T> {
 
             resources.poll_attempt += 1;
             tracing::trace!(
-                "Retry #{} for {}blocking pipe writev after EAGAIN: {}",
+                "Retry #{} for {}blocking pipe {} after EAGAIN: {}",
                 resources.poll_attempt,
                 if atomic_pipe_write { "atomic " } else { "" },
+                call.into_syscall().name(),
+                call.into_syscall().display(&guest.memory())
+            );
+            record_retry_event(guest, call.into_syscall()).await;
+        };
+
+        restore_signals_after_disposition(guest, old_mask_addr).await?;
+        result
+    }
+
+    /// Retry a current-position preadv2 on a logically blocking pipe without
+    /// exposing the O_NONBLOCK that Detcore installed on the physical fd.
+    pub async fn execute_blocking_pipe_preadv2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Preadv2,
+        expected_open_file: OpenFileId,
+    ) -> Result<i64, Error> {
+        const STACK_IOVECS: usize = 32;
+
+        // The first attempt owns Linux's validation order. In particular, do
+        // not read the iovec array before the kernel has checked fd validity,
+        // access mode, offset, and flags.
+        let first_result = self
+            .execute_pipe_vectored_attempt(guest, Syscall::Preadv2(call))
+            .await;
+        match first_result {
+            Err(error @ Error::Errno(Errno::EAGAIN)) if call.flags() & libc::RWF_NOWAIT != 0 => {
+                return Err(error);
+            }
+            Err(Error::Errno(Errno::EAGAIN)) => {}
+            result => return result,
+        }
+
+        let count = usize::try_from(call.iov_len()).map_err(|_| Errno::EINVAL)?;
+        let snapshot = snapshot_vectored_iovecs(
+            &guest.memory(),
+            call.iov().map(|address| address.as_raw()),
+            count,
+        )?;
+        if snapshot.target == 0 {
+            return Err(Errno::EAGAIN.into());
+        }
+        let attempt_iovecs = remaining_vectored_iovecs(&snapshot.iovecs, 0, snapshot.target)?;
+
+        let mut resources = pipe_vectored_resources(guest.thread_state().dettid, call.name());
+        resources.poll_attempt = 1;
+        tracing::trace!(
+            "Retry #{} for blocking pipe preadv2: {}",
+            resources.poll_attempt,
+            call.display(&guest.memory())
+        );
+        record_retry_event(guest, call).await;
+
+        let blocked_mask = blocked_signal_mask();
+        let mut stack = guest.stack().await;
+        let stack_iov = if attempt_iovecs.len() <= STACK_IOVECS {
+            let mut raw_iovecs = [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; STACK_IOVECS];
+            for (raw, (base, length)) in raw_iovecs.iter_mut().zip(&attempt_iovecs) {
+                raw.iov_base = *base as *mut libc::c_void;
+                raw.iov_len = *length;
+            }
+            let scratch_iov: Addr<libc::iovec> = stack.push(raw_iovecs).cast();
+            Some(scratch_iov.as_raw())
+        } else {
+            None
+        };
+        let blocked_mask_addr = stack.push(blocked_mask);
+        let old_mask_addr = stack.reserve::<libc::sigset_t>();
+        let action_addr = stack.reserve::<KernelSigaction>();
+        let _mask_guard = stack.commit()?;
+        let guest_signal_mask =
+            block_signals_for_disposition(guest, blocked_mask_addr, old_mask_addr).await?;
+
+        let result = loop {
+            let status = resource_request(guest, resources.clone()).await;
+            let disposition = match wait_signal_disposition(
+                guest,
+                status.clone(),
+                &guest_signal_mask,
+                action_addr,
+                true,
+            )
+            .await
+            {
+                Ok(disposition) => disposition,
+                Err(error) => break Err(error),
+            };
+            if matches!(status, ResumeStatus::Signaled(_)) && disposition.is_some() {
+                break Err(Errno::ERESTARTSYS.into());
+            }
+            if !guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| {
+                    detfd.open_file_id() == expected_open_file
+                })
+                .unwrap_or(false)
+            {
+                break self
+                    .refuse_unserviceable_operation(guest, Sysno::preadv2, Errno::EOPNOTSUPP)
+                    .await;
+            }
+
+            let attempt = self
+                .execute_pipe_preadv2_attempt(guest, call, &attempt_iovecs, stack_iov)
+                .await;
+            if !matches!(attempt, Err(Error::Errno(Errno::EAGAIN))) {
+                break attempt;
+            }
+            resources.poll_attempt += 1;
+            tracing::trace!(
+                "Retry #{} for blocking pipe preadv2: {}",
+                resources.poll_attempt,
                 call.display(&guest.memory())
             );
             record_retry_event(guest, call).await;
@@ -599,24 +820,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    async fn execute_atomic_pipe_writev_attempt<G: Guest<Self>>(
+    async fn execute_pipe_vectored_write_attempt<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: syscalls::Writev,
+        call: BlockingPipeVectoredWrite,
         iovecs: &[(usize, usize)],
         stack_iov: Option<usize>,
     ) -> Result<i64, Error> {
         if let Some(stack_iov) = stack_iov {
-            let scratch_call = call.with_iov(Addr::from_raw(stack_iov));
-            return if self.cfg.recordreplay_modes {
-                self.record_or_replay_preserving_tool_errors(guest, scratch_call)
-                    .await
-            } else {
-                guest
-                    .inject_with_retry(scratch_call)
-                    .await
-                    .map_err(Error::from)
-            };
+            let scratch_call = call.with_iov(stack_iov, iovecs.len()).into_syscall();
+            return self
+                .execute_pipe_vectored_attempt(guest, scratch_call)
+                .await;
         }
 
         let mapping_len = iovecs
@@ -634,11 +849,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_offset(0),
             ))
             .await
-            .unwrap_or_else(|error| panic!("failed to map atomic writev scratch: {error}"));
+            .unwrap_or_else(|error| panic!("failed to map vectored I/O scratch: {error}"));
         let mapped = usize::try_from(mapped)
-            .unwrap_or_else(|_| panic!("atomic writev scratch mmap returned {mapped}"));
+            .unwrap_or_else(|_| panic!("vectored I/O scratch mmap returned {mapped}"));
         let scratch_iov = Addr::<libc::iovec>::from_raw(mapped)
-            .unwrap_or_else(|| panic!("atomic writev scratch mmap returned a null address"));
+            .unwrap_or_else(|| panic!("vectored I/O scratch mmap returned a null address"));
         let mapping_addr: Addr<libc::c_void> = scratch_iov.cast();
         let write_result = {
             let raw_iovecs: Vec<libc::iovec> = iovecs
@@ -663,22 +878,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await
                 .unwrap_or_else(|cleanup_error| {
                     panic!(
-                        "failed to populate atomic writev scratch ({write_error}); cleanup failed ({cleanup_error})"
+                        "failed to populate vectored I/O scratch ({write_error}); cleanup failed ({cleanup_error})"
                     )
                 });
-            panic!("failed to populate atomic writev scratch: {write_error}");
+            panic!("failed to populate vectored I/O scratch: {write_error}");
         }
 
-        let scratch_call = call.with_iov(Some(scratch_iov));
-        let result = if self.cfg.recordreplay_modes {
-            self.record_or_replay_preserving_tool_errors(guest, scratch_call)
-                .await
-        } else {
-            guest
-                .inject_with_retry(scratch_call)
-                .await
-                .map_err(Error::from)
-        };
+        let scratch_call = call
+            .with_iov(scratch_iov.as_raw(), iovecs.len())
+            .into_syscall();
+        let result = self
+            .execute_pipe_vectored_attempt(guest, scratch_call)
+            .await;
         guest
             .inject_with_retry(Syscall::Munmap(
                 syscalls::Munmap::new()
@@ -686,8 +897,104 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_len(mapping_len),
             ))
             .await
-            .unwrap_or_else(|error| panic!("failed to unmap atomic writev scratch: {error}"));
+            .unwrap_or_else(|error| panic!("failed to unmap vectored I/O scratch: {error}"));
         result
+    }
+
+    async fn execute_pipe_preadv2_attempt<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Preadv2,
+        iovecs: &[(usize, usize)],
+        stack_iov: Option<usize>,
+    ) -> Result<i64, Error> {
+        if let Some(stack_iov) = stack_iov {
+            let scratch_call = call
+                .with_iov(Addr::from_raw(stack_iov))
+                .with_iov_len(iovecs.len() as u64);
+            return self
+                .execute_pipe_vectored_attempt(guest, Syscall::Preadv2(scratch_call))
+                .await;
+        }
+
+        let mapping_len = iovecs
+            .len()
+            .checked_mul(std::mem::size_of::<libc::iovec>())
+            .expect("validated iovec count cannot overflow scratch length");
+        let mapped = guest
+            .inject_with_retry(Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(mapping_len)
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("failed to map vectored I/O scratch: {error}"));
+        let mapped = usize::try_from(mapped)
+            .unwrap_or_else(|_| panic!("vectored I/O scratch mmap returned {mapped}"));
+        let scratch_iov = Addr::<libc::iovec>::from_raw(mapped)
+            .unwrap_or_else(|| panic!("vectored I/O scratch mmap returned a null address"));
+        let mapping_addr: Addr<libc::c_void> = scratch_iov.cast();
+        let write_result = {
+            let raw_iovecs: Vec<libc::iovec> = iovecs
+                .iter()
+                .map(|(base, length)| libc::iovec {
+                    iov_base: *base as *mut libc::c_void,
+                    iov_len: *length,
+                })
+                .collect();
+            // SAFETY: the injected anonymous mapping is exclusively owned scratch space.
+            guest
+                .memory()
+                .write_values(unsafe { scratch_iov.into_mut() }, &raw_iovecs)
+        };
+        if let Err(write_error) = write_result {
+            guest
+                .inject_with_retry(Syscall::Munmap(
+                    syscalls::Munmap::new()
+                        .with_addr(Some(mapping_addr))
+                        .with_len(mapping_len),
+                ))
+                .await
+                .unwrap_or_else(|cleanup_error| {
+                    panic!(
+                        "failed to populate vectored I/O scratch ({write_error}); cleanup failed ({cleanup_error})"
+                    )
+                });
+            panic!("failed to populate vectored I/O scratch: {write_error}");
+        }
+
+        let scratch_call = call
+            .with_iov(Some(scratch_iov))
+            .with_iov_len(iovecs.len() as u64);
+        let result = self
+            .execute_pipe_vectored_attempt(guest, Syscall::Preadv2(scratch_call))
+            .await;
+        guest
+            .inject_with_retry(Syscall::Munmap(
+                syscalls::Munmap::new()
+                    .with_addr(Some(mapping_addr))
+                    .with_len(mapping_len),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("failed to unmap vectored I/O scratch: {error}"));
+        result
+    }
+
+    async fn execute_pipe_vectored_attempt<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        if self.cfg.recordreplay_modes {
+            self.record_or_replay_preserving_tool_errors(guest, call)
+                .await
+        } else {
+            guest.inject_with_retry(call).await.map_err(Error::from)
+        }
     }
 
     /// Override physically_nonblocking to true for the file descriptor, if appropriate.
@@ -703,27 +1010,72 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
-fn remaining_writev_segment(
-    fd: i32,
+fn snapshot_vectored_iovecs<M: MemoryAccess>(
+    memory: &M,
+    iov_addr: Option<usize>,
+    count: usize,
+) -> Result<VectoredIoSnapshot, Errno> {
+    if count > MAX_VECTORED_IOVECS {
+        return Err(Errno::EINVAL);
+    }
+    if count == 0 {
+        return Ok(VectoredIoSnapshot {
+            iovecs: Vec::new(),
+            target: 0,
+        });
+    }
+    let address = iov_addr
+        .and_then(Addr::<libc::iovec>::from_raw)
+        .ok_or(Errno::EFAULT)?;
+    let mut iovecs = vec![
+        libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        };
+        count
+    ];
+    memory.read_values(address, &mut iovecs)?;
+    let iovecs: Vec<_> = iovecs
+        .into_iter()
+        .map(|iovec| (iovec.iov_base as usize, iovec.iov_len))
+        .collect();
+    let target = vectored_io_target(&iovecs);
+    Ok(VectoredIoSnapshot { iovecs, target })
+}
+
+fn vectored_io_target(iovecs: &[(usize, usize)]) -> usize {
+    iovecs.iter().fold(0, |total, (_, length)| {
+        total.saturating_add(*length).min(MAX_RW_COUNT)
+    })
+}
+
+fn remaining_vectored_iovecs(
     iovecs: &[(usize, usize)],
     mut consumed: usize,
-    remaining_limit: usize,
-) -> Result<Option<syscalls::Write>, Errno> {
+    mut remaining: usize,
+) -> Result<Vec<(usize, usize)>, Errno> {
+    let mut suffix = Vec::new();
     for (base, length) in iovecs {
         if consumed >= *length {
             consumed -= *length;
             continue;
         }
-        let base = base.checked_add(consumed).ok_or(Errno::EFAULT)?;
-        let buffer = Addr::<u8>::from_raw(base).ok_or(Errno::EFAULT)?;
-        return Ok(Some(
-            syscalls::Write::new()
-                .with_fd(fd)
-                .with_buf(Some(buffer))
-                .with_len((*length - consumed).min(remaining_limit)),
-        ));
+        let available = *length - consumed;
+        let length = available.min(remaining);
+        if length > 0 {
+            let base = base.checked_add(consumed).ok_or(Errno::EFAULT)?;
+            suffix.push((base, length));
+            remaining -= length;
+        }
+        consumed = 0;
+        if remaining == 0 {
+            break;
+        }
     }
-    Ok(None)
+    if consumed != 0 || remaining != 0 {
+        return Err(Errno::EIO);
+    }
+    Ok(suffix)
 }
 
 /// A blocking syscall that involves a fail descriptor may be handled in these three ways:
@@ -971,23 +1323,22 @@ pub trait TimeoutableSyscall: SyscallInfo {
     fn timeout_return_val(&self) -> Result<i64, Errno>;
 }
 
-fn interrupted_write_result<C: NonblockableSyscall>(
-    call: &C,
+fn interrupted_write_result(
     written_total: usize,
     disposition: Option<WaitSignalDisposition>,
 ) -> Option<Result<i64, Error>> {
     match disposition {
         None => None,
         Some(_) if written_total > 0 => Some(Ok(written_total as i64)),
-        Some(_) => Some(Err(call.signal_interrupt_errno().into())),
+        Some(_) => Some(Err(Errno::ERESTARTSYS.into())),
     }
 }
 
-fn pipe_writev_resources(dettid: DetTid, call: reverie::syscalls::Writev) -> Resources {
+fn pipe_vectored_resources(dettid: DetTid, name: &'static str) -> Resources {
     let mut resources = Resources::new(dettid);
     resources.insert(ResourceID::InternalIOPolling, Permission::W);
-    resources.fyi(call.name());
-    resources.set_signal_interrupt_errno(call.signal_interrupt_errno());
+    resources.fyi(name);
+    resources.set_signal_interrupt_errno(Errno::ERESTARTSYS);
     resources
 }
 
@@ -1714,34 +2065,82 @@ mod tests {
 
     #[test]
     fn writev_signal_result_uses_disposition_and_progress() {
-        let call = reverie::syscalls::Writev::new();
         for disposition in [
             WaitSignalDisposition::Interrupt,
             WaitSignalDisposition::Restart,
         ] {
             assert!(matches!(
-                interrupted_write_result(&call, 0, Some(disposition)),
+                interrupted_write_result(0, Some(disposition)),
                 Some(Err(Error::Errno(Errno::ERESTARTSYS)))
             ));
             assert!(matches!(
-                interrupted_write_result(&call, 17, Some(disposition)),
+                interrupted_write_result(17, Some(disposition)),
                 Some(Ok(17))
             ));
         }
-        assert!(interrupted_write_result(&call, 0, None).is_none());
-        assert!(interrupted_write_result(&call, 17, None).is_none());
+        assert!(interrupted_write_result(0, None).is_none());
+        assert!(interrupted_write_result(17, None).is_none());
     }
 
     #[test]
     fn pipe_writev_requests_signal_disposition() {
         let dettid = DetTid::from_raw(42);
         let call = reverie::syscalls::Writev::new();
-        let request = pipe_writev_resources(dettid, call);
+        let request = pipe_vectored_resources(dettid, call.name());
 
         assert_eq!(
             request.signal_interrupt_errno(),
             Some(Errno::ERESTARTSYS.into_raw())
         );
         assert_eq!(request.resources.len(), 1);
+    }
+
+    #[test]
+    fn pwritev2_retry_preserves_syscall_offset_and_flags() {
+        let original_iov = Addr::from_raw(0x1000).expect("nonzero test address");
+        let retry_iov = 0x2000;
+        let call = reverie::syscalls::Pwritev2::new()
+            .with_fd(17)
+            .with_iov(Some(original_iov))
+            .with_iov_len(3)
+            .with_pos_l(u64::MAX)
+            .with_pos_h(0xfeed_face)
+            .with_flags(libc::RWF_NOWAIT);
+
+        let retry = BlockingPipeVectoredWrite::Pwritev2(call)
+            .with_iov(retry_iov, 2)
+            .into_syscall();
+        let Syscall::Pwritev2(retry) = retry else {
+            panic!("pwritev2 retry changed syscall identity");
+        };
+
+        assert_eq!(retry.fd(), 17);
+        assert_eq!(retry.iov().map(|address| address.as_raw()), Some(retry_iov));
+        assert_eq!(retry.iov_len(), 2);
+        assert_eq!(retry.pos_l(), u64::MAX);
+        assert_eq!(retry.pos_h(), 0xfeed_face);
+        assert_eq!(retry.flags(), libc::RWF_NOWAIT);
+    }
+
+    #[test]
+    fn vectored_retry_advances_the_exact_suffix() {
+        let iovecs = [(0x1000, 2), (0x2000, 3), (0x3000, 4)];
+        assert_eq!(
+            remaining_vectored_iovecs(&iovecs, 3, 5),
+            Ok(vec![(0x2001, 2), (0x3000, 3)])
+        );
+        assert_eq!(
+            remaining_vectored_iovecs(&iovecs, 0, 5),
+            Ok(vec![(0x1000, 2), (0x2000, 3)])
+        );
+        assert_eq!(
+            remaining_vectored_iovecs(&[(usize::MAX, 2)], 1, 1),
+            Err(Errno::EFAULT)
+        );
+        assert_eq!(remaining_vectored_iovecs(&iovecs, 8, 2), Err(Errno::EIO));
+        assert_eq!(
+            vectored_io_target(&[(0, usize::MAX), (0, usize::MAX)]),
+            MAX_RW_COUNT
+        );
     }
 }
