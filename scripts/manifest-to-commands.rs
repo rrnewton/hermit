@@ -49,7 +49,8 @@ use timeouts::MAX_TIMEOUT_SECONDS;
 use timeouts::MIN_TIMEOUT_SECONDS;
 use timeouts::resolve_timeout_seconds;
 
-const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+const HERMIT_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+const NAKED_BACKENDS: [&str; 1] = ["native"];
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
@@ -481,25 +482,28 @@ fn guest_args_tsv(tests: &[(String, i64, Value)]) -> Result<Vec<String>, String>
         mode_names.sort_unstable();
         for mode in mode_names {
             let spec = &modes[mode];
+            let known_backends = if mode == "naked" {
+                &NAKED_BACKENDS[..]
+            } else {
+                &HERMIT_BACKENDS[..]
+            };
             let Some(by_backend) = spec.get("guest_args") else {
                 continue;
             };
-            let by_backend = by_backend.as_table().unwrap_or_else(|| {
-                fail(format!("{id}.modes.{mode}.guest_args must be a table"))
-            });
+            let by_backend = by_backend
+                .as_table()
+                .unwrap_or_else(|| fail(format!("{id}.modes.{mode}.guest_args must be a table")));
             let enabled = string_array(
                 spec.get("backends_enabled"),
                 &format!("{id}.modes.{mode}.backends_enabled"),
             );
-            let disabled = spec
-                .get("backends_disabled")
-                .and_then(Value::as_table);
+            let disabled = spec.get("backends_disabled").and_then(Value::as_table);
             let mut backends = by_backend.keys().map(String::as_str).collect::<Vec<_>>();
             backends.sort_unstable();
             for backend in backends {
-                if !KNOWN_BACKENDS.contains(&backend) {
+                if !known_backends.contains(&backend) {
                     return Err(format!(
-                        "{id}: modes.{mode}.guest_args.{backend} names unknown backend; expected one of {KNOWN_BACKENDS:?}"
+                        "{id}: modes.{mode}.guest_args.{backend} names unknown backend for this mode; expected one of {known_backends:?}"
                     ));
                 }
                 if !enabled.iter().any(|name| name == backend)
@@ -626,8 +630,8 @@ fn main() -> ExitCode {
     let root = repo_root();
     let manifests = root.join("tests/e2e/manifests");
     if std::env::args().skip(1).any(|a| a == "--guest-args") {
-        let lines = guest_args_tsv(&load_manifest_tests(&manifests))
-            .unwrap_or_else(|error| fail(error));
+        let lines =
+            guest_args_tsv(&load_manifest_tests(&manifests)).unwrap_or_else(|error| fail(error));
         for line in lines {
             println!("{line}");
         }
@@ -836,7 +840,46 @@ test:
         let error = guest_args_tsv(&tests).expect_err("unknown backend must be rejected");
         assert_eq!(
             error,
-            "c-programs/unknown-backend: modes.verify.guest_args.ptrcae names unknown backend; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
+            "c-programs/unknown-backend: modes.verify.guest_args.ptrcae names unknown backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
+        );
+    }
+
+    #[test]
+    fn guest_args_tsv_accepts_native_only_for_naked_mode() {
+        let naked = manifest(
+            r#"
+test:
+  - id: c-programs/native-args
+    program: tests/c/native-args.c
+    modes:
+      naked:
+        backends_enabled: [native]
+        guest_args:
+          native: [native-scenario]
+"#,
+        );
+        assert_eq!(
+            guest_args_tsv(&naked).expect("native is the naked-mode backend"),
+            ["c-programs/native-args\tnaked\tnative\tnative-scenario"]
+        );
+
+        let normal = manifest(
+            r#"
+test:
+  - id: c-programs/native-args
+    program: tests/c/native-args.c
+    modes:
+      verify:
+        backends_enabled: [ptrace]
+        backends_disabled:
+          native: invalid outside naked mode
+        guest_args:
+          native: [native-scenario]
+"#,
+        );
+        assert_eq!(
+            guest_args_tsv(&normal).expect_err("native must be rejected outside naked mode"),
+            "c-programs/native-args: modes.verify.guest_args.native names unknown backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
         );
     }
 

@@ -262,6 +262,36 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
     (commands.join(" && "), guest)
 }
 
+/// Return only the arguments declared for this exact mode/backend pair.
+/// An absent entry deliberately means no arguments; it must not inherit a
+/// sibling backend's scenario.
+fn mode_guest_args(spec: &Value, mode: &str, backend: &str, id: &str) -> Vec<String> {
+    let Some(by_backend) = spec.get("guest_args") else {
+        return Vec::new();
+    };
+    let by_backend = by_backend
+        .as_table()
+        .unwrap_or_else(|| fail(format!("{id}.modes.{mode}.guest_args must be a table")));
+    string_array(
+        by_backend.get(backend),
+        &format!("{id}.modes.{mode}.guest_args.{backend}"),
+    )
+}
+
+fn guest_with_args(guest: &str, guest_args: &[String]) -> String {
+    if guest_args.is_empty() {
+        return guest.to_owned();
+    }
+    format!(
+        "{guest} {}",
+        guest_args
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
 /// Assemble the Hermit invocation for one (mode, backend) cell. `log` overrides
 /// the `--log=` level; `extra` are additional hermit flags injected before the
 /// `-- <guest>` separator. Mirrors `manifest-to-commands.rs::hermit_command`
@@ -724,6 +754,8 @@ fn build_full_command(
 ) -> (String, String, String) {
     let (mode, backend, lane, timeout) = resolve_cell(test, id, inherited_timeout_seconds, args);
     let (setup, guest) = setup_prefix(test, id);
+    let guest_args = mode_guest_args(&modes_table(test, id)[&mode], &mode, &backend, id);
+    let guest = guest_with_args(&guest, &guest_args);
     let log = args
         .flag("log")
         .map(str::to_owned)
@@ -876,6 +908,58 @@ modes:
     );
     assert!(weak_verify.contains("--verify --verify-json \"$cell/captures/verify.json\""));
     assert!(weak_verify.contains("--strict $run_verify_strict --verify"));
+
+    let per_backend_guest_args: Value = r#"
+direct: [/bin/echo]
+lane: portable
+modes:
+  verify:
+    backends_enabled: [ptrace]
+    backends_disabled:
+      kvm: configured but not selected for ordinary validation
+    guest_args:
+      ptrace: [ptrace-scenario]
+      kvm: [kvm-scenario, value with spaces]
+"#
+    .parse()
+    .unwrap();
+    let kvm_args = parse_args(&[
+        "--mode".to_owned(),
+        "verify".to_owned(),
+        "--backend".to_owned(),
+        "kvm".to_owned(),
+    ]);
+    let (kvm_command, mode, backend) =
+        build_full_command(&per_backend_guest_args, "fixture", 15, &kvm_args);
+    assert_eq!((mode.as_str(), backend.as_str()), ("verify", "kvm"));
+    assert!(kvm_command.contains("kvm-scenario"));
+    assert!(kvm_command.contains("value with spaces"));
+    assert!(!kvm_command.contains("ptrace-scenario"));
+    assert_eq!(
+        guest_with_args(
+            "/bin/echo",
+            &["kvm-scenario".into(), "value with spaces".into()]
+        ),
+        "/bin/echo kvm-scenario 'value with spaces'"
+    );
+
+    let absent_kvm_guest_args: Value = r#"
+direct: [/bin/echo]
+lane: portable
+modes:
+  verify:
+    backends_enabled: [ptrace]
+    backends_disabled:
+      kvm: configured but not selected for ordinary validation
+    guest_args:
+      ptrace: [ptrace-scenario]
+"#
+    .parse()
+    .unwrap();
+    let (kvm_without_args, _, _) =
+        build_full_command(&absent_kvm_guest_args, "fixture", 15, &kvm_args);
+    assert!(kvm_without_args.contains("-- /bin/echo"));
+    assert!(!kvm_without_args.contains("ptrace-scenario"));
     println!("manifest-cli self-test: PASS");
     ExitCode::SUCCESS
 }

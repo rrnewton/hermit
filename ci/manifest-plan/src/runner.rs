@@ -774,10 +774,15 @@ fn validate_mode_with_cpu(
             "{id}: naked is opt-in meta-CI and must set ci=false"
         ));
     }
-    for backend in recipe.guest_args.keys() {
+    for (backend, args) in &recipe.guest_args {
         if !enabled.contains(backend.as_str()) && !disabled.contains(backend.as_str()) {
             return Err(format!(
                 "{id}: {mode} guest_args names backend {backend} outside backends_enabled/backends_disabled"
+            ));
+        }
+        if args.is_empty() {
+            return Err(format!(
+                "{id}: {mode} guest_args.{backend} must contain at least one argument"
             ));
         }
     }
@@ -4501,6 +4506,16 @@ mod tests {
             "an unselected backend must not inherit a selected sibling's arguments"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_explicit_empty_guest_arguments() {
+        let mut mode = recipe(true).modes.remove("verify").unwrap();
+        mode.guest_args.insert("kvm".into(), Vec::new());
+        assert_eq!(
+            validate_mode("fixture/test", "verify", &mode, 60).unwrap_err(),
+            "fixture/test: verify guest_args.kvm must contain at least one argument"
+        );
     }
 
     #[test]
