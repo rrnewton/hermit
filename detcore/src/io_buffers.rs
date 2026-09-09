@@ -164,6 +164,30 @@ where
     Ok(out)
 }
 
+/// Derive completed extents from the immutable iovec metadata imported by a
+/// logically blocking retry. The caller's iovec array can be changed while the
+/// syscall is parked, so consulting it after completion would describe different
+/// memory than the kernel operation actually used.
+fn snapshotted_iovec_extents(iovecs: &[(usize, usize)], moved: i64) -> Vec<BufferExtent> {
+    let mut remaining = u64::try_from(moved).unwrap_or(0);
+    let mut out = Vec::new();
+    for &(base, length) in iovecs {
+        if remaining == 0 {
+            break;
+        }
+        if base == 0 || length == 0 {
+            continue;
+        }
+        let len = (length as u64).min(remaining);
+        out.push(BufferExtent {
+            addr: base as u64,
+            len,
+        });
+        remaining -= len;
+    }
+    out
+}
+
 /// Read a `msghdr` out of the guest and walk the iovecs it points at.
 fn msghdr_extents<G, T>(
     guest: &mut G,
@@ -287,7 +311,12 @@ fn ret_gates_output(call: &Syscall) -> bool {
 /// Only syscalls whose buffer CONTENT the INFO record does not already show are
 /// listed. `clock_gettime` and `newfstatat`, for instance, are absent because
 /// Reverie's typed display already dereferences and prints their output.
-fn extents<G, T>(guest: &mut G, call: &Syscall, ret: i64) -> Result<Vec<BufferExtent>, Error>
+fn extents<G, T>(
+    guest: &mut G,
+    call: &Syscall,
+    ret: i64,
+    iovec_snapshot: Option<&[(usize, usize)]>,
+) -> Result<Vec<BufferExtent>, Error>
 where
     G: Guest<T>,
     T: Tool,
@@ -323,16 +352,22 @@ where
         Syscall::Recvmmsg(c) => {
             mmsghdr_extents(guest, c.mmsg().map_or(0, |p| p.as_raw()), c.vlen(), ret)?
         }
-        Syscall::Readv(c) => iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.len(), ret)?,
+        Syscall::Readv(c) => match iovec_snapshot {
+            Some(iovecs) => snapshotted_iovec_extents(iovecs, ret),
+            None => iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.len(), ret)?,
+        },
         Syscall::Preadv(c) => {
             iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.iov_len(), ret)?
         }
-        Syscall::Preadv2(c) => iovec_extents(
-            guest,
-            c.iov().map_or(0, |p| p.as_raw()),
-            usize::try_from(c.iov_len()).unwrap_or(usize::MAX),
-            ret,
-        )?,
+        Syscall::Preadv2(c) => match iovec_snapshot {
+            Some(iovecs) => snapshotted_iovec_extents(iovecs, ret),
+            None => iovec_extents(
+                guest,
+                c.iov().map_or(0, |p| p.as_raw()),
+                usize::try_from(c.iov_len()).unwrap_or(usize::MAX),
+                ret,
+            )?,
+        },
 
         // Bytes the guest produced. These never reach stdout/stderr for a QEMU
         // boot -- measured, all 234,872 writes went to fds 7/12/14/11/13/4/8/19/23
@@ -342,18 +377,22 @@ where
         Syscall::Pwrite64(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.len(), ret),
         Syscall::Sendto(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.size(), ret),
         Syscall::Sendmsg(c) => msghdr_extents(guest, c.msg().map_or(0, |p| p.as_raw()), ret)?,
-        Syscall::Writev(c) => {
-            iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.len(), ret)?
-        }
+        Syscall::Writev(c) => match iovec_snapshot {
+            Some(iovecs) => snapshotted_iovec_extents(iovecs, ret),
+            None => iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.len(), ret)?,
+        },
         Syscall::Pwritev(c) => {
             iovec_extents(guest, c.iov().map_or(0, |p| p.as_raw()), c.iov_len(), ret)?
         }
-        Syscall::Pwritev2(c) => iovec_extents(
-            guest,
-            c.iov().map_or(0, |p| p.as_raw()),
-            usize::try_from(c.iov_len()).unwrap_or(usize::MAX),
-            ret,
-        )?,
+        Syscall::Pwritev2(c) => match iovec_snapshot {
+            Some(iovecs) => snapshotted_iovec_extents(iovecs, ret),
+            None => iovec_extents(
+                guest,
+                c.iov().map_or(0, |p| p.as_raw()),
+                usize::try_from(c.iov_len()).unwrap_or(usize::MAX),
+                ret,
+            )?,
+        },
 
         // Rewritten in place across the WHOLE array: `poll` sets `revents` on
         // every entry, not just on the `ret` that were ready, so the extent is
@@ -474,6 +513,7 @@ pub(crate) fn detlog_io_buffers<G, T>(
     call: &Syscall,
     ret: i64,
     dettid: DetTid,
+    iovec_snapshot: Option<&[(usize, usize)]>,
 ) -> Result<(), Error>
 where
     G: Guest<T>,
@@ -503,7 +543,7 @@ where
         Some(fd) => fd.to_string(),
         None => "-".to_string(),
     };
-    for extent in extents(guest, call, ret)? {
+    for extent in extents(guest, call, ret, iovec_snapshot)? {
         let (whole, chunk, chunks) = extent_digests(guest, extent.addr, extent.len)?;
         let located = if chunks.is_empty() {
             String::new()

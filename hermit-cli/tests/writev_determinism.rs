@@ -39,6 +39,38 @@ fn command_output(mut command: Command, label: &str) -> Output {
     output
 }
 
+#[test]
+fn sibling_signal_interrupts_scalar_and_vectored_partial_pipe_writes() {
+    let guest = compile_writev_guest("writev-interrupted-partial");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "5s", "30s"])
+        .arg(hermit_test::hermit_binary())
+        .args([
+            "--log=trace",
+            "run",
+            "--strict",
+            "--panic-on-unsupported-syscalls",
+            "--base-env=minimal",
+            "--",
+        ])
+        .arg(&guest)
+        .arg("interrupted-writes");
+    let output = command_output(command, "partial pipe-write signal interruption");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("interrupted-pipe-write:4096,4096"),
+        "scalar/writev did not return exact partial progress after sibling signals\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+    assert!(
+        stderr.matches("WaitidSignals").count() >= 2,
+        "trace did not show both parked writes resumed through the signal path\n\
+         stderr:\n{stderr}",
+    );
+}
+
 fn kill_process_group(child: &mut std::process::Child) {
     unsafe {
         libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
@@ -229,9 +261,8 @@ fn writev_uses_fd_aware_scheduling_and_verifies() {
             && trace_stderr.contains(
                 "NonblockableSyscall: converting to nonblocking syscall (internal polling): write",
             )
-            && trace_stderr.contains(
-                "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev",
-            )
+            && trace_stderr
+                .contains("NonblockableSyscall: polling a physically nonblocking pipe for writev",)
             && trace_stderr.contains("Retry #1 for blocking pipe write")
             && trace_stderr.contains("Retry #1 for atomic blocking pipe writev after EAGAIN"),
         "write/writev did not reach typed dispatch and internal-fd scheduling\n\

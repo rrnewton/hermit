@@ -1267,21 +1267,9 @@ int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "partial-mixed") == 0) {
     return check_signal_after_partial_writev(PARTIAL_SIGNAL_MIXED) == 0 ? 0 : 1;
   }
-  // OFF THE DEFAULT PATH, AND NOT BECAUSE IT IS UNIMPORTANT.
-  //
-  // These two cases interrupt a writer that is blocked on a full pipe with a
-  // signal and require Linux's positive partial byte count back. Measured
-  // 2026-09-01 through `bin/safehermit` on ptrace with `--strict`: BOTH of them
-  // hang under Hermit, natively both return 0. The vectored one now runs through
-  // the same current-position pipe retry used by writev and pwritev2, so this
-  // remains a gap in `InternalIOPolling` rather than something introduced by
-  // either vectored syscall wrapper -- the loop's `ResumeStatus::Signaled`
-  // check does not fire for a signal delivered to a thread parked in it, so the
-  // write never returns.
-  //
-  // Kept compiled and reachable behind this mode rather than deleted, so the
-  // coverage is here the day that loop learns to surface the signal. Running it
-  // today hangs the whole guest, which is why the default path does not.
+  // Keep the partial-progress cases independently selectable so the Rust
+  // harness can apply a short external deadline and report this signal/polling
+  // contract separately from the broad writev matrix.
   if (argc > 1 && strcmp(argv[1], "interrupted-writes") == 0) {
     int scalar_partial = check_interrupted_blocking_pipe_write(0);
     int vector_partial = check_interrupted_blocking_pipe_write(1);

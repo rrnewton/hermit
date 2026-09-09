@@ -1499,6 +1499,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     pedigree: child_pedigree.clone(),
                     stats: ThreadStats::new(),
+                    pending_iovec_snapshot: None,
                     file_metadata: {
                         debug!(
                             "[init_thread-state, parent dtid = {}] child thread {}, clone_flags = {:x?}",
@@ -2746,6 +2747,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .observe_brk(brk as u64);
         }
 
+        // A blocking vectored-I/O helper may have yielded after importing the
+        // caller's iovec array. Consume that metadata for this syscall even when
+        // evidence logging is disabled or the syscall failed, so it can never
+        // leak into a later syscall on the same thread.
+        let iovec_snapshot = guest.thread_state_mut().pending_iovec_snapshot.take();
         self.detlog_memory_maps(guest)?;
         // Same control point again, for the bytes this syscall moved through a guest buffer.
         // Unlike the two mapping hashes above, the extent comes from the syscall's OWN
@@ -2755,7 +2761,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if let Ok(ret) = &res
             && self.cfg.detlog_io_buffers
         {
-            io_buffers::detlog_io_buffers(guest, &call, *ret, dettid)?;
+            io_buffers::detlog_io_buffers(
+                guest,
+                &call,
+                *ret,
+                dettid,
+                iovec_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.iovecs.as_slice()),
+            )?;
         }
 
         if sequentialize_threads && self.cfg.should_trace_schedevent() {
