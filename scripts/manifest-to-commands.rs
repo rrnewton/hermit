@@ -469,7 +469,7 @@ fn commands_for_test(test: &Value, bucket: &str, inherited_timeout_seconds: i64)
 /// the argument list, which would drift. Cells with no declared arguments are
 /// omitted rather than emitted empty, so a consumer can distinguish "declared
 /// nothing" from "not in the manifests" only by the test id's absence.
-fn guest_args_tsv(tests: &[(String, i64, Value)]) -> Vec<String> {
+fn guest_args_tsv(tests: &[(String, i64, Value)]) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     for (bucket, _, test) in tests {
         let id = test_id(test, bucket);
@@ -486,19 +486,35 @@ fn guest_args_tsv(tests: &[(String, i64, Value)]) -> Vec<String> {
             let by_backend = by_backend.as_table().unwrap_or_else(|| {
                 fail(format!("{id}.modes.{mode}.guest_args must be a table"))
             });
+            let enabled = string_array(
+                spec.get("backends_enabled"),
+                &format!("{id}.modes.{mode}.backends_enabled"),
+            );
+            let disabled = spec
+                .get("backends_disabled")
+                .and_then(Value::as_table);
             let mut backends = by_backend.keys().map(String::as_str).collect::<Vec<_>>();
             backends.sort_unstable();
             for backend in backends {
+                if !enabled.iter().any(|name| name == backend)
+                    && !disabled.is_some_and(|backends| backends.contains_key(backend))
+                {
+                    return Err(format!(
+                        "{id}: modes.{mode}.guest_args.{backend} names a backend outside backends_enabled/backends_disabled"
+                    ));
+                }
                 let args = mode_guest_args(spec, mode, backend, &id);
                 if args.is_empty() {
-                    continue;
+                    return Err(format!(
+                        "{id}: modes.{mode}.guest_args.{backend} must contain at least one argument"
+                    ));
                 }
                 lines.push(format!("{id}\t{mode}\t{backend}\t{}", args.join("\t")));
             }
         }
     }
     lines.sort();
-    lines
+    Ok(lines)
 }
 
 // TODO-HUMAN-REVIEW(PR-1081): Review the manifest-to-command CLI and generated shell contract.
@@ -604,7 +620,9 @@ fn main() -> ExitCode {
     let root = repo_root();
     let manifests = root.join("tests/e2e/manifests");
     if std::env::args().skip(1).any(|a| a == "--guest-args") {
-        for line in guest_args_tsv(&load_manifest_tests(&manifests)) {
+        let lines = guest_args_tsv(&load_manifest_tests(&manifests))
+            .unwrap_or_else(|error| fail(error));
+        for line in lines {
             println!("{line}");
         }
         return ExitCode::SUCCESS;
@@ -777,7 +795,7 @@ test:
         backends_enabled: [ptrace]
 "#,
         ));
-        let lines = guest_args_tsv(&tests);
+        let lines = guest_args_tsv(&tests).expect("valid guest_args must export");
         assert_eq!(
             lines,
             vec![
@@ -789,6 +807,52 @@ test:
         assert!(
             !lines.iter().any(|line| line.starts_with("c-programs/bare")),
             "a cell declaring no guest_args must not appear in the dump"
+        );
+    }
+
+    #[test]
+    fn guest_args_tsv_rejects_an_unknown_backend() {
+        let tests = manifest(
+            r#"
+test:
+  - id: c-programs/unknown-backend
+    program: tests/c/unknown-backend.c
+    modes:
+      verify:
+        backends_enabled: [ptrace]
+        backends_disabled:
+          kvm: not selected for ordinary validation
+        guest_args:
+          ptrcae: [multi]
+"#,
+        );
+        let error = guest_args_tsv(&tests).expect_err("unknown backend must be rejected");
+        assert_eq!(
+            error,
+            "c-programs/unknown-backend: modes.verify.guest_args.ptrcae names a backend outside backends_enabled/backends_disabled"
+        );
+    }
+
+    #[test]
+    fn guest_args_tsv_rejects_an_empty_vector() {
+        let tests = manifest(
+            r#"
+test:
+  - id: c-programs/empty-args
+    program: tests/c/empty-args.c
+    modes:
+      verify:
+        backends_enabled: [ptrace]
+        backends_disabled:
+          kvm: not selected for ordinary validation
+        guest_args:
+          kvm: []
+"#,
+        );
+        let error = guest_args_tsv(&tests).expect_err("empty vector must be rejected");
+        assert_eq!(
+            error,
+            "c-programs/empty-args: modes.verify.guest_args.kvm must contain at least one argument"
         );
     }
 
