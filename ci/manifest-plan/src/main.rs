@@ -1269,14 +1269,13 @@ fn validate_mode_with_cpu(
                     "{id}: modes.{mode}.guest_args.{backend} names a backend outside backends_enabled/backends_disabled"
                 ));
             }
-            if string_array(
+            let args = string_array(
                 Some(args),
                 &format!("{id}.modes.{mode}.guest_args.{backend}"),
-            )
-            .is_empty()
-            {
+            );
+            if args.iter().any(|argument| argument.contains('\0')) {
                 die(format!(
-                    "{id}: modes.{mode}.guest_args.{backend} must contain at least one argument"
+                    "{id}: modes.{mode}.guest_args.{backend} contains a NUL byte, which Linux argv cannot represent"
                 ));
             }
         }
@@ -2193,7 +2192,7 @@ backends_enabled = []
 ci = false
 ci_disabled_reason = "fixture cell: ptrace only, other backends unmeasured here"
 backends_enabled = ["ptrace"]
-guest_args = { kvm = ["--kvm"] }
+guest_args = { ptrace = [], kvm = ["--kvm"] }
 
 [backends_disabled]
 dbt = "unsupported"

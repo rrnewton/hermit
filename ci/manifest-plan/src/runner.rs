@@ -780,9 +780,9 @@ fn validate_mode_with_cpu(
                 "{id}: {mode} guest_args names backend {backend} outside backends_enabled/backends_disabled"
             ));
         }
-        if args.is_empty() {
+        if args.iter().any(|argument| argument.contains('\0')) {
             return Err(format!(
-                "{id}: {mode} guest_args.{backend} must contain at least one argument"
+                "{id}: {mode} guest_args.{backend} contains a NUL byte, which Linux argv cannot represent"
             ));
         }
     }
@@ -4509,12 +4509,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_explicit_empty_guest_arguments() {
+    fn accepts_explicit_empty_guest_arguments() {
         let mut mode = recipe(true).modes.remove("verify").unwrap();
         mode.guest_args.insert("kvm".into(), Vec::new());
+        validate_mode("fixture/test", "verify", &mode, 60).unwrap();
+    }
+
+    #[test]
+    fn rejects_nul_in_guest_arguments() {
+        let mut mode = recipe(true).modes.remove("verify").unwrap();
+        mode.guest_args
+            .insert("kvm".into(), vec!["contains\0nul".into()]);
         assert_eq!(
             validate_mode("fixture/test", "verify", &mode, 60).unwrap_err(),
-            "fixture/test: verify guest_args.kvm must contain at least one argument"
+            "fixture/test: verify guest_args.kvm contains a NUL byte, which Linux argv cannot represent"
         );
     }
 

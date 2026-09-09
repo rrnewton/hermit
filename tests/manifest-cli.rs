@@ -229,14 +229,18 @@ fn validate_mode_guest_args(spec: &Value, mode: &str, id: &str) -> Result<(), St
         let args = args
             .as_array()
             .ok_or_else(|| format!("{id}.modes.{mode}.guest_args.{backend} must be an array"))?;
-        if args.is_empty() {
-            return Err(format!(
-                "{id}: modes.{mode}.guest_args.{backend} must contain at least one argument"
-            ));
-        }
         if args.iter().any(|argument| argument.as_str().is_none()) {
             return Err(format!(
                 "{id}.modes.{mode}.guest_args.{backend} entries must be strings"
+            ));
+        }
+        if args
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|argument| argument.contains('\0'))
+        {
+            return Err(format!(
+                "{id}: modes.{mode}.guest_args.{backend} contains a NUL byte, which Linux argv cannot represent"
             ));
         }
     }
@@ -283,7 +287,7 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
     let guest = match (program, direct) {
         (Some(_), Some(_)) => fail(format!("{id}: set only one of `program` and `direct`")),
         (None, None) => fail(format!("{id}: missing `program` or `direct`")),
-        (None, Some(Value::String(command))) => format!("sh -c {} --", shell_quote(command)),
+        (None, Some(Value::String(command))) => format!("sh -c {}", shell_quote(command)),
         (None, Some(Value::Array(_))) => {
             let argv = string_array(direct, &format!("{id}.direct"));
             if argv.is_empty() {
@@ -374,12 +378,18 @@ fn mode_guest_args(spec: &Value, mode: &str, backend: &str, id: &str) -> Vec<Str
     )
 }
 
-fn guest_with_args(guest: &str, guest_args: &[String]) -> String {
+/// Append guest arguments while preserving `sh -c`'s `$0` convention.
+fn guest_with_args(test: &Value, guest: &str, guest_args: &[String]) -> String {
     if guest_args.is_empty() {
         return guest.to_owned();
     }
+    let argv0 = if matches!(test.get("direct"), Some(Value::String(_))) {
+        " --"
+    } else {
+        ""
+    };
     format!(
-        "{guest} {}",
+        "{guest}{argv0} {}",
         guest_args
             .iter()
             .map(|arg| shell_quote(arg))
@@ -854,7 +864,7 @@ fn build_full_command(
     let (mode, backend, lane, timeout) = resolve_cell(test, id, inherited_timeout_seconds, args);
     let (setup, guest) = setup_prefix(test, id);
     let guest_args = mode_guest_args(&modes_table(test, id)[&mode], &mode, &backend, id);
-    let guest = guest_with_args(&guest, &guest_args);
+    let guest = guest_with_args(test, &guest, &guest_args);
     let log = args
         .flag("log")
         .map(str::to_owned)
@@ -1036,6 +1046,7 @@ modes:
     assert!(!kvm_command.contains("ptrace-scenario"));
     assert_eq!(
         guest_with_args(
+            &per_backend_guest_args,
             "/bin/echo",
             &["kvm-scenario".into(), "value with spaces".into()]
         ),
@@ -1103,9 +1114,17 @@ guest_args:
 "#
     .parse()
     .unwrap();
+    assert!(validate_mode_guest_args(&empty_guest_args, "verify", "fixture").is_ok());
+    let nul_guest_args: Value = r#"
+backends_enabled: [ptrace]
+guest_args:
+  ptrace: ["\0"]
+"#
+    .parse()
+    .unwrap();
     assert_eq!(
-        validate_mode_guest_args(&empty_guest_args, "verify", "fixture").unwrap_err(),
-        "fixture: modes.verify.guest_args.kvm must contain at least one argument"
+        validate_mode_guest_args(&nul_guest_args, "verify", "fixture").unwrap_err(),
+        "fixture: modes.verify.guest_args.ptrace contains a NUL byte, which Linux argv cannot represent"
     );
     let outside_guest_args: Value = r#"
 backends_enabled: [ptrace]
@@ -1147,20 +1166,33 @@ guest_args:
     );
 
     let direct_string: Value = r#"
-direct: 'printf "%s" "$1"'
+direct: 'printf "%s|%s" "$0" "${1-unset}"'
 "#
     .parse()
     .unwrap();
     let (_, direct_guest) = setup_prefix(&direct_string, "fixture");
-    let direct_guest = guest_with_args(&direct_guest, &["first".into(), "second".into()]);
-    assert_eq!(direct_guest, "sh -c 'printf \"%s\" \"$1\"' -- first second");
+    let no_args = guest_with_args(&direct_string, &direct_guest, &[]);
+    assert_eq!(no_args, "sh -c 'printf \"%s|%s\" \"$0\" \"${1-unset}\"'");
+    let output = Command::new("sh").arg("-c").arg(&no_args).output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"sh|unset");
+
+    let direct_guest = guest_with_args(
+        &direct_string,
+        &direct_guest,
+        &["first".into(), "second".into()],
+    );
+    assert_eq!(
+        direct_guest,
+        "sh -c 'printf \"%s|%s\" \"$0\" \"${1-unset}\"' -- first second"
+    );
     let output = Command::new("sh")
         .arg("-c")
         .arg(&direct_guest)
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert_eq!(output.stdout, b"first");
+    assert_eq!(output.stdout, b"--|first");
     println!("manifest-cli self-test: PASS");
     ExitCode::SUCCESS
 }
