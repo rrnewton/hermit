@@ -49,6 +49,7 @@ use timeouts::MAX_TIMEOUT_SECONDS;
 use timeouts::MIN_TIMEOUT_SECONDS;
 use timeouts::resolve_timeout_seconds;
 
+const KNOWN_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
@@ -496,6 +497,11 @@ fn guest_args_tsv(tests: &[(String, i64, Value)]) -> Result<Vec<String>, String>
             let mut backends = by_backend.keys().map(String::as_str).collect::<Vec<_>>();
             backends.sort_unstable();
             for backend in backends {
+                if !KNOWN_BACKENDS.contains(&backend) {
+                    return Err(format!(
+                        "{id}: modes.{mode}.guest_args.{backend} names unknown backend; expected one of {KNOWN_BACKENDS:?}"
+                    ));
+                }
                 if !enabled.iter().any(|name| name == backend)
                     && !disabled.is_some_and(|backends| backends.contains_key(backend))
                 {
@@ -811,7 +817,7 @@ test:
     }
 
     #[test]
-    fn guest_args_tsv_rejects_an_unknown_backend() {
+    fn guest_args_tsv_rejects_a_globally_unknown_disabled_backend() {
         let tests = manifest(
             r#"
 test:
@@ -822,6 +828,7 @@ test:
         backends_enabled: [ptrace]
         backends_disabled:
           kvm: not selected for ordinary validation
+          ptrcae: misspelled backend must never be exported
         guest_args:
           ptrcae: [multi]
 "#,
@@ -829,7 +836,7 @@ test:
         let error = guest_args_tsv(&tests).expect_err("unknown backend must be rejected");
         assert_eq!(
             error,
-            "c-programs/unknown-backend: modes.verify.guest_args.ptrcae names a backend outside backends_enabled/backends_disabled"
+            "c-programs/unknown-backend: modes.verify.guest_args.ptrcae names unknown backend; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
         );
     }
 
