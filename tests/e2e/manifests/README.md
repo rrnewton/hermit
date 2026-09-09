@@ -222,11 +222,11 @@ test:
 Every `guest_args` key must name a backend listed in either `backends_enabled`
 or `backends_disabled`. This lets an explicit `--probe-disabled` run give an
 unselected backend its own scenario arguments without selecting that backend
-for ordinary validation. The test harness looks up the selected backend's
-arguments exactly, without inheriting another backend's arguments, and the
-`--guest-args` exporter emits only explicit vectors. The separate full-corpus
-collector in the parent workspace may deliberately apply its documented
-ptrace-reference fallback when a backend has no explicit vector.
+for ordinary validation. The test harness, manifest CLI, and `--guest-args`
+exporter look up the requested backend's arguments exactly, without inheriting
+another backend's arguments; an omitted backend receives no guest arguments.
+The only valid backend for `naked` is `native`; other modes accept only the five
+Hermit backends, and every explicit argument vector must be nonempty.
 
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for

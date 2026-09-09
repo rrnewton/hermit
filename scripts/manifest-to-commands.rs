@@ -175,7 +175,7 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
     let guest = match (program, direct) {
         (Some(_), Some(_)) => fail(format!("{id}: set only one of `program` and `direct`")),
         (None, None) => fail(format!("{id}: missing `program` or `direct`")),
-        (None, Some(Value::String(command))) => format!("sh -c {}", shell_quote(command)),
+        (None, Some(Value::String(command))) => format!("sh -c {} --", shell_quote(command)),
         (None, Some(Value::Array(_))) => {
             let argv = string_array(direct, &format!("{id}.direct"));
             if argv.is_empty() {
@@ -390,6 +390,8 @@ fn commands_for_test(test: &Value, bucket: &str, inherited_timeout_seconds: i64)
             let runs = spec.get("runs").and_then(Value::as_integer).unwrap_or(3);
             let timeout =
                 cell_timeout_seconds(spec, "native", inherited_timeout_seconds, &id, mode);
+            let guest_args = mode_guest_args(spec, mode, "native", &id);
+            let guest = guest_with_args(&guest, &guest_args);
             let run = format!("{RUN_ENV} {guest}");
             lines.push(format!(
                 "{} # {id} mode=naked backend=native",
@@ -766,6 +768,53 @@ test:
         let args = mode_guest_args(spec, "verify", "ptrace", "c-programs/bare");
         assert!(args.is_empty());
         assert_eq!(guest_with_args("\"$cell/guest\"", &args), "\"$cell/guest\"");
+    }
+
+    #[test]
+    fn string_direct_guest_arguments_begin_at_one() {
+        let tests = manifest(
+            r#"
+test:
+  - id: c-programs/direct-string
+    direct: 'printf "%s" "$1"'
+    modes:
+      verify:
+        backends_enabled: [ptrace]
+"#,
+        );
+        let (_, guest) = setup_prefix(&tests[0].2, "c-programs/direct-string");
+        let guest = guest_with_args(&guest, &["first".into(), "second".into()]);
+        assert_eq!(guest, "sh -c 'printf \"%s\" \"$1\"' -- first second");
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&guest)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"first");
+    }
+
+    #[test]
+    fn naked_command_appends_native_guest_arguments() {
+        let tests = manifest(
+            r#"
+test:
+  - id: c-programs/native-args
+    direct: [/bin/echo]
+    modes:
+      naked:
+        backends_enabled: [native]
+        guest_args:
+          native: [native-scenario]
+"#,
+        );
+        let commands = commands_for_test(&tests[0].2, "c-programs", 15);
+        assert_eq!(commands.len(), 1);
+        assert!(
+            commands[0].contains("native-scenario"),
+            "naked command omitted its explicit native guest argument: {}",
+            commands[0]
+        );
     }
 
     /// A backend that is enabled but not named in `guest_args` gets nothing,
