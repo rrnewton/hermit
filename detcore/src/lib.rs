@@ -1117,6 +1117,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::uname,
                 Sysno::exit_group,
                 Sysno::exit,
+                // The scheduler must observe changes to the address used for
+                // its modeled CHILD_CLEARTID wake, including record/replay's
+                // passthrough optimization.
+                Sysno::set_tid_address,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // Rare (once per thread) but load-bearing: without it the exit
                 // hook cannot replay `exit_robust_list()` and robust-mutex
@@ -2685,6 +2689,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
                 }
             },
+            // Linux and the backend own the pass-through call. Detcore also
+            // mirrors its successful registration into the scheduler because
+            // the scheduler supplies the logical CHILD_CLEARTID wake.
+            SyscallClassification::PassThrough if call.number() == Sysno::set_tid_address => {
+                match call {
+                    Syscall::SetTidAddress(s) => self.handle_set_tid_address(guest, s).await,
+                    _ => unreachable!("set_tid_address unexpectedly lost its typed variant"),
+                }
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-2223): Review observing
             // the robust-list registration without changing its pass-through
@@ -2973,6 +2986,19 @@ mod subscription_tests {
             delivered.contains(&Sysno::syslog),
             "syslog must reach its deterministic Detcore handler"
         );
+    }
+
+    #[test]
+    fn passthru_opt_intercepts_thread_exit_registrations() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+        for syscall in [Sysno::set_tid_address, Sysno::set_robust_list] {
+            assert!(
+                subscriptions
+                    .iter_syscalls()
+                    .any(|subscribed| subscribed == syscall),
+                "passthru_opt allowed {syscall} to bypass Detcore's thread-exit state"
+            );
+        }
     }
 
     #[test]

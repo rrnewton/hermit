@@ -56,6 +56,7 @@ use crate::tool_global::prepare_exec;
 use crate::tool_global::process_group;
 use crate::tool_global::ready_child_wait;
 use crate::tool_global::resource_request;
+use crate::tool_global::set_child_tid_address;
 use crate::tool_global::thread_is_live;
 use crate::tool_global::thread_observe_time;
 use crate::tool_global::wait_for_child_lifecycle;
@@ -985,6 +986,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         Ok(child_dettid.as_raw() as i64)
+    }
+
+    /// `set_tid_address` system call.
+    ///
+    /// Linux owns the guest-visible registration and return value. Detcore
+    /// mirrors the accepted address into the scheduler so its modeled
+    /// CHILD_CLEARTID wake targets the same word as the backend.
+    pub async fn handle_set_tid_address<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::SetTidAddress,
+    ) -> Result<i64, Error> {
+        let address = call.tidptr().map_or(0, |pointer| pointer.as_raw());
+        let result = self
+            .record_or_replay(guest, Syscall::SetTidAddress(call))
+            .await?;
+        if guest.config().sequentialize_threads {
+            set_child_tid_address(guest, address).await;
+        }
+        trace!(
+            "[detcore, dtid {}] child TID clear address registered: {address:#x}",
+            guest.thread_state().dettid,
+        );
+        Ok(result)
     }
 
     /// `set_robust_list` system call.
