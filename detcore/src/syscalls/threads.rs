@@ -56,6 +56,7 @@ use crate::tool_global::prepare_exec;
 use crate::tool_global::process_group;
 use crate::tool_global::ready_child_wait;
 use crate::tool_global::resource_request;
+use crate::tool_global::set_child_tid_address;
 use crate::tool_global::thread_is_live;
 use crate::tool_global::thread_observe_time;
 use crate::tool_global::wait_for_child_lifecycle;
@@ -763,6 +764,14 @@ fn absolute_timeout_uses_host_clock(
         < deadline.as_nanos().abs_diff(logical_now.as_nanos())
 }
 
+fn child_tid_clear_address(flags: CloneFlags, address: usize) -> usize {
+    if flags.contains(CloneFlags::CLONE_CHILD_CLEARTID) {
+        address
+    } else {
+        0
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     async fn futex_timeout_deadline<G: Guest<Self>>(
         &self,
@@ -849,7 +858,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     args.exit_signal as libc::c_int
                 }),
         };
-        let ctid = clone_family.child_tid(&guest.memory());
+        let ctid = child_tid_clear_address(flags, clone_family.child_tid(&guest.memory()));
         let is_vfork = flags.contains(CloneFlags::CLONE_VFORK);
         let parent_blocks_for_child = is_vfork
             || (self.cfg.backend_serializes_fork_children
@@ -985,6 +994,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         Ok(child_dettid.as_raw() as i64)
+    }
+
+    // TODO-HUMAN-REVIEW(PR-TBD): Review scheduler tracking of set_tid_address.
+    /// `set_tid_address` system call.
+    ///
+    /// Linux owns the guest-visible registration and return value. Detcore
+    /// mirrors the accepted address into the scheduler so its modeled
+    /// CHILD_CLEARTID wake targets the same word as the backend.
+    pub async fn handle_set_tid_address<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::SetTidAddress,
+    ) -> Result<i64, Error> {
+        let address = call.tidptr().map_or(0, |pointer| pointer.as_raw());
+        let result = self
+            .record_or_replay(guest, Syscall::SetTidAddress(call))
+            .await?;
+        if guest.config().sequentialize_threads {
+            set_child_tid_address(guest, address).await;
+        }
+        trace!(
+            "[detcore, dtid {}] child TID clear address registered: {address:#x}",
+            guest.thread_state().dettid,
+        );
+        Ok(result)
     }
 
     /// `set_robust_list` system call.
@@ -2556,6 +2590,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_without_child_cleartid_does_not_register_the_pointer() {
+        assert_eq!(
+            child_tid_clear_address(CloneFlags::CLONE_CHILD_SETTID, 0x1234),
+            0
+        );
+    }
+
+    #[test]
+    fn clone_with_child_cleartid_registers_the_pointer() {
+        assert_eq!(
+            child_tid_clear_address(CloneFlags::CLONE_CHILD_CLEARTID, 0x1234),
+            0x1234
+        );
+    }
 
     #[test]
     fn linux_default_dispositions_that_do_not_interrupt_child_waits() {

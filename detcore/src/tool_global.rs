@@ -1096,6 +1096,18 @@ impl GlobalTool for GlobalState {
             GlobalRequest::DeregisterThread(deregistration) => {
                 R::DeregisterThread(self.recv_deregister_thread(from, deregistration).await)
             }
+            GlobalRequest::SetChildTidAddress(address) => {
+                let updated = self
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .set_child_tid_address(dtid, address);
+                if updated {
+                    R::SetChildTidAddress(())
+                } else {
+                    R::ThreadExited
+                }
+            }
             GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => R::FutexAction(
                 self.recv_futex_action(
                     RpcIncarnation {
@@ -2302,6 +2314,10 @@ pub enum GlobalRequest {
     /// chaos-epoch transitions not yet flushed by a priority-change commit.
     DeregisterThread(ThreadDeregistration),
 
+    /// Replace the address cleared and woken when the calling thread exits.
+    /// A zero address disables the exit-time store and wake.
+    SetChildTidAddress(usize),
+
     /// Notify scheduler before/after futex action.
     /// The last two arguments are the initial contents of the memory word, and the mask.
     FutexAction(DetTid, FutexAction, FutexID, i32, u32),
@@ -2415,6 +2431,7 @@ pub enum GlobalResponse {
     /// Includes optional preemption points for the new thread.
     StartNewThread(Option<ThreadHistory>),
     DeregisterThread(()),
+    SetChildTidAddress(()),
     FutexAction(Option<SchedValue>),
     /// Return the mtime as well:
     DeterminizeInode((DetInode, LogicalTime)),
@@ -2532,6 +2549,17 @@ where
     )
     .await;
     assert_eq!(response, GlobalResponse::ReportUnsupportedSyscall(()));
+}
+
+/// Mirrors a successful `set_tid_address(2)` into scheduler-owned exit state.
+pub(crate) async fn set_child_tid_address<G, T>(guest: &mut G, address: usize)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::SetChildTidAddress(address)).await;
+    assert_eq!(response, GlobalResponse::SetChildTidAddress(()));
 }
 
 pub async fn send_and_update_time<G, T>(
@@ -3609,6 +3637,44 @@ mod tests {
         );
         scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
         scheduler.runqueue_push_back(dettid);
+    }
+
+    #[tokio::test]
+    async fn set_child_tid_address_rpc_updates_and_resets_the_registration() {
+        let (config, state, dettid, detpid) = cancellation_test_state();
+        install_test_registration(&state, dettid, Ivar::new());
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .next_turns
+            .get_mut(&dettid)
+            .unwrap()
+            .child_tid_addr = 0x1234;
+
+        let response = state
+            .receive_rpc(
+                reverie::Tid::from_raw(dettid.as_raw()),
+                (
+                    DetTime::new(&config),
+                    MmId::initial(detpid),
+                    GlobalRequest::SetChildTidAddress(0),
+                ),
+            )
+            .await;
+
+        assert_eq!(response.1, GlobalResponse::SetChildTidAddress(()));
+        assert_eq!(
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .next_turns
+                .get(&dettid)
+                .unwrap()
+                .child_tid_addr,
+            0
+        );
     }
 
     #[test]
