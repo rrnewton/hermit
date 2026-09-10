@@ -9,6 +9,7 @@
 //! hermit-manifest-plan = { path = "../manifest-plan" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
+//! sha2 = "0.10"
 //! ```
 
 #[path = "../../scripts/lib/rust_script_prelude.rs"]
@@ -65,6 +66,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
 
 const TRACKED_CELLS: &str = "ci/compat-envelope/cells.json";
 const PORTABLE_DAG: &str = "ci/dag/portable.json";
@@ -166,6 +169,7 @@ Usage: ci/compat-envelope/pressure-test.rs COMMAND [OPTIONS]
 
 Commands:
   run [--results DIR] [--mode MODE] [--sample COUNT] [--seed SEED]
+      [--cells-file PATH]
       [--green --backend BACKEND --repetitions COUNT] [--jobs COUNT]
       [--probe-disabled --backend BACKEND]
       Run bounded probes for the selected red cells. An exact-cell run uses the
@@ -188,6 +192,7 @@ Commands:
       Only unfiltered --green covers the complete current green set; an exact
       cell, --mode, or --sample is partial evidence.
   plan --results DIR [--mode MODE] [--sample COUNT] [--seed SEED]
+      [--cells-file PATH]
       [--green --backend BACKEND --repetitions COUNT] [--jobs COUNT]
       [--probe-disabled --backend BACKEND]
       Generate the same safe-ci execution plan without running it. The default
@@ -236,6 +241,14 @@ Selection and bounded-batch options (run and plan):
                            not a full-population result.
   --seed SEED              Reproduce one sample. If omitted, a generated seed
                            and every selected identity are retained in run.json.
+  --cells-file PATH        Select exactly the canonical five-field cell JSON
+                           identities listed one per line. This is a clean-
+                           commit repeated-batch selector: it requires
+                           --repetitions and cannot be combined with population
+                           filters. Duplicate, noncanonical, untracked,
+                           unsupported, disabled, or non-executable cells are
+                           rejected. run.json retains the source path, SHA-256,
+                           and exact selected identities.
   --run-timeout SECONDS    Whole-run WALL-CLOCK bound (default 7200). This is
                            not a CPU budget and never weakens per-cell limits.
   --jobs COUNT             Fixed safe-ci scheduler pool (default 4). Named
@@ -301,6 +314,16 @@ struct CellId {
     backend: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalOwnedCellId {
+    backend: String,
+    category: String,
+    lane: String,
+    mode: String,
+    test: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct TrackedCells {
     schema: u64,
@@ -322,6 +345,117 @@ fn load_tracked_cells(root: &Path) -> Result<TrackedCells, String> {
     Ok(tracked)
 }
 
+#[derive(Serialize)]
+struct CanonicalCellId<'a> {
+    backend: &'a str,
+    category: &'a str,
+    lane: &'a str,
+    mode: &'a str,
+    test: &'a str,
+}
+
+fn canonical_cell_json(cell: &CellId) -> Result<String, String> {
+    serde_json::to_string(&CanonicalCellId {
+        backend: &cell.backend,
+        category: &cell.category,
+        lane: &cell.lane,
+        mode: &cell.mode,
+        test: &cell.test,
+    })
+    .map_err(|error| format!("cannot serialize canonical cell identity: {error}"))
+}
+
+fn canonical_cells_jsonl(cells: &[CellId]) -> Result<String, String> {
+    let mut text = String::new();
+    for cell in cells {
+        text.push_str(&canonical_cell_json(cell)?);
+        text.push('\n');
+    }
+    Ok(text)
+}
+
+fn selected_population_sha256(cells: &[CellId]) -> Result<String, String> {
+    let mut cells = cells.to_vec();
+    cells.sort();
+    let canonical: Vec<_> = cells
+        .iter()
+        .map(|cell| CanonicalCellId {
+            backend: &cell.backend,
+            category: &cell.category,
+            lane: &cell.lane,
+            mode: &cell.mode,
+            test: &cell.test,
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|error| format!("cannot serialize selected cell population: {error}"))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn load_cells_file(path: &Path) -> Result<(Vec<CellId>, String), String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("cannot read --cells-file {}: {error}", path.display()))?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("--cells-file {} is not UTF-8: {error}", path.display()))?;
+    if text.is_empty() {
+        return Err(format!("--cells-file {} is empty", path.display()));
+    }
+    if !text.ends_with('\n') {
+        return Err(format!(
+            "--cells-file {} is not canonical JSONL: final newline is missing",
+            path.display()
+        ));
+    }
+    let mut cells = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (index, line) in text[..text.len() - 1].split('\n').enumerate() {
+        let line_number = index + 1;
+        if line.is_empty() {
+            return Err(format!(
+                "--cells-file {}:{line_number} is empty",
+                path.display()
+            ));
+        }
+        let parsed: CanonicalOwnedCellId = serde_json::from_str(line).map_err(|error| {
+            format!(
+                "--cells-file {}:{line_number} is not a five-field cell identity: {error}",
+                path.display()
+            )
+        })?;
+        let cell = CellId {
+            lane: parsed.lane,
+            category: parsed.category,
+            test: parsed.test,
+            mode: parsed.mode,
+            backend: parsed.backend,
+        };
+        let canonical = canonical_cell_json(&cell)?;
+        if line != canonical {
+            return Err(format!(
+                "--cells-file {}:{line_number} is not canonical JSON; expected {canonical}",
+                path.display()
+            ));
+        }
+        if !seen.insert(cell.clone()) {
+            return Err(format!(
+                "--cells-file {}:{line_number} repeats {}",
+                path.display(),
+                display_id(&cell)
+            ));
+        }
+        cells.push(cell);
+    }
+    Ok((cells, digest))
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct TrackedCell {
     #[serde(flatten)]
@@ -339,6 +473,7 @@ struct PressureCells {
     unavailable: Vec<TrackedCell>,
     eligible_cells: usize,
     preparation_by_test: BTreeMap<String, CellId>,
+    cells_file_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -367,6 +502,12 @@ struct CellSelection {
     probe_disabled: bool,
     #[serde(default)]
     jobs: Option<i64>,
+    #[serde(default)]
+    cells_file: Option<PathBuf>,
+    /// Exact cells retained in run.json are sufficient to revalidate an old
+    /// run without depending on the continued existence of its source file.
+    #[serde(skip)]
+    retained_cells_file_cells: Option<Vec<CellId>>,
 }
 
 impl CellSelection {
@@ -410,6 +551,28 @@ impl CellSelection {
 }
 
 fn validate_selection_shape(selection: &CellSelection) -> Result<(), String> {
+    if selection.cells_file.is_some() || selection.retained_cells_file_cells.is_some() {
+        if selection.repetitions.is_none() {
+            return Err("--cells-file requires --repetitions".into());
+        }
+        if selection.test.is_some()
+            || selection.mode.is_some()
+            || selection.backend.is_some()
+            || selection.sample.is_some()
+            || selection.seed.is_some()
+            || selection.green
+            || selection.probe_disabled
+            || selection.run_id_prefix.is_some()
+        {
+            return Err(
+                "--cells-file cannot be combined with --test, --mode, --backend, --sample, --seed, --green, --probe-disabled, or --run-id-prefix"
+                    .into(),
+            );
+        }
+        if selection.cells_file.is_some() && selection.retained_cells_file_cells.is_some() {
+            return Err("cell-file selection has both source and retained identities".into());
+        }
+    }
     if selection.probe_disabled {
         if selection.backend.is_none() {
             return Err("--probe-disabled requires --backend".into());
@@ -1050,6 +1213,12 @@ struct RunMetadata {
     jobs: i64,
     #[serde(default)]
     eligible_cells: usize,
+    #[serde(default)]
+    cells_file: Option<String>,
+    #[serde(default)]
+    cells_file_sha256: Option<String>,
+    #[serde(default)]
+    selected_population_sha256: Option<String>,
     cells: Vec<CellId>,
 }
 
@@ -1631,6 +1800,16 @@ fn result_options(
                     return Err("--seed may be specified only once".into());
                 }
             }
+            "--cells-file" if allow_selection => {
+                let raw = args.next().ok_or("--cells-file requires a path")?;
+                if raw.is_empty() {
+                    return Err("--cells-file requires a nonempty path".into());
+                }
+                let path = absolute_from(root, PathBuf::from(raw));
+                if selection.cells_file.replace(path).is_some() {
+                    return Err("--cells-file may be specified only once".into());
+                }
+            }
             "--run-timeout" if allow_selection => {
                 let raw = args.next().ok_or("--run-timeout requires seconds")?;
                 let value = raw.parse::<i64>().map_err(|_| {
@@ -2068,6 +2247,25 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     }
     let budgets = load_budgets(root)?;
     let tracked = load_tracked_cells(root)?;
+    let (requested_cells, cells_file_sha256) = if let Some(path) = &selection.cells_file {
+        let (cells, digest) = load_cells_file(path)?;
+        (Some(cells), Some(digest))
+    } else if let Some(cells) = &selection.retained_cells_file_cells {
+        if cells.is_empty() {
+            return Err("retained --cells-file selection is empty".into());
+        }
+        let unique: BTreeSet<_> = cells.iter().cloned().collect();
+        if unique.len() != cells.len() {
+            return Err("retained --cells-file selection contains a duplicate identity".into());
+        }
+        (Some(cells.clone()), None)
+    } else {
+        (None, None)
+    };
+    let requested_ids = requested_cells
+        .as_ref()
+        .map(|cells| cells.iter().cloned().collect::<BTreeSet<_>>());
+    let mut matched_requested = BTreeSet::new();
     let mut seen = BTreeSet::new();
     let mut selected_cells = Vec::new();
     let mut unavailable = Vec::new();
@@ -2081,27 +2279,41 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 .entry(cell.id.test.clone())
                 .or_insert_with(|| cell.id.clone());
         }
-        let selected = selection
-            .mode
-            .as_deref()
-            .is_none_or(|value| cell.id.mode == value)
-            && selection
-                .test
+        let selected = if let Some(requested) = &requested_ids {
+            let selected = requested.contains(&cell.id);
+            if selected {
+                matched_requested.insert(cell.id.clone());
+            }
+            selected
+        } else {
+            selection
+                .mode
                 .as_deref()
-                .is_none_or(|value| cell.id.test == value)
-            && selection
-                .backend
-                .as_deref()
-                .is_none_or(|value| cell.id.backend == value)
-            && !(selection.sample.is_some()
-                && selection.mode.is_none()
-                && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"));
+                .is_none_or(|value| cell.id.mode == value)
+                && selection
+                    .test
+                    .as_deref()
+                    .is_none_or(|value| cell.id.test == value)
+                && selection
+                    .backend
+                    .as_deref()
+                    .is_none_or(|value| cell.id.backend == value)
+                && !(selection.sample.is_some()
+                    && selection.mode.is_none()
+                    && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"))
+        };
         match cell.status.as_str() {
             "red"
                 if selected
                     && !selection.selects_green_population()
                     && !selection.probe_disabled =>
             {
+                if requested_ids.is_some() && !cell.enabled {
+                    return Err(format!(
+                        "--cells-file identity {} is tracked but disabled",
+                        display_id(&cell.id)
+                    ));
+                }
                 let budget = budgets
                     .get(&(
                         cell.id.test.clone(),
@@ -2116,6 +2328,11 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     })?;
                 if budget.attempts.is_some() {
                     selected_cells.push(cell);
+                } else if requested_ids.is_some() {
+                    return Err(format!(
+                        "--cells-file identity {} is tracked but its manifest declares no executable attempts",
+                        display_id(&cell.id)
+                    ));
                 } else if selection.is_exact() {
                     return Err(format!(
                         "{}/{}/{} is red but unavailable: its manifest declares no chaos seeds, so there is no guest command to run",
@@ -2126,6 +2343,12 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 }
             }
             "red" => {}
+            "green" if selected && requested_ids.is_some() => {
+                return Err(format!(
+                    "--cells-file identity {} is green, not in the red pressure population",
+                    display_id(&cell.id)
+                ));
+            }
             "green" if selected && selection.selects_green_population() && cell.enabled => {
                 let budget = budgets
                     .get(&(
@@ -2148,6 +2371,15 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 selected_cells.push(cell);
             }
             "green" => {}
+            "not-applicable" if selected && requested_ids.is_some() => {
+                return Err(format!(
+                    "--cells-file identity {} is unsupported: {}",
+                    display_id(&cell.id),
+                    cell.not_applicable_reason.as_deref().unwrap_or(
+                        "its backend is not enabled for this mode, so it has no guest command"
+                    )
+                ));
+            }
             "not-applicable" if selected && selection.probe_disabled => {
                 let budget = budgets
                     .get(&(
@@ -2187,6 +2419,14 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
             }
             "not-applicable" => {}
             other => return Err(format!("unknown cell status `{other}`")),
+        }
+    }
+    if let Some(requested) = &requested_ids {
+        if let Some(missing) = requested.difference(&matched_requested).next() {
+            return Err(format!(
+                "--cells-file identity {} is not present in the tracked scorecard",
+                display_id(missing)
+            ));
         }
     }
     selected_cells.sort_by(|left, right| left.id.cmp(&right.id));
@@ -2279,6 +2519,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         unavailable,
         eligible_cells,
         preparation_by_test,
+        cells_file_sha256,
     })
 }
 
@@ -2625,6 +2866,7 @@ fn write_plan_after_scorecard_check(
         unavailable,
         eligible_cells,
         preparation_by_test: all_preparations,
+        cells_file_sha256,
     } = pressure_cells(root, selection)?;
     let preparation_by_test = if selection.uses_shared_preparation() {
         all_preparations
@@ -3063,6 +3305,12 @@ fn write_plan_after_scorecard_check(
         ));
     }
 
+    let selected_cells: Vec<_> = cells.into_iter().map(|cell| cell.id).collect();
+    let selected_population_sha256 = selection
+        .cells_file
+        .as_ref()
+        .map(|_| selected_population_sha256(&selected_cells))
+        .transpose()?;
     let metadata = RunMetadata {
         schema: RUN_SCHEMA,
         run_id: results
@@ -3088,7 +3336,13 @@ fn write_plan_after_scorecard_check(
         probe_disabled: selection.probe_disabled,
         jobs: selection.scheduler_jobs(),
         eligible_cells,
-        cells: cells.into_iter().map(|cell| cell.id).collect(),
+        cells_file: selection
+            .cells_file
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        cells_file_sha256,
+        selected_population_sha256,
+        cells: selected_cells,
     };
     let mut metadata_text = serde_json::to_string_pretty(&metadata)
         .map_err(|e| format!("cannot serialize run metadata: {e}"))?;
@@ -3247,6 +3501,41 @@ fn validate_run_contract(
     metadata: &RunMetadata,
     allow_dirty_exact_cell: bool,
 ) -> Result<BTreeMap<CellId, bool>, String> {
+    let cells_file_fields = [
+        metadata.cells_file.is_some(),
+        metadata.cells_file_sha256.is_some(),
+        metadata.selected_population_sha256.is_some(),
+    ];
+    if cells_file_fields.iter().any(|present| *present)
+        && !cells_file_fields.iter().all(|present| *present)
+    {
+        return Err(
+            "retained --cells-file run must record source path, file SHA-256, and selected-population SHA-256"
+                .into(),
+        );
+    }
+    if metadata.cells_file.is_some() && metadata.repetitions.is_none() {
+        return Err("retained --cells-file run is not repeated".into());
+    }
+    for digest in [
+        metadata.cells_file_sha256.as_deref(),
+        metadata.selected_population_sha256.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !is_lower_sha256(digest) {
+            return Err("retained --cells-file SHA-256 is malformed".into());
+        }
+    }
+    if let Some(retained_digest) = &metadata.selected_population_sha256 {
+        let actual_digest = selected_population_sha256(&metadata.cells)?;
+        if actual_digest != *retained_digest {
+            return Err(format!(
+                "retained selected-cell population SHA-256 mismatch: recorded={retained_digest} actual={actual_digest}"
+            ));
+        }
+    }
     if metadata.source_tree_dirty && !allow_dirty_exact_cell {
         return Err("pressure run metadata claims a dirty source tree".into());
     }
@@ -3286,6 +3575,11 @@ fn validate_run_contract(
         green: metadata.green,
         probe_disabled: metadata.probe_disabled,
         jobs: Some(metadata.jobs),
+        cells_file: None,
+        retained_cells_file_cells: metadata
+            .cells_file
+            .as_ref()
+            .map(|_| metadata.cells.clone()),
     };
     let pressure_cells = pressure_cells(root, &selection)?;
     if metadata.repetitions.is_some() && metadata.eligible_cells == 0 {
@@ -6454,6 +6748,215 @@ fn self_test(root: &Path) -> Result<(), String> {
         .iter()
         .map(|tracked| tracked.id.clone())
         .collect();
+    let cells_file_ids: Vec<_> = expected_red_ids
+        .iter()
+        .filter(|cell| cell.mode == "verify")
+        .take(2)
+        .cloned()
+        .collect();
+    if cells_file_ids.len() != 2 {
+        return Err("self-test needs two executable red verify cells for --cells-file".into());
+    }
+    let cells_file_path = scratch.join("selected-cells.jsonl");
+    let cells_file_text = canonical_cells_jsonl(&cells_file_ids)?;
+    fs::write(&cells_file_path, &cells_file_text)
+        .map_err(|error| format!("cannot write --cells-file self-test fixture: {error}"))?;
+    let cells_file_digest = format!("{:x}", Sha256::digest(cells_file_text.as_bytes()));
+    let cells_population_digest = selected_population_sha256(&cells_file_ids)?;
+
+    let mut missing_repetitions_args = vec![
+        "--results".to_string(),
+        scratch.join("missing-repetitions").to_string_lossy().into_owned(),
+        "--cells-file".to_string(),
+        cells_file_path.to_string_lossy().into_owned(),
+    ]
+    .into_iter();
+    let missing_repetitions_error = result_options(
+        root,
+        &mut missing_repetitions_args,
+        false,
+        true,
+    )
+    .err()
+    .ok_or("--cells-file without --repetitions was accepted")?;
+    if !missing_repetitions_error.contains("--cells-file requires --repetitions") {
+        return Err(format!(
+            "--cells-file without --repetitions reported the wrong error: {missing_repetitions_error}"
+        ));
+    }
+
+    let duplicate_cells_file_path = scratch.join("duplicate-selected-cells.jsonl");
+    fs::write(
+        &duplicate_cells_file_path,
+        canonical_cells_jsonl(&[
+            cells_file_ids[0].clone(),
+            cells_file_ids[0].clone(),
+        ])?,
+    )
+    .map_err(|error| format!("cannot write duplicate --cells-file fixture: {error}"))?;
+    let duplicate_error = load_cells_file(&duplicate_cells_file_path)
+        .err()
+        .ok_or("duplicate --cells-file identity was accepted")?;
+    if !duplicate_error.contains("repeats") {
+        return Err(format!(
+            "duplicate --cells-file identity reported the wrong error: {duplicate_error}"
+        ));
+    }
+
+    let noncanonical_cells_file_path = scratch.join("noncanonical-selected-cells.jsonl");
+    let noncanonical = format!(
+        "{{\"lane\":{},\"category\":{},\"test\":{},\"mode\":{},\"backend\":{}}}\n",
+        serde_json::to_string(&cells_file_ids[0].lane).unwrap(),
+        serde_json::to_string(&cells_file_ids[0].category).unwrap(),
+        serde_json::to_string(&cells_file_ids[0].test).unwrap(),
+        serde_json::to_string(&cells_file_ids[0].mode).unwrap(),
+        serde_json::to_string(&cells_file_ids[0].backend).unwrap(),
+    );
+    fs::write(&noncanonical_cells_file_path, noncanonical)
+        .map_err(|error| format!("cannot write noncanonical --cells-file fixture: {error}"))?;
+    if load_cells_file(&noncanonical_cells_file_path)
+        .is_ok()
+    {
+        return Err("noncanonical --cells-file identity was accepted".into());
+    }
+
+    let mut unmatched_id = cells_file_ids[0].clone();
+    unmatched_id.test.push_str("-not-in-scorecard");
+    let unmatched_cells_file_path = scratch.join("unmatched-selected-cells.jsonl");
+    fs::write(
+        &unmatched_cells_file_path,
+        canonical_cells_jsonl(&[unmatched_id])?,
+    )
+    .map_err(|error| format!("cannot write unmatched --cells-file fixture: {error}"))?;
+    let unmatched_selection = CellSelection {
+        repetitions: Some(1),
+        cells_file: Some(unmatched_cells_file_path),
+        ..CellSelection::default()
+    };
+    let unmatched_error = pressure_cells(root, &unmatched_selection)
+        .err()
+        .ok_or("unmatched --cells-file identity was accepted")?;
+    if !unmatched_error.contains("is not present in the tracked scorecard") {
+        return Err(format!(
+            "unmatched --cells-file identity reported the wrong error: {unmatched_error}"
+        ));
+    }
+    let unsupported_cells_file_path = scratch.join("unsupported-selected-cells.jsonl");
+    fs::write(
+        &unsupported_cells_file_path,
+        canonical_cells_jsonl(&[not_applicable.id.clone()])?,
+    )
+    .map_err(|error| format!("cannot write unsupported --cells-file fixture: {error}"))?;
+    let unsupported_selection = CellSelection {
+        repetitions: Some(1),
+        cells_file: Some(unsupported_cells_file_path),
+        ..CellSelection::default()
+    };
+    let unsupported_error = pressure_cells(root, &unsupported_selection)
+        .err()
+        .ok_or("unsupported --cells-file identity was accepted")?;
+    if !unsupported_error.contains("is unsupported") {
+        return Err(format!(
+            "unsupported --cells-file identity reported the wrong error: {unsupported_error}"
+        ));
+    }
+
+    let cells_file_results = scratch.join("cells-file-plan");
+    let cells_file_selection = CellSelection {
+        cell_timeout_seconds: Some(60),
+        repetitions: Some(2),
+        run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+        jobs: Some(316),
+        cells_file: Some(cells_file_path.clone()),
+        ..CellSelection::default()
+    };
+    let (mut cells_file_metadata, cells_file_dag) = write_plan_after_scorecard_check(
+        &checked_scorecard,
+        &cells_file_results,
+        &cells_file_results.join("dag.json"),
+        &cells_file_selection,
+    )?;
+    let cells_file_cell_steps: Vec<_> = cells_file_dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+        .collect();
+    let cells_file_timeouts: BTreeMap<_, _> = cells_file_cell_steps
+        .iter()
+        .map(|step| (step.tag(), step.timeout))
+        .collect();
+    if cells_file_metadata.cells != cells_file_ids
+        || cells_file_metadata.repetitions != Some(2)
+        || cells_file_metadata.jobs != 316
+        || cells_file_metadata.cell_timeout_seconds != Some(60)
+        || cells_file_metadata.cells_file.as_deref()
+            != Some(cells_file_path.to_string_lossy().as_ref())
+        || cells_file_metadata.cells_file_sha256.as_deref() != Some(cells_file_digest.as_str())
+        || cells_file_metadata.selected_population_sha256.as_deref()
+            != Some(cells_population_digest.as_str())
+        || cells_file_cell_steps.len() != 4
+        || cells_file_cell_steps.iter().any(|step| {
+            step.timeout != 60
+                || step.cmd.matches("test-harness run").count() != 1
+                || !step.cmd.contains("--mode 'verify'")
+                || !step.cmd.contains("E2E_KEEP_VERIFY_LOGS=1")
+        })
+        || cells_file_dag.resource_caps.get("manifest_guest") != Some(&4)
+    {
+        return Err(
+            "--cells-file plan lost its exact identities, repetitions, timeout, jobs, digest, or verify-harness contract"
+                .into(),
+        );
+    }
+    // A verify cell node intentionally wraps the harness's two executions and
+    // comparison. The DAG therefore has one node per identity/repetition, not
+    // three. Removing any such wrapper must still fail the plan-shape audit.
+    let mut missing_cells_file_repetition = cells_file_dag.clone();
+    let removed_job = cells_file_cell_steps[0].job.clone();
+    missing_cells_file_repetition
+        .steps
+        .retain(|step| !(step.group == "cell" && step.job == removed_job));
+    if audit_dag(
+        &missing_cells_file_repetition,
+        4,
+        cells_file_metadata.run_timeout_seconds,
+        &cells_file_timeouts,
+    )
+    .is_ok()
+    {
+        return Err("--cells-file plan audit accepted an omitted repetition".into());
+    }
+    cells_file_metadata.source_tree_dirty = false;
+    validate_run_contract(root, &cells_file_results, &cells_file_metadata, false)
+        .map_err(|error| format!("valid retained --cells-file run was refused: {error}"))?;
+    let mut uppercase_cells_file_digest = cells_file_metadata.clone();
+    uppercase_cells_file_digest.cells_file_sha256 = Some("A".repeat(64));
+    if validate_run_contract(
+        root,
+        &cells_file_results,
+        &uppercase_cells_file_digest,
+        false,
+    )
+    .is_ok()
+    {
+        return Err("retained --cells-file run accepted an uppercase SHA-256".into());
+    }
+    let mut incomplete_cells_file_metadata = cells_file_metadata.clone();
+    incomplete_cells_file_metadata.cells.pop();
+    incomplete_cells_file_metadata.eligible_cells = 1;
+    let population_mutation_error = validate_run_contract(
+        root,
+        &cells_file_results,
+        &incomplete_cells_file_metadata,
+        false,
+    )
+    .err()
+    .ok_or("retained --cells-file run accepted an omitted identity and adjusted count")?;
+    if !population_mutation_error.contains("selected-cell population SHA-256 mismatch") {
+        return Err(format!(
+            "retained --cells-file population mutation reported the wrong error: {population_mutation_error}"
+        ));
+    }
     let green_id = tracked
         .cells
         .iter()
@@ -7593,6 +8096,9 @@ fn self_test(root: &Path) -> Result<(), String> {
         probe_disabled: false,
         jobs: default_jobs(),
         eligible_cells: 1,
+        cells_file: None,
+        cells_file_sha256: None,
+        selected_population_sha256: None,
         cells: vec![sample_a.clone()],
     };
     if retained_attempt_count(
@@ -8462,7 +8968,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
+        "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
     );
     Ok(())
 }
