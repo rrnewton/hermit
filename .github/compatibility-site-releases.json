@@ -1,5 +1,5 @@
 {
-  "latest_identity": "65493813dc95c708611e42918d09210f78c4aecca0e564909f7e1be12d441045",
+  "latest_identity": "b7d031dde2907da05829f46ffede2105f61bdf671bf9485856d831f7eebf6ff0",
   "release_repository": "rrnewton/hermit",
   "releases": [
     {
@@ -91,6 +91,36 @@
       "recursive_identity_sha256": "862dc13ecc72d3deca7fcc91a2b5744dc5dd7c8e2c189b2552201eeb4102835a",
       "release_title": "Historical compatibility website snapshot 8feef179bed2bb48c81dd0bc8186d81df47c255d8c015dc4b0eb139eab439edc",
       "tag": "compatibility-website-8feef179bed2bb48c81dd0bc8186d81df47c255d8c015dc4b0eb139eab439edc"
+    },
+    {
+      "archive_bytes": 38139566,
+      "archive_member_count": 152,
+      "archive_sha256": "251f3cf627234d2dcceb5b6aedd65ba8b37a31229accd99dc983a4c4d7a25a1e",
+      "artifacts_sha256": "9c6a516913210f56dbe4b9a62ae12221ca3b9f410414bc0eb3caa55e18cbabf4",
+      "asset": "compatibility-website-b7d031dde2907da05829f46ffede2105f61bdf671bf9485856d831f7eebf6ff0.tar.gz",
+      "build_sha256": "93a0e8f40b05708ce0ce84978b23727dcb8039ee632735d59ceda073609e9391",
+      "content_tree_sha256": "a362c148b70847911489a4d3f3cc6bef4e21a75e2fbb9ee4e61b863ef1dbf7d6",
+      "counts": {
+        "current_validation_run_row_count": 101,
+        "green_cell_count": 770,
+        "in_manifest_cell_count": 5744,
+        "never_measured_cell_count": 4929,
+        "physical_row_count": 37352,
+        "red_cell_count": 30,
+        "represented_run_count": 43535,
+        "selected_by_full_custom_command_count": 3,
+        "test_count": 359,
+        "validation_history_row_count": 113
+      },
+      "directories": ["assets", "cells", "data", "runs", "tests"],
+      "file_bytes": 69253001,
+      "file_count": 146,
+      "identity": "b7d031dde2907da05829f46ffede2105f61bdf671bf9485856d831f7eebf6ff0",
+      "manifest_tree_sha256": "b3e2b6da768d715844ab0c419331444f5489c3ca9285a4fe9d043645fdcba1a2",
+      "mode_sha256": "fda398a2fa76db699d801a1834f4253238dae5b6c8a0dd73d55c5020375bec53",
+      "recursive_identity_sha256": "241555c724ac041daf00ff19122a3e1d5646939dd6c876ee4546f1d80b53ab21",
+      "release_title": "Compatibility website snapshot b7d031dde2907da05829f46ffede2105f61bdf671bf9485856d831f7eebf6ff0",
+      "tag": "compatibility-website-b7d031dde2907da05829f46ffede2105f61bdf671bf9485856d831f7eebf6ff0"
     },
     {
       "archive_bytes": 13929857,
