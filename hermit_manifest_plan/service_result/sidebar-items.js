@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["FIELD_NAMES","HISTORICAL_FIELD_NAMES","HISTORICAL_SCHEMA_VERSION","SCHEMA_VERSION","WRITEBACK_FIELD_NAMES","WRITEBACK_SCHEMA_VERSION"],"enum":["FinalValidateStatus","ScorecardWriteback"],"struct":["ValidationServiceResult"]};
