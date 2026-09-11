@@ -21,6 +21,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_VERSION: "0.9.100"
+  RUST_SCRIPT_VERSION: "0.36.0"
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
   DETCORE_TEST_RUST_LOG: "off"
@@ -60,8 +61,26 @@ jobs:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       - name: Rust components
         run: rustup component add clippy rustfmt
+      - name: Install rust-script
+        env:
+          RUSTFLAGS: ""
+        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      - name: Verify rust-script resolves
+        run: |
+          if ! command -v rust-script >/dev/null; then
+            echo "::error::rust-script is not on PATH; DAG construction cannot start."
+            exit 1
+          fi
+          echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
       - name: Run portable lane as a DAG
-        run: ci/run-dag.sh portable ${{ inputs.max_mem != '' && format('--max-mem {0}', inputs.max_mem) || '' }} -v
+        env:
+          INPUT_MAX_MEM: ${{ inputs.max_mem }}
+        run: |
+          args=()
+          if [[ -n $INPUT_MAX_MEM ]]; then
+            args=(--max-mem "$INPUT_MAX_MEM")
+          fi
+          ci/run-dag.sh portable "${args[@]}" -v
 
   dag-privileged:
     name: DAG lane (privileged)

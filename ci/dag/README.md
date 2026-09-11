@@ -17,17 +17,19 @@ Run a lane with the wrapper:
 ```sh
 ci/run-dag.sh portable   --max-mem 32G          # memory-aware -j
 ci/run-dag.sh privileged -j 2                    # PMU lane, one gate at a time
-agent-utils/py/bin/dagrun ascii --dag ci/dag/validate.json  # inspect the superset
+ci/run-dag.sh portable json                       # inspect the selected graph
 ```
 
 ## Status: active local lanes and manual hosted diagnostics
 
 `scripts/validate.rs` reads `validate.json` and selects local labels.
-`ci/run-dag.sh portable` and `ci/run-dag.sh privileged` map to the explicit
-`hosted-portable` and `hosted-privileged` labels in that same file. The hosted
-nodes retain host commands and typed host dependencies; local labels select
-their pinned-root counterparts. Standard profile execution does not merge lane
-files, regenerate nodes, or rewrite commands and resource caps.
+`ci/run-dag.sh portable` and `ci/run-dag.sh privileged` ask that validator to
+construct the explicit `hosted-portable` and `hosted-privileged` selections
+from the same file. The selected graph is retained with its run state and fed
+to the tracked Rust runner on standard input. The hosted nodes retain host
+commands and typed host dependencies; local labels select their pinned-root
+counterparts. Standard profile execution does not merge lane files or rewrite
+commands and resource caps.
 
 `generate-validation-dag --check` is a maintenance check, not part of runtime
 plan construction. Static step definitions live as private typed generator
@@ -63,10 +65,10 @@ the same committed superset on demand.
 ### Runner dependency
 
 This change pins `rrnewton/agent-utils` at v0.2.0 as an HTTPS submodule. Portable
-CI initializes only `agent-utils` instead of all submodules, then executes the
-dependency-free Python runner so per-node performance CSVs are available
-without an install step. `ci/run-dag.sh` also accepts
-`DAGRUN_BIN` for local or preinstalled binaries.
+CI initializes only `agent-utils` instead of all submodules. `ci/run-dag.sh`
+always executes the tracked Rust runner at `agent-utils/rs/bin/dagrun`, because
+the validation graph declares structured test-result ownership. Runtime runner,
+graph, and label overrides are refused.
 
 ## Speed-to-signal audit
 
