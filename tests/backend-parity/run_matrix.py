@@ -984,22 +984,23 @@ def capture_ptrace_reference(
     expected_stdout: bytes | None,
     host_tmp: Path,
     host_capabilities: dict[str, dict[str, object]],
-) -> tuple[bytes | None, str, bool]:
+) -> tuple[bytes | None, str, bool, str]:
     """Capture the plain-run ptrace stdout used as the cross-backend reference."""
     reference = run_with_timeout(
         hermit_command(hermit, "ptrace", guest, name, strict, host_tmp)
     )
     if reference is None:
-        return None, "ptrace reference timed out", False
+        return None, "ptrace reference timed out", False, "wall_timeout"
     if reference.returncode != expected_status:
         diagnostic = reference.stderr.decode(errors="replace").strip()
         if cpuid_policy_is_blocked("ptrace", name, host_capabilities):
-            return None, CPUID_BLOCK_REASON, True
+            return None, CPUID_BLOCK_REASON, True, "no_result"
         return (
             None,
             f"ptrace reference exited {reference.returncode}, expected "
             f"{expected_status}: {diagnostic[-300:]}",
             False,
+            "failed",
         )
     if expected_stdout is not None and reference.stdout != expected_stdout:
         return (
@@ -1007,8 +1008,9 @@ def capture_ptrace_reference(
             f"ptrace reference stdout={reference.stdout!r}, "
             f"expected={expected_stdout!r}",
             False,
+            "failed",
         )
-    return reference.stdout, "", False
+    return reference.stdout, "", False, "passed"
 
 
 # Two distinct `--verify` success witnesses, and they are NOT the same assurance:
@@ -1206,7 +1208,7 @@ def run_case_verify(
     host_tmp: Path,
     host_capabilities: dict[str, dict[str, object]],
     evidence: dict[str, str] | None = None,
-) -> tuple[str, str, float]:
+) -> tuple[str, str, float, str]:
     """Verification probe: one `hermit run --strict --verify` invocation.
 
     `--verify` runs the guest twice inside hermit and diverts the guest's own
@@ -1238,12 +1240,13 @@ def run_case_verify(
         evidence.update(observed_evidence)
         evidence[COMPARISON_TIER_COLUMN] = COMPARISON_TIER_SELF_VERIFY_ONLY
     if result is None:
-        return "FAIL", "verify run timed out", time.monotonic() - started
+        return "FAIL", "verify run timed out", time.monotonic() - started, "wall_timeout"
     if observed_evidence and observed_evidence["infrastructure_error"]:
         return (
             "ERROR",
             observed_evidence["infrastructure_error"],
             time.monotonic() - started,
+            "infrastructure_error",
         )
     diagnostic = result.stderr.decode(errors="replace").strip()
     if result.returncode != expected_status:
@@ -1252,12 +1255,14 @@ def run_case_verify(
                 "BLOCKED",
                 CPUID_BLOCK_REASON,
                 time.monotonic() - started,
+                "no_result",
             )
         return (
             "FAIL",
             f"verify exited {result.returncode}, expected {expected_status}: "
             f"{diagnostic[-300:]}",
             time.monotonic() - started,
+            "failed",
         )
     if observed_evidence is None:
         return (
@@ -1265,6 +1270,7 @@ def run_case_verify(
             "verify produced no usable current typed verification report: "
             f"{diagnostic[-300:]}",
             time.monotonic() - started,
+            "no_result",
         )
     # Typed verdict: authoritative.
     observed = observed_evidence["tier"]
@@ -1275,6 +1281,7 @@ def run_case_verify(
             "FAIL",
             f"reached verification tier {observed} but contract requires {expected_l2}",
             time.monotonic() - started,
+            "failed",
         )
     # Each label states the comparison it EARNED.  The old "detlog" entry read
     # "L2 DETLOG-bitwise: --verify double-run matched" for a Stripped compare
@@ -1294,7 +1301,7 @@ def run_case_verify(
             "(internal trace not compared)"
         ),
     }[observed]
-    return "PASS", label, time.monotonic() - started
+    return "PASS", label, time.monotonic() - started, "passed"
 
 
 def run_case(
@@ -1307,7 +1314,7 @@ def run_case(
     expected_l2: str = "gap",
     host_capabilities: dict[str, dict[str, object]] | None = None,
     evidence: dict[str, str] | None = None,
-) -> tuple[str, str, float]:
+) -> tuple[str, str, float, str]:
     if host_capabilities is None:
         raise MatrixError("run_case requires the producer-owned host-capabilities record")
     guest, expected_status, expected_stdout = case_command(name, fixtures)
@@ -1351,6 +1358,7 @@ def run_case(
             reference_stdout,
             reference_problem,
             reference_blocked,
+            reference_outcome,
         ) = capture_ptrace_reference(
             hermit,
             fixtures.expose_tmp_paths("ptrace", reference_guest, reference_tmp),
@@ -1364,18 +1372,28 @@ def run_case(
         if evidence is not None:
             evidence.update(stdout_parity_evidence(None, reference_stdout))
         if reference_blocked:
-            return "BLOCKED", reference_problem, time.monotonic() - started
+            return "BLOCKED", reference_problem, time.monotonic() - started, "no_result"
         # Preserve the pre-existing DBT random-stream contract even when the
         # caller explicitly disables scorecard output.  General stdout parity
         # may remain UNMEASURED when its reference is unavailable; this named
         # functional comparison may not.
         if requires_ptrace_reference and reference_stdout is None:
-            return "FAIL", reference_problem, time.monotonic() - started
+            return (
+                "FAIL",
+                reference_problem,
+                time.monotonic() - started,
+                reference_outcome,
+            )
         if requires_exact_stdout_parity and reference_stdout is None:
             # The requested comparison itself is part of this cell's contract.
             # A missing side or comparator failure is RED, not an unmeasured
             # success: no equality verdict exists to support a green row.
-            return "FAIL", reference_problem, time.monotonic() - started
+            return (
+                "FAIL",
+                reference_problem,
+                time.monotonic() - started,
+                reference_outcome,
+            )
     ptrace_random = (
         root_random_output(reference_stdout)
         if backend == "dbt" and name == "random_sources" and reference_stdout is not None
@@ -1393,7 +1411,12 @@ def run_case(
         )
         result = run_with_timeout(command)
         if result is None:
-            return "FAIL", f"run {iteration + 1} timed out", time.monotonic() - started
+            return (
+                "FAIL",
+                f"run {iteration + 1} timed out",
+                time.monotonic() - started,
+                "wall_timeout",
+            )
 
         # Record the candidate before interpreting its status or expected output.
         # A real stdout divergence must leave unequal operands and parity=0 in
@@ -1408,6 +1431,7 @@ def run_case(
                     "FAIL",
                     "run 1 stdout differed from ptrace reference",
                     time.monotonic() - started,
+                    "failed",
                 )
 
         if result.returncode != expected_status:
@@ -1417,18 +1441,21 @@ def run_case(
                     "BLOCKED",
                     CPUID_BLOCK_REASON,
                     time.monotonic() - started,
+                    "no_result",
                 )
             return (
                 "FAIL",
                 f"run {iteration + 1} exited {result.returncode}, expected "
                 f"{expected_status}: {diagnostic[-300:]}",
                 time.monotonic() - started,
+                "failed",
             )
         if expected_stdout is not None and result.stdout != expected_stdout:
             return (
                 "FAIL",
                 f"run {iteration + 1} stdout={result.stdout!r}, expected={expected_stdout!r}",
                 time.monotonic() - started,
+                "failed",
             )
         if expected_stdout is None:
             required_markers = {
@@ -1445,6 +1472,7 @@ def run_case(
                     "FAIL",
                     f"run {iteration + 1} omitted marker {marker!r}",
                     time.monotonic() - started,
+                    "failed",
                 )
             if baseline is None:
                 baseline = result.stdout
@@ -1453,6 +1481,7 @@ def run_case(
                     "FAIL",
                     f"run {iteration + 1} output differed from run 1",
                     time.monotonic() - started,
+                    "failed",
                 )
             if (
                 ptrace_random is not None
@@ -1462,9 +1491,10 @@ def run_case(
                     "FAIL",
                     f"run {iteration + 1} root random stream differed from ptrace",
                     time.monotonic() - started,
+                    "failed",
                 )
     detail = f"{RUNS}/{RUNS} runs matched"
-    return "PASS", detail, time.monotonic() - started
+    return "PASS", detail, time.monotonic() - started, "passed"
 
 
 # The columns the `--output` TSV carries.  `evidence` is deliberately NOT one of
@@ -1483,7 +1513,7 @@ RESULT_COLUMNS = (
 # Keys a result row may legitimately carry that are not columns.  Anything
 # outside `RESULT_COLUMNS` and this set is skew nobody anticipated, and the
 # writer must say so instead of guessing.
-NON_COLUMN_RESULT_KEYS = frozenset({"evidence"})
+NON_COLUMN_RESULT_KEYS = frozenset({"attempt_outcome", "evidence"})
 
 
 def write_results(path: Path, results: list[dict[str, str]]) -> None:
@@ -1572,13 +1602,19 @@ def write_structured_test_results(
     rows = []
     for result in terminal:
         passed = result["result"] in {"PASS", "XPASS"}
-        outcome = (
-            "passed"
-            if passed
-            else "infrastructure_error"
-            if result["result"] == "ERROR"
-            else "failed"
-        )
+        outcome = result.get("attempt_outcome")
+        allowed_outcomes = {
+            "passed", "failed", "cpu_timeout", "wall_timeout", "cancelled",
+            "infrastructure_error", "no_result",
+        }
+        if outcome not in allowed_outcomes:
+            raise MatrixError(
+                f"structured DBT result {result['test_name']} has no valid typed attempt outcome: {outcome!r}"
+            )
+        if passed != (outcome == "passed"):
+            raise MatrixError(
+                f"structured DBT result {result['test_name']} says {result['result']} but its attempt outcome is {outcome}"
+            )
         detail = None if passed else str(
             result.get("detail") or f"backend parity reported {result['result']}"
         ).strip()
@@ -2031,7 +2067,7 @@ def main() -> int:
 
                 evidence: dict[str, str] = {}
                 executed_cases += 1
-                status, detail, duration = run_case(
+                status, detail, duration, attempt_outcome = run_case(
                     hermit,
                     backend,
                     name,
@@ -2055,6 +2091,7 @@ def main() -> int:
                         "seconds": f"{duration:.3f}",
                         "detail": detail,
                         "evidence": evidence,
+                        "attempt_outcome": attempt_outcome,
                     }
                 )
                 if status == "ERROR" or (not is_gap and status == "FAIL"):

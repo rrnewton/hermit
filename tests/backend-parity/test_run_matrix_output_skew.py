@@ -206,8 +206,9 @@ def main() -> int:
         # --- The guard must not be inert: the planted row really is skew the
         # --- old writer would have choked on, and the new one names it.
         check(
-            "evidence" in non_columns and "tier_evidence" not in non_columns,
-            "allowlist admits `evidence` and does NOT admit the planted key",
+            {"attempt_outcome", "evidence"}.issubset(non_columns)
+            and "tier_evidence" not in non_columns,
+            "allowlist admits typed attempt outcomes and `evidence`, but not the planted key",
         )
 
         # The scheduler must consume a producer-owned file, not a line that a
@@ -217,25 +218,54 @@ def main() -> int:
         prior = os.environ.get("DAGRUN_TEST_COUNTS_PATH")
         os.environ["DAGRUN_TEST_COUNTS_PATH"] = str(counts)
         try:
+            terminal_rows = [
+                {
+                    "test_name": "passes",
+                    "backend": "dbt",
+                    "result": "PASS",
+                    "attempt_outcome": "passed",
+                },
+                {
+                    "test_name": "fails",
+                    "backend": "dbt",
+                    "result": "FAIL",
+                    "attempt_outcome": "failed",
+                    "detail": "ordinary exit 17",
+                },
+                {
+                    "test_name": "wall-times-out",
+                    "backend": "dbt",
+                    "result": "FAIL",
+                    "attempt_outcome": "wall_timeout",
+                    "detail": "verify run timed out",
+                },
+                {
+                    "test_name": "infrastructure",
+                    "backend": "dbt",
+                    "result": "ERROR",
+                    "attempt_outcome": "infrastructure_error",
+                    "detail": "verification report was unreadable",
+                },
+                {
+                    "test_name": "blocked",
+                    "backend": "dbt",
+                    "result": "BLOCKED",
+                    "attempt_outcome": "no_result",
+                    "detail": "backend capability unavailable",
+                },
+            ]
             rm.write_structured_test_results(
                 [
-                    {
-                        "test_name": "passes",
-                        "backend": "dbt",
-                        "result": "PASS",
-                    },
-                    {
-                        "test_name": "fails",
-                        "backend": "dbt",
-                        "result": "FAIL",
-                    },
+                    *terminal_rows,
                     {
                         "test_name": "configured-gap",
                         "backend": "dbt",
                         "result": "GAP",
+                        "seconds": "0.000",
+                        "detail": "configured gap",
                     },
                 ],
-                2,
+                5,
                 1,
                 "strict",
             )
@@ -248,7 +278,7 @@ def main() -> int:
             json.loads(counts.read_text(encoding="utf-8"))
             == {
                 "schema": 3,
-                "executed_tests": 2,
+                "executed_tests": 5,
                 "filtered_tests": 1,
                 "results": [
                     {
@@ -264,13 +294,111 @@ def main() -> int:
                         "result": "fail",
                         "attempts": 1,
                         "attempt_results": [
-                            {"attempt": 1, "outcome": "failed",
-                             "detail": "backend parity reported FAIL"}
+                            {
+                                "attempt": 1,
+                                "outcome": "failed",
+                                "detail": "ordinary exit 17",
+                            }
+                        ],
+                    },
+                    {
+                        "id": "backend-parity/wall-times-out [dbt/strict]",
+                        "result": "fail",
+                        "attempts": 1,
+                        "attempt_results": [
+                            {
+                                "attempt": 1,
+                                "outcome": "wall_timeout",
+                                "detail": "verify run timed out",
+                            }
+                        ],
+                    },
+                    {
+                        "id": "backend-parity/infrastructure [dbt/strict]",
+                        "result": "fail",
+                        "attempts": 1,
+                        "attempt_results": [
+                            {
+                                "attempt": 1,
+                                "outcome": "infrastructure_error",
+                                "detail": "verification report was unreadable",
+                            }
+                        ],
+                    },
+                    {
+                        "id": "backend-parity/blocked [dbt/strict]",
+                        "result": "fail",
+                        "attempts": 1,
+                        "attempt_results": [
+                            {
+                                "attempt": 1,
+
+        # The typed cause is load-bearing. Removing it or contradicting the
+        # terminal result must refuse instead of falling back to FAIL prose.
+        for label, mutated, needle in (
+            (
+                "missing typed cause",
+                [{
+                    "test_name": "missing",
+                    "backend": "dbt",
+                    "result": "FAIL",
+                    "detail": "run timed out",
+                }],
+                "no valid typed attempt outcome",
+            ),
+            (
+                "pass with failure cause",
+                [{
+                    "test_name": "contradiction",
+                    "backend": "dbt",
+                    "result": "PASS",
+                    "attempt_outcome": "wall_timeout",
+                    "detail": "run timed out",
+                }],
+                "says PASS but its attempt outcome is wall_timeout",
+            ),
+        ):
+            refused = None
+            try:
+                rm.write_structured_test_results(mutated, 1, 0, "strict")
+            except getattr(rm, "MatrixError", ()) as error:
+                refused = str(error)
+            check(
+                refused is not None and needle in refused,
+                f"{label}: structured writer refuses by typed cause",
+            )
+
+        # Exercise the real timeout-return arm, not only a planted result row.
+        original_run = rm.run_with_timeout
+        rm.run_with_timeout = lambda _command: None
+        try:
+            timed_out = rm.run_case(
+                Path("/planted/hermit"),
+                "dbt",
+                "hello_stdout",
+                rm.CatalogFixtures(),
+                strict=True,
+                host_capabilities={
+                    "cpuid-faulting": {"present": True, "evidence": "fixture"}
+                },
+                evidence={},
+            )
+        finally:
+            rm.run_with_timeout = original_run
+        check(
+            timed_out[0] == "FAIL"
+            and timed_out[1] == "ptrace reference timed out"
+            and timed_out[3] == "wall_timeout",
+            "real backend-parity timeout arm emits wall_timeout, not failed",
+        )
+                                "outcome": "no_result",
+                                "detail": "backend capability unavailable",
+                            }
                         ],
                     },
                 ],
             },
-            "structured DBT results retain an exact pass/fail total",
+            "structured DBT results retain exact pass, failure, timeout, infrastructure, and no-result causes",
         )
         check(
             not list(workdir.glob("counts.json.tmp.*")),
