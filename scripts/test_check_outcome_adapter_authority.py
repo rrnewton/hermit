@@ -24,6 +24,7 @@ import unittest
 
 SCRIPTS = Path(__file__).resolve().parent
 ADAPTER = SCRIPTS / "check_outcome_adapter.py"
+AUTHORITY_ORACLE = SCRIPTS / "test-authority-obtained-once.sh"
 sys.path.insert(0, str(SCRIPTS))
 
 import check_outcome_adapter as adapter  # noqa: E402
@@ -52,6 +53,31 @@ def _unreachable_env(tmp: Path) -> dict[str, str]:
     simulated wrong answer.
     """
     return {"DEV_HERMIT_PARENT": str(tmp), "PATH": ""}
+
+
+def _run_oracle_with_authority_response(tmp: Path, response: str):
+    """Run the oracle through its initial fetch with one controlled response."""
+    response_bin = tmp / "bin"
+    response_bin.mkdir()
+    proxy = response_bin / "with-proxy"
+    proxy.write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$AUTHORITY_RESPONSE\" >&2\nexit 1\n"
+    )
+    proxy.chmod(0o755)
+    empty_parent = tmp / "empty"
+    empty_parent.mkdir()
+    return subprocess.run(
+        [str(AUTHORITY_ORACLE)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=dict(
+            os.environ,
+            DEV_HERMIT_PARENT=str(empty_parent),
+            AUTHORITY_RESPONSE=response,
+            PATH=f"{response_bin}:{os.environ['PATH']}",
+        ),
+    )
 
 
 class AuthorityUnavailableIsNotAVerdict(unittest.TestCase):
@@ -196,6 +222,31 @@ class TheProbeHelperReportsOnlyTheOutage(unittest.TestCase):
             "broken adapter would make every guarded checker skip silently",
         )
         self.assertNotEqual(result.returncode, 0, "and it must not be reported as success")
+
+    def test_oracle_startup_reports_transport_failure_as_no_result(self) -> None:
+        """The oracle's own authority fetch must preserve the outage direction."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = _run_oracle_with_authority_response(
+                Path(tmp), "gh: HTTP 504 Gateway Timeout"
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("NO-RESULT-CASE:"), 1)
+
+    def test_oracle_startup_does_not_skip_a_reachable_refusal(self) -> None:
+        """A reachable authority refusal must remain a lint failure."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = _run_oracle_with_authority_response(
+                Path(tmp), "gh: HTTP 403: Resource not accessible by integration"
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("NO-RESULT-CASE:", result.stdout)
+        self.assertIn("not an outage and is not being skipped", result.stderr)
 
     def test_one_obtained_authority_serves_every_later_invocation(self) -> None:
         """⚠️ THE RACE THE CODEX LANE FOUND. Obtaining must remove later fetches,
