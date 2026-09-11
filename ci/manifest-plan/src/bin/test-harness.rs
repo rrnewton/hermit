@@ -2116,6 +2116,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::env;
     use std::fs;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
@@ -2190,12 +2191,385 @@ mod tests {
         fs::set_permissions(path, permissions).unwrap();
     }
 
+    fn wait_for_file(path: &Path, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if path.exists() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        path.exists()
+    }
+
+    fn read_pid(path: &Path) -> u32 {
+        fs::read_to_string(path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap()
+    }
+
+    fn process_is_live(pid: u32) -> bool {
+        Path::new("/proc").join(pid.to_string()).exists()
+    }
+
+    fn proc_stat_field(pid: u32, index_after_comm: usize) -> Option<String> {
+        let stat =
+            fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
+        let rest = stat.rsplit_once(") ")?.1;
+        rest.split_whitespace()
+            .nth(index_after_comm)
+            .map(ToOwned::to_owned)
+    }
+
+    fn process_group(pid: u32) -> Option<u32> {
+        proc_stat_field(pid, 2)?.parse::<u32>().ok()
+    }
+
+    fn processes_in_group(pgid: u32) -> Vec<u32> {
+        let mut pids = fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+            .filter(|pid| process_group(*pid) == Some(pgid))
+            .collect::<Vec<_>>();
+        pids.sort_unstable();
+        pids
+    }
+
+    #[derive(Clone)]
+    struct RecordedProcess {
+        pid: u32,
+        start_time: String,
+        cmdline: Vec<u8>,
+    }
+
+    impl RecordedProcess {
+        fn capture(pid: u32) -> Self {
+            Self {
+                pid,
+                start_time: proc_stat_field(pid, 19)
+                    .unwrap_or_else(|| panic!("cannot read starttime for pid {pid}")),
+                cmdline: fs::read(Path::new("/proc").join(pid.to_string()).join("cmdline"))
+                    .unwrap_or_else(|error| panic!("cannot read cmdline for pid {pid}: {error}")),
+            }
+        }
+
+        fn still_matches(&self) -> bool {
+            proc_stat_field(self.pid, 19).as_deref() == Some(self.start_time.as_str())
+                && fs::read(
+                    Path::new("/proc")
+                        .join(self.pid.to_string())
+                        .join("cmdline"),
+                )
+                .is_ok_and(|cmdline| cmdline == self.cmdline)
+        }
+    }
+
+    struct UnboxedProcessGroupCleanup {
+        pgid: u32,
+        processes: Vec<RecordedProcess>,
+        armed: bool,
+        allow_group_signal: bool,
+    }
+
+    impl UnboxedProcessGroupCleanup {
+        fn new(pgid: u32, processes: Vec<RecordedProcess>) -> Self {
+            let harness_pgid =
+                process_group(process::id()).expect("cannot read test harness process group");
+            assert_ne!(
+                pgid, harness_pgid,
+                "unboxed cleanup must not target the test harness process group"
+            );
+            assert!(
+                processes
+                    .iter()
+                    .all(|process| process_group(process.pid) == Some(pgid)),
+                "recorded test processes must all be in pgid {pgid}"
+            );
+            let cleanup = Self {
+                pgid,
+                processes,
+                armed: true,
+                allow_group_signal: true,
+            };
+            let unrecorded = cleanup.unrecorded_processes_in_group();
+            if !unrecorded.is_empty() {
+                let mut cleanup = cleanup;
+                cleanup.allow_group_signal = false;
+                panic!(
+                    "unboxed cleanup must not target a process group with unrecorded members: {:?}",
+                    unrecorded
+                );
+            }
+            cleanup
+        }
+
+        fn matching_processes(&self) -> Vec<u32> {
+            self.processes
+                .iter()
+                .filter(|process| {
+                    process.still_matches() && process_group(process.pid) == Some(self.pgid)
+                })
+                .map(|process| process.pid)
+                .collect()
+        }
+
+        fn unrecorded_processes_in_group(&self) -> Vec<u32> {
+            processes_in_group(self.pgid)
+                .into_iter()
+                .filter(|pid| {
+                    !self.processes.iter().any(|process| {
+                        process.pid == *pid
+                            && process.still_matches()
+                            && process_group(process.pid) == Some(self.pgid)
+                    })
+                })
+                .collect()
+        }
+
+        fn cleanup(&mut self) {
+            if self.matching_processes().is_empty() {
+                self.armed = false;
+                return;
+            }
+            let unrecorded = self.unrecorded_processes_in_group();
+            if !unrecorded.is_empty() {
+                self.allow_group_signal = false;
+                panic!(
+                    "refusing to signal pgid {} because it contains unrecorded processes: {:?}",
+                    self.pgid, unrecorded
+                );
+            }
+            let status = Command::new("kill")
+                .arg("-TERM")
+                .arg(format!("-{}", self.pgid))
+                .status()
+                .unwrap_or_else(|error| {
+                    panic!("cannot signal test process group {}: {error}", self.pgid)
+                });
+            assert!(
+                status.success(),
+                "failed to signal test process group {}",
+                self.pgid
+            );
+            for _ in 0..200 {
+                if self.matching_processes().is_empty() {
+                    self.armed = false;
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!(
+                "recorded test processes still live in pgid {}: {:?}",
+                self.pgid,
+                self.matching_processes()
+            );
+        }
+
+        fn cleanup_matching_pids(&mut self) {
+            for pid in self.matching_processes() {
+                let _ = Command::new("kill")
+                    .arg("-TERM")
+                    .arg(pid.to_string())
+                    .status();
+            }
+            for _ in 0..200 {
+                if self.matching_processes().is_empty() {
+                    self.armed = false;
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for UnboxedProcessGroupCleanup {
+        fn drop(&mut self) {
+            if self.armed && !self.matching_processes().is_empty() {
+                if self.allow_group_signal && self.unrecorded_processes_in_group().is_empty() {
+                    let _ = Command::new("kill")
+                        .arg("-TERM")
+                        .arg(format!("-{}", self.pgid))
+                        .status();
+                    for _ in 0..200 {
+                        if self.matching_processes().is_empty() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                } else {
+                    self.cleanup_matching_pids();
+                }
+            }
+        }
+    }
+
+    struct RecordedPidCleanup {
+        process: RecordedProcess,
+    }
+
+    impl RecordedPidCleanup {
+        fn new(process: RecordedProcess) -> Self {
+            Self { process }
+        }
+
+        fn cleanup(&mut self) {
+            if self.process.still_matches() {
+                let _ = Command::new("kill")
+                    .arg("-TERM")
+                    .arg(self.process.pid.to_string())
+                    .status();
+                for _ in 0..200 {
+                    if !self.process.still_matches() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    impl Drop for RecordedPidCleanup {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
+
+    fn managed_scope_for_pid(pid: u32) -> (String, PathBuf) {
+        let cgroup = fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("cgroup"))
+            .unwrap_or_else(|error| panic!("cannot read cgroup for pid {pid}: {error}"));
+        let relative = cgroup
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap_or_else(|| panic!("pid {pid} has no cgroup-v2 entry: {cgroup}"));
+        let scope_end = relative
+            .find(".scope")
+            .map(|index| index + ".scope".len())
+            .unwrap_or_else(|| panic!("pid {pid} is not in a dagrun scope: {cgroup}"));
+        let scope_relative = &relative[..scope_end];
+        let scope = scope_relative
+            .split('/')
+            .find(|segment| segment.starts_with("dagrun-") && segment.ends_with(".scope"))
+            .unwrap_or_else(|| panic!("pid {pid} is not in a dagrun scope: {cgroup}"))
+            .to_owned();
+        (
+            scope,
+            Path::new("/sys/fs/cgroup").join(scope_relative.trim_start_matches('/')),
+        )
+    }
+
+    fn managed_scope_processes(cgroup_root: &Path) -> Vec<u32> {
+        if !cgroup_root.exists() {
+            return Vec::new();
+        }
+        let mut pids = Vec::new();
+        let mut stack = vec![cgroup_root.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            if let Ok(text) = fs::read_to_string(path.join("cgroup.procs")) {
+                pids.extend(
+                    text.lines()
+                        .filter_map(|line| line.trim().parse::<u32>().ok()),
+                );
+            }
+            if let Ok(entries) = fs::read_dir(&path) {
+                for entry in entries.flatten() {
+                    if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                        stack.push(entry.path());
+                    }
+                }
+            }
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    }
+
+    struct ManagedScopeCleanup {
+        scope: String,
+        cgroup_path: PathBuf,
+        pids: Vec<u32>,
+        armed: bool,
+    }
+
+    impl ManagedScopeCleanup {
+        fn new(scope: String, cgroup_path: PathBuf, pids: Vec<u32>) -> Self {
+            Self {
+                scope,
+                cgroup_path,
+                pids,
+                armed: true,
+            }
+        }
+
+        fn cleanup(&mut self) {
+            let output = Command::new("systemctl")
+                .args(["--user", "stop", &self.scope])
+                .output()
+                .unwrap_or_else(|error| panic!("cannot stop {}: {error}", self.scope));
+            if !output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let inactive = stdout.contains("not loaded")
+                    || stderr.contains("not loaded")
+                    || stdout.contains("inactive")
+                    || stderr.contains("inactive");
+                assert!(
+                    inactive,
+                    "systemctl stop {} failed:\nstdout:\n{}\nstderr:\n{}",
+                    self.scope, stdout, stderr
+                );
+            }
+            for _ in 0..200 {
+                if self.pids.iter().all(|pid| !process_is_live(*pid))
+                    && managed_scope_processes(&self.cgroup_path).is_empty()
+                {
+                    self.armed = false;
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!(
+                "managed scope {} still has pids {:?}; recorded pids still live: {:?}",
+                self.scope,
+                managed_scope_processes(&self.cgroup_path),
+                self.pids
+                    .iter()
+                    .copied()
+                    .filter(|pid| process_is_live(*pid))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    impl Drop for ManagedScopeCleanup {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = Command::new("systemctl")
+                    .args(["--user", "stop", &self.scope])
+                    .status();
+                for _ in 0..200 {
+                    if self.pids.iter().all(|pid| !process_is_live(*pid))
+                        && managed_scope_processes(&self.cgroup_path).is_empty()
+                    {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
     struct RunDagFixture {
         root: TestDirectory,
         construct_marker: PathBuf,
         runner_marker: PathBuf,
         args_marker: PathBuf,
         dag_bytes_marker: PathBuf,
+        runner_pid_marker: PathBuf,
+        signal_marker: PathBuf,
+        config_marker: PathBuf,
     }
 
     impl RunDagFixture {
@@ -2210,9 +2584,17 @@ mod tests {
                 root.path().join("ci/run-dag.sh"),
             )
             .unwrap();
+            chmod(&root.path().join("ci/run-dag.sh"), 0o755);
             fs::write(
                 root.path().join("ci/configure-build-jobs.sh"),
-                "CARGO_BUILD_JOBS=16\nexport CARGO_BUILD_JOBS\n",
+                r#"if [[ ${CI_DAG_BUILD_JOBS:-} == not-a-number ]]; then
+  printf evaluated > "$RUN_DAG_CONFIG_MARKER"
+  echo "fake configure-build-jobs: invalid CI_DAG_BUILD_JOBS" >&2
+  return 65
+fi
+CARGO_BUILD_JOBS=16
+export CARGO_BUILD_JOBS
+"#,
             )
             .unwrap();
             let validate = root.path().join("scripts/validate.rs");
@@ -2233,7 +2615,17 @@ if [[ -z ${output:-} ]]; then
   echo "fake validate: missing --write-constructed-dag" >&2
   exit 44
 fi
+if [[ -n ${RUN_DAG_VALIDATE_EXIT:-} ]]; then
+  echo "fake validate: planted construction failure" >&2
+  exit "$RUN_DAG_VALIDATE_EXIT"
+fi
+if [[ -n ${RUN_DAG_VALIDATE_STDOUT:-} ]]; then
+  printf '%s\n' "$RUN_DAG_VALIDATE_STDOUT"
+fi
 printf '{"schema":1,"steps":[{"id":"fixture","result_manifests":[]}]}' > "$output"
+if [[ -n ${RUN_DAG_VALIDATE_UNREADABLE_OUTPUT:-} ]]; then
+  chmod 000 "$output"
+fi
 "#,
             )
             .unwrap();
@@ -2250,10 +2642,11 @@ printf '{"schema":1,"steps":[{"id":"fixture","result_manifests":[]}]}' > "$outpu
                     fs::write(
                         &runner_path,
                         r#"#!/usr/bin/env bash
-set -euo pipefail
-printf runner > "$RUN_DAG_RUNNER_MARKER"
-printf '%s\n' "$@" > "$RUN_DAG_ARGS_MARKER"
-dag=
+	set -euo pipefail
+	verb=${1:-}
+	printf runner > "$RUN_DAG_RUNNER_MARKER"
+	printf '%s\n' "$@" > "$RUN_DAG_ARGS_MARKER"
+	dag=
 while (($#)); do
   if [[ "$1" == --dag ]]; then
     shift
@@ -2265,12 +2658,16 @@ if [[ "$dag" != - ]]; then
   echo "fake runner: expected stdin DAG marker '-', got $dag" >&2
   exit 41
 fi
-if compgen -G "$PWD/target/validation/run-dag.*" >/dev/null; then
-  echo "fake runner: generated DAG directory still exists" >&2
+if ! compgen -G "$PWD/target/validation/run-dag.*" >/dev/null; then
+  echo "fake runner: generated DAG directory was not retained before runner execution" >&2
   exit 42
-fi
-cat > "$RUN_DAG_DAG_BYTES_MARKER"
-"#,
+	fi
+	cat > "$RUN_DAG_DAG_BYTES_MARKER"
+	case "$verb" in
+	  json) printf '{"runner":"json"}\n' ;;
+	  dot) printf 'digraph dagrun {}\n' ;;
+	esac
+	"#,
                     )
                     .unwrap();
                     chmod(&runner_path, 0o755);
@@ -2295,8 +2692,8 @@ if [[ "$dag" != - ]]; then
   echo "fake runner: expected stdin DAG marker '-', got $dag" >&2
   exit 41
 fi
-if compgen -G "$PWD/target/validation/run-dag.*" >/dev/null; then
-  echo "fake runner: generated DAG directory still exists" >&2
+if ! compgen -G "$PWD/target/validation/run-dag.*" >/dev/null; then
+  echo "fake runner: generated DAG directory was not retained before runner execution" >&2
   exit 42
 fi
 cat > "$RUN_DAG_DAG_BYTES_MARKER"
@@ -2326,8 +2723,8 @@ if [[ "$dag" != - ]]; then
   echo "fake runner: expected stdin DAG marker '-', got $dag" >&2
   exit 41
 fi
-if compgen -G "$PWD/target/validation/run-dag.*" >/dev/null; then
-  echo "fake runner: generated DAG directory still exists" >&2
+if ! compgen -G "$PWD/target/validation/run-dag.*" >/dev/null; then
+  echo "fake runner: generated DAG directory was not retained before runner execution" >&2
   exit 42
 fi
 cat > "$RUN_DAG_DAG_BYTES_MARKER"
@@ -2356,12 +2753,29 @@ if [[ "$dag" != - ]]; then
   echo "fake runner: expected stdin DAG marker '-', got $dag" >&2
   exit 41
 fi
-if compgen -G "$PWD/target/validation/run-dag.*" >/dev/null; then
-  echo "fake runner: generated DAG directory still exists" >&2
+if ! compgen -G "$PWD/target/validation/run-dag.*" >/dev/null; then
+  echo "fake runner: generated DAG directory was not retained before runner execution" >&2
   exit 42
 fi
 cat > "$RUN_DAG_DAG_BYTES_MARKER"
-sleep 30
+wait_child=
+finish_signal() {
+  signal=$1
+  code=$2
+  if [[ -n ${wait_child:-} ]]; then
+    kill "$wait_child" 2>/dev/null || true
+    wait "$wait_child" 2>/dev/null || true
+  fi
+  printf '%s' "$signal" > "$RUN_DAG_SIGNAL_MARKER"
+  exit "$code"
+}
+trap 'finish_signal HUP 129' HUP
+trap 'finish_signal INT 130' INT
+trap 'finish_signal TERM 143' TERM
+sleep 30 &
+wait_child=$!
+printf '%s\n' "$$" > "$RUN_DAG_RUNNER_PID_MARKER"
+wait "$wait_child"
 "#,
                     )
                     .unwrap();
@@ -2374,6 +2788,9 @@ sleep 30
                 runner_marker: root.path().join("runner.marker"),
                 args_marker: root.path().join("runner.args"),
                 dag_bytes_marker: root.path().join("runner.dag.json"),
+                runner_pid_marker: root.path().join("runner.pid"),
+                signal_marker: root.path().join("runner.signal"),
+                config_marker: root.path().join("configure.marker"),
                 root,
             }
         }
@@ -2390,7 +2807,10 @@ sleep 30
                 .env("RUN_DAG_CONSTRUCT_MARKER", &self.construct_marker)
                 .env("RUN_DAG_RUNNER_MARKER", &self.runner_marker)
                 .env("RUN_DAG_ARGS_MARKER", &self.args_marker)
-                .env("RUN_DAG_DAG_BYTES_MARKER", &self.dag_bytes_marker);
+                .env("RUN_DAG_DAG_BYTES_MARKER", &self.dag_bytes_marker)
+                .env("RUN_DAG_RUNNER_PID_MARKER", &self.runner_pid_marker)
+                .env("RUN_DAG_SIGNAL_MARKER", &self.signal_marker)
+                .env("RUN_DAG_CONFIG_MARKER", &self.config_marker);
             for (key, value) in envs {
                 command.env(key, value);
             }
@@ -2399,6 +2819,29 @@ sleep 30
 
         fn run(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
             self.command(args, envs).output().unwrap()
+        }
+
+        fn run_with_stdin(&self, args: &[&str], envs: &[(&str, &str)], stdin: &[u8]) -> Output {
+            let mut child = self
+                .command(args, envs)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.as_mut().unwrap().write_all(stdin).unwrap();
+            child.wait_with_output().unwrap()
+        }
+
+        fn mutate_run_dag(&self, from: &str, to: &str) {
+            let path = self.root.path().join("ci/run-dag.sh");
+            let script = fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                script.matches(from).count(),
+                1,
+                "run-dag.sh mutation target must be exact: {from:?}"
+            );
+            fs::write(path, script.replace(from, to)).unwrap();
         }
 
         fn assert_no_construction_or_runner(&self) {
@@ -2412,6 +2855,17 @@ sleep 30
             );
         }
 
+        fn assert_runner_never_consumed_stdin(&self) {
+            assert!(
+                !self.runner_marker.exists(),
+                "runner marker must not be written"
+            );
+            assert!(
+                !self.dag_bytes_marker.exists(),
+                "runner must not consume ambient stdin"
+            );
+        }
+
         fn assert_no_generated_dag_dirs(&self) {
             let leftovers = fs::read_dir(self.root.path().join("target/validation"))
                 .unwrap()
@@ -2420,8 +2874,30 @@ sleep 30
                 .collect::<Vec<_>>();
             assert!(
                 leftovers.is_empty(),
-                "generated DAG directories were not cleaned up: {leftovers:?}"
+                "generated DAG directories were created before preflight refusal: {leftovers:?}"
             );
+        }
+
+        fn generated_dag_dirs(&self) -> Vec<PathBuf> {
+            fs::read_dir(self.root.path().join("target/validation"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("run-dag."))
+                })
+                .collect()
+        }
+
+        fn assert_generated_dag_dir_retained(&self) -> PathBuf {
+            let leftovers = self.generated_dag_dirs();
+            assert_eq!(
+                leftovers.len(),
+                1,
+                "expected exactly one retained generated DAG directory, got {leftovers:?}"
+            );
+            leftovers.into_iter().next().unwrap()
         }
 
         fn assert_runner_read_valid_dag(&self) {
@@ -2675,7 +3151,139 @@ sleep 30
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(stderr.contains(key), "{stderr}");
             fixture.assert_no_construction_or_runner();
+            fixture.assert_no_generated_dag_dirs();
         }
+    }
+
+    #[test]
+    fn run_dag_help_accepts_short_and_long_forms() {
+        let fixture = RunDagFixture::new("help", RunnerFixture::Executable);
+        let baseline = fixture.run(&["-h"], &[]);
+        assert!(baseline.status.success());
+        let help_surfaces = [
+            vec!["-h"],
+            vec!["--help"],
+            vec!["portable", "-h"],
+            vec!["portable", "--help"],
+            vec!["privileged", "-h"],
+            vec!["privileged", "--help"],
+            vec!["portable", "list", "-h"],
+            vec!["portable", "list", "--help"],
+            vec!["portable", "ascii", "-h"],
+            vec!["portable", "ascii", "--help"],
+            vec!["portable", "dot", "-h"],
+            vec!["portable", "dot", "--help"],
+            vec!["portable", "json", "-h"],
+            vec!["portable", "json", "--help"],
+            vec!["privileged", "list", "-h"],
+            vec!["privileged", "list", "--help"],
+            vec!["privileged", "ascii", "-h"],
+            vec!["privileged", "ascii", "--help"],
+            vec!["privileged", "dot", "-h"],
+            vec!["privileged", "dot", "--help"],
+            vec!["privileged", "json", "-h"],
+            vec!["privileged", "json", "--help"],
+        ];
+        for args in help_surfaces {
+            let output = fixture.run(args.as_slice(), &[]);
+            assert!(output.status.success());
+            assert_eq!(
+                output.stdout, baseline.stdout,
+                "help bytes changed for args {args:?}"
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let normalized_stdout = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(stdout.contains("Usage:"), "{stdout}");
+            assert!(
+                normalized_stdout.contains("agent-utils/rs/bin/dagrun with --dag -"),
+                "{stdout}"
+            );
+            assert!(
+                normalized_stdout.contains("feeds the constructed DAG on stdin"),
+                "{stdout}"
+            );
+            assert!(
+                normalized_stdout.contains("run default; executes the DAG")
+                    && normalized_stdout.contains("list | ascii | dot | json"),
+                "{stdout}"
+            );
+            assert!(
+                stdout.contains("DAGRUN_BIN") && stdout.contains("forwarded --dag"),
+                "{stdout}"
+            );
+            assert!(stdout.contains("CI_DAG_BUILD_JOBS"), "{stdout}");
+            assert!(
+                normalized_stdout.contains("before configuration validation"),
+                "{stdout}"
+            );
+            assert!(
+                normalized_stdout.contains("After a generated DAG directory has been allocated"),
+                "{stdout}"
+            );
+            assert!(
+                normalized_stdout.contains("Pre-allocation refusals have no retained path"),
+                "{stdout}"
+            );
+            assert!(
+                normalized_stdout
+                    .contains("When a retained path is printed, inspect that exact path"),
+                "{stdout}"
+            );
+            assert!(
+                normalized_stdout.contains(
+                    "remove it manually after confirming no active process still needs it"
+                ),
+                "{stdout}"
+            );
+            assert!(
+                stdout.contains("--unsafe-no-cgroups")
+                    && normalized_stdout.contains("not containment guarantees"),
+                "{stdout}"
+            );
+            assert!(
+                !stdout.contains("independently boxed"),
+                "help must not make an unconditional containment claim: {stdout}"
+            );
+            assert!(
+                normalized_stdout.contains("raw graph"),
+                "help must include the complete override sentence: {stdout}"
+            );
+            fixture.assert_no_construction_or_runner();
+            fixture.assert_no_generated_dag_dirs();
+
+            for (key, value) in [
+                ("DAGRUN_BIN", "agent-utils/py/bin/dagrun"),
+                ("DAGRUN_ENGINE", "py"),
+                ("RUN_DAG_FILE_OVERRIDE", "ci/dag/raw.json"),
+                ("CI_DAG_BUILD_JOBS", "not-a-number"),
+            ] {
+                let configured = fixture.run(args.as_slice(), &[(key, value)]);
+                assert!(configured.status.success());
+                assert_eq!(
+                    configured.stdout, baseline.stdout,
+                    "help output for {args:?} must not depend on {key}"
+                );
+                assert!(
+                    !fixture.config_marker.exists(),
+                    "help evaluated configuration for {args:?} with {key}"
+                );
+                fixture.assert_no_construction_or_runner();
+                fixture.assert_no_generated_dag_dirs();
+            }
+        }
+    }
+
+    #[test]
+    fn run_dag_does_not_treat_arbitrary_forwarded_help_as_wrapper_help() {
+        let fixture = RunDagFixture::new("forwarded-help", RunnerFixture::Executable);
+        let output = fixture.run(&["portable", "run", "-h"], &[]);
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("Usage:"), "{stdout}");
+        let args = fs::read_to_string(&fixture.args_marker).unwrap();
+        assert!(args.starts_with("run\n--dag\n-\nrun\n-h\n"), "{args}");
+        fixture.assert_runner_read_valid_dag();
+        fixture.assert_generated_dag_dir_retained();
     }
 
     #[test]
@@ -2687,6 +3295,7 @@ sleep 30
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(stderr.contains("--dag"), "{stderr}");
             fixture.assert_no_construction_or_runner();
+            fixture.assert_no_generated_dag_dirs();
         }
     }
 
@@ -2697,7 +3306,12 @@ sleep 30
         assert_eq!(output.status.code(), Some(127));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("agent-utils/rs/bin/dagrun"), "{stderr}");
+        assert!(
+            stderr.contains("Build or repair the tracked agent-utils checkout"),
+            "{stderr}"
+        );
         missing.assert_no_construction_or_runner();
+        missing.assert_no_generated_dag_dirs();
 
         let non_executable =
             RunDagFixture::new("non-executable-runner", RunnerFixture::NonExecutable);
@@ -2705,13 +3319,73 @@ sleep 30
         assert_eq!(output.status.code(), Some(126));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("not an executable file"), "{stderr}");
+        assert!(
+            stderr.contains("Build or repair the tracked agent-utils checkout"),
+            "{stderr}"
+        );
         non_executable.assert_no_construction_or_runner();
+        non_executable.assert_no_generated_dag_dirs();
     }
 
     #[test]
-    fn run_dag_constructs_the_lane_before_running_the_tracked_rust_runner() {
+    fn run_dag_accepts_the_tracked_symlinked_runner_shape() {
+        let fixture = RunDagFixture::new("symlink-runner", RunnerFixture::Missing);
+        let runner_target = fixture.root.path().join("agent-utils/rs/bin/cargo-runner");
+        fs::write(
+            &runner_target,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf runner > "$RUN_DAG_RUNNER_MARKER"
+dag=
+while (($#)); do
+  if [[ "$1" == --dag ]]; then
+    shift
+    dag=$1
+  fi
+  shift || true
+done
+cat "$dag" > "$RUN_DAG_DAG_BYTES_MARKER"
+"#,
+        )
+        .unwrap();
+        chmod(&runner_target, 0o755);
+        std::os::unix::fs::symlink(
+            "cargo-runner",
+            fixture.root.path().join("agent-utils/rs/bin/dagrun"),
+        )
+        .unwrap();
+
+        let output = fixture.run(&["portable", "list"], &[]);
+        assert!(output.status.success());
+        assert_eq!(
+            fs::read_to_string(&fixture.runner_marker).unwrap(),
+            "runner"
+        );
+        fixture.assert_runner_read_valid_dag();
+        let retained = fixture.assert_generated_dag_dir_retained();
+        assert!(retained.join("portable.json").exists());
+    }
+
+    #[test]
+    fn run_dag_constructs_retains_and_pipes_the_lane_to_the_tracked_rust_runner() {
         let fixture = RunDagFixture::new("positive", RunnerFixture::Executable);
-        let output = fixture.run(&["privileged", "list", "-v"], &[]);
+        let mut child = fixture
+            .command(&["privileged", "list", "-v"], &[])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(b"ambient stdin sentinel\n")
+                .unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         assert_eq!(
             fs::read_to_string(&fixture.construct_marker).unwrap(),
@@ -2724,28 +3398,37 @@ sleep 30
         let args = fs::read_to_string(&fixture.args_marker).unwrap();
         assert!(args.starts_with("list\n--dag\n-\n"), "{args}");
         assert!(args.contains("\n-v\n"), "{args}");
+        fixture.assert_runner_read_valid_dag();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("retained generated DAG directory:"),
+            "{stderr}"
+        );
+        let retained = fixture.assert_generated_dag_dir_retained();
+        assert!(retained.join("privileged.json").exists());
     }
 
     #[test]
-    fn run_dag_cleans_generated_dags_for_both_lanes_after_success() {
-        let fixture = RunDagFixture::new("cleanup-success", RunnerFixture::Executable);
+    fn run_dag_retains_generated_dags_for_both_lanes_after_success() {
         for lane in ["portable", "privileged"] {
+            let fixture = RunDagFixture::new(lane, RunnerFixture::Executable);
             let output = fixture.run(&[lane, "list"], &[]);
             assert!(output.status.success());
             fixture.assert_runner_read_valid_dag();
-            fixture.assert_no_generated_dag_dirs();
-            let _ = fs::remove_file(&fixture.dag_bytes_marker);
+            let retained = fixture.assert_generated_dag_dir_retained();
+            assert!(retained.join(format!("{lane}.json")).exists());
         }
     }
 
     #[test]
-    fn run_dag_preserves_runner_status_after_cleanup() {
+    fn run_dag_preserves_runner_status_and_retains_generated_dag() {
         for lane in ["portable", "privileged"] {
             let failed = RunDagFixture::new("cleanup-exit", RunnerFixture::Exit(23));
             let output = failed.run(&[lane, "list"], &[]);
             assert_eq!(output.status.code(), Some(23));
             failed.assert_runner_read_valid_dag();
-            failed.assert_no_generated_dag_dirs();
+            let retained = failed.assert_generated_dag_dir_retained();
+            assert!(retained.join(format!("{lane}.json")).exists());
         }
 
         let numeric_143 = RunDagFixture::new("cleanup-exit-143", RunnerFixture::Exit(143));
@@ -2753,41 +3436,568 @@ sleep 30
         assert_eq!(output.status.code(), Some(143));
         assert_eq!(output.status.signal(), None);
         numeric_143.assert_runner_read_valid_dag();
-        numeric_143.assert_no_generated_dag_dirs();
+        let retained = numeric_143.assert_generated_dag_dir_retained();
+        assert!(retained.join("portable.json").exists());
 
         let signaled = RunDagFixture::new("cleanup-signal", RunnerFixture::Terminate);
         let output = signaled.run(&["privileged", "list"], &[]);
+        assert_eq!(output.status.code(), None);
         assert_eq!(output.status.signal(), Some(15));
         signaled.assert_runner_read_valid_dag();
-        signaled.assert_no_generated_dag_dirs();
+        let retained = signaled.assert_generated_dag_dir_retained();
+        assert!(retained.join("privileged.json").exists());
     }
 
     #[test]
-    fn external_term_after_exec_reaches_runner_and_leaves_no_generated_dag_dir() {
-        let fixture = RunDagFixture::new("cleanup-external-term", RunnerFixture::Sleep);
-        let mut child = fixture
-            .command(&["portable", "list"], &[])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+    fn run_dag_refuses_unreadable_constructed_dag_before_runner() {
+        let fixture = RunDagFixture::new("unreadable-dag", RunnerFixture::Executable);
+        let output = fixture.run_with_stdin(
+            &["portable", "list"],
+            &[("RUN_DAG_VALIDATE_UNREADABLE_OUTPUT", "1")],
+            b"ambient stdin sentinel\n",
+        );
+        assert_eq!(output.status.code(), Some(2));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("constructed DAG is not readable"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("remove it only after confirming no validation run is active"),
+            "{stderr}"
+        );
+        fixture.assert_runner_never_consumed_stdin();
+        let retained = fixture.assert_generated_dag_dir_retained();
+        assert!(stderr.contains(&retained.display().to_string()), "{stderr}");
+    }
+
+    #[test]
+    fn run_dag_refuses_stdin_handoff_failures_before_runner() {
+        for (label, from, to, expected) in [
+            (
+                "dup-failure",
+                r#"if ! exec <&"$dag_fd"; then"#,
+                "if ! exec <&999999; then",
+                "could not attach constructed DAG to runner stdin",
+            ),
+            (
+                "close-failure",
+                r#"if ! exec {dag_fd}<&-; then"#,
+                "if ! exec {dag_fd}<&999999; then",
+                "could not close constructed DAG descriptor after stdin handoff",
+            ),
+        ] {
+            let fixture = RunDagFixture::new(label, RunnerFixture::Executable);
+            fixture.mutate_run_dag(from, to);
+            let output =
+                fixture.run_with_stdin(&["portable", "list"], &[], b"ambient stdin sentinel\n");
+            assert_eq!(output.status.code(), Some(2));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(expected), "{stderr}");
+            assert!(
+                stderr.contains("remove it only after confirming no validation run is active"),
+                "{stderr}"
+            );
+            fixture.assert_runner_never_consumed_stdin();
+            let retained = fixture.assert_generated_dag_dir_retained();
+            assert!(stderr.contains(&retained.display().to_string()), "{stderr}");
+        }
+    }
+
+    #[test]
+    fn run_dag_does_not_prefix_runner_json_or_dot_stdout_with_construction_output() {
+        for (verb, expected_stdout) in [
+            ("json", "{\"runner\":\"json\"}\n"),
+            ("dot", "digraph dagrun {}\n"),
+        ] {
+            let fixture = RunDagFixture::new(verb, RunnerFixture::Executable);
+            let output = fixture.run(
+                &["portable", verb],
+                &[("RUN_DAG_VALIDATE_STDOUT", "fake construction stdout")],
+            );
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout), expected_stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("fake construction stdout"), "{stderr}");
+            let retained = fixture.assert_generated_dag_dir_retained();
+            assert!(stderr.contains(&retained.display().to_string()), "{stderr}");
+            fixture.assert_runner_read_valid_dag();
+        }
+    }
+
+    #[test]
+    fn real_run_dag_json_and_dot_stdout_are_machine_readable_from_byte_zero() {
+        for verb in ["json", "dot"] {
+            let output = Command::new(super::root().join("ci/run-dag.sh"))
+                .args(["portable", verb])
+                .current_dir(super::root())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("retained generated DAG directory:"),
+                "{stderr}"
+            );
+            assert!(
+                !stdout.contains("PLAN ONLY")
+                    && !stdout.contains("retained generated DAG directory")
+                    && !stdout.contains("complete constructed outer DAG"),
+                "runner stdout must not contain construction diagnostics: {stdout}"
+            );
+            match verb {
+                "json" => {
+                    assert!(
+                        output
+                            .stdout
+                            .first()
+                            .is_some_and(|byte| *byte == b'{' || *byte == b'['),
+                        "json stdout must start with JSON from byte zero: {stdout}"
+                    );
+                    let _: serde_json::Value = serde_json::from_slice(&output.stdout)
+                        .unwrap_or_else(|error| {
+                            panic!("json stdout must parse exactly: {error}\n{stdout}")
+                        });
+                }
+                "dot" => {
+                    assert!(
+                        stdout.starts_with("digraph"),
+                        "dot stdout must start with DOT from byte zero: {stdout}"
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn external_signals_reach_execed_runner_and_retain_generated_dag_dir() {
+        for (name, signal, expected_code) in [
+            ("hup", "HUP", 129),
+            ("int", "INT", 130),
+            ("term", "TERM", 143),
+        ] {
+            let fixture = RunDagFixture::new(name, RunnerFixture::Sleep);
+            let mut child = fixture
+                .command(&["portable", "list"], &[])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            for _ in 0..1000 {
+                if fixture.runner_pid_marker.exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                fixture.runner_pid_marker.exists(),
+                "fake dagrun did not reach the supervised sleep point"
+            );
+            let runner_pid = read_pid(&fixture.runner_pid_marker);
+            assert_eq!(
+                runner_pid,
+                child.id(),
+                "run-dag.sh must exec the runner instead of supervising it"
+            );
+            fixture.assert_runner_read_valid_dag();
+            let live_dirs = fixture.generated_dag_dirs();
+            assert_eq!(
+                live_dirs.len(),
+                1,
+                "generated DAG should exist while dagrun runs: {live_dirs:?}"
+            );
+            let status = Command::new("kill")
+                .arg(format!("-{signal}"))
+                .arg(child.id().to_string())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let wait_started = std::time::Instant::now();
+            let status = child.wait().unwrap();
+            let elapsed = wait_started.elapsed();
+            assert_eq!(status.code(), Some(expected_code));
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "trapped {signal} should not wait for the 30s sleeper; elapsed {elapsed:?}"
+            );
+            assert_eq!(fs::read_to_string(&fixture.signal_marker).unwrap(), signal);
+            let retained = fixture.assert_generated_dag_dir_retained();
+            assert!(retained.join("portable.json").exists());
+        }
+    }
+
+    #[test]
+    fn real_unboxed_dagrun_reports_raw_external_signals() {
+        let runner = super::root().join("agent-utils/rs/bin/dagrun");
+        for (name, signal, expected_signal) in
+            [("hup", "HUP", 1), ("int", "INT", 2), ("term", "TERM", 15)]
+        {
+            let fixture = TestDirectory::new(&format!("real-unboxed-signal-{name}"));
+            let marker = fixture.path().join("step.started");
+            let shell_pid_path = fixture.path().join("step-shell.pid");
+            let sleep_pid_path = fixture.path().join("step-sleep.pid");
+            let dag = fixture.path().join("sleep.json");
+            let command = format!(
+                "printf started > {}; printf '%s\\n' $$ > {}; sleep 30 & printf '%s\\n' $! > {}; wait",
+                marker.display(),
+                shell_pid_path.display(),
+                sleep_pid_path.display()
+            );
+            let doc = serde_json::json!({
+                "steps": [{
+                    "group": "g",
+                    "job": "sleep",
+                    "cmd": command,
+                    "timeout": 60,
+                }]
+            });
+            fs::write(&dag, serde_json::to_vec(&doc).unwrap()).unwrap();
+            let mut child = Command::new(&runner)
+                .args([
+                    "run",
+                    "--dag",
+                    dag.to_str().unwrap(),
+                    "-q",
+                    "--unsafe-no-cgroups",
+                    "--no-profile",
+                ])
+                .current_dir(fixture.path())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            for _ in 0..500 {
+                if marker.exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(marker.exists(), "real dagrun step did not start");
+            assert!(
+                wait_for_file(&shell_pid_path, Duration::from_secs(10)),
+                "real dagrun step shell pid was not recorded"
+            );
+            assert!(
+                wait_for_file(&sleep_pid_path, Duration::from_secs(10)),
+                "real dagrun step sleep pid was not recorded"
+            );
+            let shell_pid = read_pid(&shell_pid_path);
+            let sleep_pid = read_pid(&sleep_pid_path);
+            let pgid = process_group(shell_pid)
+                .unwrap_or_else(|| panic!("cannot read step shell pgid for pid {shell_pid}"));
+            assert_eq!(
+                process_group(sleep_pid),
+                Some(pgid),
+                "step sleeper must be in the recorded shell process group"
+            );
+            let mut cleanup = UnboxedProcessGroupCleanup::new(
+                pgid,
+                vec![
+                    RecordedProcess::capture(shell_pid),
+                    RecordedProcess::capture(sleep_pid),
+                ],
+            );
+            let status = Command::new("kill")
+                .arg(format!("-{signal}"))
+                .arg(child.id().to_string())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let status = child.wait().unwrap();
+            assert_eq!(status.signal(), Some(expected_signal));
+            cleanup.cleanup();
+        }
+    }
+
+    #[test]
+    fn unboxed_cleanup_identity_selection_rejects_mismatched_process() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let pgid = process_group(pid).unwrap_or_else(|| panic!("cannot read pgid for pid {pid}"));
+        let mut record = RecordedProcess::capture(pid);
+        record.start_time.push_str("-not-this-process");
+        let cleanup = UnboxedProcessGroupCleanup {
+            pgid,
+            processes: vec![record],
+            armed: false,
+            allow_group_signal: false,
+        };
+        assert!(
+            cleanup.matching_processes().is_empty(),
+            "mismatched identity must not be selected for cleanup"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "negative-control process should remain live until its own cleanup"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn unboxed_cleanup_refusal_does_not_signal_unrecorded_group_member() {
+        let fixture = TestDirectory::new("unboxed-cleanup-unrecorded-member");
+        let shell_pid_path = fixture.path().join("shell.pid");
+        let recorded_sleep_pid_path = fixture.path().join("recorded-sleep.pid");
+        let unrecorded_sleep_pid_path = fixture.path().join("unrecorded-sleep.pid");
+        let script = format!(
+            "printf '%s\\n' $$ > {}; sleep 30 & printf '%s\\n' $! > {}; sleep 30 & printf '%s\\n' $! > {}; wait",
+            shell_pid_path.display(),
+            recorded_sleep_pid_path.display(),
+            unrecorded_sleep_pid_path.display()
+        );
+        let mut shell = Command::new("setsid")
+            .args(["bash", "-c", &script])
             .spawn()
             .unwrap();
-        for _ in 0..100 {
-            if fixture.dag_bytes_marker.exists() {
+        assert!(
+            wait_for_file(&shell_pid_path, Duration::from_secs(10)),
+            "test shell pid was not recorded"
+        );
+        assert!(
+            wait_for_file(&recorded_sleep_pid_path, Duration::from_secs(10)),
+            "recorded sleep pid was not recorded"
+        );
+        assert!(
+            wait_for_file(&unrecorded_sleep_pid_path, Duration::from_secs(10)),
+            "unrecorded sleep pid was not recorded"
+        );
+        let shell_pid = read_pid(&shell_pid_path);
+        let recorded_sleep_pid = read_pid(&recorded_sleep_pid_path);
+        let unrecorded_sleep_pid = read_pid(&unrecorded_sleep_pid_path);
+        let pgid = process_group(shell_pid)
+            .unwrap_or_else(|| panic!("cannot read test shell pgid for pid {shell_pid}"));
+        assert_eq!(process_group(recorded_sleep_pid), Some(pgid));
+        assert_eq!(process_group(unrecorded_sleep_pid), Some(pgid));
+        let shell_record = RecordedProcess::capture(shell_pid);
+        let recorded_sleep = RecordedProcess::capture(recorded_sleep_pid);
+        let unrecorded_sleep = RecordedProcess::capture(unrecorded_sleep_pid);
+        let mut unrecorded_guard = RecordedPidCleanup::new(unrecorded_sleep.clone());
+
+        let refusal = std::panic::catch_unwind(|| {
+            let _cleanup = UnboxedProcessGroupCleanup::new(
+                pgid,
+                vec![shell_record.clone(), recorded_sleep.clone()],
+            );
+        });
+        assert!(refusal.is_err(), "unrecorded process must refuse cleanup");
+        for _ in 0..200 {
+            if !shell_record.still_matches() && !recorded_sleep.still_matches() {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        fixture.assert_runner_read_valid_dag();
-        fixture.assert_no_generated_dag_dirs();
-        let status = Command::new("kill")
-            .arg("-TERM")
-            .arg(child.id().to_string())
-            .status()
+        assert!(
+            !shell_record.still_matches(),
+            "recorded shell should be cleaned individually after refusal"
+        );
+        assert!(
+            !recorded_sleep.still_matches(),
+            "recorded sleep should be cleaned individually after refusal"
+        );
+        assert!(
+            unrecorded_guard.process.still_matches(),
+            "unrecorded process must survive the refused whole-PGID cleanup"
+        );
+        unrecorded_guard.cleanup();
+        assert!(
+            !unrecorded_guard.process.still_matches(),
+            "unrecorded process should be cleaned only by its separate guard"
+        );
+        let _ = shell.wait();
+    }
+
+    #[test]
+    fn real_managed_dagrun_reports_signal_and_retains_generated_dag() {
+        for (name, signal, expected_raw_signal, expected_message) in [
+            ("hup", "HUP", Some(1), None),
+            ("int", "INT", None, Some("signal 2")),
+            ("term", "TERM", None, Some("signal 15")),
+        ] {
+            let fixture = TestDirectory::new(&format!("real-managed-signal-{name}"));
+            fs::create_dir_all(fixture.path().join("ci")).unwrap();
+            fs::create_dir_all(fixture.path().join("scripts")).unwrap();
+            fs::create_dir_all(fixture.path().join("agent-utils/rs/bin")).unwrap();
+            fs::create_dir_all(fixture.path().join("target/validation")).unwrap();
+            fs::copy(
+                super::root().join("ci/run-dag.sh"),
+                fixture.path().join("ci/run-dag.sh"),
+            )
             .unwrap();
-        assert!(status.success());
-        let status = child.wait().unwrap();
-        assert_eq!(status.signal(), Some(15));
-        fixture.assert_no_generated_dag_dirs();
+            chmod(&fixture.path().join("ci/run-dag.sh"), 0o755);
+            fs::write(
+                fixture.path().join("ci/configure-build-jobs.sh"),
+                "CARGO_BUILD_JOBS=16\nexport CARGO_BUILD_JOBS\n",
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                super::root().join("agent-utils/rs/bin/dagrun"),
+                fixture.path().join("agent-utils/rs/bin/dagrun"),
+            )
+            .unwrap();
+
+            let shell_pid = fixture.path().join("step-shell.pid");
+            let sleep_pid = fixture.path().join("step-sleep.pid");
+            let validate = fixture.path().join("scripts/validate.rs");
+            fs::write(
+                &validate,
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+output=
+while (($#)); do
+  if [[ $1 == --write-constructed-dag ]]; then
+    shift
+    output=$1
+  fi
+  shift || true
+done
+python3 - "$output" "$RUN_DAG_STEP_SHELL_PID" "$RUN_DAG_STEP_SLEEP_PID" <<'PY'
+import json
+import sys
+output, shell_pid, sleep_pid = sys.argv[1:4]
+cmd = (
+    "printf '%s\n' $$ > " + json.dumps(shell_pid) +
+    "; sleep 30 & printf '%s\n' $! > " + json.dumps(sleep_pid) +
+    "; wait"
+)
+with open(output, "w", encoding="utf-8") as f:
+    json.dump({"steps": [{"group": "g", "job": "sleep", "cmd": cmd, "timeout": 60}]}, f)
+PY
+"#,
+            )
+            .unwrap();
+            chmod(&validate, 0o755);
+
+            let child = Command::new("bash")
+                .arg(fixture.path().join("ci/run-dag.sh"))
+                .args(["portable", "-q", "--no-profile"])
+                .current_dir(fixture.path())
+                .env("RUN_DAG_STEP_SHELL_PID", &shell_pid)
+                .env("RUN_DAG_STEP_SLEEP_PID", &sleep_pid)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            assert!(
+                wait_for_file(&shell_pid, Duration::from_secs(10)),
+                "managed dagrun did not reach the step shell"
+            );
+            assert!(
+                wait_for_file(&sleep_pid, Duration::from_secs(10)),
+                "managed dagrun did not start the sleeping descendant"
+            );
+            let shell_pid = read_pid(&shell_pid);
+            let sleep_pid = read_pid(&sleep_pid);
+            let (scope, cgroup_path) = managed_scope_for_pid(shell_pid);
+            let mut cleanup =
+                ManagedScopeCleanup::new(scope, cgroup_path, vec![shell_pid, sleep_pid]);
+            let status = Command::new("kill")
+                .arg(format!("-{signal}"))
+                .arg(child.id().to_string())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                !output.status.success(),
+                "managed dagrun signal must not report success"
+            );
+            if let Some(expected_raw_signal) = expected_raw_signal {
+                assert_eq!(output.status.signal(), Some(expected_raw_signal));
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if let Some(expected_message) = expected_message {
+                assert!(
+                    stderr.contains(expected_message),
+                    "managed dagrun did not name its termination signal:\n{stderr}"
+                );
+            }
+            let retained = fs::read_dir(fixture.path().join("target/validation"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("run-dag."))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                retained.len(),
+                1,
+                "expected exactly one retained generated DAG directory, got {retained:?}"
+            );
+            let retained_path = retained[0].display().to_string();
+            assert!(
+                stderr.contains(&retained_path),
+                "run-dag.sh did not print the exact retained path {retained_path}:\n{stderr}"
+            );
+            assert!(
+                stderr.contains("Validation checkout lifecycle cleanup may remove it"),
+                "run-dag.sh did not print the cleanup owner message:\n{stderr}"
+            );
+            assert!(retained[0].join("portable.json").exists());
+            cleanup.cleanup();
+        }
+    }
+
+    #[test]
+    fn run_dag_retains_generated_dag_when_construction_fails() {
+        let fixture = RunDagFixture::new("construction-fails", RunnerFixture::Executable);
+        let output = fixture.run(&["portable", "list"], &[("RUN_DAG_VALIDATE_EXIT", "44")]);
+        assert_eq!(output.status.code(), Some(44));
+        assert_eq!(
+            fs::read_to_string(&fixture.construct_marker).unwrap(),
+            "constructed"
+        );
+        assert!(
+            !fixture.runner_marker.exists(),
+            "runner must not start after construction failure"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("DAG construction failed"), "{stderr}");
+        assert!(
+            stderr.contains("retained generated DAG directory:"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("remove it only after confirming no validation run is active"),
+            "{stderr}"
+        );
+        let retained = fixture.assert_generated_dag_dir_retained();
+        assert!(!retained.join("portable.json").exists());
+    }
+
+    #[test]
+    fn run_dag_preserves_boxed_and_explicit_unboxed_policy_args() {
+        let boxed = RunDagFixture::new("boxed-control", RunnerFixture::Executable);
+        let output = boxed.run(&["privileged", "-j", "2", "-v"], &[]);
+        assert!(output.status.success());
+        let args = fs::read_to_string(&boxed.args_marker).unwrap();
+        assert!(args.starts_with("run\n--dag\n-\n"), "{args}");
+        assert!(!args.contains("--unsafe-no-cgroups"), "{args}");
+        assert!(args.contains("\n-j\n2\n"), "{args}");
+        boxed.assert_generated_dag_dir_retained();
+
+        let unboxed = RunDagFixture::new("unboxed-control", RunnerFixture::Executable);
+        let output = unboxed.run(
+            &[
+                "privileged",
+                "-j",
+                "2",
+                "--unsafe-no-cgroups",
+                "--perf-dir",
+                "/tmp/perf",
+                "-v",
+            ],
+            &[("GITHUB_ACTIONS", "true")],
+        );
+        assert!(output.status.success());
+        let args = fs::read_to_string(&unboxed.args_marker).unwrap();
+        assert!(args.contains("\n--unsafe-no-cgroups\n"), "{args}");
+        assert!(args.contains("\n--perf-dir\n/tmp/perf\n"), "{args}");
+        unboxed.assert_generated_dag_dir_retained();
     }
 
     #[test]
