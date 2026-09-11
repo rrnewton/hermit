@@ -559,6 +559,9 @@ struct ObservedInvocation {
     guest_argv: Vec<String>,
     env: BTreeMap<String, String>,
     cwd: String,
+    /// Empty in compact stored observations after the importer has verified
+    /// that this value reconstructs exactly from cwd, env and argv.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     shell_command: String,
     attempts: Vec<ObservedAttemptInvocation>,
 }
@@ -574,6 +577,9 @@ struct ObservedAttemptInvocation {
     guest_argv: Vec<String>,
     env: BTreeMap<String, String>,
     cwd: String,
+    /// Empty in compact stored observations after the importer has verified
+    /// that this value reconstructs exactly from cwd, env and argv.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     shell_command: String,
 }
 
@@ -4057,6 +4063,7 @@ fn apply_pressure_summary(
         // same summary differs from its own stored form on the next process
         // invocation and appends every coordinate again.
         normalise_invocation_root(&mut observed_invocation);
+        clear_reconstructable_shell_commands(&mut observed_invocation);
         let inserted = observation.invocations.insert(observed_invocation);
         if inserted {
             observation.first_divergent_scheduler_turn.record(turn);
@@ -7247,6 +7254,17 @@ fn normalise_invocation_root(invocation: &mut ObservedInvocation) {
     }
 }
 
+/// The command string is derived from fields retained beside it. Pressure
+/// summaries are checked before this runs, so omitting that duplicate string
+/// from a newly stored invocation loses no independent evidence and keeps a
+/// repeated campaign inside the repository's file-size limit.
+fn clear_reconstructable_shell_commands(invocation: &mut ObservedInvocation) {
+    invocation.shell_command.clear();
+    for attempt in &mut invocation.attempts {
+        attempt.shell_command.clear();
+    }
+}
+
 fn normalise_recorded_root(row: &mut ResultRow) {
     let root = row.cwd.clone();
     // An empty, relative, or already-normalised root has nothing to strip.
@@ -8340,11 +8358,19 @@ red/`measured-and-passed` count is **0**.",
                 && invocation.guest_argv == ["fixture"]
                 && invocation.env == BTreeMap::from([("LC_ALL".into(), "C".into())])
                 && invocation.cwd == "/repo"
-                && invocation.shell_command == "cd /repo && env LC_ALL=C hermit run"
+                && invocation.shell_command.is_empty()
+                && literal_shell_command(&invocation.cwd, &invocation.env, &invocation.argv)
+                    == "cd /repo && env LC_ALL=C hermit run"
                 && invocation.attempts.len() == 1
                 && invocation.attempts[0].index == "1"
                 && invocation.attempts[0].outcome == "PASS"
                 && invocation.attempts[0].status == Some(0)
+                && invocation.attempts[0].shell_command.is_empty()
+                && literal_shell_command(
+                    &invocation.attempts[0].cwd,
+                    &invocation.attempts[0].env,
+                    &invocation.attempts[0].argv,
+                ) == "cd /repo && env LC_ALL=C hermit run"
         })
     {
         return Err(
