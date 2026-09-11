@@ -56,14 +56,14 @@ pub(super) fn ensure_liteinst_runtime() {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        // stage-liteinst-runtime.sh appends the current Reverie pin itself, so
+        // stage-liteinst-host-runtime.sh appends the current Reverie pin itself, so
         // cache invalidation has the same source of truth as the pin gate.
-        let runtime_target = target_dir.join("liteinst-runtime-build");
+        let runtime_target = target_dir.join("liteinst-host-runtime-build");
         let runtime = liteinst_runtime_library();
         if staged_runtime_matches_current_pin(&runtime) {
             return;
         }
-        let output = Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
+        let output = Command::new(repository.join("scripts/stage-liteinst-host-runtime.sh"))
             .current_dir(repository)
             .arg(cargo_profile)
             .arg(&runtime)

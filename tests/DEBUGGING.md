@@ -65,6 +65,52 @@
   336/336 canonical INFO records. Re-measure DBT only after its run completes;
   until then this cell is uncheckable rather than matching or diverging.
 
+## backend-parity-c/vectored-file-io
+
+### 2026-09-07T15:06:48.679036623Z — diagnostic / verify / liteinst — no_result
+
+- Evidence: `<dev-hermit>/scratch/liteinst-cli33-vectored-file-io-preparation03-20260907/execution/`
+  (`E` below); `RESULT.md` SHA-256
+  `2eeef41dba9656bf6bfaacdbfaedba78f7980c35098915f1494a382af178e7e2`.
+  Timestamp is `E/start.time`. This is one failed diagnostic of the retained
+  reference fixture, **not a completed official manifest cell**.
+- Product root (`P`): `<dev-hermit>/scratch/liteinst-private-lifecycle-20260906/cli-binding-33-owned-file-routes-release`.
+  Frozen local-diagnostic source manifest:
+  `8d9547e44656bc30453debd9d408d1efa2d956774107cd6ac9eaa6809e06ffcd`;
+  `P/build-01/host-target/release/hermit` SHA-256
+  `ca698fe2c0d83eb87559cf47e6fd03992831adb3a4c93caae91d7505adf6e29e`;
+  staged private ELF SHA-256
+  `dead56f39d02eee3da3400e5308e9aa2a81eb00c55b8b0361d57bea01b83fde9`.
+  These identify the frozen diagnostic, not a claimed landed commit/current live tree.
+- Exact argv, host cwd `P`, environment, readonly Nix mounts and `/dev/null`
+  stdin are retained in `E/retained-run/cli.command`: INFO, LiteInst SUD-only,
+  `--base-env=minimal --strict --verify --verify-strict`, JSON and full logs,
+  no runtime `--timeout`. Runtime selects the exact staged ELF;
+  `HERMIT_LOG_MAX_BYTES=0`. Guest cwd is tmpfs `/test`; `LC_ALL=C`, `TZ=UTC`,
+  `E2E_TMPDIR=/test`, `HERMIT_E2E_SCHEDULED_JOBS=8`, with recorded isolated
+  HOME/XDG/fixture paths. Fixture SHA-256:
+  `de1f95d53766a9c27cf7a39ec9ba9dcddf42d3ccc09439b2b8d14cbbfaad5ced`.
+- Observed: guest exit126/reaped, CLI125, admission1, driver125. Run1 only;
+  `verify.json` says `verified=false`, `bitwise_parity=false`, `no_result/not_run`,
+  comparison/counts null. `E/retained-run/verify-logs/run1_log_SypOm` contains
+  28 completed shared Detcore syscalls: the previously failing mmap #27 now
+  returns `Ok(140737354055680)`, followed by mmap #28 returning
+  `Ok(140737354051584)`. Its 85 INFO records are **retained, not compared**.
+- Next refusal: decoded guest stderr reports `vdso/data-fault`, signal/code11/2,
+  trap/error14/4, PC `0x7ffff7ffe0be`, address `0x7ffff7ff9008`, flags `0x10346`,
+  count18724; terminal branch `vdso/data-fault-signal-delivery-unsupported`.
+  Emitted frozen R labels are `owned_context.rs:1353:17` and `:1358:13`.
+  Function/opcode and fault-address mapping identity remain unproven. Raw
+  `cli.stderr` and `E/decoded-guest-stderr.txt` retain the complete fields.
+- Capture remains Incomplete/runFailed despite collector/publication drain;
+  guest reap and scope removal are retained. Empty stdout and missing Run2 log
+  fail secondary oracles, not a replacement cause. Kernel
+  `7.1.3-0_fbk0_rc18_0_gd373cd4b8dbf`; 2CPU/8GiB/swap0, diagnostic node120s/CPU240s,
+  scheduler180s/systemd240s. Observed node14.976s was not a timeout and earns
+  **no historical shared15s fixture-preparation/whole-verify deadline credit**.
+  Next: resolve this exact PC/data mapping from retained evidence before attributing
+  a function or changing vDSO handling; no fixture-body success or parity established.
+
 # bin-c
 
 # c-programs

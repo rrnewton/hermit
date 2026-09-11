@@ -1,170 +1,247 @@
 use std::env;
 use std::fs;
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io;
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-use goblin::elf::Elf;
-use goblin::elf::header;
-use goblin::elf::section_header;
-
 mod artifact;
+#[path = "../hermit-cli/src/liteinst_artifact.rs"]
+pub mod liteinst_artifact;
+mod private_build;
 
-fn has_preload_constructor(path: &Path) -> io::Result<bool> {
-    let bytes = fs::read(path)?;
-    let elf =
-        Elf::parse(&bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if elf.header.e_type != header::ET_DYN || elf.header.e_machine != header::EM_X86_64 {
-        return Ok(false);
-    }
-    let Some((initializer_index, initializer)) =
-        elf.dynsyms.iter().enumerate().find(|(_, symbol)| {
-            elf.dynstrtab.get_at(symbol.st_name) == Some("reverie_liteinst_initialize")
-        })
-    else {
-        return Ok(false);
-    };
-    let Some(init_array) = elf
-        .section_headers
-        .iter()
-        .find(|section| section.sh_type == section_header::SHT_INIT_ARRAY)
-    else {
-        return Ok(false);
-    };
-    let init_start = init_array.sh_addr;
-    let init_end = init_start.saturating_add(init_array.sh_size);
-    let relocated = elf
-        .dynrelas
-        .iter()
-        .chain(elf.dynrels.iter())
-        .any(|relocation| {
-            (init_start..init_end).contains(&relocation.r_offset)
-                && relocation.r_sym == initializer_index
-        });
-    let direct = usize::try_from(init_array.sh_offset)
-        .ok()
-        .and_then(|start| {
-            usize::try_from(init_array.sh_size)
-                .ok()
-                .and_then(|size| bytes.get(start..start.checked_add(size)?))
-        })
-        .unwrap_or_default()
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .any(|entry| u64::from_le_bytes(*entry) == initializer.st_value);
-    Ok(relocated || direct)
+fn path(name: &str) -> PathBuf {
+    PathBuf::from(env::var_os(name).unwrap_or_else(|| panic!("{name} is required")))
 }
 
-fn copy_into_protected_stage(source: &Path, destination: &Path) -> io::Result<()> {
-    let mut source_file = File::open(source)?;
-    let source_permissions = source_file.metadata()?.permissions();
-    let mut destination_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
-    if !destination_file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "LiteInst stage is not a regular file",
-        ));
+fn cargo(subcommand: &str, config: &Option<PathBuf>) -> Command {
+    let mut command = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    command.arg(subcommand);
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
     }
-    io::copy(&mut source_file, &mut destination_file)?;
-    destination_file.set_permissions(source_permissions)?;
-    destination_file.sync_all()
+    command
+        .env_remove("HERMIT_LITEINST_STAGE")
+        .env("CARGO_NET_OFFLINE", "true");
+    command
 }
 
 fn main() {
     println!("cargo:rerun-if-env-changed=HERMIT_LITEINST_STAGE");
-    println!("cargo:rerun-if-env-changed=PROFILE");
-    println!("cargo:rerun-if-changed=Cargo.lock");
-    println!("cargo:rerun-if-changed=artifact.rs");
-    println!("cargo:rerun-if-changed=runtime/Cargo.toml");
-    println!("cargo:rerun-if-changed=runtime/src/lib.rs");
-    let destination = PathBuf::from(
-        env::var_os("HERMIT_LITEINST_STAGE")
-            .expect("HERMIT_LITEINST_STAGE must name a unique runtime output path"),
-    );
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo did not set OUT_DIR"));
-    // Derive the nested runtime build's `--profile` from cargo's `PROFILE`
-    // build-script env var: it is `release` for release-like profiles and
-    // `debug` otherwise, which map to the `--profile` values `release` and
-    // `dev`. The previous approach walked `out_dir.ancestors().nth(3)` to guess
-    // the profile directory name; a cargo nightly changed the build-script
-    // OUT_DIR layout so that ancestor now resolves to the literal `build`
-    // directory, and passing `--profile build` fails with
-    // "error: profile name `build` is reserved". Sourcing the profile from the
-    // documented env var is robust against that layout drift.
-    let profile = match env::var("PROFILE").as_deref() {
-        Ok("debug") => "dev",
-        Ok("release") => "release",
-        Ok(other) => panic!("unexpected Cargo PROFILE {other:?}; expected debug or release"),
-        Err(error) => panic!("Cargo did not set PROFILE: {error}"),
-    };
-    let manifest_dir = PathBuf::from(
-        env::var_os("CARGO_MANIFEST_DIR").expect("Cargo did not set CARGO_MANIFEST_DIR"),
-    );
-    let nested_target = out_dir.join("runtime-target");
-    let output = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args([
-            "build",
-            "--locked",
-            "--manifest-path",
-            "Cargo.toml",
-            "-p",
-            "hermit-liteinst-runtime-artifact",
-            "--profile",
-            profile,
-            "--target-dir",
-        ])
-        .arg(&nested_target)
-        .arg("--message-format=json-render-diagnostics")
-        .current_dir(&manifest_dir)
-        .env_remove("HERMIT_LITEINST_STAGE")
-        .output()
-        .expect("failed to invoke Cargo for the isolated LiteInst runtime build");
-    if !output.status.success() {
-        panic!(
-            "isolated LiteInst runtime build failed with {}\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+    if env::var_os("HERMIT_LITEINST_STAGE").is_none() {
+        return;
+    }
+    println!("cargo:rerun-if-env-changed=HERMIT_LITEINST_LEGACY_HOST");
+    println!("cargo:rerun-if-changed=legacy.rs");
+    println!("cargo:rerun-if-changed=legacy_artifact.rs");
+    if env::var("HERMIT_LITEINST_LEGACY_HOST").as_deref() == Ok("1") {
+        legacy::stage();
+        return;
+    }
+    for name in [
+        "HERMIT_LITEINST_STAGE",
+        "HERMIT_LITEINST_SOURCE_RECORD",
+        "HERMIT_LITEINST_HERMIT_ROOT",
+        "HERMIT_LITEINST_REVERIE_ROOT",
+        "HERMIT_LITEINST_CLI_MANIFEST",
+        "HERMIT_LITEINST_DSO_MANIFEST",
+        "HERMIT_LITEINST_CARGO_CONFIG",
+        "HERMIT_LITEINST_DIAGNOSTIC",
+        "HERMIT_LITEINST_RUNTIME_KIND",
+        "HERMIT_LITEINST_PRIVATE_INPUTS",
+        "PROFILE",
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    for name in [
+        "build.rs",
+        "artifact.rs",
+        "private_build.rs",
+        "private-native",
+        "Cargo.toml",
+        "Cargo.lock",
+        "../hermit-cli/src/liteinst_artifact.rs",
+        "../hermit-cli/src/liteinst_artifact_private.rs",
+    ] {
+        println!("cargo:rerun-if-changed={name}");
+    }
+    let hermit = path("HERMIT_LITEINST_HERMIT_ROOT").canonicalize().unwrap();
+    let reverie = path("HERMIT_LITEINST_REVERIE_ROOT").canonicalize().unwrap();
+    let cli = env::var_os("HERMIT_LITEINST_CLI_MANIFEST")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| hermit.join("hermit-cli/Cargo.toml"));
+    let dso = env::var_os("HERMIT_LITEINST_DSO_MANIFEST")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| hermit.join("liteinst-runtime-build/detcore-runtime/Cargo.toml"));
+    let config = env::var_os("HERMIT_LITEINST_CARGO_CONFIG").map(PathBuf::from);
+    let source = path("HERMIT_LITEINST_SOURCE_RECORD");
+    let destination = path("HERMIT_LITEINST_STAGE");
+    let diagnostic = env::var("HERMIT_LITEINST_DIAGNOSTIC").as_deref() == Ok("1");
+    if diagnostic {
+        let parent = destination.parent().unwrap().canonicalize().unwrap();
+        assert!(
+            !parent.starts_with(&hermit) && !parent.starts_with(&reverie),
+            "diagnostic staging must be outside product trees"
         );
     }
-    let messages = String::from_utf8(output.stdout)
-        .expect("isolated LiteInst runtime Cargo output was not UTF-8");
-    let candidates = artifact::liteinst_cdylibs_from_cargo_messages(&messages)
-        .unwrap_or_else(|error| panic!("failed to parse isolated Cargo output: {error}"));
-    assert_eq!(
-        candidates.len(),
-        1,
-        "expected exactly one LiteInst cdylib in current isolated Cargo output, found {candidates:?}",
-    );
+    let pin_output = Command::new(hermit.join("ci/run-reverie-pin-check.sh"))
+        .args(["--repo"])
+        .arg(&hermit)
+        .arg("--print-pin")
+        .output()
+        .unwrap();
     assert!(
-        has_preload_constructor(&candidates[0]).unwrap_or_else(|error| panic!(
-            "failed to validate current LiteInst artifact {}: {error}",
-            candidates[0].display()
-        )),
-        "current LiteInst artifact lacks the preload constructor: {}",
-        candidates[0].display()
+        pin_output.status.success(),
+        "pin check failed: {}",
+        String::from_utf8_lossy(&pin_output.stderr)
     );
-    copy_into_protected_stage(&candidates[0], &destination).unwrap_or_else(|error| {
-        panic!(
-            "failed to stage {} as {}: {error}",
-            candidates[0].display(),
-            destination.display()
+    let pin = String::from_utf8(pin_output.stdout).unwrap();
+    let inputs = liteinst_artifact::SourceInputs {
+        hermit: &hermit,
+        reverie: &reverie,
+        cli_manifest: &cli,
+        dso_manifest: &dso,
+        config: config.as_deref(),
+        evidence: source.parent().unwrap(),
+        pin: pin.trim(),
+        diagnostic,
+    };
+    if !source.exists() {
+        use std::io::Write;
+        let bytes = serde_json::to_vec_pretty(
+            &liteinst_artifact::source_record(&inputs)
+                .expect("capture actual source/dependency record"),
         )
-    });
-    assert!(
-        destination.is_file()
-            && !fs::symlink_metadata(&destination)
-                .expect("read staged LiteInst runtime metadata")
-                .file_type()
-                .is_symlink(),
-        "LiteInst runtime stage is missing or not a real file: {}",
-        destination.display()
+        .unwrap();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&source)
+            .expect("create source record");
+        file.write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+    }
+    let private = liteinst_artifact::private::requested().expect("runtime build kind");
+    if private {
+        assert!(
+            env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
+                && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux"),
+            "private runtime requires x86-64 Linux"
+        );
+        println!(
+            "cargo:rerun-if-changed={}",
+            path("HERMIT_LITEINST_PRIVATE_INPUTS").display()
+        );
+    }
+    let (identity, record) = liteinst_artifact::verify_source_record(&source, &inputs)
+        .expect("verify source/dependency record before build");
+    println!("cargo:rerun-if-changed={}", source.display());
+    for (role, root) in [("hermit_files", &hermit), ("reverie_files", &reverie)] {
+        for file in record[role].as_object().unwrap().keys() {
+            println!("cargo:rerun-if-changed={}", root.join(file).display());
+        }
+    }
+    for file in [&cli, &dso].into_iter().chain(config.iter()) {
+        println!("cargo:rerun-if-changed={}", file.display());
+    }
+    let mut metadata_command = cargo("metadata", &config);
+    if private {
+        metadata_command.args(["--no-default-features", "--features", "private-crt"]);
+    }
+    let metadata = metadata_command
+        .args([
+            "--offline",
+            "--locked",
+            "--format-version=1",
+            "--manifest-path",
+        ])
+        .arg(&dso)
+        .output()
+        .unwrap();
+    assert!(metadata.status.success(), "runtime metadata failed");
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+    let package = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| {
+            package["name"] == "hermit-liteinst-detcore-runtime"
+                && PathBuf::from(package["manifest_path"].as_str().unwrap())
+                    .canonicalize()
+                    .unwrap()
+                    == dso.canonicalize().unwrap()
+        })
+        .expect("actual Detcore runtime package");
+    let package_id = package["id"].as_str().unwrap();
+    let profile = match env::var("PROFILE").unwrap().as_str() {
+        "debug" => "dev",
+        "release" => "release",
+        other => panic!("unsupported profile {other}"),
+    };
+    let artifact = if private {
+        private_build::build(
+            &hermit,
+            &dso,
+            &config,
+            package_id,
+            profile,
+            &path("OUT_DIR").join(format!(
+                "private-runtime-{}",
+                &liteinst_artifact::digest(destination.as_os_str().as_encoded_bytes())[..16]
+            )),
+        )
+        .expect("genuine private runtime build")
+    } else {
+        let output = cargo("build", &config)
+            .args(["--offline", "--locked", "--manifest-path"])
+            .arg(&dso)
+            .args([
+                "-p",
+                "hermit-liteinst-detcore-runtime",
+                "--profile",
+                profile,
+                "--target-dir",
+            ])
+            .arg(path("OUT_DIR").join("runtime-target"))
+            .arg("--message-format=json-render-diagnostics")
+            .output()
+            .unwrap();
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "actual Detcore runtime build failed"
+        );
+        artifact::selected_cdylib(std::str::from_utf8(&output.stdout).unwrap(), package_id).unwrap()
+    };
+    let bytes = fs::read(&artifact).unwrap();
+    if private {
+        liteinst_artifact::validate_private_runtime(&bytes)
+    } else {
+        liteinst_artifact::validate_constructor(&bytes)
+    }
+    .expect("actual runtime constructor validation");
+    let (after, _) = liteinst_artifact::verify_source_record(&source, &inputs)
+        .expect("verify sources after build");
+    assert_eq!(identity, after, "source record changed during build");
+    let provenance =
+        serde_json::to_vec_pretty(&liteinst_artifact::provenance(&bytes, &identity, &record))
+            .unwrap();
+    liteinst_artifact::stage_pair(
+        &destination,
+        &bytes,
+        &provenance,
+        pin.trim(),
+        &identity,
+        diagnostic,
+    )
+    .expect("protected Detcore staging");
+    println!(
+        "cargo:warning=staged {} ({})",
+        if private {
+            liteinst_artifact::private::RUNTIME_NAME
+        } else {
+            liteinst_artifact::RUNTIME_NAME
+        },
+        liteinst_artifact::digest(&bytes)
     );
 }
+
+mod legacy;

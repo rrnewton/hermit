@@ -45,6 +45,8 @@ mod dirents;
 #[allow(missing_docs)]
 pub mod edit_distance;
 mod fd;
+#[cfg(test)]
+mod guest_progress_tests;
 mod io_buffers;
 #[allow(unused)]
 mod ivar;
@@ -64,6 +66,8 @@ mod syscalls;
 mod tool_global;
 mod tool_local;
 pub mod util;
+#[cfg(test)]
+mod vdso_rng_tests;
 
 pub mod detlog;
 pub mod preemptions;
@@ -1056,6 +1060,26 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             cfg: cfg.clone(),
             record_or_replay: T::new(pid, cfg),
         }
+    }
+
+    /// ThreadState constructors install the configured or derived Pcg stream.
+    /// The existing always-ready entropy domain has no autonomous reseed;
+    /// draws, exec AT_RANDOM consumption and child-stream derivation do not
+    /// advance its generation. A future domain reset must revise this policy.
+    fn vdso_rng_snapshot(
+        &self,
+        _thread_state: &Self::ThreadState,
+    ) -> Result<reverie::vdso::VdsoRngSnapshot, Error> {
+        Ok(reverie::vdso::VdsoRngSnapshot {
+            ready: true,
+            generation: 1,
+        })
+    }
+
+    async fn handle_guest_progress<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        self.pre_handler_hook(guest, false).await;
+        self.post_handler_hook(guest).await;
+        Ok(())
     }
 
     /// NOTE: these subscriptions are used ONLY for hermit run mode.  Hermit record has its own

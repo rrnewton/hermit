@@ -211,7 +211,7 @@ pub enum Strength {
 // ================================================================================
 
 /// A resolved reference to a thread.
-#[derive(PartialEq, Eq, Debug, Clone, PartialOrd, Ord)]
+#[derive(PartialEq, Eq, Debug, Clone, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ThreadRef {
     /// The symbolic label (map key, or the raw id as text).
     pub label: String,
@@ -222,7 +222,7 @@ pub struct ThreadRef {
 }
 
 /// A source-level location, resolvable to/from an address via debug info.
-#[derive(PartialEq, Eq, Debug, Clone, Default)]
+#[derive(PartialEq, Eq, Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CodeLocation {
     /// Function name.
     pub function: Option<String>,
@@ -258,7 +258,7 @@ impl fmt::Display for CodeLocation {
 /// stream plus an occurrence count," but the two leading variants
 /// ([`Position::SyscallCount`] and [`Position::Rcb`]) are absolute counts that
 /// need no per-anchor occurrence tracking.
-#[derive(PartialEq, Eq, Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub enum Position {
     /// After the thread has executed exactly this many syscalls (any syscall).
     SyscallCount(u64),
@@ -317,7 +317,7 @@ impl fmt::Display for Position {
 }
 
 /// A fully normalized anchor: a named, deterministic per-thread stop point.
-#[derive(PartialEq, Eq, Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct Anchor {
     /// The event name (map key), for diagnostics and edge references.
     pub name: String,
@@ -340,7 +340,7 @@ impl fmt::Display for Anchor {
 }
 
 /// A normalized happens-before edge between two anchors.
-#[derive(PartialEq, Eq, Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct HappensBeforeEdge {
     /// The source anchor name (observed first).
     pub before: String,
@@ -352,7 +352,7 @@ pub struct HappensBeforeEdge {
 
 /// A validated, normalized happens-before program: anchors indexed by name plus
 /// the edge list, guaranteed acyclic with all references resolved.
-#[derive(PartialEq, Eq, Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone, Serialize)]
 pub struct HappensBeforeProgram {
     /// Normalized anchors, keyed by event name.
     pub anchors: BTreeMap<String, Anchor>,
@@ -360,7 +360,59 @@ pub struct HappensBeforeProgram {
     pub edges: Vec<HappensBeforeEdge>,
 }
 
+impl<'de> Deserialize<'de> for HappensBeforeProgram {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename = "HappensBeforeProgram")]
+        struct UncheckedProgram {
+            anchors: BTreeMap<String, Anchor>,
+            edges: Vec<HappensBeforeEdge>,
+        }
+
+        let unchecked = UncheckedProgram::deserialize(deserializer)?;
+        let program = Self {
+            anchors: unchecked.anchors,
+            edges: unchecked.edges,
+        };
+        program.validate().map_err(serde::de::Error::custom)?;
+        Ok(program)
+    }
+}
+
 impl HappensBeforeProgram {
+    fn validate(&self) -> Result<(), HappensBeforeError> {
+        for (name, anchor) in &self.anchors {
+            if name != &anchor.name {
+                return Err(HappensBeforeError::AnchorNameMismatch {
+                    key: name.clone(),
+                    name: anchor.name.clone(),
+                });
+            }
+            if matches!(anchor.position, Position::Rip { addr: None, .. })
+                && anchor.location.is_empty()
+            {
+                return Err(HappensBeforeError::AmbiguousPosition {
+                    event: name.clone(),
+                    found: Vec::new(),
+                });
+            }
+        }
+        for edge in &self.edges {
+            for (which, name) in [("before", &edge.before), ("after", &edge.after)] {
+                if !self.anchors.contains_key(name) {
+                    return Err(HappensBeforeError::UnknownEvent {
+                        which: which.to_string(),
+                        name: name.clone(),
+                    });
+                }
+            }
+        }
+        detect_cycle(&self.anchors, &self.edges)
+    }
+
     /// Anchors that still require debug-info resolution (an unresolved RIP from a
     /// code location, i.e. a `func`/`line` that has not been turned into an
     /// address yet).
@@ -397,6 +449,13 @@ impl HappensBeforeProgram {
 /// An error produced while parsing or validating a happens-before specification.
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub enum HappensBeforeError {
+    /// A normalized anchor's map key disagrees with its name.
+    AnchorNameMismatch {
+        /// The anchor map key.
+        key: String,
+        /// The stored anchor name.
+        name: String,
+    },
     /// The schema `version` is not understood by this build.
     UnsupportedVersion(u32),
     /// An event named more than one position selector, or none.
@@ -449,6 +508,13 @@ pub enum HappensBeforeError {
 impl fmt::Display for HappensBeforeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            HappensBeforeError::AnchorNameMismatch { key, name } => {
+                write!(
+                    f,
+                    "event key '{}' does not match anchor name '{}'",
+                    key, name
+                )
+            }
             HappensBeforeError::UnsupportedVersion(v) => write!(
                 f,
                 "unsupported happens-before schema version {} (this build understands {})",
@@ -529,21 +595,8 @@ impl HappensBeforeSpec {
             anchors.insert(name.clone(), self.normalize_event(name, ev)?);
         }
 
-        // Resolve edges against the anchor table.
         let mut edges = Vec::with_capacity(self.edges.len());
         for e in &self.edges {
-            if !anchors.contains_key(&e.before) {
-                return Err(HappensBeforeError::UnknownEvent {
-                    which: "before".to_string(),
-                    name: e.before.clone(),
-                });
-            }
-            if !anchors.contains_key(&e.after) {
-                return Err(HappensBeforeError::UnknownEvent {
-                    which: "after".to_string(),
-                    name: e.after.clone(),
-                });
-            }
             edges.push(HappensBeforeEdge {
                 before: e.before.clone(),
                 after: e.after.clone(),
@@ -551,9 +604,9 @@ impl HappensBeforeSpec {
             });
         }
 
-        detect_cycle(&anchors, &edges)?;
-
-        Ok(HappensBeforeProgram { anchors, edges })
+        let program = HappensBeforeProgram { anchors, edges };
+        program.validate()?;
+        Ok(program)
     }
 
     /// Resolve one event into a normalized [`Anchor`].

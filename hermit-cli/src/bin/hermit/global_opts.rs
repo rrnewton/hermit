@@ -98,6 +98,40 @@ impl GlobalOpts {
         Ok(())
     }
 
+    pub fn log_file_writer(&self) -> Option<File> {
+        if let Some(handle) = &self.log_file_handle {
+            // Each subscriber needs an owned File; `try_clone` dups the descriptor,
+            // so every run writes through the same host-side open file.
+            Some(
+                handle
+                    .try_clone()
+                    .expect("cannot duplicate the host log file descriptor"),
+            )
+        } else {
+            // An internal caller set the path directly rather than going through
+            // `open_log_file` -- today that is verify's double-run setup, which
+            // creates its own temp files and is measured NOT to hit the namespace
+            // problem. Keep the historical behaviour for those, rather than changing
+            // a path this task did not investigate.
+            self.log_file
+                .as_ref()
+                .map(|path| File::create(path).expect("Failed to open log file"))
+        }
+    }
+
+    pub fn init_liteinst_capture(&self) -> Result<super::tracing::capture::Capture, Error> {
+        let filter = super::tracing::effective_filter(self.log);
+        if let Some(file) = self.log_file_writer() {
+            super::tracing::capture::Capture::install(
+                file,
+                log_max_bytes().map_err(Error::msg)?,
+                filter,
+            )
+        } else {
+            super::tracing::capture::Capture::install(detcore::util::RetryingStderr, 0, filter)
+        }
+    }
+
     /// Initalizes tracing. If using a container, this must be done *inside* of
     /// the container because the tracer may create a new thread.
     ///
@@ -106,22 +140,7 @@ impl GlobalOpts {
     /// guest namespace and silently loses it.
     #[must_use = "This function returns a guard that should not be immediately dropped"]
     pub fn init_tracing(&self) -> Option<impl Drop + use<>> {
-        if let Some(handle) = &self.log_file_handle {
-            // Each subscriber needs an owned File; `try_clone` dups the descriptor,
-            // so every run writes through the same host-side open file.
-            let file_writer = handle
-                .try_clone()
-                .expect("cannot duplicate the host log file descriptor");
-            let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
-            let file_writer = BoundedWriter::new(file_writer, limit);
-            Some(init_file_tracing(self.log, file_writer))
-        } else if let Some(path) = &self.log_file {
-            // An internal caller set the path directly rather than going through
-            // `open_log_file` -- today that is verify's double-run setup, which
-            // creates its own temp files and is measured NOT to hit the namespace
-            // problem. Keep the historical behaviour for those, rather than changing
-            // a path this task did not investigate.
-            let file_writer = File::create(path).expect("Failed to open log file");
+        if let Some(file_writer) = self.log_file_writer() {
             // Bounded so a run that makes no progress cannot fill the disk: a
             // livelocked guest logged 928.8 GiB over 11.7 hours before this.
             // The bound is on the LOG only; the run is unaffected.
@@ -135,5 +154,92 @@ impl GlobalOpts {
             init_stderr_tracing(self.log);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    fn options() -> GlobalOpts {
+        GlobalOpts {
+            log: None,
+            log_file: None,
+            log_file_handle: None,
+            backend: None,
+        }
+    }
+
+    #[test]
+    fn host_handle_wins_over_replaced_path_and_shares_offset() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("log");
+        let original_path = directory.path().join("original");
+        let mut opts = options();
+        opts.log_file = Some(path.clone());
+        opts.open_log_file().unwrap();
+        opts.log_file_writer()
+            .unwrap()
+            .write_all(b"before-")
+            .unwrap();
+        std::fs::rename(&path, &original_path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        opts.clone()
+            .log_file_writer()
+            .unwrap()
+            .write_all(b"after")
+            .unwrap();
+        assert_eq!(std::fs::read(original_path).unwrap(), b"before-after");
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn path_only_destination_preserves_create_and_truncate_behavior() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("log");
+        let mut opts = options();
+        opts.log_file = Some(path.clone());
+        opts.log_file_writer().unwrap().write_all(b"first").unwrap();
+        opts.log_file_writer().unwrap().write_all(b"next").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"next");
+    }
+
+    #[test]
+    fn absent_file_keeps_stderr_selection_and_standard_descriptors() {
+        let stdio = || {
+            [0, 1, 2].map(|descriptor| {
+                std::fs::read_link(format!("/proc/self/fd/{descriptor}")).unwrap()
+            })
+        };
+        let before = stdio();
+        let mut opts = options();
+        opts.open_log_file().unwrap();
+        assert!(opts.log_file_writer().is_none());
+        assert_eq!(stdio(), before);
+    }
+
+    #[test]
+    fn host_open_failure_preserves_path_diagnostic() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing/log");
+        let mut opts = options();
+        opts.log_file = Some(path.clone());
+        let error = opts.open_log_file().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("cannot open --log-file {} for writing", path.display())
+        );
+        assert!(opts.log_file_handle.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "Failed to open log file")]
+    fn path_only_open_failure_preserves_refusal() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut opts = options();
+        opts.log_file = Some(directory.path().join("missing/log"));
+        opts.log_file_writer();
     }
 }

@@ -48,6 +48,8 @@ use std::path::Path;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 
+use hermit::liteinst_bootstrap;
+
 const STDIN_UNCAPTURED: i32 = i32::MIN;
 const STDIN_TAKEN: i32 = i32::MIN + 1;
 static STARTUP_STDIN: AtomicI32 = AtomicI32::new(STDIN_UNCAPTURED);

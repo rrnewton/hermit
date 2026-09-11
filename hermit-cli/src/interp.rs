@@ -8,6 +8,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::io::Read;
 use std::io::Seek;
 use std::os::unix::ffi::OsStrExt;
@@ -27,46 +28,75 @@ const MAX_INTERP_SIZE: usize = libc::PATH_MAX as usize;
 /// Get the right ld.so from elf's interp section.
 pub fn elf_get_interp<P: AsRef<Path>>(elf: P) -> Option<PathBuf> {
     let mut file = fs::File::open(elf).ok()?;
+    read_elf_interp(&mut file, false).ok().flatten()
+}
+
+pub(crate) fn elf_interp_from_reader(file: &mut (impl Read + Seek)) -> io::Result<Option<PathBuf>> {
+    read_elf_interp(file, true)
+}
+
+fn read_elf_interp(
+    file: &mut (impl Read + Seek),
+    require_unique: bool,
+) -> io::Result<Option<PathBuf>> {
+    let invalid = |error| io::Error::new(io::ErrorKind::InvalidData, error);
+    file.seek(io::SeekFrom::Start(0))?;
     let mut header_bytes = [0; ELF_HEADER_SIZE];
-    file.read_exact(&mut header_bytes).ok()?;
-    let header = Elf::parse_header(&header_bytes).ok()?;
-    let mut elf = Elf::lazy_parse(header).ok()?;
+    file.read_exact(&mut header_bytes)?;
+    let header = Elf::parse_header(&header_bytes).map_err(|error| invalid(error.to_string()))?;
+    let mut elf = Elf::lazy_parse(header).map_err(|error| invalid(error.to_string()))?;
     let ctx = Ctx {
-        le: header.endianness().ok()?,
-        container: header.container().ok()?,
+        le: header
+            .endianness()
+            .map_err(|error| invalid(error.to_string()))?,
+        container: header
+            .container()
+            .map_err(|error| invalid(error.to_string()))?,
     };
 
     // parse and assemble the program headers
     let program_header_size = ProgramHeader::size(ctx);
     if usize::from(header.e_phentsize) != program_header_size {
-        return None;
+        return Err(invalid("invalid program header size".into()));
     }
     let program_header_count = usize::from(header.e_phnum);
-    let table_size = program_header_size.checked_mul(program_header_count)?;
+    let table_size = program_header_size
+        .checked_mul(program_header_count)
+        .ok_or_else(|| invalid("program header table overflow".into()))?;
     let mut table = vec![0; table_size];
-    file.seek(std::io::SeekFrom::Start(header.e_phoff)).ok()?;
-    file.read_exact(&mut table).ok()?;
-    elf.program_headers = ProgramHeader::parse(&table, 0, program_header_count, ctx).ok()?;
+    file.seek(std::io::SeekFrom::Start(header.e_phoff))?;
+    file.read_exact(&mut table)?;
+    elf.program_headers = ProgramHeader::parse(&table, 0, program_header_count, ctx)
+        .map_err(|error| invalid(error.to_string()))?;
 
+    let mut result = None;
     for ph in &elf.program_headers {
         if ph.p_type == program_header::PT_INTERP {
-            let size = usize::try_from(ph.p_filesz).ok()?;
+            if result.is_some() {
+                return Err(invalid("duplicate PT_INTERP".into()));
+            }
+            let size = usize::try_from(ph.p_filesz).map_err(|error| invalid(error.to_string()))?;
             if !(2..=MAX_INTERP_SIZE).contains(&size) {
-                return None;
+                return Err(invalid("invalid PT_INTERP size".into()));
             }
 
             let mut interp = vec![0; size];
-            file.seek(std::io::SeekFrom::Start(ph.p_offset)).ok()?;
-            file.read_exact(&mut interp).ok()?;
-            let path = interp.strip_suffix(b"\0")?;
+            file.seek(std::io::SeekFrom::Start(ph.p_offset))?;
+            file.read_exact(&mut interp)?;
+            let path = interp
+                .strip_suffix(b"\0")
+                .ok_or_else(|| invalid("unterminated PT_INTERP".into()))?;
             if path.is_empty() || path.contains(&0) {
-                return None;
+                return Err(invalid("invalid PT_INTERP path".into()));
             }
-            return Some(PathBuf::from(OsStr::from_bytes(path)));
+            result = Some(PathBuf::from(OsStr::from_bytes(path)));
+            if !require_unique {
+                return Ok(result);
+            }
         }
     }
 
-    None
+    Ok(result)
 }
 
 #[cfg(test)]

@@ -206,6 +206,19 @@ fn getrandom_request_len(requested: usize) -> usize {
     requested.min(GETRANDOM_MAX_BYTES)
 }
 
+pub(crate) fn generate_random_chunk<'scratch>(
+    prng: &mut rand_pcg::Pcg64Mcg,
+    scratch: &'scratch mut [u64; RANDOM_FILL_CHUNK_BYTES / std::mem::size_of::<u64>()],
+    requested: usize,
+) -> &'scratch [u8] {
+    let chunk_len = requested.min(RANDOM_FILL_CHUNK_BYTES);
+    // safeptrace's 8-byte write fast path currently requires an aligned source buffer.
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(scratch.as_mut_ptr().cast::<u8>(), chunk_len) };
+    prng.fill(bytes);
+    bytes
+}
+
 fn write_random_chunk(
     mut memory: impl MemoryAccess,
     remote_buf: AddrMut<u8>,
@@ -483,12 +496,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 None if written == 0 => return Err(Errno::EFAULT.into()),
                 None => break,
             };
-            let chunk_len = (len - written).min(RANDOM_FILL_CHUNK_BYTES);
-            // safeptrace's 8-byte write fast path currently requires an aligned source buffer.
-            let local_buf = unsafe {
-                std::slice::from_raw_parts_mut(local_words.as_mut_ptr().cast::<u8>(), chunk_len)
-            };
-            guest.thread_state_mut().thread_prng().fill(local_buf);
+            let local_buf = generate_random_chunk(
+                guest.thread_state_mut().thread_prng(),
+                &mut local_words,
+                len - written,
+            );
+            let chunk_len = local_buf.len();
             let n = match write_random_chunk(guest.memory(), remote_chunk, local_buf) {
                 Ok(n) => n,
                 Err(_) if written > 0 => break,
@@ -840,7 +853,137 @@ impl<T: RecordOrReplay> Detcore<T> {
 
 #[cfg(test)]
 mod tests {
+    use rand::SeedableRng as _;
+
     use super::*;
+
+    fn original_random_chunk<'scratch>(
+        prng: &mut rand_pcg::Pcg64Mcg,
+        scratch: &'scratch mut [u64; RANDOM_FILL_CHUNK_BYTES / std::mem::size_of::<u64>()],
+        requested: usize,
+    ) -> &'scratch [u8] {
+        let chunk_len = requested.min(RANDOM_FILL_CHUNK_BYTES);
+        let local_buf =
+            unsafe { std::slice::from_raw_parts_mut(scratch.as_mut_ptr().cast::<u8>(), chunk_len) };
+        prng.fill(local_buf);
+        local_buf
+    }
+
+    struct RandomCopyMemory<'state> {
+        results: &'state mut std::collections::VecDeque<Result<usize, Errno>>,
+        writes: &'state mut Vec<(usize, Vec<u8>)>,
+    }
+
+    impl MemoryAccess for RandomCopyMemory<'_> {
+        fn read_vectored(
+            &self,
+            _read_from: &[std::io::IoSlice],
+            _write_to: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            panic!("random generation must not read guest memory")
+        }
+
+        fn write_vectored(
+            &mut self,
+            _read_from: &[std::io::IoSlice],
+            _write_to: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            panic!("random copy must use the existing write path")
+        }
+
+        fn write(&mut self, address: AddrMut<u8>, bytes: &[u8]) -> Result<usize, Errno> {
+            self.writes.push((address.as_raw(), bytes.to_vec()));
+            let result = self.results.pop_front().expect("unexpected extra write");
+            if let Ok(count) = result {
+                assert!(count <= bytes.len());
+            }
+            result
+        }
+    }
+
+    #[test]
+    fn getrandom_generation_matches_original_mixed_chunk_boundaries() {
+        for seed in [0, 1, u64::MAX] {
+            let mut original = rand_pcg::Pcg64Mcg::seed_from_u64(seed);
+            let mut extracted = original.clone();
+            for requested in [0, 1, 4, 8, 9, 4095, 4096, 4097, 8193, usize::MAX, 3] {
+                let mut original_words = [u64::MAX; RANDOM_FILL_CHUNK_BYTES / 8];
+                let mut extracted_words = original_words;
+                let expected = original_random_chunk(&mut original, &mut original_words, requested);
+                let actual = generate_random_chunk(&mut extracted, &mut extracted_words, requested);
+                assert_eq!(actual.len(), requested.min(RANDOM_FILL_CHUNK_BYTES));
+                assert_eq!(actual, expected, "seed={seed}, requested={requested}");
+                assert_eq!(actual.as_ptr() as usize % std::mem::align_of::<u64>(), 0);
+                assert_eq!(extracted_words, original_words);
+                let mut expected_next = [0_u8; 64];
+                let mut actual_next = [0_u8; 64];
+                original.clone().fill(&mut expected_next);
+                extracted.clone().fill(&mut actual_next);
+                assert_eq!(actual_next, expected_next);
+                assert!(extracted == original);
+            }
+        }
+    }
+
+    #[test]
+    fn getrandom_generation_preserves_stream_after_partial_and_failed_copies() {
+        let mut original = rand_pcg::Pcg64Mcg::seed_from_u64(71);
+        let mut extracted = original.clone();
+        let mut expected_words = [0_u64; RANDOM_FILL_CHUNK_BYTES / 8];
+        let mut actual_words = expected_words;
+        let mut expected_writes = Vec::new();
+        let mut actual_writes = Vec::new();
+        let steps = [
+            (4096, vec![Ok(4096)], Ok(4096)),
+            (4096, vec![Ok(100)], Ok(100)),
+            (9, vec![Err(Errno::EFAULT)], Err(Errno::EFAULT)),
+            (8, vec![Ok(4), Err(Errno::EFAULT)], Ok(4)),
+            (8, vec![Ok(2)], Ok(2)),
+            (8, vec![Ok(0)], Ok(0)),
+            (17, vec![Ok(17)], Ok(17)),
+        ];
+        for (requested, writes, expected_result) in steps {
+            let expected = original_random_chunk(&mut original, &mut expected_words, requested);
+            let actual = generate_random_chunk(&mut extracted, &mut actual_words, requested);
+            let mut expected_results = writes.clone().into();
+            let mut actual_results = writes.into();
+            let address = AddrMut::from_raw(0x1000).unwrap();
+            let before = actual_writes.len();
+            let original_result = write_random_chunk(
+                RandomCopyMemory {
+                    results: &mut expected_results,
+                    writes: &mut expected_writes,
+                },
+                address,
+                expected,
+            );
+            let actual_result = write_random_chunk(
+                RandomCopyMemory {
+                    results: &mut actual_results,
+                    writes: &mut actual_writes,
+                },
+                address,
+                actual,
+            );
+            assert_eq!(original_result, expected_result);
+            assert_eq!(actual_result, expected_result);
+            assert!(expected_results.is_empty());
+            assert!(actual_results.is_empty());
+            assert_eq!(actual_writes, expected_writes);
+            if requested == 8 {
+                assert_eq!(actual_writes[before], (0x1000, actual[..4].to_vec()));
+                if expected_result == Ok(4) {
+                    assert_eq!(actual_writes[before + 1], (0x1004, actual[4..].to_vec()));
+                }
+            }
+            let mut expected_next = [0_u8; 65];
+            let mut actual_next = [0_u8; 65];
+            original.clone().fill(&mut expected_next);
+            extracted.clone().fill(&mut actual_next);
+            assert_eq!(actual_next, expected_next);
+            assert!(extracted == original);
+        }
+    }
 
     #[test]
     fn prctl_support_covers_deterministic_controls() {

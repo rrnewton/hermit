@@ -107,8 +107,9 @@ struct Config {
     /// Skip every NETWORKED judgement (ancestry, monotonicity, and the
     /// main-tip query) and decide only what is decidable offline: that the
     /// tracked manifests agree with each other, and that the LiteInst cache
-    /// keys track the pin. Used by the pre-commit hook, which the owner has
-    /// ruled must not be a hard blocker on distance from the main tip.
+    /// keys and DBT budget bindings track the pin. Used by the pre-commit hook,
+    /// which the owner has ruled must not be a hard blocker on distance from
+    /// the main tip.
     offline: bool,
     /// Pre-commit advisory. Judges the STAGED pin against HEAD's and against
     /// Reverie main, and speaks in exactly one of four cases (see
@@ -163,6 +164,7 @@ fn usage() -> &'static str {
        --no-verify-build                   Skip the post-bump compile check (UNSAFE)\n\
        --base-ref REF                      Monotonicity floor (default: origin/main)\n\
        --offline                           Local consistency only; no networked policy checks\n\
+                                           Incompatible with --update-to-latest and --staged-pin-advisory\n\
        --no-base                           Declare there is no monotonicity base (skip it)\n\
        --staged-pin-advisory               Pre-commit advisory on a STAGED pin edit\n\
        -h, --help                          Show this help\n\
@@ -994,6 +996,8 @@ fn clear_git_local_env(command: &mut Command) -> Result<(), String> {
 fn isolated_git_command() -> Result<Command, String> {
     let mut command = Command::new("git");
     clear_git_local_env(&mut command)?;
+    #[cfg(test)]
+    tests::trace_git(&mut command);
     Ok(command)
 }
 
@@ -2178,6 +2182,12 @@ fn check_dbt_budget_bindings(root: &Path, pin: &str) -> Result<i32, String> {
 }
 
 fn run_with_config(config: Config) -> Result<i32, String> {
+    if config.offline && (config.update_to_latest || config.staged_advisory) {
+        return Err(
+            "--offline and --update-to-latest/--staged-pin-advisory are mutually exclusive"
+                .to_string(),
+        );
+    }
     let root = config.repo.clone().map_or_else(git_root, Ok)?;
     let scan = read_pins(&root)?;
     let pins = &scan.occurrences;
@@ -2233,6 +2243,35 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         return Ok(1);
     }
 
+    if !config.update_to_latest {
+        let pin = unique_pin(&scan)?;
+        let cache_code = check_liteinst_cache_keys(&root, pin)?;
+        if cache_code != 0 {
+            return Ok(cache_code);
+        }
+        let budget_code = check_dbt_budget_bindings(&root, pin)?;
+        if budget_code != 0 {
+            return Ok(budget_code);
+        }
+
+        // OFFLINE STOPS HERE, having decided everything that does not need the
+        // network: the manifests agree with each other (checked above via
+        // unique_pin) and the LiteInst cache keys and DBT budget bindings track
+        // the pin. Those are real, offline-decidable defects that no amount of
+        // waiting fixes, so they stay BLOCKING for every caller. What offline
+        // deliberately does NOT judge is remote-policy compliance -- see the
+        // pre-commit hook for why that must not block.
+        if config.offline {
+            let entries = pins.len();
+            let pin_files = pinned_file_count.len();
+            println!(
+                "Reverie pin is locally consistent: {pin} ({entries} revision entries across \
+                 {pin_files} tracked Cargo metadata files; remote policy not evaluated, --offline)"
+            );
+            return Ok(0);
+        }
+    }
+
     // Production has no CLI/env/recorded-value override for the authority.
     // Tests substitute only the remote transport, then exercise this same
     // refs/heads/main dereference rather than injecting a well-shaped SHA.
@@ -2272,32 +2311,8 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     }
 
     let pin = unique_pin(&scan)?;
-    let cache_code = check_liteinst_cache_keys(&root, pin)?;
-    if cache_code != 0 {
-        return Ok(cache_code);
-    }
-    let budget_code = check_dbt_budget_bindings(&root, pin)?;
-    if budget_code != 0 {
-        return Ok(budget_code);
-    }
-
     let entries = pins.len();
     let pin_files = pinned_file_count.len();
-
-    // OFFLINE STOPS HERE, having decided everything that does not need the
-    // network: the manifests agree with each other (checked above via
-    // unique_pin) and the LiteInst cache keys track the pin. Those are real,
-    // offline-decidable defects that no amount of waiting fixes, so they stay
-    // BLOCKING for every caller. What offline deliberately does NOT judge is
-    // remote-policy compliance -- see the pre-commit hook for why that must not
-    // block.
-    if config.offline {
-        println!(
-            "Reverie pin is locally consistent: {pin} ({entries} revision entries across \
-             {pin_files} tracked Cargo metadata files; remote policy not evaluated, --offline)"
-        );
-        return Ok(0);
-    }
 
     // OWNER-APPROVED RULE (2026-08-08): ANCESTRY + MONOTONICITY; equality is
     // allowed but not required.
@@ -2440,6 +2455,214 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     use super::*;
+
+    thread_local! {
+        static GIT_TRACE_PATH: std::cell::RefCell<Option<PathBuf>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    pub(super) fn trace_git(command: &mut Command) {
+        GIT_TRACE_PATH.with_borrow(|path| {
+            if let Some(path) = path {
+                command.env("GIT_TRACE", path);
+            }
+        });
+    }
+
+    fn traced_run(config: Config) -> (Result<i32, String>, String) {
+        struct TraceGuard;
+        impl Drop for TraceGuard {
+            fn drop(&mut self) {
+                GIT_TRACE_PATH.set(None);
+            }
+        }
+        let path = temp_path("transport-trace");
+        GIT_TRACE_PATH.set(Some(path.clone()));
+        let guard = TraceGuard;
+        let result = run_with_config(config);
+        drop(guard);
+        let trace = fs::read_to_string(&path).unwrap_or_default();
+        if path.exists() {
+            fs::remove_file(path).expect("remove transport trace");
+        }
+        (result, trace)
+    }
+
+    fn assert_local_only(trace: &str) {
+        assert!(
+            trace.contains("ls-files"),
+            "local scan must execute: {trace}"
+        );
+        for transport in ["ls-remote", "fetch", "upload-pack", "remote-http", "ssh"] {
+            assert!(!trace.contains(transport), "unexpected transport: {trace}");
+        }
+    }
+
+    #[test]
+    fn offline_checks_local_consistency_without_transport() {
+        let pin = "1".repeat(40);
+        let other = "2".repeat(40);
+        let root = hermit_fixture("offline", &pin, &pin);
+        let cache = root.join("cache-key.txt");
+        let budget = root.join(DBT_BUDGET_BINDING_FILES[0]);
+        let lock = root.join("Cargo.lock");
+        fs::create_dir_all(budget.parent().unwrap()).unwrap();
+        fs::write(&cache, format!("liteinst-runtime-build-{}\n", &pin[..12])).unwrap();
+        fs::write(&budget, format!("expected_pin={pin}\n")).unwrap();
+        fs::write(
+            &lock,
+            format!("source = \"git+{DEFAULT_REMOTE}?rev={pin}#{pin}\"\n"),
+        )
+        .unwrap();
+        assert!(git_in(&root, &["add", "."]).unwrap().status.success());
+        let config = || Config {
+            repo: Some(root.clone()),
+            remote: Some(root.join("missing-remote").to_string_lossy().into_owned()),
+            offline: true,
+            ..Config::default()
+        };
+
+        let (result, trace) = traced_run(config());
+        assert_local_only(&trace);
+        assert_eq!(result.unwrap(), 0);
+
+        fs::write(
+            &lock,
+            format!("source = \"git+{DEFAULT_REMOTE}?rev={other}#{other}\"\n"),
+        )
+        .unwrap();
+        let (result, trace) = traced_run(config());
+        assert_local_only(&trace);
+        assert_eq!(
+            result.unwrap(),
+            1,
+            "split tracked revisions must be refused"
+        );
+        fs::write(
+            &lock,
+            format!("source = \"git+{DEFAULT_REMOTE}?rev={pin}#{pin}\"\n"),
+        )
+        .unwrap();
+
+        fs::write(&cache, format!("liteinst-runtime-build-{}\n", &other[..12])).unwrap();
+        let (result, trace) = traced_run(config());
+        assert_local_only(&trace);
+        assert_eq!(result.unwrap(), 1, "stale cache keys must be refused");
+        fs::write(&cache, format!("liteinst-runtime-build-{}\n", &pin[..12])).unwrap();
+
+        for contents in [format!("expected_pin={other}\n"), String::new()] {
+            fs::write(&budget, contents).unwrap();
+            let (result, trace) = traced_run(config());
+            assert_local_only(&trace);
+            assert_eq!(
+                result.unwrap(),
+                1,
+                "stale or empty budget bindings must be refused"
+            );
+        }
+        fs::write(&budget, format!("expected_pin={pin}\n")).unwrap();
+        let (result, trace) = traced_run(config());
+        assert_local_only(&trace);
+        assert_eq!(result.unwrap(), 0, "restored local coherence must pass");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn online_and_update_transport_refusal_remains_blocking() {
+        let pin = "1".repeat(40);
+        let root = hermit_fixture("transport-refusal", &pin, &pin);
+        for update_to_latest in [false, true] {
+            let (result, trace) = traced_run(Config {
+                repo: Some(root.clone()),
+                remote: Some(root.join("missing-remote").to_string_lossy().into_owned()),
+                update_to_latest,
+                ..Config::default()
+            });
+            assert!(
+                trace.contains("ls-remote"),
+                "transport must execute: {trace}"
+            );
+            assert!(
+                trace.contains("upload-pack"),
+                "local transport must execute: {trace}"
+            );
+            assert_eq!(result.unwrap(), 1, "transport refusal must remain blocking");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn offline_rejects_networked_modes_before_transport() {
+        let pin = "1".repeat(40);
+        let root = hermit_fixture("offline-flags", &pin, &pin);
+        for update_to_latest in [false, true] {
+            let (result, trace) = traced_run(Config {
+                repo: Some(root.clone()),
+                remote: Some(root.join("missing-remote").to_string_lossy().into_owned()),
+                offline: true,
+                update_to_latest,
+                staged_advisory: !update_to_latest,
+                ..Config::default()
+            });
+            let error = result.expect_err("offline cannot select a networked mode");
+            assert!(
+                error.contains("--offline") && error.contains("mutually exclusive"),
+                "{error}"
+            );
+            assert!(
+                trace.is_empty(),
+                "invalid flags must fail before Git: {trace}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_queries_main_and_preserves_calibration_refusal() {
+        let (remote, old, latest, _) = shared_reverie();
+        let root = hermit_fixture("update-transport", latest, latest);
+        let config = || Config {
+            repo: Some(root.clone()),
+            remote: Some(remote.to_string_lossy().into_owned()),
+            update_to_latest: true,
+            skip_verify_build: true,
+            ..Config::default()
+        };
+        let (result, trace) = traced_run(config());
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "already-current update must remain valid"
+        );
+        assert!(
+            trace.contains("ls-remote") && trace.contains("upload-pack"),
+            "{trace}"
+        );
+
+        let budget = root.join(DBT_BUDGET_BINDING_FILES[0]);
+        fs::create_dir_all(budget.parent().unwrap()).unwrap();
+        fs::write(&budget, format!("expected_pin={old}\n")).unwrap();
+        let cache = root.join("cache-key.txt");
+        fs::write(&cache, format!("liteinst-runtime-build-{old}\n")).unwrap();
+        assert!(git_in(&root, &["add", "."]).unwrap().status.success());
+        let (result, trace) = traced_run(config());
+        assert!(
+            trace.contains("ls-remote"),
+            "update must query authority: {trace}"
+        );
+        let error = result.expect_err("unsettled calibration must still refuse after carry");
+        assert!(error.contains("CALIBRATION DECISION REQUIRED"), "{error}");
+        assert_eq!(
+            fs::read_to_string(&cache).unwrap(),
+            format!("liteinst-runtime-build-{latest}\n")
+        );
+        assert_eq!(
+            fs::read_to_string(&budget).unwrap(),
+            format!("expected_pin={old}\n")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn extracts_rev_key_not_reverie_prefix() {
