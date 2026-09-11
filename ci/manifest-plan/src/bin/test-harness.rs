@@ -2238,6 +2238,9 @@ mod tests {
         pids
     }
 
+    const SLEEP_EXECUTABLE: &str = "/usr/bin/sleep";
+    const SLEEP_30_CMDLINE: &[u8] = b"/usr/bin/sleep\0\x33\x30\0";
+
     #[derive(Clone)]
     struct RecordedProcess {
         pid: u32,
@@ -2264,6 +2267,90 @@ mod tests {
                         .join("cmdline"),
                 )
                 .is_ok_and(|cmdline| cmdline == self.cmdline)
+        }
+
+        fn wait_for_cmdline(
+            mut self,
+            expected_pgid: u32,
+            expected_cmdline: &[u8],
+            timeout: Duration,
+        ) -> Result<Self, String> {
+            let pid = self.pid;
+            let recorded_start_time = self.start_time.clone();
+            let cmdline_path = Path::new("/proc").join(pid.to_string()).join("cmdline");
+            let deadline = std::time::Instant::now() + timeout;
+            let context = || {
+                format!(
+                    "pid {pid} with recorded starttime {} and expected pgid {expected_pgid} waiting for cmdline {expected_cmdline:?}",
+                    recorded_start_time
+                )
+            };
+            loop {
+                let observed_start_time = proc_stat_field(pid, 19).ok_or_else(|| {
+                    format!("refusing to record {}: process disappeared", context())
+                })?;
+                if observed_start_time != recorded_start_time {
+                    return Err(format!(
+                        "refusing to record {}: starttime changed to {observed_start_time}",
+                        context()
+                    ));
+                }
+                let observed_pgid = process_group(pid).ok_or_else(|| {
+                    format!(
+                        "refusing to record {}: process group disappeared",
+                        context()
+                    )
+                })?;
+                if observed_pgid != expected_pgid {
+                    return Err(format!(
+                        "refusing to record {}: pgid changed to {observed_pgid}",
+                        context()
+                    ));
+                }
+
+                let cmdline = fs::read(&cmdline_path);
+                if cmdline
+                    .as_deref()
+                    .is_ok_and(|bytes| bytes == expected_cmdline)
+                {
+                    let final_start_time = proc_stat_field(pid, 19).ok_or_else(|| {
+                        format!(
+                            "refusing to record {}: process disappeared after cmdline matched",
+                            context()
+                        )
+                    })?;
+                    if final_start_time != recorded_start_time {
+                        return Err(format!(
+                            "refusing to record {}: starttime changed to {final_start_time} after cmdline matched",
+                            context()
+                        ));
+                    }
+                    let final_pgid = process_group(pid).ok_or_else(|| {
+                        format!("refusing to record {}: process group disappeared after cmdline matched", context())
+                    })?;
+                    if final_pgid != expected_pgid {
+                        return Err(format!(
+                            "refusing to record {}: pgid changed to {final_pgid} after cmdline matched",
+                            context()
+                        ));
+                    }
+                    self.cmdline = cmdline
+                        .as_ref()
+                        .expect("checked successful cmdline read")
+                        .clone();
+                    if self.still_matches() && process_group(pid) == Some(expected_pgid) {
+                        return Ok(self);
+                    }
+                }
+
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "timed out after {timeout:?} while {}; last starttime {observed_start_time}, last pgid {observed_pgid}, last cmdline observation: {cmdline:?}",
+                        context()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
@@ -2432,6 +2519,31 @@ mod tests {
     }
 
     impl Drop for RecordedPidCleanup {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
+
+    struct SpawnedChildCleanup(Option<process::Child>);
+
+    impl SpawnedChildCleanup {
+        fn new(child: process::Child) -> Self {
+            Self(Some(child))
+        }
+
+        fn child_mut(&mut self) -> &mut process::Child {
+            self.0.as_mut().expect("spawned child already cleaned up")
+        }
+
+        fn cleanup(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    impl Drop for SpawnedChildCleanup {
         fn drop(&mut self) {
             self.cleanup();
         }
@@ -3640,7 +3752,7 @@ cat "$dag" > "$RUN_DAG_DAG_BYTES_MARKER"
             let sleep_pid_path = fixture.path().join("step-sleep.pid");
             let dag = fixture.path().join("sleep.json");
             let command = format!(
-                "printf started > {}; printf '%s\\n' $$ > {}; sleep 30 & printf '%s\\n' $! > {}; wait",
+                "printf started > {}; printf '%s\\n' $$ > {}; {SLEEP_EXECUTABLE} 30 & printf '%s\\n' $! > {}; wait",
                 marker.display(),
                 shell_pid_path.display(),
                 sleep_pid_path.display()
@@ -3692,12 +3804,12 @@ cat "$dag" > "$RUN_DAG_DAG_BYTES_MARKER"
                 Some(pgid),
                 "step sleeper must be in the recorded shell process group"
             );
+            let sleep_process = RecordedProcess::capture(sleep_pid)
+                .wait_for_cmdline(pgid, SLEEP_30_CMDLINE, Duration::from_secs(10))
+                .unwrap_or_else(|error| panic!("{error}"));
             let mut cleanup = UnboxedProcessGroupCleanup::new(
                 pgid,
-                vec![
-                    RecordedProcess::capture(shell_pid),
-                    RecordedProcess::capture(sleep_pid),
-                ],
+                vec![RecordedProcess::capture(shell_pid), sleep_process],
             );
             let status = Command::new("kill")
                 .arg(format!("-{signal}"))
@@ -3709,6 +3821,85 @@ cat "$dag" > "$RUN_DAG_DAG_BYTES_MARKER"
             assert_eq!(status.signal(), Some(expected_signal));
             cleanup.cleanup();
         }
+    }
+
+    #[test]
+    fn recorded_process_capture_after_exec_replaces_pre_exec_identity() {
+        let fixture = TestDirectory::new("recorded-process-exec-identity");
+        let ready = fixture.path().join("ready");
+        let script = format!("printf started > \"$1\"; read -r _; exec {SLEEP_EXECUTABLE} 30");
+        let child = Command::new("setsid")
+            .args(["bash", "-c", &script, "bash"])
+            .arg(&ready)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = SpawnedChildCleanup::new(child);
+        let pid = child.child_mut().id();
+        assert!(
+            wait_for_file(&ready, Duration::from_secs(10)),
+            "pre-exec fixture did not become ready"
+        );
+        let pgid = process_group(pid)
+            .unwrap_or_else(|| panic!("cannot read pre-exec fixture pgid for pid {pid}"));
+        let pre_exec = RecordedProcess::capture(pid);
+        assert!(
+            pre_exec.still_matches(),
+            "pre-exec identity must match before the fixture is released"
+        );
+        let timeout_error = match pre_exec.clone().wait_for_cmdline(
+            pgid,
+            SLEEP_30_CMDLINE,
+            Duration::from_millis(50),
+        ) {
+            Ok(_) => panic!("blocked pre-exec process must not match the expected sleeper"),
+            Err(error) => error,
+        };
+        assert!(
+            timeout_error.contains(&format!("pid {pid}"))
+                && timeout_error.contains("recorded starttime")
+                && timeout_error.contains("expected pgid")
+                && timeout_error.contains("last cmdline observation"),
+            "pre-exec timeout must report the recorded and observed identity: {timeout_error}"
+        );
+
+        child
+            .child_mut()
+            .stdin
+            .as_mut()
+            .expect("pre-exec fixture stdin must be piped")
+            .write_all(b"continue\n")
+            .unwrap();
+        drop(child.child_mut().stdin.take());
+        let post_exec = pre_exec
+            .clone()
+            .wait_for_cmdline(pgid, SLEEP_30_CMDLINE, Duration::from_secs(10))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            post_exec.start_time, pre_exec.start_time,
+            "exec must preserve the recorded starttime"
+        );
+        assert_eq!(
+            process_group(pid),
+            Some(pgid),
+            "exec must preserve the recorded process group"
+        );
+        assert!(
+            !pre_exec.still_matches(),
+            "pre-exec identity must stop matching after exec"
+        );
+        assert!(
+            post_exec.still_matches(),
+            "post-exec identity must match the running sleeper"
+        );
+
+        child.cleanup();
+        assert!(
+            !post_exec.still_matches(),
+            "post-exec fixture must be gone after exact child cleanup"
+        );
     }
 
     #[test]
