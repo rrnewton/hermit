@@ -28,7 +28,8 @@ function require_complete_resources {
         libdetcore_dbt.so \
         libdetcore_sabre.so \
         libreverie_dbt_client.so \
-        libreverie_liteinst.so; do
+        libhermit_liteinst_detcore.so \
+        libhermit_liteinst_detcore.so.provenance.json; do
         [[ -f $install/rsrcs/$path && ! -L $install/rsrcs/$path && -s $install/rsrcs/$path ]] ||
             fail "resource bundle is missing or empty: $install/rsrcs/$path"
     done

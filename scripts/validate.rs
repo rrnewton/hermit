@@ -7980,15 +7980,15 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     if matches!(args.focused, Some(Focused::LiteinstCompat)) {
         let mut steps = pre;
         steps.push(nextest_setup_node(root, gate)?);
-        steps.push(step_with_caps("liteinst", "hermit_release", "Release Hermit for LiteInst compatibility",
-            "cargo build --release --locked -p hermit --features third-party-backends".into(),
-            vec![gate.to_string()], 1200, 3600, 16 * 1024 * 1024 * 1024));
         steps.push(step_with_caps("liteinst", "runtime", "Release LiteInst runtime",
-            "./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build".into(),
-            vec!["liteinst.hermit_release".into()], 900, 1800, 8 * 1024 * 1024 * 1024));
+            "HERMIT_LITEINST_SOURCE_RECORD=$PWD/target/liteinst-source-record.json ./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libhermit_liteinst_detcore.so $PWD/target/liteinst-runtime-build".into(),
+            vec![gate.to_string()], 900, 1800, 8 * 1024 * 1024 * 1024));
+        steps.push(step_with_caps("liteinst", "hermit_release", "Release Hermit with LiteInst source identity",
+            "reverie_manifest=$(cargo metadata --offline --locked --format-version=1 --manifest-path liteinst-runtime-build/detcore-runtime/Cargo.toml | jq -er '[.packages[] | select(.name == \"reverie-liteinst-runtime\") | .manifest_path] | if length == 1 then .[0] else error(\"expected one reverie-liteinst-runtime package\") end') && reverie_root=$(git -C \"$(dirname \"$reverie_manifest\")\" rev-parse --show-toplevel) && HERMIT_LITEINST_SOURCE_RECORD=$PWD/target/liteinst-source-record.json HERMIT_LITEINST_HERMIT_ROOT=$PWD HERMIT_LITEINST_REVERIE_ROOT=$reverie_root cargo build --release --locked -p hermit --features third-party-backends && source_identity=$(jq -er .source_pair_sha256 target/release/libhermit_liteinst_detcore.so.provenance.json) && grep -aFq \"$source_identity\" target/release/hermit".into(),
+            vec!["liteinst.runtime".into()], 1200, 3600, 16 * 1024 * 1024 * 1024));
         steps.push(step_with_caps("liteinst", "strict", "Portable CI liteinst_strict",
-            "HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test liteinst_advanced -j 1".into(),
-            vec!["liteinst.runtime".into(), "setup.nextest".into()], 900, 1800, 8 * 1024 * 1024 * 1024));
+            "reverie_manifest=$(cargo metadata --offline --locked --format-version=1 --manifest-path liteinst-runtime-build/detcore-runtime/Cargo.toml | jq -er '[.packages[] | select(.name == \"reverie-liteinst-runtime\") | .manifest_path] | if length == 1 then .[0] else error(\"expected one reverie-liteinst-runtime package\") end') && reverie_root=$(git -C \"$(dirname \"$reverie_manifest\")\" rev-parse --show-toplevel) && HERMIT_LITEINST_SOURCE_RECORD=$PWD/target/liteinst-source-record.json HERMIT_LITEINST_HERMIT_ROOT=$PWD HERMIT_LITEINST_REVERIE_ROOT=$reverie_root HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test liteinst_advanced -j 1".into(),
+            vec!["liteinst.hermit_release".into(), "setup.nextest".into()], 900, 1800, 8 * 1024 * 1024 * 1024));
         let cfg = validate_plan::config_from(steps, "liteinst compatibility");
         return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
             profile: args.focused.as_ref().unwrap().profile(), selection_mode: "full",

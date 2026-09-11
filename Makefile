@@ -19,10 +19,16 @@ RUN_MATRIX = python3 tests/backend-parity/run_matrix.py
 	validate-self-test validate-timeout-layers-test lint \
 	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
 
-build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
+build: install-deps ## Build the development Hermit binary with every backend
 	@echo 'make: building the hermit binary (dev profile, third-party-backends) -- expect ~45s warm, longer cold'
 	@echo "make: cargo jobs=$(THIRD_PARTY_BUILD_JOBS) (host has $$(nproc) logical cores)"
-	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --locked \
+	@reverie_manifest=$$($(CARGO) metadata --offline --locked --format-version=1 \
+		--manifest-path liteinst-runtime-build/detcore-runtime/Cargo.toml | \
+		jq -er '[.packages[] | select(.name == "reverie-liteinst-runtime") | .manifest_path] | if length == 1 then .[0] else error("expected one reverie-liteinst-runtime package") end'); \
+		reverie_root=$$(git -C "$$(dirname "$$reverie_manifest")" rev-parse --show-toplevel); \
+		HERMIT_LITEINST_SOURCE_RECORD=$$PWD/target/liteinst-source-record.json \
+		HERMIT_LITEINST_HERMIT_ROOT=$$PWD HERMIT_LITEINST_REVERIE_ROOT=$$reverie_root \
+		CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --locked \
 		-p hermit --features third-party-backends
 	@bin=target/debug/hermit; \
 		if [ -x "$$bin" ]; then \
@@ -38,11 +44,27 @@ build: prune-stale-release install-deps ## Build the development Hermit binary w
 # the transitive `check-build-tools` prereq sees this and installs before it
 # asserts. `validate`/`release-core` do NOT set it and therefore only assert.
 install-deps: INSTALL_BUILD_TOOLS := 1
-install-deps: install-hooks check-submodules ## Build and stage all third-party backend runtimes and plugins
+# Serialize stale release removal before staging dependencies. In a parallel
+# build, the caller digest validation below must not race a sibling removal.
+install-deps: prune-stale-release install-hooks check-submodules ## Build and stage all third-party backend runtimes and plugins
 	@echo 'make: building the third-party backend runtimes (release profile) -- expect ~60s cold'
 	@echo "make: cargo jobs=$(THIRD_PARTY_BUILD_JOBS) (host has $$(nproc) logical cores)"
-	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
-		-p detcore-dbt -p detcore-sabre -p hermit-install
+	@reverie_manifest=$$($(CARGO) metadata --offline --locked --format-version=1 \
+		--manifest-path liteinst-runtime-build/detcore-runtime/Cargo.toml | \
+		jq -er '[.packages[] | select(.name == "reverie-liteinst-runtime") | .manifest_path] | if length == 1 then .[0] else error("expected one reverie-liteinst-runtime package") end'); \
+		reverie_root=$$(git -C "$$(dirname "$$reverie_manifest")" rev-parse --show-toplevel); \
+		HERMIT_LITEINST_SOURCE_RECORD=$$PWD/target/liteinst-source-record.json \
+		HERMIT_LITEINST_HERMIT_ROOT=$$PWD HERMIT_LITEINST_REVERIE_ROOT=$$reverie_root \
+		./scripts/stage-liteinst-runtime.sh release \
+		$$PWD/target/release/libhermit_liteinst_detcore.so $$PWD/target/liteinst-runtime-build; \
+		HERMIT_LITEINST_SOURCE_RECORD=$$PWD/target/liteinst-source-record.json \
+		HERMIT_LITEINST_HERMIT_ROOT=$$PWD HERMIT_LITEINST_REVERIE_ROOT=$$reverie_root \
+		CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
+		-p hermit --features third-party-backends -p detcore-dbt -p detcore-sabre; \
+		HERMIT_LITEINST_SOURCE_RECORD=$$PWD/target/liteinst-source-record.json \
+		HERMIT_LITEINST_HERMIT_ROOT=$$PWD HERMIT_LITEINST_REVERIE_ROOT=$$reverie_root \
+		CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
+		-p hermit-install
 	@echo 'make: backend runtimes OK (release profile: detcore-dbt, detcore-sabre, hermit-install)'
 
 # Install this clone's git pre-commit hooks (core.hooksPath -> .githooks) so a

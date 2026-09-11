@@ -146,11 +146,12 @@ hermit run --base-env=minimal -e LANG=C --workdir=/tmp -- /bin/pwd
 #### Backend Selection
 
 Use `--backend=ptrace|dbt|liteinst|sabre|kvm|e9patch` to select the process
-instrumentation backend.
-It is a global option and belongs before the subcommand, but backend scope is
-command-specific. LiteInst and e9patch support only `run`, while SaBRe supports
-`run` and `strace`; unsupported combinations fail closed. The default is
-`ptrace`, so existing commands are unchanged:
+instrumentation backend. It is a global option and belongs before the
+subcommand. Backend scope is command-specific: e9patch supports only `run`,
+while SaBRe supports `run` and `strace`; unsupported combinations fail closed.
+The command-line LiteInst selection currently refuses because it cannot own and
+finalize the required capture session. The default is `ptrace`, so existing
+commands are unchanged:
 
 ```bash
 hermit --backend=ptrace run -- /bin/echo hello
@@ -161,44 +162,41 @@ subcommand (`hermit run --backend=ptrace -- /bin/echo hello`).
 
 Hermit detects whether the requested backend is integrated and available on
 the current host. It does not silently fall back to a different backend.
-LiteInst requires `libreverie_liteinst.so` beside the Hermit executable. That
-DSO initializes only the in-guest patch/helper runtime. The ptrace host owns the
-sole `Detcore` Tool and GlobalTool from the initial exec; it observes the first
-syscall at each site and installs a LiteInst trampoline for later invocations.
-There is no second in-guest Detcore instance or coordinator RPC Tool.
+LiteInst uses the public library session API: create `liteinst::Session` and
+`liteinst::LogInput` with `liteinst::prepare`, call
+`run_with_backend_timeout_and_log` or
+`run_with_output_backend_timeout_and_log`, and finalize the returned run with
+`Session::finish`. That route requires `libhermit_liteinst_detcore.so` and its
+adjacent `.provenance.json`; the runtime loads the shared `Detcore` tool in the
+guest and uses syscall user dispatch without patching.
 
-Build and stage the constructor-enabled runtime with its locked standalone
-manifest before building Hermit:
+The current Reverie pin does not contain the split runtime package and session
+APIs, so normal locked, offline staging refuses. After a genuine Reverie commit
+containing those APIs is pinned, build and stage the runtime before building
+Hermit, and give both builds the same source record and source roots:
 
 ```bash
+export HERMIT_LITEINST_SOURCE_RECORD="$PWD/target/liteinst-source-record.json"
+export HERMIT_LITEINST_HERMIT_ROOT="$PWD"
+reverie_manifest=$(cargo metadata --offline --locked --format-version=1 \
+  --manifest-path liteinst-runtime-build/detcore-runtime/Cargo.toml | \
+  jq -er '[.packages[] | select(.name == "reverie-liteinst-runtime") | .manifest_path] | if length == 1 then .[0] else error("expected one reverie-liteinst-runtime package") end')
+export HERMIT_LITEINST_REVERIE_ROOT=$(git -C "$(dirname "$reverie_manifest")" \
+  rev-parse --show-toplevel)
 ./scripts/stage-liteinst-runtime.sh dev \
-  "$PWD/target/debug/libreverie_liteinst.so" \
+  "$PWD/target/debug/libhermit_liteinst_detcore.so" \
   "$PWD/target/liteinst-runtime-build"
-cargo build --locked -p hermit --bin hermit
+cargo build --locked --offline -p hermit --bin hermit
 ```
 
-Hermit verifies the DSO architecture, required exports, and preload constructor
-before activation; an arbitrary shared object or constructor-free runtime is
-rejected rather than silently falling back.
+Hermit verifies the DSO descriptor, source identity, artifact bytes, and
+constructor before activation; an invalid pair is rejected rather than
+silently falling back.
 
-LiteInst uses the normal Hermit run and verification paths. A successful
-`--strict --verify` run compares status/stdout/stderr exactly and applies the
-`Stripped` comparison to selected Detcore scheduler messages; it is useful
-diagnostic evidence, but it is not strict determinism. Strict verification requires
-`--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
-compared-message counts. Verification snapshots guest stdin once and supplies
-the identical bytes to both runs. The supported execution scope is dynamically
-linked, single-threaded, single-process Linux x86-64 guests. Thread clone,
-`fork`, and `vfork` fail closed with `EOPNOTSUPP`, and `exec` remains
-unsupported because the patch runtime is not yet re-bootstrapped and
-revalidated after image replacement. PMU/RCB timer delivery, CPUID, RDTSC, and
-RDTSCP use the ptrace host path and therefore have the same host capability
-requirements as the normal ptrace backend.
-
-The default namespace, mount, and network setup is shared with Hermit's other
-backends; `--no-namespace` remains available for trusted guests. The preload
-runtime reserves `SIGSYS` in kernel-visible signal masks. This experimental
-patch-helper path is not a security boundary for intentionally hostile code.
+The caller-owned route and native child lifecycle currently have compile-only
+and refusal evidence. Guest execution and backend qualification remain pending;
+do not infer them from artifact validation or successful compilation. The
+preload runtime is not a security boundary for intentionally hostile code.
 The release installation package provides the DynamoRIO, SaBRe, LiteInst, and
 e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus a
 guest-kernel ABI.

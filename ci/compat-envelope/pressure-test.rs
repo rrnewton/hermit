@@ -2460,16 +2460,16 @@ fn build_marker(results: &Path, tag: &str) -> PathBuf {
 
 fn required_build_tags(
     exact_cell: Option<(&str, &str)>,
-    includes_liteinst: bool,
+    _includes_liteinst: bool,
 ) -> BTreeSet<&'static str> {
     // Batch cells consume the canonical prebuilt artifact, so retain the build
     // nodes that produce it. The complete metadata audit is not a product-build
     // prerequisite: write_plan already refuses a stale scorecard and derives
-    // selection and budgets through the typed manifest tool. LiteInst's separate
-    // runtime build is retained only when a selected cell uses it. Exact
-    // ptrace/KVM cells use a direct Hermit build, DBT/SaBRe retain the canonical
-    // third-party runtime build, LiteInst retains its build chain, and a naked
-    // native command needs no Hermit build.
+    // selection and budgets through the typed manifest tool. Batch cells retain
+    // LiteInst's build because the canonical artifact publisher depends on it.
+    // Exact ptrace/KVM cells use a direct Hermit build, DBT/SaBRe retain the
+    // canonical third-party runtime build, LiteInst retains its build chain, and
+    // a naked native command needs no Hermit build.
     if let Some((mode, backend)) = exact_cell {
         if mode == "naked" && backend == "native" {
             return BTreeSet::from(["setup.manifest_plan"]);
@@ -2478,10 +2478,7 @@ fn required_build_tags(
             return BTreeSet::from(["setup.manifest_plan", "build.runtime_release"]);
         }
     }
-    REQUIRED_BUILD_TAGS
-        .into_iter()
-        .filter(|tag| includes_liteinst || *tag != "build.liteinst_runtime_release")
-        .collect()
+    REQUIRED_BUILD_TAGS.into_iter().collect()
 }
 
 fn required_builds_complete(results: &Path, metadata: &RunMetadata) -> bool {
@@ -5603,10 +5600,6 @@ fn self_test(root: &Path) -> Result<(), String> {
             return Err(format!("repeated selection accepted {label}"));
         }
     }
-    let batch_without_liteinst: BTreeSet<_> = REQUIRED_BUILD_TAGS
-        .into_iter()
-        .filter(|tag| *tag != "build.liteinst_runtime_release")
-        .collect();
     let lean_exact = BTreeSet::from(["setup.manifest_plan", "build.runtime_release"]);
     let exact_runtime_backends_ok = ["ptrace", "kvm", "dbt", "sabre"]
         .into_iter()
@@ -5616,11 +5609,11 @@ fn self_test(root: &Path) -> Result<(), String> {
             != BTreeSet::from(["setup.manifest_plan"])
         || required_build_tags(Some(("verify", "liteinst")), true)
             != BTreeSet::from(REQUIRED_BUILD_TAGS)
-        || required_build_tags(None, false) != batch_without_liteinst
+        || required_build_tags(None, false) != BTreeSet::from(REQUIRED_BUILD_TAGS)
         || required_build_tags(None, true) != BTreeSet::from(REQUIRED_BUILD_TAGS)
     {
         return Err(
-            "selected-cell build closure lost a required node or built LiteInst for a sample without LiteInst"
+            "selected-cell build closure lost a required canonical artifact producer"
                 .into(),
         );
     }
@@ -7025,10 +7018,14 @@ fn self_test(root: &Path) -> Result<(), String> {
         let tag = step.tag();
         let expected: BTreeSet<&str> = match tag.as_str() {
             "build.workspace" | "build.runtime_release" => BTreeSet::new(),
-            "build.e2e_artifact" => {
+            "build.e2e_artifact" => BTreeSet::from([
+                "build.workspace",
+                "build.runtime_release",
+                "build.liteinst_runtime_release",
+            ]),
+            "build.liteinst_runtime_release" => {
                 BTreeSet::from(["build.workspace", "build.runtime_release"])
             }
-            "build.liteinst_runtime_release" => BTreeSet::from(["build.e2e_artifact"]),
             other => return Err(format!("unexpected green-batch build node {other}")),
         };
         if deps != expected {

@@ -6,9 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#[path = "common/liteinst.rs"]
-mod liteinst_runtime;
-
 use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -50,7 +47,6 @@ static DBT_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_STDERR_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_LOG_ENV_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -211,64 +207,6 @@ fn read_terminal_dbt_verdict(path: &Path) -> serde_json::Value {
         );
     }
     verdict
-}
-
-fn write_matching_liteinst_revision(runtime: &Path) {
-    let revision = PathBuf::from(format!("{}.revision", runtime.display()));
-    fs::write(revision, format!("{}\n", env!("HERMIT_REVERIE_PIN")))
-        .expect("failed to write LiteInst runtime revision fixture");
-}
-
-#[test]
-fn liteinst_runtime_cache_requires_the_current_revision() {
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .expect("failed to create LiteInst cache fixture directory");
-    let runtime = directory.path().join("libreverie_liteinst.so");
-    assert!(!liteinst_runtime::staged_runtime_matches_current_pin(
-        &runtime
-    ));
-    fs::write(&runtime, b"fixture").expect("failed to write LiteInst cache fixture");
-    assert!(!liteinst_runtime::staged_runtime_matches_current_pin(
-        &runtime
-    ));
-    fs::write(
-        format!("{}.revision", runtime.display()),
-        "stale-revision\n",
-    )
-    .expect("failed to write stale LiteInst revision fixture");
-    assert!(!liteinst_runtime::staged_runtime_matches_current_pin(
-        &runtime
-    ));
-    write_matching_liteinst_revision(&runtime);
-    assert!(liteinst_runtime::staged_runtime_matches_current_pin(
-        &runtime
-    ));
-}
-
-fn liteinst_inert_runtime() -> &'static Path {
-    LITEINST_INERT_RUNTIME.get_or_init(|| {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-inert-runtime");
-        fs::create_dir_all(&build_root).expect("failed to create inert runtime directory");
-        let runtime = build_root.join("libreverie_liteinst_inert.so");
-        let output = Command::new("cc")
-            .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/liteinst_inert_runtime.c"))
-            .arg("-o")
-            .arg(&runtime)
-            .output()
-            .expect("failed to compile inert LiteInst runtime fixture");
-        assert!(
-            output.status.success(),
-            "inert LiteInst fixture compilation failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        write_matching_liteinst_revision(&runtime);
-        runtime
-    })
 }
 
 fn exec_clock_continuity_guest() -> &'static Path {
@@ -1417,39 +1355,19 @@ fn run_dbt_strict_returns_with_blocked_stdin_source() {
     assert!(stderr(&output).contains("unsupported syscall"));
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-736): Review the real LiteInst Detcore CLI assertion.
 #[test]
-fn run_liteinst_verifies_detcore_backend() {
-    liteinst_runtime::ensure_liteinst_runtime();
-    let args = [
-        "run",
-        "--backend",
-        "liteinst",
-        "--strict",
-        "--verify",
-        "--",
-        "/bin/echo",
-        "liteinst-cli-ok",
-    ];
+fn run_liteinst_requires_a_caller_owned_capture_session() {
+    let args = ["run", "--backend", "liteinst", "--", "/must-not-launch"];
     let output = hermit(&args);
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "liteinst-cli-ok\n");
+    assert_eq!(output.status.code(), Some(122), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
     let stderr = stderr(&output);
     assert!(
-        stderr.contains(
-            "liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
-        ),
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
         "{stderr}"
     );
     assert!(
-        stderr.contains("Success: deterministic. Determinism verified."),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains(
-            "LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)"
-        ),
+        stderr.contains("does not yet own and finalize a LiteInst capture session"),
         "{stderr}"
     );
 }
@@ -1570,58 +1488,6 @@ fn inherited_container_output_does_not_expose_capture_offset() {
         report.contains("guest-file-stderr offset=0 errno=0"),
         "guest-installed stderr lost ordinary file seek semantics:\n{report}"
     );
-}
-
-#[test]
-fn run_liteinst_rejects_a_non_runtime_override_before_activation_claim() {
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .expect("failed to create false LiteInst runtime directory");
-    let runtime = directory.path().join("not-a-liteinst-runtime");
-    fs::copy("/bin/true", &runtime).expect("failed to copy false LiteInst runtime fixture");
-    write_matching_liteinst_revision(&runtime);
-    let args = [
-        "run",
-        "--backend",
-        "liteinst",
-        "--strict",
-        "--",
-        "/bin/true",
-    ];
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .env("HERMIT_LITEINST_RUNTIME", &runtime)
-        .args(args)
-        .output()
-        .expect("failed to run Hermit with a false LiteInst runtime");
-    assert!(!output.status.success(), "{output:?}");
-    let stderr = stderr(&output);
-    assert!(stderr.contains("missing required export"), "{stderr}");
-    assert!(!stderr.contains("activation verified"), "{stderr}");
-    assert!(!stderr.contains("Success: deterministic"), "{stderr}");
-}
-
-#[test]
-fn run_liteinst_rejects_an_inert_dso_before_activation_claim() {
-    let args = [
-        "run",
-        "--backend",
-        "liteinst",
-        "--strict",
-        "--",
-        "/bin/true",
-    ];
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .env("HERMIT_LITEINST_RUNTIME", liteinst_inert_runtime())
-        .args(args)
-        .output()
-        .expect("failed to run Hermit with an inert LiteInst runtime");
-    assert!(!output.status.success(), "{output:?}");
-    let stderr = stderr(&output);
-    assert!(
-        stderr.contains("does not register reverie_liteinst_initialize as a preload constructor"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("activation verified"), "{stderr}");
-    assert!(!stderr.contains("Success: deterministic"), "{stderr}");
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -6033,11 +5899,11 @@ fn run_timeout_fallback_fires_when_the_unwind_does_not_finish() {
 /// backend does not silently inherit a guarantee nobody measured for it.
 ///
 /// Measured 2026-08-26 with `--timeout 3` on a guest that never exits, two runs
-/// each: ptrace and liteinst stopped at 3s reporting `class=run-timeout`; kvm
-/// stopped only via the hard fallback at 13s; sabre ran 40s and dbt ran 20s and
-/// neither produced any marker at all -- those elapsed times are the harness's
-/// own deadline, not hermit's. All five run correctly WITHOUT the flag, so it is
-/// the bound that fails, not the backend.
+/// each: ptrace stopped at 3s reporting `class=run-timeout`; kvm stopped only
+/// via the hard fallback at 13s; sabre ran 40s and dbt ran 20s and neither
+/// produced any marker at all -- those elapsed times are the harness's own
+/// deadline, not hermit's. LiteInst is covered separately by the command-line
+/// capture-session refusal and has no qualifying timeout result.
 ///
 /// ⚠️ `dbt` IS THE LOAD-BEARING CASE. The `RunOpts::main` DBT arm returns
 /// `run_dbt(..)` and never reaches `RunOpts::run`, so the first version of this

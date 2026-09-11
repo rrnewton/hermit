@@ -566,6 +566,11 @@ fn tracked_cargo_metadata(root: &Path) -> Result<Vec<PathBuf>, String> {
         .split('\0')
         .filter(|entry| !entry.is_empty())
         .map(PathBuf::from)
+        // `git ls-files` includes an index entry for a tracked deletion. It is
+        // absent from the candidate worktree and therefore cannot contribute
+        // a dependency; a manifest that still references it fails separately
+        // when Cargo reads the workspace graph.
+        .filter(|path| root.join(path).exists())
         .collect())
 }
 

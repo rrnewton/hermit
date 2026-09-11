@@ -14,8 +14,6 @@
     reason = "`fbcode_build` is supplied by the internal Buck build"
 )]
 
-use core::arch::global_asm;
-
 mod analyze;
 mod backends;
 mod bisect;
@@ -51,88 +49,6 @@ use std::sync::atomic::Ordering;
 const STDIN_UNCAPTURED: i32 = i32::MIN;
 const STDIN_TAKEN: i32 = i32::MIN + 1;
 static STARTUP_STDIN: AtomicI32 = AtomicI32::new(STDIN_UNCAPTURED);
-
-const LITEINST_ACTIVATION_PROBE_ENV: &str = "HERMIT_INTERNAL_LITEINST_ACTIVATION_PROBE";
-const LITEINST_ACTIVATION_CALLS: u64 = 32;
-
-global_asm!(
-    r#"
-    .text
-    .p2align 4
-    .global hermit_liteinst_probe_getpid
-    .hidden hermit_liteinst_probe_getpid
-    .type hermit_liteinst_probe_getpid,@function
-hermit_liteinst_probe_getpid:
-    mov eax, 39
-    .global hermit_liteinst_probe_getpid_site
-    .hidden hermit_liteinst_probe_getpid_site
-hermit_liteinst_probe_getpid_site:
-    syscall
-    nop
-    nop
-    nop
-    ret
-    .size hermit_liteinst_probe_getpid, .-hermit_liteinst_probe_getpid
-"#
-);
-
-unsafe extern "C" {
-    fn hermit_liteinst_probe_getpid() -> i64;
-    static hermit_liteinst_probe_getpid_site: u8;
-}
-
-type LiteinstCountFn = unsafe extern "C" fn(u64) -> u64;
-
-unsafe fn liteinst_count_function(name: &std::ffi::CStr) -> Option<LiteinstCountFn> {
-    // SAFETY: RTLD_DEFAULT searches already loaded DSOs and name is terminated.
-    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
-    if symbol.is_null() {
-        return None;
-    }
-    // SAFETY: both required runtime counter exports have this exact C ABI.
-    Some(unsafe { core::mem::transmute::<*mut libc::c_void, LiteinstCountFn>(symbol) })
-}
-
-fn liteinst_activation_probe() -> Option<ExitStatus> {
-    if std::env::var_os(LITEINST_ACTIVATION_PROBE_ENV).as_deref() != Some(std::ffi::OsStr::new("1"))
-    {
-        return None;
-    }
-    let mut expected = None;
-    for _ in 0..LITEINST_ACTIVATION_CALLS {
-        // SAFETY: the assembly function preserves the C ABI and returns getpid.
-        let observed = unsafe { hermit_liteinst_probe_getpid() };
-        if *expected.get_or_insert(observed) != observed {
-            eprintln!("LiteInst activation probe observed inconsistent getpid results");
-            return Some(ExitStatus::Exited(126));
-        }
-    }
-    let address = core::ptr::addr_of!(hermit_liteinst_probe_getpid_site) as usize as u64;
-    // SAFETY: the expected runtime exports use the fixed counter ABI above.
-    let Some(trap_count) =
-        (unsafe { liteinst_count_function(c"reverie_liteinst_site_trap_count") })
-    else {
-        eprintln!("LiteInst activation probe could not resolve the trap counter");
-        return Some(ExitStatus::Exited(126));
-    };
-    // SAFETY: the expected runtime exports use the fixed counter ABI above.
-    let Some(hook_count) =
-        (unsafe { liteinst_count_function(c"reverie_liteinst_site_hook_count") })
-    else {
-        eprintln!("LiteInst activation probe could not resolve the hook counter");
-        return Some(ExitStatus::Exited(126));
-    };
-    // SAFETY: the counter functions accept the fixed syscall-site address.
-    let traps = unsafe { trap_count(address) };
-    // SAFETY: the counter functions accept the fixed syscall-site address.
-    let hooks = unsafe { hook_count(address) };
-    println!(
-        "hermit-liteinst-activation calls={LITEINST_ACTIVATION_CALLS} traps={traps} hooks={hooks}"
-    );
-    Some(ExitStatus::Exited(i32::from(
-        traps != 1 || hooks != LITEINST_ACTIVATION_CALLS - 1,
-    )))
-}
 
 unsafe extern "C" fn capture_startup_stdin() {
     // SAFETY: this runs single-threaded before Rust can sanitize a closed fd 0.
@@ -318,10 +234,10 @@ impl Subcommand {
                  preprocess their guest"
             );
         }
-        if backend == Some(hermit::Backend::Liteinst) && !matches!(self, Subcommand::Run(_)) {
+        if backend == Some(hermit::Backend::Liteinst) {
             anyhow::bail!(
-                "the LiteInst preload backend is available only through `hermit --backend \
-                 liteinst run`; other subcommands do not use the preload runtime"
+                "the hermit command does not yet own and finalize a LiteInst capture session; \
+                 use the public session-aware LiteInst API"
             );
         }
         if backend == Some(hermit::Backend::Kvm) && !matches!(self, Subcommand::Run(_)) {
@@ -402,9 +318,6 @@ fn main() {
     // container inits -- three on `--verify`, which forks once per run. This
     // placement dominates every with_container and run_guarded_at site.
     detcore::util::init_shared_stderr_deadline_origin();
-    if let Some(status) = liteinst_activation_probe() {
-        status.raise_or_exit();
-    }
     let Args {
         mut global,
         mut command,
@@ -1103,23 +1016,31 @@ mod tests {
     }
 
     #[test]
-    fn liteinst_is_rejected_outside_run() {
+    fn liteinst_is_rejected_without_a_caller_owned_capture_session() {
         use hermit::Backend;
 
-        let args = Args::try_parse_from([
-            "hermit",
-            "--backend",
-            "liteinst",
-            "record",
-            "list",
-            "--json",
-        ])
-        .unwrap();
-        let error = args
-            .command
-            .validate_backend_scope(Some(Backend::Liteinst))
-            .unwrap_err();
-        assert!(error.to_string().contains("only through"));
+        for command in [
+            vec!["hermit", "--backend", "liteinst", "run", "/bin/true"],
+            vec![
+                "hermit",
+                "--backend",
+                "liteinst",
+                "record",
+                "list",
+                "--json",
+            ],
+        ] {
+            let args = Args::try_parse_from(command).unwrap();
+            let error = args
+                .command
+                .validate_backend_scope(Some(Backend::Liteinst))
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "the hermit command does not yet own and finalize a LiteInst capture session; \
+                 use the public session-aware LiteInst API"
+            );
+        }
     }
 
     #[test]

@@ -30,13 +30,10 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Enable after the ptrace baseline for direct C guests is trusted
           kvm: Enable after the ptrace baseline for direct C guests is trusted
           sabre: SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC
@@ -69,8 +66,8 @@ test:
           repeat_identical: true
         backends_enabled:
           - ptrace
-          - liteinst
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: The custom clock matrix baseline is ptrace-only
           kvm: The custom clock matrix baseline is ptrace-only
           sabre: The custom clock matrix baseline is ptrace-only
@@ -900,15 +897,12 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
           sabre: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
           - sabre
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: DBT coverage is owned by its backend parity partition
           kvm: KVM requires the privileged runner
       replay:

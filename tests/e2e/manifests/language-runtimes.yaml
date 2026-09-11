@@ -212,14 +212,13 @@ test:
           dbt: false
           kvm: true
           sabre: false
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - kvm
           - sabre
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
         ci_disabled_reason:
           dbt: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
@@ -1148,7 +1147,7 @@ test:
           dbt: DBI rewrites the code stream, so a JIT that writes its own code at run time needs separate qualification
           kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
-          liteinst: LiteInst patches the code stream, so JIT-generated code needs separate qualification
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
       replay:
         ci: false
         backends_enabled: []

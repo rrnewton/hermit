@@ -8,6 +8,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::io::Read;
 use std::io::Seek;
 use std::os::unix::ffi::OsStrExt;
@@ -27,46 +28,75 @@ const MAX_INTERP_SIZE: usize = libc::PATH_MAX as usize;
 /// Get the right ld.so from elf's interp section.
 pub fn elf_get_interp<P: AsRef<Path>>(elf: P) -> Option<PathBuf> {
     let mut file = fs::File::open(elf).ok()?;
+    elf_interp_from_reader(&mut file).ok().flatten()
+}
+
+pub(crate) fn elf_interp_from_reader<R: Read + Seek>(file: &mut R) -> io::Result<Option<PathBuf>> {
     let mut header_bytes = [0; ELF_HEADER_SIZE];
-    file.read_exact(&mut header_bytes).ok()?;
-    let header = Elf::parse_header(&header_bytes).ok()?;
-    let mut elf = Elf::lazy_parse(header).ok()?;
+    file.read_exact(&mut header_bytes)?;
+    let header = Elf::parse_header(&header_bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut elf = Elf::lazy_parse(header)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let ctx = Ctx {
-        le: header.endianness().ok()?,
-        container: header.container().ok()?,
+        le: header
+            .endianness()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        container: header
+            .container()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
     };
 
     // parse and assemble the program headers
     let program_header_size = ProgramHeader::size(ctx);
     if usize::from(header.e_phentsize) != program_header_size {
-        return None;
+        return Ok(None);
     }
     let program_header_count = usize::from(header.e_phnum);
-    let table_size = program_header_size.checked_mul(program_header_count)?;
+    let table_size = program_header_size
+        .checked_mul(program_header_count)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "program header table overflow")
+        })?;
     let mut table = vec![0; table_size];
-    file.seek(std::io::SeekFrom::Start(header.e_phoff)).ok()?;
-    file.read_exact(&mut table).ok()?;
-    elf.program_headers = ProgramHeader::parse(&table, 0, program_header_count, ctx).ok()?;
+    file.seek(io::SeekFrom::Start(header.e_phoff))?;
+    file.read_exact(&mut table)?;
+    elf.program_headers = ProgramHeader::parse(&table, 0, program_header_count, ctx)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
+    let mut interpreter = None;
     for ph in &elf.program_headers {
         if ph.p_type == program_header::PT_INTERP {
-            let size = usize::try_from(ph.p_filesz).ok()?;
+            if interpreter.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate PT_INTERP",
+                ));
+            }
+            let size = usize::try_from(ph.p_filesz).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PT_INTERP size does not fit usize",
+                )
+            })?;
             if !(2..=MAX_INTERP_SIZE).contains(&size) {
-                return None;
+                return Ok(None);
             }
 
             let mut interp = vec![0; size];
-            file.seek(std::io::SeekFrom::Start(ph.p_offset)).ok()?;
-            file.read_exact(&mut interp).ok()?;
-            let path = interp.strip_suffix(b"\0")?;
+            file.seek(io::SeekFrom::Start(ph.p_offset))?;
+            file.read_exact(&mut interp)?;
+            let Some(path) = interp.strip_suffix(b"\0") else {
+                return Ok(None);
+            };
             if path.is_empty() || path.contains(&0) {
-                return None;
+                return Ok(None);
             }
-            return Some(PathBuf::from(OsStr::from_bytes(path)));
+            interpreter = Some(PathBuf::from(OsStr::from_bytes(path)));
         }
     }
 
-    None
+    Ok(interpreter)
 }
 
 #[cfg(test)]
@@ -155,6 +185,37 @@ mod tests {
         ))
         .unwrap();
 
+        assert_eq!(elf_get_interp(file.path()), None);
+    }
+
+    #[test]
+    fn reader_reports_truncated_interp_segment() {
+        let mut bytes =
+            std::io::Cursor::new(elf_with_late_interp(QEMU_INTERP_OFFSET, INTERP.len(), None));
+
+        assert_eq!(
+            elf_interp_from_reader(&mut bytes).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn reader_rejects_duplicate_interp_and_legacy_wrapper_returns_none() {
+        const INTERP_OFFSET: usize = 256;
+        const PROGRAM_HEADER_SIZE: usize = 56;
+        let mut bytes = elf_with_late_interp(INTERP_OFFSET, INTERP.len(), Some(INTERP));
+        write_u16(&mut bytes, 56, 2);
+        bytes.copy_within(
+            ELF_HEADER_SIZE..ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE,
+            ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE,
+        );
+
+        let error = elf_interp_from_reader(&mut std::io::Cursor::new(&bytes)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "duplicate PT_INTERP");
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&bytes).unwrap();
         assert_eq!(elf_get_interp(file.path()), None);
     }
 

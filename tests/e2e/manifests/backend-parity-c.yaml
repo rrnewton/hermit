@@ -21,17 +21,14 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
@@ -90,17 +87,14 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
@@ -162,15 +156,12 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "17107307a33b6f6383c1b7bc2acb364b162b6c8c", "reason": "LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; a 12-RCB (120ns) initial drift accumulates to 672 RCBs (6,720ns), causing guest-visible virtual-time divergence under canonical verification at scheduler turn 10."}
         backends_enabled:
           - ptrace
-          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: DBT completes the five-step contract but its dedicated adapter publishes typed no_result with no INFO comparison, so it cannot establish L2
           kvm: Current KVM fixture and /bin/true controls time out before guest start on the validation host, so no personality-specific verdict is available
           sabre: Not yet qualified for the personality(2) execution-domain round-trip
@@ -1104,15 +1095,12 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
@@ -1670,17 +1658,14 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
@@ -2121,9 +2106,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -2996,17 +2981,14 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
@@ -3251,17 +3233,14 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
@@ -3826,15 +3805,12 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
@@ -4231,15 +4207,12 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "17107307a33b6f6383c1b7bc2acb364b162b6c8c", "reason": "LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; a 12-RCB (120ns) initial drift accumulates to 672 RCBs (6,720ns), causing guest-visible virtual-time divergence under canonical verification at scheduler turn 10."}
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
@@ -4298,15 +4271,12 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
@@ -5162,17 +5132,14 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
@@ -5301,15 +5268,12 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: KVM ElfExecutor implements F_SETLK advisory locking but returns a deterministic ENOSYS for F_GETLK lock queries
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
@@ -5372,17 +5336,14 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "e73e7ba0bf56fbbfefffa304f7622c67aac6ea88", "reason": "LiteInst parses host-assigned /proc/self/maps inode digit widths while ptrace PMU counting is active; the resulting 672-RCB (6,720ns) virtual-time divergence caused canonical verification to fail at scheduler turn 10."}
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
@@ -5518,17 +5479,14 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
@@ -5590,15 +5548,12 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: KVM ElfExecutor returns a deterministic error for the F_SETOWN/F_GETOWN async-I/O owner fcntl family, so the SIGIO/SIGURG owner round-trip is unavailable
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
@@ -5661,17 +5616,14 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
@@ -5730,13 +5682,12 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Not buildable on the authoring host (cmake absent); qualify DBT separately
           sabre: Not buildable on the authoring host (cmake absent); qualify SaBRe separately
       naked:
@@ -5798,13 +5749,12 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: DBI is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBI separately -- this guest is a PRIORITY for DBI once it builds, since layout divergence is exactly what it detects
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
       naked:
@@ -6148,15 +6098,12 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: 'Measured: the guest produces NO stdout and the run is killed at 150s under --backend dbi, so the event-delivery legs never complete there. Observed gap, not diagnosed by this change'
           kvm: KVM does not start the guest on the validation host; the existing inotify_watch entry already records that its ElfExecutor personality omits the inotify family
           sabre: Not yet qualified for inotify/signalfd event delivery
@@ -6285,13 +6232,10 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
           kvm: New top-of-funnel coverage is established on the ptrace reference first; KVM ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
@@ -6351,15 +6295,12 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
           kvm: true
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
       naked:
@@ -6423,7 +6364,7 @@ test:
           dbt: The DynamoRIO (DBT) backend is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake), so no witness could be recorded; qualify DBT separately once it builds
           kvm: KVM livelocks at guest startup on the current host, so no witness could be recorded; qualify KVM separately
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
-          liteinst: LiteInst preload runtime libreverie_liteinst.so is not built beside the binary on the current host; qualify LiteInst separately
+          liteinst: LiteInst runtime libhermit_liteinst_detcore.so is not built beside the binary on the current host; qualify LiteInst separately
       naked:
         ci: false
         ci_disabled_reason: "NOT-EXERCISED (by design): native variation is the premise measured by this guest, not a stable naked-mode oracle that the guest asserts."
@@ -6612,7 +6553,7 @@ test:
         backends_disabled:
           dbt: DBT is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBT separately
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
-          liteinst: LiteInst preload runtime libreverie_liteinst.so is not built beside the binary; qualify LiteInst separately
+          liteinst: LiteInst runtime libhermit_liteinst_detcore.so is not built beside the binary; qualify LiteInst separately
       naked:
         ci: false
         backends_enabled: []

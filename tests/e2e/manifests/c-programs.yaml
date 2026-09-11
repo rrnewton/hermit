@@ -1276,12 +1276,10 @@ test:
           ptrace: true
           kvm: true
           sabre: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
-          - liteinst
         guest_args:
           ptrace:
             - multi
@@ -1289,9 +1287,8 @@ test:
             - multi
           sabre:
             - multi
-          liteinst:
-            - multi
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -2399,18 +2396,16 @@ test:
           ptrace: true
           dbt: false
           sabre: true
-          liteinst: false
           kvm: true
         ci_disabled_reason:
           dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
           - dbt
           - sabre
-          - liteinst
           - kvm
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
       naked:
         ci: false
         backends_enabled: []
@@ -3671,12 +3666,10 @@ test:
           ptrace: true
           kvm: true
           sabre: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
-          - liteinst
         guest_args:
           ptrace:
             - multiple
@@ -3684,9 +3677,8 @@ test:
             - multiple
           sabre:
             - multiple
-          liteinst:
-            - multiple
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -3810,9 +3802,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -3868,9 +3860,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -3926,9 +3918,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -3984,9 +3976,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -4262,13 +4254,12 @@ test:
           ptrace: true
           kvm: true
           sabre: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
-          - liteinst
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -4324,13 +4315,12 @@ test:
           ptrace: true
           kvm: true
           sabre: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
-          - liteinst
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -4386,13 +4376,12 @@ test:
           ptrace: true
           kvm: true
           sabre: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
-          - liteinst
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -4620,15 +4609,12 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: pause(2) scheduler interaction is qualified against the ptrace reference first; qualify DBT separately
           kvm: pause(2) scheduler interaction is qualified against the ptrace reference first; qualify KVM separately
           sabre: pause(2) scheduler interaction is qualified against the ptrace reference first; qualify SaBRe separately
@@ -5724,8 +5710,8 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
       naked:
@@ -8321,14 +8307,13 @@ test:
         ci:
           ptrace: true
           sabre: false
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a timeout; this cell did not pass every repetition cleanly. Retained detail: cell exceeded 15 s before attempt 1 started", "result": "timeout"}
@@ -8386,9 +8371,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -8444,9 +8429,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -8502,9 +8487,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -8560,9 +8545,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -8618,9 +8603,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -8675,13 +8660,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - liteinst
         guest_args:
           ptrace:
             - v4-us
-          liteinst:
-            - v4-us
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
@@ -8737,17 +8720,15 @@ test:
       verify:
         ci:
           ptrace: false
-          liteinst: false
         backends_enabled:
           - ptrace
-          - liteinst
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
         ci_disabled_reason:
           ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison", "result": "crash-error"}
-          liteinst: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison", "result": "crash-error"}
       naked:
         ci: false
         backends_enabled: []
@@ -8801,9 +8782,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
       naked:
@@ -8859,9 +8840,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
       naked:
@@ -10254,9 +10235,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -10312,9 +10293,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
@@ -10370,9 +10351,9 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
+          liteinst: The ordinary LiteInst command-line route refuses because it cannot own and finalize the required capture session
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
       naked:
         ci: false
