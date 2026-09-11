@@ -190,13 +190,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions", 2),
     ("test.rr_suite_contract", 1),
     ("privileged-test.pmu_buck_chaos_cases", 6),
-    ("privileged-test.cli_kvm", 24),
+    ("privileged-test.cli_kvm", 32),
     ("test.cli_on_host", 76),
     ("test.hermit_modes_on_host", 18),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
-    ("privileged-only-test.cli_kvm", 24),
+    ("privileged-only-test.cli_kvm", 32),
     ("privileged-only-test.pmu_buck_chaos_cases_on_host", 6),
-    ("privileged-only-test.cli_kvm_on_host", 24),
+    ("privileged-only-test.cli_kvm_on_host", 32),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
