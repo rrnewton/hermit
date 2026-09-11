@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+exec /home/newton/work/dev-hermit/bin/safehermit \
+  --sh-bin /home/newton/work/dev-hermit/worktrees/slots/integration-pr529-pr538-hermit/target/debug/hermit \
+  "$@"
