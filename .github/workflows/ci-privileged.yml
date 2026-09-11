@@ -111,6 +111,8 @@ jobs:
       run: timeout --foreground --kill-after=10s 120s ./ci/probe-runner-boxing.sh
 
     - name: PMU, CPUID-faulting, and KVM smoke DAG
+      env:
+        DAGRUN_BIN: agent-utils/rs/bin/dagrun
       # GitHub Actions sets GITHUB_ACTIONS=true, which makes the runner's ordinary
       # scope bring-up deliberately skip systemd --user. Select explicit unboxed
       # execution only in that exact context. A copied/local invocation, or any
@@ -131,7 +133,7 @@ jobs:
           echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2
           exit 2
         fi
-        timeout --foreground --kill-after=10s 1560s env DAGRUN_BIN=agent-utils/py/bin/dagrun ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+        timeout --foreground --kill-after=10s 1560s ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
     - name: Run non-gating occasional KVM probes
       id: kvm_occasional
       continue-on-error: true

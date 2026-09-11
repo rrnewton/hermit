@@ -1149,6 +1149,7 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
 }
 
 fn audit_budget_ordering(root: &Path) -> Result<(), String> {
+    audit_workflow_run_dag_runners(root)?;
     let portable = read_dag(&root.join("ci/dag/portable.json"))?;
     let privileged = read_dag(&root.join("ci/dag/privileged.json"))?;
     for (lane, dag) in [("portable", &portable), ("privileged", &privileged)] {
@@ -1235,18 +1236,11 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
             "privileged workflow must contain exactly one diagnostic continue-on-error".into(),
         );
     }
-    let launcher_bound = privileged_workflow
+    let launcher_line = privileged_workflow
         .lines()
         .find(|line| line.contains("ci/run-dag.sh privileged"))
-        .and_then(|line| {
-            let words = line.split_whitespace().collect::<Vec<_>>();
-            words
-                .iter()
-                .position(|word| *word == "env")
-                .and_then(|index| index.checked_sub(1))
-                .and_then(|index| words[index].strip_suffix('s'))
-                .and_then(|value| value.parse::<u64>().ok())
-        })
+        .ok_or_else(|| "cannot find privileged launcher command".to_string())?;
+    let launcher_bound = command_timeout_seconds(launcher_line)?
         .ok_or_else(|| "cannot derive privileged launcher timeout".to_string())?;
     let privileged_yaml = parse_yaml(&root.join(".github/workflows/ci-privileged.yml"))?;
     let privileged_job_bound = workflow_job_timeout(&privileged_yaml, "privileged")? * 60;
@@ -1304,6 +1298,258 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
         privileged.steps.len()
     );
     Ok(())
+}
+
+fn audit_workflow_run_dag_runners(root: &Path) -> Result<(), String> {
+    let workflows = root.join(".github/workflows");
+    let mut discovered = BTreeSet::new();
+    for entry in fs::read_dir(&workflows).map_err(|error| {
+        format!(
+            "cannot discover workflows in {}: {error}",
+            workflows.display()
+        )
+    })? {
+        let path = entry
+            .map_err(|error| format!("cannot read workflow directory entry: {error}"))?
+            .path();
+        if !matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| format!("cannot relativize workflow {}: {error}", path.display()))?
+            .to_path_buf();
+        let label = relative.to_string_lossy();
+        let workflow = parse_yaml(&path)?;
+        if !workflow_run_dag_steps(&label, &workflow)?.is_empty() {
+            discovered.insert(relative);
+        }
+    }
+    if discovered.is_empty() {
+        return Err("no GitHub workflow invokes ci/run-dag.sh".into());
+    }
+
+    let mut audited = BTreeSet::new();
+    for relative in &discovered {
+        let label = relative.to_string_lossy();
+        let workflow = parse_yaml(&root.join(relative))?;
+        if audit_run_dag_workflow_runner(&label, &workflow)? > 0 {
+            audited.insert(relative.clone());
+        }
+    }
+    if audited != discovered {
+        return Err(format!(
+            "run-dag workflow discovery and audit differ: discovered={discovered:?} audited={audited:?}"
+        ));
+    }
+    Ok(())
+}
+
+struct WorkflowRunDagStep<'a> {
+    job_name: &'a str,
+    step_index: usize,
+    job: &'a YamlValue,
+    step: &'a YamlValue,
+    run: &'a str,
+}
+
+fn workflow_run_dag_steps<'a>(
+    label: &str,
+    workflow: &'a YamlValue,
+) -> Result<Vec<WorkflowRunDagStep<'a>>, String> {
+    let jobs = workflow["jobs"]
+        .as_mapping()
+        .ok_or_else(|| format!("workflow {label} has no jobs mapping"))?;
+    let mut callers = Vec::new();
+    for (job_name, job) in jobs {
+        let job_name = job_name
+            .as_str()
+            .ok_or_else(|| format!("workflow {label} has a non-string job name"))?;
+        let Some(steps_value) = job.get("steps") else {
+            continue;
+        };
+        let steps = steps_value
+            .as_sequence()
+            .ok_or_else(|| format!("workflow {label} job {job_name} steps must be a sequence"))?;
+        for (step_index, step) in steps.iter().enumerate() {
+            let Some(run_value) = step.get("run") else {
+                continue;
+            };
+            let run = run_value.as_str().ok_or_else(|| {
+                format!("workflow {label} job {job_name} step {step_index} run must be a string")
+            })?;
+            let normalized = run.replace("\\\n", "");
+            if normalized
+                .lines()
+                .any(|line| !line.trim_start().starts_with('#') && line.contains("ci/run-dag.sh"))
+            {
+                callers.push(WorkflowRunDagStep {
+                    job_name,
+                    step_index,
+                    job,
+                    step,
+                    run,
+                });
+            }
+        }
+    }
+    Ok(callers)
+}
+
+fn workflow_env_value(
+    scope: &YamlValue,
+    key: &str,
+    location: &str,
+) -> Result<Option<String>, String> {
+    let Some(environment) = scope.get("env") else {
+        return Ok(None);
+    };
+    let environment = environment
+        .as_mapping()
+        .ok_or_else(|| format!("{location} env must be a mapping"))?;
+    let key = YamlValue::String(key.to_string());
+    let Some(value) = environment.get(&key) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(|value| Some(value.to_string()))
+        .ok_or_else(|| format!("{location} {} must be a string", key.as_str().unwrap()))
+}
+
+fn audit_inline_run_dag_command(location: &str, command: &str) -> Result<(), String> {
+    if command.contains("\\\n") {
+        return Err(format!(
+            "{location} uses a physical shell line continuation; keep the run-dag invocation on one auditable line"
+        ));
+    }
+    let invocation_lines = command
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#') && line.contains("ci/run-dag.sh"))
+        .collect::<Vec<_>>();
+    if invocation_lines.len() != 1 {
+        return Err(format!(
+            "{location} must contain exactly one ci/run-dag.sh invocation, found {}",
+            invocation_lines.len()
+        ));
+    }
+    if command.contains("DAGRUN_ENGINE") || command.contains("DAGRUN_BIN") {
+        return Err(format!(
+            "{location} sets an inline dagrun environment override; declare the exact Rust launcher in the step env mapping"
+        ));
+    }
+
+    let line = invocation_lines[0];
+    if line.matches("ci/run-dag.sh").count() != 1 {
+        return Err(format!(
+            "{location} must contain exactly one ci/run-dag.sh invocation"
+        ));
+    }
+    if line.contains("${{") {
+        return Err(format!(
+            "{location} interpolates a GitHub expression into the run-dag command; pass it through the step env mapping and quote it"
+        ));
+    }
+    let words = line.split_whitespace().collect::<Vec<_>>();
+    let invocation = words
+        .iter()
+        .position(|word| {
+            matches!(
+                word.trim_matches(['\'', '"', ';']),
+                "ci/run-dag.sh" | "./ci/run-dag.sh"
+            )
+        })
+        .ok_or_else(|| {
+            format!("{location} run-dag invocation is not a standalone command token")
+        })?;
+    for word in &words[..invocation] {
+        let word = word.trim_matches(['\'', '"', ';']);
+        if word == "env"
+            || word == "timeout"
+            || word.starts_with('-')
+            || word
+                .strip_suffix('s')
+                .is_some_and(|value| value.parse::<u64>().is_ok())
+        {
+            continue;
+        } else {
+            return Err(format!(
+                "{location} has an unsupported command prefix token {word:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn audit_effective_run_dag_runner(
+    location: &str,
+    engine: Option<&str>,
+    binary: Option<&str>,
+) -> Result<(), String> {
+    let engine = engine.filter(|value| !value.is_empty());
+    let binary = binary.filter(|value| !value.is_empty());
+
+    match binary {
+        Some("agent-utils/rs/bin/dagrun" | "./agent-utils/rs/bin/dagrun") => return Ok(()),
+        Some("agent-utils/common/bin/dagrun" | "./agent-utils/common/bin/dagrun")
+            if matches!(engine, Some("rust" | "rs")) =>
+        {
+            return Ok(());
+        }
+        Some(value) if value.ends_with("/py/bin/dagrun") => {
+            return Err(format!(
+                "{location} selects the Python dagrun binary, which cannot execute structured-result DAGs"
+            ));
+        }
+        Some(value) => {
+            return Err(format!(
+                "{location} sets unsupported DAGRUN_BIN={value:?}; use the default or the exact tracked Rust launcher"
+            ));
+        }
+        None => {}
+    }
+
+    match engine {
+        None | Some("rust" | "rs") => Ok(()),
+        Some("python" | "py") => Err(format!(
+            "{location} selects the Python dagrun engine, which cannot execute structured-result DAGs"
+        )),
+        Some(value) => Err(format!(
+            "{location} sets unsupported DAGRUN_ENGINE={value:?}; use the default Rust selection or exact `rust`/`rs`"
+        )),
+    }
+}
+
+fn audit_run_dag_workflow_runner(label: &str, workflow: &YamlValue) -> Result<usize, String> {
+    let workflow_engine = workflow_env_value(workflow, "DAGRUN_ENGINE", label)?;
+    let workflow_binary = workflow_env_value(workflow, "DAGRUN_BIN", label)?;
+    let callers = workflow_run_dag_steps(label, workflow)?;
+    for caller in &callers {
+        let job_location = format!("workflow {label} job {}", caller.job_name);
+        let job_engine = workflow_env_value(caller.job, "DAGRUN_ENGINE", &job_location)?
+            .or_else(|| workflow_engine.clone());
+        let job_binary = workflow_env_value(caller.job, "DAGRUN_BIN", &job_location)?
+            .or_else(|| workflow_binary.clone());
+        let location = format!("{job_location} run-dag step {}", caller.step_index);
+        let engine = workflow_env_value(caller.step, "DAGRUN_ENGINE", &location)?
+            .or_else(|| job_engine.clone());
+        let step_binary = workflow_env_value(caller.step, "DAGRUN_BIN", &location)?;
+        if step_binary.as_deref() != Some("agent-utils/rs/bin/dagrun") {
+            return Err(format!(
+                "{location} must set step env DAGRUN_BIN=agent-utils/rs/bin/dagrun"
+            ));
+        }
+        let binary = step_binary.or_else(|| job_binary.clone());
+        audit_inline_run_dag_command(&location, caller.run)?;
+        audit_effective_run_dag_runner(&location, engine.as_deref(), binary.as_deref())?;
+    }
+    if callers.is_empty() {
+        return Err(format!("workflow {label} has no ci/run-dag.sh consumer"));
+    }
+    Ok(callers.len())
 }
 
 fn audit_privileged_unboxed_guard(workflow: &str) -> Result<(), String> {
@@ -1400,6 +1646,20 @@ fn workflow_job_timeout(workflow: &YamlValue, job: &str) -> Result<u64, String> 
     workflow["jobs"][job]["timeout-minutes"]
         .as_u64()
         .ok_or_else(|| format!("workflow job {job} has no numeric timeout-minutes"))
+}
+
+fn command_timeout_seconds(command: &str) -> Result<Option<u64>, String> {
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    let Some(index) = words.iter().position(|word| *word == "timeout") else {
+        return Ok(None);
+    };
+    let budget = words[index + 1..]
+        .iter()
+        .find(|word| !word.starts_with('-'))
+        .and_then(|word| word.trim_end_matches('\\').strip_suffix('s'))
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| format!("cannot derive timeout budget from `{command}`"))?;
+    Ok(Some(budget))
 }
 
 fn workflow_step_timeout_sum(workflow: &YamlValue, job: &str) -> Result<u64, String> {
@@ -1954,7 +2214,11 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::env;
     use std::fs;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::process;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -1968,9 +2232,13 @@ mod tests {
     use super::HostCapability;
     use super::HostCapabilityVerdict;
     use super::accumulate_cell_cpu_usage;
+    use super::audit_effective_run_dag_runner;
     use super::audit_privileged_unboxed_guard;
+    use super::audit_run_dag_workflow_runner;
+    use super::audit_workflow_run_dag_runners;
     use super::build_worker_capacity;
     use super::command_jobs;
+    use super::command_timeout_seconds;
     use super::expected_plan_document;
     use super::for_each_parallel;
     use super::host_inapplicable_reason;
@@ -1979,6 +2247,37 @@ mod tests {
     use super::scheduled_worker_capacity;
     use super::structured_test_results_from_rows;
     use super::unique_plan_rows;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            for _ in 0..100 {
+                let path = env::temp_dir().join(format!(
+                    "hermit-test-harness-{label}-{}-{}",
+                    process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("cannot create {}: {error}", path.display()),
+                }
+            }
+            panic!("cannot allocate a unique temporary directory for {label}");
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn generated_expected_plan_is_versioned_and_matches_the_tracked_file() {
@@ -2142,6 +2441,165 @@ mod tests {
     fn privileged_unboxed_execution_rejects_broad_boxing_failure_acceptance() {
         let executable = format!("{GUARDED_WORKFLOW}        run: tool --allow-cgroup-failure\n");
         assert!(audit_privileged_unboxed_guard(&executable).is_err());
+    }
+
+    #[test]
+    fn run_dag_workflows_require_a_step_scoped_exact_rust_runner() {
+        for workflow in [
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/rs/bin/dagrun\n        run: ci/run-dag.sh privileged -v\n",
+            "env:\n  DAGRUN_ENGINE: python\njobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/rs/bin/dagrun\n        run: ci/run-dag.sh privileged -v\n",
+            "env:\n  DAGRUN_BIN: agent-utils/py/bin/dagrun\njobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/rs/bin/dagrun\n        run: ci/run-dag.sh portable -v\n",
+        ] {
+            let workflow: serde_yaml::Value = serde_yaml::from_str(workflow).unwrap();
+            assert!(audit_run_dag_workflow_runner("fixture", &workflow).is_ok());
+        }
+
+        for workflow in [
+            "jobs:\n  validation:\n    steps:\n      - run: ci/run-dag.sh portable -v\n",
+            "env:\n  DAGRUN_BIN: agent-utils/rs/bin/dagrun\njobs:\n  validation:\n    steps:\n      - run: ci/run-dag.sh portable -v\n",
+            "jobs:\n  validation:\n    env:\n      DAGRUN_BIN: agent-utils/rs/bin/dagrun\n    steps:\n      - run: ci/run-dag.sh privileged -v\n",
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/common/bin/dagrun\n          DAGRUN_ENGINE: rust\n        run: ci/run-dag.sh privileged -v\n",
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/py/bin/dagrun\n        run: ci/run-dag.sh privileged -v\n",
+        ] {
+            let workflow: serde_yaml::Value = serde_yaml::from_str(workflow).unwrap();
+            let error = audit_run_dag_workflow_runner("fixture", &workflow)
+                .expect_err("every caller must pin the exact Rust launcher at step scope");
+            assert!(error.contains("must set step env DAGRUN_BIN"), "{error}");
+        }
+    }
+
+    #[test]
+    fn run_dag_workflows_refuse_all_inline_runner_overrides() {
+        for assignment in [
+            "DAGRUN_BIN=agent-utils/py/bin/dagrun",
+            "DAGRUN_BIN=\"agent-utils/py/bin/dagrun\"",
+            "DAGRUN_ENGINE=python",
+            "DAGRUN_ENGINE='python'",
+            "DAGRUN_ENGINE=py",
+            "DAGRUN_ENGINE=\"py\"",
+            "DAGRUN_ENGINE=rust",
+            "DAGRUN_ENGINE+=py",
+        ] {
+            let workflow: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/rs/bin/dagrun\n        run: env {assignment} ci/run-dag.sh privileged -v\n"
+            ))
+            .unwrap();
+            let error = audit_run_dag_workflow_runner("fixture", &workflow)
+                .expect_err("inline runner overrides are outside the auditable workflow grammar");
+            assert!(
+                error.contains("inline dagrun environment override"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_dag_runner_resolution_honors_binary_precedence() {
+        assert!(
+            audit_effective_run_dag_runner(
+                "fixture",
+                Some("python"),
+                Some("agent-utils/rs/bin/dagrun")
+            )
+            .is_ok()
+        );
+        assert!(
+            audit_effective_run_dag_runner(
+                "fixture",
+                Some("rust"),
+                Some("agent-utils/py/bin/dagrun")
+            )
+            .is_err()
+        );
+        assert!(
+            audit_effective_run_dag_runner(
+                "fixture",
+                Some("python"),
+                Some("agent-utils/common/bin/dagrun")
+            )
+            .is_err()
+        );
+        assert!(
+            audit_effective_run_dag_runner(
+                "fixture",
+                Some("rust"),
+                Some("agent-utils/common/bin/dagrun")
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn run_dag_workflows_refuse_unparsed_or_multiple_invocations() {
+        for workflow in [
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/rs/bin/dagrun\n        run: |\n          DAGRUN_ENGI\\\n          NE=python ci/run-dag.sh privileged -v\n",
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/rs/bin/dagrun\n        run: |\n          ci/run-\\\n          dag.sh privileged -v\n",
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/rs/bin/dagrun\n        run: |\n          ci/run-dag.sh portable -v\n          env DAGRUN_ENGINE=py ci/run-dag.sh privileged -v\n",
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/rs/bin/dagrun\n        run: echo ci/run-dag.sh\n",
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/rs/bin/dagrun\n        run: |\n          DAGRUN_ENGINE=rust true; ci/run-dag.sh privileged -v\n",
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/rs/bin/dagrun\n        run: env DAGRUN_\"ENGINE\"=python ci/run-dag.sh privileged -v\n",
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/rs/bin/dagrun\n        run: ci/run-dag.sh portable ${{ inputs.max_mem }} -v\n",
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/rs/bin/dagrun\n        run: '# ci/run-dag.sh is not an invocation'\n",
+        ] {
+            let workflow: serde_yaml::Value = serde_yaml::from_str(workflow).unwrap();
+            assert!(audit_run_dag_workflow_runner("fixture", &workflow).is_err());
+        }
+    }
+
+    #[test]
+    fn run_dag_workflow_discovery_audits_every_yaml_caller() {
+        let root = TestDirectory::new("workflow-discovery");
+        let workflows = root.path().join(".github/workflows");
+        fs::create_dir_all(&workflows).unwrap();
+        fs::write(
+            workflows.join("first.yml"),
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/rs/bin/dagrun\n        run: ci/run-dag.sh portable -v\n",
+        )
+        .unwrap();
+        fs::write(
+            workflows.join("second.yaml"),
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/rs/bin/dagrun\n        run: ci/run-dag.sh privileged -v\n",
+        )
+        .unwrap();
+        fs::write(
+            workflows.join("no-caller.yml"),
+            "jobs:\n  docs:\n    steps:\n      - run: echo docs\n",
+        )
+        .unwrap();
+        audit_workflow_run_dag_runners(root.path()).unwrap();
+
+        fs::write(
+            workflows.join("new-caller.yaml"),
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/py/bin/dagrun\n        run: ci/run-dag.sh portable -v\n",
+        )
+        .unwrap();
+        let error = audit_workflow_run_dag_runners(root.path())
+            .expect_err("a newly added workflow caller must be discovered and audited");
+        assert!(error.contains("new-caller.yaml"), "{error}");
+
+        fs::write(
+            workflows.join("new-caller.yaml"),
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/rs/bin/dagrun\n        run: ci/run-dag.sh portable -v\n",
+        )
+        .unwrap();
+        fs::write(
+            workflows.join("later-caller.yml"),
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/py/bin/dagrun\n        run: ci/run-dag.sh privileged -v\n",
+        )
+        .unwrap();
+        let error = audit_workflow_run_dag_runners(root.path())
+            .expect_err("a newly added .yml workflow caller must also be audited");
+        assert!(error.contains("later-caller.yml"), "{error}");
+    }
+
+    #[test]
+    fn privileged_launcher_timeout_does_not_depend_on_an_env_prefix() {
+        for command in [
+            "timeout --foreground --kill-after=10s 1560s ci/run-dag.sh privileged -v",
+            "timeout --foreground --kill-after=10s 1560s env DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
+        ] {
+            assert_eq!(command_timeout_seconds(command).unwrap(), Some(1560));
+        }
     }
 
     #[test]
