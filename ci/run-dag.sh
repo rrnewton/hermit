@@ -26,13 +26,11 @@
 #   ci/run-dag.sh privileged -j 1 --perf-dir ./perf
 #   ci/run-dag.sh portable ascii   # any non-`run` verb also works
 #
-# Environment:
-#   DAGRUN_BIN     override the runner executable to use.
-#   RUN_DAG_FILE_OVERRIDE  run this exact DAG file instead of ci/dag/<lane>.json.
-#                          Used by scripts/validate.rs --selective to feed a subset DAG
-#                          (a dependency-closed slice of the lane) while keeping
-#                          the lane argument for runner labeling. The override
-#                          must exist and be readable, or run-dag.sh fails closed.
+# Runner:
+#   run-dag.sh always constructs the selected validation DAG with
+#   scripts/validate.rs --write-constructed-dag, then runs the tracked Rust
+#   scheduler at agent-utils/rs/bin/dagrun. Runtime runner and DAG overrides are
+#   rejected so CI cannot silently switch to a different scheduler or raw graph.
 
 set -uo pipefail
 
@@ -50,20 +48,43 @@ fi
 lane=$1
 shift
 
-if [[ -n ${RUN_DAG_FILE_OVERRIDE:-} ]]; then
-    dag="$RUN_DAG_FILE_OVERRIDE"
-    if [[ ! -f $dag ]]; then
-        echo "run-dag.sh: RUN_DAG_FILE_OVERRIDE set but not a file: $dag" >&2
+for name in DAGRUN_BIN DAGRUN_ENGINE RUN_DAG_FILE_OVERRIDE; do
+    if [[ -n ${!name:-} ]]; then
+        echo "run-dag.sh: $name is no longer supported for CI DAG execution." >&2
+        echo "            Use ci/run-dag.sh <portable|privileged>; it constructs the DAG and runs agent-utils/rs/bin/dagrun." >&2
         exit 2
     fi
-    echo "run-dag.sh: using DAG override for lane '$lane': $dag" >&2
-else
-    dag="$ROOT_DIR/ci/dag/${lane}.json"
-    if [[ ! -f $dag ]]; then
-        echo "run-dag.sh: unknown lane '$lane' (no such file: $dag)" >&2
+done
+
+for arg in "$@"; do
+    case "$arg" in
+        --dag|--dag=*)
+            echo "run-dag.sh: forwarded --dag is not supported." >&2
+            echo "            ci/run-dag.sh constructs the portable or privileged DAG with scripts/validate.rs --write-constructed-dag." >&2
+            exit 2
+            ;;
+    esac
+done
+
+case "$lane" in
+    portable|privileged) ;;
+    *)
+        echo "run-dag.sh: unknown lane '$lane'." >&2
         echo "            known lanes: portable, privileged" >&2
         exit 2
-    fi
+        ;;
+esac
+
+runner="$ROOT_DIR/agent-utils/rs/bin/dagrun"
+if [[ ! -e "$runner" ]]; then
+    echo "run-dag.sh: required dagrun runner is missing: $runner" >&2
+    echo "            Build or check out the tracked Rust runner at agent-utils/rs/bin/dagrun." >&2
+    exit 127
+fi
+if [[ ! -f "$runner" || ! -x "$runner" ]]; then
+    echo "run-dag.sh: required dagrun runner is not an executable file: $runner" >&2
+    echo "            Build or repair the tracked Rust runner at agent-utils/rs/bin/dagrun." >&2
+    exit 126
 fi
 
 # Structured result ownership is attached during validate plan construction for
@@ -75,68 +96,40 @@ fi
 # This exports data only; the single dagrun invocation below remains the only
 # scheduler.
 generated_dir=
-if [[ -z ${RUN_DAG_FILE_OVERRIDE:-} && ( $lane == portable || $lane == privileged ) ]]; then
-    mkdir -p "$ROOT_DIR/target/validation" || exit 2
-    generated_dir=$(mktemp -d "$ROOT_DIR/target/validation/run-dag.XXXXXX") || exit 2
-    trap 'rm -rf -- "$generated_dir"' EXIT
-    dag="$generated_dir/$lane.json"
-    level="${lane}-only"
-    if [[ $lane == privileged ]]; then
-        level=--privileged-only
+cleanup_generated_dir() {
+    if [[ -n ${generated_dir:-} ]]; then
+        rm -rf -- "$generated_dir"
     fi
-    if ! ./scripts/validate.rs "$level" --write-constructed-dag "$dag" >/dev/null; then
-        echo "run-dag.sh: validate could not construct the $lane DAG" >&2
-        exit 2
-    fi
-fi
-
-# Locate the runner. Prefer an explicit override, then the TRACKED, source-invoked
-# engine resolver (agent-utils/common/bin/dagrun -> engine-resolver),
-# then the tracked, source-invoked Python entrypoint. NEVER auto-select the
-# untracked prebuilt Rust binary (rs/bin): a compiled artifact can silently drift
-# from its source, which is exactly how a runner missing an enforcement guard (the
-# historical cpu_timeout gap) can run while we believe we are boxed.
-#
-# The staleness axis is SOURCE-INVOKED vs PREBUILT-BINARY, not Rust vs Python.
-# This entrypoint selects the tracked Rust engine by default because Hermit's
-# constructed DAG declares structured test results and the Python scheduler
-# deliberately refuses that execution contract. An explicit DAGRUN_ENGINE or
-# DAGRUN_BIN remains diagnostic override surface; either engine still logs its
-# exact selection and never silently falls back.
-find_runner() {
-    if [[ -n ${DAGRUN_BIN:-} ]]; then
-        printf '%s\n' "$DAGRUN_BIN"
-        return 0
-    fi
-    local base="$ROOT_DIR/agent-utils"
-    # Tracked, source-invoked resolver: deterministic engine selection that logs
-    # which engine won. Preferred over any prebuilt binary.
-    if [[ -x "$base/common/bin/dagrun" ]]; then
-        printf '%s\n' "$base/common/bin/dagrun"
-        return 0
-    fi
-    # Fallback: the tracked, source-invoked Python entrypoint directly.
-    if [[ -x "$base/py/bin/dagrun" ]]; then
-        printf '%s\n' "$base/py/bin/dagrun"
-        return 0
-    fi
-    # Last resort: a resolver/runner already on PATH.
-    if command -v dagrun >/dev/null 2>&1; then
-        command -v dagrun
-        return 0
-    fi
-    return 1
 }
-
-runner=$(find_runner) || {
-    echo "run-dag.sh: dagrun not found." >&2
-    echo "            Build it with: (cd agent-utils && ./setup) or set DAGRUN_BIN." >&2
+mkdir -p "$ROOT_DIR/target/validation" || exit 2
+generated_dir=$(mktemp -d "$ROOT_DIR/target/validation/run-dag.XXXXXX") || exit 2
+trap cleanup_generated_dir EXIT
+dag="$generated_dir/$lane.json"
+level="${lane}-only"
+if [[ $lane == privileged ]]; then
+    level=--privileged-only
+fi
+if ! ./scripts/validate.rs "$level" --write-constructed-dag "$dag" >/dev/null; then
+    echo "run-dag.sh: validate could not construct the $lane DAG" >&2
+    exit 2
+fi
+exec {dag_fd}<"$dag" || {
+    echo "run-dag.sh: could not open constructed $lane DAG: $dag" >&2
     exit 2
 }
-
-if [[ -z ${DAGRUN_BIN:-} && -z ${DAGRUN_ENGINE:-} ]]; then
-    export DAGRUN_ENGINE=rust
+if ! cleanup_generated_dir; then
+    echo "run-dag.sh: could not remove generated DAG directory: $generated_dir" >&2
+    exit 2
 fi
+if ! exec <&"$dag_fd"; then
+    echo "run-dag.sh: could not attach constructed $lane DAG to stdin" >&2
+    exit 2
+fi
+if ! exec {dag_fd}<&-; then
+    echo "run-dag.sh: could not close constructed $lane DAG descriptor" >&2
+    exit 2
+fi
+trap - EXIT
 
 # A leading non-`run` verb (list/ascii/dot/json) is passed straight through; the
 # common case is `run` with scheduling flags.
@@ -157,8 +150,4 @@ if [[ $verb == run ]]; then
     export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1
     export PATH="$ROOT_DIR/ci/rust-script-bin:$PATH"
 fi
-if [[ -n $generated_dir ]]; then
-    "$runner" "$verb" --dag "$dag" "$@"
-    exit $?
-fi
-exec "$runner" "$verb" --dag "$dag" "$@"
+exec "$runner" "$verb" --dag - "$@"

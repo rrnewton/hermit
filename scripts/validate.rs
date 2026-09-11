@@ -9573,48 +9573,39 @@ fn portable_strict_compat_outer_dag_bracket(root: &Path) -> Result<String, Strin
 
 /// Exercise the public raw-lane entrypoint used by `.github/workflows/ci-dag.yml`.
 ///
-/// The first arm invokes its default `run` verb with a capture runner, proving
-/// the workflow path receives the constructed DAG rather than portable.json's
-/// exit-125 marker. The second uses the real pinned runner's `json` verb, proving
-/// that same generated document is accepted by dagrun. Neither arm runs a test
-/// workload or creates a second scheduler.
+/// The entrypoint must construct both lane DAGs through this validator before
+/// handing them to the tracked Rust dagrun runner. Runtime runner and raw-DAG
+/// overrides are refused before construction so CI cannot silently select an
+/// unreviewed scheduler or graph.
 fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
-    let fixture = tempfile::Builder::new()
-        .prefix("validate-run-dag-flat-")
-        .tempdir()
-        .map_err(|error| format!("raw run-dag: cannot create fixture: {error}"))?;
-    let captured = fixture.path().join("captured.json");
-    let runner = fixture.path().join("capture-runner");
-    std::fs::write(
-        &runner,
-        "#!/bin/sh\nset -eu\ntest \"$1\" = run\ntest \"$2\" = --dag\ntest \"$#\" -eq 3\ncp -- \"$3\" \"$RUN_DAG_CAPTURE\"\n",
-    )
-    .map_err(|error| format!("raw run-dag: cannot write capture runner: {error}"))?;
-    std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755))
-        .map_err(|error| format!("raw run-dag: cannot chmod capture runner: {error}"))?;
-
-    let output = Command::new(root.join("ci/run-dag.sh"))
-        .arg("portable")
-        .current_dir(root)
-        .env("DAGRUN_BIN", &runner)
-        .env("RUN_DAG_CAPTURE", &captured)
-        .env_remove("RUN_DAG_FILE_OVERRIDE")
-        .output()
-        .map_err(|error| format!("raw run-dag: cannot launch default entrypoint: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "raw run-dag: default portable entrypoint failed with {}: {}{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    let inspect = |label: &str, bytes: &[u8]| -> Result<(), String> {
+    let inspect = |label: &str, bytes: &[u8], expect_portable_compat: bool| -> Result<usize, String> {
         let text = std::str::from_utf8(bytes)
             .map_err(|error| format!("raw run-dag: {label} output is not UTF-8: {error}"))?;
         let cfg = dag_from_json(text)
             .map_err(|error| format!("raw run-dag: {label} is not a valid DAG: {error}"))?;
+        let explicit_result_manifests = cfg
+            .steps
+            .iter()
+            .filter(|step| step.result_manifests.is_some())
+            .count();
+        let producers = cfg
+            .steps
+            .iter()
+            .filter(|step| {
+                step.result_manifests
+                    .as_ref()
+                    .is_some_and(|manifests| !manifests.is_empty())
+            })
+            .count();
+        if explicit_result_manifests != cfg.steps.len() || producers == 0 {
+            return Err(format!(
+                "raw run-dag: {label} did not receive explicit structured-result ownership for every step: explicit={explicit_result_manifests}/{} producers={producers}",
+                cfg.steps.len()
+            ));
+        }
+        if !expect_portable_compat {
+            return Ok(producers);
+        }
         let compat = cfg
             .steps
             .iter()
@@ -9663,94 +9654,92 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
                 ordinary_present,
             ));
         }
-        Ok(())
+        Ok(producers)
     };
 
-    let captured_bytes = std::fs::read(&captured)
-        .map_err(|error| format!("raw run-dag: capture runner received no DAG: {error}"))?;
-    inspect("default run input", &captured_bytes)?;
-
-    let output = Command::new(root.join("ci/run-dag.sh"))
+    let portable = Command::new(root.join("ci/run-dag.sh"))
         .args(["portable", "json"])
         .current_dir(root)
         .env_remove("DAGRUN_BIN")
+        .env_remove("DAGRUN_ENGINE")
         .env_remove("RUN_DAG_FILE_OVERRIDE")
         .output()
-        .map_err(|error| format!("raw run-dag: cannot launch real json entrypoint: {error}"))?;
-    if !output.status.success() {
+        .map_err(|error| format!("raw run-dag: cannot launch portable json entrypoint: {error}"))?;
+    if !portable.status.success() {
         return Err(format!(
             "raw run-dag: real runner rejected constructed portable DAG with {}: {}{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            portable.status,
+            String::from_utf8_lossy(&portable.stdout),
+            String::from_utf8_lossy(&portable.stderr)
         ));
     }
-    inspect("real runner json output", &output.stdout)?;
-    let real_stderr = String::from_utf8_lossy(&output.stderr);
-    if !real_stderr.contains("[dagrun] engine=rust") {
+    let portable_producers = inspect("portable json output", &portable.stdout, true)?;
+    let portable_stderr = String::from_utf8_lossy(&portable.stderr);
+    let expected_runner = format!("runner={}", root.join("agent-utils/rs/bin/dagrun").display());
+    if !portable_stderr.contains("[dagrun] rust") || !portable_stderr.contains(&expected_runner) {
         return Err(format!(
-            "raw run-dag: default entrypoint did not select the structured-capable Rust engine: {real_stderr}"
+            "raw run-dag: default entrypoint did not select the tracked Rust runner: {portable_stderr}"
         ));
     }
 
-    let python_marker = fixture.path().join("python-run-marker");
-    let mut structured_step = step_with_caps(
-        "fixture",
-        "structured",
-        "structured result engine fixture",
-        format!("touch {}", validate_plan::shell_quote(&python_marker.to_string_lossy())),
-        Vec::new(),
-        30,
-        30,
-        1024 * 1024,
-    );
-    structured_step.result_manifests = Some(vec![ResultManifest::StructuredTestResults(
-        StructuredTestResultsManifest::current("fixture.structured"),
-    )]);
-    let structured_dag = fixture.path().join("structured.json");
-    std::fs::write(
-        &structured_dag,
-        format!(
-            "{}\n",
-            dag_to_json(&validate_plan::config_from(
-                vec![structured_step],
-                "structured result engine fixture",
-            ))
-        ),
-    )
-    .map_err(|error| format!("raw run-dag: cannot write structured fixture: {error}"))?;
-    // This deliberately exercises a second runner from inside validate's own
-    // self-test DAG. Permit that nesting only for this inert marker fixture so
-    // the Python engine reaches its structured-result preflight refusal.
-    let python = Command::new(root.join("ci/run-dag.sh"))
-        .args([
-            "portable",
-            "--allow-cgroup-failure",
-            "--allow-unwise-nest-dagruns",
-            "-q",
-        ])
+    let privileged = Command::new(root.join("ci/run-dag.sh"))
+        .args(["privileged", "json"])
         .current_dir(root)
         .env_remove("DAGRUN_BIN")
-        .env("DAGRUN_ENGINE", "python")
-        .env("RUN_DAG_FILE_OVERRIDE", &structured_dag)
+        .env_remove("DAGRUN_ENGINE")
+        .env_remove("RUN_DAG_FILE_OVERRIDE")
         .output()
-        .map_err(|error| format!("raw run-dag: cannot launch Python refusal fixture: {error}"))?;
-    let python_stderr = String::from_utf8_lossy(&python.stderr);
-    if python.status.success()
-        || !python_stderr.contains("[dagrun] engine=python")
-        || !python_stderr.contains("REFUSING to run before any node starts")
-        || !python_stderr.contains("Python runner does not implement structured test-result capture")
-        || python_marker.exists()
-    {
+        .map_err(|error| format!("raw run-dag: cannot launch privileged json entrypoint: {error}"))?;
+    if !privileged.status.success() {
         return Err(format!(
-            "raw run-dag: explicit Python engine did not refuse structured results before execution: status={} marker={} stderr={python_stderr}",
-            python.status,
-            python_marker.exists(),
+            "raw run-dag: real runner rejected constructed privileged DAG with {}: {}{}",
+            privileged.status,
+            String::from_utf8_lossy(&privileged.stdout),
+            String::from_utf8_lossy(&privileged.stderr)
         ));
+    }
+    let privileged_producers = inspect("privileged json output", &privileged.stdout, false)?;
+
+    for (name, value) in [
+        ("DAGRUN_BIN", "agent-utils/py/bin/dagrun"),
+        ("DAGRUN_ENGINE", "py"),
+        ("RUN_DAG_FILE_OVERRIDE", "ci/dag/portable.json"),
+    ] {
+        let refused = Command::new(root.join("ci/run-dag.sh"))
+            .args(["portable", "json"])
+            .current_dir(root)
+            .env(name, value)
+            .output()
+            .map_err(|error| format!("raw run-dag: cannot launch {name} refusal: {error}"))?;
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        if refused.status.success() || !stderr.contains(name) || stderr.contains("PLAN ONLY") {
+            return Err(format!(
+                "raw run-dag: {name} was not refused before construction: status={} stderr={stderr}",
+                refused.status
+            ));
+        }
+    }
+
+    for arg in ["--dag", "--dag=ci/dag/portable.json"] {
+        let refused = Command::new(root.join("ci/run-dag.sh"))
+            .args(["portable", "json", arg])
+            .current_dir(root)
+            .env_remove("DAGRUN_BIN")
+            .env_remove("DAGRUN_ENGINE")
+            .env_remove("RUN_DAG_FILE_OVERRIDE")
+            .output()
+            .map_err(|error| format!("raw run-dag: cannot launch {arg} refusal: {error}"))?;
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        if refused.status.success() || !stderr.contains("--dag") || stderr.contains("PLAN ONLY") {
+            return Err(format!(
+                "raw run-dag: {arg} was not refused before construction: status={} stderr={stderr}",
+                refused.status
+            ));
+        }
     }
 
     Ok(format!(
-        "raw run-dag: default Rust workflow and real json parser received {}/{} direct strict-compat nodes; explicit Python refused structured results before execution; marker exit 125 absent",
+        "raw run-dag: tracked Rust runner received constructed portable/privileged DAGs; portable strict-compat nodes {}/{}; structured producers portable={portable_producers} privileged={privileged_producers}; runtime runner and raw-DAG overrides refused before construction",
         validate_corpus::STRICT_COMPAT_TOTAL - validate_corpus::portable_super_only().len(),
         validate_corpus::STRICT_COMPAT_TOTAL - validate_corpus::portable_super_only().len() + 1,
     ))

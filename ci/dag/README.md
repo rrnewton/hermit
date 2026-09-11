@@ -54,10 +54,10 @@ runs either DAG on demand.
 ### Runner dependency
 
 This change pins `rrnewton/agent-utils` at v0.2.0 as an HTTPS submodule. Portable
-CI initializes only `agent-utils` instead of all submodules, then executes the
-dependency-free Python runner so per-node performance CSVs are available
-without an install step. `ci/run-dag.sh` also accepts
-`DAGRUN_BIN` for local or preinstalled binaries.
+CI initializes only `agent-utils` instead of all submodules. `ci/run-dag.sh`
+constructs the selected DAG with `scripts/validate.rs --write-constructed-dag`
+and then runs the tracked Rust runner at `agent-utils/rs/bin/dagrun`; runtime
+runner and raw-DAG overrides are refused.
 
 ## Speed-to-signal audit
 

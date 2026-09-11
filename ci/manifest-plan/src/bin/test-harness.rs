@@ -1149,6 +1149,7 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
 }
 
 fn audit_budget_ordering(root: &Path) -> Result<(), String> {
+    audit_workflow_run_dag_runners(root)?;
     let portable = read_dag(&root.join("ci/dag/portable.json"))?;
     let privileged = read_dag(&root.join("ci/dag/privileged.json"))?;
     for (lane, dag) in [("portable", &portable), ("privileged", &privileged)] {
@@ -1235,18 +1236,11 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
             "privileged workflow must contain exactly one diagnostic continue-on-error".into(),
         );
     }
-    let launcher_bound = privileged_workflow
+    let launcher_line = privileged_workflow
         .lines()
         .find(|line| line.contains("ci/run-dag.sh privileged"))
-        .and_then(|line| {
-            let words = line.split_whitespace().collect::<Vec<_>>();
-            words
-                .iter()
-                .position(|word| *word == "env")
-                .and_then(|index| index.checked_sub(1))
-                .and_then(|index| words[index].strip_suffix('s'))
-                .and_then(|value| value.parse::<u64>().ok())
-        })
+        .ok_or_else(|| "cannot find privileged launcher command".to_string())?;
+    let launcher_bound = command_timeout_seconds(launcher_line)?
         .ok_or_else(|| "cannot derive privileged launcher timeout".to_string())?;
     let privileged_yaml = parse_yaml(&root.join(".github/workflows/ci-privileged.yml"))?;
     let privileged_job_bound = workflow_job_timeout(&privileged_yaml, "privileged")? * 60;
@@ -1303,6 +1297,158 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
             .sum::<usize>(),
         privileged.steps.len()
     );
+    Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct RunDagWorkflowBinding {
+    id: String,
+    run: String,
+    input_max_mem: Option<String>,
+}
+
+fn audit_workflow_run_dag_runners(root: &Path) -> Result<(), String> {
+    let expected = [
+        RunDagWorkflowBinding {
+            id: ".github/workflows/ci-dag.yml job dag-portable step 8".into(),
+            run: "args=()\nif [[ -n $INPUT_MAX_MEM ]]; then\n  args=(--max-mem \"$INPUT_MAX_MEM\")\nfi\nci/run-dag.sh portable \"${args[@]}\" -v\n".into(),
+            input_max_mem: Some("${{ inputs.max_mem }}".into()),
+        },
+        RunDagWorkflowBinding {
+            id: ".github/workflows/ci-dag.yml job dag-privileged step 3".into(),
+            run: "ci/run-dag.sh privileged -j 2 -v".into(),
+            input_max_mem: None,
+        },
+        RunDagWorkflowBinding {
+            id: ".github/workflows/ci-privileged.yml job privileged step 6".into(),
+            run: "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\ntimeout --foreground --kill-after=10s 1560s ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v\n".into(),
+            input_max_mem: None,
+        },
+        RunDagWorkflowBinding {
+            id: ".github/workflows/validation-levels.yml job full step 4".into(),
+            run: "ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v".into(),
+            input_max_mem: None,
+        },
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+
+    let workflows = root.join(".github/workflows");
+    let mut actual = BTreeSet::new();
+    for entry in fs::read_dir(&workflows).map_err(|error| {
+        format!(
+            "cannot discover workflows in {}: {error}",
+            workflows.display()
+        )
+    })? {
+        let path = entry
+            .map_err(|error| format!("cannot read workflow directory entry: {error}"))?
+            .path();
+        if !matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| format!("cannot relativize workflow {}: {error}", path.display()))?
+            .to_path_buf();
+        let label = relative.to_string_lossy();
+        let workflow = parse_yaml(&path)?;
+        actual.extend(collect_run_dag_workflow_bindings(&label, &workflow)?);
+    }
+    if actual != expected {
+        let unexpected = actual.difference(&expected).collect::<Vec<_>>();
+        let missing = expected.difference(&actual).collect::<Vec<_>>();
+        return Err(format!(
+            "run-dag workflow bindings drifted: unexpected={unexpected:#?} missing={missing:#?}"
+        ));
+    }
+    Ok(())
+}
+
+fn collect_run_dag_workflow_bindings(
+    label: &str,
+    workflow: &YamlValue,
+) -> Result<Vec<RunDagWorkflowBinding>, String> {
+    let jobs = workflow["jobs"]
+        .as_mapping()
+        .ok_or_else(|| format!("workflow {label} has no jobs mapping"))?;
+    reject_forbidden_run_dag_env(workflow, &format!("workflow {label}"))?;
+    let mut bindings = Vec::new();
+    for (job_name, job) in jobs {
+        let job_name = job_name
+            .as_str()
+            .ok_or_else(|| format!("workflow {label} has a non-string job name"))?;
+        let job_location = format!("workflow {label} job {job_name}");
+        reject_forbidden_run_dag_env(job, &job_location)?;
+        let Some(steps_value) = job.get("steps") else {
+            continue;
+        };
+        let steps = steps_value
+            .as_sequence()
+            .ok_or_else(|| format!("workflow {label} job {job_name} steps must be a sequence"))?;
+        for (step_index, step) in steps.iter().enumerate() {
+            let Some(run_value) = step.get("run") else {
+                continue;
+            };
+            let run = run_value.as_str().ok_or_else(|| {
+                format!("workflow {label} job {job_name} step {step_index} run must be a string")
+            })?;
+            if run.lines().any(|line| {
+                let line = line.trim_start();
+                !line.starts_with('#') && line.contains("ci/run-dag.sh")
+            }) {
+                let location = format!("{job_location} step {step_index}");
+                reject_forbidden_run_dag_env(step, &location)?;
+                bindings.push(RunDagWorkflowBinding {
+                    id: format!("{label} job {job_name} step {step_index}"),
+                    run: run.to_string(),
+                    input_max_mem: workflow_env_value(step, "INPUT_MAX_MEM", &location)?,
+                });
+            } else if run.contains("DAGRUN_BIN")
+                || run.contains("DAGRUN_ENGINE")
+                || run.contains("RUN_DAG_FILE_OVERRIDE")
+            {
+                return Err(format!(
+                    "{job_location} step {step_index} sets a run-dag environment variable without invoking ci/run-dag.sh"
+                ));
+            }
+        }
+    }
+    Ok(bindings)
+}
+
+fn workflow_env_value(
+    scope: &YamlValue,
+    key: &str,
+    location: &str,
+) -> Result<Option<String>, String> {
+    let Some(environment) = scope.get("env") else {
+        return Ok(None);
+    };
+    let environment = environment
+        .as_mapping()
+        .ok_or_else(|| format!("{location} env must be a mapping"))?;
+    let key = YamlValue::String(key.to_string());
+    let Some(value) = environment.get(&key) else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(|value| Some(value.to_string()))
+        .ok_or_else(|| format!("{location} {} must be a string", key.as_str().unwrap()))
+}
+
+fn reject_forbidden_run_dag_env(scope: &YamlValue, location: &str) -> Result<(), String> {
+    for key in ["DAGRUN_BIN", "DAGRUN_ENGINE", "RUN_DAG_FILE_OVERRIDE"] {
+        if workflow_env_value(scope, key, location)?.is_some() {
+            return Err(format!(
+                "{location} sets {key}; ci/run-dag.sh chooses the constructed DAG and tracked Rust runner"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1400,6 +1546,20 @@ fn workflow_job_timeout(workflow: &YamlValue, job: &str) -> Result<u64, String> 
     workflow["jobs"][job]["timeout-minutes"]
         .as_u64()
         .ok_or_else(|| format!("workflow job {job} has no numeric timeout-minutes"))
+}
+
+fn command_timeout_seconds(command: &str) -> Result<Option<u64>, String> {
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    let Some(index) = words.iter().position(|word| *word == "timeout") else {
+        return Ok(None);
+    };
+    let budget = words[index + 1..]
+        .iter()
+        .find(|word| !word.starts_with('-'))
+        .and_then(|word| word.trim_end_matches('\\').strip_suffix('s'))
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| format!("cannot derive timeout budget from `{command}`"))?;
+    Ok(Some(budget))
 }
 
 fn workflow_step_timeout_sum(workflow: &YamlValue, job: &str) -> Result<u64, String> {
@@ -1954,10 +2114,20 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::env;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::process::Output;
+    use std::process::Stdio;
+    use std::process::{self};
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+    use std::thread;
     use std::time::Duration;
 
     use hermit_manifest_plan::runner::ManifestSet;
@@ -1969,8 +2139,11 @@ mod tests {
     use super::HostCapabilityVerdict;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
+    use super::audit_workflow_run_dag_runners;
     use super::build_worker_capacity;
+    use super::collect_run_dag_workflow_bindings;
     use super::command_jobs;
+    use super::command_timeout_seconds;
     use super::expected_plan_document;
     use super::for_each_parallel;
     use super::host_inapplicable_reason;
@@ -1979,6 +2152,294 @@ mod tests {
     use super::scheduled_worker_capacity;
     use super::structured_test_results_from_rows;
     use super::unique_plan_rows;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            for _ in 0..100 {
+                let path = env::temp_dir().join(format!(
+                    "hermit-test-harness-{label}-{}-{}",
+                    process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("cannot create {}: {error}", path.display()),
+                }
+            }
+            panic!("cannot allocate a unique temporary directory for {label}");
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(mode);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    struct RunDagFixture {
+        root: TestDirectory,
+        construct_marker: PathBuf,
+        runner_marker: PathBuf,
+        args_marker: PathBuf,
+        dag_bytes_marker: PathBuf,
+    }
+
+    impl RunDagFixture {
+        fn new(label: &str, runner: RunnerFixture) -> Self {
+            let root = TestDirectory::new(label);
+            fs::create_dir_all(root.path().join("ci")).unwrap();
+            fs::create_dir_all(root.path().join("scripts")).unwrap();
+            fs::create_dir_all(root.path().join("agent-utils/rs/bin")).unwrap();
+            fs::create_dir_all(root.path().join("target/validation")).unwrap();
+            fs::copy(
+                super::root().join("ci/run-dag.sh"),
+                root.path().join("ci/run-dag.sh"),
+            )
+            .unwrap();
+            fs::write(
+                root.path().join("ci/configure-build-jobs.sh"),
+                "CARGO_BUILD_JOBS=16\nexport CARGO_BUILD_JOBS\n",
+            )
+            .unwrap();
+            let validate = root.path().join("scripts/validate.rs");
+            fs::write(
+                &validate,
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+printf constructed > "$RUN_DAG_CONSTRUCT_MARKER"
+output=
+while (($#)); do
+  if [[ $1 == --write-constructed-dag ]]; then
+    shift
+    output=$1
+  fi
+  shift || true
+done
+if [[ -z ${output:-} ]]; then
+  echo "fake validate: missing --write-constructed-dag" >&2
+  exit 44
+fi
+printf '{"schema":1,"steps":[{"id":"fixture","result_manifests":[]}]}' > "$output"
+"#,
+            )
+            .unwrap();
+            chmod(&validate, 0o755);
+
+            let runner_path = root.path().join("agent-utils/rs/bin/dagrun");
+            match runner {
+                RunnerFixture::Missing => {}
+                RunnerFixture::NonExecutable => {
+                    fs::write(&runner_path, "#!/usr/bin/env bash\nexit 99\n").unwrap();
+                    chmod(&runner_path, 0o644);
+                }
+                RunnerFixture::Executable => {
+                    fs::write(
+                        &runner_path,
+                        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf runner > "$RUN_DAG_RUNNER_MARKER"
+printf '%s\n' "$@" > "$RUN_DAG_ARGS_MARKER"
+dag=
+while (($#)); do
+  if [[ "$1" == --dag ]]; then
+    shift
+    dag=$1
+  fi
+  shift || true
+done
+if [[ "$dag" != - ]]; then
+  echo "fake runner: expected stdin DAG marker '-', got $dag" >&2
+  exit 41
+fi
+if compgen -G "$PWD/target/validation/run-dag.*" >/dev/null; then
+  echo "fake runner: generated DAG directory still exists" >&2
+  exit 42
+fi
+cat > "$RUN_DAG_DAG_BYTES_MARKER"
+"#,
+                    )
+                    .unwrap();
+                    chmod(&runner_path, 0o755);
+                }
+                RunnerFixture::Exit(code) => {
+                    fs::write(
+                        &runner_path,
+                        format!(
+                            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf runner > "$RUN_DAG_RUNNER_MARKER"
+printf '%s\n' "$@" > "$RUN_DAG_ARGS_MARKER"
+dag=
+while (($#)); do
+  if [[ "$1" == --dag ]]; then
+    shift
+    dag=$1
+  fi
+  shift || true
+done
+if [[ "$dag" != - ]]; then
+  echo "fake runner: expected stdin DAG marker '-', got $dag" >&2
+  exit 41
+fi
+if compgen -G "$PWD/target/validation/run-dag.*" >/dev/null; then
+  echo "fake runner: generated DAG directory still exists" >&2
+  exit 42
+fi
+cat > "$RUN_DAG_DAG_BYTES_MARKER"
+exit {code}
+"#
+                        ),
+                    )
+                    .unwrap();
+                    chmod(&runner_path, 0o755);
+                }
+                RunnerFixture::Terminate => {
+                    fs::write(
+                        &runner_path,
+                        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf runner > "$RUN_DAG_RUNNER_MARKER"
+printf '%s\n' "$@" > "$RUN_DAG_ARGS_MARKER"
+dag=
+while (($#)); do
+  if [[ "$1" == --dag ]]; then
+    shift
+    dag=$1
+  fi
+  shift || true
+done
+if [[ "$dag" != - ]]; then
+  echo "fake runner: expected stdin DAG marker '-', got $dag" >&2
+  exit 41
+fi
+if compgen -G "$PWD/target/validation/run-dag.*" >/dev/null; then
+  echo "fake runner: generated DAG directory still exists" >&2
+  exit 42
+fi
+cat > "$RUN_DAG_DAG_BYTES_MARKER"
+kill -TERM $$
+"#,
+                    )
+                    .unwrap();
+                    chmod(&runner_path, 0o755);
+                }
+                RunnerFixture::Sleep => {
+                    fs::write(
+                        &runner_path,
+                        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf runner > "$RUN_DAG_RUNNER_MARKER"
+printf '%s\n' "$@" > "$RUN_DAG_ARGS_MARKER"
+dag=
+while (($#)); do
+  if [[ "$1" == --dag ]]; then
+    shift
+    dag=$1
+  fi
+  shift || true
+done
+if [[ "$dag" != - ]]; then
+  echo "fake runner: expected stdin DAG marker '-', got $dag" >&2
+  exit 41
+fi
+if compgen -G "$PWD/target/validation/run-dag.*" >/dev/null; then
+  echo "fake runner: generated DAG directory still exists" >&2
+  exit 42
+fi
+cat > "$RUN_DAG_DAG_BYTES_MARKER"
+sleep 30
+"#,
+                    )
+                    .unwrap();
+                    chmod(&runner_path, 0o755);
+                }
+            }
+
+            Self {
+                construct_marker: root.path().join("constructed.marker"),
+                runner_marker: root.path().join("runner.marker"),
+                args_marker: root.path().join("runner.args"),
+                dag_bytes_marker: root.path().join("runner.dag.json"),
+                root,
+            }
+        }
+
+        fn command(&self, args: &[&str], envs: &[(&str, &str)]) -> Command {
+            let mut command = Command::new("bash");
+            command
+                .arg(self.root.path().join("ci/run-dag.sh"))
+                .args(args)
+                .current_dir(self.root.path())
+                .env_remove("DAGRUN_BIN")
+                .env_remove("DAGRUN_ENGINE")
+                .env_remove("RUN_DAG_FILE_OVERRIDE")
+                .env("RUN_DAG_CONSTRUCT_MARKER", &self.construct_marker)
+                .env("RUN_DAG_RUNNER_MARKER", &self.runner_marker)
+                .env("RUN_DAG_ARGS_MARKER", &self.args_marker)
+                .env("RUN_DAG_DAG_BYTES_MARKER", &self.dag_bytes_marker);
+            for (key, value) in envs {
+                command.env(key, value);
+            }
+            command
+        }
+
+        fn run(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
+            self.command(args, envs).output().unwrap()
+        }
+
+        fn assert_no_construction_or_runner(&self) {
+            assert!(
+                !self.construct_marker.exists(),
+                "validate construction marker must not be written"
+            );
+            assert!(
+                !self.runner_marker.exists(),
+                "runner marker must not be written"
+            );
+        }
+
+        fn assert_no_generated_dag_dirs(&self) {
+            let leftovers = fs::read_dir(self.root.path().join("target/validation"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("run-dag."))
+                .collect::<Vec<_>>();
+            assert!(
+                leftovers.is_empty(),
+                "generated DAG directories were not cleaned up: {leftovers:?}"
+            );
+        }
+
+        fn assert_runner_read_valid_dag(&self) {
+            let dag: serde_json::Value =
+                serde_json::from_slice(&fs::read(&self.dag_bytes_marker).unwrap()).unwrap();
+            let steps = dag["steps"].as_array().expect("fixture DAG has steps");
+            assert_eq!(steps[0]["id"].as_str(), Some("fixture"));
+        }
+    }
+
+    enum RunnerFixture {
+        Missing,
+        NonExecutable,
+        Executable,
+        Exit(u8),
+        Terminate,
+        Sleep,
+    }
 
     #[test]
     fn generated_expected_plan_is_versioned_and_matches_the_tracked_file() {
@@ -2142,6 +2603,244 @@ mod tests {
     fn privileged_unboxed_execution_rejects_broad_boxing_failure_acceptance() {
         let executable = format!("{GUARDED_WORKFLOW}        run: tool --allow-cgroup-failure\n");
         assert!(audit_privileged_unboxed_guard(&executable).is_err());
+    }
+
+    #[test]
+    fn run_dag_workflow_bindings_reject_runner_overrides() {
+        for (scope, yaml) in [
+            (
+                "workflow",
+                "env:\n  DAGRUN_ENGINE: py\njobs:\n  validation:\n    steps:\n      - run: ci/run-dag.sh portable -v\n",
+            ),
+            (
+                "job",
+                "jobs:\n  validation:\n    env:\n      DAGRUN_BIN: agent-utils/rs/bin/dagrun\n    steps:\n      - run: ci/run-dag.sh portable -v\n",
+            ),
+            (
+                "step",
+                "jobs:\n  validation:\n    steps:\n      - env:\n          RUN_DAG_FILE_OVERRIDE: ci/dag/raw.json\n        run: ci/run-dag.sh privileged -v\n",
+            ),
+        ] {
+            let workflow: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            let error = collect_run_dag_workflow_bindings("fixture.yml", &workflow)
+                .expect_err("workflow bindings must not select a runner or raw DAG");
+            assert!(error.contains(scope), "{error}");
+        }
+    }
+
+    #[test]
+    fn run_dag_workflow_discovery_requires_the_current_four_bindings() {
+        let root = TestDirectory::new("workflow-discovery");
+        let workflows = root.path().join(".github/workflows");
+        fs::create_dir_all(&workflows).unwrap();
+        fs::write(
+            workflows.join("ci-dag.yml"),
+            "jobs:\n  dag-portable:\n    steps:\n      - run: echo one\n      - run: echo two\n      - run: echo three\n      - run: echo four\n      - run: echo five\n      - run: echo six\n      - run: echo seven\n      - run: echo eight\n      - env:\n          INPUT_MAX_MEM: ${{ inputs.max_mem }}\n        run: |\n          args=()\n          if [[ -n $INPUT_MAX_MEM ]]; then\n            args=(--max-mem \"$INPUT_MAX_MEM\")\n          fi\n          ci/run-dag.sh portable \"${args[@]}\" -v\n  dag-privileged:\n    steps:\n      - run: echo one\n      - run: echo two\n      - run: echo three\n      - run: ci/run-dag.sh privileged -j 2 -v\n",
+        )
+        .unwrap();
+        fs::write(
+            workflows.join("ci-privileged.yml"),
+            "jobs:\n  privileged:\n    steps:\n      - run: echo one\n      - run: echo two\n      - run: echo three\n      - run: echo four\n      - run: echo five\n      - run: echo six\n      - run: |\n          if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n            echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n            exit 2\n          fi\n          timeout --foreground --kill-after=10s 1560s ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v\n",
+        )
+        .unwrap();
+        fs::write(
+            workflows.join("validation-levels.yml"),
+            "jobs:\n  full:\n    steps:\n      - run: echo one\n      - run: echo two\n      - run: echo three\n      - run: echo four\n      - run: ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v\n",
+        )
+        .unwrap();
+        audit_workflow_run_dag_runners(root.path()).unwrap();
+
+        fs::write(
+            workflows.join("new-caller.yaml"),
+            "jobs:\n  validation:\n    steps:\n      - run: ci/run-dag.sh portable -v\n",
+        )
+        .unwrap();
+        let error = audit_workflow_run_dag_runners(root.path())
+            .expect_err("a newly added workflow caller must be discovered as unexpected");
+        assert!(error.contains("new-caller.yaml"), "{error}");
+    }
+
+    #[test]
+    fn run_dag_rejects_runtime_overrides_before_construction() {
+        for (key, value) in [
+            ("DAGRUN_BIN", "agent-utils/py/bin/dagrun"),
+            ("DAGRUN_BIN", "agent-utils/rs/bin/dagrun"),
+            ("DAGRUN_ENGINE", "py"),
+            ("DAGRUN_ENGINE", "rust"),
+            ("RUN_DAG_FILE_OVERRIDE", "ci/dag/raw.json"),
+        ] {
+            let fixture = RunDagFixture::new(key, RunnerFixture::Executable);
+            let output = fixture.run(&["portable", "list"], &[(key, value)]);
+            assert_eq!(output.status.code(), Some(2));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(key), "{stderr}");
+            fixture.assert_no_construction_or_runner();
+        }
+    }
+
+    #[test]
+    fn run_dag_rejects_forwarded_dag_args_before_construction() {
+        for arg in ["--dag", "--dag=ci/dag/raw.json"] {
+            let fixture = RunDagFixture::new("forbidden-dag-arg", RunnerFixture::Executable);
+            let output = fixture.run(&["privileged", "list", arg], &[]);
+            assert_eq!(output.status.code(), Some(2));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("--dag"), "{stderr}");
+            fixture.assert_no_construction_or_runner();
+        }
+    }
+
+    #[test]
+    fn run_dag_refuses_missing_or_unexecutable_runner_before_construction() {
+        let missing = RunDagFixture::new("missing-runner", RunnerFixture::Missing);
+        let output = missing.run(&["portable", "list"], &[]);
+        assert_eq!(output.status.code(), Some(127));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("agent-utils/rs/bin/dagrun"), "{stderr}");
+        missing.assert_no_construction_or_runner();
+
+        let non_executable =
+            RunDagFixture::new("non-executable-runner", RunnerFixture::NonExecutable);
+        let output = non_executable.run(&["portable", "list"], &[]);
+        assert_eq!(output.status.code(), Some(126));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("not an executable file"), "{stderr}");
+        non_executable.assert_no_construction_or_runner();
+    }
+
+    #[test]
+    fn run_dag_constructs_the_lane_before_running_the_tracked_rust_runner() {
+        let fixture = RunDagFixture::new("positive", RunnerFixture::Executable);
+        let output = fixture.run(&["privileged", "list", "-v"], &[]);
+        assert!(output.status.success());
+        assert_eq!(
+            fs::read_to_string(&fixture.construct_marker).unwrap(),
+            "constructed"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.runner_marker).unwrap(),
+            "runner"
+        );
+        let args = fs::read_to_string(&fixture.args_marker).unwrap();
+        assert!(args.starts_with("list\n--dag\n-\n"), "{args}");
+        assert!(args.contains("\n-v\n"), "{args}");
+    }
+
+    #[test]
+    fn run_dag_cleans_generated_dags_for_both_lanes_after_success() {
+        let fixture = RunDagFixture::new("cleanup-success", RunnerFixture::Executable);
+        for lane in ["portable", "privileged"] {
+            let output = fixture.run(&[lane, "list"], &[]);
+            assert!(output.status.success());
+            fixture.assert_runner_read_valid_dag();
+            fixture.assert_no_generated_dag_dirs();
+            let _ = fs::remove_file(&fixture.dag_bytes_marker);
+        }
+    }
+
+    #[test]
+    fn run_dag_preserves_runner_status_after_cleanup() {
+        for lane in ["portable", "privileged"] {
+            let failed = RunDagFixture::new("cleanup-exit", RunnerFixture::Exit(23));
+            let output = failed.run(&[lane, "list"], &[]);
+            assert_eq!(output.status.code(), Some(23));
+            failed.assert_runner_read_valid_dag();
+            failed.assert_no_generated_dag_dirs();
+        }
+
+        let numeric_143 = RunDagFixture::new("cleanup-exit-143", RunnerFixture::Exit(143));
+        let output = numeric_143.run(&["portable", "list"], &[]);
+        assert_eq!(output.status.code(), Some(143));
+        assert_eq!(output.status.signal(), None);
+        numeric_143.assert_runner_read_valid_dag();
+        numeric_143.assert_no_generated_dag_dirs();
+
+        let signaled = RunDagFixture::new("cleanup-signal", RunnerFixture::Terminate);
+        let output = signaled.run(&["privileged", "list"], &[]);
+        assert_eq!(output.status.signal(), Some(15));
+        signaled.assert_runner_read_valid_dag();
+        signaled.assert_no_generated_dag_dirs();
+    }
+
+    #[test]
+    fn external_term_after_exec_reaches_runner_and_leaves_no_generated_dag_dir() {
+        let fixture = RunDagFixture::new("cleanup-external-term", RunnerFixture::Sleep);
+        let mut child = fixture
+            .command(&["portable", "list"], &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if fixture.dag_bytes_marker.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        fixture.assert_runner_read_valid_dag();
+        fixture.assert_no_generated_dag_dirs();
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(child.id().to_string())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(15));
+        fixture.assert_no_generated_dag_dirs();
+    }
+
+    #[test]
+    fn constructed_ci_dags_have_explicit_structured_result_manifests() {
+        for (label, level) in [
+            ("portable", "portable-only"),
+            ("privileged", "--privileged-only"),
+        ] {
+            let output_dir = TestDirectory::new(label);
+            let dag = output_dir.path().join(format!("{label}.json"));
+            let status = Command::new(super::root().join("scripts/validate.rs"))
+                .arg(level)
+                .arg("--write-constructed-dag")
+                .arg(&dag)
+                .status()
+                .unwrap();
+            assert!(status.success(), "validate construction failed for {label}");
+            let graph: serde_json::Value =
+                serde_json::from_slice(&fs::read(&dag).unwrap()).unwrap();
+            let steps = graph["steps"]
+                .as_array()
+                .expect("DAG steps must be an array");
+            assert!(!steps.is_empty(), "{label} DAG must contain steps");
+            let mut structured_producers = 0;
+            for step in steps {
+                let manifests = step
+                    .get("result_manifests")
+                    .unwrap_or_else(|| panic!("{label} step lacks explicit result_manifests"));
+                let manifests = manifests
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{label} step result_manifests must be an array"));
+                if manifests.iter().any(|manifest| {
+                    manifest.get("kind").and_then(serde_json::Value::as_str)
+                        == Some("structured-test-results")
+                }) {
+                    structured_producers += 1;
+                }
+            }
+            assert!(
+                structured_producers > 0,
+                "{label} DAG must declare at least one structured-test-results producer"
+            );
+        }
+    }
+
+    #[test]
+    fn privileged_launcher_timeout_does_not_depend_on_an_env_prefix() {
+        for command in [
+            "timeout --foreground --kill-after=10s 1560s ci/run-dag.sh privileged -v",
+            "timeout --foreground --kill-after=10s 1560s env INPUT_MAX_MEM=32G ci/run-dag.sh privileged -v",
+        ] {
+            assert_eq!(command_timeout_seconds(command).unwrap(), Some(1560));
+        }
     }
 
     #[test]

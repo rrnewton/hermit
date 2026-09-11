@@ -63,7 +63,8 @@
 # argument list, so a nextest-level `-E` filter must not be appended there.
 #
 # Environment:
-#   DAGRUN_BIN   override the runner executable (mirrors run-dag.sh).
+#   DAGRUN_BIN   override the runner executable for this local-only edited-node
+#                path. `ci/run-dag.sh` deliberately does not accept this override.
 #   RUN_NODE_JOBS        optional outer-concurrency override across selected
 #                        nodes. When unset, constructed-plan runs leave `-j`
 #                        unset and use validate's host-adaptive default. The
@@ -299,7 +300,7 @@ if [[ -n $quoted ]]; then
     fi
 fi
 
-# Locate the runner. Mirror ci/run-dag.sh's find_runner EXACTLY: an explicit
+# Locate the runner for local edited-node iteration: an explicit
 # override, then the TRACKED, source-invoked engine resolver
 # (agent-utils/common/bin/dagrun), then the tracked, source-invoked
 # Python entrypoint (agent-utils/py/bin), then a resolver already on PATH. NEVER

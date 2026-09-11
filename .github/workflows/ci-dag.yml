@@ -61,7 +61,14 @@ jobs:
       - name: Rust components
         run: rustup component add clippy rustfmt
       - name: Run portable lane as a DAG
-        run: ci/run-dag.sh portable ${{ inputs.max_mem != '' && format('--max-mem {0}', inputs.max_mem) || '' }} -v
+        env:
+          INPUT_MAX_MEM: ${{ inputs.max_mem }}
+        run: |
+          args=()
+          if [[ -n $INPUT_MAX_MEM ]]; then
+            args=(--max-mem "$INPUT_MAX_MEM")
+          fi
+          ci/run-dag.sh portable "${args[@]}" -v
 
   dag-privileged:
     name: DAG lane (privileged)
