@@ -70,9 +70,12 @@ Commands:
   update [--allow-green-removal REASON] [--allow-cell-removal]
       Rewrite the two tracked files. Green regressions and cell deletion are
       refused unless the matching explicit flag is present.
-  update-observations --summary FILE
-      Merge one completed clean pressure-test summary into the red cells'
-      checked-in observations. This never changes which cells are green.
+  update-observations --summary FILE [--summary FILE ...] [--retained]
+      Merge completed clean pressure-test summaries into the cells' checked-in
+      observations. By default every summary must name HEAD. --retained admits
+      summaries from other readable Hermit commits after checking each commit's
+      recorded Detcore tree, without replacing newer last_tested evidence.
+      This never changes which cells are green.
   observe-results --results DIR
       Merge the canonical comparison results from ONE validate result directory
       into the cells' checked-in observations, under the `validate` provenance
@@ -2081,6 +2084,38 @@ struct CurrentPressureEvidence {
 const MISSING_RETAINED_VERIFY_LOGS: &str =
     "terminal verify result must retain exactly one nonempty run1 log and one nonempty run2 log";
 
+fn parse_update_observations_args<I>(mut args: I) -> Result<(Vec<PathBuf>, bool), String>
+where
+    I: Iterator<Item = String>,
+{
+    let mut summaries = Vec::new();
+    let mut retained = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--summary" => summaries.push(PathBuf::from(
+                args.next().ok_or("--summary requires a file")?,
+            )),
+            "--retained" if !retained => retained = true,
+            "--retained" => {
+                return Err("update-observations accepts --retained only once".into());
+            }
+            _ => {
+                return Err(format!(
+                    "unknown update-observations option `{arg}`\n\n{USAGE}"
+                ));
+            }
+        }
+    }
+    if summaries.is_empty() {
+        return Err("update-observations requires --summary FILE".into());
+    }
+    let distinct = summaries.iter().collect::<BTreeSet<_>>();
+    if distinct.len() != summaries.len() {
+        return Err("update-observations refuses a duplicate --summary FILE".into());
+    }
+    Ok((summaries, retained))
+}
+
 fn main() -> ExitCode {
     rust_script_prelude::init();
     match run() {
@@ -2151,25 +2186,8 @@ fn run() -> Result<(), String> {
             update_tracked(&root, allow_green_removal.as_deref(), allow_cell_removal)?;
         }
         "update-observations" => {
-            let mut summary = None;
-            while let Some(arg) = args.next() {
-                match arg.as_str() {
-                    "--summary" => {
-                        summary = Some(PathBuf::from(
-                            args.next().ok_or("--summary requires a file")?,
-                        ));
-                    }
-                    _ => {
-                        return Err(format!(
-                            "unknown update-observations option `{arg}`\n\n{USAGE}"
-                        ));
-                    }
-                }
-            }
-            update_observations(
-                &root,
-                &summary.ok_or("update-observations requires --summary FILE")?,
-            )?;
+            let (summaries, retained) = parse_update_observations_args(args)?;
+            update_observations(&root, &summaries, retained)?;
         }
         "project-observations" => {
             let mut series_root = None;
@@ -3707,6 +3725,8 @@ fn default_provenance() -> ObservationProvenance {
 struct FoldOutcome {
     /// Distinct cells that received an observation.
     cells: usize,
+    /// Their exact identities, for callers merging more than one summary.
+    cell_ids: BTreeSet<CellId>,
     /// Rows admitted, which exceeds `cells` when a campaign repeated a cell.
     rows: usize,
     /// (cell identity, joined reasons) for every row that marked itself
@@ -3963,6 +3983,10 @@ fn apply_pressure_summary(
     }
 
     let prepared_len = prepared.len();
+    let prepared_cell_ids = prepared
+        .iter()
+        .map(|(index, _, _, _, _, _, _)| tracked.cells[*index].id.clone())
+        .collect::<BTreeSet<_>>();
     let prepared_cells = prepared
         .iter()
         .map(|(index, _, _, _, _, _, _)| *index)
@@ -4056,6 +4080,7 @@ fn apply_pressure_summary(
     // count; the caller reports admitted rows, admitted cells, and skips separately.
     Ok(FoldOutcome {
         cells: prepared_cells,
+        cell_ids: prepared_cell_ids,
         rows: prepared_len,
         skipped,
     })
@@ -4774,7 +4799,26 @@ fn import_results(
     Ok(())
 }
 
-fn update_observations(root: &Path, summary_path: &Path) -> Result<(), String> {
+fn git_is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+    let status = Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(root)
+        .status()
+        .map_err(|e| format!("cannot compare Hermit revisions {ancestor} and {descendant}: {e}"))?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        code => Err(format!(
+            "git merge-base could not compare Hermit revisions {ancestor} and {descendant} (exit {code:?})"
+        )),
+    }
+}
+
+fn update_observations(
+    root: &Path,
+    summary_paths: &[PathBuf],
+    retained: bool,
+) -> Result<(), String> {
     let derived = check_tracked(root)?;
     let status = Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=no"])
@@ -4788,35 +4832,106 @@ fn update_observations(root: &Path, summary_path: &Path) -> Result<(), String> {
         return Err("update-observations requires a clean tracked working tree".into());
     }
 
-    let summary: PressureSummary = read_json(summary_path)?;
+    let summaries = summary_paths
+        .iter()
+        .map(|path| read_json(path).map(|summary| (path, summary)))
+        .collect::<Result<Vec<(&PathBuf, PressureSummary)>, String>>()?;
     let head = git_head(root)?;
-    let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
-    let depth = source_depths(root, &summary.hermit_sha)?;
-    if !depth.contains_key("reverie") {
-        println!(
-            "  note: no Reverie depth was resolved from the recorded Hermit revision, so \
-             Reverie depth is OMITTED rather than guessed. Hermit depth is recorded."
-        );
-    }
+    let head_detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
     let before = tracked.clone();
-    let outcome = apply_pressure_summary(&mut tracked, &summary, &head, &detcore_tree, &depth)?;
+    let mut changed_cells = BTreeSet::new();
+    let mut total_rows = 0usize;
+    let mut total_skipped = 0usize;
+
+    for (summary_path, summary) in summaries {
+        let (expected_head, expected_detcore_tree, main_ancestry) = if retained {
+            let recorded_detcore_tree =
+                git_rev_parse(root, &format!("{}:detcore", summary.hermit_sha)).map_err(
+                    |error| {
+                        format!(
+                            "{} names Hermit commit {} whose Detcore tree cannot be read: {error}",
+                            summary_path.display(),
+                            summary.hermit_sha
+                        )
+                    },
+                )?;
+            if recorded_detcore_tree != summary.detcore_tree {
+                return Err(format!(
+                    "{} names Detcore tree {}, but Hermit {} contains {}",
+                    summary_path.display(),
+                    summary.detcore_tree,
+                    summary.hermit_sha,
+                    recorded_detcore_tree
+                ));
+            }
+            (
+                summary.hermit_sha.as_str(),
+                summary.detcore_tree.as_str(),
+                Some(git_is_ancestor(root, &summary.hermit_sha, &head)?),
+            )
+        } else {
+            (head.as_str(), head_detcore_tree.as_str(), Some(true))
+        };
+        let depth = source_depths(root, &summary.hermit_sha)?;
+        if !depth.contains_key("reverie") {
+            println!(
+                "  note: no Reverie depth was resolved from the recorded Hermit revision, so \
+                 Reverie depth is OMITTED rather than guessed. Hermit depth is recorded."
+            );
+        }
+        let previous_last_tested = tracked
+            .cells
+            .iter()
+            .map(|cell| cell.last_tested.clone())
+            .collect::<Vec<_>>();
+        let outcome = apply_pressure_summary(
+            &mut tracked,
+            &summary,
+            expected_head,
+            expected_detcore_tree,
+            &depth,
+        )?;
+        if retained {
+            for (previous, current) in previous_last_tested.iter().zip(&mut tracked.cells) {
+                if !should_replace_last_tested_at(
+                    previous.as_ref(),
+                    &summary.hermit_sha,
+                    main_ancestry,
+                    &depth,
+                ) {
+                    current.last_tested = previous.clone();
+                }
+            }
+        }
+        changed_cells.extend(outcome.cell_ids.iter().cloned());
+        total_rows += outcome.rows;
+        total_skipped += outcome.skipped.len();
+        println!(
+            "compatibility scorecard: {} merged {} row(s) across {} cell(s) at {}; {} row(s) skipped",
+            summary_path.display(),
+            outcome.rows,
+            outcome.cells,
+            summary.hermit_sha,
+            outcome.skipped.len()
+        );
+        // NAMED INDIVIDUALLY, NEVER JUST COUNTED. A fold that drops rows silently
+        // is worse than one that refuses everything, because the caller cannot then
+        // tell a thin batch from a broken one. A high skip ratio here is the signal
+        // that something systemic went wrong with the campaign.
+        for (cell, why) in &outcome.skipped {
+            println!("  skipped {cell}: {why}");
+        }
+    }
+
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     write_observation_files(root, &derived, &tracked)?;
     println!(
-        "compatibility scorecard: merged {} row(s) across {} cell(s) at {head}; {} row(s) skipped",
-        outcome.rows,
-        outcome.cells,
-        outcome.skipped.len()
+        "compatibility scorecard: merged {total_rows} row(s) across {} distinct cell(s) from {} summary file(s); {total_skipped} row(s) skipped",
+        changed_cells.len(),
+        summary_paths.len()
     );
-    // NAMED INDIVIDUALLY, NEVER JUST COUNTED. A fold that drops rows silently
-    // is worse than one that refuses everything, because the caller cannot then
-    // tell a thin batch from a broken one. A high skip ratio here is the signal
-    // that something systemic went wrong with the campaign.
-    for (cell, why) in &outcome.skipped {
-        println!("  skipped {cell}: {why}");
-    }
     Ok(())
 }
 
@@ -5239,29 +5354,37 @@ fn series_observation_identity(row: &SeriesRow) -> Result<SeriesObservationIdent
     }
 }
 
-fn should_replace_last_tested(previous: Option<&LastTested>, row: &PreparedSeriesRow) -> bool {
+fn should_replace_last_tested_at(
+    previous: Option<&LastTested>,
+    hermit_sha: &str,
+    main_ancestry: Option<bool>,
+    depth: &BTreeMap<String, SourceDepth>,
+) -> bool {
     let Some(previous) = previous else {
         return true;
     };
-    if previous.hermit_sha == row.hermit_sha {
+    if previous.hermit_sha == hermit_sha {
         return true;
     }
-    if row.main_ancestry == Some(false) {
+    if main_ancestry == Some(false) {
         return false;
     }
     let previous_depth = previous
         .depth
         .get("hermit")
         .map(|depth| (depth.first_parent, depth.commits));
-    let row_depth = row
-        .depth
+    let candidate_depth = depth
         .get("hermit")
         .map(|depth| (depth.first_parent, depth.commits));
-    match (previous_depth, row_depth) {
+    match (previous_depth, candidate_depth) {
         (None, Some(_)) => true,
         (Some(previous), Some(candidate)) => candidate > previous,
         _ => false,
     }
+}
+
+fn should_replace_last_tested(previous: Option<&LastTested>, row: &PreparedSeriesRow) -> bool {
+    should_replace_last_tested_at(previous, &row.hermit_sha, row.main_ancestry, &row.depth)
 }
 
 fn remove_replaceable_projected_observations(
@@ -7185,6 +7308,65 @@ fn recorded_shell_quote(value: &str) -> String {
 }
 
 fn self_test() -> Result<(), String> {
+    let (summary_paths, retained) = parse_update_observations_args(
+        [
+            "--summary",
+            "first.json",
+            "--retained",
+            "--summary",
+            "second.json",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    )?;
+    if summary_paths != vec![PathBuf::from("first.json"), PathBuf::from("second.json")] || !retained
+    {
+        return Err("multiple retained pressure summaries were not parsed in order".into());
+    }
+    if parse_update_observations_args(
+        ["--summary", "same.json", "--summary", "same.json"]
+            .into_iter()
+            .map(str::to_string),
+    )
+    .is_ok()
+    {
+        return Err("a duplicate pressure summary was accepted".into());
+    }
+    if parse_update_observations_args(std::iter::empty()).is_ok() {
+        return Err("update-observations accepted no summaries".into());
+    }
+
+    let current_last_tested = LastTested {
+        hermit_sha: "current-sha".into(),
+        detcore_tree: "current-tree".into(),
+        depth: BTreeMap::from([(
+            "hermit".into(),
+            SourceDepth {
+                commits: 20,
+                first_parent: 20,
+            },
+        )]),
+    };
+    let older_depth = BTreeMap::from([(
+        "hermit".into(),
+        SourceDepth {
+            commits: 10,
+            first_parent: 10,
+        },
+    )]);
+    if should_replace_last_tested_at(
+        Some(&current_last_tested),
+        "older-sha",
+        Some(false),
+        &older_depth,
+    ) || !should_replace_last_tested_at(None, "older-sha", Some(false), &older_depth)
+    {
+        return Err(
+            "retained pressure evidence did not preserve newer last_tested evidence or fill an absent value"
+                .into(),
+        );
+    }
+
     for error_kind in [
         "incomplete-verification-evidence",
         "cpu-timeout",
