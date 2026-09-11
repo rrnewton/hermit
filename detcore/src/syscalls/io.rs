@@ -487,7 +487,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 let mask_addr =
                     Addr::<libc::sigset_t>::from_raw(argument.sigmask).ok_or(Errno::EFAULT)?;
-                let mask = read_kernel_sigset(guest, mask_addr).await?;
+                let mask = read_kernel_sigset(&guest.memory(), mask_addr)?;
                 Some(sanitize_ppoll_signal_mask(mask))
             } else {
                 None
@@ -898,7 +898,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if call.sigsetsize() != KERNEL_SIGSET_SIZE {
                     return Err(Errno::EINVAL.into());
                 }
-                let signal_mask = read_kernel_sigset(guest, signal_mask).await?;
+                let signal_mask = read_kernel_sigset(&guest.memory(), signal_mask)?;
                 let mut stack = guest.stack().await;
                 let signal_mask = stack.push(sanitize_ppoll_signal_mask(signal_mask)).cast();
                 signal_mask_guard = Some(stack.commit()?);
@@ -928,7 +928,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if call.sigsetsize() != KERNEL_SIGSET_SIZE {
                     return Err(Errno::EINVAL.into());
                 }
-                let signal_mask = read_kernel_sigset(guest, signal_mask).await?;
+                let signal_mask = read_kernel_sigset(&guest.memory(), signal_mask)?;
                 Some(sanitize_ppoll_signal_mask(signal_mask))
             }
             None => None,
