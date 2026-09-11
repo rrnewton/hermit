@@ -132,34 +132,48 @@ fn without_perf_event_signal(mask: KernelSigset) -> KernelSigset {
 ///
 /// `safeptrace::Stopped::read` deliberately uses `PTRACE_PEEKDATA` for reads of
 /// eight bytes or less. That operation can read a `PROT_NONE` page, unlike the
-/// kernel's `copy_from_user`, so using `MemoryAccess::read_value` alone would
-/// turn an `EFAULT` from a raw signal syscall into success. An invalid `how`
-/// value makes `rt_sigprocmask` copy exactly the kernel-sized input and then
-/// return `EINVAL` without changing the mask. Use that as a permission probe,
-/// then read the already-validated word while the guest is stopped.
-pub(super) async fn read_kernel_sigset<G, T>(
-    guest: &mut G,
+/// kernel's `copy_from_user`. Read one extra byte to select the
+/// protection-respecting `process_vm_readv` path. The extra byte stays in a page
+/// already occupied by the signal mask, so its accessibility cannot reject an
+/// otherwise valid eight-byte mask. Require the whole read in one operation:
+/// retrying a short read could fall back to the ptrace fast path for the tail.
+fn read_kernel_sigset_from_memory<M: MemoryAccess>(
+    memory: &M,
+    address: Addr<'_, libc::sigset_t>,
+) -> Result<KernelSigset, Error> {
+    const PAGE_SIZE: usize = 4096;
+    const PROBE_SIZE: usize = KERNEL_SIGSET_SIZE + 1;
+
+    let raw = address.as_raw();
+    let ends_at_page_boundary = raw % PAGE_SIZE == PAGE_SIZE - KERNEL_SIGSET_SIZE;
+    let (probe_address, mask_offset) = if ends_at_page_boundary {
+        (
+            Addr::<u8>::from_raw(raw - 1).expect("a page-ending sigset cannot start at zero"),
+            1,
+        )
+    } else {
+        (address.cast(), 0)
+    };
+    let mut bytes = [0_u8; PROBE_SIZE];
+    if memory.read(probe_address, &mut bytes)? != PROBE_SIZE {
+        return Err(Errno::EFAULT.into());
+    }
+    Ok(KernelSigset::from_ne_bytes(
+        bytes[mask_offset..mask_offset + KERNEL_SIGSET_SIZE]
+            .try_into()
+            .expect("kernel sigset slice has the fixed kernel width"),
+    ))
+}
+
+pub(super) fn read_kernel_sigset<G, T>(
+    guest: &G,
     address: Addr<'_, libc::sigset_t>,
 ) -> Result<KernelSigset, Error>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let validation = syscalls::RtSigprocmask::new()
-        .with_how(-1)
-        .with_set(Some(address))
-        .with_oldset(None)
-        .with_sigsetsize(KERNEL_SIGSET_SIZE);
-    match guest.inject(validation).await {
-        Err(Errno::EINVAL) => {}
-        Err(errno) => return Err(errno.into()),
-        Ok(_) => {
-            // Both Linux and the KVM syscall implementation reject an unknown
-            // operation. Success means the backend did not validate the probe.
-            return Err(Errno::EIO.into());
-        }
-    }
-    Ok(guest.memory().read_value(address.cast())?)
+    read_kernel_sigset_from_memory(&guest.memory(), address)
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -352,7 +366,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EFAULT.into());
         };
 
-        let temporary_mask = read_kernel_sigset(guest, mask_addr).await?;
+        let temporary_mask = read_kernel_sigset(guest, mask_addr)?;
         let mut stack = guest.stack().await;
         let pending_addr = stack.push(0_u64);
         let pending_guard = stack.commit()?;
@@ -451,7 +465,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if call.how() != libc::SIG_BLOCK && call.how() != libc::SIG_SETMASK {
             Ok(guest.inject_with_retry(call).await?)
         } else if let Some(set) = call.set() {
-            let set_mask = read_kernel_sigset(guest, set).await?;
+            let set_mask = read_kernel_sigset(guest, set)?;
             let mut stack = guest.stack().await;
             let new_set = stack.push(without_perf_event_signal(set_mask));
             let _stack_guard = stack.commit()?;
@@ -709,7 +723,45 @@ fn should_notify_cross_task_signal(sender: DetTid, target: DetTid, raw_signal: i
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    struct ProbeMemory {
+        expected_address: usize,
+        bytes: [u8; KERNEL_SIGSET_SIZE + 1],
+        returned: usize,
+        reads: Cell<usize>,
+    }
+
+    impl MemoryAccess for ProbeMemory {
+        fn read_vectored(
+            &self,
+            _read_from: &[std::io::IoSlice<'_>],
+            _write_to: &mut [std::io::IoSliceMut<'_>],
+        ) -> Result<usize, Errno> {
+            unreachable!("the signal-mask probe must call the backend's read method")
+        }
+
+        fn write_vectored(
+            &mut self,
+            _read_from: &[std::io::IoSlice<'_>],
+            _write_to: &mut [std::io::IoSliceMut<'_>],
+        ) -> Result<usize, Errno> {
+            unreachable!("the signal-mask probe never writes guest memory")
+        }
+
+        fn read<'a, A>(&self, address: A, output: &mut [u8]) -> Result<usize, Errno>
+        where
+            A: Into<Addr<'a, u8>>,
+        {
+            assert_eq!(address.into().as_raw(), self.expected_address);
+            assert_eq!(output.len(), self.bytes.len());
+            self.reads.set(self.reads.get() + 1);
+            output[..self.returned].copy_from_slice(&self.bytes[..self.returned]);
+            Ok(self.returned)
+        }
+    }
 
     fn timeval(seconds: libc::time_t, micros: libc::suseconds_t) -> libc::timeval {
         libc::timeval {
@@ -723,6 +775,65 @@ mod tests {
         assert_eq!(KERNEL_SIGSET_SIZE, 8);
         assert_eq!(std::mem::size_of::<KernelSigset>(), 8);
         assert!(std::mem::size_of::<libc::sigset_t>() > KERNEL_SIGSET_SIZE);
+    }
+
+    #[test]
+    fn kernel_signal_mask_probe_reads_one_extra_byte_in_the_same_page() {
+        let mask = 0x8877_6655_4433_2211_u64;
+        let mut ordinary_bytes = [0_u8; KERNEL_SIGSET_SIZE + 1];
+        ordinary_bytes[..KERNEL_SIGSET_SIZE].copy_from_slice(&mask.to_ne_bytes());
+        ordinary_bytes[KERNEL_SIGSET_SIZE] = 0xa5;
+        let ordinary = ProbeMemory {
+            expected_address: 0x1008,
+            bytes: ordinary_bytes,
+            returned: ordinary_bytes.len(),
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            read_kernel_sigset_from_memory(
+                &ordinary,
+                Addr::from_raw(0x1008).expect("non-null ordinary address")
+            )
+            .unwrap(),
+            mask
+        );
+        assert_eq!(ordinary.reads.get(), 1);
+
+        let mut boundary_bytes = [0_u8; KERNEL_SIGSET_SIZE + 1];
+        boundary_bytes[0] = 0x5a;
+        boundary_bytes[1..].copy_from_slice(&mask.to_ne_bytes());
+        let boundary = ProbeMemory {
+            expected_address: 0x1ff7,
+            bytes: boundary_bytes,
+            returned: boundary_bytes.len(),
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            read_kernel_sigset_from_memory(
+                &boundary,
+                Addr::from_raw(0x1ff8).expect("non-null page-ending address")
+            )
+            .unwrap(),
+            mask
+        );
+        assert_eq!(boundary.reads.get(), 1);
+    }
+
+    #[test]
+    fn kernel_signal_mask_probe_rejects_a_short_read() {
+        let memory = ProbeMemory {
+            expected_address: 0x2008,
+            bytes: [0; KERNEL_SIGSET_SIZE + 1],
+            returned: KERNEL_SIGSET_SIZE,
+            reads: Cell::new(0),
+        };
+        let error = read_kernel_sigset_from_memory(
+            &memory,
+            Addr::from_raw(0x2008).expect("non-null test address"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Errno(Errno::EFAULT)));
+        assert_eq!(memory.reads.get(), 1);
     }
 
     #[test]

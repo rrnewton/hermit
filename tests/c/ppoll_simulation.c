@@ -337,6 +337,49 @@ static int run_inaccessible_mask_kernel_wait(void) {
   return 0;
 }
 
+static int run_boundary_mask_zero_timeout(void) {
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    perror("sysconf page size");
+    return 1;
+  }
+  void* pages = mmap(NULL, (size_t)page_size * 2,
+                     PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (pages == MAP_FAILED) {
+    perror("mmap boundary ppoll mask");
+    return 1;
+  }
+  if (mprotect((char*)pages + page_size, (size_t)page_size, PROT_NONE) != 0) {
+    int saved_errno = errno;
+    munmap(pages, (size_t)page_size * 2);
+    errno = saved_errno;
+    perror("mprotect boundary ppoll mask guard page");
+    return 1;
+  }
+
+  uint64_t* mask =
+      (uint64_t*)((char*)pages + page_size - (long)sizeof(uint64_t));
+  *mask = UINT64_C(1) << (SIGUSR1 - 1);
+  struct timespec timeout = {.tv_sec = 0, .tv_nsec = 0};
+  errno = 0;
+  long result = syscall(SYS_ppoll, NULL, 0, &timeout, mask,
+                        sizeof(uint64_t));
+  int observed_errno = errno;
+  if (munmap(pages, (size_t)page_size * 2) != 0) {
+    perror("munmap boundary ppoll mask");
+    return 1;
+  }
+  if (result != 0 || observed_errno != 0) {
+    fprintf(stderr,
+            "page-ending ppoll mask touched its guard page: result=%ld "
+            "errno=%d\n",
+            result, observed_errno);
+    return 1;
+  }
+  return 0;
+}
+
 static int run_default_workload(void) {
   int pipefd[2];
   if (pipe(pipefd) != 0 || write(pipefd[1], "r", 1) != 1) {
@@ -439,7 +482,8 @@ int main(int argc, char** argv) {
     fprintf(stderr,
             "usage: %s [raw-timeout-copyout|masked-readonly-timeout|"
             "masked-readonly-zero-timeout|masked-fail-closed|"
-            "inaccessible-mask-kernel-wait|record-replay]\n",
+            "inaccessible-mask-kernel-wait|boundary-mask-zero-timeout|"
+            "record-replay]\n",
             argv[0]);
     return 2;
   }
@@ -485,11 +529,19 @@ int main(int argc, char** argv) {
     }
     return result;
   }
+  if (strcmp(argv[1], "boundary-mask-zero-timeout") == 0) {
+    int result = run_boundary_mask_zero_timeout();
+    if (result == 0) {
+      puts("ppoll-simulation-ok");
+    }
+    return result;
+  }
 
   fprintf(stderr,
           "usage: %s [raw-timeout-copyout|masked-readonly-timeout|"
           "masked-readonly-zero-timeout|masked-fail-closed|"
-          "inaccessible-mask-kernel-wait|record-replay]\n",
+          "inaccessible-mask-kernel-wait|boundary-mask-zero-timeout|"
+          "record-replay]\n",
           argv[0]);
   return 2;
 }

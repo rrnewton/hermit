@@ -6,6 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[path = "common/liteinst.rs"]
+mod liteinst_runtime;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -139,6 +142,7 @@ fn ppoll_nonsequentialized_kernel_wait_checks_mask_access() {
             "--log=info",
             "--backend=ptrace",
             "run",
+            "--tmp=/tmp",
             "--no-sequentialize-threads",
             "--verify",
             "--verify-strict",
@@ -163,6 +167,120 @@ fn ppoll_nonsequentialized_kernel_wait_checks_mask_access() {
     assert!(
         verdict.contains("\"bitwise_parity\":true"),
         "inaccessible-mask ppoll did not meet canonical INFO parity: {verdict}",
+    );
+}
+
+#[test]
+fn ppoll_liteinst_reads_page_ending_kernel_mask() {
+    liteinst_runtime::ensure_liteinst_runtime();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ppoll-liteinst-boundary-mask");
+    fs::create_dir_all(&build_root).expect("failed to create LiteInst ppoll guest build directory");
+    let guest = build_root.join("ppoll_simulation");
+
+    let mut compile = Command::new("cc");
+    compile
+        .args([
+            "-O0", "-g", "-pthread", "-std=c11", "-Wall", "-Wextra", "-Werror",
+        ])
+        .arg(repository.join("tests/c/ppoll_simulation.c"))
+        .arg("-o")
+        .arg(&guest);
+    command_output(compile, "LiteInst page-ending ppoll-mask guest compilation");
+
+    let mut verify = Command::new("timeout");
+    verify
+        .args(["--kill-after", "5s", "90s"])
+        .arg(liteinst_runtime::hermit_binary())
+        .args([
+            "--log=info",
+            "--backend=liteinst",
+            "run",
+            "--tmp=/tmp",
+            "--strict",
+            "--verify",
+            "--base-env=minimal",
+            "--",
+        ])
+        .arg(&guest)
+        .arg("boundary-mask-zero-timeout");
+    let verify_output = command_output(
+        verify,
+        "strict LiteInst page-ending ppoll-mask verification",
+    );
+    assert_eq!(
+        verify_output.stdout, b"ppoll-simulation-ok\n",
+        "LiteInst page-ending ppoll mask produced unexpected guest output"
+    );
+    let verify_stderr = String::from_utf8_lossy(&verify_output.stderr);
+    assert!(
+        verify_stderr.contains("Determinism verified"),
+        "LiteInst verification omitted its success marker:\n{verify_stderr}"
+    );
+    assert!(
+        verify_stderr.contains("liteinst host hybrid] activation verified"),
+        "LiteInst verification omitted its backend-activation evidence:\n{verify_stderr}"
+    );
+}
+
+#[cfg(feature = "dbt")]
+#[test]
+fn ppoll_dbt_reads_page_ending_kernel_mask() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ppoll-dbt-boundary-mask");
+    fs::create_dir_all(&build_root).expect("failed to create DBT ppoll guest build directory");
+    let guest = build_root.join("ppoll_simulation");
+
+    let mut compile = Command::new("cc");
+    compile
+        .args([
+            "-O0", "-g", "-pthread", "-std=c11", "-Wall", "-Wextra", "-Werror",
+        ])
+        .arg(repository.join("tests/c/ppoll_simulation.c"))
+        .arg("-o")
+        .arg(&guest);
+    command_output(compile, "DBT page-ending ppoll-mask guest compilation");
+
+    let mut native = Command::new("timeout");
+    native
+        .args(["--kill-after", "5s", "30s"])
+        .arg(&guest)
+        .arg("boundary-mask-zero-timeout");
+    let native_output = command_output(native, "native page-ending ppoll mask");
+    assert_eq!(
+        native_output.stdout, b"ppoll-simulation-ok\n",
+        "native page-ending ppoll mask produced unexpected output"
+    );
+
+    let mut verify = Command::new("timeout");
+    verify
+        .args(["--kill-after", "5s", "90s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "--backend=dbt",
+            "run",
+            "--tmp=/tmp",
+            "--strict",
+            "--verify",
+            "--base-env=minimal",
+            "--",
+        ])
+        .arg(&guest)
+        .arg("boundary-mask-zero-timeout");
+    let verify_output = command_output(verify, "strict DBT page-ending ppoll-mask verification");
+    assert_eq!(
+        verify_output.stdout, b"ppoll-simulation-ok\n",
+        "DBT page-ending ppoll mask produced unexpected guest output"
+    );
+    let verify_stderr = String::from_utf8_lossy(&verify_output.stderr);
+    assert!(
+        verify_stderr.contains("Determinism verified"),
+        "DBT verification omitted its success marker:\n{verify_stderr}"
     );
 }
 
