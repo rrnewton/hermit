@@ -1,0 +1,82 @@
+diff --git a/ci-hub/health/tests/test_integration_tip_validate.py b/ci-hub/health/tests/test_integration_tip_validate.py
+--- a/ci-hub/health/tests/test_integration_tip_validate.py
++++ b/ci-hub/health/tests/test_integration_tip_validate.py
+@@ -66,8 +66,19 @@ class Authorities:
+     ) -> subprocess.CompletedProcess[str]:
+         if "validate-status" in command and "--sha" in command:
+             in_progress = [
+-                {"sha": SHA, "in_progress": True, "summary": f"run {index}"}
++                {
++                    "sha": SHA,
++                    "in_progress": True,
++                    "summary": f"run {index}",
++                }
+                 for index in range(self.in_progress)
+             ]
++            handles = [
++                {"unit": f"validate-{index}.service", "state": "running", "sha": SHA,
++                 "started_at": "2026-09-05T00:00:00Z", "slot": f"slot-{index}",
++                 "log_file": f"/logs/validate-{index}.log", "process_verified": True,
++                 "admission": "admitted", "finished_at": None, "result": None,
++                 "detail": None, "exit_code": None}
++                for index in range(self.in_progress)
++            ]
+             verdict = self.record_verdict if self.records else "NOT-VALIDATED"
+@@ -103,7 +114,7 @@ class Authorities:
+                 ),
+                 "in_progress_count": len(in_progress),
+                 "in_progress": in_progress,
+-                "run_handles": in_progress,
++                "run_handles": handles,
+                 "unreadable_handles": [],
+             }
+@@ -177,12 +188,7 @@ def test_two_in_progress_readings_launch_nothing(tmp_path: Path, capsys) -> None:
+     authorities = Authorities(in_progress=1)
+ 
+-    def launcher_must_not_be_queried(*_args) -> bool:
+-        raise AssertionError("canonical in-progress authority must short-circuit systemd")
+-
+-    assert read_twice(
+-        tmp_path, authorities, launcher_active=launcher_must_not_be_queried
+-    ) == (0, 0)
++    assert read_twice(tmp_path, authorities) == (0, 0)
+     assert authorities.launches == []
+     output = capsys.readouterr().out
+@@ -193,10 +199,7 @@ def test_absent_record_and_run_launches_exactly_once_across_two_readings(
+     tmp_path: Path, capsys
+ ) -> None:
+     authorities = Authorities()
+-    assert read_twice(
+-        tmp_path,
+-        authorities,
+-        launcher_active=lambda _settings, _attempt, _timeout, _run: True,
+-    ) == (0, 0)
++    assert read_twice(tmp_path, authorities) == (0, 0)
+     assert len(authorities.launches) == 1
+@@ -226,7 +229,6 @@ def test_failed_prior_launch_is_not_reported_as_never_attempted(
+             fetch=authorities.fetch,
+             run=authorities.run,
+             spawn=authorities.spawn,
+-            launcher_active=lambda _settings, _attempt, _timeout, _run: False,
+         )
+         == 0
+@@ -267,7 +269,7 @@ def test_unattributable_unreadable_handle_refuses_the_decision(tmp_path: Path) -> None:
+-def test_pre_recorded_launcher_unit_closes_the_post_accept_kill_window(
++def test_pre_recorded_launcher_unit_is_not_used_as_run_truth(
+     tmp_path: Path, capsys
+ ) -> None:
+@@ -287,16 +289,12 @@ def test_pre_recorded_launcher_unit_closes_the_post_accept_kill_window(
+             fetch=authorities.fetch,
+             run=authorities.run,
+             spawn=authorities.spawn,
+-            launcher_active=lambda _settings, attempt, _timeout, _run: (
+-                attempt["launcher_unit"]
+-                == "validate-ops-tick-fixture-launcher.service"
+-            ),
+         )
+         == 0
+     )
+-    assert authorities.launches == []
+-    assert "no second validate started" in capsys.readouterr().out
++    assert len(authorities.launches) == 1
++    assert "state=launched" in capsys.readouterr().out

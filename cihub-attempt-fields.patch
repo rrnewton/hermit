@@ -1,0 +1,134 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -7113,6 +7113,10 @@ struct ValidateRunAttempt {
+     state: String,
+     sha: String,
+     started_at: String,
++    slot: Option<String>,
++    log_file: Option<String>,
++    process_verified: bool,
++    admission: Option<String>,
+     finished_at: Option<String>,
+     result: Option<String>,
+     detail: Option<String>,
+@@ -7272,16 +7276,37 @@ fn live_validate_runs_from(
+                     error: "validation run handle has no started_at after shared validation".into(),
+                 });
+                 continue;
+             };
++            let (slot, log_file) = if include_log_paths {
++                let source_checkout = current_validate_run_text(&value, "source_checkout", &path)?;
++                let log_file = current_validate_run_text(&value, "log", &path)?;
++                (
++                    slot_from_validate_checkout(state_root, &source_checkout),
++                    Some(log_file),
++                )
++            } else {
++                (None, None)
++            };
++            let process_is_live = match record.process_identity.as_ref() {
++                Some(identity) => {
++                    validate_run_process_is_live(proc_root, boot_id_path, unit, identity)
++                        .map_err(CiHubError::ValidateStatus)?
++                }
++                None => false,
++            };
+             attempts.push(ValidateRunAttempt {
+                 unit: unit.to_string(),
+                 state: record.state.clone(),
+                 sha: target.clone(),
+                 started_at: started_at.clone(),
++                slot: slot.clone(),
++                log_file: log_file.clone(),
++                process_verified: process_is_live,
++                admission: record.admission_result.as_ref().map(|result| match result.state {
++                    validate_run_handle::AdmissionState::Admitted => "admitted".to_string(),
++                    validate_run_handle::AdmissionState::Refused => "refused".to_string(),
++                }),
+                 finished_at: record.finished_at.clone(),
+                 result: record.result.clone(),
+                 detail: record.detail.clone(),
+                 exit_code: record.exit_code,
+             });
+-            let process_is_live = match record.process_identity.as_ref() {
+-                Some(identity) => {
+-                    validate_run_process_is_live(proc_root, boot_id_path, unit, identity)
+-                        .map_err(CiHubError::ValidateStatus)?
+-                }
+-                None => false,
+-            };
+             let termination = confirmed_termination(&record)
+                 .or_else(|| {
+                     (!process_is_live)
+@@ -7294,17 +7319,6 @@ fn live_validate_runs_from(
+                     .as_ref()
+                     .unwrap_or(&termination.requested_at)
+                     .clone();
+-                let (slot, log_file) = if include_log_paths {
+-                    let source_checkout =
+-                        current_validate_run_text(&value, "source_checkout", &path)?;
+-                    let log_file = current_validate_run_text(&value, "log", &path)?;
+-                    (
+-                        slot_from_validate_checkout(state_root, &source_checkout),
+-                        Some(log_file),
+-                    )
+-                } else {
+-                    (None, None)
+-                };
+                 live.push(ValidateStatusEntry {
+                     depth: None,
+                     run_number: record.admission_result.as_ref().and_then(|result| {
+@@ -7359,17 +7373,6 @@ fn live_validate_runs_from(
+                     )
+                 },
+             );
+-            let (slot, log_file) = if include_log_paths {
+-                let source_checkout = current_validate_run_text(&value, "source_checkout", &path)?;
+-                let log_file = current_validate_run_text(&value, "log", &path)?;
+-                (
+-                    slot_from_validate_checkout(state_root, &source_checkout),
+-                    Some(log_file),
+-                )
+-            } else {
+-                (None, None)
+-            };
+             live.push(ValidateStatusEntry {
+                 depth: None,
+                 run_number: record.admission_result.as_ref().and_then(|result| {
+@@ -7498,6 +7501,24 @@ fn live_validate_runs_from(
+             state: record.state.clone(),
+             sha: record.target.clone(),
+             started_at: record.started_at.clone(),
++            slot: if include_log_paths {
++                record
++                    .source_checkout
++                    .as_deref()
++                    .or(record.checkout.as_deref())
++                    .and_then(|checkout| slot_from_validate_checkout(state_root, checkout))
++            } else {
++                None
++            },
++            log_file: if include_log_paths {
++                record.log.clone()
++            } else {
++                None
++            },
++            process_verified: false,
++            admission: record
++                .admission_result
++                .as_ref()
++                .map(|result| result.state.clone()),
+             finished_at: record.finished_at.clone(),
+             result: record.result.clone(),
+             detail: record.detail.clone(),
+@@ -7524,6 +7545,9 @@ fn live_validate_runs_from(
+         {
+             continue;
+         }
++        if let Some(attempt) = attempts.last_mut() {
++            attempt.process_verified = true;
++        }
+         let summary = format!(
+             "agent={} unit={}",
+             record.agent.as_deref().unwrap_or("?"),

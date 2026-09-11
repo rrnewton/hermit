@@ -1,0 +1,222 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -521,6 +521,17 @@ struct ValidateStatusArgs {
+     )]
+     in_progress_only: bool,
++    /// Freshly fetch the selected repository's main branch, report whether its
++    /// exact tip has a validation in progress, and include slot and log paths.
++    /// This is an exact-SHA comparison; an older commit on main does not match.
++    #[arg(
++        long,
++        conflicts_with_all = [
++            "sha_positional", "sha", "pr", "run_no", "commit_timeline"
++        ],
++        help_heading = "WHICH RESULTS"
++    )]
++    current_main: bool,
+     /// Identity columns for the current/recent table. Comma-separated values
+@@ -7599,6 +7610,100 @@ fn live_validate_runs(
+     )
+ }
+ 
++fn validate_attempt_is_in_flight(attempt: &ValidateRunAttempt) -> bool {
++    matches!(attempt.state.as_str(), "launching" | "running")
++        && attempt.admission.as_deref() != Some("refused")
++        && attempt.finished_at.is_none()
++        && attempt.result.is_none()
++        && attempt.exit_code.is_none()
++}
++
++fn unverified_attempt_entry(
++    attempt: &ValidateRunAttempt,
++    now: chrono::DateTime<chrono::Utc>,
++) -> ValidateStatusEntry {
++    ValidateStatusEntry {
++        depth: None,
++        run_number: None,
++        verdict: None,
++        result: None,
++        nonqualification_reason: None,
++        in_progress: true,
++        sha: Some(attempt.sha.clone()),
++        branch: None,
++        main_match: None,
++        main_sha: None,
++        git_depth: None,
++        started_at: Some(attempt.started_at.clone()),
++        finished_at: None,
++        elapsed_seconds: elapsed_since(&attempt.started_at, now),
++        tests_executed: None,
++        tests_passed: None,
++        host: local_host(),
++        slot: attempt.slot.clone(),
++        log_file: attempt.log_file.clone(),
++        terminated_by: None,
++        termination_reason: None,
++        no_result_reasons: Vec::new(),
++        summary: format!(
++            "state={} process-verified=false unit={}",
++            attempt.state, attempt.unit
++        ),
++        tree: None,
++        allow_tree_match: false,
++    }
++}
++
++fn include_unverified_attempts(
++    scan: &mut LiveValidateRunScan,
++    now: chrono::DateTime<chrono::Utc>,
++) {
++    let already_listed = scan
++        .entries
++        .iter()
++        .filter_map(|entry| entry.sha.as_deref().zip(entry.started_at.as_deref()))
++        .collect::<BTreeSet<_>>();
++    scan.entries.extend(
++        scan.attempts
++            .iter()
++            .filter(|attempt| {
++                !attempt.process_verified
++                    && validate_attempt_is_in_flight(attempt)
++                    && !already_listed.contains(&(attempt.sha.as_str(), attempt.started_at.as_str()))
++            })
++            .map(|attempt| unverified_attempt_entry(attempt, now)),
++    );
++    scan.entries
++        .sort_by(|left, right| right.started_at.cmp(&left.started_at));
++}
++
++fn fetch_current_validation_main(
++    tool_root: &Path,
++    state_root: &Path,
++    repo: &str,
++) -> Result<String, CiHubError> {
++    let checkout = validation_repo_checkout(state_root, repo);
++    let script = tool_root.join("ci-hub/lib/fetch_ref.py");
++    let output = Command::new("python3")
++        .arg(&script)
++        .arg("--repo")
++        .arg(&checkout)
++        .bounded_output()
++        .map_err(|source| CiHubError::Launch {
++            tool: format!("{} current-main fetch", script.display()),
++            source,
++        })?;
++    if !output.status.success() {
++        return Err(CiHubError::ValidateStatus(format!(
++            "cannot fetch current main for {repo} from {}: {}. Restore GitHub access, then retry `ci-hub validate-status --current-main`",
++            checkout.display(),
++            String::from_utf8_lossy(&output.stderr).trim()
++        )));
++    }
++    let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
++        CiHubError::ValidateStatus(format!(
++            "current-main fetch returned unreadable JSON: {error}. Retry `ci-hub validate-status --current-main`"
++        ))
++    })?;
++    let sha = value
++        .get("tracking_sha")
++        .and_then(serde_json::Value::as_str)
++        .filter(|sha| is_oid(sha))
++        .ok_or_else(|| CiHubError::ValidateStatus(
++            "current-main fetch omitted a full lowercase tracking_sha; retry `ci-hub validate-status --current-main`".into()
++        ))?;
++    Ok(sha.to_string())
++}
++
+ fn selected_validate_status_columns(
+@@ -8704,8 +8809,22 @@ fn print_recent_validate_history(
+         None
+     };
+     let now = chrono::Utc::now();
+-    let scan = live_validate_runs(tool_root, state_root, repo, now, args.log_paths)?;
++    let current_main_sha = if args.current_main {
++        Some(fetch_current_validation_main(tool_root, state_root, repo)?)
++    } else {
++        None
++    };
++    let include_log_paths = args.log_paths || args.current_main;
++    let mut scan = live_validate_runs(tool_root, state_root, repo, now, include_log_paths)?;
++    if let Some(main_sha) = current_main_sha.as_deref() {
++        let exact_live = scan.entries.iter().any(|entry| {
++            entry.in_progress && entry.sha.as_deref() == Some(main_sha)
++        });
++        if !exact_live {
++            scan = live_validate_runs(tool_root, state_root, repo, now, include_log_paths)?;
++        }
++    }
++    include_unverified_attempts(&mut scan, now);
+     let mut current = scan.entries;
++    let current_main_in_progress_count = current_main_sha.as_deref().map(|main_sha| {
++        current.iter().filter(|entry| entry.in_progress && entry.sha.as_deref() == Some(main_sha)).count()
++    });
+     let live_total = current.iter().filter(|entry| entry.in_progress).count();
+@@ -8730,7 +8849,7 @@ fn print_recent_validate_history(
+             .map(|(row, run_number)| {
+-                let mut entry = finished_validate_status_entry(repo, row, args.log_paths);
++                let mut entry = finished_validate_status_entry(repo, row, include_log_paths);
+                 entry.run_number = run_number;
+                 entry
+@@ -8751,7 +8870,7 @@ fn print_recent_validate_history(
+             .map(|(row, number)| {
+-                let mut entry = finished_validate_status_entry(repo, row, args.log_paths);
++                let mut entry = finished_validate_status_entry(repo, row, include_log_paths);
+                 entry.run_number = number;
+                 entry
+@@ -8782,7 +8901,7 @@ fn print_recent_validate_history(
+                 &historical_run_numbers,
+                 &current,
+                 repo,
+-                args.log_paths,
++                include_log_paths,
+             );
+@@ -8823,7 +8942,7 @@ fn print_recent_validate_history(
+     };
+ 
+     if args.json {
+-        println!(
+-            "{}",
+-            serde_json::to_string_pretty(&validate_status_history_json(
++        let mut report = validate_status_history_json(
+                 &entries,
+                 &unreadable_handles,
+@@ -8837,9 +8956,18 @@ fn print_recent_validate_history(
+                 unassigned_unreadable_count,
+                 recent_counts,
+-            ))
+-            .expect("serialize recent validation history")
+-        );
++            );
++        if let Some(main_sha) = current_main_sha.as_deref() {
++            report["current_main"] = serde_json::json!({
++                "sha": main_sha,
++                "in_progress": current_main_in_progress_count != Some(0),
++                "in_progress_count": current_main_in_progress_count,
++            });
++        }
++        println!(
++            "{}",
++            serde_json::to_string_pretty(&report).expect("serialize recent validation history")
++        );
+         return Ok(if args.run_no.is_some() && entries.is_empty() {
+@@ -8850,6 +8978,13 @@ fn print_recent_validate_history(
+         });
+     }
+ 
++    if let Some(main_sha) = current_main_sha.as_deref() {
++        let count = current_main_in_progress_count.expect("current-main count is present");
++        println!(
++            "CURRENT-MAIN {main_sha} VALIDATE-IN-PROGRESS={} COUNT={count}",
++            if count > 0 { "yes" } else { "no" }
++        );
++    }
+     // Printed even when there are no runs at all: "no runs" and "no green in the
+@@ -8890,7 +9025,7 @@ fn print_recent_validate_history(
+         &columns,
+         args.times,
+         now,
+         args.commit_timeline,
+-        args.log_paths,
++        include_log_paths,
+     ) {

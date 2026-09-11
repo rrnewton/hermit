@@ -1,0 +1,14 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -13246,7 +13246,9 @@ mod tests {
+     fn printed_current_main_remedy_entrypoint_exists_and_is_executable() {
+         use std::os::unix::fs::PermissionsExt;
+ 
+-        let metadata = std::fs::metadata("./ci-hub/ci-hub")
++        let entrypoint = Path::new(file!())
++            .parent()
++            .expect("ci-hub.rs has a parent directory")
++            .join("ci-hub");
++        let metadata = std::fs::metadata(entrypoint)
+             .expect("printed remedy must not fail with command-not-found (127)");

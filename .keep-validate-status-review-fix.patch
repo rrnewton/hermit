@@ -1,0 +1,73 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -7191,6 +7191,10 @@ fn current_main_diagnostic_command() -> &'static str {
+     "./ci-hub/ci-hub validate-status --current-main --show-unreadable-handles"
+ }
+ 
++fn current_main_lock_status_command() -> &'static str {
++    "./ci-hub/ci-hub validate-lock status"
++}
++
+ fn valid_agent_name(value: &str) -> bool {
+@@ -7243,13 +7247,9 @@ fn current_main_status_lines(
+     if !unreadable_handles.is_empty() {
+         lines.push(format!(
+             "RUN-HANDLES UNREADABLE={} -- {}",
+             unreadable_handles.len(),
+             if show_unreadable_handles {
+                 "individual records follow"
+             } else {
+-                "individual records hidden; run `./ci-hub/ci-hub validate-status --current-main --show-unreadable-handles`"
++                "individual records hidden"
+             }
+         ));
+@@ -7271,16 +7271,30 @@ fn current_main_status_lines(
+     }
+ 
+     if !answer_known {
+-        let (command, purpose) = current_main_admission_command(sha, admission_agent).map_or_else(
+-            || (
+-                current_main_diagnostic_command().to_string(),
+-                "identify the unreadable run records",
+-            ),
+-            |command| (command, "inspect admission for this exact commit"),
+-        );
+-        lines.push(format!("NEXT run `{command}` to {purpose}."));
++        if !unreadable_handles.is_empty() && !show_unreadable_handles {
++            lines.push(format!(
++                "NEXT run `{}` to identify the unreadable run records.",
++                current_main_diagnostic_command()
++            ));
++        }
++        if !run_handles.is_empty() {
++            if let Some(command) = current_main_admission_command(sha, admission_agent) {
++                lines.push(format!(
++                    "NEXT run `{command}` to inspect admission for this exact commit."
++                ));
++            } else {
++                lines.push(format!(
++                    "NEXT run `{}` to inspect the validation lock; the RUN-HANDLE line above identifies the unverified record.",
++                    current_main_lock_status_command()
++                ));
++            }
++        }
+     }
+     lines
+ }
+diff --git a/ci-hub/README.md b/ci-hub/README.md
+--- a/ci-hub/README.md
++++ b/ci-hub/README.md
+@@ -171,9 +171,12 @@ reports their count without printing every path and parse error; use
+ `validate-status --current-main --show-unreadable-handles` for those individual
+ details. When `DG_AGENT_NAME` is a valid agent identity, the unknown result also
+-prints a complete read-only `validate-lock admission-status` command. Otherwise
+-it prints the agent-free command that shows the unreadable records.
+-The periodic integration-tip
++prints a complete read-only `validate-lock admission-status` command for an
++unverified handle. Without that identity, it prints the agent-free
++`validate-lock status` command and keeps the handle's state, unit, head, slot,
++log, and start time in the report. When unreadable records and an unverified
++handle both prevent a yes/no answer, the output gives both applicable commands.
++
++The periodic integration-tip

@@ -1,0 +1,49 @@
+diff --git a/ci-hub/health/tests/test_integration_tip_validate.py b/ci-hub/health/tests/test_integration_tip_validate.py
+--- a/ci-hub/health/tests/test_integration_tip_validate.py
++++ b/ci-hub/health/tests/test_integration_tip_validate.py
+@@ -244,6 +244,51 @@ def test_launching_handle_appearing_between_reads_suppresses_launch(
+     assert "process_verified=False" in output
+ 
+ 
++def test_lock_only_exact_target_suppresses_launch_after_two_empty_snapshots(
++    tmp_path: Path, capsys
++) -> None:
++    authorities = Authorities()
++    events: list[str] = []
++
++    def lock_only(command, cwd, timeout):
++        if "validate-status" in command:
++            events.append("snapshot")
++            return authorities.run(command, cwd, timeout)
++        if "admission-status" in command:
++            events.append("lock")
++            report = {
++                "schema_version": 1,
++                "target": SHA,
++                "kind": "validate",
++                "admissible": False,
++                "state": "busy",
++                "reason_code": "exact-target-already-running",
++                "detail": f"validation slot 3 already runs exact target {SHA}",
++            }
++            return subprocess.CompletedProcess(command, 1, json.dumps(report), "")
++        raise AssertionError(command)
++
++    assert (
++        driver.run_tick(
++            settings(tmp_path),
++            fetch=authorities.fetch,
++            run=lock_only,
++            spawn=authorities.spawn,
++        )
++        == 0
++    )
++    assert events == ["snapshot", "lock", "snapshot"]
++    assert authorities.launches == []
++    output = capsys.readouterr().out
++    assert "state=in-progress" in output
++    assert "validation slot 3 already runs exact target" in output
++    assert "launched=0" in output
++
++
+ def test_absent_record_and_run_launches_exactly_once_across_two_readings(

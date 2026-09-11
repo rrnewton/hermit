@@ -1,0 +1,57 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -7191,6 +7191,10 @@ fn current_main_diagnostic_command() -> &'static str {
+     "./ci-hub/ci-hub validate-status --current-main --show-unreadable-handles"
+ }
+ 
++fn current_main_lock_status_command() -> &'static str {
++    "./ci-hub/ci-hub validate-lock status"
++}
++
+ fn valid_agent_name(value: &str) -> bool {
+@@ -7243,13 +7247,9 @@ fn current_main_status_lines(
+     if !unreadable_handles.is_empty() {
+         lines.push(format!(
+             "RUN-HANDLES UNREADABLE={} -- {}",
+             unreadable_handles.len(),
+             if show_unreadable_handles {
+                 "individual records follow"
+             } else {
+-                "individual records hidden; run `./ci-hub/ci-hub validate-status --current-main --show-unreadable-handles`"
++                "individual records hidden"
+             }
+         ));
+@@ -7271,16 +7271,30 @@ fn current_main_status_lines(
+     }
+ 
+     if !answer_known {
+-        let (command, purpose) = current_main_admission_command(sha, admission_agent).map_or_else(
+-            || (
+-                current_main_diagnostic_command().to_string(),
+-                "identify the unreadable run records",
+-            ),
+-            |command| (command, "inspect admission for this exact commit"),
+-        );
+-        lines.push(format!("NEXT run `{command}` to {purpose}."));
++        if !unreadable_handles.is_empty() && !show_unreadable_handles {
++            lines.push(format!(
++                "NEXT run `{}` to identify the unreadable run records.",
++                current_main_diagnostic_command()
++            ));
++        }
++        if !run_handles.is_empty() {
++            if let Some(command) = current_main_admission_command(sha, admission_agent) {
++                lines.push(format!(
++                    "NEXT run `{command}` to inspect admission for this exact commit."
++                ));
++            } else {
++                lines.push(format!(
++                    "NEXT run `{}` to inspect the validation lock; the RUN-HANDLE line above identifies the unverified record.",
++                    current_main_lock_status_command()
++                ));
++            }
++        }
+     }
+     lines
+ }

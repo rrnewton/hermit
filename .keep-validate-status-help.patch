@@ -1,0 +1,36 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -15091,6 +15091,23 @@ mod tests {
+             panic!("wrong command variant")
+         };
+         assert!(args.current_main);
++        assert!(!args.show_unreadable_handles);
++        let cli = Cli::try_parse_from([
++            "ci-hub",
++            "validate-status",
++            "--current-main",
++            "--show-unreadable-handles",
++        ])
++        .unwrap();
++        let HubCommand::ValidateStatus(args) = cli.command else {
++            panic!("wrong command variant")
++        };
++        assert!(args.show_unreadable_handles);
++        assert!(Cli::try_parse_from([
++            "ci-hub",
++            "validate-status",
++            "--show-unreadable-handles"
++        ])
++        .is_err());
++        assert!(Cli::try_parse_from([
++            "ci-hub", "validate-status", "--current-main", "--show-unreadable-handles", "--json"
++        ])
++        .is_err());
+         assert!(Cli::try_parse_from([
+@@ -15105,6 +15122,7 @@ mod tests {
+             let error = Cli::try_parse_from(["ci-hub", "validate-status", help]).unwrap_err();
+             assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+             assert!(error.to_string().contains("--current-main"));
++            assert!(error.to_string().contains("--show-unreadable-handles"));
+         }

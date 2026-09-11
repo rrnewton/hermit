@@ -1,0 +1,151 @@
+diff --git a/ci-hub/ci-hub.rs b/ci-hub/ci-hub.rs
+--- a/ci-hub/ci-hub.rs
++++ b/ci-hub/ci-hub.rs
+@@ -559,10 +559,15 @@ struct ValidateStatusArgs {
+-    /// Show every unreadable validation run-record path and parse error.
+-    /// `--current-main` reports only a count by default so its yes/no/unknown
+-    /// answer remains concise.
+-    #[arg(long, help_heading = "HOW RENDERED")]
+-    diagnostic: bool,
++    /// Show every unreadable validation run-record path and parse error when
++    /// inspecting current main. By default, only the count is shown.
++    #[arg(
++        long,
++        requires = "current_main",
++        conflicts_with = "json",
++        help_heading = "HOW RENDERED"
++    )]
++    show_unreadable_handles: bool,
+@@ -7151,21 +7156,32 @@ fn unreadable_run_handle_line(unreadable: &validate_run_handle::UnreadableRecor
+-fn shell_single_quote(value: &str) -> String {
+-    format!("'{}'", value.replace('\'', "'\\''"))
+-}
+-
+ fn current_main_diagnostic_command() -> &'static str {
+-    "ci-hub validate-status --current-main --diagnostic"
++    "./ci-hub/ci-hub validate-status --current-main --show-unreadable-handles"
+ }
+ 
++fn valid_agent_name(value: &str) -> bool {
++    let mut characters = value.chars();
++    characters
++        .next()
++        .is_some_and(|character| character.is_ascii_alphanumeric())
++        && characters.all(|character| {
++            character.is_ascii_alphanumeric()
++                || matches!(character, '.' | '_' | '/' | '@' | '+' | '-')
++        })
++}
++
++fn current_agent_name() -> Option<String> {
++    env::var("DG_AGENT_NAME")
++        .ok()
++        .filter(|agent| valid_agent_name(agent))
++}
++
+ fn current_main_admission_command(
+     sha: &str,
+-    run_handles: &[ValidateRunAttempt],
++    agent: Option<&str>,
+ ) -> Option<String> {
+-    let agent = run_handles
+-        .iter()
+-        .find_map(|attempt| attempt.agent.as_deref().filter(|agent| !agent.is_empty()))?;
++    let agent = agent.filter(|agent| valid_agent_name(agent))?;
+     Some(format!(
+-        "ci-hub validate-lock admission-status --agent {} --kind validate --target {sha} --target-was-fetched-main --json",
+-        shell_single_quote(agent)
++        "./ci-hub/ci-hub validate-lock admission-status --agent {agent} --kind validate --target {sha} --target-was-fetched-main --json"
+     ))
+ }
+@@ -7177,7 +7193,8 @@ fn current_main_status_lines(
+     answer_known: bool,
+     run_handles: &[ValidateRunAttempt],
+     unreadable_handles: &[validate_run_handle::UnreadableRecord],
+-    diagnostic: bool,
++    admission_agent: Option<&str>,
++    show_unreadable_handles: bool,
+ ) -> Vec<String> {
+@@ -7197,11 +7214,11 @@ fn current_main_status_lines(
+             "RUN-HANDLES UNREADABLE={} -- {}",
+             unreadable_handles.len(),
+-            if diagnostic {
++            if show_unreadable_handles {
+                 "individual records follow"
+             } else {
+-                "individual records hidden; run `ci-hub validate-status --current-main --diagnostic`"
++                "individual records hidden; run `./ci-hub/ci-hub validate-status --current-main --show-unreadable-handles`"
+             }
+         ));
+@@ -7221,12 +7238,12 @@ fn current_main_status_lines(
+         ));
+     }
+ 
+-    if diagnostic {
++    if show_unreadable_handles {
+         lines.extend(unreadable_handles.iter().map(unreadable_run_handle_line));
+     }
+ 
+     if !answer_known {
+-        let (command, purpose) = current_main_admission_command(sha, run_handles).map_or_else(
++        let (command, purpose) = current_main_admission_command(sha, admission_agent).map_or_else(
+             || (
+                 current_main_diagnostic_command().to_string(),
+                 "identify the unreadable run records",
+@@ -7409,6 +7426,7 @@ fn live_validate_runs_from(
+                 unit: unit.to_string(),
+                 state: record.state.clone(),
+                 sha: target.clone(),
++                agent: record.agent.clone(),
+                 started_at: started_at.clone(),
+                 slot: slot.clone(),
+@@ -7612,6 +7630,7 @@ fn live_validate_runs_from(
+             unit: record.unit.clone(),
+             state: record.state.clone(),
+             sha: record.target.clone(),
++            agent: record.agent.clone(),
+             started_at: record.started_at.clone(),
+@@ -9134,30 +9153,17 @@ fn print_recent_validate_history(
+     if let Some(main_sha) = current_main_sha.as_deref() {
+         let count = current_main_in_progress_count.expect("current-main count is present");
+-        if current_main_answer_known {
+-            if count > 0 {
+-                println!("CURRENT-MAIN {main_sha} VALIDATE-IN-PROGRESS=yes COUNT={count}");
+-            } else {
+-                println!(
+-                    "CURRENT-MAIN {main_sha} VALIDATE-IN-PROGRESS=no COUNT=0 -- run records were read twice; before launching, also run `ci-hub validate-lock admission-status --agent AGENT --kind validate --target {main_sha} --target-was-fetched-main --json`"
+-                );
+-            }
+-        } else {
+-            println!(
+-                "CURRENT-MAIN {main_sha} VALIDATE-IN-PROGRESS=unknown -- an outstanding unverified or unreadable run record may describe this exact commit; inspect the run handles and `ci-hub validate-lock admission-status --agent AGENT --kind validate --target {main_sha} --target-was-fetched-main --json`, then repair or finish the handle before retrying"
+-            );
+-        }
+-        for attempt in &current_main_run_handles {
+-            println!(
+-                "RUN-HANDLE unit={} state={} head={} slot={} log={} started={} process_verified={}",
+-                attempt.unit,
+-                attempt.state,
+-                attempt.sha,
+-                attempt.slot.as_deref().unwrap_or("?"),
+-                attempt.log_file.as_deref().unwrap_or("?"),
+-                attempt.started_at,
+-                attempt.process_verified,
+-            );
++        for line in current_main_status_lines(
++            main_sha,
++            count,
++            current_main_answer_known,
++            &current_main_run_handles,
++            &unreadable_handles,
++            current_agent_name().as_deref(),
++            args.show_unreadable_handles,
++        ) {
++            println!("{line}");
+         }
+     }
+@@ -9171,7 +9177,7 @@ fn print_recent_validate_history(
+-    for unreadable in &unreadable_handles {
++    for unreadable in unreadable_handles.iter().filter(|_| !args.current_main) {
+         println!("{}", unreadable_run_handle_line(unreadable));
+     }
