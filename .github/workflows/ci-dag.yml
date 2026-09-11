@@ -61,7 +61,7 @@ jobs:
       - name: Rust components
         run: rustup component add clippy rustfmt
       - name: Run portable lane as a DAG
-        run: ci/run-dag.sh portable ${{ inputs.max_mem != '' && format('--max-mem {0}', inputs.max_mem) || '' }} -v
+        run: env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable ${{ inputs.max_mem != '' && format('--max-mem {0}', inputs.max_mem) || '' }} -v
 
   dag-privileged:
     name: DAG lane (privileged)
@@ -96,4 +96,4 @@ jobs:
       # The DAG's in-run resource_caps still serialize genuine exclusive
       # resources (kvm).
       - name: Run privileged lane as a DAG
-        run: ci/run-dag.sh privileged -j 2 -v
+        run: env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 -v

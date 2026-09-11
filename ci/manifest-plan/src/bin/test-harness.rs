@@ -1149,6 +1149,7 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
 }
 
 fn audit_budget_ordering(root: &Path) -> Result<(), String> {
+    audit_workflow_run_dag_runners(root)?;
     let portable = read_dag(&root.join("ci/dag/portable.json"))?;
     let privileged = read_dag(&root.join("ci/dag/privileged.json"))?;
     for (lane, dag) in [("portable", &portable), ("privileged", &privileged)] {
@@ -1235,18 +1236,11 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
             "privileged workflow must contain exactly one diagnostic continue-on-error".into(),
         );
     }
-    let launcher_bound = privileged_workflow
+    let launcher_line = privileged_workflow
         .lines()
         .find(|line| line.contains("ci/run-dag.sh privileged"))
-        .and_then(|line| {
-            let words = line.split_whitespace().collect::<Vec<_>>();
-            words
-                .iter()
-                .position(|word| *word == "env")
-                .and_then(|index| index.checked_sub(1))
-                .and_then(|index| words[index].strip_suffix('s'))
-                .and_then(|value| value.parse::<u64>().ok())
-        })
+        .ok_or_else(|| "cannot find privileged launcher command".to_string())?;
+    let launcher_bound = command_timeout_seconds(launcher_line)?
         .ok_or_else(|| "cannot derive privileged launcher timeout".to_string())?;
     let privileged_yaml = parse_yaml(&root.join(".github/workflows/ci-privileged.yml"))?;
     let privileged_job_bound = workflow_job_timeout(&privileged_yaml, "privileged")? * 60;
@@ -1303,6 +1297,77 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
             .sum::<usize>(),
         privileged.steps.len()
     );
+    Ok(())
+}
+
+fn audit_workflow_run_dag_runners(root: &Path) -> Result<(), String> {
+    for relative in [
+        ".github/workflows/ci-dag.yml",
+        ".github/workflows/ci-privileged.yml",
+        ".github/workflows/validation-levels.yml",
+    ] {
+        let workflow = parse_yaml(&root.join(relative))?;
+        audit_run_dag_workflow_runner(relative, &workflow)?;
+    }
+    Ok(())
+}
+
+fn audit_run_dag_workflow_runner(label: &str, workflow: &YamlValue) -> Result<(), String> {
+    const PORTABLE: &str = "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable ${{ inputs.max_mem != '' && format('--max-mem {0}', inputs.max_mem) || '' }} -v";
+    const DAG_PRIVILEGED: &str =
+        "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 -v";
+    const VALIDATION_PRIVILEGED: &str = "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
+    const STANDALONE_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\ntimeout --foreground --kill-after=10s 1560s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
+    const FIXTURES: &[&str] = &[
+        "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v",
+        "timeout --foreground --kill-after=10s 1560s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
+    ];
+    let expected: &[(&str, &str)] = match label {
+        ".github/workflows/ci-dag.yml" => &[
+            ("dag-portable", PORTABLE),
+            ("dag-privileged", DAG_PRIVILEGED),
+        ],
+        ".github/workflows/ci-privileged.yml" => &[("privileged", STANDALONE_PRIVILEGED)],
+        ".github/workflows/validation-levels.yml" => &[("full", VALIDATION_PRIVILEGED)],
+        "fixture" => &[],
+        _ => return Err(format!("workflow {label} has no expected run-dag commands")),
+    };
+    let jobs = workflow["jobs"]
+        .as_mapping()
+        .ok_or_else(|| format!("workflow {label} has no jobs mapping"))?;
+    let mut consumers = Vec::new();
+    for (job_name, job) in jobs {
+        let job_name = job_name.as_str().unwrap_or("<non-string job>");
+        let steps = job["steps"]
+            .as_sequence()
+            .ok_or_else(|| format!("workflow {label} job {job_name} has no steps"))?;
+        for (step_index, step) in steps.iter().enumerate() {
+            let Some(run) = step.get("run").and_then(YamlValue::as_str) else {
+                continue;
+            };
+            let normalized = run
+                .chars()
+                .filter(|character| !matches!(character, '\\' | '\'' | '"'))
+                .collect::<String>();
+            if !normalized.contains("ci/run-dag.sh") {
+                continue;
+            }
+            consumers.push((job_name, run.trim_end()));
+            if label == "fixture" && !FIXTURES.contains(&run.trim_end()) {
+                return Err(format!(
+                    "workflow {label} job {job_name} run-dag step {step_index} is not an exact allowed Rust-runner command"
+                ));
+            }
+        }
+    }
+    if label == "fixture" && consumers.len() != 1 {
+        return Err(format!("workflow {label} has no ci/run-dag.sh consumer"));
+    }
+    if label != "fixture" && consumers != expected {
+        return Err(format!(
+            "workflow {label} run-dag commands differ from the exact Rust-runner commands: actual={consumers:?} expected={expected:?}"
+        ));
+    }
     Ok(())
 }
 
@@ -1400,6 +1465,20 @@ fn workflow_job_timeout(workflow: &YamlValue, job: &str) -> Result<u64, String> 
     workflow["jobs"][job]["timeout-minutes"]
         .as_u64()
         .ok_or_else(|| format!("workflow job {job} has no numeric timeout-minutes"))
+}
+
+fn command_timeout_seconds(command: &str) -> Result<Option<u64>, String> {
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    let Some(index) = words.iter().position(|word| *word == "timeout") else {
+        return Ok(None);
+    };
+    let budget = words[index + 1..]
+        .iter()
+        .find(|word| !word.starts_with('-'))
+        .and_then(|word| word.trim_end_matches('\\').strip_suffix('s'))
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| format!("cannot derive timeout budget from `{command}`"))?;
+    Ok(Some(budget))
 }
 
 fn workflow_step_timeout_sum(workflow: &YamlValue, job: &str) -> Result<u64, String> {
@@ -1969,8 +2048,10 @@ mod tests {
     use super::HostCapabilityVerdict;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
+    use super::audit_run_dag_workflow_runner;
     use super::build_worker_capacity;
     use super::command_jobs;
+    use super::command_timeout_seconds;
     use super::expected_plan_document;
     use super::for_each_parallel;
     use super::host_inapplicable_reason;
@@ -2142,6 +2223,108 @@ mod tests {
     fn privileged_unboxed_execution_rejects_broad_boxing_failure_acceptance() {
         let executable = format!("{GUARDED_WORKFLOW}        run: tool --allow-cgroup-failure\n");
         assert!(audit_privileged_unboxed_guard(&executable).is_err());
+    }
+
+    #[test]
+    fn run_dag_workflows_use_a_structured_result_capable_runner() {
+        for command in [
+            "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v",
+            "timeout --foreground --kill-after=10s 1560s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
+        ] {
+            let workflow: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "jobs:\n  validation:\n    steps:\n      - run: {command}\n"
+            ))
+            .unwrap();
+            assert!(audit_run_dag_workflow_runner("fixture", &workflow).is_ok());
+        }
+    }
+
+    #[test]
+    fn run_dag_workflows_refuse_python_overrides_even_when_multiline() {
+        for assignment in [
+            "DAGRUN_BIN=agent-utils/py/bin/dagrun",
+            "DAGRUN_BIN=\"agent-utils/py/bin/dagrun\"",
+            "DAGRUN_ENGINE=python",
+            "DAGRUN_ENGINE='python'",
+            "DAGRUN_ENGINE=py",
+            "DAGRUN_ENGINE='py'",
+        ] {
+            let workflow: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "jobs:\n  validation:\n    steps:\n      - run: |\n          env \\\n            {assignment} \\\n            ci/run-dag.sh privileged -v\n"
+            ))
+            .unwrap();
+            let error = audit_run_dag_workflow_runner("fixture", &workflow)
+                .expect_err("a Python runner cannot consume structured-result DAGs");
+            assert!(
+                error.contains("not an exact allowed Rust-runner command"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_dag_workflows_refuse_python_overrides_from_each_environment_scope() {
+        for workflow in [
+            "env:\n  DAGRUN_ENGINE: py\njobs:\n  validation:\n    steps:\n      - run: ci/run-dag.sh portable -v\n",
+            "jobs:\n  validation:\n    env:\n      DAGRUN_ENGINE: python\n    steps:\n      - run: ci/run-dag.sh portable -v\n",
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/py/bin/dagrun\n        run: ci/run-dag.sh portable -v\n",
+        ] {
+            let workflow: serde_yaml::Value = serde_yaml::from_str(workflow).unwrap();
+            let error = audit_run_dag_workflow_runner("fixture", &workflow)
+                .expect_err("a Python runner cannot consume structured-result DAGs");
+            assert!(
+                error.contains("not an exact allowed Rust-runner command"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_dag_workflows_follow_binary_precedence_and_refuse_dynamic_commands() {
+        for command in [
+            "DAGRUN_BIN=agent-utils/common/bin/dagrun ci/run-dag.sh portable -v",
+            "export DAGRUN_ENGINE=py; ci/run-dag.sh portable -v",
+            "env 'DAGRUN_ENGINE=py' ci/run-dag.sh portable -v",
+            "env 'DAGRUN_BIN=agent-utils/py/bin/dagrun' ci/run-dag.sh portable -v",
+            "echo 'env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v'",
+            "if false; then env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v; fi",
+            "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v; DAGRUN_ENGINE=py ci/run-dag\\.sh portable -v",
+            "DAGRUN_ENGINE=py ci/run-dag.sh portable -v; ci/run-dag.sh privileged -v",
+        ] {
+            let workflow: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "jobs:\n  validation:\n    steps:\n      - run: {command}\n"
+            ))
+            .unwrap();
+            assert!(audit_run_dag_workflow_runner("fixture", &workflow).is_err());
+        }
+
+        let expression: serde_yaml::Value = serde_yaml::from_str(
+            "env:\n  DAGRUN_ENGINE: ${{ vars.DAGRUN_ENGINE }}\njobs:\n  validation:\n    steps:\n      - run: ci/run-dag.sh portable -v\n",
+        )
+        .unwrap();
+        assert!(audit_run_dag_workflow_runner("fixture", &expression).is_err());
+
+        let inherited_from_github_env: serde_yaml::Value = serde_yaml::from_str(
+            "jobs:\n  validation:\n    steps:\n      - run: echo DAGRUN_ENGINE=py >> \"$GITHUB_ENV\"\n      - run: ci/run-dag.sh portable -v\n",
+        )
+        .unwrap();
+        assert!(audit_run_dag_workflow_runner("fixture", &inherited_from_github_env).is_err());
+
+        let inherited_values_are_cleared: serde_yaml::Value = serde_yaml::from_str(
+            "env:\n  DAGRUN_ENGINE: python\njobs:\n  validation:\n    steps:\n      - run: echo DAGRUN_BIN=agent-utils/py/bin/dagrun >> \"$GITHUB_ENV\"\n      - env:\n          DAGRUN_BIN: agent-utils/py/bin/dagrun\n        run: env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v\n",
+        )
+        .unwrap();
+        assert!(audit_run_dag_workflow_runner("fixture", &inherited_values_are_cleared).is_ok());
+    }
+
+    #[test]
+    fn privileged_launcher_timeout_does_not_depend_on_an_env_prefix() {
+        for command in [
+            "timeout --foreground --kill-after=10s 1560s ci/run-dag.sh privileged -v",
+            "timeout --foreground --kill-after=10s 1560s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
+        ] {
+            assert_eq!(command_timeout_seconds(command).unwrap(), Some(1560));
+        }
     }
 
     #[test]
