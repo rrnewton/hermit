@@ -131,7 +131,7 @@ jobs:
           echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2
           exit 2
         fi
-        timeout --foreground --kill-after=10s 1560s env DAGRUN_BIN=agent-utils/py/bin/dagrun ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+        timeout --foreground --kill-after=10s 1560s ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
     - name: Run non-gating occasional KVM probes
       id: kvm_occasional
       continue-on-error: true
