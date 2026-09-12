@@ -19,7 +19,7 @@
 //!
 //! `ENVELOPE_PROBES` is three rows, dumped mechanically from the real bash with
 //! `declare -p ENVELOPE_PROBES` in the same instrumented copy that produced
-//! `ci/dag/validate.json`:
+//! `ci/super/gates.json`:
 //!
 //! ```text
 //! declare -ar ENVELOPE_PROBES=([0]="true|/bin/true" [1]="echo|/bin/echo hermit-envelope"

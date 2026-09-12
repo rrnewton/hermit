@@ -162,18 +162,26 @@ pub(super) const BACKEND_PARITY_RESULT_PRODUCERS: &[&str] = &["test.dbt_parity"]
 pub(super) const ENVELOPE_RESULT_PRODUCERS: &[&str] = &["test.envelope_levels"];
 pub(super) const APPLICATION_RESULT_PRODUCERS: &[&str] = &["test.applications_e2e"];
 
-/// Exact historical populations from the last split-DAG source. These are
-/// independent of Nextest's output parser and make an empty or narrowed run
-/// refuse rather than minting a smaller successful population.
+pub(super) const PMU_MEMORY_FAILURE_FAMILY: &str = "super.Weekly PMU parallel memory diagnostic";
+pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore",
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore",
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore",
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore",
+];
+
+/// Exact selected populations, independent of Nextest's output parser, make
+/// an empty or narrowed run refuse. Update these only after enumerating the
+/// corresponding shipped command and accounting for changed test identities.
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
-    ("test.regular_crates", 392),
-    ("test.hermit_unit", 490),
+    ("test.regular_crates", 406),
+    ("test.hermit_unit", 496),
     ("test.detcore_unit", 652),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     ("test.hermit_integration", 138),
     ("test.arbitrary_binaries", 3),
-    ("test.cli", 71),
+    ("test.cli", 76),
     ("test.liteinst_strict", 23),
     ("test.sabre_examples", 5),
     ("test.hermit_modes", 18),
@@ -183,7 +191,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.rr_suite_contract", 1),
     ("privileged-test.pmu_buck_chaos_cases", 6),
     ("privileged-test.cli_kvm", 24),
-    ("test.cli_on_host", 71),
+    ("test.cli_on_host", 76),
     ("test.hermit_modes_on_host", 18),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 24),
@@ -357,7 +365,9 @@ impl StaticStepSpec {
             write_domains: None,
             write_domain_guarantee: None,
             explains: Vec::new(),
-            fail_fast_family: None,
+            fail_fast_family: PMU_MEMORY_FAILURE_FAMILY_MEMBERS
+                .contains(&tag.as_str())
+                .then(|| PMU_MEMORY_FAILURE_FAMILY.into()),
         }
     }
 }
@@ -366,7 +376,7 @@ pub(super) fn config() -> DagConfig {
     DagConfig {
         description: "Hermit validation superset; select quick, portable, hosted-portable, full, super, privileged, or hosted-privileged by step label".into(),
         default_step_timeout: 600,
-        resource_caps: BTreeMap::from([("manifest_guest".into(), 8)]),
+        resource_caps: BTreeMap::from([("manifest_guest".into(), 8), ("integration_test_binaries.cli".into(), 1), ("integration_test_binaries.hermit_modes".into(), 1)]),
         steps: STATIC_STEPS
             .iter()
             .copied()
@@ -892,7 +902,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./scripts/test-check-status-outcome.sh && ./scripts/check-merge-gate-policy.sh"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/check-outcome-consumers-node.sh"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -2268,7 +2278,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         ],
         env: &[],
         hint: HintSpec {
-            resources: &[],
+            resources: &[(r########"integration_test_binaries.cli"########, 1)],
             est_duration_s: 150.0,
             rss_baseline_bytes: Some(4294967296),
             hard_mem_max_bytes: Some(6442450944),
@@ -2406,7 +2416,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         ],
         env: &[],
         hint: HintSpec {
-            resources: &[],
+            resources: &[(r########"integration_test_binaries.hermit_modes"########, 1)],
             est_duration_s: 150.0,
             rss_baseline_bytes: Some(2147483648),
             hard_mem_max_bytes: Some(4294967296),
@@ -2684,12 +2694,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"build.e2e_artifact"########,
             r########"build.liteinst_runtime_release"########,
             r########"gate.manifest"########,
-            r########"test.cli"########,
-            r########"test.hermit_modes"########,
         ],
         env: &[],
         hint: HintSpec {
-            resources: &[],
+            resources: &[
+                (r########"integration_test_binaries.cli"########, 1),
+                (r########"integration_test_binaries.hermit_modes"########, 1),
+            ],
             est_duration_s: 60.0,
             rss_baseline_bytes: Some(5368709120),
             hard_mem_max_bytes: Some(8589934592),
@@ -2779,7 +2790,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         ],
         env: &[],
         hint: HintSpec {
-            resources: &[],
+            resources: &[(r########"integration_test_binaries.hermit_modes"########, 1)],
             est_duration_s: 45.0,
             rss_baseline_bytes: Some(8589934592),
             hard_mem_max_bytes: Some(17179869184),
@@ -2927,7 +2938,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         deps: &[r########"privileged-build.privileged_tests"########],
         env: &[],
         hint: HintSpec {
-            resources: &[],
+            resources: &[(r########"integration_test_binaries.cli"########, 1)],
             est_duration_s: 60.0,
             rss_baseline_bytes: Some(8589934592),
             hard_mem_max_bytes: Some(17179869184),
