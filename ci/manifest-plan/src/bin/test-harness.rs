@@ -1774,6 +1774,22 @@ fn run_with_retry<T>(
     }
 }
 
+/// Retry only a completed product observation.
+///
+/// The failure class is the producer-owned distinction between a measured
+/// product failure and a run that could not produce a product verdict. Do not
+/// infer retryability from the human-readable reason or from the broad
+/// `FAIL`/`ERROR` presentation outcome: doing so doubled every `no_result` row
+/// in one failed validation without producing any additional information.
+fn cell_result_is_retryable(outcome: &str, failure_class: Option<FailureClass>) -> bool {
+    match failure_class {
+        Some(FailureClass::ProductFailure) => outcome == "FAIL",
+        Some(FailureClass::UnderstoodInfrastructureFailure) => false,
+        Some(FailureClass::UnderstoodPrerequisiteFailure) => false,
+        Some(FailureClass::NoResult) | None => false,
+    }
+}
+
 fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let mut selection = args.selection.clone();
     if selection.population.is_none() {
@@ -1845,7 +1861,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         Err(error) => infrastructure_error_result(&attempt_context, cell, error),
                     }
                 },
-                |result| !matches!(result.outcome.as_str(), "PASS" | "HOST-INAPPLICABLE"),
+                |result| cell_result_is_retryable(result.outcome.as_str(), result.failure_class),
                 emit,
             );
         },
@@ -2039,6 +2055,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use hermit_manifest_plan::runner::FailureClass;
     use hermit_manifest_plan::runner::ManifestSet;
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 
@@ -2050,6 +2067,7 @@ mod tests {
     use super::audit_privileged_unboxed_guard;
     use super::audit_run_dag_workflow_runner;
     use super::build_worker_capacity;
+    use super::cell_result_is_retryable;
     use super::command_jobs;
     use super::command_timeout_seconds;
     use super::expected_plan_document;
@@ -2406,6 +2424,108 @@ mod tests {
         );
         assert_eq!(executions.load(Ordering::SeqCst), 2);
         assert_eq!(rows.into_inner().unwrap(), [(1, true), (2, false)]);
+    }
+
+    #[test]
+    fn retry_policy_is_exhaustive_over_typed_failure_classes() {
+        use FailureClass::NoResult;
+        use FailureClass::ProductFailure;
+        use FailureClass::UnderstoodInfrastructureFailure;
+        use FailureClass::UnderstoodPrerequisiteFailure;
+
+        for (outcome, failure_class, expected) in [
+            ("FAIL", Some(ProductFailure), true),
+            ("ERROR", Some(ProductFailure), false),
+            ("FAIL", Some(NoResult), false),
+            ("ERROR", Some(NoResult), false),
+            ("ERROR", Some(UnderstoodPrerequisiteFailure), false),
+            ("ERROR", Some(UnderstoodInfrastructureFailure), false),
+            (
+                "HOST-INAPPLICABLE",
+                Some(UnderstoodPrerequisiteFailure),
+                false,
+            ),
+            ("PASS", None, false),
+            ("FAIL", None, false),
+        ] {
+            assert_eq!(
+                cell_result_is_retryable(outcome, failure_class),
+                expected,
+                "outcome={outcome} failure_class={failure_class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_result_batch_and_passing_peer_each_execute_once() {
+        const NO_RESULT_CELLS: usize = 178;
+        const CELL_COUNT: usize = NO_RESULT_CELLS + 1;
+
+        let executions = (0..CELL_COUNT)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>();
+        let rows = Mutex::new(Vec::new());
+        for_each_parallel(
+            CELL_COUNT,
+            ScheduledWorkerCapacity::new(8),
+            |index, emit| {
+                run_with_retry(
+                    1,
+                    |attempt| {
+                        executions[index].fetch_add(1, Ordering::SeqCst);
+                        if index < NO_RESULT_CELLS {
+                            (attempt, "ERROR", Some(FailureClass::NoResult))
+                        } else {
+                            (attempt, "PASS", None)
+                        }
+                    },
+                    |(_, outcome, failure_class)| cell_result_is_retryable(outcome, *failure_class),
+                    emit,
+                );
+            },
+            |index, (attempt, _, _), will_retry| {
+                rows.lock().unwrap().push((index, attempt, will_retry));
+                true
+            },
+        );
+
+        assert!(
+            executions
+                .iter()
+                .all(|count| count.load(Ordering::SeqCst) == 1)
+        );
+        let mut rows = rows.into_inner().unwrap();
+        rows.sort_unstable();
+        assert_eq!(rows.len(), CELL_COUNT);
+        assert!(
+            rows.iter()
+                .all(|(_, attempt, will_retry)| *attempt == 1 && !will_retry)
+        );
+    }
+
+    #[test]
+    fn product_failure_keeps_one_retry() {
+        let executions = AtomicUsize::new(0);
+        let mut rows = Vec::new();
+        run_with_retry(
+            1,
+            |attempt| {
+                executions.fetch_add(1, Ordering::SeqCst);
+                if attempt == 1 {
+                    (attempt, "FAIL", Some(FailureClass::ProductFailure))
+                } else {
+                    (attempt, "PASS", None)
+                }
+            },
+            |(_, outcome, failure_class)| cell_result_is_retryable(outcome, *failure_class),
+            |(attempt, _, _), will_retry| {
+                rows.push((attempt, will_retry));
+                true
+            },
+        );
+
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert_eq!(rows, [(1, true), (2, false)]);
     }
 
     #[test]
