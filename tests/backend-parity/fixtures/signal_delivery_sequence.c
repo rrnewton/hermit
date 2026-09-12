@@ -92,12 +92,123 @@ static void expect_errno(const char *name, long result, int wanted) {
   }
 }
 
+static void check_raw_signal_action_partial_access(void) {
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0)
+    fail("sysconf partial signal action page size");
+  unsigned char *mapping = mmap(NULL, (size_t)page_size * 4,
+                                PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED)
+    fail("mmap partial signal actions");
+
+  struct kernel_sigaction default_action;
+  memset(&default_action, 0xa5, sizeof(default_action));
+  if (syscall(SYS_rt_sigaction, SIGKILL, NULL, &default_action,
+              sizeof(uint64_t)) != 0)
+    fail("query immutable SIGKILL action");
+  struct kernel_sigaction zero_action = {0};
+  if (memcmp(&default_action, &zero_action, sizeof(default_action)) != 0)
+    fail("SIGKILL action is not the four-word default");
+
+  /* Exercise every possible short tail, including ptrace's final-word path. */
+  for (size_t accessible = 1; accessible < sizeof(default_action); ++accessible) {
+    unsigned char *action = mapping + page_size - accessible;
+    unsigned char *reference = mapping + 3 * page_size - accessible;
+    struct kernel_sigaction requested = {.handler = 1};
+    memcpy(action, &requested, sizeof(requested));
+    if (mprotect(mapping + page_size, (size_t)page_size, PROT_NONE) != 0 ||
+        mprotect(mapping + 3 * page_size, (size_t)page_size, PROT_NONE) != 0)
+      fail("protect partial signal action tails");
+
+    int previous_violations = violations;
+    errno = 0;
+    expect_errno("partial rt_sigaction input",
+                 syscall(SYS_rt_sigaction, SIGUSR2, action, NULL,
+                         sizeof(uint64_t)),
+                 EFAULT);
+    errno = 0;
+    expect_errno("partial reserved rt_sigaction input and output alias",
+                 syscall(SYS_rt_sigaction, SIGSTKFLT, action, action,
+                         sizeof(uint64_t)),
+                 EFAULT);
+
+    if (mprotect(mapping + page_size, (size_t)page_size,
+                 PROT_READ | PROT_WRITE) != 0)
+      fail("inspect partial signal action input");
+    if (memcmp(action, &requested, sizeof(requested)) != 0)
+      fail("failed signal action input changed its aliased output");
+    if (mprotect(mapping + 3 * page_size, (size_t)page_size,
+                 PROT_READ | PROT_WRITE) != 0)
+      fail("initialize partial signal action output reference");
+    memset(action, 0xa5, sizeof(default_action));
+    memset(reference, 0xa5, sizeof(default_action));
+    if (mprotect(mapping + page_size, (size_t)page_size, PROT_NONE) != 0 ||
+        mprotect(mapping + 3 * page_size, (size_t)page_size, PROT_NONE) != 0)
+      fail("protect partial signal action outputs");
+
+    errno = 0;
+    expect_errno("partial reserved rt_sigaction output",
+                 syscall(SYS_rt_sigaction, SIGSTKFLT, NULL, action,
+                         sizeof(uint64_t)),
+                 EFAULT);
+    errno = 0;
+    expect_errno("partial immutable rt_sigaction output reference",
+                 syscall(SYS_rt_sigaction, SIGKILL, NULL, reference,
+                         sizeof(uint64_t)),
+                 EFAULT);
+    if (mprotect(mapping + page_size, (size_t)page_size,
+                 PROT_READ | PROT_WRITE) != 0 ||
+        mprotect(mapping + 3 * page_size, (size_t)page_size,
+                 PROT_READ | PROT_WRITE) != 0)
+      fail("inspect partial signal action outputs");
+
+    /* Compare the complete partial copy with the backend's kernel operation,
+     * including bytes left untouched when it faults. No private action bytes
+     * or protected tail writes may appear in the reserved-signal output. */
+    if (memcmp(action, reference, sizeof(default_action)) != 0)
+      fail("reserved signal action partial copy differs from kernel default");
+    for (size_t offset = accessible; offset < sizeof(default_action); ++offset)
+      if (action[offset] != 0xa5)
+        fail("signal action output wrote through its protected tail");
+    if (violations != previous_violations)
+      fprintf(stderr, "signal action boundary: %zu accessible bytes\n", accessible);
+  }
+
+  /* A readable action aliased with its output must be snapshotted before the
+   * kernel overwrites the old disposition. Keep the positive installation. */
+  struct kernel_sigaction alias = {
+      .handler = 1,
+      .mask = UINT64_C(1) << (SIGUSR1 - 1),
+  };
+  struct kernel_sigaction requested = alias;
+  if (syscall(SYS_rt_sigaction, SIGUSR2, &zero_action, NULL,
+              sizeof(uint64_t)) != 0 ||
+      syscall(SYS_rt_sigaction, SIGUSR2, &alias, &alias,
+              sizeof(uint64_t)) != 0)
+    fail("aliased signal action installation");
+  if (memcmp(&alias, &zero_action, sizeof(alias)) != 0)
+    fail("aliased signal action did not return the previous default");
+  if (syscall(SYS_rt_sigaction, SIGUSR2, NULL, &alias,
+              sizeof(uint64_t)) != 0)
+    fail("query aliased signal action installation");
+  if (memcmp(&alias, &requested, sizeof(alias)) != 0)
+    fail("aliased signal action lost its input before installation");
+  if (syscall(SYS_rt_sigaction, SIGUSR2, &zero_action, NULL,
+              sizeof(uint64_t)) != 0)
+    fail("restore aliased signal action");
+
+  if (munmap(mapping, (size_t)page_size * 4) != 0)
+    fail("munmap partial signal actions");
+}
+
 /*
  * Keep raw kernel signal objects immediately before an inaccessible page. This
  * distinguishes the kernel's eight-byte mask from glibc's 128-byte sigset_t:
  * reading either object as the latter crosses into the guard page and fails.
  */
 static void check_raw_signal_abi_boundaries(void) {
+  check_raw_signal_action_partial_access();
   long page_size = sysconf(_SC_PAGESIZE);
   if (page_size <= 0)
     fail("sysconf page size");

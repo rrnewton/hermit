@@ -162,6 +162,31 @@ where
     Ok(guest.memory().read_value(address.cast())?)
 }
 
+/// Validate the entire action through the kernel before copying it privately.
+/// A partial `read_value` can fall back to ptrace for its final eight bytes,
+/// which would read through a protected page. SIGKILL accepts no new action,
+/// but both Linux and KVM copy the complete input before rejecting it.
+async fn read_kernel_sigaction<G, T>(
+    guest: &mut G,
+    address: Addr<'_, libc::sigaction>,
+) -> Result<KernelSigaction, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let validation = syscalls::RtSigaction::new()
+        .with_signum(libc::SIGKILL)
+        .with_action(Some(address))
+        .with_old_action(None)
+        .with_sigsetsize(KERNEL_SIGSET_SIZE);
+    match guest.inject(validation).await {
+        Err(Errno::EINVAL) => {}
+        Err(errno) => return Err(errno.into()),
+        Ok(_) => return Err(Errno::EIO.into()),
+    }
+    Ok(guest.memory().read_value(address.cast())?)
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#663)
 fn timeval_to_logical_time(value: libc::timeval) -> Result<LogicalTime, Errno> {
@@ -390,13 +415,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Copy the complete kernel object before inspecting the signal number or
         // writing old_action. This preserves Linux's action-before-old_action
         // pointer ordering, including when both arguments alias.
-        let kernel_action = call
-            .action()
-            .map(|action| {
-                let action: Addr<'_, KernelSigaction> = action.cast();
-                guest.memory().read_value(action)
-            })
-            .transpose()?;
+        let kernel_action = match call.action() {
+            Some(action) => Some(read_kernel_sigaction(guest, action).await?),
+            None => None,
+        };
 
         // Both appropriated signals are reported here, at the one point where the
         // guest states its expectation. SIGTRAP falls through to the ordinary
@@ -413,10 +435,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             // rather than returning `Err(Errno::EINVAL.into())`. Preserve that established
             // policy while still honoring the raw syscall's pointer accesses: the virtual old
             // disposition is the default action, never Reverie's private preemption handler.
-            if let Some(old_action) = call.old_action() {
-                guest
-                    .memory()
-                    .write_value(old_action.cast(), &KernelSigaction::default())?;
+            if call.old_action().is_some() {
+                // SIGKILL's disposition cannot be changed by userspace, so its
+                // query copies the same four zero words as our virtual default.
+                // Let the kernel copy them: a short write_value can finish with
+                // PTRACE_POKEDATA and overwrite a protected final word. This also
+                // preserves the kernel's partial-copy effects on EFAULT without
+                // exposing Reverie's private preemption action.
+                return Ok(guest
+                    .inject(call.with_signum(libc::SIGKILL).with_action(None))
+                    .await?);
             }
             return Ok(0);
         }
