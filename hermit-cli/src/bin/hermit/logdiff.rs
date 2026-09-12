@@ -1013,6 +1013,27 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
     }
 
     #[test]
+    fn follow_missing_logs_reports_no_comparable_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+        let json = directory.path().join("follow.json");
+        let mut options = LogDiffCLIOpts::new(&left, &right);
+        options.follow = true;
+        options.follow_interval_ms = 1;
+        options.follow_settle_polls = 1;
+        options.json = Some(json.clone());
+
+        let status = options.main(&GlobalOpts::try_parse_from(["hermit"]).unwrap());
+        assert!(matches!(status, ExitStatus::Exited(2)));
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(json).unwrap()).unwrap();
+        assert_eq!(report["verdict"], "no_comparable_messages");
+        assert_eq!(report["follow_stopped_because"], "quiescent");
+        assert_eq!(report["records"]["compared"], 0);
+    }
+
+    #[test]
     fn follow_reports_divergence_before_either_run_finishes() {
         let directory = tempfile::tempdir().unwrap();
         let left = directory.path().join("left.log");
