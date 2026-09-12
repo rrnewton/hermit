@@ -577,65 +577,76 @@ fn materialize_quick_super_budgets(cfg: &mut DagConfig) {
     }
 }
 
-/// Keep the source/pin and manifest gates as direct immutable dependencies of
-/// executable nodes. Focused selection may drop ordinary build prerequisites,
-/// but it must not let a requested command race or survive a failed preflight.
+/// Keep direct preflight dependencies on host commands and tests so focused
+/// selection cannot drop their source/gate ordering. Pinned preparation retains
+/// its original pin/fetch prerequisites and can overlap the manifest audit.
 fn materialize_focused_preflight(cfg: &mut DagConfig) -> Result<(), String> {
-    let selected = select_steps_by_labels(
-        cfg,
-        &[
-            "full".into(),
-            "portable".into(),
-            "quick".into(),
-            "super".into(),
-            "privileged".into(),
-        ],
-    )?;
-    let executable_tags = selected
-        .steps
-        .iter()
-        .map(Step::tag)
-        .collect::<BTreeSet<_>>();
-    let preflight = dagrun::select_steps_by_tags(
-        cfg,
-        &[
-            "gate.manifest".into(),
-            "setup.manifest_plan_in_pinned_root".into(),
-        ],
-        false,
-    )?;
-    let gate_ancestors = preflight
-        .steps
-        .iter()
-        .map(Step::tag)
-        .collect::<BTreeSet<_>>();
-    let pin_preflight = dagrun::select_steps_by_tags(cfg, &["pre.reverie_pin".into()], false)?;
-    let pin_ancestors = pin_preflight
-        .steps
-        .iter()
-        .map(Step::tag)
-        .collect::<BTreeSet<_>>();
-    for step in &mut cfg.steps {
-        let tag = step.tag();
-        if !executable_tags.contains(&tag) || is_hosted_variant(step) {
-            continue;
-        }
-        if !gate_ancestors.contains(&tag) {
-            step.deps.push("gate.manifest".into());
-        }
-        if !pin_ancestors.contains(&tag) {
-            step.deps.push("pre.reverie_pin".into());
-        }
-        // Manifest commands need their canonical test-harness producer even
-        // when --only is asked to use the other already-built artifacts.
-        if is_manifest_run(step) || tag == "build.manifest_guests" {
-            step.deps.push("setup.manifest_plan".into());
-            if step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
-                step.deps.push("setup.manifest_plan_in_pinned_root".into());
+    for (labels, gate, pin, manifest_producer) in [
+        (
+            vec![
+                "full",
+                "portable",
+                "quick",
+                "super",
+                "privileged",
+                HOSTED_PORTABLE_LABEL,
+            ],
+            "gate.manifest",
+            "pre.reverie_pin",
+            "setup.manifest_plan",
+        ),
+        (
+            vec![HOSTED_PRIVILEGED_LABEL],
+            "gate.manifest_on_host",
+            "pre.reverie_pin_on_host",
+            "setup.manifest_plan_on_host",
+        ),
+    ] {
+        let selected = select_steps_by_labels(
+            cfg,
+            &labels.into_iter().map(str::to_string).collect::<Vec<_>>(),
+        )?;
+        let executable_tags = selected
+            .steps
+            .iter()
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+        let preflight = dagrun::select_steps_by_tags(cfg, &[gate.into()], false)?;
+        let gate_ancestors = preflight
+            .steps
+            .iter()
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+        let pin_preflight = dagrun::select_steps_by_tags(cfg, &[pin.into()], false)?;
+        let pin_ancestors = pin_preflight
+            .steps
+            .iter()
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+        for step in &mut cfg.steps {
+            let tag = step.tag();
+            if !executable_tags.contains(&tag) {
+                continue;
             }
+            let pinned_preparation =
+                step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX) || tag == PINNED_ROOT_FETCH_TAG;
+            if !pinned_preparation && !gate_ancestors.contains(&tag) {
+                step.deps.push(gate.into());
+            }
+            if !pin_ancestors.contains(&tag) {
+                step.deps.push(pin.into());
+            }
+            // Manifest commands need their canonical test-harness producer
+            // even when focused selection uses other already-built artifacts.
+            if is_manifest_run(step) || step.job == "manifest_guests" {
+                step.deps.push(manifest_producer.into());
+                if step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
+                    step.deps.push("setup.manifest_plan_in_pinned_root".into());
+                }
+            }
+            step.deps.sort();
+            step.deps.dedup();
         }
-        step.deps.sort();
-        step.deps.dedup();
     }
     Ok(())
 }
@@ -1315,9 +1326,9 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 critical_path_wall_seconds(&selected)?
             ));
         }
-        if profile.label == "privileged" && critical_path_wall_seconds(&selected)? != 4020 {
+        if profile.label == "privileged" && critical_path_wall_seconds(&selected)? != 3900 {
             return Err(format!(
-                "local privileged selected critical path changed from the pre-cutover 4020 seconds to {}",
+                "local privileged selected critical path changed from the pre-cutover wrapped 3900 seconds to {}",
                 critical_path_wall_seconds(&selected)?
             ));
         }
