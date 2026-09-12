@@ -61,11 +61,33 @@ advisory. Manual tooling that strips the label must record a durable evidence
 comment (see "Validation-evidence trail" below) so the record of what was
 validated is never lost.
 
+When an operator dispatches it for the current pull-request head, a
+same-repository Demo Hot Path NO_RESULT waits without duplication while an
+exact-head run is active, reruns that selected run by ID after a terminal
+non-result, or starts a new `workflow_dispatch` run with the exact SHA when none
+exists. After that run completes, an operator dispatches the merge gate again
+to consume it.
+
 The job first verifies that its workflow file has the exact Git blob registered
 in the server-side `MERGE_GATE_V4_BLOB` variable. This rejects accidental drift
 inside the advisory workflow. The context name remains versioned so consumers
 can distinguish incompatible classifier semantics; it is not required by the
 main-branch ruleset.
+
+Changing `.github/workflows/merge-gate.yml` therefore requires an explicit
+landing action after the final reviewed commit exists remotely. The landing
+operator records that exact commit's workflow blob, updates the repository
+variable, and reads it back before dispatching the gate:
+
+```bash
+final_sha="$(git rev-parse HEAD)"
+gate_blob=$(git rev-parse "$final_sha:.github/workflows/merge-gate.yml")
+with-proxy gh variable set MERGE_GATE_V4_BLOB --repo rrnewton/hermit --body "$gate_blob"
+test "$(with-proxy gh variable get MERGE_GATE_V4_BLOB --repo rrnewton/hermit)" = "$gate_blob"
+```
+
+Do not update the variable for an unpushed or still-changing commit. Until this
+readback succeeds, the workflow's blob guard must refuse the new definition.
 
 This is not a cryptographic attestation of PR-owned YAML. A deliberate workflow
 edit can delete the blob-check step while retaining the v4 job name, and both

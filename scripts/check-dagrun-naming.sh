@@ -113,7 +113,7 @@ elif [[ -z $exported ]]; then
     echo "check-dagrun-naming: $EXPORTER no longer exports a width-channel variable" >&2
     echo "  set to CARGO_BUILD_JOBS. A DAG node's declared width can no longer reach Cargo." >&2
     status=1
-elif [[ $pinned_py != "$pinned_rs" || $pinned_py != "$exported" ]]; then
+elif [[ $pinned_py != "$pinned_rs" ]] || [[ $pinned_py != "$exported" ]]; then
     echo "check-dagrun-naming: the build-width channel is broken." >&2
     echo "  $MODEL_PY reads:   $pinned_py" >&2
     echo "  $MODEL_RS reads:   $pinned_rs" >&2
@@ -122,6 +122,52 @@ elif [[ $pinned_py != "$pinned_rs" || $pinned_py != "$exported" ]]; then
     echo "  These must be the same string. They are not, so a per-node width can be" >&2
     echo "  exported into a variable one or both engines do not read, silently leaving" >&2
     echo "  that engine on the ambient default. Rename all three together." >&2
+    status=1
+fi
+
+# The ad-hoc Hermit box must use the same tracked, source-invoked runner order as
+# the CI entry points: common/bin first, py/bin second, then PATH. Exercise the
+# real script from a temporary checkout shape so a stale path cannot pass merely
+# because this working tree happens to have another runner installed.
+box_runner_scratch=$(mktemp -d)
+trap 'rm -rf -- "$box_runner_scratch"' EXIT
+mkdir -p "$box_runner_scratch/scripts" \
+    "$box_runner_scratch/agent-utils/common/bin" \
+    "$box_runner_scratch/agent-utils/py/bin"
+cp scripts/hermit-box-run "$box_runner_scratch/scripts/hermit-box-run"
+
+write_fake_runner() {
+    local path=$1 marker=$2
+    printf '#!/bin/sh\nprintf "used\\n" > %q\n' "$marker" > "$path"
+    chmod +x "$path"
+}
+
+common_marker="$box_runner_scratch/common.used"
+python_marker="$box_runner_scratch/python.used"
+runner_output="$box_runner_scratch/runner.out"
+write_fake_runner "$box_runner_scratch/agent-utils/common/bin/dagrun" "$common_marker"
+write_fake_runner "$box_runner_scratch/agent-utils/py/bin/dagrun" "$python_marker"
+if ! PATH=/usr/bin:/bin "$box_runner_scratch/scripts/hermit-box-run" -- /bin/true \
+        >"$runner_output" 2>&1 \
+    || [[ ! -f $common_marker || -f $python_marker ]]; then
+    echo "check-dagrun-naming: hermit-box-run did not prefer agent-utils/common/bin/dagrun" >&2
+    status=1
+fi
+
+rm -f "$box_runner_scratch/agent-utils/common/bin/dagrun" "$common_marker" "$python_marker"
+if ! PATH=/usr/bin:/bin "$box_runner_scratch/scripts/hermit-box-run" -- /bin/true \
+        >"$runner_output" 2>&1 \
+    || [[ ! -f $python_marker ]]; then
+    echo "check-dagrun-naming: hermit-box-run did not fall back to agent-utils/py/bin/dagrun" >&2
+    status=1
+fi
+
+rm -f "$box_runner_scratch/agent-utils/py/bin/dagrun" "$python_marker"
+runner_rc=0
+PATH=/usr/bin:/bin "$box_runner_scratch/scripts/hermit-box-run" -- /bin/true \
+    >"$runner_output" 2>&1 || runner_rc=$?
+if [[ $runner_rc -ne 2 ]] || ! grep -q 'dagrun not found' "$runner_output"; then
+    echo "check-dagrun-naming: hermit-box-run did not refuse a missing runner with exit 2" >&2
     status=1
 fi
 

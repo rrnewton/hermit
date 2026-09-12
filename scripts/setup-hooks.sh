@@ -6,11 +6,13 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 git config core.hooksPath .githooks
 chmod +x .githooks/pre-commit
+chmod +x .githooks/commit-msg
 chmod +x .githooks/pre-push
 chmod +x scripts/check-default-build-warnings.sh
 
 echo "core.hooksPath -> .githooks"
 echo "Active (pre-commit): Reverie pin consistency gate and forward-advance advisory"
+echo "Active (commit-msg): demo changes require a green-demo review attestation"
 echo "Active (pre-push):   default-feature build with warnings denied"
 echo "  Runs the same command as CI's lint.clippy node, which local testing does"
 echo "  not cover: cargo test does not set -D warnings and every workflow does."

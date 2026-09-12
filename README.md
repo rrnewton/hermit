@@ -13,6 +13,10 @@ repository is
 Hermit is useful for repeatable execution, controlled concurrency testing,
 record/replay experiments, and diagnosing schedule-sensitive failures.
 
+Runnable examples and their dependency-aware entry points live in
+[demos/](demos/README.md). The standalone QEMU/BusyBox example remains
+documented in [demos/QEMU_BUSYBOX.md](demos/QEMU_BUSYBOX.md).
+
 ## Requirements
 
 Hermit currently supports x86-64 Linux. Building and running it requires:

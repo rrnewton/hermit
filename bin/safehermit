@@ -1,0 +1,472 @@
+#!/usr/bin/env bash
+# safehermit -- the only hermit entry point agents may call.
+#
+# WHY THIS EXISTS
+# ===============
+# On 2026-08-17 three hermit runs each wrote ~4.5 TB of stderr over 28+ hours at
+# 75% CPU and filled the filesystem, taking down ORC and every running agent. No
+# single mechanism would have stopped it, so this applies several and -- the part
+# that matters -- SAYS WHICH ONES IT COULD NOT APPLY.
+#
+# THE CASE THAT DECIDES WHETHER THIS WORKS. The incident binary was
+# /tmp/hermit-ers-patched, invoked by absolute path. Absolute-path execution never
+# consults PATH, so a shim named `hermit` dropped in front covers the ordinary case
+# and misses precisely the one that caused the outage. This therefore takes the
+# binary as an argument:
+#
+#     safehermit /tmp/hermit-ers-patched run -- ./prog     # arbitrary binary
+#     safehermit run -- ./prog                             # default hermit
+#
+# The first argument is the hermit binary IF it contains a `/` and is executable,
+# or if --bin is given. Nothing else is treated as a binary, so a subcommand
+# (`run`, `record`, `replay`, `verify`, `log-diff` -- none contains a `/`) can
+# never be mistaken for one.
+#
+# FAIL LOUD, NEVER SILENTLY UNBOUNDED
+# ===================================
+# Every bound is reported on EVERY run as APPLIED or NOT_APPLIED with a reason,
+# including when everything works. This is deliberate and is the whole discipline:
+# on the day of the incident several mechanisms were present and inert, and a
+# wrapper that only speaks up when something breaks becomes another one of them.
+# `safehermit: bound.* =` lines are the contract; grep them.
+#
+# WHAT IT DOES NOT DO
+# ===================
+# It does not change hermit's behaviour, arguments, stdio or exit code. stdout and
+# stderr of the child are passed through untouched; everything this script says
+# goes to stderr prefixed `safehermit:` so it can never be confused with, or
+# parsed as, hermit output.
+#
+# EXIT CODES
+#   the child's exit code, verbatim, whenever the child ran
+#   2   safehermit usage error (the child did not run)
+#   124 the deadline fired and the run was killed by its cgroup
+#   125 the log cap fired and the run was killed by its cgroup
+set -uo pipefail
+
+PROG=safehermit
+# WHERE THIS SCRIPT'S OWN LINES GO. Default 2 (stderr), exactly as before.
+# --sh-report FILE moves them, and the reason is a measured demo failure, not
+# tidiness: demos/05-qemu-boot.py hashes its hermit log into run-metadata.json
+# (info_log_sha256) and demo_common.compare_runs then LINE-DIFFS two runs' logs,
+# failing the repeat on any difference that survives normalization. Six of the
+# lines below embed run_id, which is a UTC timestamp plus this script's pid and so
+# differs on every run. Verified against the real comparator: hermit_log_diff on
+# two otherwise-identical logs reports "first divergence at line 1 ... run_id",
+# i.e. wiring that demo to safehermit while the report shares fd 2 with hermit's
+# stderr would fail repeat verification on 100% of runs, for a reason that has
+# nothing to do with hermit.
+# The report is still WRITTEN and still greppable -- this only changes where -- so
+# the "fail loud, never silently unbounded" discipline is intact. A caller that
+# redirects it takes on the job of surfacing it.
+REPORT_FD=2
+say()  { printf '%s: %s\n' "$PROG" "$*" >&$REPORT_FD; }
+# die() stays on real stderr: a usage error must be visible even when the caller
+# has pointed the report at a file it is not going to read.
+die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
+field(){ printf '%s: %s=%s\n' "$PROG" "$1" "$2" >&$REPORT_FD; }
+
+# ---------------------------------------------------------------- defaults
+DEFAULT_DEADLINE_SECS=3600          # (2) no run outlives a default without opting out
+DEFAULT_MAX_LOG_BYTES=$((64*1024*1024))   # LOW ON PURPOSE -- see the cap note below
+DEFAULT_DISK_LIMIT=8G
+DEFAULT_MEM_MAX=16G
+# (4) THE EMITTER IS DELIBERATELY LEFT ALONE. An earlier version of this script
+# defaulted RUST_LOG=detcore::scheduler=warn, which does work (measured: stderr
+# 380 -> 272 lines, detcore::scheduler 40 -> 0). The owner ruled against it, and
+# the reasoning is better: a spinning program SHOULD die from the timeout or from
+# the log hitting a low cap. Quieting the emitter hides the very signal that a run
+# is stuck -- it makes a wedged run look healthy and cheap. So the cap is set LOW
+# so that it is the thing that fires, the deadline backs it up, and the first
+# bytes are kept as evidence. RUST_LOG is never set by safehermit; the caller's
+# value, if any, is passed through untouched.
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG_ROOT="${SAFEHERMIT_LOG_ROOT:-$ROOT/ignored/safehermit}"
+REGISTRY="$LOG_ROOT/registry"
+
+deadline=$DEFAULT_DEADLINE_SECS
+max_log_bytes=$DEFAULT_MAX_LOG_BYTES
+disk_limit=$DEFAULT_DISK_LIMIT
+mem_max=$DEFAULT_MEM_MAX
+bin_override=""
+no_deadline=0
+fresh=0
+report_file=""
+
+# ---------------------------------------------------------------- our own flags
+# Parsed ONLY until the first argument we do not own, so hermit's own flags are
+# never intercepted. `--` ends our parsing explicitly.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --sh-bin)       [ $# -ge 2 ] || die "--sh-bin needs a value"; bin_override="$2"; shift 2 ;;
+        --sh-bin=*)     bin_override="${1#*=}"; shift ;;
+        --sh-deadline)  [ $# -ge 2 ] || die "--sh-deadline needs a value"; deadline="$2"; shift 2 ;;
+        --sh-deadline=*) deadline="${1#*=}"; shift ;;
+        --sh-no-deadline) no_deadline=1; shift ;;
+        --sh-fresh) fresh=1; shift ;;
+        --sh-report)    [ $# -ge 2 ] || die "--sh-report needs a value"; report_file="$2"; shift 2 ;;
+        --sh-report=*)  report_file="${1#*=}"; shift ;;
+        --sh-max-log-bytes)   [ $# -ge 2 ] || die "needs a value"; max_log_bytes="$2"; shift 2 ;;
+        --sh-max-log-bytes=*) max_log_bytes="${1#*=}"; shift ;;
+        --sh-disk-limit)   [ $# -ge 2 ] || die "needs a value"; disk_limit="$2"; shift 2 ;;
+        --sh-disk-limit=*) disk_limit="${1#*=}"; shift ;;
+        --sh-help|-h)
+            sed -n '2,/^set -uo pipefail/{/^set -uo pipefail/d;p}' "$0" | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+
+if [ -n "$report_file" ]; then
+    # Fail loudly on an unwritable destination rather than losing the report: a
+    # report that silently goes nowhere is the inert-mechanism failure this script
+    # exists to prevent.
+    exec 3>"$report_file" || die "--sh-report: cannot write $report_file"
+    REPORT_FD=3
+fi
+
+[ $# -ge 1 ] || die "no hermit arguments given (try --sh-help)"
+
+# ---------------------------------------------------------------- pick the binary
+# The rule that makes an ARBITRARY binary as cheap as running it bare.
+# PRECEDENCE IS NAMED, NOT JUST APPLIED. `binary_source` below reports which layer
+# won, because "which build produced this artifact" was unanswerable for most of
+# 2026-08-19 and that cost most of a day's rework.
+#
+# FRESHNESS IS OPT-IN (--sh-fresh), NOT DEFAULT, AND THAT IS A DELIBERATE
+# DEVIATION worth reading: the owner asked for ./target/release/hermit "or cargo
+# run it to ensure freshness", and separately, this morning, asked that a stable
+# binary be FROZEN for demo work precisely because rebuild churn in the shared
+# checkout produced artifacts whose originating build was unrecorded. Rebuilding
+# by default in the entry point every demo uses would reintroduce that churn. So
+# the default resolves an EXISTING binary and never builds; `--sh-fresh` opts in.
+# Raised with the owner rather than decided quietly.
+hermit_bin=""; binary_source=""
+if [ -n "$bin_override" ]; then
+    hermit_bin="$bin_override"; binary_source="flag:--sh-bin"
+elif [ -x "$1" ] && case "$1" in */*) true ;; *) false ;; esac; then
+    hermit_bin="$1"; binary_source="argv:positional-path"; shift
+elif [ -n "${HERMIT_BIN:-}" ]; then
+    hermit_bin="$HERMIT_BIN"; binary_source="env:HERMIT_BIN"
+elif [ -x "$ROOT/target/release/hermit" ]; then
+    hermit_bin="$ROOT/target/release/hermit"; binary_source="default:target/release/hermit"
+elif [ -x "$ROOT/bin/hermit" ]; then
+    hermit_bin="$ROOT/bin/hermit"; binary_source="default:bin/hermit"
+else
+    hermit_bin="$(command -v hermit 2>/dev/null || true)"; binary_source="path:$(command -v hermit 2>/dev/null || echo none)"
+fi
+if [ "$fresh" = 1 ]; then
+    if [ "$binary_source" = "default:target/release/hermit" ] || [ ! -x "$hermit_bin" ]; then
+        say "--sh-fresh: building hermit --release (this mutates the shared checkout's target/)"
+        if (cd "$ROOT" && cargo build --release -p hermit >&2); then
+            hermit_bin="$ROOT/target/release/hermit"; binary_source="fresh:cargo build --release"
+        else
+            die "--sh-fresh: cargo build --release failed; refusing to run a stale binary while you asked for a fresh one"
+        fi
+    else
+        say "--sh-fresh ignored: an explicit binary was selected ($binary_source); refusing to rebuild over an explicit choice"
+    fi
+fi
+[ -n "$hermit_bin" ] || die "no hermit binary found: pass one as the first argument, set HERMIT_BIN, or use --sh-bin"
+[ -x "$hermit_bin" ] || die "not executable: $hermit_bin"
+hermit_bin="$(cd "$(dirname "$hermit_bin")" && printf '%s/%s' "$(pwd)" "$(basename "$hermit_bin")")"
+
+# ---------------------------------------------------------------- identity (5)
+# Most of today's rework came from artifacts whose originating build was
+# unrecorded. The hash is of the binary that ACTUALLY ran, resolved absolute.
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+binary_sha256="$(sha256sum "$hermit_bin" 2>/dev/null | cut -d' ' -f1)"
+[ -n "$binary_sha256" ] || binary_sha256="unavailable"
+
+# ---------------------------------------------------------------- (6) bounded space
+mkdir -p "$LOG_ROOT" "$REGISTRY" 2>/dev/null
+brs="$ROOT/scripts/bounded-run-space"
+disk_state=""; log_dir=""
+if [ -x "$brs" ]; then
+    log_dir="$("$brs" create --limit "$disk_limit" --tag "safehermit-$run_id" --base "$LOG_ROOT" 2>/dev/null)"
+    rc=$?
+    if [ $rc -eq 0 ] && [ -n "$log_dir" ]; then
+        disk_state="APPLIED:$disk_limit"
+    elif [ -n "$log_dir" ]; then
+        # exit 10: the space exists but nothing caps it. RELAY IT -- this is the
+        # case bounded-run-space exists to make impossible to miss.
+        disk_state="NOT_APPLIED:bounded-run-space reported UNBOUNDED (rc=$rc); space exists but is not capped"
+    else
+        disk_state="NOT_APPLIED:bounded-run-space failed (rc=$rc)"
+    fi
+fi
+if [ -z "$log_dir" ]; then
+    log_dir="$LOG_ROOT/$run_id"
+    mkdir -p "$log_dir" || die "cannot create log dir $log_dir"
+    [ -n "$disk_state" ] || disk_state="NOT_APPLIED:scripts/bounded-run-space not present (branch runner-bounded-run-space_20260819 is unlanded)"
+fi
+log_file="$log_dir/hermit.log"
+
+# ---------------------------------------------------------------- (1)(2) killability
+# The container init is a namespace PID 1 with no SIGTERM handler and the kernel
+# DISCARDS default-disposition signals to it, so `timeout` and even
+# `timeout --kill-after` cannot reap this process shape. A cgroup kill can.
+# RuntimeMaxSec on a transient unit is that cgroup kill.
+unit="safehermit-$run_id"
+wall_state="APPLIED:${deadline}s"
+runner=(); runner_state="APPLIED"
+if [ "$no_deadline" = 1 ]; then
+    wall_state="NOT_APPLIED:--sh-no-deadline was passed explicitly by the caller"
+fi
+# PROBE THE CAPABILITY, DO NOT ASK A PROXY ABOUT IT. `systemctl --user
+# is-system-running` returns "degraded" (rc=1) on this box while `systemd-run
+# --user` works perfectly -- gating on it silently dropped BOTH the wall bound and
+# the memory bound on a machine that supports them. Caught by this script's own
+# acceptance test. So we actually start a throwaway transient unit and see.
+systemd_ok=0
+if command -v systemd-run >/dev/null 2>&1; then
+    if timeout 20 systemd-run --user "--unit=safehermit-probe-$$" --collect --quiet \
+         --property=RuntimeMaxSec=10 --pipe --wait -- /bin/true >/dev/null 2>&1; then
+        systemd_ok=1
+    fi
+fi
+env_state="NOT_APPLIED:no transient unit, so the child inherits this shell's environment directly"
+if [ "$systemd_ok" = 1 ]; then
+    # FORWARD THE CALLER'S ENVIRONMENT EXPLICITLY. `systemd-run --user` does NOT
+    # inherit the invoking shell's environment -- it starts the unit from the user
+    # manager's own environment -- so without this every caller variable is
+    # SILENTLY DROPPED. Measured: with RUST_LOG=warn,detcore=info,reverie_ptrace::task=info
+    # exported, a guest that writes 46,868,869 bytes of stderr in 8.4s when hermit
+    # is run directly wrote 0 bytes through the transient unit, and this script
+    # reported bytes_written=0 truncated=false exit_code=0 -- a completely silent
+    # run that looked clean. Worse, the line below used to claim the caller's
+    # RUST_LOG was "passed through untouched" while it was being discarded, so the
+    # report asserted the opposite of what happened.
+    #
+    # This matters most for exactly the callers this wrapper is for: the demos set
+    # RUST_LOG, HERMIT_REPO, QEMU_BIN, LD_LIBRARY_PATH and TZ, and a run stripped of
+    # them is not the run the caller asked for.
+    #
+    # Exported shell FUNCTIONS cannot be forwarded -- systemd rejects the name
+    # `BASH_FUNC_which%%` with "Invalid argument" and, because that aborts the whole
+    # invocation, one such variable in the caller's environment would take the entire
+    # run down. So names that are not [A-Za-z_][A-Za-z0-9_]* are skipped, and the
+    # count of skips is REPORTED rather than swallowed.
+    setenv_args=(); env_fwd=0; env_skipped=0
+    while IFS= read -r -d '' _e; do
+        _n="${_e%%=*}"
+        case "$_n" in
+            [A-Za-z_]*) case "$_n" in *[!A-Za-z0-9_]*) env_skipped=$((env_skipped+1)); continue ;; esac ;;
+            *) env_skipped=$((env_skipped+1)); continue ;;
+        esac
+        setenv_args+=("--setenv=$_e"); env_fwd=$((env_fwd+1))
+    done < <(env -0)
+    env_state="APPLIED:$env_fwd variables forwarded"
+    [ "$env_skipped" -eq 0 ] || env_state="$env_state; $env_skipped SKIPPED (name not a plain shell identifier, e.g. an exported function)"
+    # NO --collect HERE, DELIBERATELY, AND IT MUST NOT BE ADDED BACK.
+    # After the run we ask systemd whether the unit timed out, because that answer
+    # is authoritative and the exit code is not. --collect garbage-collects the unit
+    # the moment it finishes, and `systemctl show` on a unit that no longer exists
+    # does not fail and does not return empty -- it returns the DEFAULT, which is
+    # Result=success. Measured, three trials each on the same timed-out unit:
+    #     with    --collect:  Result=success
+    #     without --collect:  Result=timeout
+    # So keeping --collect while reading the result would report every timed-out run
+    # as a clean success, confidently and silently. That is worse than the inference
+    # it replaces. The unit is instead stopped and reset explicitly below.
+    # Built in one pass. The previous form appended the deadline by SPLICING at a
+    # hard-coded index -- "${runner[@]:0:5}" ... "${runner[@]:5}" -- which silently
+    # means something different the moment a flag is added or removed above it, as
+    # removing --collect just did. Nothing here depends on position now.
+    runner=(systemd-run --user "--unit=$unit" --quiet
+            "--property=MemoryMax=$mem_max" "--property=MemorySwapMax=0")
+    [ "$no_deadline" = 1 ] || runner+=("--property=RuntimeMaxSec=$deadline")
+    runner+=("--working-directory=$PWD" "${setenv_args[@]}" --pipe --wait --)
+else
+    # NEVER fall back silently to an unbounded run.
+    runner=()
+    runner_state="NOT_APPLIED"
+    wall_state="NOT_APPLIED:systemd --user unavailable; NO cgroup kill and NO wall bound -- \`timeout\` cannot kill a namespace PID 1, so none is attempted"
+    unit="none"
+fi
+
+# ---------------------------------------------------------------- (4) log filter
+if [ -n "${RUST_LOG:-}" ]; then
+    # "passed through untouched" is only true because the environment is now
+    # explicitly forwarded above; before that it was false, and silently so.
+    logfilter_state="NOT_APPLIED:caller set RUST_LOG=$RUST_LOG; passed through untouched"
+else
+    logfilter_state="NOT_APPLIED:by owner ruling -- the emitter is left loud so a stuck run stays visible; the low byte cap is the mechanism that fires"
+fi
+
+# ---------------------------------------------------------------- (8) best-effort note
+# NOT A LEDGER, AND NOTHING MAY DEPEND ON IT. Owner ruling: "every time we
+# introduce a ledger it breaks and we get confused." So this writes a line because
+# writing is free, and that is the end of its authority. No receipt semantics, no
+# gate reads it, no agent behaviour is keyed to it, and a failure to write it is
+# not a failure of the run. If you find yourself wanting to make a decision from
+# this file, do not.
+reg="$REGISTRY/$run_id.json"
+printf '{"run_id":"%s","unit":"%s","pid":%s,"binary":"%s","binary_sha256":"%s","log_dir":"%s","started_at":"%s","state":"running"}\n' \
+    "$run_id" "$unit" "$$" "$hermit_bin" "$binary_sha256" "$log_dir" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$reg" 2>/dev/null \
+    && reg_state="$reg (best-effort; nothing depends on it)" || reg_state="unwritten (best-effort; harmless)"
+
+# ---------------------------------------------------------------- announce (7)
+field run_id        "$run_id"
+field binary        "$hermit_bin"
+field binary_source "$binary_source"
+field binary_sha256 "$binary_sha256"
+field log_dir       "$log_dir"
+field log_file      "$log_file"
+field unit          "$unit"
+field bound.wall      "$wall_state"
+field bound.cgroup    "$( [ "$runner_state" = APPLIED ] && echo "APPLIED:MemoryMax=$mem_max MemorySwapMax=0" || echo "NOT_APPLIED:systemd --user unavailable" )"
+field bound.disk      "$disk_state"
+if [ "$runner_state" = APPLIED ]; then
+    byte_bound_state="APPLIED:$max_log_bytes (LETHAL: the run is cgroup-killed at the cap)"
+else
+    byte_bound_state="APPLIED:$max_log_bytes (TRUNCATION ONLY: no cgroup kill is available; stderr is still drained so the child can finish)"
+fi
+field bound.bytes     "$byte_bound_state"
+field bound.logfilter "$logfilter_state"
+field env.forwarded   "$env_state"
+field note.run_record "$reg_state"
+
+# ---------------------------------------------------------------- (3) byte cap
+# A capped log that reads as complete is worse than a missing one, so the capper
+# records the truncation. It NEVER closes the pipe: closing would deliver SIGPIPE
+# to hermit and turn a log cap into a kill, and under `set -o pipefail` that also
+# takes the script down silently. It keeps draining and stops writing.
+capper() {
+    # STREAMING, CONSTANT MEMORY. A reviewer found that the evidence cap in
+    # dagrun bounds the FILE while still holding complete stdout and
+    # stderr in memory -- trading a full disk for an OOM is not a fix. This reads
+    # and writes in 64 KiB chunks and accumulates nothing, so peak memory is the
+    # chunk, not the stream.
+    #
+    # IT NEVER CLOSES THE PIPE. Closing would deliver SIGPIPE to hermit and turn a
+    # log cap into an unexplained kill, and under `set -o pipefail` it would take
+    # this script down silently too. On cap it stops WRITING and keeps DRAINING.
+    #
+    # THE CAP IS LETHAL, BY OWNER RULING. A spinning program should die from the
+    # timeout or from the log hitting a low cap, so on cap we kill the run through
+    # its cgroup and keep the first bytes as evidence. Without systemd there is no
+    # cgroup to kill, so it degrades to truncate-and-say-so rather than pretending.
+    python3 -u -c '
+import sys, os, subprocess
+cap = int(sys.argv[1]); path = sys.argv[2]; unit = sys.argv[3]
+written = 0; truncated = False; killed = "n/a"
+out = open(path, "wb")
+src = sys.stdin.buffer; dst = sys.stdout.buffer
+while True:
+    chunk = src.read(65536)
+    if not chunk: break
+    dst.write(chunk); dst.flush()
+    if not truncated:
+        room = cap - written
+        if len(chunk) <= room:
+            out.write(chunk); written += len(chunk)
+        else:
+            if room > 0: out.write(chunk[:room]); written += room
+            out.write(b"\n[safehermit] LOG CAP OF %d BYTES REACHED. The bytes above are kept as evidence; everything after this point was discarded.\n" % cap)
+            out.flush(); truncated = True
+            if unit and unit != "none":
+                rc = subprocess.call(["systemctl", "--user", "kill", "--signal=SIGKILL", unit],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                killed = "cgroup-killed" if rc == 0 else "kill-failed-rc%d" % rc
+                out.write(b"[safehermit] the run was killed at the cap (%s).\n" % killed.encode())
+            else:
+                killed = "no-cgroup-available"
+                out.write(b"[safehermit] NOT killed: no systemd cgroup was available, so the cap could only truncate.\n")
+            out.flush()
+out.flush(); out.close()
+with open(path + ".meta", "w") as m:
+    m.write("bytes_written=%d\ntruncated=%s\ncap=%d\nkilled=%s\n" % (written, str(truncated).lower(), cap, killed))
+' "$1" "$2" "$3"
+}
+
+# ---------------------------------------------------------------- run
+# A FIFO, NOT PROCESS SUBSTITUTION. `2> >(capper …)` is not waited on, so the
+# script read `.meta` before the capper had written it and reported
+# `truncated=unknown` -- i.e. the truncation record, which is the entire point of
+# requirement (3), was missing on every run. Caught by this script's own test. A
+# FIFO with an explicit `wait` makes the capper's completion a precondition of
+# reporting, and keeps `$?` the child's own status rather than the pipeline's.
+fifo="$log_dir/.stderr.fifo"
+rm -f "$fifo"; mkfifo "$fifo" 2>/dev/null || die "cannot create fifo $fifo"
+capper "$max_log_bytes" "$log_file" "$unit" < "$fifo" >&2 &
+capper_pid=$!
+
+started=$(date +%s)
+if [ "$runner_state" = APPLIED ]; then
+    "${runner[@]}" "$hermit_bin" "$@" 2>"$fifo"
+else
+    "$hermit_bin" "$@" 2>"$fifo"
+fi
+rc=$?
+wait "$capper_pid" 2>/dev/null
+rm -f "$fifo"
+elapsed=$(( $(date +%s) - started ))
+
+# ---------------------------------------------------------------- report
+trunc="unknown"; wrote="unknown"
+if [ -f "$log_file.meta" ]; then
+    trunc="$(sed -n 's/^truncated=//p' "$log_file.meta")"
+    killed="$(sed -n 's/^killed=//p' "$log_file.meta")"
+    wrote="$(sed -n 's/^bytes_written=//p' "$log_file.meta")"
+fi
+field elapsed_secs  "$elapsed"
+field bytes_written "$wrote"
+field truncated     "$trunc"
+field exit_code     "$rc"
+if [ "$trunc" = true ]; then
+    field killed_at_cap "${killed:-unknown}"
+    # A distinct code, because "255" tells a caller nothing about WHY.
+    [ "${killed:-}" = "cgroup-killed" ] && rc=125
+    say "LOG CAP: the run hit the ${max_log_bytes}-byte cap (${killed:-unknown}). The log is INCOMPLETE by design; the kept bytes are the evidence."
+fi
+# ---------------------------------------------------------------- deadline verdict
+# ASK SYSTEMD, DO NOT INFER. This used to reconstruct "did the deadline fire?" from
+# two proxies -- `elapsed >= deadline` arithmetic, and an allowlist of child exit
+# codes (143/137/1) -- and both can be wrong.
+#
+# THE REPRODUCED FAILURE, which is why this is not a tidy-up. `--sh-deadline 6s` is a
+# perfectly ordinary thing for a caller to write and systemd accepts it: RuntimeMaxSec
+# takes a suffix, the bound IS applied, and the run IS killed. But bash `[ 6 -ge 6s ]`
+# aborts with "integer expression expected", so the whole condition went false and the
+# kill went UNREPORTED -- measured, a 600s child under `--sh-deadline 6s` returned exit
+# 1 after 6s with zero DEADLINE lines, against exit 124 for `--sh-deadline 6`. Exit 1
+# is hermit's own convention for "the guest failed", so the caller sees a plausible
+# ordinary failure and has no reason to suspect the run was killed.
+#
+# `Result` is what systemd itself concluded, so neither proxy is needed and the
+# arithmetic that broke on "6s" is deleted rather than repaired.
+#
+# THE NON-ANSWER IS TREATED AS A NON-ANSWER. If the result cannot be read, this says
+# so and falls back to the old inference rather than trusting a blank -- a unit that
+# no longer exists reports Result=success, so "unreadable" and "the run was fine" look
+# identical and must not be conflated.
+unit_result=""
+if [ "$runner_state" = APPLIED ] && [ "$unit" != none ]; then
+    unit_result="$(systemctl --user show "$unit.service" -p Result --value 2>/dev/null)"
+    field unit_result "${unit_result:-UNREADABLE}"
+    # Clean up explicitly, since --collect is deliberately not used. A timed-out unit
+    # is left in the failed state otherwise, and its name stays taken.
+    systemctl --user reset-failed "$unit.service" >/dev/null 2>&1 || true
+    systemctl --user stop "$unit.service" >/dev/null 2>&1 || true
+fi
+if [ "$unit_result" = timeout ]; then
+    say "DEADLINE: the run reached ${deadline} and was killed by its cgroup (systemd Result=timeout, child exit $rc)."
+    rc=124
+elif [ -z "$unit_result" ] && [ "$no_deadline" != 1 ] && [ "$runner_state" = APPLIED ] \
+     && { [ $rc -eq 143 ] || [ $rc -eq 137 ] || [ $rc -eq 1 ]; }; then
+    say "DEADLINE(inferred): systemd's unit result was UNREADABLE, so this is a GUESS from exit $rc, not a fact."
+    rc=124
+fi
+
+if [ -f "$reg" ]; then
+    python3 - "$reg" "$rc" "$trunc" <<'PY' 2>/dev/null || true
+import json, sys
+p, rc, tr = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(p)); d.update(state="finished", exit_code=int(rc), truncated=(tr == "true"))
+json.dump(d, open(p, "w"))
+PY
+fi
+exit $rc

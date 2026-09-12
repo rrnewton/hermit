@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Require the demo review attestation when a staged change touches runnable
+# files under demos/. The range checker remains authoritative before landing.
+set -uo pipefail
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+
+checker="$root/scripts/check-demo-review.sh"
+[ -f "$checker" ] || {
+  echo "demo-review gate: REFUSED: checker missing at $checker" >&2
+  exit 1
+}
+exec bash "$checker" --staged --message-file "$1"

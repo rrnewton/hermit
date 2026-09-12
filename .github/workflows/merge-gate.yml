@@ -43,8 +43,8 @@ permissions:
 # the three PMU runners also carry the `gate` label as fallback, so a single-node
 # outage cannot block a requested diagnostic.
 jobs:
-  refire-on-ci-completion:
-    name: refire-on-ci-completion
+  dispatch-after-ci-completion:
+    name: dispatch-after-ci-completion
     if: github.repository == 'rrnewton/hermit' && github.event_name == 'workflow_run'
     runs-on: [self-hosted, gate]
     timeout-minutes: 5
@@ -77,7 +77,7 @@ jobs:
 
           while IFS=$'\t' read -r pr_number current; do
             if [ "$current" != "true" ]; then
-              echo "PR #${pr_number} advanced beyond $HEAD_SHA; its newer CI run will re-fire the gate."
+              echo "PR #${pr_number} advanced beyond $HEAD_SHA; an operator must dispatch the gate for the newer head after its evidence is ready."
               continue
             fi
             gh workflow run merge-gate.yml \
@@ -281,11 +281,12 @@ jobs:
             -f body="$body" --silent
           echo "Removed locally-validated from PR #${PR_NUMBER}; evidence no longer validates head ${head_sha}."
 
-          # Events caused by GITHUB_TOKEN do not recursively start workflows.
-          # Same-repository refs can run the normal gate immediately. Fork refs
-          # cannot be passed to workflow_dispatch in the base repository, so the
-          # failing check above remains authoritative until a new validation
-          # record and label re-fire the pull_request gate.
+          # This branch is dormant while the workflow has only workflow_dispatch.
+          # If an owner restores the pull_request trigger, same-repository refs
+          # can dispatch the normal gate immediately. Fork refs cannot be passed
+          # to workflow_dispatch in the base repository, so the advisory failure
+          # remains attached until an operator records new validation evidence
+          # and dispatches the gate for a reachable ref.
           if [ "$head_repo" = "$REPO" ]; then
             gh workflow run merge-gate.yml \
               --repo "$REPO" \
@@ -674,7 +675,7 @@ jobs:
             case "$status" in
               queued | in_progress | waiting | requested | pending)
                 no_result=1
-                echo "NO_RESULT is still active ($status); completion will refire the gate."
+                echo "NO_RESULT is still active ($status); wait for completion, then dispatch the merge gate again."
                 ;;
               *) queue_dispatch "$@" ;;
             esac
@@ -683,19 +684,20 @@ jobs:
           dispatch_no_result() {
             sort -u "$dispatch_file" | while IFS=$'\t' read -r workflow head_ref pr_number head_sha run_id; do
               [ -n "$workflow" ] || continue
-              echo "NO_RESULT: re-dispatching $workflow for PR #$pr_number at $head_sha (ref=$head_ref)."
+              echo "NO_RESULT: dispatching $workflow for PR #$pr_number at $head_sha (ref=$head_ref)."
               case "$workflow" in
                 merge-gate.yml)
                   gh workflow run "$workflow" --repo "$REPO" --ref "$head_ref" \
                     -f pr_number="$pr_number"
                   ;;
-                demo-hot-path-rerun)
-                  if [ -z "$run_id" ]; then
-                    echo "::warning::No pull-request demo run exists to rerun for PR #$pr_number at $head_sha."
-                    continue
+                demo-hot-path.yml)
+                  if [ -n "$run_id" ]; then
+                    gh api --method POST \
+                      "repos/${REPO}/actions/runs/${run_id}/rerun" --silent
+                  else
+                    gh workflow run "$workflow" --repo "$REPO" --ref "$head_ref" \
+                      -f sha="$head_sha"
                   fi
-                  gh api --method POST \
-                    "repos/${REPO}/actions/runs/${run_id}/rerun" --silent
                   ;;
                 *)
                   gh workflow run "$workflow" --repo "$REPO" --ref "$head_ref"
@@ -920,7 +922,7 @@ jobs:
             # Keep this classifier synchronized with demo-hot-path.yml's paths.
             # Match the hot-path globs, then subtract the test trees the demo
             # suite provably never executes. The demo job runs
-            # `scripts/super-validate.sh --demos-only` (parent demos 1-8 only)
+            # `demos/run-all.sh --all` (in-repository demos 1-8 only)
             # and never runs the Hermit e2e corpus, so nothing under
             # `tests/e2e/**` can change a demo outcome; the standalone
             # `tests/backend-parity/**` parity fixtures are likewise never read.
@@ -934,7 +936,7 @@ jobs:
                 --paginate --jq '.[].filename'
             )"
             hot_files="$(
-              grep -E '^([.]github/workflows/demo-hot-path[.]yml|Cargo[.](lock|toml)|rust-toolchain[.]toml|common/|detcore[^/]*/|examples/|flaky-tests/|hermit-cli/|hermit-install/|hermit-resources/|tests/)' <<< "$files" \
+              grep -E '^([.]github/workflows/demo-hot-path[.]yml|Cargo[.](lock|toml)|rust-toolchain[.]toml|common/|demos/|detcore[^/]*/|examples/|flaky-tests/|hermit-cli/|hermit-install/|hermit-resources/|tests/)' <<< "$files" \
                 | grep -vE '^tests/(e2e|backend-parity)/' || true
             )"
             if [ -n "$hot_files" ]; then
@@ -943,7 +945,7 @@ jobs:
               )"
               demo_run="$("$CHECK_OUTCOME_AUTHORITY" \
                 --select-latest-run --head-sha "$head_sha" \
-                --event pull_request <<<"$demo_runs")"
+                --event workflow_dispatch <<<"$demo_runs")"
               demo_status="$(jq -r '.status // "missing"' <<< "$demo_run")"
               demo_conclusion="$(jq -r '.conclusion // ""' <<< "$demo_run")"
               demo_url="$(jq -r '.html_url // ""' <<< "$demo_run")"
@@ -959,7 +961,7 @@ jobs:
                   ;;
                 NO_RESULT)
                   echo "P0 demo gate has NO_RESULT for hot-path PR #${pr_number} at $head_sha ($demo_status/${demo_conclusion:-none})."
-                  queue_hosted_retry "$demo_status" demo-hot-path-rerun "$head_ref" "$head_repo" \
+                  queue_hosted_retry "$demo_status" demo-hot-path.yml "$head_ref" "$head_repo" \
                     "$pr_number" "$head_sha" "$demo_run_id"
                   ;;
               esac

@@ -1,0 +1,41 @@
+name: Demo review gate
+
+# Mechanical enforcement of the demo-adversarial-review policy: any reviewed
+# range that touches a runnable demo (demos/**) must carry a Demo-Green-Review
+# attestation (an adversarial reviewer verified the demo runs GREEN) after the
+# final change to each touched demo. Independent of post-facto-human-review. See
+# demos/ADVERSARIAL-REVIEW-POLICY.md and scripts/check-demo-review.sh.
+
+# This diagnostic runs automatically only after a commit reaches `integration`,
+# and may also be dispatched manually. It never runs automatically for a pull
+# request or `main`. Local exact-head validation remains the canonical and only
+# landing gate; this hosted result is supplemental evidence.
+#
+# THIS IS NOT A GATE. Nothing blocks a landing on the result (owner directive
+# 2026-08-17); it measures the same demo-review policy used by local validation.
+#
+# Kick one off:  ./ci-hub/bin/manual-run --workflow demo-review-gate.yml [--commit SHA]
+on:
+  workflow_dispatch:
+  push:
+    branches: [integration]
+permissions:
+  contents: read
+
+jobs:
+  demo-review:
+    name: Demo-touching commits require a green-demo attestation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0            # need the full range base..head
+      - name: Require a Demo-Green-Review attestation for demos/** changes
+        run: |
+          set -euo pipefail
+          head="${{ github.sha }}"
+          git fetch --no-tags origin main
+          base="$(git merge-base "$head" origin/main)"
+          echo "scanning range ${base}..${head}"
+          scripts/check-demo-review.sh --range "${base}..${head}"
