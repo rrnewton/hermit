@@ -79,6 +79,7 @@ const PORTABLE_DAG: &str = "ci/dag/portable.json";
 const TRACKED_CELLS_SCHEMA: u64 = 7;
 const RUN_SCHEMA: u64 = 3;
 const SUMMARY_SCHEMA: u64 = 4;
+const PROMOTION_REPETITIONS: usize = 10;
 const REQUIRED_BUILD_TAGS: [&str; 5] = [
     "setup.manifest_plan",
     "build.workspace",
@@ -3773,6 +3774,260 @@ fn repeated_result_description(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct RepeatedOutcomeCounts {
+    expected_repetitions: usize,
+    observed_repetitions: usize,
+    qualifying_passes: usize,
+    terminal_passes: usize,
+    product_failures: usize,
+    infrastructure_failures: usize,
+    prerequisite_failures: usize,
+    no_results: usize,
+    mixed_repetitions: usize,
+    missing_repetitions: usize,
+    retried_repetitions: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PressureSampleClassification {
+    PromotionCandidate,
+    Intermittent,
+    ConfirmedFailing,
+    InfrastructureFailure,
+    PrerequisiteFailure,
+    NoResult,
+    Incomplete,
+}
+
+impl PressureSampleClassification {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PromotionCandidate => "promotion-candidate",
+            Self::Intermittent => "intermittent",
+            Self::ConfirmedFailing => "confirmed-failing",
+            Self::InfrastructureFailure => "infrastructure-failure",
+            Self::PrerequisiteFailure => "prerequisite-failure",
+            Self::NoResult => "no-result",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+fn classify_pressure_sample(counts: RepeatedOutcomeCounts) -> PressureSampleClassification {
+    let accounted = counts
+        .terminal_passes
+        .saturating_add(counts.product_failures)
+        .saturating_add(counts.infrastructure_failures)
+        .saturating_add(counts.prerequisite_failures)
+        .saturating_add(counts.no_results)
+        .saturating_add(counts.mixed_repetitions);
+    if counts.expected_repetitions != PROMOTION_REPETITIONS
+        || counts.observed_repetitions != counts.expected_repetitions
+        || counts.missing_repetitions != 0
+        || accounted != counts.observed_repetitions
+        || counts.qualifying_passes > counts.terminal_passes
+        || counts.retried_repetitions > counts.observed_repetitions
+    {
+        return PressureSampleClassification::Incomplete;
+    }
+    if counts.qualifying_passes == PROMOTION_REPETITIONS
+        && counts.terminal_passes == PROMOTION_REPETITIONS
+        && counts.retried_repetitions == 0
+        && counts.product_failures == 0
+        && counts.infrastructure_failures == 0
+        && counts.prerequisite_failures == 0
+        && counts.no_results == 0
+    {
+        PressureSampleClassification::PromotionCandidate
+    } else if counts.terminal_passes > 0 {
+        PressureSampleClassification::Intermittent
+    } else if counts.product_failures == PROMOTION_REPETITIONS {
+        PressureSampleClassification::ConfirmedFailing
+    } else if counts.infrastructure_failures == PROMOTION_REPETITIONS {
+        PressureSampleClassification::InfrastructureFailure
+    } else if counts.prerequisite_failures == PROMOTION_REPETITIONS {
+        PressureSampleClassification::PrerequisiteFailure
+    } else if counts.no_results == PROMOTION_REPETITIONS {
+        PressureSampleClassification::NoResult
+    } else {
+        PressureSampleClassification::Incomplete
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepetitionClassification {
+    ProductFailure,
+    InfrastructureFailure,
+    PrerequisiteFailure,
+    NoResult,
+    Mixed,
+    Missing,
+}
+
+#[derive(Debug, Deserialize)]
+struct HarnessSummary {
+    schema: u64,
+    cells: usize,
+    passed: usize,
+    failed: usize,
+    errors: usize,
+    host_inapplicable: usize,
+    host_inapplicable_cells: Vec<HostInapplicableCell>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HostInapplicableCell {
+    test: String,
+    mode: String,
+    backend: Option<String>,
+    reason: Option<String>,
+}
+
+fn retained_host_inapplicable(cell_dir: &Path, cell: &CellId) -> Result<bool, String> {
+    let path = cell_dir.join("summary.json");
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read harness summary {}: {error}", path.display()))?;
+    let summary: HarnessSummary = serde_json::from_str(&text)
+        .map_err(|error| format!("invalid harness summary {}: {error}", path.display()))?;
+    if summary.schema != 1 {
+        return Err(format!(
+            "unsupported harness summary schema {} in {}",
+            summary.schema,
+            path.display()
+        ));
+    }
+    if summary.host_inapplicable == 0 {
+        return Ok(false);
+    }
+    let observed = summary.host_inapplicable_cells.first();
+    let observed_backend = observed.and_then(|entry| {
+        entry.backend.as_deref().or_else(|| {
+            if entry.mode == "naked" {
+                Some("native")
+            } else {
+                None
+            }
+        })
+    });
+    if summary.cells != 1
+        || summary.passed != 0
+        || summary.failed != 0
+        || summary.errors != 0
+        || summary.host_inapplicable != 1
+        || summary.host_inapplicable_cells.len() != 1
+        || !observed.is_some_and(|entry| {
+            entry.test == cell.test
+                && entry.mode == cell.mode
+                && observed_backend == Some(cell.backend.as_str())
+                && entry.reason.as_deref().is_some_and(|reason| !reason.trim().is_empty())
+        })
+    {
+        return Err(format!(
+            "harness summary {} does not prove exactly one host-inapplicable selected cell {}/{}/{}",
+            path.display(),
+            cell.test,
+            cell.mode,
+            cell.backend
+        ));
+    }
+    Ok(true)
+}
+
+fn classify_nonpassing_repetition(
+    result: &str,
+    result_rows: &[CellResult],
+    row_valid: bool,
+    evidence_valid: bool,
+    rejected_result_history: bool,
+    proven_timeout: bool,
+    proven_oom: bool,
+    retained_prerequisite: bool,
+) -> RepetitionClassification {
+    if retained_prerequisite {
+        return if !row_valid
+            && evidence_valid
+            && result_rows.is_empty()
+            && !proven_timeout
+            && !proven_oom
+        {
+            RepetitionClassification::PrerequisiteFailure
+        } else {
+            RepetitionClassification::Mixed
+        };
+    }
+    if !row_valid && rejected_result_history && result_rows.is_empty() {
+        return RepetitionClassification::Missing;
+    }
+    if !row_valid && !proven_timeout && !proven_oom {
+        return RepetitionClassification::Missing;
+    }
+    if (proven_timeout || proven_oom) && !row_valid {
+        return if result_rows.is_empty() {
+            RepetitionClassification::NoResult
+        } else {
+            RepetitionClassification::Mixed
+        };
+    }
+    if row_valid && (evidence_valid || proven_timeout || proven_oom) && !result_rows.is_empty() {
+        let pass = result_rows
+            .iter()
+            .any(|row| row.result == Some(ObservedResult::Pass));
+        let product = result_rows
+            .iter()
+            .any(|row| row.failure_class == Some(FailureClass::ProductFailure));
+        let infrastructure = result_rows.iter().any(|row| {
+            row.failure_class == Some(FailureClass::UnderstoodInfrastructureFailure)
+        });
+        let prerequisite = result_rows.iter().any(|row| {
+            row.failure_class == Some(FailureClass::UnderstoodPrerequisiteFailure)
+        });
+        let no_result = proven_timeout
+            || proven_oom
+            || result_rows
+            .iter()
+            .any(|row| row.failure_class == Some(FailureClass::NoResult));
+        let untyped = result_rows
+            .iter()
+            .any(|row| row.result.is_none() && row.failure_class.is_none());
+        let categories = usize::from(product)
+            + usize::from(infrastructure)
+            + usize::from(prerequisite)
+            + usize::from(no_result)
+            + usize::from(pass)
+            + usize::from(untyped);
+        return match (
+            categories,
+            pass,
+            product,
+            infrastructure,
+            prerequisite,
+            no_result,
+        ) {
+            (1, false, true, false, false, false) => {
+                RepetitionClassification::ProductFailure
+            }
+            (1, false, false, true, false, false) => {
+                RepetitionClassification::InfrastructureFailure
+            }
+            (1, false, false, false, true, false) => {
+                RepetitionClassification::PrerequisiteFailure
+            }
+            (1, false, false, false, false, true) => RepetitionClassification::NoResult,
+            _ => RepetitionClassification::Mixed,
+        };
+    }
+    if matches!(result, "timeout" | "oom") {
+        RepetitionClassification::NoResult
+    } else {
+        RepetitionClassification::InfrastructureFailure
+    }
+}
+
 fn repeated_batch_result_description(
     _terminal_passes: usize,
     clean_passes: usize,
@@ -3861,19 +4116,28 @@ fn repeated_run_has_unacceptable_product_result(
 
 fn repeated_cell_summary(
     cell: &CellId,
-    terminal_passes: usize,
-    clean_passes: usize,
-    retried: usize,
-    total: usize,
+    counts: RepeatedOutcomeCounts,
     result: &str,
 ) -> JsonValue {
+    let classification = classify_pressure_sample(counts);
     json!({
         "cell": cell,
-        "passes": terminal_passes,
-        "clean_passes": clean_passes,
-        "retried_repetitions": retried,
-        "total": total,
+        "passes": counts.terminal_passes,
+        "clean_passes": counts.qualifying_passes,
+        "retried_repetitions": counts.retried_repetitions,
+        "total": counts.expected_repetitions,
         "result": result,
+        "classification": classification,
+        "promotion_candidate": classification == PressureSampleClassification::PromotionCandidate,
+        "expected_repetitions": counts.expected_repetitions,
+        "observed_repetitions": counts.observed_repetitions,
+        "qualifying_passes": counts.qualifying_passes,
+        "terminal_product_failures": counts.product_failures,
+        "infrastructure_failures": counts.infrastructure_failures,
+        "prerequisite_failures": counts.prerequisite_failures,
+        "no_results": counts.no_results,
+        "mixed_repetitions": counts.mixed_repetitions,
+        "missing_repetitions": counts.missing_repetitions,
     })
 }
 
@@ -3910,16 +4174,81 @@ fn verify_repetition_summary_json(
             .get("retried_repetitions")
             .and_then(JsonValue::as_u64);
         let total = cell.get("total").and_then(JsonValue::as_u64);
+        let expected = cell
+            .get("expected_repetitions")
+            .and_then(JsonValue::as_u64);
+        let observed = cell
+            .get("observed_repetitions")
+            .and_then(JsonValue::as_u64);
+        let qualifying = cell
+            .get("qualifying_passes")
+            .and_then(JsonValue::as_u64);
+        let product_failures = cell
+            .get("terminal_product_failures")
+            .and_then(JsonValue::as_u64);
+        let infrastructure_failures = cell
+            .get("infrastructure_failures")
+            .and_then(JsonValue::as_u64);
+        let prerequisite_failures = cell
+            .get("prerequisite_failures")
+            .and_then(JsonValue::as_u64);
+        let no_results = cell.get("no_results").and_then(JsonValue::as_u64);
+        let mixed = cell
+            .get("mixed_repetitions")
+            .and_then(JsonValue::as_u64);
+        let missing = cell
+            .get("missing_repetitions")
+            .and_then(JsonValue::as_u64);
+        let classification = cell.get("classification").and_then(JsonValue::as_str);
+        let promotion_candidate = cell
+            .get("promotion_candidate")
+            .and_then(JsonValue::as_bool);
         if terminal_passes.is_none()
             || clean_passes.is_none()
             || retried.is_none()
             || total.is_none()
+            || expected.is_none()
+            || observed.is_none()
+            || qualifying.is_none()
+            || product_failures.is_none()
+            || infrastructure_failures.is_none()
+            || prerequisite_failures.is_none()
+            || no_results.is_none()
+            || mixed.is_none()
+            || missing.is_none()
+            || classification.is_none()
+            || promotion_candidate.is_none()
             || cell.get("result").and_then(JsonValue::as_str).is_none()
         {
             return Err("summary JSON has an incomplete repeated-cell result".into());
         }
         if terminal_passes > total || clean_passes > terminal_passes || retried > total {
             return Err("summary JSON has impossible repeated-cell counts".into());
+        }
+        let counts = RepeatedOutcomeCounts {
+            expected_repetitions: expected.unwrap() as usize,
+            observed_repetitions: observed.unwrap() as usize,
+            qualifying_passes: qualifying.unwrap() as usize,
+            terminal_passes: terminal_passes.unwrap() as usize,
+            product_failures: product_failures.unwrap() as usize,
+            infrastructure_failures: infrastructure_failures.unwrap() as usize,
+            prerequisite_failures: prerequisite_failures.unwrap() as usize,
+            no_results: no_results.unwrap() as usize,
+            mixed_repetitions: mixed.unwrap() as usize,
+            missing_repetitions: missing.unwrap() as usize,
+            retried_repetitions: retried.unwrap() as usize,
+        };
+        let expected_classification = classify_pressure_sample(counts);
+        if total != expected
+            || clean_passes != qualifying
+            || classification != Some(expected_classification.as_str())
+            || promotion_candidate
+                != Some(
+                    expected_classification
+                        == PressureSampleClassification::PromotionCandidate,
+                )
+        {
+            return Err("summary JSON has inconsistent repeated-cell classification".into());
         }
     }
     Ok(())
@@ -4279,7 +4608,13 @@ fn summarize(
     let mut by_backend: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
     let mut repeated_terminal_passes = BTreeMap::<CellId, usize>::new();
     let mut repeated_clean_passes = BTreeMap::<CellId, usize>::new();
+    let mut repeated_product_failures = BTreeMap::<CellId, usize>::new();
     let mut repeated_infrastructure_errors = BTreeMap::<CellId, usize>::new();
+    let mut repeated_prerequisite_failures = BTreeMap::<CellId, usize>::new();
+    let mut repeated_no_results = BTreeMap::<CellId, usize>::new();
+    let mut repeated_mixed = BTreeMap::<CellId, usize>::new();
+    let mut repeated_missing = BTreeMap::<CellId, usize>::new();
+    let mut repeated_observed = BTreeMap::<CellId, usize>::new();
     let mut repeated_totals = BTreeMap::<CellId, usize>::new();
     let mut retried_by_cell = BTreeMap::<CellId, usize>::new();
     let mut retried_repetitions = 0usize;
@@ -4329,6 +4664,39 @@ fn summarize(
             let proven_oom = is_proven_oom_attempt(runner, harness_status);
             let proven_timeout = is_proven_timeout_attempt(runner, harness_status);
             let result_file = cell_dir.join("results.jsonl");
+            let result_file_size = if result_file.is_file() {
+                Some(result_file.metadata().map_err(|error| {
+                    format!("cannot inspect result file {}: {error}", result_file.display())
+                })?.len())
+            } else {
+                None
+            };
+            let prepared_empty_result_file = result_file_size == Some(0);
+            let rejected_result_history = result_file_size.is_some_and(|size| size > 0);
+            let retained_prerequisite = if prepared_empty_result_file {
+                match retained_host_inapplicable(&cell_dir, cell) {
+                    Ok(true)
+                        if harness_status.is_some_and(|status| status != 0)
+                            && runner_observed_terminal_attempt(runner, harness_status) =>
+                    {
+                        true
+                    }
+                    Ok(true) => {
+                        evidence_errors.push(format!(
+                            "{} records host-inapplicable without a matching completed scheduler node",
+                            cell_dir.join("summary.json").display()
+                        ));
+                        false
+                    }
+                    Ok(false) => false,
+                    Err(error) => {
+                        evidence_errors.push(error);
+                        false
+                    }
+                }
+            } else {
+                false
+            };
             let mut observations = Vec::new();
             let mut result_rows_for_history = Vec::new();
             let (
@@ -4341,7 +4709,31 @@ fn summarize(
                 attempt,
                 invocation,
                 artifact_dir,
-            ) = if result_file.is_file() {
+            ) = if retained_prerequisite {
+                (
+                    "HOST-INAPPLICABLE".to_string(),
+                    false,
+                    None,
+                    None,
+                    None,
+                    Some(FailureClass::UnderstoodPrerequisiteFailure),
+                    1,
+                    None,
+                    None,
+                )
+            } else if prepared_empty_result_file && (proven_oom || proven_timeout) {
+                (
+                    "NO_RESULT".to_string(),
+                    false,
+                    None,
+                    None,
+                    None,
+                    Some(FailureClass::NoResult),
+                    1,
+                    None,
+                    None,
+                )
+            } else if result_file.is_file() {
                 match read_result_rows(&result_file) {
                     Ok(result_rows) => {
                         observations = result_rows
@@ -4479,7 +4871,7 @@ fn summarize(
                         )
                     }
                 }
-            } else if !proven_oom && !proven_timeout {
+            } else if !proven_oom && !proven_timeout && !retained_prerequisite {
                 evidence_errors.push(format!("missing result row {}", result_file.display()));
                 (
                     "NO_RESULT".to_string(),
@@ -4511,7 +4903,8 @@ fn summarize(
                     Ok(None)
                         if matches!(cell.mode.as_str(), "verify" | "replay")
                             && !proven_oom
-                            && !proven_timeout =>
+                            && !proven_timeout
+                            && !retained_prerequisite =>
                     {
                         evidence_errors.push(format!(
                             "missing verification report {}",
@@ -4571,7 +4964,11 @@ fn summarize(
                 evidence_errors
                     .push("terminal ptrace verify result has no normalized golden INFO log".into());
             }
-            if invocation.is_none() {
+            if invocation.is_none()
+                && !retained_prerequisite
+                && !proven_timeout
+                && !proven_oom
+            {
                 evidence_errors.push("selected result has no complete recorded invocation".into());
             }
             let derived_result = classify_result(
@@ -4589,7 +4986,11 @@ fn summarize(
             // The older pressure classifier remains only to read retained
             // pre-field rows and to refuse disagreement; it is no longer the
             // authority that reconstructs a current result after execution.
-            let mut result = derived_result;
+            let mut result = if retained_prerequisite {
+                "prerequisite-failure"
+            } else {
+                derived_result
+            };
             if row_valid && evidence_errors.is_empty() {
                 if let Some(recorded_result) = recorded_result {
                     if recorded_result.as_str() != derived_result {
@@ -4634,13 +5035,58 @@ fn summarize(
                 if result == "pass" {
                     *repeated_terminal_passes.entry(cell.clone()).or_default() += 1;
                 }
-                if repetition_passed_cleanly(result, &result_rows_for_history) {
+                let qualifying_pass = recorded_result == Some(ObservedResult::Pass)
+                    && failure_class.is_none()
+                    && evidence_errors.is_empty()
+                    && repetition_passed_cleanly(result, &result_rows_for_history);
+                if qualifying_pass {
                     *repeated_clean_passes.entry(cell.clone()).or_default() += 1;
                 }
-                if result == "infrastructure-error" {
-                    *repeated_infrastructure_errors
-                        .entry(cell.clone())
-                        .or_default() += 1;
+                if result == "pass" {
+                    *repeated_observed.entry(cell.clone()).or_default() += 1;
+                } else {
+                    let observed = match classify_nonpassing_repetition(
+                        result,
+                        &result_rows_for_history,
+                        row_valid,
+                        evidence_errors.is_empty(),
+                        rejected_result_history,
+                        proven_timeout,
+                        proven_oom,
+                        retained_prerequisite,
+                    ) {
+                        RepetitionClassification::ProductFailure => {
+                            *repeated_product_failures.entry(cell.clone()).or_default() += 1;
+                            true
+                        }
+                        RepetitionClassification::InfrastructureFailure => {
+                            *repeated_infrastructure_errors
+                                .entry(cell.clone())
+                                .or_default() += 1;
+                            true
+                        }
+                        RepetitionClassification::PrerequisiteFailure => {
+                            *repeated_prerequisite_failures
+                                .entry(cell.clone())
+                                .or_default() += 1;
+                            true
+                        }
+                        RepetitionClassification::NoResult => {
+                            *repeated_no_results.entry(cell.clone()).or_default() += 1;
+                            true
+                        }
+                        RepetitionClassification::Mixed => {
+                            *repeated_mixed.entry(cell.clone()).or_default() += 1;
+                            true
+                        }
+                        RepetitionClassification::Missing => {
+                            *repeated_missing.entry(cell.clone()).or_default() += 1;
+                            false
+                        }
+                    };
+                    if observed {
+                        *repeated_observed.entry(cell.clone()).or_default() += 1;
+                    }
                 }
                 if retained_attempts > 1 {
                     retried_repetitions = retried_repetitions
@@ -4846,6 +5292,25 @@ fn summarize(
     let repeated_terminal_pass_count: usize = repeated_terminal_passes.values().sum();
     let repeated_clean_pass_count: usize = repeated_clean_passes.values().sum();
     let repeated_total_count: usize = repeated_totals.values().sum();
+    let counts_for = |cell: &CellId| RepeatedOutcomeCounts {
+        expected_repetitions: metadata.repetitions.unwrap_or(0),
+        observed_repetitions: repeated_observed.get(cell).copied().unwrap_or(0),
+        qualifying_passes: repeated_clean_passes.get(cell).copied().unwrap_or(0),
+        terminal_passes: repeated_terminal_passes.get(cell).copied().unwrap_or(0),
+        product_failures: repeated_product_failures.get(cell).copied().unwrap_or(0),
+        infrastructure_failures: repeated_infrastructure_errors
+            .get(cell)
+            .copied()
+            .unwrap_or(0),
+        prerequisite_failures: repeated_prerequisite_failures
+            .get(cell)
+            .copied()
+            .unwrap_or(0),
+        no_results: repeated_no_results.get(cell).copied().unwrap_or(0),
+        mixed_repetitions: repeated_mixed.get(cell).copied().unwrap_or(0),
+        missing_repetitions: repeated_missing.get(cell).copied().unwrap_or(0),
+        retried_repetitions: retried_by_cell.get(cell).copied().unwrap_or(0),
+    };
     let repeated_result = if metadata.repetitions.is_some() && metadata.is_exact() {
         let cell = &metadata.cells[0];
         let terminal_passes = repeated_terminal_passes.get(cell).copied().unwrap_or(0);
@@ -4864,28 +5329,16 @@ fn summarize(
             retried,
             total,
         );
+        let counts = counts_for(cell);
+        let classification = classify_pressure_sample(counts);
         println!(
-            "{}",
-            repeated_summary_line(
-                &metadata,
-                terminal_passes,
-                clean_passes,
-                infrastructure_errors,
-                retried,
-                total,
-            )
+            "Repeated result: {terminal_passes}/{total} terminally passed; {clean_passes}/{total} qualified; classification {}.",
+            classification.as_str()
         );
-        repeated_cells.push(repeated_cell_summary(
-            cell,
-            terminal_passes,
-            clean_passes,
-            retried,
-            total,
-            result,
-        ));
+        repeated_cells.push(repeated_cell_summary(cell, counts, result));
         Some(result)
     } else if metadata.repetitions.is_some() {
-        println!("| Cell | Terminal passes | Clean passes | Result |");
+        println!("| Cell | Terminal passes | Qualifying passes | Classification |");
         println!("| --- | ---: | ---: | --- |");
         for cell in &metadata.cells {
             let terminal_passes = repeated_terminal_passes.get(cell).copied().unwrap_or(0);
@@ -4903,18 +5356,14 @@ fn summarize(
                 retried,
                 total,
             );
+            let counts = counts_for(cell);
+            let classification = classify_pressure_sample(counts);
             println!(
-                "| `{}` | {terminal_passes}/{total} | {clean_passes}/{total} | {result} |",
-                display_id(cell)
+                "| `{}` | {terminal_passes}/{total} | {clean_passes}/{total} | {} |",
+                display_id(cell),
+                classification.as_str(),
             );
-            repeated_cells.push(repeated_cell_summary(
-                cell,
-                terminal_passes,
-                clean_passes,
-                retried,
-                total,
-                result,
-            ));
+            repeated_cells.push(repeated_cell_summary(cell, counts, result));
         }
         println!();
         let infrastructure_errors: usize = repeated_infrastructure_errors.values().sum();
@@ -7575,6 +8024,94 @@ fn self_test(root: &Path) -> Result<(), String> {
                 .into(),
         );
     }
+    let sample_counts = |qualifying_passes,
+                         terminal_passes,
+                         product_failures,
+                         infrastructure_failures,
+                         prerequisite_failures,
+                         no_results,
+                         missing_repetitions,
+                         retried_repetitions| RepeatedOutcomeCounts {
+        expected_repetitions: PROMOTION_REPETITIONS,
+        observed_repetitions: PROMOTION_REPETITIONS - missing_repetitions,
+        qualifying_passes,
+        terminal_passes,
+        product_failures,
+        infrastructure_failures,
+        prerequisite_failures,
+        no_results,
+        mixed_repetitions: 0,
+        missing_repetitions,
+        retried_repetitions,
+    };
+    let promotion_cases = [
+        (
+            sample_counts(10, 10, 0, 0, 0, 0, 0, 0),
+            PressureSampleClassification::PromotionCandidate,
+        ),
+        (
+            sample_counts(1, 1, 9, 0, 0, 0, 0, 0),
+            PressureSampleClassification::Intermittent,
+        ),
+        (
+            sample_counts(9, 9, 1, 0, 0, 0, 0, 0),
+            PressureSampleClassification::Intermittent,
+        ),
+        (
+            sample_counts(9, 10, 0, 0, 0, 0, 0, 1),
+            PressureSampleClassification::Intermittent,
+        ),
+        (
+            sample_counts(0, 0, 10, 0, 0, 0, 0, 0),
+            PressureSampleClassification::ConfirmedFailing,
+        ),
+        (
+            sample_counts(0, 0, 0, 10, 0, 0, 0, 0),
+            PressureSampleClassification::InfrastructureFailure,
+        ),
+        (
+            sample_counts(0, 0, 0, 0, 10, 0, 0, 0),
+            PressureSampleClassification::PrerequisiteFailure,
+        ),
+        (
+            sample_counts(0, 0, 0, 0, 0, 10, 0, 0),
+            PressureSampleClassification::NoResult,
+        ),
+        (
+            sample_counts(0, 0, 9, 1, 0, 0, 0, 0),
+            PressureSampleClassification::Incomplete,
+        ),
+        (
+            sample_counts(9, 9, 0, 0, 0, 0, 1, 0),
+            PressureSampleClassification::Incomplete,
+        ),
+    ];
+    if promotion_cases
+        .iter()
+        .any(|(counts, expected)| classify_pressure_sample(*counts) != *expected)
+    {
+        return Err(format!(
+            "pressure sample classification changed unexpectedly: {promotion_cases:?}"
+        ));
+    }
+    let duplicate_attempt_count = RepeatedOutcomeCounts {
+        observed_repetitions: PROMOTION_REPETITIONS,
+        terminal_passes: PROMOTION_REPETITIONS + 1,
+        qualifying_passes: PROMOTION_REPETITIONS,
+        ..sample_counts(0, 0, 0, 0, 0, 0, 0, 0)
+    };
+    if classify_pressure_sample(duplicate_attempt_count)
+        != PressureSampleClassification::Incomplete
+    {
+        return Err("duplicate attempt accounting produced a promotion candidate".into());
+    }
+    let all_mixed = RepeatedOutcomeCounts {
+        mixed_repetitions: PROMOTION_REPETITIONS,
+        ..sample_counts(0, 0, 0, 0, 0, 0, 0, 0)
+    };
+    if classify_pressure_sample(all_mixed) != PressureSampleClassification::Incomplete {
+        return Err("mixed repetition outcomes produced a product classification".into());
+    }
     let sample_a = CellId {
         lane: "portable".into(),
         category: "sample".into(),
@@ -7822,6 +8359,162 @@ fn self_test(root: &Path) -> Result<(), String> {
             "classification disagreement did not fail by name: {error}"
         ));
     }
+    for nonproduct in [
+        FailureClass::UnderstoodInfrastructureFailure,
+        FailureClass::UnderstoodPrerequisiteFailure,
+        FailureClass::NoResult,
+    ] {
+        let mut mixed_retry = first_row.clone();
+        mixed_retry.attempt = 2;
+        mixed_retry.outcome = "ERROR".into();
+        mixed_retry.result = None;
+        mixed_retry.failure_class = Some(nonproduct);
+        if classify_nonpassing_repetition(
+            "determinism-failure",
+            &[first_row.clone(), mixed_retry],
+            true,
+            true,
+            true,
+            false,
+            false,
+            false,
+        ) != RepetitionClassification::Mixed
+        {
+            return Err(format!(
+                "product failure plus {nonproduct:?} retry was promoted to a terminal product classification"
+            ));
+        }
+    }
+    if classify_nonpassing_repetition(
+        "infrastructure-error",
+        &[],
+        false,
+        false,
+        true,
+        false,
+        false,
+        false,
+    ) != RepetitionClassification::Missing
+    {
+        return Err(
+            "a rejected duplicate, gapped, empty, or malformed result history counted as an observed infrastructure failure"
+                .into(),
+        );
+    }
+    for (proven_timeout, proven_oom) in [(true, false), (false, true)] {
+        if classify_nonpassing_repetition(
+            "infrastructure-error",
+            &[],
+            false,
+            false,
+            false,
+            proven_timeout,
+            proven_oom,
+            false,
+        ) != RepetitionClassification::NoResult
+        {
+            return Err(
+                "a proven timeout or OOM without a result row did not remain no-result".into(),
+            );
+        }
+        if classify_nonpassing_repetition(
+            "infrastructure-error",
+            &[],
+            false,
+            false,
+            true,
+            proven_timeout,
+            proven_oom,
+            false,
+        ) != RepetitionClassification::Missing
+        {
+            return Err(
+                "a malformed present result history was hidden by a proven timeout or OOM"
+                    .into(),
+            );
+        }
+        if classify_nonpassing_repetition(
+            "infrastructure-error",
+            &[first_row.clone()],
+            false,
+            false,
+            true,
+            proven_timeout,
+            proven_oom,
+            false,
+        ) != RepetitionClassification::Mixed
+        {
+            return Err(
+                "a retained product failure followed by a proven timeout or OOM was not kept mixed"
+                    .into(),
+            );
+        }
+    }
+    let host_inapplicable_dir = scratch.join("host-inapplicable-summary");
+    fs::create_dir_all(&host_inapplicable_dir)
+        .map_err(|e| format!("cannot create host-inapplicable summary fixture: {e}"))?;
+    fs::write(
+        host_inapplicable_dir.join("summary.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "cells": 1,
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "host_inapplicable": 1,
+            "cell_cpu_usage_usec": null,
+            "host_inapplicable_cells": [{
+                "test": sample_a.test,
+                "mode": sample_a.mode,
+                "backend": sample_a.backend,
+                "reason": "required host capability is unavailable",
+            }],
+        }))
+        .map_err(|e| format!("cannot encode host-inapplicable summary fixture: {e}"))?,
+    )
+    .map_err(|e| format!("cannot write host-inapplicable summary fixture: {e}"))?;
+    if !retained_host_inapplicable(&host_inapplicable_dir, &sample_a)?
+        || classify_nonpassing_repetition(
+            "prerequisite-failure",
+            &[],
+            false,
+            true,
+            false,
+            false,
+            false,
+            true,
+        ) != RepetitionClassification::PrerequisiteFailure
+    {
+        return Err(
+            "canonical host-inapplicable summary was not retained as a prerequisite failure"
+                .into(),
+        );
+    }
+    let mismatched_host_inapplicable_dir = scratch.join("mismatched-host-inapplicable-summary");
+    fs::create_dir_all(&mismatched_host_inapplicable_dir)
+        .map_err(|e| format!("cannot create mismatched host-inapplicable fixture: {e}"))?;
+    fs::write(
+        mismatched_host_inapplicable_dir.join("summary.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "cells": 1,
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "host_inapplicable": 1,
+            "host_inapplicable_cells": [{
+                "test": "foreign-cell",
+                "mode": sample_a.mode,
+                "backend": sample_a.backend,
+                "reason": "required host capability is unavailable",
+            }],
+        }))
+        .map_err(|e| format!("cannot encode mismatched host-inapplicable fixture: {e}"))?,
+    )
+    .map_err(|e| format!("cannot write mismatched host-inapplicable fixture: {e}"))?;
+    if retained_host_inapplicable(&mismatched_host_inapplicable_dir, &sample_a).is_ok() {
+        return Err("a host-inapplicable summary for a foreign cell was accepted".into());
+    }
     if retained_attempt_count(
         &appended,
         &sample_slug,
@@ -7989,12 +8682,175 @@ fn self_test(root: &Path) -> Result<(), String> {
             "production summarize lost fail-then-pass retry accounting: {summarize_json}"
         ));
     }
+
+    // HOST-INAPPLICABLE is deliberately withheld from results.jsonl by the
+    // manifest runner because no product attempt ran. Its one-cell harness
+    // summary is therefore the canonical retained prerequisite evidence.
+    let mut prerequisite_selection = summarize_retry_selection.clone();
+    prerequisite_selection.run_id_prefix = Some("summarize-prerequisite".into());
+    let prerequisite_results = scratch.join("summarize-prerequisite");
+    let (mut prerequisite_metadata, _) = write_plan_after_scorecard_check(
+        &checked_scorecard,
+        &prerequisite_results,
+        &prerequisite_results.join("dag.json"),
+        &prerequisite_selection,
+    )?;
+    prerequisite_metadata.source_tree_dirty = false;
+    fs::write(
+        prerequisite_results.join("run.json"),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&prerequisite_metadata)
+                .map_err(|e| format!("cannot encode prerequisite metadata: {e}"))?
+        ),
+    )
+    .map_err(|e| format!("cannot write prerequisite metadata: {e}"))?;
+    let prerequisite_slug = cell_run_slug(&summarize_retry.id, Some(1));
+    let prerequisite_cell_dir = prerequisite_results
+        .join("cells")
+        .join(&prerequisite_slug);
+    fs::create_dir_all(&prerequisite_cell_dir)
+        .map_err(|e| format!("cannot create prerequisite fixture: {e}"))?;
+    fs::write(prerequisite_cell_dir.join("harness-status"), "1\n")
+        .map_err(|e| format!("cannot write prerequisite harness status: {e}"))?;
+    fs::write(prerequisite_cell_dir.join("results.jsonl"), "")
+        .map_err(|e| format!("cannot prepare empty prerequisite result file: {e}"))?;
+    fs::write(
+        prerequisite_cell_dir.join("summary.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": 1,
+            "cells": 1,
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "host_inapplicable": 1,
+            "cell_cpu_usage_usec": null,
+            "host_inapplicable_cells": [{
+                "test": summarize_retry.id.test,
+                "mode": summarize_retry.id.mode,
+                "backend": summarize_retry.id.backend,
+                "reason": "required host capability is unavailable",
+            }],
+        }))
+        .map_err(|e| format!("cannot encode prerequisite harness summary: {e}"))?,
+    )
+    .map_err(|e| format!("cannot write prerequisite harness summary: {e}"))?;
+    let prerequisite_runner = BTreeMap::from([(
+        format!("cell.{prerequisite_slug}"),
+        runner_failed,
+    )]);
+    summarize(
+        root,
+        &prerequisite_results,
+        false,
+        Some(&prerequisite_runner),
+    )?;
+    let prerequisite_json: JsonValue = serde_json::from_str(
+        &fs::read_to_string(prerequisite_results.join("summary.json"))
+            .map_err(|e| format!("cannot read production prerequisite summary: {e}"))?,
+    )
+    .map_err(|e| format!("cannot parse production prerequisite summary: {e}"))?;
+    let prerequisite_cell = prerequisite_json
+        .get("repeated_cells")
+        .and_then(JsonValue::as_array)
+        .and_then(|cells| cells.first())
+        .ok_or("production prerequisite summary lost its repeated cell")?;
+    if prerequisite_json["attempted"] != 1
+        || prerequisite_cell["observed_repetitions"] != 1
+        || prerequisite_cell["prerequisite_failures"] != 1
+        || prerequisite_cell["missing_repetitions"] != 0
+        || prerequisite_cell["classification"] != "incomplete"
+        || prerequisite_cell["promotion_candidate"] != false
+    {
+        return Err(format!(
+            "production summarize did not preserve host-inapplicable prerequisite evidence: {prerequisite_json}"
+        ));
+    }
+
+    let summarize_empty_terminal =
+        |name: &str, runner: RunnerEvidence, status: i32| -> Result<JsonValue, String> {
+            let mut selection = summarize_retry_selection.clone();
+            selection.run_id_prefix = Some(name.into());
+            let result_dir = scratch.join(name);
+            let (mut metadata, _) = write_plan_after_scorecard_check(
+                &checked_scorecard,
+                &result_dir,
+                &result_dir.join("dag.json"),
+                &selection,
+            )?;
+            metadata.source_tree_dirty = false;
+            fs::write(
+                result_dir.join("run.json"),
+                format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&metadata)
+                        .map_err(|e| format!("cannot encode {name} metadata: {e}"))?
+                ),
+            )
+            .map_err(|e| format!("cannot write {name} metadata: {e}"))?;
+            let slug = cell_run_slug(&summarize_retry.id, Some(1));
+            let cell_dir = result_dir.join("cells").join(&slug);
+            fs::create_dir_all(&cell_dir)
+                .map_err(|e| format!("cannot create {name} fixture: {e}"))?;
+            fs::write(cell_dir.join("harness-status"), format!("{status}\n"))
+                .map_err(|e| format!("cannot write {name} harness status: {e}"))?;
+            fs::write(cell_dir.join("results.jsonl"), "")
+                .map_err(|e| format!("cannot prepare empty {name} result file: {e}"))?;
+            let runner_evidence = BTreeMap::from([(format!("cell.{slug}"), runner)]);
+            summarize(root, &result_dir, false, Some(&runner_evidence))?;
+            serde_json::from_str(
+                &fs::read_to_string(result_dir.join("summary.json"))
+                    .map_err(|e| format!("cannot read production {name} summary: {e}"))?,
+            )
+            .map_err(|e| format!("cannot parse production {name} summary: {e}"))
+        };
+    for (name, runner, status) in [
+        (
+            "summarize-empty-timeout",
+            runner_timeout,
+            INCOMPLETE_ATTEMPT_STATUS,
+        ),
+        ("summarize-empty-oom", runner_oom, 137),
+    ] {
+        let terminal_json = summarize_empty_terminal(name, runner, status)?;
+        let terminal_cell = terminal_json
+            .get("repeated_cells")
+            .and_then(JsonValue::as_array)
+            .and_then(|cells| cells.first())
+            .ok_or_else(|| format!("production {name} summary lost its repeated cell"))?;
+        if terminal_json["attempted"] != 1
+            || terminal_cell["observed_repetitions"] != 1
+            || terminal_cell["no_results"] != 1
+            || terminal_cell["missing_repetitions"] != 0
+            || terminal_cell["classification"] != "incomplete"
+            || terminal_cell["promotion_candidate"] != false
+        {
+            return Err(format!(
+                "production summarize did not preserve empty-file {name} no-result evidence: {terminal_json}"
+            ));
+        }
+    }
     let mut one_pass = second_row.clone();
     one_pass.attempt = 1;
     if !repetition_passed_cleanly("pass", &[one_pass]) {
         return Err("a one-attempt passing repetition was not counted as passed".into());
     }
-    let retry_summary = repeated_cell_summary(&sample_a, 2, 1, 1, 2, "flaky");
+    let repeated_counts = |expected, terminal, qualifying, product, retried| {
+        RepeatedOutcomeCounts {
+            expected_repetitions: expected,
+            observed_repetitions: expected,
+            qualifying_passes: qualifying,
+            terminal_passes: terminal,
+            product_failures: product,
+            retried_repetitions: retried,
+            ..RepeatedOutcomeCounts::default()
+        }
+    };
+    let retry_summary = repeated_cell_summary(
+        &sample_a,
+        repeated_counts(2, 2, 1, 0, 1),
+        "flaky",
+    );
     if retry_summary["passes"] != 2
         || retry_summary["clean_passes"] != 1
         || retry_summary["retried_repetitions"] != 1
@@ -8003,10 +8859,21 @@ fn self_test(root: &Path) -> Result<(), String> {
     {
         return Err("repeated-cell JSON lost pass, retry, total, or result accounting".into());
     }
-    let one_recovered = repeated_cell_summary(&sample_a, 1, 0, 1, 1, "flaky");
-    let all_recovered = repeated_cell_summary(&sample_a, 2, 0, 2, 2, "flaky");
-    let all_terminal_failures =
-        repeated_cell_summary(&sample_a, 0, 0, 2, 2, "failed every repetition");
+    let one_recovered = repeated_cell_summary(
+        &sample_a,
+        repeated_counts(1, 1, 0, 0, 1),
+        "flaky",
+    );
+    let all_recovered = repeated_cell_summary(
+        &sample_a,
+        repeated_counts(2, 2, 0, 0, 2),
+        "flaky",
+    );
+    let all_terminal_failures = repeated_cell_summary(
+        &sample_a,
+        repeated_counts(2, 0, 0, 2, 2),
+        "failed every repetition",
+    );
     let exact_recovered_json = json!({
         "probe_disabled": false,
         "attempted": 2,
@@ -8148,7 +9015,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .remove("retried_repetitions");
     let mut wrong_attempt_count = summary_accounting.clone();
     wrong_attempt_count["attempted"] = json!(2);
-    let mut incomplete_cell = summary_accounting;
+    let mut incomplete_cell = summary_accounting.clone();
     incomplete_cell["repeated_cells"][0]
         .as_object_mut()
         .expect("repeated-cell fixture is an object")
@@ -8156,11 +9023,15 @@ fn self_test(root: &Path) -> Result<(), String> {
     let mut impossible_cell = missing_retry_count.clone();
     impossible_cell["retried_repetitions"] = json!(1);
     impossible_cell["repeated_cells"][0]["retried_repetitions"] = json!(3);
+    let mut forged_promotion = summary_accounting.clone();
+    forged_promotion["repeated_cells"][0]["classification"] = json!("promotion-candidate");
+    forged_promotion["repeated_cells"][0]["promotion_candidate"] = json!(true);
     if verify_repetition_summary_json(&missing_population_identity, 3, 1).is_ok()
         || verify_repetition_summary_json(&missing_retry_count, 3, 1).is_ok()
         || verify_repetition_summary_json(&wrong_attempt_count, 3, 1).is_ok()
         || verify_repetition_summary_json(&incomplete_cell, 3, 1).is_ok()
         || verify_repetition_summary_json(&impossible_cell, 3, 1).is_ok()
+        || verify_repetition_summary_json(&forged_promotion, 3, 1).is_ok()
     {
         return Err("mutated repetition-accounting JSON was accepted".into());
     }
