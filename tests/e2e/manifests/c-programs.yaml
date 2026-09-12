@@ -6927,6 +6927,68 @@ test:
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: c-programs/record-replay-file-state-regular-sink
+    description: Strict verification for tests/c/record_replay_file_state_regular_sink.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/record_replay_file_state_regular_sink.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - sabre
+        backends_disabled:
+          dbt: Regular-file sendfile variant has not been qualified on DBT
+          kvm: Regular-file sendfile variant has not been qualified on KVM
+          liteinst: Regular-file sendfile variant has not been qualified on LiteInst
+      naked:
+        ci: false
+        ci_disabled_reason: This fixture asserts repeatable file-state behavior under verification; it has no native nondeterminism oracle.
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: This added regular-file sink is qualified for verify only; record/replay has not been measured.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: This fixture has no schedule-diversity oracle; verify owns its file-state assertions.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        ci_disabled_reason: The regular-file sink is a separately named verify fixture and has no additional custom argument case.
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
   - id: c-programs/record-replay-lseek-seek-cur
     description: Strict verification for tests/c/record_replay_lseek_seek_cur.c
     lane: portable

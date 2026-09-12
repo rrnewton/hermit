@@ -3659,6 +3659,12 @@
       "path": "tests/e2e/performance/yield-storm.c",
       "runner": "outer dev-hermit compat-envelope/collect-fullcorpus.sh",
       "why": "tests/e2e/performance/yield-storm.c is owned by the outer dev-hermit compat-envelope/collect-fullcorpus.sh runner: this wrapper selects the yield-storm workload from steady_state_common.c and is compiled as the performance/yield-storm cell in the 235-cell compatibility corpus. Hermit's manifest plan does not schedule it."
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/record_replay_file_state_regular_sink.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "Separate regular-file sendfile variant preserves unlinked-source and FICLONE byte checks; the original stdout-destination fixture remains independently declared."
     }
   ],
   "schema": 2
