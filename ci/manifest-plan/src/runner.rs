@@ -4567,11 +4567,24 @@ mod tests {
                 ..Selection::default()
             })
             .unwrap();
+        // https://github.com/rrnewton/hermit/pull/2425 adds these two qualified
+        // cells after the frozen calibration. Keep their identities explicit
+        // without changing the historical population or timeout overrides.
+        let regular_sink = required
+            .iter()
+            .filter(|cell| cell.id.test == "c-programs/record-replay-file-state-regular-sink")
+            .map(|cell| (cell.id.mode.as_str(), cell.id.backend.as_deref()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            regular_sink,
+            BTreeSet::from([("verify", Some("ptrace")), ("verify", Some("sabre"))])
+        );
         assert_eq!(
             required.len(),
             CALIBRATED_CI_CELL_COUNT + KVM_RATCHET_CI_CELL_COUNT - KVM_RUN_1709_CI_REMOVAL_COUNT
                 + KVM_PINNED_IMAGE_QUALIFIED_CI_CELL_COUNT
                 + KVM_NEXT40_QUALIFIED_CI_CELL_COUNT
+                + 2
         );
         assert_eq!(
             enabled.len() - required.len(),
