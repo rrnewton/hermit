@@ -96,7 +96,7 @@
   later groups added the two-blocked-writer check, six signal/partial-write
   checks, or both. Commit `d04efc883640ff111781c6f324e3ed10c60f52ad`
   adds the signal/partial-write cases to the default path, and
-  `9c4ae3e02c5ddd4f9d72ac43971ac26305ae48f3` adds the two-blocked-writer
+  `c4bdf4d4d366931f9f1778a6f7325aaffd3dd95d` adds the two-blocked-writer
   check. Their larger stable scheduler-turn and syscall counts are direct
   evidence that the later fixture versions intentionally execute more work.
 - Build and accounting: full validate invokes this bucket with `--prebuilt`.
