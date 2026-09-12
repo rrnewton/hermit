@@ -23,11 +23,13 @@
 # Read-only is the right default for a one-shot command; it is not a property
 # the test phase can satisfy.
 #
-# --cargo-home mounts an already-populated CARGO_HOME. The test phase has no
-# network BY DESIGN, so cargo must find its registry and git database already
-# present or it cannot even resolve the dependency graph. This is the local
-# equivalent of the shard jobs' `Swatinem/rust-cache` restore, not a workaround:
-# in both cases the cache is an input carried across the phase boundary.
+# --cargo-home mounts the registry and git caches from an already-populated
+# CARGO_HOME. The test phase has no network BY DESIGN, so cargo must find those
+# caches already present or it cannot even resolve the dependency graph. Host
+# executables and configuration are deliberately not mounted: the image owns
+# its toolchain and network policy. This is the local equivalent of the shard
+# jobs' `Swatinem/rust-cache` restore, not a workaround: in both cases the cache
+# is an input carried across the phase boundary.
 #
 # DAGRUN_TEST_COUNTS_PATH is scheduler-owned on the host. When requested through
 # --env, its parent directory is mounted at /dagrun-test-counts and the child is
@@ -115,8 +117,19 @@ if [[ -n "$cargo_home" ]]; then
         echo "  to populate it from. Run the build phase first." >&2
         exit 2
     }
-    cargo_mount=(--mount "type=bind,source=$cargo_home,destination=/cargo")
-    cargo_home_in=/cargo
+    # A host Cargo home also contains installed executables and configuration.
+    # Mounting it whole made `cargo clippy` select the host's rustup proxy and
+    # try to update the moving `nightly` channel through the intentionally
+    # disabled network, even though the image carries its own pinned clippy.
+    # Import only dependency caches into a separate Cargo home so `/bin` remains
+    # the sole source of Cargo subcommands in the pinned root.
+    mkdir -p "$out/home/.cargo"
+    for cache in registry git; do
+        if [[ -d "$cargo_home/$cache" ]]; then
+            mkdir -p "$out/home/.cargo/$cache"
+            cargo_mount+=(--mount "type=bind,source=$cargo_home/$cache,destination=/build/.cargo/$cache")
+        fi
+    done
 fi
 
 env_args=()

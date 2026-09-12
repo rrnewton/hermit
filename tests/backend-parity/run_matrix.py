@@ -28,6 +28,8 @@ VERIFICATION_REPORT_BIN = Path(
 )
 BACKENDS = ("ptrace", "dbt", "kvm")
 RUNS = 3
+ISOLATED_WORKDIR_ENV = "HERMIT_E2E_EMPTY_WORKDIR"
+HERMETIC_TEST_WORKDIR = "/test"
 
 DBT_PRIVATE_TMP_SCRIPT = """\
 private_tmp=$1
@@ -266,6 +268,18 @@ DEFAULT_VERIFY_POLICY = VerifyPolicy.checked(
 
 class MatrixError(Exception):
     """An invalid case catalog or failed regression contract."""
+
+
+def hermetic_test_workdir() -> str | None:
+    """Return the pinned-root workdir, refusing any unrecognised request."""
+    value = os.environ.get(ISOLATED_WORKDIR_ENV)
+    if value is None:
+        return None
+    if value != HERMETIC_TEST_WORKDIR:
+        raise MatrixError(
+            f"{ISOLATED_WORKDIR_ENV} must be {HERMETIC_TEST_WORKDIR}, got {value}"
+        )
+    return value
 
 
 def tmp_destination(path: Path, host_tmp: Path) -> tuple[Path, Path] | None:
@@ -716,6 +730,8 @@ def backend_block(backend: str, hermit: Path, strict: bool) -> str | None:
         smoke_command = [str(hermit), "run", "--backend", "dbt"]
         if strict:
             smoke_command.append("--strict")
+        if workdir := hermetic_test_workdir():
+            smoke_command.extend(["--base-env=minimal", f"--workdir={workdir}"])
         smoke_command.extend(["--", "/bin/true"])
         try:
             smoke = subprocess.run(
@@ -777,6 +793,8 @@ def hermit_command(
         # fixed /tmp names are isolated even when the guest ignores TMPDIR.
         command.append("--tmp=/tmp")
         command.append("--env=TMPDIR=/tmp")
+        if workdir := hermetic_test_workdir():
+            command.append(f"--workdir={workdir}")
     else:
         command.append(f"--tmp={host_tmp}")
     if backend == "ptrace" and name != "cpuid_policy":

@@ -850,7 +850,7 @@ pub fn validate_mode_workdir(
     id: &str,
     mode: &str,
     workdir: Option<&str>,
-    backends_enabled: &[String],
+    _backends_enabled: &[String],
 ) -> Result<(), String> {
     let Some(workdir) = workdir else {
         return Ok(());
@@ -863,20 +863,11 @@ pub fn validate_mode_workdir(
     if !Path::new(workdir).is_absolute() {
         return Err(format!("{id}: {mode} workdir must be an absolute path"));
     }
-    // The pinned DBT launcher preserves Command::current_dir, but it does not
-    // enter Hermit's container and therefore cannot see a workdir supplied by
-    // Hermit's mount namespace. Refuse until the requested path is established
-    // in the namespace the DBT guest actually uses.
-    if backends_enabled.iter().any(|backend| backend == "dbt") {
-        return Err(format!(
-            "{id}: {mode} workdir is unsupported when DBT is enabled because DBT does not enter the Hermit mount namespace"
-        ));
-    }
     Ok(())
 }
 
-fn supports_test_workdir(mode: &str, backend: &str) -> bool {
-    matches!(mode, "verify" | "replay" | "chaos" | "custom") && backend != "dbt"
+fn supports_test_workdir(mode: &str, _backend: &str) -> bool {
+    matches!(mode, "verify" | "replay" | "chaos" | "custom")
 }
 
 fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
@@ -2037,6 +2028,7 @@ pub fn build_spec(
             }
             append_execution_root_args(
                 &mut argv,
+                backend,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
                 bound_workdir_source,
@@ -2074,6 +2066,7 @@ pub fn build_spec(
             ]);
             append_execution_root_args(
                 &mut argv,
+                backend,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
                 bound_workdir_source,
@@ -2109,6 +2102,7 @@ pub fn build_spec(
             ]);
             append_execution_root_args(
                 &mut argv,
+                backend,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
                 bound_workdir_source,
@@ -2136,6 +2130,7 @@ pub fn build_spec(
             }
             append_execution_root_args(
                 &mut argv,
+                backend,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
                 bound_workdir_source,
@@ -3919,12 +3914,19 @@ fn require_minimal_base_env(argv: &mut Vec<String>) -> Result<(), String> {
 ///      per-attempt directory at `/tmp/test`.
 fn append_execution_root_args(
     argv: &mut Vec<String>,
+    backend: &str,
     isolated_workdir: Option<&Path>,
     requested_workdir: Option<&str>,
     fixed_workdir_source: Option<&Path>,
 ) {
     if let Some(workdir) = isolated_workdir {
-        argv.push(format!("--mount=type=tmpfs,target={}", workdir.display()));
+        // DBT runs in the outer pinned root rather than Hermit's mount namespace.
+        // That root already supplies a private tmpfs at /test, so only pass the
+        // working directory through to DynamoRIO. Other backends create their
+        // per-invocation tmpfs here.
+        if backend != "dbt" {
+            argv.push(format!("--mount=type=tmpfs,target={}", workdir.display()));
+        }
         argv.extend(["--workdir".into(), workdir.to_string_lossy().into_owned()]);
     } else if let Some(workdir) = requested_workdir {
         // Outside the explicit hermetic path, a manifest that names its own
@@ -5495,7 +5497,7 @@ backends_disabled:
     }
 
     #[test]
-    fn workdir_accepts_ptrace_and_rejects_dbt_or_mixed_modes() {
+    fn workdir_accepts_every_hermit_run_backend() {
         let ptrace = vec!["ptrace".into()];
         assert_eq!(
             validate_mode_workdir("fixture/test", "verify", Some("/tmp"), &ptrace),
@@ -5505,11 +5507,8 @@ backends_disabled:
         for mode in ["verify", "chaos", "custom"] {
             for backends in [vec!["dbt".into()], vec!["ptrace".into(), "dbt".into()]] {
                 assert_eq!(
-                    validate_mode_workdir("fixture/test", mode, Some("/tmp"), &backends)
-                        .unwrap_err(),
-                    format!(
-                        "fixture/test: {mode} workdir is unsupported when DBT is enabled because DBT does not enter the Hermit mount namespace"
-                    )
+                    validate_mode_workdir("fixture/test", mode, Some("/tmp"), &backends),
+                    Ok(())
                 );
             }
         }
@@ -7587,7 +7586,7 @@ backends_disabled:
     fn fixed_workdir_is_bound_by_default_and_withheld_where_it_would_lie() {
         let source = Path::new("/cells/x/workdir/attempt-7");
         let mut argv: Vec<String> = Vec::new();
-        append_execution_root_args(&mut argv, None, None, Some(source));
+        append_execution_root_args(&mut argv, "ptrace", None, None, Some(source));
         assert_eq!(
             argv,
             vec![
@@ -7599,11 +7598,11 @@ backends_disabled:
         );
 
         let mut argv: Vec<String> = Vec::new();
-        append_execution_root_args(&mut argv, None, Some("/tmp"), Some(source));
+        append_execution_root_args(&mut argv, "ptrace", None, Some("/tmp"), Some(source));
         assert_eq!(argv, vec!["--workdir".to_string(), "/tmp".to_string()]);
 
         let mut argv: Vec<String> = Vec::new();
-        append_execution_root_args(&mut argv, None, None, None);
+        append_execution_root_args(&mut argv, "ptrace", None, None, None);
         assert!(
             argv.is_empty(),
             "a cell that cannot honour a workdir must be given none, got {argv:?}"
@@ -7615,6 +7614,7 @@ backends_disabled:
         let mut argv: Vec<String> = Vec::new();
         append_execution_root_args(
             &mut argv,
+            "ptrace",
             Some(Path::new(HERMETIC_TEST_WORKDIR)),
             Some("/tmp"),
             Some(Path::new("/cells/x/workdir/attempt-7")),
@@ -7632,15 +7632,29 @@ backends_disabled:
             !argv.iter().any(|arg| arg.starts_with("--bind")),
             "the ordinary-host bind leaked into the /test path: {argv:?}"
         );
+
+        let mut dbt_argv = Vec::new();
+        append_execution_root_args(
+            &mut dbt_argv,
+            "dbt",
+            Some(Path::new(HERMETIC_TEST_WORKDIR)),
+            None,
+            None,
+        );
+        assert_eq!(
+            dbt_argv,
+            vec!["--workdir".to_string(), HERMETIC_TEST_WORKDIR.to_string()],
+            "DBT must use the outer pinned root's /test without claiming a Hermit mount"
+        );
     }
 
     #[test]
     fn test_workdir_support_matches_the_modes_that_can_honour_it() {
         for mode in ["verify", "replay", "chaos", "custom"] {
             assert!(supports_test_workdir(mode, "ptrace"), "mode={mode}");
+            assert!(supports_test_workdir(mode, "dbt"), "mode={mode}");
         }
         assert!(!supports_test_workdir("naked", "native"));
-        assert!(!supports_test_workdir("verify", "dbt"));
     }
 
     #[test]

@@ -1,9 +1,12 @@
 # Hermetic validate - pinned root
 
-The canonical validate driver stays on the host and runs its build and test DAG
-nodes in the pinned root. This directory contains that runner, its locked fetch
-phase, and the v3 per-cell isolation contract. The older whole-split invocation
-remains available as an explicit diagnostic path.
+The canonical validate driver stays on the host. Its scheduled manifest cells,
+quick guest checks, working-envelope measurement, and dedicated LiteInst
+validation nodes run in the pinned root; other nodes remain on the host until
+their execution boundaries can satisfy the same contract. This directory
+contains that runner, its locked fetch phase, and the v3 per-cell isolation
+contract. The older whole-split invocation remains available as an explicit
+diagnostic path.
 
 ## What this is
 
@@ -47,8 +50,10 @@ The pinned-root path selects one canonical execution root for every Hermit cell:
 fresh private `tmpfs` mounted at `/test`, with the guest working directory set
 to `/test`. The outer podman root supplies an empty `/test` mountpoint; each
 verify, replay, chaos, or custom invocation overlays its own tmpfs there.
-A naked or DBT invocation fails closed because those paths cannot apply the
-mount. The default working directory and relative scratch namespace therefore
+A naked invocation fails closed because it cannot apply the mount. DBT uses
+the outer pinned root's private `/test` tmpfs and passes that directory through
+the DynamoRIO launcher; it does not claim to apply Hermit's mount namespace.
+The default working directory and relative scratch namespace therefore
 cannot observe files or directory metadata written by sibling cells, even when every
 cell uses the same relative names. The pinned-root validation nodes keep `/src`
 writable and shared for build products and repository fixtures;
@@ -67,6 +72,64 @@ receives null; a shell derives `PWD=/test` from `getcwd(2)`. No cell requires
 inherited `PWD`. Record and replay now accept the same base-environment, mount,
 and working-directory controls as `hermit run`, so replay cells obey the
 identical contract.
+
+The quick suite's guest-running checks, the working-envelope measurement, the
+dedicated `test.liteinst_strict` node, and the focused
+`--liteinst-compat-only` path also run in the pinned root. The DBT parity matrix
+runs there as well, as do `test.detcore_misc` and `test.detcore_parallel`.
+The in-process Detcore test helper applies the pinned-root `/test` request
+inside each tracee before its test closure runs. Portable strict compatibility
+is expanded into its ordinary direct `compat.*` nodes before those nodes and
+their fixture preparation are moved into the pinned root; it does not start a
+second validation scheduler. `test.applications_e2e`,
+`test.arbitrary_binaries`, and `test.command_strict_verify` run there too. The
+application helper replaces its ordinary private `/tmp` workdir with a private
+`/test` mount when the pinned-root marker is present; the scheduled
+arbitrary-binary run matrix and strict-command suite apply the same marker to
+each Hermit command. The ignored epoll and register-canonicalization regression
+tests do the same, and launch Hermit from their guest-artifact directories so
+verification's private summary remains visible when a source checkout itself
+is under host `/tmp`. Their executable inputs are built there. The direct quick
+smoke commands, the working-envelope probes, and every Hermit invocation owned
+by `liteinst_advanced` request `--base-env=minimal`, a private tmpfs at `/test`,
+and `/test` as their working directory. `test.hermit_integration`, `test.cli`,
+and `test.app_strict_verify` run in the pinned root as well. The portable CLI
+selection retains its existing KVM and DBT exclusions; the selected KVM CLI
+tests run in the pinned root on the privileged lane.
+
+The focused `test.rr_suite_contract` node also runs in the pinned root. Its one
+selected test checks scratch-directory creation and cleanup and does not launch
+a Hermit guest, so it has no guest working directory to change.
+
+The `test.sabre_examples` node runs in the pinned root and uses the SaBRe loader
+and Hermit binary built there. Every ptrace and SaBRe guest invocation receives
+the private `/test` mount and `/test` working directory; the controller keeps
+its retained comparison logs in the guest-visible target directory.
+
+The portable `test.hermit_modes` node also runs in the pinned root. Its shared
+Hermit command and each direct guest invocation apply the same exact `/test`
+request. The separately selected PMU Buck cases retain that contract on the
+privileged lane.
+
+The privileged CPUID-faulting check, PMU preemption check, and the six selected
+PMU Buck chaos cases run in the pinned root as well, with their test executable
+built there. The CPUID check uses the same in-process Detcore helper that enters
+`/test` before its tracee closure runs. The PMU check executes the repository's
+performance-counter probe rather than a Hermit guest, so it has no guest working
+directory to change. Each selected Buck chaos case gives its Hermit guest a
+private `/test` mount and `/test` working directory.
+
+The regular workspace crates, Hermit library and binary unit tests, and Detcore
+library and binary unit tests also run in the pinned root and consume its build
+artifact. Most of these are ordinary unit tests with no Hermit guest. The
+`detcore-testutils` cases included in the regular-crates node use the same
+`/test` request for their in-process tracees.
+
+This does not complete the every-test contract. Other host integration tests
+still need their Hermit invocations audited and staged.
+
+The exact environment retained on top of `--base-env=minimal` is a separate
+policy decision; this change does not alter it.
 
 The mount mechanism has a standalone control measurement, not an integrated
 Hermit-harness result. Two hundred live
@@ -89,6 +152,9 @@ Validate has **two phases with a network boundary between them**:
 |---|---|---|---|
 | **fetch** | the host | **yes** | `cargo fetch --locked` into a `CARGO_HOME`. Downloads only; produces no build output. |
 | **build and test** | the pinned root | **no** | each host-scheduled DAG node runs against that cache and the pinned toolchain. |
+
+Pinned test nodes use the image's `cargo-nextest` directly and do not depend on
+the host `setup.nextest` node or its network-install fallback.
 
 The network window is deliberately a **pure download**. That matters because
 `cargo fetch --locked` cannot introduce variance: every byte it writes is

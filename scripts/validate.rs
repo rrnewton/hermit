@@ -191,6 +191,7 @@ fn fused_privileged_test_build_command() -> String {
 
 const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     "CARGO_BUILD_JOBS",
+    "CI",
     STEP_STARTED_MONOTONIC_NS_ENV,
     "E2E_BUILD_ROOT",
     E2E_KERNEL_VERSION_ENV,
@@ -2366,7 +2367,7 @@ fn self_test() -> Result<(), String> {
         validate_receipt::self_test()?,
         validate_runtime::self_test()?,
         prebuilt_rust_script_plan_bracket()?,
-        pinned_root_plan_bracket()?,
+        pinned_root_plan_bracket(&root)?,
     ] {
         println!("  {line}");
     }
@@ -2911,6 +2912,20 @@ cleared-caps refusal names {} starved step(s)",
         // the dependency that fusion rewrites through gate.manifest.
         let mut pinned_full = build_plan(&root, &full_args, &tmp)?;
         apply_pinned_root(&mut pinned_full, &root, false)?;
+        for step in pinned_full
+            .cfg
+            .steps
+            .iter()
+            .filter(|step| pinned_root_test_step(step, pinned_full.compat))
+        {
+            if step.deps.iter().any(|dependency| dependency == "setup.nextest") {
+                return Err(format!(
+                    "full-plan bracket: pinned-root test {} still depends on host setup.nextest: {:?}",
+                    step.tag(),
+                    step.deps
+                ));
+            }
+        }
         let deps_of = |tag: &str| {
             pinned_full
                 .cfg
@@ -2936,9 +2951,160 @@ cleared-caps refusal names {} starved step(s)",
                 ));
             }
         }
+        let privileged_test_producer = pinned_full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "privileged-build.privileged_tests_in_pinned_root")
+            .ok_or(
+                "full-plan bracket: post-fusion pinned-root privileged-test producer disappeared",
+            )?;
+        if !privileged_test_producer
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+            || privileged_test_producer
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.e2e_artifact")
+        {
+            return Err(format!(
+                "full-plan bracket: post-fusion privileged-test producer does not consume the in-image artifact: deps={:?}",
+                privileged_test_producer.deps
+            ));
+        }
+        for tag in [
+            "privileged-cpuid.faulting",
+            "privileged-pmu.preemption",
+            "privileged-test.cli_kvm",
+        ] {
+            let test = pinned_full
+                .cfg
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .ok_or_else(|| {
+                    format!("full-plan bracket: post-fusion pinned-root test {tag} disappeared")
+                })?;
+            if !test.cmd.contains("run-in-pinned-root.sh")
+                || (tag == "privileged-test.cli_kvm"
+                    && (!test.cmd.contains("--env CI")
+                        || !test.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
+                        || !test.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")))
+                || test.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+                || !test.deps.iter().any(|dependency| {
+                    dependency == "privileged-build.privileged_tests_in_pinned_root"
+                })
+                || test
+                    .deps
+                    .iter()
+                    .any(|dependency| dependency == "privileged-build.privileged_tests")
+            {
+                return Err(format!(
+                    "full-plan bracket: post-fusion {tag} lost its image wrapper, /test gate or in-image privileged-test dependency: {test:?}"
+                ));
+            }
+        }
+        for (tag, required_producers, host_producers) in [
+            (
+                "test.hermit_integration",
+                &["build.e2e_artifact_in_pinned_root"][..],
+                &["build.e2e_artifact"][..],
+            ),
+            (
+                "test.cli",
+                &[
+                    "build.e2e_artifact_in_pinned_root",
+                    "build.liteinst_runtime_release_in_pinned_root",
+                ][..],
+                &["build.e2e_artifact", "build.liteinst_runtime_release"][..],
+            ),
+            (
+                "test.app_strict_verify",
+                &["build.e2e_artifact_in_pinned_root"][..],
+                &["build.e2e_artifact"][..],
+            ),
+        ] {
+            let test = pinned_full
+                .cfg
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .ok_or_else(|| {
+                    format!("full-plan bracket: post-fusion pinned-root test {tag} disappeared")
+                })?;
+            if !test.cmd.contains("run-in-pinned-root.sh")
+                || !test.cmd.contains("--env CI")
+                || !test.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
+                || !test.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")
+                || test.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+                || required_producers
+                    .iter()
+                    .any(|producer| !test.deps.iter().any(|dependency| dependency == *producer))
+                || host_producers
+                    .iter()
+                    .any(|producer| test.deps.iter().any(|dependency| dependency == *producer))
+            {
+                return Err(format!(
+                    "full-plan bracket: post-fusion {tag} lost its image wrapper, /test gate, count path or in-image producer dependency: {test:?}"
+                ));
+            }
+        }
+        let portable_cli = pinned_full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.cli")
+            .expect("test.cli checked above");
+        for excluded in [
+            "--skip run_kvm_",
+            "--skip backend_accepted_in_global_position",
+            "--skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them",
+            "--skip run_dbt_strict_returns_with_blocked_stdin_source",
+            "--skip run_dbt_verifies_pipe_backpressure",
+            "--skip run_dbt_keeps_diagnostics_out_of_guest_stderr",
+            "--skip run_dbt_recovers_after_failed_exec",
+            "--skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls",
+            "--skip run_dbt_verifies_queued_self_signals",
+            "--skip run_dbt_verifies_self_prlimit",
+            "--skip run_dbt_verifies_shell_process_lifecycle",
+            "--skip run_dbt_verifies_simple_env_shebang",
+            "--skip run_liteinst_rejects_non_fork_clone",
+            "--skip run_liteinst_handles_inherited_ignored_sigchld",
+            "--skip run_liteinst_verifies_forked_guest",
+            "--skip run_liteinst_verifies_raw_fork_guest",
+        ] {
+            if !portable_cli.cmd.contains(excluded) {
+                return Err(format!(
+                    "full-plan bracket: pinned-root test.cli lost the existing DBT/KVM exclusion {excluded:?}: {}",
+                    portable_cli.cmd
+                ));
+            }
+        }
+        let pmu_buck = pinned_full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "privileged-test.pmu_buck_chaos_cases")
+            .ok_or("full-plan bracket: post-fusion PMU Buck chaos test disappeared")?;
+        if !pmu_buck.cmd.contains("run-in-pinned-root.sh")
+            || pmu_buck
+                .env
+                .get("HERMIT_E2E_EMPTY_WORKDIR")
+                .map(String::as_str)
+                != Some("/test")
+            || !pmu_buck
+                .deps
+                .iter()
+                .any(|dependency| dependency == "privileged-pmu.preemption")
+        {
+            return Err(format!(
+                "full-plan bracket: post-fusion privileged-test.pmu_buck_chaos_cases lost its image wrapper, /test gate or PMU dependency: {pmu_buck:?}"
+            ));
+        }
         for step in pinned_full.cfg.steps.iter().filter(|step| {
             step.tag().ends_with("_in_pinned_root")
-                || validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+                || pinned_root_test_step(step, pinned_full.compat)
         }) {
             if !step
                 .cmd
@@ -2949,6 +3115,75 @@ cleared-caps refusal names {} starved step(s)",
                     step.tag(), step.cmd
                 ));
             }
+        }
+        let compat_steps: Vec<&Step> = pinned_full
+            .cfg
+            .steps
+            .iter()
+            .filter(|step| step.group == "compat")
+            .collect();
+        let expected_compat = validate_corpus::STRICT_COMPAT_TOTAL
+            - validate_corpus::portable_super_only().len();
+        let host_hermit = root.join("target/ci/hermit-strict");
+        if compat_steps.len() != expected_compat
+            || compat_steps.iter().any(|step| {
+                !step.cmd.contains("run-in-pinned-root.sh")
+                    || !step.cmd.contains("/src/target/ci/hermit-strict")
+                    || step.cmd.contains(host_hermit.to_string_lossy().as_ref())
+                    || step
+                        .env
+                        .get("HERMIT_E2E_EMPTY_WORKDIR")
+                        .map(String::as_str)
+                        != Some("/test")
+            })
+        {
+            return Err(format!(
+                "full-plan bracket: portable strict compatibility did not produce {expected_compat} pinned-root probes with /src paths and the /test gate"
+            ));
+        }
+        let compat_prep = pinned_full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "compatprep.fixtures")
+            .ok_or("full-plan bracket: compatibility fixture preparation disappeared")?;
+        if !compat_prep.cmd.contains("run-in-pinned-root.sh")
+            || !compat_prep
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.runtime_release_in_pinned_root")
+            || compat_prep
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.runtime_release")
+        {
+            return Err(format!(
+                "full-plan bracket: compatibility fixtures lost their pinned root or in-image release dependency: {compat_prep:?}"
+            ));
+        }
+        let liteinst = pinned_full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.liteinst_strict")
+            .ok_or("full-plan bracket: test.liteinst_strict disappeared")?;
+        if !liteinst.cmd.contains("run-in-pinned-root.sh")
+            || !liteinst.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
+            || !liteinst
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+            || !liteinst.deps.iter().any(|dependency| {
+                dependency == "build.liteinst_runtime_release_in_pinned_root"
+            })
+            || liteinst
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.liteinst_runtime_release")
+        {
+            return Err(format!(
+                "full-plan bracket: test.liteinst_strict is not bound to its in-image artifact and runtime producers: {liteinst:?}"
+            ));
         }
         for tag in [
             "privileged-e2e.manifest_applications",
@@ -4310,10 +4545,23 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
         "DAGRUN_TEST_COUNTS_PATH)",
         "destination=/dagrun-test-counts",
         "DAGRUN_TEST_COUNTS_PATH=/dagrun-test-counts/$counts_file",
+        "for cache in registry git",
+        "source=$cargo_home/$cache,destination=/build/.cargo/$cache",
+        "-e CARGO_HOME=\"$cargo_home_in\"",
     ] {
         if !pinned_root_wrapper.contains(fixture) {
             return Err(format!(
                 "verbosity: pinned-root wrapper lost structured count mapping {fixture:?}"
+            ));
+        }
+    }
+    for forbidden in [
+        "source=$cargo_home,destination=/cargo",
+        "-e CARGO_HOME=/cargo",
+    ] {
+        if pinned_root_wrapper.contains(forbidden) {
+            return Err(format!(
+                "verbosity: pinned-root wrapper restored the host Cargo home mount {forbidden:?}"
             ));
         }
     }
@@ -8336,7 +8584,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
     if args.level == Level::Quick && args.focused.is_none() {
         let hermit = "target/debug/hermit";
         let marker = "hermit-validation-smoke";
-        let run_args = "run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled";
+        let run_args = "run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test";
         let mut steps = pre;
         steps.push(nextest_setup_node(root, gate)?);
         let mut add = |job: &str, desc: &str, cmd: String, deps: Vec<String>, t: i64, mem: i64| {
@@ -8353,7 +8601,7 @@ fn build_plan(root: &Path, args: &Args, tmp: &Path) -> Result<Plan, String> {
             format!("timeout 30s {hermit} {run_args} --verify -- /bin/echo {marker}"),
             vec!["quick.build".into()], 120, 4 * 1024 * 1024 * 1024);
         add("record_replay_smoke", "Hermit record/replay smoke test",
-            format!("timeout 30s {hermit} record start --verify -- /bin/echo {marker}"),
+            format!("timeout 30s {hermit} record start --base-env=minimal --mount=type=tmpfs,target=/test --workdir=/test --verify -- /bin/echo {marker}"),
             vec!["quick.build".into()], 180, 4 * 1024 * 1024 * 1024);
         let cfg = validate_plan::config_from(steps, "quick smoke suite");
         return Ok(Plan { planned_test_nodes: test_nodes_of(&cfg), cfg, second: None,
@@ -11149,8 +11397,7 @@ fn propagate_verbosity(plan: &mut Plan, verbosity: i64) {
     }
 }
 
-/// The steps that run inside the pinned root: the scheduled E2E manifest cells,
-/// and nothing else.
+/// The build steps whose output runs inside the pinned root.
 ///
 /// ⚠️ THIS IS AN ALLOW-LIST BY DELIBERATE CHOICE, AND THE EARLIER DENY-LIST IS WHY.
 /// The first version wrapped everything except three preflight steps, which moved
@@ -11165,9 +11412,6 @@ fn propagate_verbosity(plan: &mut Plan, verbosity: i64) {
 /// A deny-list also has to be complete to be safe, and nothing enumerates which
 /// steps depend on a host facility. An allow-list is wrong in the safe direction: a
 /// step nobody classified keeps running exactly where it runs today.
-/// The build steps whose OUTPUT IS EXECUTED inside the pinned root, and which must
-/// therefore be BUILT there.
-///
 /// ⚠️ THE RULE IS "AN OUTPUT THAT EXECUTES IN THE CONTAINER MUST BE BUILT IN THE
 /// CONTAINER", AND IT IS NOT A PREFERENCE. Measured 2026-08-27, same container, same
 /// mount, two binaries:
@@ -11195,9 +11439,89 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
     "build.runtime_release",
     // packages the above into the artifact the cell command requires
     "build.e2e_artifact",
+    // stages the LiteInst runtime beside the release Hermit binary used by
+    // test.liteinst_strict inside the pinned root
+    "build.liteinst_runtime_release",
     // compiles the guest programs the cells execute under hermit
     "build.manifest_guests",
+    // builds the Hermit and test-harness binaries used by the quick guest
+    // checks; its host copy still feeds quick.e2e_metadata and unit tests
+    "quick.build",
+    // focused LiteInst builds have their own tags but produce the same two
+    // executable inputs as the full-plan release/runtime nodes
+    "liteinst.hermit_release",
+    "liteinst.runtime",
+    // builds the exact Detcore and Hermit test executables consumed by the
+    // privileged checks that run inside the pinned root; the unprefixed tag is
+    // used by --privileged-only and the prefixed tag by the fused full plan
+    "build.privileged_tests",
+    "privileged-build.privileged_tests",
 ];
+
+/// Dedicated non-manifest test nodes that run inside the pinned root.
+const PINNED_ROOT_LITEINST_TEST_STEPS: &[&str] = &["test.liteinst_strict", "liteinst.strict"];
+const PINNED_ROOT_QUICK_TEST_STEPS: &[&str] = &[
+    "quick.run_smoke",
+    "quick.verify_smoke",
+    "quick.record_replay_smoke",
+];
+const PINNED_ROOT_ENVELOPE_TEST_STEPS: &[&str] = &["test.envelope_levels"];
+const PINNED_ROOT_DBT_TEST_STEPS: &[&str] = &["test.dbt_parity"];
+const PINNED_ROOT_DETCORE_TEST_STEPS: &[&str] =
+    &["test.detcore_misc", "test.detcore_parallel"];
+const PINNED_ROOT_UNIT_TEST_STEPS: &[&str] = &[
+    "test.regular_crates",
+    "test.hermit_unit",
+    "test.detcore_unit",
+];
+const PINNED_ROOT_APPLICATION_TEST_STEPS: &[&str] = &["test.applications_e2e"];
+const PINNED_ROOT_ARBITRARY_BINARY_TEST_STEPS: &[&str] = &["test.arbitrary_binaries"];
+const PINNED_ROOT_COMMAND_TEST_STEPS: &[&str] = &["test.command_strict_verify"];
+const PINNED_ROOT_RR_CONTRACT_TEST_STEPS: &[&str] = &["test.rr_suite_contract"];
+const PINNED_ROOT_IGNORED_SYSCALL_TEST_STEPS: &[&str] =
+    &["test.ignored_syscall_regressions"];
+const PINNED_ROOT_SABRE_TEST_STEPS: &[&str] = &["test.sabre_examples"];
+const PINNED_ROOT_HERMIT_MODES_TEST_STEPS: &[&str] = &["test.hermit_modes"];
+const PINNED_ROOT_PORTABLE_TEST_STEPS: &[&str] = &[
+    "test.hermit_integration",
+    "test.cli",
+    "test.app_strict_verify",
+];
+const PINNED_ROOT_PRIVILEGED_TEST_STEPS: &[&str] = &[
+    "cpuid.faulting",
+    "pmu.preemption",
+    "test.pmu_buck_chaos_cases",
+    "privileged-cpuid.faulting",
+    "privileged-pmu.preemption",
+    "privileged-test.pmu_buck_chaos_cases",
+    "test.cli_kvm",
+    "privileged-test.cli_kvm",
+];
+
+fn pinned_root_test_step(step: &Step, compat: Option<CompatMode>) -> bool {
+    validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+        || PINNED_ROOT_LITEINST_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_QUICK_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_ENVELOPE_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_DBT_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_DETCORE_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_UNIT_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_APPLICATION_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_ARBITRARY_BINARY_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_COMMAND_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_RR_CONTRACT_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_IGNORED_SYSCALL_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_SABRE_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_HERMIT_MODES_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_PORTABLE_TEST_STEPS.contains(&step.tag().as_str())
+        || PINNED_ROOT_PRIVILEGED_TEST_STEPS.contains(&step.tag().as_str())
+        || (compat == Some(CompatMode::PortableStrict)
+            && (step.group == "compat"
+                || matches!(
+                    step.tag().as_str(),
+                    "compatprep.fixtures" | "compatprep.hermit_release"
+                )))
+}
 
 // ⚠️ e2e.metadata IS DELIBERATELY ABSENT FROM THAT LIST, AND THE REASON CORRECTS MY OWN
 // FIRST DRAFT. I had listed it because it RUNS test-harness, but running a tool is not
@@ -11212,9 +11536,14 @@ const PINNED_ROOT_PRODUCER_STEPS: &[&str] = &[
 
 
 
-fn pinned_root_command(root: &Path, out: &Path, step: &Step) -> String {
+fn pinned_root_command(
+    root: &Path,
+    out: &Path,
+    step: &Step,
+    compat: Option<CompatMode>,
+) -> String {
     let mut env_names: BTreeSet<&str> = PINNED_ROOT_FORWARDED_ENV.iter().copied().collect();
-    if validation_step_identity(step) == ValidationStepIdentity::ManifestRun {
+    if pinned_root_test_step(step, compat) {
         env_names.insert("DAGRUN_TEST_COUNTS_PATH");
     }
     env_names.extend(step.env.keys().map(String::as_str));
@@ -11233,6 +11562,13 @@ fn pinned_root_command(root: &Path, out: &Path, step: &Step) -> String {
     for name in env_names {
         argv.extend(["--env".into(), name.into()]);
     }
+    let command = if compat == Some(CompatMode::PortableStrict)
+        && (step.group == "compat" || step.tag() == "compatprep.fixtures")
+    {
+        step.cmd.replace(root.to_string_lossy().as_ref(), "/src")
+    } else {
+        step.cmd.clone()
+    };
     argv.extend([
         "--".into(),
         "bash".into(),
@@ -11241,7 +11577,7 @@ fn pinned_root_command(root: &Path, out: &Path, step: &Step) -> String {
          /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\""
             .into(),
         "bash".into(),
-        step.cmd.clone(),
+        command,
     ]);
     validate_plan::shell_join(argv)
 }
@@ -11261,6 +11597,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
         return Ok(());
     }
     let out = root.join("ignored/hermetic/split");
+    let compat = plan.compat;
     for (index, cfg) in std::iter::once(&mut plan.cfg)
         .chain(plan.second.iter_mut())
         .enumerate()
@@ -11362,7 +11699,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
             }
             twin.env
                 .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
-            twin.cmd = pinned_root_command(root, &out, &twin);
+            twin.cmd = pinned_root_command(root, &out, &twin, compat);
             if index == 0 {
                 twin.deps.push(PINNED_ROOT_FETCH_TAG.into());
             }
@@ -11373,13 +11710,14 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
         cfg.steps.extend(twins);
 
         for step in &mut cfg.steps {
-            if validation_step_identity(step) != ValidationStepIdentity::ManifestRun {
+            if !pinned_root_test_step(step, compat) {
                 continue;
             }
-            // The selected E2E population has no naked or DBT cells. Every
-            // scheduled Hermit attempt therefore accepts this exact tmpfs gate;
-            // the harness refuses an unsupported mode/backend instead of
-            // silently running it outside /test.
+            // Scheduled manifest cells use this environment gate to add the
+            // guest's tmpfs /test. The dedicated LiteInst, quick smoke and
+            // working-envelope tests construct the same mount and
+            // working-directory arguments directly, and carry the gate here so
+            // the plan records the same contract.
             step.env
                 .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
             // Point the cell at the in-image producers. Depending on the host copies
@@ -11396,10 +11734,15 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                     }
                 })
                 .collect();
+            // cargo-nextest is part of the pinned image. A pinned test must
+            // not wait for the host setup node, whose fallback installs it
+            // over the network and makes host tool state a test prerequisite.
+            step.deps.retain(|dep| dep != "setup.nextest");
             // The fused privileged build node is a host-side assertion over the
             // host artifact. Keep that edge, and also wait for the artifact built
             // in the pinned root that this wrapped cell will actually execute.
-            if producer_tags.contains("build.e2e_artifact")
+            if validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+                && producer_tags.contains("build.e2e_artifact")
                 && !step
                     .deps
                     .iter()
@@ -11417,7 +11760,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
                 step.deps
                     .push("build.rust_scripts_in_pinned_root".into());
             }
-            step.cmd = pinned_root_command(root, &out, step);
+            step.cmd = pinned_root_command(root, &out, step, compat);
             if index == 0 && !step.deps.iter().any(|dep| dep == PINNED_ROOT_FETCH_TAG) {
                 step.deps.push(PINNED_ROOT_FETCH_TAG.into());
             }
@@ -11427,7 +11770,7 @@ fn apply_pinned_root(plan: &mut Plan, root: &Path, already_inside: bool) -> Resu
     Ok(())
 }
 
-fn pinned_root_plan_bracket() -> Result<String, String> {
+fn pinned_root_plan_bracket(root: &Path) -> Result<String, String> {
     let step = |group: &str, job: &str, cmd: &str, deps: Vec<String>| {
         step_with_caps(group, job, "fixture", cmd.into(), deps, 30, 30, 1024 * 1024)
     };
@@ -11457,16 +11800,224 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
                     STRICT_COMPAT_PLACEHOLDER_COMMAND,
                     vec![],
                 ),
+                step(
+                    "compatprep",
+                    "hermit_release",
+                    "cargo build --release -p hermit --features third-party-backends",
+                    vec![],
+                ),
+                step(
+                    "compatprep",
+                    "fixtures",
+                    "/repo/tests/compat/prepare_real_compat_fixtures.sh /repo/target/validation/strict-compat/real-compat-fixtures",
+                    vec!["compatprep.hermit_release".into()],
+                ),
+                step(
+                    "compat",
+                    "echo",
+                    "/repo/target/ci/hermit-strict run --strict --verify --base-env=minimal --mount=type=tmpfs,target=/test --workdir=/test -- /bin/echo </dev/null",
+                    vec!["compatprep.fixtures".into()],
+                ),
                 step("lint", "clippy", "cargo clippy --workspace", vec![]),
-                step("test", "hermit_integration", "./ci/run-nextest-counted.sh -p hermit", vec![]),
+                step(
+                    "test",
+                    "hermit_integration",
+                    "./ci/run-nextest-counted.sh -p hermit",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step("setup", "nextest", "cargo nextest show-config version", vec![]),
+                step(
+                    "test",
+                    "cli",
+                    "./ci/run-nextest-counted.sh -p hermit --test cli",
+                    vec![
+                        "build.e2e_artifact".into(),
+                        "build.liteinst_runtime_release".into(),
+                        "setup.nextest".into(),
+                    ],
+                ),
+                step(
+                    "test",
+                    "app_strict_verify",
+                    "./ci/run-nextest-counted.sh -p hermit --test app_strict_verify",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
                 // A producer whose output the cells execute: wrapped by the rule.
                 step("build", "workspace", "cargo build --workspace", vec![]),
+                step(
+                    "build",
+                    "runtime_release",
+                    "cargo build --release --workspace",
+                    vec![],
+                ),
+                step(
+                    "build",
+                    "e2e_artifact",
+                    "./ci/publish-hermit-e2e-artifact.sh",
+                    vec!["build.workspace".into()],
+                ),
+                step(
+                    "build",
+                    "liteinst_runtime_release",
+                    "./scripts/stage-liteinst-runtime.sh release",
+                    vec!["build.e2e_artifact".into()],
+                ),
+                step(
+                    "test",
+                    "liteinst_strict",
+                    "./ci/run-nextest-counted.sh -p hermit --test liteinst_advanced",
+                    vec![
+                        "build.liteinst_runtime_release".into(),
+                        "setup.nextest".into(),
+                    ],
+                ),
+                step(
+                    "test",
+                    "envelope_levels",
+                    "HERMIT=target/debug/hermit; ARGS='run --base-env=minimal --mount=type=tmpfs,target=/test --workdir=/test'; true",
+                    vec!["build.workspace".into()],
+                ),
+                step(
+                    "test",
+                    "dbt_parity",
+                    "python3 tests/backend-parity/run_matrix.py --hermit target/release/hermit --backend dbt --strict --require-backend --no-parent-scorecard",
+                    vec!["build.runtime_release".into()],
+                ),
+                step(
+                    "test",
+                    "detcore_misc",
+                    "./ci/run-nextest-counted.sh -p hermit-detcore --test tests_misc -j 1",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
+                    "test",
+                    "detcore_parallel",
+                    "./ci/run-nextest-counted.sh -p hermit-detcore --test tests_parallelism -j 4",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
+                    "test",
+                    "regular_crates",
+                    "./ci/run-nextest-counted.sh --workspace --exclude hermit-detcore --exclude hermit --exclude hermetic_infra_hermit_flaky-tests",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
+                    "test",
+                    "hermit_unit",
+                    "./ci/run-nextest-counted.sh -p hermit --features third-party-backends --lib --bins -j 1",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
+                    "test",
+                    "detcore_unit",
+                    "./ci/run-nextest-counted.sh -p hermit-detcore --lib --bins",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
+                    "test",
+                    "applications_e2e",
+                    "./ci/run-with-hermit-e2e-artifact.sh --require-install ./tests/e2e/lib/applications/run_all.sh",
+                    vec!["build.e2e_artifact".into()],
+                ),
+                step(
+                    "test",
+                    "arbitrary_binaries",
+                    "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test arbitrary_binaries -j 1",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
+                    "test",
+                    "command_strict_verify",
+                    "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test command_strict_verify -j 1 -- --ignored",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
+                    "test",
+                    "rr_suite_contract",
+                    "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test rr_suite -j 1 rr_scratch_directories_are_fresh_and_cleaned -- --exact",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
+                    "test",
+                    "ignored_syscall_regressions",
+                    "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test epoll_determinism --test rcx_canonicalization -j 1 -- --ignored",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
+                    "test",
+                    "sabre_examples",
+                    "HERMIT_SABRE_TEST_BINARY=$PWD/target/release/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test sabre_examples -j 1",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
+                    "test",
+                    "hermit_modes",
+                    "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test hermit_modes -j 1 -- --skip default_ --skip chaos_buck_ --skip hello_race_chaos_verify",
+                    vec!["build.e2e_artifact".into(), "setup.nextest".into()],
+                ),
+                step(
+                    "privileged-build",
+                    "privileged_tests",
+                    "cargo test -p hermit-detcore --test tests_misc --no-run && ./ci/publish-hermit-e2e-artifact.sh",
+                    vec!["build.e2e_artifact".into()],
+                ),
+                step(
+                    "privileged-cpuid",
+                    "faulting",
+                    "target/debug/deps/tests_misc rdrand_rdseed_is_masked --exact",
+                    vec!["privileged-build.privileged_tests".into()],
+                ),
+                step(
+                    "privileged-pmu",
+                    "preemption",
+                    "cc tests/util/pmu_skid.c -o target/ci-pmu-skid && target/ci-pmu-skid",
+                    vec!["privileged-build.privileged_tests".into()],
+                ),
+                step(
+                    "privileged-test",
+                    "cli_kvm",
+                    "./ci/run-nextest-counted.sh -p hermit --test cli -E 'test(/^run_kvm_/)'",
+                    vec!["privileged-build.privileged_tests".into()],
+                ),
+                step(
+                    "liteinst",
+                    "hermit_release",
+                    "cargo build --release -p hermit",
+                    vec![],
+                ),
+                step(
+                    "liteinst",
+                    "runtime",
+                    "./scripts/stage-liteinst-runtime.sh release",
+                    vec!["liteinst.hermit_release".into()],
+                ),
+                step(
+                    "liteinst",
+                    "strict",
+                    "./ci/run-nextest-counted.sh -p hermit --test liteinst_advanced",
+                    vec!["liteinst.runtime".into(), "setup.nextest".into()],
+                ),
             ],
             "pinned-root bracket",
         ),
+        compat: Some(CompatMode::PortableStrict),
         ..Default::default()
     };
     apply_pinned_root(&mut plan, Path::new("/repo"), false)?;
+    for step in plan
+        .cfg
+        .steps
+        .iter()
+        .filter(|step| pinned_root_test_step(step, plan.compat))
+    {
+        if step.deps.iter().any(|dependency| dependency == "setup.nextest") {
+            return Err(format!(
+                "pinned-root bracket: test {} still depends on host setup.nextest: {:?}",
+                step.tag(),
+                step.deps
+            ));
+        }
+    }
     let by_tag: BTreeMap<String, &Step> =
         plan.cfg.steps.iter().map(|step| (step.tag(), step)).collect();
     let fetch = by_tag
@@ -11490,7 +12041,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
         "gate.manifest",
         "test.strict_compat",
         "lint.clippy",
-        "test.hermit_integration",
+        "setup.nextest",
         "pre.submodules",
         PIN_GATE_TAG,
     ] {
@@ -11602,6 +12153,694 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
         ));
     }
 
+    for (tag, required_producers, host_producers) in [
+        (
+            "test.hermit_integration",
+            &["build.e2e_artifact_in_pinned_root"][..],
+            &["build.e2e_artifact"][..],
+        ),
+        (
+            "test.cli",
+            &[
+                "build.e2e_artifact_in_pinned_root",
+                "build.liteinst_runtime_release_in_pinned_root",
+            ][..],
+            &["build.e2e_artifact", "build.liteinst_runtime_release"][..],
+        ),
+        (
+            "test.app_strict_verify",
+            &["build.e2e_artifact_in_pinned_root"][..],
+            &["build.e2e_artifact"][..],
+        ),
+    ] {
+        let test = by_tag
+            .get(tag)
+            .ok_or_else(|| format!("pinned-root bracket: {tag} disappeared"))?;
+        if !test.cmd.contains("run-in-pinned-root.sh")
+            || !test.cmd.contains("--env CI")
+            || !test.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
+            || !test.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")
+            || test.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+            || required_producers
+                .iter()
+                .any(|producer| !test.deps.iter().any(|dependency| dependency == *producer))
+            || host_producers
+                .iter()
+                .any(|producer| test.deps.iter().any(|dependency| dependency == *producer))
+        {
+            return Err(format!(
+                "pinned-root bracket: portable test {tag} lost its image wrapper, /test gate, count path or in-image producer dependency: {test:?}"
+            ));
+        }
+    }
+
+    let fused_cli_kvm = by_tag
+        .get("privileged-test.cli_kvm")
+        .ok_or("pinned-root bracket: fused privileged-test.cli_kvm disappeared")?;
+    if !fused_cli_kvm.cmd.contains("run-in-pinned-root.sh")
+        || !fused_cli_kvm.cmd.contains("--env CI")
+        || !fused_cli_kvm.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
+        || !fused_cli_kvm.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")
+        || fused_cli_kvm
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
+        || !fused_cli_kvm
+            .deps
+            .iter()
+            .any(|dependency| dependency == "privileged-build.privileged_tests_in_pinned_root")
+        || fused_cli_kvm
+            .deps
+            .iter()
+            .any(|dependency| dependency == "privileged-build.privileged_tests")
+    {
+        return Err(format!(
+            "pinned-root bracket: fused privileged-test.cli_kvm lost its image wrapper, /test gate, count path or in-image producer dependency: {fused_cli_kvm:?}"
+        ));
+    }
+
+    for (test_tag, producer_tag) in [
+        (
+            "test.liteinst_strict",
+            "build.liteinst_runtime_release_in_pinned_root",
+        ),
+        ("liteinst.strict", "liteinst.runtime_in_pinned_root"),
+    ] {
+        let test = by_tag
+            .get(test_tag)
+            .ok_or_else(|| format!("pinned-root bracket: {test_tag} disappeared"))?;
+        if !test.cmd.contains("run-in-pinned-root.sh")
+            || !test.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
+            || test.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+            || !test.deps.iter().any(|dependency| dependency == producer_tag)
+            || test
+                .deps
+                .iter()
+                .any(|dependency| dependency == producer_tag.trim_end_matches("_in_pinned_root"))
+        {
+            return Err(format!(
+                "pinned-root bracket: dedicated LiteInst test {test_tag} lost its image wrapper, /test gate, count path or in-image runtime dependency: {test:?}"
+            ));
+        }
+    }
+
+    let envelope = by_tag
+        .get("test.envelope_levels")
+        .ok_or("pinned-root bracket: test.envelope_levels disappeared")?;
+    if !envelope.cmd.contains("run-in-pinned-root.sh")
+        || !envelope.cmd.contains("--base-env=minimal")
+        || !envelope.cmd.contains("--mount=type=tmpfs,target=/test")
+        || !envelope.cmd.contains("--workdir=/test")
+        || envelope.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+        || !envelope
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.workspace_in_pinned_root")
+        || envelope
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.workspace")
+        || envelope
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+    {
+        return Err(format!(
+            "pinned-root bracket: test.envelope_levels lost its image wrapper, minimal environment, /test arguments or in-image build dependency: {envelope:?}"
+        ));
+    }
+    let dbt = by_tag
+        .get("test.dbt_parity")
+        .ok_or("pinned-root bracket: test.dbt_parity disappeared")?;
+    if !dbt.cmd.contains("run-in-pinned-root.sh")
+        || dbt.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+        || !dbt
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.runtime_release_in_pinned_root")
+        || dbt
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.runtime_release")
+    {
+        return Err(format!(
+            "pinned-root bracket: test.dbt_parity lost its image wrapper, /test gate or in-image release dependency: {dbt:?}"
+        ));
+    }
+    for tag in PINNED_ROOT_DETCORE_TEST_STEPS {
+        let test = by_tag
+            .get(*tag)
+            .ok_or_else(|| format!("pinned-root bracket: {tag} disappeared"))?;
+        if !test.cmd.contains("run-in-pinned-root.sh")
+            || test
+                .env
+                .get("HERMIT_E2E_EMPTY_WORKDIR")
+                .map(String::as_str)
+                != Some("/test")
+            || !test
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+            || test
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.e2e_artifact")
+        {
+            return Err(format!(
+                "pinned-root bracket: {tag} lost its image wrapper, /test gate or in-image artifact dependency: {test:?}"
+            ));
+        }
+    }
+    for tag in PINNED_ROOT_UNIT_TEST_STEPS {
+        let test = by_tag
+            .get(*tag)
+            .ok_or_else(|| format!("pinned-root bracket: {tag} disappeared"))?;
+        if !test.cmd.contains("run-in-pinned-root.sh")
+            || test
+                .env
+                .get("HERMIT_E2E_EMPTY_WORKDIR")
+                .map(String::as_str)
+                != Some("/test")
+            || !test
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+            || test
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.e2e_artifact")
+        {
+            return Err(format!(
+                "pinned-root bracket: {tag} lost its image wrapper, /test gate or in-image artifact dependency: {test:?}"
+            ));
+        }
+    }
+    let applications = by_tag
+        .get("test.applications_e2e")
+        .ok_or("pinned-root bracket: test.applications_e2e disappeared")?;
+    if !applications.cmd.contains("run-in-pinned-root.sh")
+        || applications
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
+        || !applications
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+        || applications
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact")
+    {
+        return Err(format!(
+            "pinned-root bracket: test.applications_e2e lost its image wrapper, /test gate or in-image artifact dependency: {applications:?}"
+        ));
+    }
+    let arbitrary_binaries = by_tag
+        .get("test.arbitrary_binaries")
+        .ok_or("pinned-root bracket: test.arbitrary_binaries disappeared")?;
+    if !arbitrary_binaries.cmd.contains("run-in-pinned-root.sh")
+        || arbitrary_binaries
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
+        || !arbitrary_binaries
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+        || arbitrary_binaries
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact")
+    {
+        return Err(format!(
+            "pinned-root bracket: test.arbitrary_binaries lost its image wrapper, /test gate or in-image artifact dependency: {arbitrary_binaries:?}"
+        ));
+    }
+    let command_strict_verify = by_tag
+        .get("test.command_strict_verify")
+        .ok_or("pinned-root bracket: test.command_strict_verify disappeared")?;
+    if !command_strict_verify.cmd.contains("run-in-pinned-root.sh")
+        || command_strict_verify
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
+        || !command_strict_verify
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+        || command_strict_verify
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact")
+    {
+        return Err(format!(
+            "pinned-root bracket: test.command_strict_verify lost its image wrapper, /test gate or in-image artifact dependency: {command_strict_verify:?}"
+        ));
+    }
+    let rr_suite_contract = by_tag
+        .get("test.rr_suite_contract")
+        .ok_or("pinned-root bracket: test.rr_suite_contract disappeared")?;
+    if !rr_suite_contract.cmd.contains("run-in-pinned-root.sh")
+        || rr_suite_contract
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
+        || !rr_suite_contract
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+        || rr_suite_contract
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact")
+    {
+        return Err(format!(
+            "pinned-root bracket: test.rr_suite_contract lost its image wrapper, /test gate or in-image artifact dependency: {rr_suite_contract:?}"
+        ));
+    }
+    let ignored_syscall_regressions = by_tag
+        .get("test.ignored_syscall_regressions")
+        .ok_or("pinned-root bracket: test.ignored_syscall_regressions disappeared")?;
+    if !ignored_syscall_regressions
+        .cmd
+        .contains("run-in-pinned-root.sh")
+        || ignored_syscall_regressions
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
+        || !ignored_syscall_regressions
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+        || ignored_syscall_regressions
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact")
+    {
+        return Err(format!(
+            "pinned-root bracket: test.ignored_syscall_regressions lost its image wrapper, /test gate or in-image artifact dependency: {ignored_syscall_regressions:?}"
+        ));
+    }
+    let sabre_examples = by_tag
+        .get("test.sabre_examples")
+        .ok_or("pinned-root bracket: test.sabre_examples disappeared")?;
+    if !sabre_examples.cmd.contains("run-in-pinned-root.sh")
+        || sabre_examples
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
+        || !sabre_examples
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+        || sabre_examples
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact")
+    {
+        return Err(format!(
+            "pinned-root bracket: test.sabre_examples lost its image wrapper, /test gate or in-image artifact dependency: {sabre_examples:?}"
+        ));
+    }
+    let hermit_modes = by_tag
+        .get("test.hermit_modes")
+        .ok_or("pinned-root bracket: test.hermit_modes disappeared")?;
+    if !hermit_modes.cmd.contains("run-in-pinned-root.sh")
+        || hermit_modes
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
+        || !hermit_modes
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+        || hermit_modes
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact")
+    {
+        return Err(format!(
+            "pinned-root bracket: test.hermit_modes lost its image wrapper, /test gate or in-image artifact dependency: {hermit_modes:?}"
+        ));
+    }
+    for tag in ["privileged-cpuid.faulting", "privileged-pmu.preemption"] {
+        let test = by_tag
+            .get(tag)
+            .ok_or_else(|| format!("pinned-root bracket: {tag} disappeared"))?;
+        if !test.cmd.contains("run-in-pinned-root.sh")
+            || test
+                .env
+                .get("HERMIT_E2E_EMPTY_WORKDIR")
+                .map(String::as_str)
+                != Some("/test")
+            || !test
+                .deps
+                .iter()
+                .any(|dependency| dependency == "privileged-build.privileged_tests_in_pinned_root")
+            || test
+                .deps
+                .iter()
+                .any(|dependency| dependency == "privileged-build.privileged_tests")
+        {
+            return Err(format!(
+                "pinned-root bracket: {tag} lost its image wrapper, /test gate or in-image privileged-test dependency: {test:?}"
+            ));
+        }
+    }
+    let privileged_test_producer = by_tag
+        .get("privileged-build.privileged_tests_in_pinned_root")
+        .ok_or("pinned-root bracket: the in-image privileged-test producer disappeared")?;
+    if !privileged_test_producer.cmd.contains("run-in-pinned-root.sh")
+        || !privileged_test_producer
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact_in_pinned_root")
+        || privileged_test_producer
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.e2e_artifact")
+    {
+        return Err(format!(
+            "pinned-root bracket: the privileged-test producer is not in the image or still consumes the host artifact: {privileged_test_producer:?}"
+        ));
+    }
+    let compat_prep = by_tag
+        .get("compatprep.fixtures")
+        .ok_or("pinned-root bracket: compatprep.fixtures disappeared")?;
+    if !compat_prep.cmd.contains("run-in-pinned-root.sh")
+        || !compat_prep.cmd.contains(
+            "/src/tests/compat/prepare_real_compat_fixtures.sh /src/target/validation/strict-compat/real-compat-fixtures",
+        )
+        || compat_prep.cmd.contains(
+            "/repo/tests/compat/prepare_real_compat_fixtures.sh /repo/target/validation/strict-compat/real-compat-fixtures",
+        )
+        || compat_prep.deps.len() != 3
+        || !compat_prep
+            .deps
+            .iter()
+            .any(|dependency| dependency == "compatprep.hermit_release")
+        || !compat_prep
+            .deps
+            .iter()
+            .any(|dependency| dependency == PINNED_ROOT_FETCH_TAG)
+        || !compat_prep
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.rust_scripts_in_pinned_root")
+    {
+        return Err(format!(
+            "pinned-root bracket: compatibility fixture preparation lost its wrapper, /src paths or in-image release dependency: {compat_prep:?}"
+        ));
+    }
+    let compat_release = by_tag
+        .get("compatprep.hermit_release")
+        .ok_or("pinned-root bracket: compatprep.hermit_release disappeared")?;
+    if !compat_release.cmd.contains("run-in-pinned-root.sh")
+        || by_tag.contains_key("compatprep.hermit_release_in_pinned_root")
+    {
+        return Err(format!(
+            "pinned-root bracket: focused compatibility release build was not moved exactly once into the pinned root: {compat_release:?}"
+        ));
+    }
+    let compat = by_tag
+        .get("compat.echo")
+        .ok_or("pinned-root bracket: compat.echo disappeared")?;
+    if !compat.cmd.contains("run-in-pinned-root.sh")
+        || !compat.cmd.contains("/src/target/ci/hermit-strict")
+        || compat.cmd.contains("/repo/target/ci/hermit-strict")
+        || compat.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+        || compat.deps.len() != 3
+        || !compat
+            .deps
+            .iter()
+            .any(|dependency| dependency == "compatprep.fixtures")
+        || !compat
+            .deps
+            .iter()
+            .any(|dependency| dependency == PINNED_ROOT_FETCH_TAG)
+        || !compat
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.rust_scripts_in_pinned_root")
+    {
+        return Err(format!(
+            "pinned-root bracket: portable strict compatibility probe lost its wrapper, /src Hermit path, /test gate or fixture dependency: {compat:?}"
+        ));
+    }
+    for (producer_tag, dependency_tag) in [
+        (
+            "build.liteinst_runtime_release_in_pinned_root",
+            "build.e2e_artifact_in_pinned_root",
+        ),
+        (
+            "liteinst.runtime_in_pinned_root",
+            "liteinst.hermit_release_in_pinned_root",
+        ),
+    ] {
+        let producer = by_tag
+            .get(producer_tag)
+            .ok_or_else(|| format!("pinned-root bracket: {producer_tag} disappeared"))?;
+        if !producer.cmd.contains("run-in-pinned-root.sh")
+            || !producer
+                .deps
+                .iter()
+                .any(|dependency| dependency == dependency_tag)
+        {
+            return Err(format!(
+                "pinned-root bracket: LiteInst producer {producer_tag} is not in the image or lost its in-image dependency {dependency_tag}: {producer:?}"
+            ));
+        }
+    }
+
+    let focused_args = parse_argv(&[
+        ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+        "--liteinst-compat-only".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("pinned-root bracket: focused LiteInst parser exited {code}"))?;
+    let mut focused = build_plan(
+        root,
+        &focused_args,
+        &std::env::temp_dir().join("validate-pinned-root-liteinst-plan"),
+    )?;
+    configure_prebuilt_rust_scripts(&mut focused, false)?;
+    apply_pinned_root(&mut focused, root, false)?;
+    let focused_by_tag: BTreeMap<String, &Step> = focused
+        .cfg
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step))
+        .collect();
+    let focused_test = focused_by_tag
+        .get("liteinst.strict")
+        .ok_or("pinned-root bracket: focused LiteInst test disappeared")?;
+    if !focused_test.cmd.contains("run-in-pinned-root.sh")
+        || !focused_test
+            .deps
+            .iter()
+            .any(|dependency| dependency == "liteinst.runtime_in_pinned_root")
+        || focused_test
+            .deps
+            .iter()
+            .any(|dependency| dependency == "liteinst.runtime")
+    {
+        return Err(format!(
+            "pinned-root bracket: actual focused LiteInst test is not bound to its in-image runtime: {focused_test:?}"
+        ));
+    }
+    for required in [
+        "liteinst.hermit_release_in_pinned_root",
+        "liteinst.runtime_in_pinned_root",
+    ] {
+        if !focused_by_tag.contains_key(required) {
+            return Err(format!(
+                "pinned-root bracket: actual focused LiteInst plan omitted {required}"
+            ));
+        }
+    }
+
+    let privileged_args = parse_argv(&[
+        ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+        "--privileged-only".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("pinned-root bracket: privileged parser exited {code}"))?;
+    let mut privileged = build_plan(
+        root,
+        &privileged_args,
+        &std::env::temp_dir().join("validate-pinned-root-privileged-plan"),
+    )?;
+    configure_prebuilt_rust_scripts(&mut privileged, false)?;
+    apply_pinned_root(&mut privileged, root, false)?;
+    let privileged_by_tag: BTreeMap<String, &Step> = privileged
+        .cfg
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step))
+        .collect();
+    let privileged_producer = privileged_by_tag
+        .get("build.privileged_tests_in_pinned_root")
+        .ok_or("pinned-root bracket: focused privileged-test producer disappeared")?;
+    if !privileged_producer.cmd.contains("run-in-pinned-root.sh") {
+        return Err(format!(
+            "pinned-root bracket: focused privileged-test producer is not in the image: {privileged_producer:?}"
+        ));
+    }
+    for tag in ["cpuid.faulting", "pmu.preemption", "test.cli_kvm"] {
+        let test = privileged_by_tag.get(tag).ok_or_else(|| {
+            format!(
+                "pinned-root bracket: focused privileged test {tag} disappeared; available={:?}",
+                privileged_by_tag.keys().collect::<Vec<_>>()
+            )
+        })?;
+        if !test.cmd.contains("run-in-pinned-root.sh")
+            || (tag == "test.cli_kvm"
+                && (!test.cmd.contains("--env CI")
+                    || !test.cmd.contains("--env DAGRUN_TEST_COUNTS_PATH")
+                    || !test.cmd.contains("--env HERMIT_E2E_EMPTY_WORKDIR")))
+            || test.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+            || !test
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.privileged_tests_in_pinned_root")
+            || test
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.privileged_tests")
+        {
+            return Err(format!(
+                "pinned-root bracket: focused privileged test {tag} lost its image wrapper, /test gate or in-image privileged-test dependency: {test:?}"
+            ));
+        }
+    }
+    let pmu_buck = privileged_by_tag
+        .get("test.pmu_buck_chaos_cases")
+        .ok_or("pinned-root bracket: focused PMU Buck chaos test disappeared")?;
+    if !pmu_buck.cmd.contains("run-in-pinned-root.sh")
+        || pmu_buck
+            .env
+            .get("HERMIT_E2E_EMPTY_WORKDIR")
+            .map(String::as_str)
+            != Some("/test")
+        || !pmu_buck
+            .deps
+            .iter()
+            .any(|dependency| dependency == "pmu.preemption")
+    {
+        return Err(format!(
+            "pinned-root bracket: focused test.pmu_buck_chaos_cases lost its image wrapper, /test gate or PMU dependency: {pmu_buck:?}"
+        ));
+    }
+
+    let quick_args = parse_argv(&[
+        ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+        "quick".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("pinned-root bracket: quick parser exited {code}"))?;
+    let mut quick = build_plan(
+        root,
+        &quick_args,
+        &std::env::temp_dir().join("validate-pinned-root-quick-plan"),
+    )?;
+    configure_prebuilt_rust_scripts(&mut quick, false)?;
+    apply_pinned_root(&mut quick, root, false)?;
+    let quick_by_tag: BTreeMap<String, &Step> = quick
+        .cfg
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step))
+        .collect();
+    let quick_build = quick_by_tag
+        .get("quick.build_in_pinned_root")
+        .ok_or("pinned-root bracket: quick build has no in-image copy")?;
+    if !quick_build.cmd.contains("run-in-pinned-root.sh")
+        || !quick_build
+            .deps
+            .iter()
+            .any(|dependency| dependency == "build.rust_scripts_in_pinned_root")
+    {
+        return Err(format!(
+            "pinned-root bracket: quick build is not bound to the image and its Rust-script producer: {quick_build:?}"
+        ));
+    }
+    let host_quick_build = quick_by_tag
+        .get("quick.build")
+        .ok_or("pinned-root bracket: host quick build disappeared")?;
+    if host_quick_build.cmd.contains("run-in-pinned-root.sh") {
+        return Err(format!(
+            "pinned-root bracket: host quick build was moved instead of copied: {host_quick_build:?}"
+        ));
+    }
+    for tag in ["quick.e2e_metadata", "quick.detcore_unit"] {
+        let host = quick_by_tag
+            .get(tag)
+            .ok_or_else(|| format!("pinned-root bracket: host quick step {tag} disappeared"))?;
+        if host.cmd.contains("run-in-pinned-root.sh")
+            || !host
+                .deps
+                .iter()
+                .any(|dependency| dependency == "quick.build")
+            || host
+                .deps
+                .iter()
+                .any(|dependency| dependency == "quick.build_in_pinned_root")
+        {
+            return Err(format!(
+                "pinned-root bracket: {tag} no longer consumes the host quick build: {host:?}"
+            ));
+        }
+    }
+    for tag in [
+        "quick.e2e_verify",
+        "quick.run_smoke",
+        "quick.verify_smoke",
+        "quick.record_replay_smoke",
+    ] {
+        let test = quick_by_tag
+            .get(tag)
+            .ok_or_else(|| format!("pinned-root bracket: {tag} disappeared"))?;
+        if !test.cmd.contains("run-in-pinned-root.sh")
+            || test.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+            || !test
+                .deps
+                .iter()
+                .any(|dependency| dependency == "quick.build_in_pinned_root")
+            || test
+                .deps
+                .iter()
+                .any(|dependency| dependency == "quick.build")
+        {
+            return Err(format!(
+                "pinned-root bracket: quick guest test {tag} lost its image wrapper, /test gate or in-image build dependency: {test:?}"
+            ));
+        }
+    }
+    for tag in [
+        "quick.run_smoke",
+        "quick.verify_smoke",
+        "quick.record_replay_smoke",
+    ] {
+        let command = &quick_by_tag[tag].cmd;
+        if !command.contains("--base-env=minimal")
+            || !command.contains("--mount=type=tmpfs,target=/test")
+            || !command.contains("--workdir=/test")
+        {
+            return Err(format!(
+                "pinned-root bracket: quick guest test {tag} lost minimal environment or /test arguments: {command}"
+            ));
+        }
+    }
+
     let mut nested = Plan {
         cfg: validate_plan::config_from(
             vec![step("e2e", "manifest_nested", "echo already-inside", vec![])],
@@ -11673,7 +12912,7 @@ fn pinned_root_plan_bracket() -> Result<String, String> {
             "pinned-root bracket: sequential lanes must fetch once then reuse the cache: first_fetches={first_fetches} second_fetches={second_fetches} second={second_step:?}"
         ));
     }
-    Ok("pinned root: scheduled manifest cells wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; 6 non-producer steps verified still on the host; 1 locked fetch added".into())
+    Ok("pinned root: scheduled manifest cells, portable strict compatibility probes, the application, arbitrary-binary, strict-command, rr-suite contract, SaBRe example, Hermit mode, Hermit integration, CLI and application strict-verify test nodes, the DBT parity matrix, 2 in-process Detcore test nodes, 3 ordinary unit-test nodes, the selected KVM CLI tests, 2 privileged checks, 3 quick guest checks, the working-envelope check and 2 dedicated LiteInst test nodes wrapped and repointed at in-image copies of the producers they execute; the host copies of those producers verified untouched; unrelated test and setup steps verified still on the host; 1 locked fetch added".into())
 }
 
 // --------------------------------------------------------------------------- interruption
