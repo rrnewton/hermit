@@ -8439,6 +8439,21 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         Vec::new(),
         "strict compatibility one-scheduler execution bracket",
     );
+    // The committed probes now carry direct preflight edges so --only cannot
+    // drop their source/gate ordering. Retain those five prerequisites here as
+    // inert commands; the same three workload commands still must overlap.
+    let fixture_preflight = [
+        "pre.submodules", PIN_GATE_TAG, RUST_SCRIPT_PRODUCER_TAG,
+        validate_plan::MANIFEST_PLAN_PRODUCER_TAG, "gate.manifest",
+    ];
+    for tag in fixture_preflight {
+        let source = first.steps.iter().find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("strict-compat flatten: missing committed preflight {tag}"))?;
+        execution.steps.push(step_with_caps(
+            &source.group, &source.job, "inert committed preflight", "true".into(),
+            source.deps.clone(), 10, 10, 64 * 1024 * 1024,
+        ));
+    }
     let mut execution_prep = prep.clone();
     execution_prep.deps.clear();
     execution_prep.cmd = "true".into();
@@ -8471,7 +8486,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     }
     let mut ordinary = ordinary;
     let ordinary_observed = barrier.join("ordinary.observed");
-    ordinary.deps = vec!["compatprep.fixtures".into()];
+    ordinary.deps = vec!["compatprep.fixtures".into(), PIN_GATE_TAG.into(), "gate.manifest".into()];
     ordinary.cmd = format!(
         "set -eu; test \"${{DAGRUN_OUTER_RUN:-}}\" = {tag}; test -n \"${{DAGRUN_STEP:-}}\"; touch {active}; i=0; while test ! -e {first} || test ! -e {second}; do i=$((i+1)); test \"$i\" -lt 200; sleep 0.01; done; sleep 0.1; rm -f -- {active}; printf '%s\\n' \"$DAGRUN_OUTER_RUN\" > {observed}; printf '%s\\n' '{{\"schema\":2,\"executed_tests\":0,\"filtered_tests\":0,\"results\":[]}}' > \"$DAGRUN_TEST_COUNTS_PATH\"",
         tag = validate_plan::shell_quote(&ordinary.tag()),
@@ -8507,9 +8522,14 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         .map(String::as_str)
         .chain(std::iter::once("test.hermit_modes"))
         .collect::<BTreeSet<_>>();
+    let expected_outcomes = fixture_preflight.into_iter()
+        .chain(std::iter::once("compatprep.fixtures"))
+        .chain(expected_observed.iter().copied())
+        .collect::<BTreeSet<_>>();
     if !result.ok
         || !result.complete
-        || result.outcomes.len() != 4
+        || result.outcomes.len() != 9
+        || result.outcomes.iter().map(|outcome| outcome.tag.as_str()).collect::<BTreeSet<_>>() != expected_outcomes
         || !result.skipped.is_empty()
         || observed
             .iter()
