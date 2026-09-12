@@ -36,6 +36,7 @@ const SUPER_REPETITIONS: &str = "20";
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
 const PIN_GATE_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; with-proxy ./ci/run-reverie-pin-check.sh --repo "$PWD""#;
+const OUTCOME_CONSUMERS_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/check-outcome-consumers-node.sh"#;
 const PINNED_ROOT_TWIN_SUFFIX: &str = "_in_pinned_root";
 pub const HOSTED_PORTABLE_LABEL: &str = "hosted-portable";
 const HOSTED_PRIVILEGED_LABEL: &str = "hosted-privileged";
@@ -527,6 +528,118 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+// These six shared ancestors need separate immutable IDs because quick/super
+// retain their 900-second Rust-script CPU budget, while the other profiles keep
+// the established 7200-second cold-build budget. This is generation, not a
+// runtime rewrite of the selected graph.
+const QUICK_SUPER_VARIANTS: &[&str] = &[
+    "build.rust_scripts",
+    "build.rust_scripts_in_pinned_root",
+    "gate.manifest",
+    "setup.manifest_plan",
+    "setup.manifest_plan_in_pinned_root",
+    "setup.nextest",
+];
+
+fn quick_super_variant(tag: &str) -> String {
+    format!("quick-super-{tag}")
+}
+
+fn materialize_quick_super_budgets(cfg: &mut DagConfig) {
+    let is_quick_super = |label: &str| matches!(label, "quick" | "super");
+    let mut variants = Vec::new();
+    for step in &mut cfg.steps {
+        if QUICK_SUPER_VARIANTS.contains(&step.tag().as_str()) {
+            let mut variant = step.clone();
+            variant.group = format!("quick-super-{}", variant.group);
+            variant.labels.retain(|label| is_quick_super(label));
+            variant.fail_fast_family = Some(variant.tag());
+            if step.group == "build" {
+                variant.cpu_timeout = 900;
+                variant.hint.rss_baseline_bytes = Some(2 * 1024 * 1024 * 1024);
+                variant.hint.est_duration_s = 0.0;
+            }
+            step.labels.retain(|label| !is_quick_super(label));
+            variants.push(variant);
+        }
+    }
+    cfg.steps.extend(variants);
+    for step in &mut cfg.steps {
+        if !step.labels.is_empty() && step.labels.iter().all(|label| is_quick_super(label)) {
+            for dependency in &mut step.deps {
+                if QUICK_SUPER_VARIANTS.contains(&dependency.as_str()) {
+                    *dependency = quick_super_variant(dependency);
+                }
+            }
+            step.deps.sort();
+            step.deps.dedup();
+        }
+    }
+}
+
+/// Keep the source/pin and manifest gates as direct immutable dependencies of
+/// executable nodes. Focused selection may drop ordinary build prerequisites,
+/// but it must not let a requested command race or survive a failed preflight.
+fn materialize_focused_preflight(cfg: &mut DagConfig) -> Result<(), String> {
+    let selected = select_steps_by_labels(
+        cfg,
+        &[
+            "full".into(),
+            "portable".into(),
+            "quick".into(),
+            "super".into(),
+            "privileged".into(),
+        ],
+    )?;
+    let executable_tags = selected
+        .steps
+        .iter()
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
+    let preflight = dagrun::select_steps_by_tags(
+        cfg,
+        &[
+            "gate.manifest".into(),
+            "setup.manifest_plan_in_pinned_root".into(),
+        ],
+        false,
+    )?;
+    let gate_ancestors = preflight
+        .steps
+        .iter()
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
+    let pin_preflight = dagrun::select_steps_by_tags(cfg, &["pre.reverie_pin".into()], false)?;
+    let pin_ancestors = pin_preflight
+        .steps
+        .iter()
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
+    for step in &mut cfg.steps {
+        let tag = step.tag();
+        if !executable_tags.contains(&tag) || is_hosted_variant(step) {
+            continue;
+        }
+        if !gate_ancestors.contains(&tag) {
+            step.deps.push("gate.manifest".into());
+        }
+        if !pin_ancestors.contains(&tag) {
+            step.deps.push("pre.reverie_pin".into());
+        }
+        // Manifest commands need their canonical test-harness producer even
+        // when --only is asked to use the other already-built artifacts.
+        if is_manifest_run(step) || tag == "build.manifest_guests" {
+            step.deps.push("setup.manifest_plan".into());
+            if step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
+                step.deps.push("setup.manifest_plan_in_pinned_root".into());
+            }
+        }
+        step.deps.sort();
+        step.deps.dedup();
+    }
+    Ok(())
+}
+
 fn materialize_runtime_policy(cfg: &mut DagConfig) {
     for step in &mut cfg.steps {
         if step.fail_fast_family.is_none() {
@@ -940,32 +1053,24 @@ fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
 
 fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
     assert_structured_result_producers(cfg)?;
-    if cfg.steps.len() != 1382 {
+    if cfg.steps.len() != 1388 {
         return Err(format!(
-            "superset has {} steps, expected 1382",
+            "superset has {} steps, expected 1388",
             cfg.steps.len()
         ));
     }
     if cfg.default_step_timeout != 600
-        || cfg.resource_caps != BTreeMap::from([("manifest_guest".into(), 8)])
+        || cfg.resource_caps
+            != BTreeMap::from([
+                ("manifest_guest".into(), 8),
+                ("integration_test_binaries.cli".into(), 1),
+                ("integration_test_binaries.hermit_modes".into(), 1),
+            ])
     {
         return Err(format!(
             "top-level validation policy changed: default_step_timeout={} resource_caps={:?}",
             cfg.default_step_timeout, cfg.resource_caps
         ));
-    }
-    for step in &cfg.steps {
-        if step
-            .hint
-            .resources
-            .keys()
-            .any(|name| name.starts_with("integration_test_binaries."))
-        {
-            return Err(format!(
-                "{} restored a removed integration-test resource demand",
-                step.tag()
-            ));
-        }
     }
     let step = |tag: &str| {
         cfg.steps
@@ -973,21 +1078,63 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
             .find(|step| step.tag() == tag)
             .ok_or_else(|| format!("committed DAG lost {tag}"))
     };
-    for (consumer, dependency) in [
-        ("privileged-build.privileged_tests", "test.cli"),
-        ("privileged-build.privileged_tests", "test.hermit_modes"),
-        (
-            "privileged-test.pmu_buck_chaos_cases",
-            "privileged-build.privileged_tests",
-        ),
-    ] {
-        if !step(consumer)?
-            .deps
-            .iter()
-            .any(|candidate| candidate == dependency)
+    for tag in crate::validation_dag_static::PMU_MEMORY_FAILURE_FAMILY_MEMBERS {
+        if step(tag)?.fail_fast_family.as_deref()
+            != Some(crate::validation_dag_static::PMU_MEMORY_FAILURE_FAMILY)
         {
             return Err(format!(
-                "{consumer} lost the explicit full-only serialization edge to {dependency}"
+                "{tag} lost the shared pre-cutover PMU failure family"
+            ));
+        }
+    }
+    let outcome_consumers = step("check.check_outcome_consumers")?;
+    if outcome_consumers.cmd != OUTCOME_CONSUMERS_COMMAND {
+        return Err(
+            "check.check_outcome_consumers must retain its no-result classification wrapper".into(),
+        );
+    }
+    let builder = step("privileged-build.privileged_tests")?;
+    for (binary, portable, privileged) in [
+        ("cli", "test.cli", "privileged-test.cli_kvm"),
+        (
+            "hermit_modes",
+            "test.hermit_modes",
+            "privileged-test.pmu_buck_chaos_cases",
+        ),
+    ] {
+        if builder.deps.iter().any(|dependency| dependency == portable) {
+            return Err(format!(
+                "privileged build must not depend on portable test success: {portable}"
+            ));
+        }
+        let resource = format!("integration_test_binaries.{binary}");
+        let expected = BTreeMap::from([
+            (builder.tag(), 1),
+            (portable.to_string(), 1),
+            (privileged.to_string(), 1),
+        ]);
+        let actual = cfg
+            .steps
+            .iter()
+            .filter_map(|step| {
+                step.hint
+                    .resources
+                    .get(&resource)
+                    .map(|demand| (step.tag(), *demand))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if actual != expected {
+            return Err(format!(
+                "shared integration resource {resource} demanders changed: expected={expected:?}, actual={actual:?}"
+            ));
+        }
+        if !step(privileged)?
+            .deps
+            .iter()
+            .any(|dependency| dependency == &builder.tag())
+        {
+            return Err(format!(
+                "{privileged} lost its privileged build prerequisite"
             ));
         }
     }
@@ -1042,7 +1189,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         .any(|step| step.tag() == "quick.build_in_pinned_root")
         || quick_verify.deps
             != [
-                "build.rust_scripts_in_pinned_root".to_string(),
+                "pre.reverie_pin".to_string(),
+                "quick-super-build.rust_scripts_in_pinned_root".to_string(),
+                "quick-super-gate.manifest".to_string(),
+                "quick-super-setup.manifest_plan".to_string(),
+                "quick-super-setup.manifest_plan_in_pinned_root".to_string(),
                 "quick.build".to_string(),
                 "setup.pinned_root_fetch".to_string(),
             ]
@@ -1086,10 +1237,18 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         .filter(|step| {
             is_manifest_run(step)
                 && !is_hosted_variant(step)
-                && !step
-                    .deps
-                    .iter()
-                    .any(|dependency| dependency == "build.rust_scripts_in_pinned_root")
+                && !step.deps.iter().any(|dependency| {
+                    dependency
+                        == if step
+                            .labels
+                            .iter()
+                            .any(|label| label == "quick" || label == "super")
+                        {
+                            "quick-super-build.rust_scripts_in_pinned_root"
+                        } else {
+                            "build.rust_scripts_in_pinned_root"
+                        }
+                })
         })
         .map(Step::tag)
         .collect::<Vec<_>>();
@@ -1156,9 +1315,9 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                 critical_path_wall_seconds(&selected)?
             ));
         }
-        if profile.label == "privileged" && critical_path_wall_seconds(&selected)? != 3900 {
+        if profile.label == "privileged" && critical_path_wall_seconds(&selected)? != 4020 {
             return Err(format!(
-                "local privileged selected critical path changed from 3900 seconds to {}",
+                "local privileged selected critical path changed from the pre-cutover 4020 seconds to {}",
                 critical_path_wall_seconds(&selected)?
             ));
         }
@@ -1284,6 +1443,35 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
             }
         }
     }
+    for profile in ["quick", "super", "portable", "full", HOSTED_PORTABLE_LABEL] {
+        let selected = select_steps_by_labels(cfg, &[profile.into()])?;
+        let quick_super = matches!(profile, "quick" | "super");
+        let producers = selected
+            .steps
+            .iter()
+            .filter(|step| step.job == "rust_scripts" || step.job == "rust_scripts_in_pinned_root")
+            .collect::<Vec<_>>();
+        let expected_count = if profile == HOSTED_PORTABLE_LABEL {
+            1
+        } else {
+            2
+        };
+        let expected_cpu = if quick_super { 900 } else { 7200 };
+        if producers.len() != expected_count
+            || producers.iter().any(|step| {
+                step.cpu_timeout != expected_cpu
+                    || step.group.starts_with("quick-super-") != quick_super
+            })
+        {
+            return Err(format!(
+                "{profile} Rust-script producers must retain {expected_count} distinct producers with CPU budget {expected_cpu}: {:?}",
+                producers
+                    .iter()
+                    .map(|step| (step.tag(), step.cpu_timeout))
+                    .collect::<Vec<_>>()
+            ));
+        }
+    }
     let known_results = cells.iter().map(result_identity).collect::<BTreeSet<_>>();
     for step in &cfg.steps {
         if step.result_manifests.is_none() {
@@ -1321,6 +1509,8 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     let mut refreshed = refresh_generated_partitions(static_source, generated)?;
     materialize_hosted_portable_selection(&mut refreshed);
     materialize_pinned_root(&mut refreshed)?;
+    materialize_focused_preflight(&mut refreshed)?;
+    materialize_quick_super_budgets(&mut refreshed);
     materialize_runtime_policy(&mut refreshed);
     attach_result_ownership(&mut refreshed, &cells);
     assert_invariants(&refreshed, &cells)?;
@@ -1603,6 +1793,67 @@ mod tests {
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
             error.contains("hosted-portable label has 250 direct steps"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn profile_producers_retain_distinct_pre_cutover_cpu_limits() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        assert_invariants(&committed, &cells).unwrap();
+        for (tag, wrong_cpu) in [
+            ("quick-super-build.rust_scripts", 7200),
+            ("quick-super-build.rust_scripts_in_pinned_root", 7200),
+            ("build.rust_scripts", 900),
+            ("build.rust_scripts_in_pinned_root", 900),
+        ] {
+            let mut changed = committed.clone();
+            changed
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .unwrap()
+                .cpu_timeout = wrong_cpu;
+            let error = assert_invariants(&changed, &cells).unwrap_err();
+            assert!(error.contains("CPU budget"), "{tag}: {error}");
+        }
+    }
+
+    #[test]
+    fn result_classification_and_failure_families_retain_their_pre_cutover_policy() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let cells = expected_cells(&repo_root().unwrap()).unwrap();
+        assert_invariants(&committed, &cells).unwrap();
+
+        let mut changed_family = committed.clone();
+        changed_family
+            .steps
+            .iter_mut()
+            .find(|step| {
+                step.tag() == crate::validation_dag_static::PMU_MEMORY_FAILURE_FAMILY_MEMBERS[0]
+            })
+            .unwrap()
+            .fail_fast_family = Some("independent family".into());
+        let error = assert_invariants(&changed_family, &cells).unwrap_err();
+        assert!(
+            error.contains("shared pre-cutover PMU failure family"),
+            "{error}"
+        );
+
+        let mut bypassed = committed;
+        bypassed
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "check.check_outcome_consumers")
+            .unwrap()
+            .cmd = OUTCOME_CONSUMERS_COMMAND.replace(
+            "./ci/check-outcome-consumers-node.sh",
+            "./scripts/test-check-status-outcome.sh && ./scripts/check-merge-gate-policy.sh",
+        );
+        let error = assert_invariants(&bypassed, &cells).unwrap_err();
+        assert!(
+            error.contains("no-result classification wrapper"),
             "{error}"
         );
     }

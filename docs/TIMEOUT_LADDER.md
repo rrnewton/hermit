@@ -45,10 +45,12 @@ Distribution of the selected CI-cell values calibrated at that cutoff:
 
 - manifest CPU: 22s ×488, 25s ×1, 32s ×1, 46s ×1, 56s ×1.
 - manifest wall: 57s ×487, 58s ×1, 74s ×1, 91s ×1, 105s ×1, 118s ×1.
-- dagrun node wall and CPU budgets are generated into the committed DAG for
-  every node; there is no per-lane DAG or global CPU fallback to quote. Run the
-  generator's `--check` and the undeclared-node audit rather than copying a
-  count from one labelled selection, because labels and generated partitions move.
+- historical dagrun step `timeout`: 600s ×15, 900s ×15, 120s ×11, 180s ×6,
+  60s ×6, 720s ×5, 1200s ×4, 300s ×3, 2400s ×1, 40s ×1, 30s ×1.
+
+Those distributions describe the snapshot at the cutoff above. Current node wall
+and CPU budgets are explicit in `ci/dag/validate.json`; the generator's `--check`
+and undeclared-node audit check its current labelled populations.
 
 ## Individual-test CPU and wall policy
 
@@ -204,10 +206,10 @@ the same ceiling rule; planted base and multiplier mismatches are rejected.
 
 `hermit-cli/tests/container_init_deadline.rs` — which defends `PR_SET_PDEATHSIG`
 and the container-init stop handlers, i.e. the guarantee that an external
-deadline can end a hung run at all — **is in no DAG node**. Enumerating every
-`--test <target>` across the labelled populations in `ci/dag/validate.json`
-yields 50 targets and that file is not among them, so those cells never run in
-validation. The regression cells for `hermit run --timeout` are in
+deadline can end a hung run at all — **was in no DAG node at that cutoff**.
+The historical enumeration of every `--test <target>` across
+`ci/dag/portable.json` and `ci/dag/privileged.json` yielded 50 targets and omitted
+that file, so those cells did not run in that validation snapshot. The regression cells for `hermit run --timeout` are in
 `hermit-cli/tests/cli.rs` for that reason.
 
 If that file is ever wired in, its own 12-second startup and 20-second teardown

@@ -38,7 +38,7 @@ independent source and refuses any command, dependency, or cap drift in the
 committed artifact. `--write` updates this same file; there is no secondary
 runnable DAG.
 
-The local privileged selection contains 19 nodes with a 3900-second critical
+The local privileged selection contains 19 nodes with the pre-cutover 4020-second critical
 path. The separately labelled hosted privileged smoke preserves its historical
 12-node population and 1500-second critical path, so the manual workflow keeps
 its audited 1560-second launcher bound. The stale hosted file omitted CPU
