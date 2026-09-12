@@ -1068,7 +1068,28 @@ fn self_test() {
     let rp_dbt = derive_run_plan(&dbt, &shards, &plan);
     check("dbt ⇒ dbt-parity shard", rp_dbt.shards.contains(&"dbt-parity".to_string()));
     check("dbt ⇒ hermit reverse-dep sabre shard", rp_dbt.shards.contains(&"sabre".to_string()));
-    check("dbt ⇒ only dbt cells", !rp_dbt.cells.is_empty() && rp_dbt.cells.iter().all(|c| c.backend == "dbt"));
+    let expected_dbt_cells = plan.cells.iter().filter(|cell| cell.backend == "dbt").count();
+    check(
+        "dbt ⇒ exactly the planned dbt cells",
+        rp_dbt.cells.len() == expected_dbt_cells
+            && rp_dbt.cells.iter().all(|cell| cell.backend == "dbt"),
+    );
+    // The committed plan currently has no DBT cells. Keep a positive control
+    // independent of that population so dropping every DBT cell cannot pass.
+    let mixed_backend_fixture = Plan {
+        cells: vec![
+            Cell { category: "fixture-a".into(), mode: "run".into(), backend: "dbt".into() },
+            Cell { category: "fixture-a".into(), mode: "run".into(), backend: "ptrace".into() },
+            Cell { category: "fixture-b".into(), mode: "verify".into(), backend: "dbt".into() },
+            Cell { category: "fixture-b".into(), mode: "verify".into(), backend: "sabre".into() },
+        ],
+    };
+    let selected_fixture = derive_run_plan(&dbt, &shards, &mixed_backend_fixture);
+    check(
+        "dbt fixture ⇒ both DBT identities and no other backend",
+        selected_fixture.cells.iter().map(Plan::slug).collect::<Vec<_>>()
+            == vec!["fixture-a__run__dbt".to_string(), "fixture-b__verify__dbt".to_string()],
+    );
     check("dbt ⇒ reverse-dep builds dbt and aux", rp_dbt.build_dbt && rp_dbt.build_aux);
     check("dbt ⇒ cells are a strict subset", rp_dbt.cells.len() < total_cells);
 
