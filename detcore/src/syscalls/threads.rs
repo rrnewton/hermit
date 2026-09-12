@@ -541,7 +541,7 @@ fn signal_is_blocked(mask: &KernelSigset, signal: SigWrapper) -> bool {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(super) struct KernelSigaction {
     pub(super) handler: u64,
     pub(super) flags: u64,
