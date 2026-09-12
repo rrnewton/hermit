@@ -1341,11 +1341,15 @@ impl ResultRow {
                         index + 1
                     ));
                 }
-                None => {
+                Some(canonical_verdict::NoResultReason::ComparisonRefused { detail }) => {
                     return Err(format!(
-                        "attempt {} no_result omitted no_result_reason",
+                        "attempt {} comparison was refused: {detail}",
                         index + 1
                     ));
+                }
+                None => {
+                    reasons.push("explicitly unspecified no-result cause".into());
+                    continue;
                 }
             };
             reasons.push(
@@ -1537,7 +1541,7 @@ impl ResultRow {
                 ));
             }
             let report =
-                canonical_verdict::VerificationReport::from_json_slice(report_text.as_bytes())
+                canonical_verdict::VerificationReport::from_current_json_value(raw.clone())
                     .map_err(|error| format!("attempt {} {error}", index + 1))?;
             report.require_canonical_comparison().map_err(|error| {
                 format!(
@@ -1664,7 +1668,7 @@ impl ResultRow {
                 )
             })?;
             let report =
-                canonical_verdict::VerificationReport::from_json_slice(report_text.as_bytes())
+                canonical_verdict::VerificationReport::from_current_json_value(raw.clone())
                     .map_err(|error| format!("attempt {} {error}", index + 1))?;
 
             if matches!(
@@ -1885,11 +1889,18 @@ impl ResultRow {
                             .ok_or("FirstRunRejected did not classify as no_result")?;
                         unavailable.get_or_insert(format!("NO_RESULT: {reason}"));
                     }
-                    None => {
-                        return Err(format!(
-                            "attempt {} no_result omitted no_result_reason",
+                    Some(canonical_verdict::NoResultReason::ComparisonRefused { detail }) => {
+                        saw_no_result = true;
+                        unavailable.get_or_insert(format!(
+                            "NO_RESULT: attempt {} comparison was refused: {detail}",
                             index + 1
                         ));
+                    }
+                    None => {
+                        saw_no_result = true;
+                        unavailable.get_or_insert_with(|| {
+                            format!("NO_RESULT: attempt {} recorded no specific cause", index + 1)
+                        });
                     }
                 },
                 canonical_verdict::Verdict::InfrastructureError => {
@@ -7334,6 +7345,50 @@ fn self_test() -> Result<(), String> {
         }
     };
     let current_identity = candidate("PASS").row;
+    let current_report_text = current_identity.attempts[0]["verification_report"]
+        .as_str()
+        .unwrap();
+    let current_report: JsonValue = serde_json::from_str(current_report_text).unwrap();
+    if current_report.get("no_result_reason") != Some(&JsonValue::Null) {
+        return Err(
+            "a current verification report did not serialize explicit null no_result_reason"
+                .into(),
+        );
+    }
+    current_identity
+        .bitwise_info_comparison()
+        .map_err(|error| format!("explicit-null current comparison was refused: {error}"))?;
+    current_identity
+        .comparison_evidence()
+        .map_err(|error| format!("explicit-null current evidence was refused: {error}"))?;
+
+    // These are the two live scorecard ingestion paths, not the retained-history
+    // parser. A report produced now must carry the nullable key explicitly so
+    // "producer recorded no specific cause" remains distinguishable from "an
+    // older producer did not have this field".
+    let mut missing_current_reason = current_identity.clone();
+    let mut missing_report = current_report;
+    missing_report
+        .as_object_mut()
+        .unwrap()
+        .remove("no_result_reason");
+    let missing_report = serde_json::to_string(&missing_report).unwrap();
+    missing_current_reason.attempts[0]["verification_report_sha256"] =
+        JsonValue::String(format!("{:x}", Sha256::digest(missing_report.as_bytes())));
+    missing_current_reason.attempts[0]["verification_report"] =
+        JsonValue::String(missing_report);
+    for error in [
+        missing_current_reason
+            .bitwise_info_comparison()
+            .unwrap_err(),
+        missing_current_reason.comparison_evidence().unwrap_err(),
+    ] {
+        if !error.contains("no_result_reason") {
+            return Err(format!(
+                "a live scorecard reader refused a missing current key without naming it: {error}"
+            ));
+        }
+    }
     current_identity.validate_timeout_policy()?;
     let mut retained_without_explicit_bounds = current_identity.clone();
     retained_without_explicit_bounds.execution_cpu_timeout_seconds = None;
@@ -9666,6 +9721,26 @@ red/`measured-and-passed` count is **0**.",
     no_result_row.attempts = vec![no_result_attempt];
     let no_result_identity = no_result_row.evidence_identity().unwrap();
 
+    let mut unspecified_no_result = no_result_row.clone();
+    let mut report: JsonValue = serde_json::from_str(
+        unspecified_no_result.attempts[0]["verification_report"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    report["no_result_reason"] = JsonValue::Null;
+    let report = serde_json::to_string(&report).unwrap();
+    unspecified_no_result.attempts[0]["verification_report_sha256"] =
+        JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
+    unspecified_no_result.attempts[0]["verification_report"] = JsonValue::String(report);
+    if unspecified_no_result.typed_no_result_reason()?.as_deref()
+        != Some("explicitly unspecified no-result cause")
+    {
+        return Err(
+            "an explicitly null no_result_reason was not retained as explicit absence".into(),
+        );
+    }
+
     let mut recovered_pass_row = validate_row.clone();
     recovered_pass_row.run_id = no_result_row.run_id.clone();
     recovered_pass_row.attempt = 2;
@@ -11846,6 +11921,7 @@ red/`measured-and-passed` count is **0**.",
         attempts: vec![SeriesAttemptDisposition {
             index: "1".into(),
             kind: SeriesNoVerdictKind::NotRun,
+            detail: None,
             attempt_outcome: "ERROR".into(),
             disposition: if timed_out {
                 SeriesOutcome::Timeout
