@@ -6887,7 +6887,7 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "652"
+        "NEXTEST_EXPECTED_EXECUTED": "656"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7214,6 +7214,8 @@
       "deps": [
         "build.e2e_artifact",
         "build.liteinst_runtime_release",
+        "gate.manifest",
+        "pre.reverie_pin",
         "setup.nextest"
       ],
       "env": {
@@ -7408,6 +7410,8 @@
       ],
       "deps": [
         "build.e2e_artifact",
+        "gate.manifest",
+        "pre.reverie_pin",
         "setup.nextest"
       ],
       "env": {
@@ -7884,7 +7888,8 @@
       "result_manifests": [],
       "deps": [
         "gate.manifest",
-        "pre.reverie_pin"
+        "pre.reverie_pin",
+        "setup.manifest_plan"
       ],
       "env": {},
       "networkonly": false,
@@ -13144,7 +13149,9 @@
       "deps": [
         "build.e2e_artifact",
         "build.manifest_guests",
-        "gate.manifest"
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
       ],
       "env": {},
       "networkonly": false,
@@ -14444,7 +14451,9 @@
       "deps": [
         "build.e2e_artifact",
         "build.manifest_guests",
-        "gate.manifest"
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
       ],
       "env": {},
       "networkonly": false,
@@ -14512,7 +14521,9 @@
       "deps": [
         "build.e2e_artifact",
         "build.manifest_guests",
-        "gate.manifest"
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
       ],
       "env": {},
       "networkonly": false,
@@ -17401,7 +17412,9 @@
       "deps": [
         "build.e2e_artifact",
         "build.manifest_guests",
-        "gate.manifest"
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
       ],
       "env": {},
       "networkonly": false,
@@ -17462,7 +17475,9 @@
       "deps": [
         "build.e2e_artifact",
         "build.manifest_guests",
-        "gate.manifest"
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
       ],
       "env": {},
       "networkonly": false,
@@ -17551,7 +17566,9 @@
       "deps": [
         "build.e2e_artifact",
         "build.manifest_guests",
-        "gate.manifest"
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
       ],
       "env": {},
       "networkonly": false,
@@ -17626,7 +17643,9 @@
       "deps": [
         "build.e2e_artifact",
         "build.manifest_guests",
-        "gate.manifest"
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
       ],
       "env": {},
       "networkonly": false,
@@ -17757,7 +17776,9 @@
       "deps": [
         "build.e2e_artifact",
         "build.manifest_guests",
-        "gate.manifest"
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
       ],
       "env": {},
       "networkonly": false,
@@ -17846,7 +17867,9 @@
       "deps": [
         "build.e2e_artifact",
         "build.manifest_guests",
-        "gate.manifest"
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
       ],
       "env": {},
       "networkonly": false,
@@ -18089,7 +18112,9 @@
       "deps": [
         "build.e2e_artifact",
         "build.manifest_guests",
-        "gate.manifest"
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
       ],
       "env": {},
       "networkonly": false,
@@ -18136,7 +18161,9 @@
       "deps": [
         "build.e2e_artifact",
         "build.manifest_guests",
-        "gate.manifest"
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
       ],
       "env": {},
       "networkonly": false,
@@ -18596,7 +18623,9 @@
       "deps": [
         "build.e2e_artifact",
         "build.manifest_guests",
-        "gate.manifest"
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
       ],
       "env": {},
       "networkonly": false,
@@ -18643,7 +18672,9 @@
       "deps": [
         "build.e2e_artifact",
         "build.manifest_guests",
-        "gate.manifest"
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
       ],
       "env": {},
       "networkonly": false,
@@ -18684,12 +18715,14 @@
         "e2e.manifest_chaos_c_on_host",
         "e2e.manifest_data_handling_on_host",
         "e2e.manifest_debugger_c_on_host",
-        "e2e.manifest_determinism_stress_on_host",
         "e2e.manifest_determinism_stress_c_on_host",
+        "e2e.manifest_determinism_stress_on_host",
         "e2e.manifest_language_runtimes_on_host",
         "e2e.manifest_shared_futex_c_on_host",
         "e2e.manifest_system_utils_on_host",
-        "e2e.manifest_util_c_on_host"
+        "e2e.manifest_util_c_on_host",
+        "gate.manifest",
+        "pre.reverie_pin"
       ],
       "env": {},
       "networkonly": false,
@@ -18783,7 +18816,8 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build -p hermit-manifest-plan --bins",
       "result_manifests": [],
       "deps": [
-        "build.rust_scripts_on_host"
+        "build.rust_scripts_on_host",
+        "pre.reverie_pin_on_host"
       ],
       "env": {},
       "networkonly": false,
@@ -18815,6 +18849,7 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness validate",
       "result_manifests": [],
       "deps": [
+        "pre.reverie_pin_on_host",
         "setup.manifest_plan_on_host"
       ],
       "env": {},
@@ -18847,7 +18882,8 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run && CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run",
       "result_manifests": [],
       "deps": [
-        "gate.manifest_on_host"
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host"
       ],
       "env": {},
       "networkonly": false,
@@ -18879,6 +18915,8 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; status=0; timeout --kill-after=5s 30s cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact || status=$?; if [ \"$status\" -eq 124 ] || [ \"$status\" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact Cargo timeout: exit %s)\\n' \"$status\" >&2; fi; exit \"$status\"",
       "result_manifests": [],
       "deps": [
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
         "privileged-only-build.privileged_tests_on_host"
       ],
       "env": {},
@@ -18911,6 +18949,8 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cc -O2 -Wall -Wextra -Werror tests/util/pmu_skid.c -o target/ci-pmu-skid && timeout 20 target/ci-pmu-skid --iterations 16 --period 100000",
       "result_manifests": [],
       "deps": [
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
         "privileged-only-build.privileged_tests_on_host"
       ],
       "env": {},
@@ -18953,6 +18993,8 @@
         "hermit_modes"
       ],
       "deps": [
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
         "privileged-only-pmu.preemption_on_host"
       ],
       "env": {
@@ -18987,7 +19029,8 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness build --lane privileged --ci-only --allow-empty",
       "result_manifests": [],
       "deps": [
-        "gate.manifest_on_host"
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host"
       ],
       "env": {},
       "networkonly": false,
@@ -19038,8 +19081,10 @@
       ],
       "deps": [
         "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
         "privileged-build.manifest_guests_on_host",
-        "privileged-only-build.privileged_tests_on_host"
+        "privileged-only-build.privileged_tests_on_host",
+        "setup.manifest_plan_on_host"
       ],
       "env": {},
       "networkonly": false,
@@ -19097,8 +19142,10 @@
       ],
       "deps": [
         "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
         "privileged-build.manifest_guests_on_host",
-        "privileged-only-build.privileged_tests_on_host"
+        "privileged-only-build.privileged_tests_on_host",
+        "setup.manifest_plan_on_host"
       ],
       "env": {},
       "networkonly": false,
@@ -19140,6 +19187,8 @@
         "cli"
       ],
       "deps": [
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
         "privileged-only-build.privileged_tests_on_host"
       ],
       "env": {
@@ -58956,7 +59005,6 @@
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
-        "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
       ],
@@ -58994,7 +59042,6 @@
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
-        "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
       ],
@@ -59034,7 +59081,6 @@
         "build.runtime_release_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
         "build.workspace_in_pinned_root",
-        "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
       ],
@@ -59072,7 +59118,6 @@
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
-        "gate.manifest",
         "pre.reverie_pin",
         "setup.manifest_plan_in_pinned_root",
         "setup.pinned_root_fetch"
@@ -59111,7 +59156,6 @@
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
-        "gate.manifest",
         "pre.reverie_pin",
         "setup.manifest_plan_in_pinned_root",
         "setup.pinned_root_fetch"
@@ -59149,7 +59193,6 @@
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
-        "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
       ],

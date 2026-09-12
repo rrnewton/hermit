@@ -4142,6 +4142,28 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         ));
     }
 
+    for (lane, target, producer, pin) in [
+        ("hosted-portable", "build.manifest_guests", "setup.manifest_plan", PIN_GATE_TAG),
+        ("hosted-privileged", "privileged-build.manifest_guests_on_host", "setup.manifest_plan_on_host", "pre.reverie_pin_on_host"),
+    ] {
+        for off_record in [false, true] {
+            let mut argv = vec!["--only".into(), lane.into(), target.into()];
+            if off_record { argv.push(ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into()); }
+            let args = parse_argv(&argv).map_err(|code| format!("only bracket: {lane} parser exited {code}"))?;
+            let hosted = build_plan(root, &args, &std::env::temp_dir())?;
+            let tags = hosted.cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+            if !tags.contains(target) || !tags.contains(producer) || !tags.contains(pin)
+                || tags.iter().any(|tag| tag.ends_with("_in_pinned_root") || tag == "setup.pinned_root_fetch")
+                || (off_record && tags.iter().any(|tag| tag.starts_with("gate.")))
+            {
+                return Err(format!("only bracket: {lane} changed focused host preparation (off_record={off_record}): {tags:?}"));
+            }
+            if !dagrun::model::graph_structure_violations(&hosted.cfg).is_empty() {
+                return Err(format!("only bracket: {lane} focused host preparation is not dependency-closed"));
+            }
+        }
+    }
+
     let source_after = std::fs::read(&source_path)
         .map_err(|error| format!("only bracket: cannot re-read source DAG: {error}"))?;
     if source_after != source_before {
@@ -7572,11 +7594,16 @@ fn select_from_committed_decision(
 /// commands. Ordinary build prerequisites remain outside --only; every ID and
 /// dependency retained here is read from the committed source without rewriting.
 fn retain_focused_manifest_producers(cfg: &DagConfig, tags: &mut BTreeSet<String>) {
-    if tags.contains("build.manifest_guests") {
-        tags.insert("build.manifest_guests_in_pinned_root".into());
-    }
+    let available = cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    let twins = cfg.steps.iter()
+        .filter(|step| step.job == "manifest_guests" && tags.contains(&step.tag()))
+        .map(|step| format!("{}_in_pinned_root", step.tag()))
+        .filter(|twin| available.contains(twin))
+        .collect::<Vec<_>>();
+    tags.extend(twins);
     let required_producer = |tag: &str| {
         let tag = tag.strip_prefix("quick-super-").unwrap_or(tag);
+        let tag = tag.strip_suffix("_on_host").unwrap_or(tag);
         matches!(tag,
             "setup.manifest_plan" | "setup.manifest_plan_in_pinned_root"
                 | "build.rust_scripts" | "build.rust_scripts_in_pinned_root"
@@ -7605,16 +7632,17 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         let mut tags = requested_step_ids(nodes, "--only")?;
         map_privileged_public_tags(&mut tags, lane);
         expand_strict_compat_alias(&lane_cfg, &mut tags, lane)?;
-        let preflight: &[&str] = if args.allow_local_off_the_record_run {
-            &["pre.submodules", PIN_GATE_TAG]
-        } else {
-            &[
-                "pre.submodules",
-                PIN_GATE_TAG,
-                RUST_SCRIPT_PRODUCER_TAG,
-                validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
-                "gate.manifest",
-            ]
+        let preflight: &[&str] = match (lane.as_str(), args.allow_local_off_the_record_run) {
+            ("hosted-privileged", true) => &["pre.reverie_pin_on_host"],
+            ("hosted-privileged", false) => &[
+                "pre.reverie_pin_on_host", "build.rust_scripts_on_host",
+                "setup.manifest_plan_on_host", "gate.manifest_on_host",
+            ],
+            (_, true) => &["pre.submodules", PIN_GATE_TAG],
+            (_, false) => &[
+                "pre.submodules", PIN_GATE_TAG, RUST_SCRIPT_PRODUCER_TAG,
+                validate_plan::MANIFEST_PLAN_PRODUCER_TAG, "gate.manifest",
+            ],
         };
         tags.extend(preflight.iter().map(|tag| {
             if matches!(lane.as_str(), "quick" | "super") && matches!(*tag,
@@ -19520,12 +19548,17 @@ mod committed_selection_preservation_tests {
     #[test]
     fn focused_selection_cannot_execute_after_failed_preflight() {
         let root = Path::new(file!()).parent().and_then(Path::parent).expect("validate.rs has a repository parent");
+        for (lane, target, pin, gate) in [
+            ("portable", "test.detcore_unit", PIN_GATE_TAG, "gate.manifest"),
+            ("hosted-portable", "test.cli_on_host", PIN_GATE_TAG, "gate.manifest"),
+            ("hosted-privileged", "privileged-only-test.cli_kvm_on_host", "pre.reverie_pin_on_host", "gate.manifest_on_host"),
+        ] {
         for off_record in [false, true] {
-            for failed_gate in [PIN_GATE_TAG, "gate.manifest"] {
-                if off_record && failed_gate == "gate.manifest" { continue; }
+            for failed_gate in [pin, gate] {
+                if off_record && failed_gate == gate { continue; }
                 let temp = tempfile::tempdir().unwrap();
                 let sentinel = temp.path().join("target-ran");
-                let mut argv = vec!["--only".into(), "portable".into(), "test.detcore_unit".into()];
+                let mut argv = vec!["--only".into(), lane.into(), target.into()];
                 if off_record { argv.push(ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into()); }
                 let args = parse_argv(&argv).unwrap();
                 let plan = build_plan(&root, &args, temp.path()).unwrap();
@@ -19533,7 +19566,7 @@ mod committed_selection_preservation_tests {
                 let fixture = plan.cfg.with_steps(plan.cfg.steps.iter().map(|source| {
                     let cmd = match source.tag().as_str() {
                         tag if tag == failed_gate => "exit 23".into(),
-                        "test.detcore_unit" => format!(": > {}", validate_plan::shell_quote(&sentinel.to_string_lossy())),
+                        tag if tag == target => format!(": > {}", validate_plan::shell_quote(&sentinel.to_string_lossy())),
                         _ => "true".into(),
                     };
                     inert_step(source, cmd)
@@ -19541,18 +19574,19 @@ mod committed_selection_preservation_tests {
                 let result = run_lane_once(&fixture, 4, true, 0, None, &temp.path().join("failed.log"), None, false);
                 assert!(!result.ok);
                 assert!(result.outcomes.iter().any(|outcome| outcome.tag == failed_gate && outcome.returncode == Some(23)));
-                assert!(result.skipped.contains(&"test.detcore_unit".into()), "{:?}", result.skipped);
+                assert!(result.skipped.contains(&target.to_string()), "{:?}", result.skipped);
                 assert!(!sentinel.exists(), "{failed_gate} failure did not block target (off_record={off_record})");
 
                 // Removing both gate edges recreates the bug and must let the
                 // sentinel run despite the same failing preflight.
                 let mut missing_gate = fixture.clone();
-                missing_gate.steps.iter_mut().find(|step| step.tag() == "test.detcore_unit").unwrap().deps.clear();
+                missing_gate.steps.iter_mut().find(|step| step.tag() == target).unwrap().deps.clear();
                 let result = run_lane_once(&missing_gate, 4, true, 0, None, &temp.path().join("missing-edge.log"), None, false);
                 assert!(!result.ok);
                 assert!(sentinel.exists(), "negative control failed to expose lost ordering");
             }
         }
+    }
     }
 
     #[test]
