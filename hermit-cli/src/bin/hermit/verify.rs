@@ -1076,7 +1076,7 @@ fn retain_failed_verification_logs(
     let retired = retire_failed_verification_logs(&root, &completed, retention.keep)?;
     if retired > 0 {
         eprintln!(
-            ":: Retired {retired} older failed verification comparison(s); kept at most {}",
+            ":: Retired {retired} older failed verification comparison(s); keeping the newest {} plus comparisons with active readers",
             retention.keep.max(1)
         );
     }
@@ -1088,6 +1088,12 @@ pub(crate) fn lock_failed_verification_logs_for_read(
 ) -> io::Result<Vec<File>> {
     let mut directories = BTreeSet::new();
     for path in paths {
+        let path = match fs::canonicalize(path) {
+            Ok(path) => path,
+            // Follow mode also accepts logs their writers have not created yet.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         let Some(directory) = path.parent() else {
             continue;
         };
@@ -2341,6 +2347,50 @@ mod tests {
             "the unlocked old evidence is retired later"
         );
         assert_eq!(retained_comparison_dirs(&root).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn failed_comparison_retirement_protects_symlinked_readers() {
+        for file_alias in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            let root = temporary.path().join("verify-failures");
+            fs::create_dir(&source).unwrap();
+            let retention = FailedVerifyLogRetention::new(root.clone(), 2);
+            run_failed_comparison(&source, retention.clone(), 0);
+            run_failed_comparison(&source, retention.clone(), 2);
+
+            let oldest = retained_comparison_dirs(&root).unwrap().pop().unwrap().0;
+            let protected_log = fs::read_dir(&oldest)
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| entry.file_name() != FAILED_VERIFY_LOG_LOCK)
+                .unwrap()
+                .path();
+            let alias = temporary.path().join("reader-path");
+            let input = if file_alias {
+                std::os::unix::fs::symlink(&protected_log, &alias).unwrap();
+                alias
+            } else {
+                std::os::unix::fs::symlink(&oldest, &alias).unwrap();
+                alias.join(protected_log.file_name().unwrap())
+            };
+            let read_locks = lock_failed_verification_logs_for_read([input]).unwrap();
+            run_failed_comparison(&source, retention.clone(), 4);
+            assert!(
+                oldest.is_dir(),
+                "a reader through a symlink must prevent retirement (file_alias={file_alias})"
+            );
+            assert_eq!(retained_comparison_dirs(&root).unwrap().len(), 3);
+
+            drop(read_locks);
+            run_failed_comparison(&source, retention, 6);
+            assert!(
+                !oldest.exists(),
+                "the aliased evidence must be retired after its reader releases the lock"
+            );
+            assert_eq!(retained_comparison_dirs(&root).unwrap().len(), 2);
+        }
     }
 
     #[test]
