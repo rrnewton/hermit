@@ -4194,6 +4194,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/record-replay-file-state-regular-sink",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/record-replay-file-state-regular-sink",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/record-replay-lseek-seek-cur",
           "mode": "verify",
           "backend": "ptrace"
@@ -9536,6 +9550,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/record-replay-fd-close",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/record-replay-file-state-regular-sink",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -16105,6 +16126,20 @@
           "test": "c-programs/record-replay-fd-close",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/record-replay-file-state-regular-sink",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/record-replay-file-state-regular-sink",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",

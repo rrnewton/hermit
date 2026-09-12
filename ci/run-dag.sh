@@ -128,7 +128,7 @@ validate_runner_args "$@" || exit $?
 #
 # The staleness axis is SOURCE-INVOKED vs PREBUILT-BINARY, not Rust vs Python.
 # This entrypoint selects the tracked Rust engine by default because Hermit's
-# constructed DAG declares structured test results and the Python scheduler
+# committed DAG declares structured test results and the Python scheduler
 # deliberately refuses that execution contract. An explicit DAGRUN_ENGINE or
 # DAGRUN_BIN remains diagnostic override surface; either engine still logs its
 # exact selection and never silently falls back.

@@ -1435,6 +1435,7 @@ fn self_test() -> Result<(), String> {
     run_state_path_bracket()?;
     println!("  {}", committed_validation_execution_bracket(&repo_root())?);
     println!("  {}", raw_run_dag_strict_compat_bracket(&repo_root())?);
+    println!("  {}", raw_run_dag_engine_bracket(&repo_root())?);
     shard_coverage_resource_policy_bracket(&repo_root())?;
     println!(
         "  {}",
@@ -8383,8 +8384,101 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     ))
 }
 
+/// Exercise both engine choices through the public labelled-DAG entrypoint.
+/// The private fixture must execute through Rust and refuse through Python
+/// before its marker runs, preserving the structured-result requirement.
+fn raw_run_dag_engine_bracket(root: &Path) -> Result<String, String> {
+    let fixture = tempfile::Builder::new()
+        .prefix("validate-run-dag-engine-")
+        .tempdir()
+        .map_err(|error| format!("raw run-dag engine: cannot create fixture: {error}"))?;
+    let fixture_root = fixture.path();
+    std::fs::create_dir_all(fixture_root.join("ci/dag"))
+        .map_err(|error| format!("raw run-dag engine: cannot create DAG directory: {error}"))?;
+    // Exercise the actual public launcher against an inert committed fixture.
+    // Its own ROOT_DIR resolves inside this private tree, so the test needs no
+    // alternate-DAG override and cannot launch the product validation graph.
+    for relative in ["ci/run-dag.sh", "ci/configure-build-jobs.sh"] {
+        std::fs::copy(root.join(relative), fixture_root.join(relative))
+            .map_err(|error| format!("raw run-dag engine: cannot copy {relative}: {error}"))?;
+    }
+    std::os::unix::fs::symlink(root.join("agent-utils"), fixture_root.join("agent-utils"))
+        .map_err(|error| format!("raw run-dag engine: cannot link pinned runner: {error}"))?;
+    let marker = fixture_root.join("structured-step-executed");
+    let counts = serde_json::json!({
+        "schema": 2,
+        "executed_tests": 1,
+        "filtered_tests": 0,
+        "results": [{"id": "engine-fixture", "result": "pass", "attempts": 1}],
+    }).to_string();
+    let mut step = step_with_caps(
+        "fixture",
+        "structured",
+        "structured result engine fixture",
+        format!(
+            "printf '%s\\n' {} > \"$DAGRUN_TEST_COUNTS_PATH\"; touch {}",
+            validate_plan::shell_quote(&counts),
+            validate_plan::shell_quote(&marker.to_string_lossy()),
+        ),
+        Vec::new(),
+        30,
+        30,
+        1024 * 1024,
+    );
+    step.labels = vec!["hosted-portable".into()];
+    step.result_manifests = Some(vec![ResultManifest::StructuredTestResults(
+        StructuredTestResultsManifest::current("fixture.structured"),
+    )]);
+    std::fs::write(
+        fixture_root.join("ci/dag/validate.json"),
+        dag_to_json(&validate_plan::config_from(vec![step], "structured result engine fixture")),
+    )
+    .map_err(|error| format!("raw run-dag engine: cannot write committed fixture: {error}"))?;
+    let launch = |engine: Option<&str>| -> Result<std::process::Output, String> {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after=2s", "60s"])
+            .arg(fixture_root.join("ci/run-dag.sh"))
+            .args(["portable", "--allow-cgroup-failure", "--allow-unwise-nest-dagruns", "-q"])
+            .current_dir(fixture_root)
+            .env_remove("DAGRUN_BIN")
+            .env_remove("DAGRUN_ENGINE")
+            .env_remove("RUN_DAG_FILE_OVERRIDE")
+            .env_remove("VALIDATE_RUN_STATE")
+            .env_remove("E2E_RESULT_ROOT")
+            .env_remove("E2E_BUILD_ROOT");
+        if let Some(engine) = engine {
+            command.env("DAGRUN_ENGINE", engine);
+        }
+        command.output().map_err(|error| format!("raw run-dag engine: cannot launch: {error}"))
+    };
+    let rust = launch(None)?;
+    let rust_stderr = String::from_utf8_lossy(&rust.stderr);
+    if !rust.status.success() || !rust_stderr.contains("[dagrun] engine=rust") || !marker.exists() {
+        return Err(format!(
+            "raw run-dag engine: default runner did not execute the structured committed fixture: status={} marker={} stdout={} stderr={rust_stderr}",
+            rust.status, marker.exists(), String::from_utf8_lossy(&rust.stdout),
+        ));
+    }
+    std::fs::remove_file(&marker)
+        .map_err(|error| format!("raw run-dag engine: cannot reset marker: {error}"))?;
+    let python = launch(Some("python"))?;
+    let python_stderr = String::from_utf8_lossy(&python.stderr);
+    if python.status.success()
+        || !python_stderr.contains("[dagrun] engine=python")
+        || !python_stderr.contains("REFUSING to run before any node starts")
+        || !python_stderr.contains("Python runner does not implement structured test-result capture")
+        || marker.exists()
+    {
+        return Err(format!(
+            "raw run-dag engine: Python did not refuse structured results before execution: status={} marker={} stderr={python_stderr}",
+            python.status, marker.exists(),
+        ));
+    }
+    Ok("raw run-dag engine: default Rust executed the structured committed fixture; explicit Python refused before its marker could execute".into())
+}
+
 /// Exercise the public labelled-DAG entrypoint used by `.github/workflows/ci-dag.yml`.
-///
 /// A capture runner proves the workflow passes the committed bytes plus the
 /// requested label to dagrun. It executes no workload.
 fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
