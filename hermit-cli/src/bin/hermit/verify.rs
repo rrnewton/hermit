@@ -1274,6 +1274,8 @@ mod tests {
             log,
             log_file: None,
             log_file_handle: None,
+            run_evidence_log_handle: None,
+            run_evidence_write_error: None,
             backend: None,
         }
     }
