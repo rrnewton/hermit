@@ -170,8 +170,8 @@ source bytes.
   determinism relaxations.
 
   ```bash
-  dev_hermit=/home/newton/work/dev-hermit
-  hermit_bin="$dev_hermit/hermit/target/debug/hermit"
+  dev_hermit=${DEV_HERMIT_ROOT:?set DEV_HERMIT_ROOT}
+  hermit_bin=${HERMIT_BIN:?set HERMIT_BIN to the measured Hermit binary}
   run=$(mktemp -d)
   mkdir -p "$run/home" "$run/xdg-config" "$run/fixtures"
   env E2E_FIXTURE_DIR="$run/fixtures" E2E_TMPDIR=/tmp/hermit-e2e \
@@ -212,9 +212,16 @@ source bytes.
   seconds, while its peer was killed at 15.042 and 15.036 seconds after using
   14.298 and 6.466 process CPU-seconds. The smaller CPU total belongs to an
   incomplete execution; it is not evidence that the cell selected less work.
-- Next: size the per-test CPU and wall bounds in the timeout-policy work. Do not
-  add cached preparation or reduce the transfer population to make this cell
-  fit the current 15-second wall deadline.
+- Follow-up checked on 2026-09-12: the manifest now configures a 58-second wall
+  bound and a 22-second CPU bound. Its 60 retained typed passing rows had a
+  nearest-rank p90 of 14.275 wall seconds and 12.732855 CPU seconds; the
+  calibration requires `ceil(4 * wall) = 58` and `ceil(1.5 * CPU) = 20`,
+  covered by the configured 22-second CPU default. The historical 15-second
+  failures above do not describe the current bound. The guest source hash and
+  full transfer population remain unchanged. See
+  `tests/e2e/manifests/data-handling.yaml` and
+  `ci/manifest-plan/src/timeouts.rs` for the measured policy. Preserve that
+  fixed workload when investigating future runtime variation.
 
 # debugger-c
 
