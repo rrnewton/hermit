@@ -1004,7 +1004,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "bincode",
+ "bincode 2.0.1",
  "bitflags 2.13.1",
  "chrono",
  "clap",
