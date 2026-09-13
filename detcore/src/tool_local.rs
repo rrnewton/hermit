@@ -22,7 +22,6 @@ use detcore_model::pedigree::Pedigree;
 use detcore_model::summary::TimesliceStats;
 use nix::fcntl::OFlag;
 use nix::sys::stat;
-use nix::unistd::Pid;
 use rand::Rng as _;
 use rand::RngExt as _;
 use rand::SeedableRng;
@@ -641,31 +640,45 @@ impl FileMetadata {
     /// Hermit. Their status flags are live input, not an empty placeholder, and
     /// aliases that already name the same Linux open file description must
     /// share one modeled description too.
-    fn setup_stdio(mut self, _pid: Pid, owner: DetTid) -> Self {
-        for fd in 0..=2 {
-            let status_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    fn setup_stdio(self, owner: DetTid) -> Result<Self, InheritedStdioAliasError> {
+        self.setup_stdio_with(owner, [0, 1, 2], same_open_file_description)
+    }
+
+    fn setup_stdio_with(
+        mut self,
+        owner: DetTid,
+        inherited: [RawFd; 3],
+        mut same_description: impl FnMut(RawFd, RawFd) -> Result<bool, InheritedStdioAliasError>,
+    ) -> Result<Self, InheritedStdioAliasError> {
+        for (fd, host_fd) in inherited.into_iter().enumerate() {
+            let fd = fd as RawFd;
+            let status_flags = unsafe { libc::fcntl(host_fd, libc::F_GETFL) };
+            let fd_flags = unsafe { libc::fcntl(host_fd, libc::F_GETFD) };
             assert!(
                 status_flags >= 0 && fd_flags >= 0,
                 "container stdio descriptor {fd} must be open"
             );
             // SAFETY: the descriptor was just confirmed live by fcntl.
-            let raw_stat = stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).unwrap();
+            let raw_stat = stat::fstat(unsafe { BorrowedFd::borrow_raw(host_fd) }).unwrap();
             let mut flags = OFlag::from_bits_truncate(status_flags);
             if fd_flags & libc::FD_CLOEXEC != 0 {
                 flags.insert(OFlag::O_CLOEXEC);
             }
 
-            let alias = (0..fd).find_map(|candidate| {
-                same_open_file_description(candidate, fd).then(|| {
-                    self.file_handles
-                        .get(&candidate)
-                        .expect("earlier stdio descriptor must be registered")
-                        .clone()
-                        .with_fd(fd)
-                        .with_fd_flags(flags)
-                })
-            });
+            let mut alias = None;
+            for candidate in 0..fd {
+                if same_description(inherited[candidate as usize], host_fd)? {
+                    alias = Some(
+                        self.file_handles
+                            .get(&candidate)
+                            .expect("earlier stdio descriptor must be registered")
+                            .clone()
+                            .with_fd(fd)
+                            .with_fd_flags(flags),
+                    );
+                    break;
+                }
+            }
             let detfd = alias.unwrap_or_else(|| {
                 // Preserve setup_stdio's existing Regular classification. The
                 // socket-specific handlers still identify recv/send by syscall,
@@ -700,7 +713,7 @@ impl FileMetadata {
             detfd.mark_flock_mode_unobserved();
             self.add_detfd(detfd);
         }
-        self
+        Ok(self)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -869,25 +882,216 @@ fn stdio_resource(fd: RawFd) -> Option<ResourceID> {
     }
 }
 
+/// Failure to establish the exact open-file-description identity of inherited stdio.
+///
+/// An unknown comparison cannot safely become two independent modeled descriptions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InheritedStdioAliasError {
+    /// First physical descriptor passed to `kcmp(KCMP_FILE)`.
+    pub left: RawFd,
+    /// Second physical descriptor passed to `kcmp(KCMP_FILE)`.
+    pub right: RawFd,
+    /// Exact errno from the failed kernel comparison.
+    pub errno: i32,
+}
+
+impl std::fmt::Display for InheritedStdioAliasError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot compare inherited stdio descriptors {} and {} with kcmp(KCMP_FILE): {} (errno {})",
+            self.left,
+            self.right,
+            std::io::Error::from_raw_os_error(self.errno),
+            self.errno,
+        )
+    }
+}
+
+impl std::error::Error for InheritedStdioAliasError {}
+
 /// Return whether two descriptors in Hermit's process name the same Linux open
-/// file description. `kcmp(KCMP_FILE)` is the kernel operation that answers
-/// exactly that question; inode equality is not enough because two independent
-/// opens of one file have separate offsets and status flags.
-fn same_open_file_description(left: RawFd, right: RawFd) -> bool {
+/// file description. Inode equality is insufficient: independent opens of one
+/// file have separate offsets and status flags. Refuse an unknown kernel answer.
+fn same_open_file_description(left: RawFd, right: RawFd) -> Result<bool, InheritedStdioAliasError> {
     const KCMP_FILE: libc::c_int = 0;
     // SAFETY: kcmp only compares descriptor-table entries owned by this process.
     let pid = unsafe { libc::getpid() };
     let comparison = unsafe { libc::syscall(libc::SYS_kcmp, pid, pid, KCMP_FILE, left, right) };
     if comparison == -1 {
-        tracing::warn!(
+        Err(InheritedStdioAliasError {
             left,
             right,
-            error = %std::io::Error::last_os_error(),
-            "could not compare inherited stdio open file descriptions; treating them as distinct"
-        );
-        false
+            errno: std::io::Error::last_os_error()
+                .raw_os_error()
+                .expect("a failed kcmp sets errno"),
+        })
     } else {
-        comparison == 0
+        Ok(comparison == 0)
+    }
+}
+
+#[cfg(test)]
+mod inherited_stdio_alias_tests {
+    use std::os::fd::AsRawFd;
+    use std::process::Command;
+    use std::time::Instant;
+
+    use reverie::Pid;
+
+    use super::*;
+
+    #[test]
+    fn inherited_stdio_compares_descriptions_not_inodes() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let alias = file.as_file().try_clone().unwrap();
+        let independent = std::fs::File::open(file.path()).unwrap();
+        let fds = [file.as_raw_fd(), alias.as_raw_fd(), independent.as_raw_fd()];
+        assert_eq!(same_open_file_description(fds[0], fds[1]), Ok(true));
+        assert_eq!(same_open_file_description(fds[0], fds[2]), Ok(false));
+        let owner = DetTid::from_raw(17);
+        let metadata = FileMetadata::new(owner)
+            .setup_stdio_with(owner, fds, same_open_file_description)
+            .unwrap();
+        assert_eq!(metadata.file_handles.len(), 3);
+        assert_eq!(
+            metadata.file_handles[&0].open_file_id(),
+            metadata.file_handles[&1].open_file_id()
+        );
+        assert_ne!(
+            metadata.file_handles[&0].open_file_id(),
+            metadata.file_handles[&2].open_file_id()
+        );
+        let error = same_open_file_description(fds[0], -1).unwrap_err();
+        assert_eq!(
+            (error.left, error.right, error.errno),
+            (fds[0], -1, libc::EBADF)
+        );
+    }
+
+    #[test]
+    fn inherited_stdio_late_comparison_error_rejects_partial_table() {
+        let file = tempfile::tempfile().unwrap();
+        let owner = DetTid::from_raw(17);
+        for errno in [libc::EPERM, libc::EBADF] {
+            let mut calls = 0;
+            let result = FileMetadata::new(owner).setup_stdio_with(
+                owner,
+                [file.as_raw_fd(); 3],
+                |left, right| {
+                    calls += 1;
+                    if calls == 1 {
+                        Ok(true)
+                    } else {
+                        Err(InheritedStdioAliasError { left, right, errno })
+                    }
+                },
+            );
+            assert_eq!(calls, 2, "the failure follows an already accepted alias");
+            assert_eq!(
+                result.unwrap_err().errno,
+                errno,
+                "partial metadata must not be returned"
+            );
+        }
+    }
+
+    // Run only this test in its own executed process: the seccomp filter is
+    // permanent and must not contaminate other libtest cases or host stdio.
+    #[test]
+    fn inherited_stdio_kernel_errors_leave_empty_state_and_survive_clones() {
+        const CHILD: &str = "HERMIT_STDIO_ALIAS_ERROR_CONTROL";
+        let Ok(value) = std::env::var(CHILD) else {
+            for errno in [libc::EPERM, libc::EBADF] {
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "tool_local::inherited_stdio_alias_tests::inherited_stdio_kernel_errors_leave_empty_state_and_survive_clones", "--nocapture"])
+                    .env(CHILD, errno.to_string())
+                    .spawn().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let status = loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        break status;
+                    }
+                    if Instant::now() >= deadline {
+                        child.kill().unwrap();
+                        let status = child.wait().unwrap();
+                        panic!("isolated alias control timed out: {status}");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                assert!(status.success(), "isolated errno {errno} control: {status}");
+            }
+            return;
+        };
+        let errno: i32 = value.parse().unwrap();
+        assert!([libc::EPERM, libc::EBADF].contains(&errno));
+        let filter = [
+            libc::sock_filter {
+                code: 0x20,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            }, // seccomp_data.nr
+            libc::sock_filter {
+                code: 0x15,
+                jt: 0,
+                jf: 1,
+                k: libc::SYS_kcmp as u32,
+            },
+            libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ERRNO | errno as u32,
+            },
+            libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            },
+        ];
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr().cast_mut(),
+        };
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) },
+            0
+        );
+        let config = Config::default();
+        let mut state = ThreadState::new(DetTid::from_raw(17), &config, ());
+        let expected = InheritedStdioAliasError {
+            left: 0,
+            right: 1,
+            errno,
+        };
+        assert_eq!(state.inherited_stdio_alias_error, Some(expected.clone()));
+        assert!(
+            state.file_metadata.lock().unwrap().file_handles.is_empty(),
+            "no partial root table survives the failed comparison"
+        );
+        assert_eq!(
+            state.file_metadata.lock().unwrap().next_open_file_sequence,
+            0
+        );
+        use reverie::Tool;
+        let tool = <Detcore as Tool>::new(Pid::from_raw(17), &config);
+        for flags in [
+            CloneFlags::empty(),
+            CloneFlags::CLONE_FILES,
+            CloneFlags::CLONE_VM | CloneFlags::CLONE_THREAD | CloneFlags::CLONE_FILES,
+        ] {
+            state.clone_flags = Some(flags);
+            let child =
+                tool.init_thread_state(Pid::from_raw(18), Some((Pid::from_raw(17), &state)));
+            assert_eq!(child.inherited_stdio_alias_error, Some(expected.clone()));
+            assert!(child.file_metadata.lock().unwrap().file_handles.is_empty());
+        }
     }
 }
 
@@ -1732,6 +1936,11 @@ pub struct ThreadState<T> {
     /// Initialized for new threads (shared or fresh), and then overwritten again on `execve`.
     pub file_metadata: Arc<Mutex<FileMetadata>>,
 
+    /// Failed inherited-stdio identity proof, retained until the start hook can
+    /// return a Tool error. Never expose a partially initialized descriptor table.
+    #[serde(default)]
+    pub(crate) inherited_stdio_alias_error: Option<InheritedStdioAliasError>,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review backend-gated live descriptor discovery state.
     /// Whether missing guest descriptors may be inspected in the current process.
@@ -2095,6 +2304,13 @@ impl<T> ThreadState<T> {
             .prepare_child(pid);
     }
 
+    /// Return an unresolved inherited-stdio identity failure. Backends with
+    /// lazy initialization must check this before probing guest memory or
+    /// publishing a guest syscall result, without running the scheduler early.
+    pub fn inherited_stdio_alias_error(&self) -> Option<&InheritedStdioAliasError> {
+        self.inherited_stdio_alias_error.as_ref()
+    }
+
     /// Create a fresh new thread state from nothing.  In practice this is only used for the thread
     /// state of the root thread of the container.
     pub fn new(pid: DetPid, cfg: &Config, record_or_replay: T) -> Self {
@@ -2109,16 +2325,19 @@ impl<T> ThreadState<T> {
         let thread_logical_time = DetTime::new(cfg);
         let last_accounted_user_time = thread_logical_time.user_cpu_time();
         let last_accounted_system_time = thread_logical_time.system_cpu_time();
-        let file_metadata = if cfg.discover_live_file_metadata {
+        let (file_metadata, inherited_stdio_alias_error) = if cfg.discover_live_file_metadata {
             let mut metadata = FileMetadata::new(pid);
             for fd in 0..=2 {
                 metadata
                     .discover_fd_from_current_process(pid, fd)
                     .expect("SaBRe guest stdio must be open");
             }
-            metadata
+            (metadata, None)
         } else {
-            FileMetadata::new(pid).setup_stdio(pid.into(), pid)
+            match FileMetadata::new(pid).setup_stdio(pid) {
+                Ok(metadata) => (metadata, None),
+                Err(error) => (FileMetadata::new(pid), Some(error)),
+            }
         };
         ThreadState {
             dettid: pid,
@@ -2130,6 +2349,7 @@ impl<T> ThreadState<T> {
             pedigree: Pedigree::new(), // Root thread.
             stats: ThreadStats::new(),
             file_metadata: Arc::new(Mutex::new(file_metadata)),
+            inherited_stdio_alias_error,
             discover_live_file_metadata: cfg.discover_live_file_metadata,
             timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
