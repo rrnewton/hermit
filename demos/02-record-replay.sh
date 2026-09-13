@@ -33,7 +33,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 if [ "${DEMO_SKIP_BUILD:-0}" != "1" ]; then
   (cd "$HERMIT_REPO" && cargo build --locked -p hermit --bin hermit)
 fi
-HERMIT="$HERMIT_REPO/target/debug/hermit"
+HERMIT="${HERMIT_DEBUG:-$HERMIT_REPO/target/debug/hermit}"
 if [ ! -x "$HERMIT" ]; then
   echo "missing debug hermit binary: $HERMIT" >&2
   echo "run the demo without DEMO_SKIP_BUILD=1 so its prerequisites are built" >&2

@@ -38,8 +38,15 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 export PYTHON="${PYTHON:-python3}"
 
 demo_banner "Build a debug guest so the report can resolve source locations"
-( cd "$HERMIT_REPO" && cargo build -p hermetic_infra_hermit_flaky-tests --bin hello_race )
-export HELLO_RACE_DEBUG="$HERMIT_REPO/target/debug/hello_race"
+if [ "${DEMO_SKIP_BUILD:-0}" != "1" ]; then
+  ( cd "$HERMIT_REPO" && cargo build -p hermetic_infra_hermit_flaky-tests --bin hello_race )
+fi
+export HELLO_RACE_DEBUG="${HELLO_RACE_DEBUG:-$HERMIT_REPO/target/debug/hello_race}"
+if [ ! -x "$HELLO_RACE_DEBUG" ]; then
+  echo "missing debug hello_race binary: $HELLO_RACE_DEBUG" >&2
+  echo "run the demo without DEMO_SKIP_BUILD=1 so its prerequisites are built" >&2
+  exit 1
+fi
 export ANALYSIS_REPORT="$DEMO_ARTIFACTS/hello-race-analysis.json"
 export ANALYZE_PREEMPTION_TIMEOUT="${ANALYZE_PREEMPTION_TIMEOUT:-disabled}"
 
