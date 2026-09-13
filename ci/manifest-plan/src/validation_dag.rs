@@ -921,7 +921,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
                 ));
             }
         };
-        if command_kind == Some(StructuredResultProducerKind::Nextest) {
+        if command_kind == Some(StructuredResultProducerKind::Nextest)
+            || step.cmd.contains("nextest-binaries.rs executable ")
+        {
             crate::nextest_build_selections::assert_command_selection(step)?;
         }
         if step.cmd.contains("NEXTEST_EXPECTED_EXECUTED") {
