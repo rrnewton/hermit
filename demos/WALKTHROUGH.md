@@ -269,13 +269,14 @@ make demo8                       # or: ./demos/08-btrfs-convert-uaf.sh
 Two prebuilt AddressSanitizer binaries (`buggy` = pre-73e211a7, `fixed` =
 73e211a7) and a populated ext4 image live under `ignored/demo08-btrfs/`. ASAN
 turns the latent UAF into an observable abort with a precise report. When the
-assets are absent the demo prints `SKIPPED` and exits 0, so `make all` stays
-green; `demos/08-btrfs-convert-uaf.md` has the build recipe.
+assets are absent the demo prints `SKIPPED` and exits 0; the suite records SKIP,
+which does not satisfy a GREEN demo review. Set `DEMO08_REQUIRE_ASSETS=1` to
+refuse missing assets. `demos/08-btrfs-convert-uaf.md` has the build recipe.
 
-### Blind execution almost never hits it
+### Report the native baseline
 
-Native execution misses the bug because the teardown window is tiny on real
-hardware. The experiment behind this demo swept the buggy binary 40 times
+Native execution can encounter the race. The historical hand-built fixture
+experiment behind this demo swept the buggy binary 40 times
 natively and across 32 chaos seeds:
 
 | Execution | Runs | UAF crashes |
@@ -284,11 +285,14 @@ natively and across 32 chaos seeds:
 | hermit `--chaos` buggy, seeds 0-31 | 32 | **2** (seeds **15**, **19**) |
 | hermit `--chaos` fixed, seeds 0-31 | 32 | **0** — the fix closes the window |
 
-(from the retained source measurements summarized in
-`demos/08-btrfs-convert-uaf.md`.)
+(from the original fixture measurements summarized in
+`demos/08-btrfs-convert-uaf.md`; these are not results for a newly built binary.)
 
-The demo then drives one known crashing seed end to end. Step 1 confirms the
-blind baseline — the same buggy binary, run natively, exits cleanly:
+The demo then drives a calibrated seed end to end. By default it reads
+`.crash-seed`, which preparation binds to the buggy binary's SHA256. The seed 15
+in the illustrative excerpts below belongs to the original hand-built fixture;
+a current preparation can choose another seed. Step 1 reports the actual native
+status and can continue after a nonzero native result:
 
 ```text
 === Demo 08: schedule-dependent btrfs-convert progress-thread UAF ===
@@ -315,8 +319,8 @@ SUMMARY: AddressSanitizer: heap-use-after-free common/task-utils.c:154 in task_p
 chaos buggy: reproduced the use-after-free
 ```
 
-`--sched-seed 15` is the recorded seed: it names the exact interleaving, so the
-crash is reproducible rather than a lucky one-off.
+The recorded seed is used with the same binary, image and arguments for the
+repeat. A seed from a different fixture is not evidence about the current one.
 
 ### The fix closes the window on the same seed
 
@@ -325,22 +329,24 @@ The no-detach + join teardown removes the race, so it exits cleanly:
 
 ```text
 --- Step 3: chaos fixed, --sched-seed 15 (expect clean) ---
-chaos fixed: clean exit on the crashing seed (73e211a7 closes the window)
+chaos fixed: completed rc=0 with no UAF report (73e211a7 closes the window)
 ```
 
-### The crash replays bit-for-bit
+### Compare the extracted ASAN signature
 
 Re-running the crashing seed with the identical image path (hermit determinism
 is per-input, and the faulting heap address depends on `argv`) reproduces a
-byte-identical guest ASAN report — same heap address, PC, and frames:
+byte-identical extracted ASAN signature — the error, selected guest frames and
+SUMMARY, including the same heap address and PC. The full reports remain in the
+artifacts but are not the comparator's input:
 
 ```text
 --- Step 4: replay --sched-seed 15, confirm identical crash ---
-replay: guest ASAN report byte-identical (same heap address, PC, frames)
+replay: extracted ASAN signature byte-identical (same heap address, PC, frames)
 
 === Demo 08: SUCCESS ===
-native missed the UAF; chaos found it on seed 15, the fix closed
-it, and the crash replayed deterministically.
+chaos found the UAF on seed 15, the fixed control completed cleanly,
+and the extracted ASAN signature matched on replay.
 ```
 
 ### Observability adaptation (stated plainly)
@@ -357,8 +363,10 @@ does not reach the hermit guest. Neither change alters which teardown ordering
 is safe; they only make the existing race reachable and observable under
 hermit's logical clock. Full detail: `demos/08-btrfs-convert-uaf.md`.
 
-Useful overrides: `DEMO08_CRASH_SEED` (default 15), `DEMO08_TIMEOUT` (default
-90), `DEMO08_DIR`, `DEMO08_ARTIFACTS`, and `HERMIT_RELEASE`.
+Useful overrides: `DEMO08_CRASH_SEED` replaces the fixture's recorded seed;
+`DEMO08_TIMEOUT` defaults to 90. `DEMO08_DIR`, `DEMO08_ARTIFACTS`,
+`HERMIT_RELEASE`, and `SAFEHERMIT` select the assets, outputs and executables.
+The compatibility fallback 15 applies only to legacy assets without `.crash-seed`.
 
 `DEMO08_TIMEOUT` bounds each calibration run as well as each demo run, so the
 calibration cannot select a seed that the demo would then cut off. Raising it

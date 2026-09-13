@@ -7,15 +7,14 @@
 # subthread and task_stop() never pthread_join()ed it, so task_deinit() could
 # free(info) while the subthread was still reading it -- a use-after-free whose
 # occurrence depends entirely on the teardown interleaving. It is therefore
-# essentially invisible to blind/native execution, but hermit's chaos scheduler
-# lands the racing schedule deterministically on specific seeds and replays it
-# bit-for-bit.
+# possible in native execution. Hermit's chaos scheduler can select a seed that
+# reproduces the abort and the extracted ASAN signature on replay.
 #
 # This demo runs prebuilt AddressSanitizer binaries (so the latent UAF becomes
 # an observable abort) of two btrfs-convert variants -- `buggy` (pre-73e211a7)
-# and `fixed` (73e211a7). It shows: native buggy is clean, chaos buggy crashes
-# on a known seed, chaos fixed on the same seed is clean (the differential), and
-# the chaos crash reproduces byte-for-byte on replay. See the companion
+# and `fixed` (73e211a7). It reports the native result, then requires a buggy
+# chaos crash, a clean fixed control on the same seed, and an extracted ASAN
+# signature that matches byte-for-byte on replay. See the companion
 # 08-btrfs-convert-uaf.md for the bug, the build recipe, and the observability
 # adaptation the ASAN binaries carry.
 
@@ -31,7 +30,7 @@ usage() {
 Usage: demos/08-btrfs-convert-uaf.sh
 
 Demonstrate a schedule-dependent btrfs-convert progress-thread use-after-free
-that native execution misses and hermit --chaos finds and replays.
+with a native baseline, a chaos crash, a fixed control and a matching replay.
 
 Requires prebuilt ASAN btrfs-convert binaries and a populated ext4 image under
 the ignored asset directory (see 08-btrfs-convert-uaf.md for the build recipe):
@@ -68,8 +67,8 @@ fi
 
 # Gate: the ASAN binaries and populated image are large and host-specific, so
 # they live in the ignored asset directory rather than the repository. Skip
-# cleanly (exit 0) when they are absent so run-all.sh stays green on hosts that
-# have not built them.
+# explicitly when they are absent. run-all.sh records that outcome as SKIP,
+# which cannot supply a GREEN demo review.
 for f in "$BUGGY" "$FIXED" "$IMAGE"; do
   if [ ! -r "$f" ]; then
     if [ "$REQUIRE_ASSETS" = 1 ]; then
@@ -132,10 +131,11 @@ fresh_image() {
   cp --reflink=auto "$IMAGE" "$dst"
 }
 
-# The deterministic core of an ASAN heap-use-after-free report: the error line
+# The extracted signature of an ASAN heap-use-after-free report: the error line
 # (faulting heap address + PC), the two guest frames, and the SUMMARY. Under
-# hermit these are byte-identical across replays of the same seed; only hermit's
-# own host-side log lines vary, and this filter drops them.
+# hermit these must be byte-identical across replays of the same seed. This
+# comparator excludes the remaining ASAN report and Hermit's host-side logs;
+# the complete outputs remain in the artifacts.
 asan_core() {
   grep -aE 'AddressSanitizer: heap-use-after-free|task_period_wait|print_copied_inodes|SUMMARY: AddressSanitizer' "$1" || true
 }
@@ -165,7 +165,7 @@ echo "buggy=$BUGGY"
 echo "fixed=$FIXED"
 echo
 
-# --- Step 1: native buggy is clean (bug dormant under blind execution) --------
+# --- Step 1: report the native buggy baseline --------------------------------
 echo "--- Step 1: native buggy btrfs-convert (blind execution) ---"
 NATIVE_IMG="$ARTIFACTS/native-buggy.img"
 fresh_image "$NATIVE_IMG"
@@ -244,7 +244,7 @@ fi
 echo "chaos fixed: completed rc=0 with no UAF report (73e211a7 closes the window)"
 echo
 
-# --- Step 4: the chaos crash replays byte-for-byte ----------------------------
+# --- Step 4: the extracted ASAN signature replays byte-for-byte ---------------
 # Reuse the exact same image path (hence byte-identical argv) as Step 2: hermit
 # determinism is per-input, and the faulting heap address depends on argv (the
 # image path length shifts the initial heap layout). A different path would give
@@ -266,7 +266,7 @@ if ! complete_asan_uaf "$ARTIFACTS/chaos-buggy-replay.out"; then
 fi
 asan_core "$ARTIFACTS/chaos-buggy-replay.out" >"$ARTIFACTS/asan-report-replay.txt"
 if cmp -s "$ARTIFACTS/asan-report.txt" "$ARTIFACTS/asan-report-replay.txt"; then
-  echo "replay: guest ASAN report byte-identical (same heap address, PC, frames)"
+  echo "replay: extracted ASAN signature byte-identical (same heap address, PC, frames)"
 else
   echo "replay: ASAN reports differ between runs" >&2
   diff "$ARTIFACTS/asan-report.txt" "$ARTIFACTS/asan-report-replay.txt" >&2 || true
@@ -275,5 +275,5 @@ fi
 
 echo
 echo "=== Demo 08: SUCCESS ==="
-echo "native missed the UAF; chaos found it on seed $CRASH_SEED, the fix closed"
-echo "it, and the crash replayed deterministically."
+echo "chaos found the UAF on seed $CRASH_SEED, the fixed control completed cleanly,"
+echo "and the extracted ASAN signature matched on replay."

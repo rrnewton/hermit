@@ -1,9 +1,9 @@
 # Demo 08: schedule-dependent btrfs-convert use-after-free
 
 Demo 08 reproduces a real **userspace** concurrency bug — a heap
-use-after-free in btrfs-progs' `btrfs-convert` — that native (blind) execution
-almost never hits, but hermit's chaos scheduler lands deterministically on a
-recorded seed and replays bit-for-bit. No QEMU is involved; this is an ordinary
+use-after-free in btrfs-progs' `btrfs-convert`. It reports a native baseline,
+then requires a chaos abort, a clean fixed control and a repeated abort with
+the same extracted ASAN signature on a recorded seed. No QEMU is involved; this is an ordinary
 multithreaded userspace program under `hermit run --chaos`.
 
 ## The bug
@@ -62,10 +62,12 @@ existing race *reachable and observable* under hermit's logical clock. The
 racing access itself — the subthread's load/store of `*info` after the main
 thread frees it — is the genuine, unmodified 73e211a7 bug.
 
-## Results
+## Historical fixture results
 
 From `demos/fixtures/demo08/` (btrfs-progs
-v7.1, hermit primary checkout `103657d…`, `pop-tiny.img` ≈100 files):
+v7.1, hermit primary checkout `103657d…`, `pop-tiny.img` ≈100 files).
+These are the original hand-built fixture's measurements, not results for a
+new build or a promise that its seeds work with another binary:
 
 | Execution | Runs | UAF crashes | Notes |
 |---|---|---|---|
@@ -95,12 +97,17 @@ freed by thread T0 here:  free -> task_deinit -> do_convert
 ./demos/08-btrfs-convert-uaf.sh
 ```
 
-The script runs native buggy (clean), chaos buggy on the crashing seed
+The script reports native buggy's actual status, runs chaos buggy on the crashing seed
 (reproduces the UAF), chaos fixed on the same seed (clean — the differential),
-then replays the crashing seed and confirms the guest ASAN report is identical.
+then replays the crashing seed and compares the extracted ASAN signature. That
+comparison covers the UAF error line, `task_period_wait`, `print_copied_inodes`
+and `SUMMARY` lines; it does not compare the complete report or Hermit's logs.
+Both complete outputs are retained. A nonzero native result remains visible;
+the script's existing native baseline allows it to continue to the chaos controls.
 
-It **skips cleanly (exit 0)** when the prebuilt assets are absent, so it is safe
-in `make all`. Provide them under `ignored/demo08-btrfs/` (or point
+It reports **SKIPPED (exit 0)** when the prebuilt assets are absent; the suite
+records SKIP, which cannot satisfy a GREEN demo review. Set
+`DEMO08_REQUIRE_ASSETS=1` to refuse missing assets. Provide them under `ignored/demo08-btrfs/` (or point
 `DEMO08_DIR` elsewhere):
 
 ```
@@ -109,8 +116,15 @@ ignored/demo08-btrfs/fixed/btrfs-convert
 ignored/demo08-btrfs/pop-tiny.img
 ```
 
-Overrides: `DEMO08_DIR`, `DEMO08_ARTIFACTS`, `DEMO08_CRASH_SEED` (default 15),
-`DEMO08_TIMEOUT` (default 90), `HERMIT_RELEASE`.
+The default seed comes from the asset directory's `.crash-seed`. Preparation
+writes the seed together with the buggy binary's SHA256 after completing the
+buggy, replay and fixed controls; the demo refuses a recorded hash that differs
+from the supplied binary. The value 15 is only the compatibility fallback for
+original hand-built assets without that file. It is not the default for a
+newly calibrated fixture.
+
+Overrides: `DEMO08_DIR`, `DEMO08_ARTIFACTS`, `DEMO08_CRASH_SEED` (explicit seed),
+`DEMO08_TIMEOUT` (default 90), `HERMIT_RELEASE`, `SAFEHERMIT`.
 
 `DEMO08_TIMEOUT` is not the demo's budget alone: `scripts/prepare-demo08-assets.sh`
 caps each calibration run at the same value, and refuses a
@@ -119,17 +133,21 @@ budget the demo will apply to it.
 
 ## Build recipe
 
-Build btrfs-progs **v7.1** twice, applying the vendored sources from
-`demos/fixtures/demo08/`:
+Use `scripts/prepare-demo08-assets.sh` to build the fixtures and calibrate a
+seed. It pins btrfs-progs **v7.1** to
+`4ab0e80be9e3bb1db2e6038e6d4316d35fb7ba8b`, builds both variants, creates
+the populated image and records a seed only after the required controls.
+The build consumes these repository files:
 
-- `src/buggy/common/task-utils.c` and `src/fixed/common/task-utils.c` — the two
+- `demos/fixtures/demo08/buggy/common/task-utils.c` and
+  `demos/fixtures/demo08/fixed/common/task-utils.c` — the two
   teardown variants (both carry the pipe harness; they differ only in
   detach/no-join vs. join).
-- `src/{buggy,fixed}/common/task-utils.h` — the `struct periodic_info` fields
+- `demos/fixtures/demo08/{buggy,fixed}/common/task-utils.h` — the `struct periodic_info` fields
   the harness adds (`wait_write_fd`, `stop`).
-- `src/convert-main.c.changes.md` — the two `convert/main.c` edits common to
-  both variants (bake in `__asan_default_options`; observe the `stop` flag in
-  the progress loop).
+- `demos/fixtures/demo08-convert-main-v7.1.patch` — the shared `convert/main.c`
+  changes: bake in `__asan_default_options`, replace the irrelevant timer
+  period argument and observe the `stop` flag in the progress loop.
 
 Compile each variant with ASAN:
 
@@ -145,10 +163,10 @@ rejects it):
 mkfs.ext4 -F -q -b 4096 -N 200 -d <some-populated-dir> pop-tiny.img   # 256 MiB
 ```
 
-The validated hermit invocation the demo uses is:
+The demo's invocation through the parent wrapper is:
 
 ```bash
-hermit run --chaos --sched-seed <S> --no-virtualize-cpuid -- <variant>/btrfs-convert <fresh-image-copy>
+timeout 90 "$SAFEHERMIT" "$HERMIT_RELEASE" --log=error run --chaos --sched-seed <S> --no-virtualize-cpuid -- <variant>/btrfs-convert <fresh-image-copy>
 ```
 
 (`--no-virtualize-cpuid` because CPUID faulting is unavailable on the demo
