@@ -641,6 +641,19 @@ impl DetFd {
         let description = self.description();
         description.flock_mode_ever_known && !description.flock_mode_known
     }
+
+    /// Update the GUEST-VISIBLE status flags for every alias of this open file
+    /// description without touching Detcore's physical nonblocking state.
+    ///
+    /// This is the counterpart of [`Self::set_status_flags`] for a request that
+    /// deliberately never reached the kernel. `set_status_flags` also rewrites
+    /// `physically_nonblocking`, which is only correct when the physical
+    /// descriptor really was changed; claiming it here would tell the scheduler
+    /// an fd is nonblocking when the kernel still says otherwise, and a read
+    /// that should have been nonblockized would block instead.
+    pub(crate) fn set_logical_status_flags(&self, flags: i32) {
+        self.description().status_flags = flags & !OFlag::O_CLOEXEC.bits();
+    }
 }
 
 impl fmt::Display for DetFd {
