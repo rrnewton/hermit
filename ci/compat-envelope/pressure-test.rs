@@ -79,8 +79,12 @@ const PORTABLE_DAG: &str = "ci/dag/validate.json";
 const TRACKED_CELLS_SCHEMA: u64 = 7;
 const RUN_SCHEMA: u64 = 3;
 const SUMMARY_SCHEMA: u64 = 4;
-const REQUIRED_BUILD_TAGS: [&str; 5] = [
+const REQUIRED_BUILD_TAGS: [&str; 9] = [
+    "pre.submodules",
+    "pre.reverie_pin",
+    "build.rust_scripts",
     "setup.manifest_plan",
+    "gate.manifest",
     "build.workspace",
     "build.runtime_release",
     "build.e2e_artifact",
@@ -281,9 +285,9 @@ Other options:
 How it runs:
   Plan generation first checks the tracked scorecard and reads selection and
   budgets from the typed manifest tool. The in-memory graph then reuses the
-  canonical Hermit/resource build commands from ci/dag/validate.json without
-  recursively running the full validation metadata audit. Fixture preparation
-  is serialized. Every selected-cell repetition then runs in its own safe-ci
+  canonical Hermit/resource build commands and their submodule, pin, script,
+  and manifest prerequisites from ci/dag/validate.json. It does not run the
+  full validation graph. Fixture preparation is serialized. Every selected-cell repetition then runs in its own safe-ci
   cgroup. Existing resource caps admit
   four manifest guests at once, including KVM guests. A failure, timeout, OOM, or missing result does not
   intentionally stop later selected checks.
@@ -2467,20 +2471,22 @@ fn required_build_tags(
     exact_cell: Option<(&str, &str)>,
     includes_liteinst: bool,
 ) -> BTreeSet<&'static str> {
-    // Batch cells consume the canonical prebuilt artifact, so retain the build
-    // nodes that produce it. The complete metadata audit is not a product-build
-    // prerequisite: write_plan already refuses a stale scorecard and derives
-    // selection and budgets through the typed manifest tool. LiteInst's separate
-    // runtime build is retained only when a selected cell uses it. Exact
-    // ptrace/KVM cells use a direct Hermit build, DBT/SaBRe retain the canonical
-    // third-party runtime build, LiteInst retains its build chain, and a naked
-    // native command needs no Hermit build.
+    // Keep the explicit canonical prerequisite chain, including the scripts
+    // required by the copied commands. The plan-time scorecard check does not
+    // replace gate.manifest. Exact native cells need only the manifest tool;
+    // other exact non-LiteInst cells add the gated runtime build. Batch and
+    // LiteInst cells retain the canonical artifact producers.
     if let Some((mode, backend)) = exact_cell {
+        let mut required = BTreeSet::from([
+            "pre.submodules", "pre.reverie_pin", "build.rust_scripts",
+            "setup.manifest_plan",
+        ]);
         if mode == "naked" && backend == "native" {
-            return BTreeSet::from(["setup.manifest_plan"]);
+            return required;
         }
         if backend != "liteinst" {
-            return BTreeSet::from(["setup.manifest_plan", "build.runtime_release"]);
+            required.extend(["gate.manifest", "build.runtime_release"]);
+            return required;
         }
     }
     REQUIRED_BUILD_TAGS
@@ -2549,31 +2555,15 @@ fn retain_required_build_dependencies(
     required_builds: &BTreeSet<&str>,
 ) -> Result<(), String> {
     let tag = step.tag();
-    let mut retained = Vec::new();
+    // The selected set is explicit. Never import an arbitrary future closure,
+    // and never omit a prerequisite of a copied canonical command.
     for dependency in &step.deps {
-        if required_builds.contains(dependency.as_str()) {
-            retained.push(dependency.clone());
-            continue;
+        if !required_builds.contains(dependency.as_str()) {
+            return Err(format!(
+                "canonical build node {tag} has unexpected prerequisite {dependency}; refusing to omit a prerequisite whose effect on the consumed build artifacts is unknown"
+            ));
         }
-        // These current edges impose work that the pressure execution itself
-        // does not consume. The complete metadata audit produces no binary or
-        // prebuilt artifact, and build.rust_scripts serves source-based graph
-        // commands that are not present in this generated plan. Pressure plan
-        // generation performs its scorecard and typed-manifest checks before
-        // execution instead.
-        if matches!(dependency.as_str(), "e2e.metadata" | "gate.manifest")
-            && matches!(tag.as_str(), "build.workspace" | "build.runtime_release")
-        {
-            continue;
-        }
-        if dependency == "build.rust_scripts" && tag == "setup.manifest_plan" {
-            continue;
-        }
-        return Err(format!(
-            "canonical build node {tag} has unexpected prerequisite {dependency}; refusing to omit a prerequisite whose effect on the consumed build artifacts is unknown"
-        ));
     }
-    step.deps = retained;
     Ok(())
 }
 
@@ -2684,10 +2674,9 @@ fn write_plan_after_scorecard_check(
                 state = shell_quote(&marker.parent().unwrap().to_string_lossy()),
                 marker = shell_quote(&marker.to_string_lossy()),
             );
-            // Preserve every dependency between selected build nodes. Only the
-            // two explicitly checked metadata-audit edges may be omitted; an
-            // unknown future prerequisite refuses instead of silently shrinking
-            // the build closure.
+            // Preserve every canonical dependency. An unknown future
+            // prerequisite refuses instead of silently shrinking or expanding
+            // the explicitly selected build closure.
             retain_required_build_dependencies(&mut step, &required_builds)?;
             if direct_backend_build {
                 step.timeout = 600;
@@ -5060,6 +5049,72 @@ fn display_id(cell: &CellId) -> String {
     )
 }
 
+fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Result<(), String> {
+    let required = required_build_tags(None, true);
+    let original: BTreeMap<_, _> = canonical.steps.iter()
+        .filter(|step| required.contains(step.tag().as_str()))
+        .map(|step| (step.tag(), step.clone())).collect();
+    for failed in [None, Some("pre.submodules"), Some("pre.reverie_pin"),
+        Some("build.rust_scripts"), Some("gate.manifest")]
+    {
+        let log = scratch.join(format!("prerequisites-{}", failed.unwrap_or("positive")));
+        let mut fixture = canonical.clone();
+        fixture.steps = original.values().cloned().collect();
+        for step in &mut fixture.steps {
+            retain_required_build_dependencies(step, &required)?;
+            let tag = step.tag();
+            // Delay the planted failure so accidentally unguarded consumers
+            // have time to leave a sentinel. The assertions retain the exact
+            // canonical dependency chain and do not rely on dispatch ordering.
+            step.cmd = format!("{}printf '%s\\n' {} >> {}; exit {}",
+                if failed == Some(tag.as_str()) { "sleep 0.1; " } else { "" },
+                shell_quote(&tag), shell_quote(&log.to_string_lossy()),
+                if failed == Some(tag.as_str()) { 17 } else { 0 });
+            step.env.clear();
+            step.timeout = 5;
+            step.cpu_timeout = 5;
+            step.jobs_flag = None;
+            step.jobs_env = None;
+            step.hint = ResourceHint {
+                rss_baseline_bytes: Some(67_108_864),
+                hard_mem_max_bytes: Some(67_108_864),
+                classification: StepClass::Light,
+                ..ResourceHint::default()
+            };
+        }
+        let result = with_execution_root(scratch, || {
+            execute_typed_dag(&fixture, 4, None, Instant::now(), 100)
+        });
+        let mut expected = BTreeSet::new();
+        if let Some(failed) = failed {
+            let error = result.err().ok_or_else(|| format!("failed prerequisite {failed} was accepted"))?;
+            if !error.contains(&format!("pressure setup node {failed} failed:")) {
+                return Err(format!("failed prerequisite {failed} lost its diagnostic: {error}"));
+            }
+            let mut pending = vec![failed.to_string()];
+            while let Some(tag) = pending.pop() {
+                if expected.insert(tag.clone()) {
+                    pending.extend(original[&tag].deps.iter().cloned());
+                }
+            }
+        } else {
+            let execution = result?;
+            if execution.outcomes.len() != 9 || execution.outcomes.iter().any(|outcome| !outcome.ok) {
+                return Err("positive prerequisite fixture did not execute all nine nodes".into());
+            }
+            expected.extend(original.keys().cloned());
+        }
+        let text = fs::read_to_string(&log)
+            .map_err(|e| format!("cannot read prerequisite sentinels: {e}"))?;
+        let actual: BTreeSet<String> = text.lines().map(str::to_string).collect();
+        if actual != expected || text.lines().count() != expected.len() {
+            return Err(format!("prerequisite failure {failed:?} admitted a consumer or lost an ancestor: expected={expected:?} actual={actual:?}"));
+        }
+    }
+    println!("  prerequisite scheduler: nine-node positive and four failed-preflight controls retain exact execution identities");
+    Ok(())
+}
+
 fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
     const CONTROL_STEP_TIMEOUT_SECONDS: i64 = 5;
     const CELL_WALL_TIMEOUT_SECONDS: i64 = 30;
@@ -5614,13 +5669,16 @@ fn self_test(root: &Path) -> Result<(), String> {
         .into_iter()
         .filter(|tag| *tag != "build.liteinst_runtime_release")
         .collect();
-    let lean_exact = BTreeSet::from(["setup.manifest_plan", "build.runtime_release"]);
+    let native_exact = BTreeSet::from([
+        "pre.submodules", "pre.reverie_pin", "build.rust_scripts", "setup.manifest_plan",
+    ]);
+    let mut lean_exact = native_exact.clone();
+    lean_exact.extend(["gate.manifest", "build.runtime_release"]);
     let exact_runtime_backends_ok = ["ptrace", "kvm", "dbt", "sabre"]
         .into_iter()
         .all(|backend| required_build_tags(Some(("verify", backend)), false) == lean_exact);
     if !exact_runtime_backends_ok
-        || required_build_tags(Some(("naked", "native")), false)
-            != BTreeSet::from(["setup.manifest_plan"])
+        || required_build_tags(Some(("naked", "native")), false) != native_exact
         || required_build_tags(Some(("verify", "liteinst")), true)
             != BTreeSet::from(REQUIRED_BUILD_TAGS)
         || required_build_tags(None, false) != batch_without_liteinst
@@ -5670,6 +5728,9 @@ fn self_test(root: &Path) -> Result<(), String> {
         let mut selected_step = canonical_step.clone();
         retain_required_build_dependencies(&mut selected_step, &all_required_builds)
             .map_err(|e| format!("current canonical build graph was refused: {e}"))?;
+        if selected_step.deps != canonical_step.deps {
+            return Err(format!("{} lost a canonical prerequisite", selected_step.tag()));
+        }
         if selected_step
             .deps
             .iter()
@@ -6104,6 +6165,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     fs::remove_file(scratch.join("old-row"))
         .map_err(|e| format!("cannot remove self-test stale row: {e}"))?;
+    prerequisite_scheduler_self_test(&canonical_build_dag, &scratch)?;
     direct_scheduler_self_test(&scratch)?;
 
     let dirty_fixture = scratch.join("dirty-source");
@@ -6628,7 +6690,9 @@ fn self_test(root: &Path) -> Result<(), String> {
             .steps
             .iter()
             .any(|step| recursive_metadata_tags.contains(&step.tag().as_str()))
-        || !runtime_build_steps[0].deps.is_empty()
+        || runtime_build_steps[0].deps
+            != ["gate.manifest".to_string(), "pre.reverie_pin".to_string()]
+        || manifest_plan_steps[0].deps != ["build.rust_scripts".to_string()]
         || !runtime_build_steps[0]
             .cmd
             .contains("cargo build --release --locked -p hermit --bin hermit")
@@ -6817,6 +6881,13 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     fs::write(&setup_marker, "ok\n")
         .map_err(|e| format!("cannot write repeated runner marker: {e}"))?;
+    for tag in ["pre.submodules", "pre.reverie_pin", "build.rust_scripts", "gate.manifest"] {
+        if required_builds_complete(&repeated_build_results, &repeated_metadata) {
+            return Err(format!("repeated exact setup accepted missing prerequisite marker {tag}"));
+        }
+        fs::write(build_marker(&repeated_build_results, tag), "ok\n")
+            .map_err(|e| format!("cannot write prerequisite marker {tag}: {e}"))?;
+    }
     if !required_builds_complete(&repeated_build_results, &repeated_metadata) {
         return Err("repeated exact ptrace setup refused its direct Hermit build".into());
     }
@@ -7026,7 +7097,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     let actual_green_build_tags: BTreeSet<String> = green_batch_dag
         .steps
         .iter()
-        .filter(|step| matches!(step.group.as_str(), "build" | "setup"))
+        .filter(|step| matches!(step.group.as_str(), "pre" | "gate" | "build" | "setup"))
         .map(|step| step.tag())
         .collect();
     if actual_green_build_tags != expected_green_build_tags
@@ -7042,16 +7113,25 @@ fn self_test(root: &Path) -> Result<(), String> {
     for step in green_batch_dag
         .steps
         .iter()
-        .filter(|step| step.group == "build")
+        .filter(|step| matches!(step.group.as_str(), "pre" | "gate" | "build" | "setup"))
     {
         let deps: BTreeSet<&str> = step.deps.iter().map(String::as_str).collect();
         let tag = step.tag();
         let expected: BTreeSet<&str> = match tag.as_str() {
-            "build.workspace" | "build.runtime_release" => BTreeSet::new(),
-            "build.e2e_artifact" => {
-                BTreeSet::from(["build.workspace", "build.runtime_release"])
+            "pre.submodules" => BTreeSet::new(),
+            "pre.reverie_pin" => BTreeSet::from(["pre.submodules"]),
+            "build.rust_scripts" => BTreeSet::from(["pre.reverie_pin"]),
+            "setup.manifest_plan" => BTreeSet::from(["build.rust_scripts"]),
+            "gate.manifest" => BTreeSet::from(["setup.manifest_plan"]),
+            "build.workspace" | "build.runtime_release" => {
+                BTreeSet::from(["gate.manifest", "pre.reverie_pin"])
             }
-            "build.liteinst_runtime_release" => BTreeSet::from(["build.e2e_artifact"]),
+            "build.e2e_artifact" => BTreeSet::from([
+                "build.workspace", "build.runtime_release", "gate.manifest", "pre.reverie_pin",
+            ]),
+            "build.liteinst_runtime_release" => BTreeSet::from([
+                "build.e2e_artifact", "gate.manifest", "pre.reverie_pin",
+            ]),
             other => return Err(format!("unexpected green-batch build node {other}")),
         };
         if deps != expected {
