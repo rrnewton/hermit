@@ -1585,7 +1585,7 @@ fn run() -> Result<(), String> {
             }
             require_empty_result_dir(&results)?;
             let output = results.join("dag.json");
-            let (metadata, _) = write_plan(&root, &results, &output, &selection)?;
+            let (metadata, dag) = write_plan(&root, &results, &output, &selection)?;
             println!("DAG: {}", output.display());
             println!("Results: {}", results.display());
             println!(
@@ -1599,7 +1599,7 @@ fn run() -> Result<(), String> {
             println!("Whole-run bound: {}s", metadata.run_timeout_seconds);
             print_sample(&metadata);
             if selection.is_exact() {
-                print_exact_manifest_command(&root, &metadata.cells[0], &selection)?;
+                print_exact_manifest_command(&dag, &metadata)?;
             }
             println!(
                 "Inspection only: `run` builds the same typed graph in memory; dag.json is never execution authority."
@@ -1643,7 +1643,7 @@ fn run() -> Result<(), String> {
                 print_unavailable(&metadata);
                 print_sample(&metadata);
                 if exact_cell {
-                    print_exact_manifest_command(execution_root, &metadata.cells[0], &selection)?;
+                    print_exact_manifest_command(&dag, &metadata)?;
                 }
                 let execution = with_execution_root(execution_root, || {
                     execute_typed_dag(
@@ -1957,46 +1957,39 @@ fn absolute_from(root: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
-fn print_exact_manifest_command(
-    root: &Path,
-    cell: &CellId,
-    selection: &CellSelection,
-) -> Result<(), String> {
-    println!("Cell: {}/{}/{}", cell.test, cell.mode, cell.backend);
-    let budgets = resolve_budgets(load_budgets(root)?, PressureTimeoutPolicy::from_env()?,
-        &BTreeSet::from([(cell.test.clone(), cell.mode.clone(), cell.backend.clone())]))?;
-    let budget = budgets
-        .get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
-        .ok_or_else(|| {
-            format!(
-                "no manifest budget for {}/{}/{}",
-                cell.test, cell.mode, cell.backend
-            )
-        })?;
-    println!(
-        "Boxed cell wall cap: {}s (the manifest's per-cell timeout remains nested and cannot extend this cap)",
-        pressure_timeout(budget, selection.cell_timeout_seconds)?
-    );
-    println!("Manifest command inside that boxed cell:");
-    let output = Command::new(root.join("tests/manifest-cli.rs"))
-        .args([
-            "get",
-            &cell.test,
-            "--mode",
-            &cell.mode,
-            "--backend",
-            &cell.backend,
-        ])
-        .current_dir(root)
-        .output()
-        .map_err(|e| format!("cannot ask manifest-cli for the exact cell command: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "manifest-cli could not render the exact cell command: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+fn exact_manifest_command_description(dag: &DagConfig, metadata: &RunMetadata) -> Result<String, String> {
+    let [cell] = metadata.cells.as_slice() else {
+        return Err("exact command display requires precisely one selected cell identity".into());
+    };
+    if !metadata.is_exact() || metadata.repetitions == Some(0) {
+        return Err("exact command display requires a valid exact-cell selection".into());
     }
-    print!("{}", String::from_utf8_lossy(&output.stdout));
+    let repetition = metadata.repetitions.map(|_| 1);
+    let tag = format!("cell.{}", cell_run_slug(cell, repetition));
+    let matches: Vec<_> = dag.steps.iter().filter(|step| step.tag() == tag).collect();
+    let [step] = matches.as_slice() else {
+        return Err(format!("exact command display found {} nodes for {tag}; expected exactly one", matches.len()));
+    };
+    let policy = metadata.timeout_policy.ok_or("generated command display omitted its timeout policy")?;
+    policy.multipliers()?;
+    let mut text = format!("Cell: {}/{}/{}\nNode: {tag}", cell.test, cell.mode, cell.backend);
+    if let Some(total) = metadata.repetitions {
+        text.push_str(&format!(" (repetition 1 of {total})"));
+    }
+    text.push_str(&format!("\nWall bound: {}s\nCPU bound: {}s\nNode environment:\n",
+        step.timeout,
+        effective_cpu_timeout(step, dag.default_step_cpu_timeout, dag.cpu_timeout_multiplier)));
+    for (name, value) in &step.env {
+        text.push_str(&format!("  {name}={}\n", shell_quote(value)));
+    }
+    text.push_str(&format!(
+        "Inherited timeout multipliers recorded for this run:\n  HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER={}\n  HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER={}\nCommand:\n{}\n",
+        policy.cpu_multiplier, policy.wall_multiplier, step.cmd));
+    Ok(text)
+}
+
+fn print_exact_manifest_command(dag: &DagConfig, metadata: &RunMetadata) -> Result<(), String> {
+    print!("{}", exact_manifest_command_description(dag, metadata)?);
     Ok(())
 }
 
@@ -7344,6 +7337,41 @@ fn self_test(root: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot read repeated-plan DAG: {e}"))?;
     let repeated_dag = dag_from_json(&repeated_dag_text)
         .map_err(|e| format!("cannot parse repeated-plan DAG: {e}"))?;
+    let before_display = dag_to_json(&repeated_dag);
+    let display = exact_manifest_command_description(&repeated_dag, &repeated_metadata)?;
+    let displayed_tag = format!("cell.{}", cell_run_slug(&repeated_metadata.cells[0], Some(1)));
+    let displayed_node = repeated_dag.steps.iter().find(|step| step.tag() == displayed_tag)
+        .ok_or("repeated command display lost its first node")?;
+    if !display.contains(&format!("Node: {displayed_tag} (repetition 1 of 3)"))
+        || !display.contains(&format!("Command:\n{}\n", displayed_node.cmd))
+        || !display.contains(&format!("Wall bound: {}s", displayed_node.timeout))
+        || !display.contains(&format!("CPU bound: {}s", effective_cpu_timeout(
+            displayed_node, repeated_dag.default_step_cpu_timeout, repeated_dag.cpu_timeout_multiplier)))
+        || displayed_node.env.iter().any(|(name, value)| !display.contains(&format!("{name}={}", shell_quote(value))))
+        || dag_to_json(&repeated_dag) != before_display
+    {
+        return Err("exact command display changed the graph or misrepresented the selected repetition".into());
+    }
+    let mut missing_display = repeated_dag.clone();
+    missing_display.steps.retain(|step| step.tag() != displayed_tag);
+    let mut duplicate_display = repeated_dag.clone();
+    duplicate_display.steps.push(displayed_node.clone());
+    if exact_manifest_command_description(&missing_display, &repeated_metadata).is_ok()
+        || exact_manifest_command_description(&duplicate_display, &repeated_metadata).is_ok()
+    {
+        return Err("exact command display accepted missing or ambiguous nodes".into());
+    }
+    let mut scaled_display_metadata = repeated_metadata.clone();
+    scaled_display_metadata.timeout_policy = Some(PressureTimeoutPolicy {
+        version: 1, cpu_multiplier: 2.0, wall_multiplier: 3.0,
+    });
+    let scaled_display = exact_manifest_command_description(&repeated_dag, &scaled_display_metadata)?;
+    if !scaled_display.contains("HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER=2\n")
+        || !scaled_display.contains("HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER=3\n")
+        || dag_to_json(&repeated_dag) != before_display
+    {
+        return Err("exact command display conflated independent recorded multipliers or changed the graph".into());
+    }
     let repeated_cell_steps: Vec<_> = repeated_dag
         .steps
         .iter()
