@@ -63,6 +63,11 @@ use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::E2E_RUN_INDEX_ENV;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::ObservedResult;
+use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
+use hermit_manifest_plan::timeouts::TimeoutMultipliers;
+use hermit_manifest_plan::timeouts::resolve_test_timeouts;
+use hermit_manifest_plan::timeouts::timeout_multipliers_from_env;
+use hermit_manifest_plan::timeouts::validate_timeout_multiplier;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -97,11 +102,10 @@ const INCOMPLETE_ATTEMPT_STATUS: i32 = 125;
 /// Written when a cell is not invoked because its serialized fixture
 /// preparation did not complete successfully.
 const PREPARATION_FAILED_STATUS: i32 = 126;
-/// The shipped portable DAG gives a whole manifest bucket 600 seconds. A red
-/// cell gets that complete existing allowance to itself; cells whose repeated
-/// mode could theoretically consume longer remain red when this pressure
-/// boundary cuts them. This bounds a known-bad cell without redefining green.
-const PRESSURE_CELL_TIMEOUT_SECONDS: i64 = 600;
+/// Historical pressure plans truncated their enclosing cell allowance at 600s.
+/// Retained plans without a timeout-policy record still use that exact rule.
+const LEGACY_PRESSURE_CELL_TIMEOUT_SECONDS: i64 = 600;
+const MAX_PRESSURE_GENERATED_NODES: usize = 100_000;
 /// The prior 432-cell measurement completed in nine minutes on this host. Two
 /// hours is an operational stop for the periodic experiment, not a pass
 /// threshold: breach makes the run incomplete and publishes no promotion.
@@ -137,11 +141,35 @@ fn pressure_scope_grace_s(run_timeout_s: i64) -> i64 {
     60.max(run_timeout_s / 10)
 }
 
+fn inherited_pressure_scope_timeout(run_timeout_s: i64) -> Result<Option<i64>, String> {
+    parse_pressure_scope_timeout(run_timeout_s, env::var(PRESSURE_SCOPE_TIMEOUT_ENV))
+}
+
+fn parse_pressure_scope_timeout(
+    run_timeout_s: i64, raw: Result<String, env::VarError>,
+) -> Result<Option<i64>, String> {
+    let inherited = match raw {
+        Ok(raw) => Some(raw.parse::<i64>().map_err(|_| {
+            format!("{PRESSURE_SCOPE_TIMEOUT_ENV}={raw:?} is not a valid positive timeout")
+        })?),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(format!("{PRESSURE_SCOPE_TIMEOUT_ENV} is not valid UTF-8"));
+        }
+    };
+    if let Some(inherited) = inherited {
+        if inherited <= 0 || inherited != run_timeout_s {
+            return Err(format!(
+                "{PRESSURE_SCOPE_TIMEOUT_ENV}={inherited} does not match the requested {run_timeout_s}s whole-run bound"
+            ));
+        }
+    }
+    Ok(inherited)
+}
+
 fn establish_pressure_cgroups(run_timeout_s: i64) -> Result<BoxedCgroups, String> {
     let already_in_scope = dagrun::cgroup::is_in_scope();
-    let inherited_marker = env::var(PRESSURE_SCOPE_TIMEOUT_ENV)
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok());
+    let inherited_marker = inherited_pressure_scope_timeout(run_timeout_s)?;
     if !already_in_scope {
         env::set_var(PRESSURE_SCOPE_TIMEOUT_ENV, run_timeout_s.to_string());
     }
@@ -218,8 +246,10 @@ Exact-cell options (run and plan):
   --probe-disabled         Probe disabled cells for one backend. With --test,
                            also requires --mode; without --test, --mode may
                            narrow the disabled-backend population.
-  --cell-timeout SECONDS   Tighter cap for each selected cell; requires either
-                           an exact cell, --sample, or a repeated batch
+  --cell-timeout SECONDS   Maximum enclosing allowance for each selected cell;
+                           refuses before launch if it cannot retain the current
+                           preparation, execution, retry, and reporting bounds.
+                           Requires an exact cell, --sample, or a repeated batch
   --repetitions COUNT      Repeat each selected red cell in independent boxed
                            jobs, or selected green cells with --green. COUNT must
                            be positive. Plan and run
@@ -249,26 +279,26 @@ Selection and bounded-batch options (run and plan):
                            resource caps still limit manifest guests to four.
 
 Examples:
-  # Probe one currently red ptrace/verify cell with a 60-second boxed wall cap.
+  # Probe one cell with at most 600 seconds for its complete retry lifecycle.
   ./ci/compat-envelope/pressure-test.rs run \
     --test applications/example-timed-progress-bar \
-    --mode verify --backend ptrace --cell-timeout 60
+    --mode verify --backend ptrace --cell-timeout 600
 
-  # Reproducibly sample ten red verify/replay/chaos cells, sixty seconds each.
+  # Reproducibly sample ten red verify/replay/chaos cells.
   ./ci/compat-envelope/pressure-test.rs run \
-    --sample 10 --seed 42 --cell-timeout 60
+    --sample 10 --seed 42 --cell-timeout 600
 
   # Repeat every executable red verify cell twice with one shared build.
   ./ci/compat-envelope/pressure-test.rs plan \
     --results ignored/compat-envelope/repeated-red-verify \
-    --mode verify --repetitions 2 --cell-timeout 60
+    --mode verify --repetitions 2 --cell-timeout 600
 
   # Check one committed green cell 100 times under the same boxed limits.
   # The DAG admits at most four manifest guests at once.
   ./ci/compat-envelope/pressure-test.rs run \
     --test backend-parity-c/fork-exec-pipeline \
     --mode verify --backend ptrace --green \
-    --repetitions 100 --cell-timeout 120
+    --repetitions 100 --cell-timeout 600
 
   # Check every enabled green cell once with one shared build.
   ./ci/compat-envelope/pressure-test.rs run \
@@ -277,7 +307,7 @@ Examples:
   # Inspect the bounded plan without executing it.
   ./ci/compat-envelope/pressure-test.rs plan \
     --results ignored/compat-envelope/pressure-review \
-    --mode verify --sample 10 --seed 42 --cell-timeout 60
+    --mode verify --sample 10 --seed 42 --cell-timeout 600
 
 Other options:
   --results DIR            Retained ignored/ result directory
@@ -908,6 +938,7 @@ impl FreshCheckout {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CellBudget {
+    cpu_timeout_seconds: i64,
     timeout_seconds: i64,
     attempts: Option<i64>,
 }
@@ -917,8 +948,92 @@ struct ManifestBudgetRow {
     test: String,
     mode: String,
     backend: String,
+    cpu_timeout_seconds: i64,
     timeout_seconds: i64,
     attempts: JsonValue,
+}
+
+/// Additive run metadata distinguishes the current producer contract from
+/// historical campaigns. Keep the independent multipliers used to generate the
+/// plan, so a later reader's environment cannot reinterpret its recorded caps.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PressureTimeoutPolicy {
+    version: u64,
+    cpu_multiplier: f64,
+    wall_multiplier: f64,
+}
+
+impl PressureTimeoutPolicy {
+    fn from_env() -> Result<Self, String> {
+        let multipliers = timeout_multipliers_from_env()?;
+        Ok(Self {
+            version: 1,
+            cpu_multiplier: multipliers.cpu,
+            wall_multiplier: multipliers.wall,
+        })
+    }
+
+    fn multipliers(&self) -> Result<TimeoutMultipliers, String> {
+        if self.version != 1 {
+            return Err(format!("unsupported pressure timeout policy {}", self.version));
+        }
+        Ok(TimeoutMultipliers {
+            cpu: validate_timeout_multiplier(self.cpu_multiplier, "recorded CPU multiplier")?,
+            wall: validate_timeout_multiplier(self.wall_multiplier, "recorded wall multiplier")?,
+        })
+    }
+}
+
+fn deserialize_timeout_policy<'de, D>(deserializer: D) -> Result<Option<PressureTimeoutPolicy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let policy = PressureTimeoutPolicy::deserialize(deserializer)?;
+    policy.multipliers().map_err(serde::de::Error::custom)?;
+    Ok(Some(policy))
+}
+
+fn current_result_policy(metadata: &RunMetadata, fresh: bool) -> Result<bool, String> {
+    if let Some(policy) = metadata.timeout_policy {
+        policy.multipliers()?;
+        Ok(true)
+    } else if fresh {
+        Err("fresh pressure run omitted its timeout policy".into())
+    } else {
+        Ok(false)
+    }
+}
+
+fn resolve_budgets(
+    mut budgets: BTreeMap<(String, String, String), CellBudget>,
+    policy: PressureTimeoutPolicy,
+    selected: &BTreeSet<(String, String, String)>,
+) -> Result<BTreeMap<(String, String, String), CellBudget>, String> {
+    let multipliers = policy.multipliers()?;
+    budgets.retain(|key, _| selected.contains(key));
+    for budget in budgets.values_mut() {
+        let resolved = resolve_test_timeouts(
+            u64::try_from(budget.cpu_timeout_seconds).map_err(|_| "negative CPU timeout")?,
+            u64::try_from(budget.timeout_seconds).map_err(|_| "negative wall timeout")?,
+            multipliers,
+        )?;
+        budget.cpu_timeout_seconds = i64::try_from(resolved.cpu_seconds)
+            .map_err(|_| "resolved CPU timeout exceeds the supported integer range")?;
+        budget.timeout_seconds = i64::try_from(resolved.wall_seconds)
+            .map_err(|_| "resolved wall timeout exceeds the supported integer range")?;
+    }
+    Ok(budgets)
+}
+
+fn read_current_result_rows(path: &Path) -> Result<Vec<CellResult>, String> {
+    let rows = read_result_rows(path)?;
+    for row in &rows {
+        row.require_current_timeout_policy().map_err(|error| {
+            format!("{} attempt {} has invalid current timeout evidence: {error}", path.display(), row.attempt)
+        })?;
+    }
+    Ok(rows)
 }
 
 fn read_result_rows(path: &Path) -> Result<Vec<CellResult>, String> {
@@ -1031,6 +1146,8 @@ struct RunMetadata {
     detcore_tree: String,
     source_tree_dirty: bool,
     run_timeout_seconds: i64,
+    #[serde(default, deserialize_with = "deserialize_timeout_policy", skip_serializing_if = "Option::is_none")]
+    timeout_policy: Option<PressureTimeoutPolicy>,
     #[serde(default)]
     mode: Option<String>,
     #[serde(default)]
@@ -1557,11 +1674,12 @@ fn run() -> Result<(), String> {
                     &results,
                     selection.allows_dirty_source(),
                     Some(&runner_evidence),
+                    true,
                 )?;
                 Ok(())
             })();
             let series_result = if std::env::var_os("DEV_HERMIT_PARENT").is_some() {
-                emit_series(&results, execution_root)
+                emit_series(&results, execution_root, true)
             } else {
                 Ok(())
             };
@@ -1596,14 +1714,14 @@ fn run() -> Result<(), String> {
             // Dirty retained results are admissible only when their own
             // metadata proves they came from one exact cell; summarize()
             // enforces that boundary before reading any evidence.
-            summarize(&root, &results, true, None)?;
+            summarize(&root, &results, true, None, false)?;
         }
         "emit-series" => {
             let (results, output, _) = result_options(&root, &mut args, false, false)?;
             if output.is_some() {
                 return Err("emit-series does not accept --output".into());
             }
-            emit_series(&results, &root)?;
+            emit_series(&results, &root, false)?;
         }
         "self-test" => {
             if args.next().is_some() {
@@ -1845,7 +1963,8 @@ fn print_exact_manifest_command(
     selection: &CellSelection,
 ) -> Result<(), String> {
     println!("Cell: {}/{}/{}", cell.test, cell.mode, cell.backend);
-    let budgets = load_budgets(root)?;
+    let budgets = resolve_budgets(load_budgets(root)?, PressureTimeoutPolicy::from_env()?,
+        &BTreeSet::from([(cell.test.clone(), cell.mode.clone(), cell.backend.clone())]))?;
     let budget = budgets
         .get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
         .ok_or_else(|| {
@@ -1945,7 +2064,7 @@ fn collect_series_result_files(path: &Path, output: &mut Vec<PathBuf>) -> Result
     Ok(())
 }
 
-fn collect_series_rows(results: &Path) -> Result<Vec<(String, CellResult)>, String> {
+fn collect_series_rows(results: &Path, current_timeouts: bool) -> Result<Vec<(String, CellResult)>, String> {
     let mut result_files = Vec::new();
     collect_series_result_files(results, &mut result_files)?;
     result_files.sort();
@@ -1957,7 +2076,12 @@ fn collect_series_rows(results: &Path) -> Result<Vec<(String, CellResult)>, Stri
             .ok_or_else(|| format!("{} has no result-directory name", result_file.display()))?
             .to_string_lossy()
             .into_owned();
-        for row in read_result_rows(&result_file)? {
+        let rows = if current_timeouts {
+            read_current_result_rows(&result_file)?
+        } else {
+            read_result_rows(&result_file)?
+        };
+        for row in rows {
             let repetition = series_run_index(&dir_name);
             if row.run_index != Some(repetition) {
                 return Err(format!(
@@ -1985,7 +2109,7 @@ fn collect_series_rows(results: &Path) -> Result<Vec<(String, CellResult)>, Stri
     Ok(collected)
 }
 
-fn emit_series(results: &Path, checkout: &Path) -> Result<(), String> {
+fn emit_series(results: &Path, checkout: &Path, fresh: bool) -> Result<(), String> {
     let parent = std::env::var("DEV_HERMIT_PARENT")
         .ok()
         .filter(|value| !value.is_empty())
@@ -2009,7 +2133,7 @@ fn emit_series(results: &Path, checkout: &Path) -> Result<(), String> {
     // right for reading a campaign you are standing in; emitting a RETAINED
     // campaign from a checkout that has since moved is the normal case, and the
     // tree being attributed is recorded in the campaign, not read from git.
-    let collected = collect_series_rows(results)?;
+    let collected = collect_series_rows(results, current_result_policy(&metadata, fresh)?)?;
     if collected.is_empty() {
         return Err(format!(
             "no per-cell results under {}; nothing to emit",
@@ -2443,6 +2567,11 @@ fn decode_budgets(
                 row.timeout_seconds, row.test, row.mode, row.backend
             ));
         }
+        resolve_test_timeouts(
+            u64::try_from(row.cpu_timeout_seconds).map_err(|_| "negative manifest CPU timeout")?,
+            row.timeout_seconds as u64,
+            TimeoutMultipliers::default(),
+        )?;
         let attempts = if row.attempts.is_null() {
             None
         } else {
@@ -2467,6 +2596,7 @@ fn decode_budgets(
         }
         let key = (row.test, row.mode, row.backend);
         let budget = CellBudget {
+            cpu_timeout_seconds: row.cpu_timeout_seconds,
             timeout_seconds: row.timeout_seconds,
             attempts,
         };
@@ -2484,27 +2614,71 @@ fn decode_budgets(
     Ok(out)
 }
 
-/// The harness gives preparation and every invocation one shared manifest
-/// timeout. The extra 10 seconds admits its documented TERM/KILL grace; the
-/// final 30 seconds is the existing nextest/reporting grace used by this
-/// repository, not an invocation multiplier or a guessed speed ratio.
+/// Each framework attempt gets a preparation deadline and a fresh execution
+/// deadline. Internal runs/seeds share the execution budget; they do not multiply
+/// it. Allow the existing 10s TERM/KILL grace per attempt, then 30s for reporting.
+/// `budget` already contains the separately resolved CPU and wall limits.
 fn outer_timeout(budget: &CellBudget) -> Result<i64, String> {
     budget.attempts.ok_or(
         "cannot derive a wall cap for a cell whose manifest has no executable attempt recipe",
     )?;
-    Ok(budget.timeout_seconds + 10 + 30)
+    budget.timeout_seconds.checked_mul(2)
+        .and_then(|seconds| seconds.checked_add(10))
+        .and_then(|seconds| seconds.checked_mul(MAX_ATTEMPTS_PER_CELL as i64))
+        .and_then(|seconds| seconds.checked_add(30))
+        .ok_or_else(|| "cell retry lifecycle exceeds the supported integer range".into())
 }
 
 fn pressure_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> Result<i64, String> {
-    Ok(outer_timeout(budget)?.min(
-        selected_cap
-            .unwrap_or(PRESSURE_CELL_TIMEOUT_SECONDS)
-            .min(PRESSURE_CELL_TIMEOUT_SECONDS),
+    let required = outer_timeout(budget)?;
+    if let Some(cap) = selected_cap {
+        if cap < required {
+            return Err(format!(
+                "--cell-timeout {cap}s is shorter than the required {required}s enclosing lifecycle; refusing before launch without changing the requested cap or any inner timeout"
+            ));
+        }
+    }
+    required.checked_mul(2).ok_or("cell outer CPU bound exceeds the supported integer range")?;
+    Ok(required)
+}
+
+/// Exact old rule, solely for reading plans written before timeout_policy.
+fn legacy_pressure_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> Result<i64, String> {
+    budget.attempts.ok_or(
+        "cannot derive a wall cap for a cell whose manifest has no executable attempt recipe",
+    )?;
+    Ok((budget.timeout_seconds + 10 + 30).min(
+        selected_cap.unwrap_or(LEGACY_PRESSURE_CELL_TIMEOUT_SECONDS)
+            .min(LEGACY_PRESSURE_CELL_TIMEOUT_SECONDS),
     ))
 }
 
-fn preparation_node_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> Result<i64, String> {
-    Ok(pressure_timeout(budget, selected_cap)? + 20)
+/// Shared preparation runs once, outside the framework retry loop. Preserve its
+/// own wall deadline, TERM/KILL grace, and reporting allowance independently.
+fn preparation_timeout(budget: &CellBudget) -> Result<i64, String> {
+    budget.timeout_seconds.checked_add(10 + 30)
+        .ok_or_else(|| "preparation timeout exceeds the supported integer range".into())
+}
+
+fn preparation_node_timeout(budget: &CellBudget) -> Result<i64, String> {
+    preparation_timeout(budget)?.checked_add(20)
+        .ok_or_else(|| "preparation node timeout exceeds the supported integer range".into())
+}
+
+fn require_generated_node_count(
+    cells: usize, repetitions: usize, preparations: usize, builds: usize,
+) -> Result<usize, String> {
+    let count = cells.checked_mul(repetitions)
+        .and_then(|count| count.checked_add(preparations))
+        .and_then(|count| count.checked_add(builds))
+        .and_then(|count| count.checked_add(1))
+        .ok_or("--repetitions produces an unrepresentable generated-node count")?;
+    if count > MAX_PRESSURE_GENERATED_NODES {
+        return Err(format!(
+            "--repetitions would generate {count} nodes, above the {MAX_PRESSURE_GENERATED_NODES}-node safety bound"
+        ));
+    }
+    Ok(count)
 }
 
 fn require_cell_occupancy_fits(
@@ -2552,7 +2726,7 @@ fn require_cell_occupancy_fits(
     let occupancy_floor = all_seconds / guest_width + i64::from(all_seconds % guest_width != 0);
     if occupancy_floor >= run_timeout_seconds {
         return Err(format!(
-            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at -j {jobs} and manifest_guest=4, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample (and optionally --cell-timeout), reduce --repetitions, or deliberately raise --run-timeout",
+            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at -j {jobs} and manifest_guest=4, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample, reduce --repetitions, or deliberately raise --run-timeout",
             i64::try_from(cells.len())
                 .unwrap_or(i64::MAX)
                 .saturating_mul(repetitions)
@@ -2721,7 +2895,24 @@ fn write_plan_after_scorecard_check(
     } else {
         BTreeMap::new()
     };
-    let budgets = load_budgets(root)?;
+    let includes_liteinst = cells.iter().any(|tracked| tracked.id.backend == "liteinst");
+    let exact_cell = selection.is_exact().then(|| {
+        (
+            selection.mode.as_deref().expect("exact selection has mode"),
+            selection
+                .backend
+                .as_deref()
+                .expect("exact selection has backend"),
+        )
+    });
+    let required_builds = required_build_tags(exact_cell, includes_liteinst);
+    require_generated_node_count(cells.len(), selection.run_count(), preparation_by_test.len(), required_builds.len())?;
+    let timeout_policy = PressureTimeoutPolicy::from_env()?;
+    let selected_budgets = cells.iter().map(|tracked| &tracked.id)
+        .chain(preparation_by_test.values())
+        .map(|cell| (cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+        .collect();
+    let budgets = resolve_budgets(load_budgets(root)?, timeout_policy, &selected_budgets)?;
     let run_timeout_seconds = selection
         .run_timeout_seconds
         .unwrap_or(PRESSURE_RUN_TIMEOUT_SECONDS);
@@ -2743,17 +2934,6 @@ fn write_plan_after_scorecard_check(
         .map_err(|e| format!("cannot read {PORTABLE_DAG}: {e}"))?;
     let canonical =
         dag_from_json(&canonical_text).map_err(|e| format!("invalid {PORTABLE_DAG}: {e}"))?;
-    let includes_liteinst = cells.iter().any(|tracked| tracked.id.backend == "liteinst");
-    let exact_cell = selection.is_exact().then(|| {
-        (
-            selection.mode.as_deref().expect("exact selection has mode"),
-            selection
-                .backend
-                .as_deref()
-                .expect("exact selection has backend"),
-        )
-    });
-    let required_builds = required_build_tags(exact_cell, includes_liteinst);
     let mut steps = Vec::new();
     for mut step in canonical.steps.iter().cloned() {
         let tag = step.tag();
@@ -2823,7 +3003,7 @@ fn write_plan_after_scorecard_check(
         } else {
             format!(" --backend {}", shell_quote(&cell.backend))
         };
-        let pressure_seconds = pressure_timeout(budget, selection.cell_timeout_seconds)?;
+        let pressure_seconds = preparation_timeout(budget)?;
         let cmd = format!(
             "mkdir -p {status_dir}; if test -f {status}; then exit 0; fi; \
              printf '{incomplete}\\n' > {status}; status=0; \
@@ -2841,7 +3021,7 @@ fn write_plan_after_scorecard_check(
             status = shell_quote(&status_path.to_string_lossy()),
             incomplete = INCOMPLETE_ATTEMPT_STATUS,
         );
-        let wall = preparation_node_timeout(budget, selection.cell_timeout_seconds)?;
+        let wall = preparation_node_timeout(budget)?;
         let preparation_deps = if selection.is_exact() {
             selected_cell_dependencies(true, false, &cell.mode, &cell.backend, None)
         } else {
@@ -3166,6 +3346,7 @@ fn write_plan_after_scorecard_check(
         detcore_tree,
         source_tree_dirty: worktree_dirty(root)?,
         run_timeout_seconds,
+        timeout_policy: Some(timeout_policy),
         mode: selection.mode.clone(),
         test: selection.test.clone(),
         backend: selection.backend.clone(),
@@ -3454,6 +3635,12 @@ fn validate_run_contract(
     let dag =
         dag_from_json(&dag_text).map_err(|e| format!("invalid {}: {e}", dag_path.display()))?;
     let budgets = load_budgets(root)?;
+    let budgets = match metadata.timeout_policy {
+        Some(policy) => resolve_budgets(budgets, policy, &expected.keys()
+            .map(|cell| (cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+            .collect())?,
+        None => budgets,
+    };
     let mut expected_cell_timeouts = BTreeMap::new();
     for cell in expected.keys() {
         let budget = budgets
@@ -3467,7 +3654,11 @@ fn validate_run_contract(
         for repetition in repetition_numbers(metadata.repetitions) {
             expected_cell_timeouts.insert(
                 format!("cell.{}", cell_run_slug(cell, repetition)),
-                pressure_timeout(budget, metadata.cell_timeout_seconds)?,
+                if metadata.timeout_policy.is_some() {
+                    pressure_timeout(budget, metadata.cell_timeout_seconds)?
+                } else {
+                    legacy_pressure_timeout(budget, metadata.cell_timeout_seconds)?
+                },
             );
         }
     }
@@ -4304,6 +4495,7 @@ fn summarize(
     results: &Path,
     allow_dirty_exact_cell: bool,
     typed_runner_evidence: Option<&BTreeMap<String, RunnerEvidence>>,
+    fresh: bool,
 ) -> Result<(), String> {
     let metadata_path = results.join("run.json");
     let metadata: RunMetadata = serde_json::from_str(
@@ -4314,6 +4506,7 @@ fn summarize(
     if metadata.schema != RUN_SCHEMA {
         return Err(format!("unsupported run schema {}", metadata.schema));
     }
+    let current_timeouts = current_result_policy(&metadata, fresh)?;
     let current = git_output(root, &["rev-parse", "HEAD"])?;
     if current != metadata.hermit_sha {
         return Err(format!(
@@ -4429,7 +4622,12 @@ fn summarize(
                 invocation,
                 artifact_dir,
             ) = if result_file.is_file() {
-                match read_result_rows(&result_file) {
+                let result_rows = if current_timeouts {
+                    read_current_result_rows(&result_file)
+                } else {
+                    read_result_rows(&result_file)
+                };
+                match result_rows {
                     Ok(result_rows) => {
                         observations = result_rows
                             .iter()
@@ -5754,6 +5952,90 @@ fn fixture_attempt(outcome: &str, status: i32) -> AttemptResult {
     }
 }
 
+fn pressure_timeout_self_test() -> Result<(), String> {
+    let key = ("fixture/current".into(), "verify".into(), "ptrace".into());
+    let raw = CellBudget { cpu_timeout_seconds: 22, timeout_seconds: 57, attempts: Some(3) };
+    let selected = BTreeSet::from([key.clone()]);
+    for (cpu, wall, expected_cpu, expected_wall, expected_outer) in [
+        (1.0, 1.0, 22, 57, 278),
+        (1.5, 1.0, 33, 57, 278),
+        (1.0, 1.5, 22, 86, 394),
+        (2.0, 3.0, 44, 171, 734),
+    ] {
+        let policy = PressureTimeoutPolicy { version: 1, cpu_multiplier: cpu, wall_multiplier: wall };
+        let budgets = resolve_budgets(BTreeMap::from([(key.clone(), raw.clone())]), policy, &selected)?;
+        let budget = &budgets[&key];
+        if budget.cpu_timeout_seconds != expected_cpu || budget.timeout_seconds != expected_wall
+            || outer_timeout(budget)? != expected_outer
+            || pressure_timeout(budget, Some(expected_outer))? != expected_outer
+            || pressure_timeout(budget, Some(expected_outer + 1))? != expected_outer
+            || preparation_node_timeout(budget)? != expected_wall + 60
+        {
+            return Err(format!("independent pressure timeout resolution changed for CPU={cpu} wall={wall}"));
+        }
+        let error = pressure_timeout(budget, Some(expected_outer - 1))
+            .expect_err("short caller cap must refuse before launch");
+        if !error.contains("refusing before launch") {
+            return Err(format!("short caller cap reported the wrong refusal: {error}"));
+        }
+        let mut many_internal_runs = budget.clone();
+        many_internal_runs.attempts = Some(32);
+        if outer_timeout(&many_internal_runs)? != expected_outer {
+            return Err("internal runs multiplied the aggregate execution timeout".into());
+        }
+    }
+    if MAX_ATTEMPTS_PER_CELL != 2 {
+        return Err("pressure lifecycle controls need an explicit review of the changed framework attempt count".into());
+    }
+    for policy in [
+        PressureTimeoutPolicy { version: 2, cpu_multiplier: 1.0, wall_multiplier: 1.0 },
+        PressureTimeoutPolicy { version: 1, cpu_multiplier: 0.0, wall_multiplier: 1.0 },
+        PressureTimeoutPolicy { version: 1, cpu_multiplier: 1.0, wall_multiplier: f64::NAN },
+        PressureTimeoutPolicy { version: 1, cpu_multiplier: 3.0, wall_multiplier: 1.0 },
+    ] {
+        if resolve_budgets(BTreeMap::from([(key.clone(), raw.clone())]), policy, &selected).is_ok() {
+            return Err("malformed or inverted current pressure timeout policy was accepted".into());
+        }
+    }
+    let mut missing_recipe = raw.clone();
+    missing_recipe.attempts = None;
+    if outer_timeout(&missing_recipe).is_ok() {
+        return Err("an unavailable cell acquired a timeout-derived execution recipe".into());
+    }
+    let mut overflow = raw;
+    overflow.timeout_seconds = i64::MAX;
+    if outer_timeout(&overflow).is_ok() || preparation_node_timeout(&overflow).is_ok() {
+        return Err("overflowing lifecycle arithmetic was accepted".into());
+    }
+    if require_generated_node_count(99_989, 1, 1, 9)? != 100_000 {
+        return Err("generated-node boundary omitted a producer or summary".into());
+    }
+    for (cells, repetitions) in [(99_990, 1), (1, 100_000), (usize::MAX, 2)] {
+        if require_generated_node_count(cells, repetitions, 1, 9).is_ok() {
+            return Err("oversized pressure graph reached allocation".into());
+        }
+    }
+    if parse_pressure_scope_timeout(7200, Err(env::VarError::NotPresent))?.is_some()
+        || parse_pressure_scope_timeout(7200, Ok("7200".into()))? != Some(7200)
+    {
+        return Err("valid pressure scope marker was refused".into());
+    }
+    for raw in ["", "garbage", "0", "-1", "7199", "7201", "9223372036854775808"] {
+        if parse_pressure_scope_timeout(7200, Ok(raw.into())).is_ok() {
+            return Err(format!("malformed or mismatched scope marker {raw:?} was accepted"));
+        }
+    }
+    {
+        use std::os::unix::ffi::OsStringExt;
+        if parse_pressure_scope_timeout(7200,
+            Err(env::VarError::NotUnicode(std::ffi::OsString::from_vec(vec![0xff])))).is_ok()
+        {
+            return Err("non-UTF-8 pressure scope marker was accepted".into());
+        }
+    }
+    Ok(())
+}
+
 fn self_test(root: &Path) -> Result<(), String> {
     // Read the real checked-in scorecard before building synthetic fixtures.
     // A scorecard schema bump must take this consumer offline immediately and
@@ -5763,6 +6045,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("tracked cells are empty".into());
     }
     safe_ci_scope::self_test()?;
+    pressure_timeout_self_test()?;
     if series_run_index("a-cell-repetition-0004") != 4
         || series_run_index("a-cell-with-no-suffix") != 0
     {
@@ -5850,7 +6133,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     // plan/run still checks at its command boundary before constructing a plan.
     let checked_scorecard = check_scorecard(root)?;
     let explicit_null = decode_budgets(
-        br#"[{"test":"fixture/test","mode":"chaos","backend":"ptrace","timeout_seconds":90,"attempts":null}]"#,
+        br#"[{"test":"fixture/test","mode":"chaos","backend":"ptrace","cpu_timeout_seconds":2,"timeout_seconds":90,"attempts":null}]"#,
     )?;
     if explicit_null
         .get(&("fixture/test".into(), "chaos".into(), "ptrace".into()))
@@ -5859,7 +6142,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err("explicit null chaos attempts must remain unavailable".into());
     }
     let backend_specific = decode_budgets(
-        br#"[{"test":"fixture/test","mode":"verify","backend":"ptrace","timeout_seconds":30,"attempts":1},{"test":"fixture/test","mode":"verify","backend":"liteinst","timeout_seconds":15,"attempts":1}]"#,
+        br#"[{"test":"fixture/test","mode":"verify","backend":"ptrace","cpu_timeout_seconds":2,"timeout_seconds":30,"attempts":1},{"test":"fixture/test","mode":"verify","backend":"liteinst","cpu_timeout_seconds":2,"timeout_seconds":15,"attempts":1}]"#,
     )?;
     if backend_specific.len() != 2
         || backend_specific
@@ -5881,19 +6164,19 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     for (matrix, expected) in [
         (
-            br#"[{"test":"fixture/test","mode":"chaos","backend":"ptrace","timeout_seconds":90}]"#.as_slice(),
+            br#"[{"test":"fixture/test","mode":"chaos","backend":"ptrace","cpu_timeout_seconds":2,"timeout_seconds":90}]"#.as_slice(),
             "missing field `attempts`",
         ),
         (
-            br#"[{"test":"fixture/test","mode":"verify","backend":"ptrace","timeout_seconds":90,"attempts":null}]"#.as_slice(),
+            br#"[{"test":"fixture/test","mode":"verify","backend":"ptrace","cpu_timeout_seconds":2,"timeout_seconds":90,"attempts":null}]"#.as_slice(),
             "no attempt count for non-chaos mode",
         ),
         (
-            br#"[{"test":"fixture/test","mode":"verify","backend":"ptrace","timeout_seconds":1801,"attempts":1}]"#.as_slice(),
+            br#"[{"test":"fixture/test","mode":"verify","backend":"ptrace","cpu_timeout_seconds":2,"timeout_seconds":1801,"attempts":1}]"#.as_slice(),
             "outside 1..=1800",
         ),
         (
-            br#"[{"test":"fixture/test","mode":"verify","backend":"ptrace","timeout_seconds":90,"attempts":1},{"test":"fixture/test","mode":"verify","backend":"ptrace","timeout_seconds":91,"attempts":1}]"#.as_slice(),
+            br#"[{"test":"fixture/test","mode":"verify","backend":"ptrace","cpu_timeout_seconds":2,"timeout_seconds":90,"attempts":1},{"test":"fixture/test","mode":"verify","backend":"ptrace","cpu_timeout_seconds":2,"timeout_seconds":91,"attempts":1}]"#.as_slice(),
             "conflicting execution budgets",
         ),
     ] {
@@ -5947,27 +6230,30 @@ fn self_test(root: &Path) -> Result<(), String> {
         ));
     }
     let budget = CellBudget {
+        cpu_timeout_seconds: 2,
         timeout_seconds: 7,
         attempts: Some(3),
     };
-    if outer_timeout(&budget)? != 47 {
+    if legacy_pressure_timeout(&budget, None)? != 47 {
         return Err(format!(
             "timeout derivation changed: expected 47, got {}",
-            outer_timeout(&budget)?
+            legacy_pressure_timeout(&budget, None)?
         ));
     }
-    if pressure_timeout(
+    if legacy_pressure_timeout(
         &CellBudget {
+            cpu_timeout_seconds: 600,
             timeout_seconds: 1800,
             attempts: Some(32),
         },
         None,
-    )? != PRESSURE_CELL_TIMEOUT_SECONDS
+    )? != LEGACY_PRESSURE_CELL_TIMEOUT_SECONDS
     {
         return Err("pressure timeout did not cap a long repeated red cell".into());
     }
-    if pressure_timeout(
+    if legacy_pressure_timeout(
         &CellBudget {
+            cpu_timeout_seconds: 600,
             timeout_seconds: 1800,
             attempts: Some(32),
         },
@@ -7044,6 +7330,16 @@ fn self_test(root: &Path) -> Result<(), String> {
             "huge repetition refusal was late or unactionable: {huge_repetition_error}"
         ));
     }
+    let mut too_many_nodes = repeated_selection.clone();
+    too_many_nodes.repetitions = Some(100_000);
+    too_many_nodes.run_timeout_seconds = Some(i64::MAX);
+    let too_many_results = scratch.join("bounded-node-count");
+    let error = write_plan_after_scorecard_check(&checked_scorecard, &too_many_results,
+        &too_many_results.join("dag.json"), &too_many_nodes)
+        .err().ok_or("oversized representable plan reached allocation")?;
+    if too_many_results.exists() || !error.contains("100000-node safety bound") {
+        return Err(format!("node-count refusal was late or unrelated: {error}"));
+    }
     let repeated_dag_text = fs::read_to_string(repeated_results.join("dag.json"))
         .map_err(|e| format!("cannot read repeated-plan DAG: {e}"))?;
     let repeated_dag = dag_from_json(&repeated_dag_text)
@@ -8113,6 +8409,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         detcore_tree: "def".into(),
         source_tree_dirty: false,
         run_timeout_seconds: 60,
+        timeout_policy: None,
         mode: Some(sample_a.mode.clone()),
         test: Some(sample_a.test.clone()),
         backend: Some(sample_a.backend.clone()),
@@ -8128,6 +8425,37 @@ fn self_test(root: &Path) -> Result<(), String> {
         eligible_cells: 1,
         cells: vec![sample_a.clone()],
     };
+    if current_result_policy(&sample_metadata, false)?
+        || current_result_policy(&sample_metadata, true).is_ok()
+    {
+        return Err("fresh admission and retained historical metadata were conflated".into());
+    }
+    let mut current_metadata = sample_metadata.clone();
+    current_metadata.timeout_policy = Some(PressureTimeoutPolicy {
+        version: 1, cpu_multiplier: 1.5, wall_multiplier: 2.0,
+    });
+    if !current_result_policy(&current_metadata, false)? || !current_result_policy(&current_metadata, true)? {
+        return Err("current pressure metadata lost strict admission".into());
+    }
+    let mut current_json = serde_json::to_value(&current_metadata).map_err(|error| error.to_string())?;
+    let restored: RunMetadata = serde_json::from_value(current_json.clone()).map_err(|error| error.to_string())?;
+    let restored_policy = restored.timeout_policy.ok_or("timeout policy vanished in round trip")?;
+    if restored_policy.cpu_multiplier != 1.5 || restored_policy.wall_multiplier != 2.0 {
+        return Err("retained CPU and wall multipliers were conflated".into());
+    }
+    for malformed in [
+        JsonValue::Null,
+        json!({"version": 2, "cpu_multiplier": 1.0, "wall_multiplier": 1.0}),
+        json!({"version": 1, "cpu_multiplier": 1.0}),
+        json!({"version": 1, "cpu_multiplier": 0.0, "wall_multiplier": 1.0}),
+        json!({"version": 1, "cpu_multiplier": "1", "wall_multiplier": 1.0}),
+        json!({"version": 1, "cpu_multiplier": 1.0, "wall_multiplier": 1.0, "unknown": true}),
+    ] {
+        current_json["timeout_policy"] = malformed;
+        if serde_json::from_value::<RunMetadata>(current_json.clone()).is_ok() {
+            return Err("malformed timeout policy fell back to historical interpretation".into());
+        }
+    }
     if retained_attempt_count(
         &[],
         &sample_slug,
@@ -8313,6 +8641,52 @@ fn self_test(root: &Path) -> Result<(), String> {
             "two appended result observations were not retained independently: {appended:?}"
         ));
     }
+    if read_current_result_rows(&appended_results)?.len() != 2 {
+        return Err("the existing current retry history lost strict admission".into());
+    }
+    let historical_results = scratch.join("historical-timeout-results.jsonl");
+    let mut historical_rows = appended.clone();
+    for row in &mut historical_rows {
+        row.execution_cpu_timeout_seconds = None;
+        row.execution_wall_timeout_seconds = None;
+    }
+    let historical_text = historical_rows.iter().map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?.join("\n") + "\n";
+    fs::write(&historical_results, &historical_text).map_err(|error| error.to_string())?;
+    if read_result_rows(&historical_results)?.len() != 2 {
+        return Err("historical rows without additive timeout fields became unreadable".into());
+    }
+    let missing_timeout_error = read_current_result_rows(&historical_results)
+        .expect_err("historical rows must not satisfy fresh timeout admission");
+    if !missing_timeout_error.contains("omitted explicit execution timeout bounds") {
+        return Err(format!("historical current-policy refusal had the wrong cause: {missing_timeout_error}"));
+    }
+    let current_results = scratch.join("current-timeout-results.jsonl");
+    let mut current_row = second_row.clone();
+    current_row.attempt = 1;
+    current_row.timeout_seconds = 57;
+    current_row.execution_cpu_timeout_seconds = Some(22);
+    current_row.execution_wall_timeout_seconds = Some(57);
+    let write_current = |row: &CellResult| -> Result<(), String> {
+        fs::write(&current_results, format!("{}\n", serde_json::to_string(row).map_err(|error| error.to_string())?))
+            .map_err(|error| error.to_string())
+    };
+    write_current(&current_row)?;
+    if read_current_result_rows(&current_results)?.len() != 1 {
+        return Err("valid current timeout result was not admitted".into());
+    }
+    for (cpu, wall) in [(None, None), (Some(22), None), (None, Some(57)),
+        (Some(0), Some(57)), (Some(57), Some(57)), (Some(22), Some(58))]
+    {
+        let mut malformed = current_row.clone();
+        malformed.execution_cpu_timeout_seconds = cpu;
+        malformed.execution_wall_timeout_seconds = wall;
+        write_current(&malformed)?;
+        if read_current_result_rows(&current_results).is_ok() {
+            return Err(format!("fresh result accepted malformed timeout pair {cpu:?}/{wall:?}"));
+        }
+    }
+    write_current(&current_row)?;
     let inconsistent_results = scratch.join("inconsistent-results.jsonl");
     let mut inconsistent = first_row.clone();
     inconsistent.failure_class = Some(FailureClass::NoResult);
@@ -8478,6 +8852,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         &summarize_retry_results,
         false,
         Some(&summarize_runner),
+        false,
     )?;
     let summarize_json: JsonValue = serde_json::from_str(
         &fs::read_to_string(summarize_retry_results.join("summary.json"))
@@ -8501,6 +8876,66 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err(format!(
             "production summarize lost fail-then-pass retry accounting: {summarize_json}"
         ));
+    }
+    // Exercise retained and fresh admission through the real summary boundary.
+    // Original current fixture bytes and every outcome assertion above remain
+    // intact; a separate historical variant deliberately omits additive fields.
+    let summary_metadata_path = summarize_retry_results.join("run.json");
+    let summary_dag_path = summarize_retry_results.join("dag.json");
+    let summary_result_path = summarize_retry_cell_dir.join("results.jsonl");
+    let saved_metadata = fs::read(&summary_metadata_path).map_err(|error| error.to_string())?;
+    let saved_dag = fs::read(&summary_dag_path).map_err(|error| error.to_string())?;
+    let saved_results = fs::read(&summary_result_path).map_err(|error| error.to_string())?;
+    let mut historical_metadata = summarize_retry_metadata.clone();
+    historical_metadata.timeout_policy = None;
+    let old_budget = manifest_budgets.get(&(
+        summarize_retry.id.test.clone(), summarize_retry.id.mode.clone(), summarize_retry.id.backend.clone()
+    )).ok_or("historical summary fixture lost its manifest budget")?;
+    let mut historical_dag = dag_from_json(std::str::from_utf8(&saved_dag)
+        .map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+    for step in historical_dag.steps.iter_mut().filter(|step| step.group == "cell") {
+        step.timeout = legacy_pressure_timeout(old_budget, historical_metadata.cell_timeout_seconds)?;
+        step.cpu_timeout = step.timeout * 2;
+    }
+    let historical_result_text = [summarize_first.clone(), summarize_second.clone()].into_iter()
+        .map(|mut row| {
+            row.execution_cpu_timeout_seconds = None;
+            row.execution_wall_timeout_seconds = None;
+            serde_json::to_string(&row)
+        }).collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?.join("\n") + "\n";
+    fs::write(&summary_metadata_path, serde_json::to_vec(&historical_metadata)
+        .map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+    fs::write(&summary_dag_path, dag_to_json(&historical_dag)).map_err(|error| error.to_string())?;
+    fs::write(&summary_result_path, &historical_result_text).map_err(|error| error.to_string())?;
+    summarize(root, &summarize_retry_results, false, Some(&summarize_runner), false)?;
+    let read_summary = || -> Result<JsonValue, String> {
+        serde_json::from_slice(&fs::read(summarize_retry_results.join("summary.json"))
+            .map_err(|error| error.to_string())?).map_err(|error| error.to_string())
+    };
+    if read_summary()? != summarize_json {
+        return Err("historical summary changed retained retry outcomes or observations".into());
+    }
+    let fresh_error = summarize(root, &summarize_retry_results, false, Some(&summarize_runner), true)
+        .expect_err("a fresh run cannot omit its policy");
+    if !fresh_error.contains("fresh pressure run omitted its timeout policy") {
+        return Err(format!("fresh metadata refusal had the wrong cause: {fresh_error}"));
+    }
+    fs::write(&summary_metadata_path, &saved_metadata).map_err(|error| error.to_string())?;
+    fs::write(&summary_dag_path, &saved_dag).map_err(|error| error.to_string())?;
+    let missing_error = summarize(root, &summarize_retry_results, false, Some(&summarize_runner), false)
+        .expect_err("current retained policy must reject historical timeout omissions");
+    let missing_summary = read_summary()?;
+    if !missing_error.contains("no trustworthy result")
+        || missing_summary["pass_candidates"].as_array().is_none_or(|rows| !rows.is_empty())
+        || missing_summary["rows"][0]["result_row_valid"] != false
+        || missing_summary["repeated_cells"][0]["passes"] != 0
+    {
+        return Err(format!("missing current timeout evidence was promoted: {missing_summary}"));
+    }
+    fs::write(&summary_result_path, &saved_results).map_err(|error| error.to_string())?;
+    summarize(root, &summarize_retry_results, false, Some(&summarize_runner), true)?;
+    if read_summary()? != summarize_json {
+        return Err("restoring exact current evidence changed its fresh summary".into());
     }
     let mut one_pass = second_row.clone();
     one_pass.attempt = 1;
@@ -8718,7 +9153,22 @@ fn self_test(root: &Path) -> Result<(), String> {
         ),
     )
     .map_err(|e| format!("cannot write nested series result fixture: {e}"))?;
-    let nested_rows = collect_series_rows(&nested_results)?;
+    if collect_series_rows(&nested_results, true)?.len() != 2 {
+        return Err("the existing current nested series lost strict admission".into());
+    }
+    let historical_series = scratch.join("historical-series-layout");
+    let historical_cell = historical_series.join("cells").join(&sample_slug);
+    fs::create_dir_all(&historical_cell).map_err(|error| error.to_string())?;
+    fs::write(historical_cell.join("results.jsonl"), &historical_text).map_err(|error| error.to_string())?;
+    if collect_series_rows(&historical_series, false)?.len() != 2 {
+        return Err("historical series rows became unreadable".into());
+    }
+    let strict_series_error = collect_series_rows(&historical_series, true)
+        .expect_err("historical series rows must not satisfy fresh admission");
+    if !strict_series_error.contains("omitted explicit execution timeout bounds") {
+        return Err(format!("strict series admission refused for the wrong cause: {strict_series_error}"));
+    }
+    let nested_rows = collect_series_rows(&nested_results, false)?;
     if nested_rows.len() != 2
         || nested_rows[0].1.run_index != Some(4)
         || nested_rows[0].1.attempt != 1
@@ -8747,7 +9197,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         ),
     )
     .map_err(|e| format!("cannot write mismatched nested series fixture: {e}"))?;
-    if collect_series_rows(&nested_results).is_ok() {
+    if collect_series_rows(&nested_results, false).is_ok() {
         return Err("a framework result whose run_index disagreed with its pressure directory was accepted".into());
     }
     let mut reused_artifact = second_row.clone();
