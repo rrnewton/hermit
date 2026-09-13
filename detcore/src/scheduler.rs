@@ -2282,10 +2282,18 @@ impl Scheduler {
         self.drain_pending_run_queue_removals();
         self.drain_pending_waitid_signals();
         self.drain_pending_run_queue_admissions();
-        if !self.pending_physical_thread_exits.is_empty() {
+        if self.pending_physical_thread_exits.values().any(|futexid| {
+            self.blocked
+                .futex_waiters
+                .get(futexid)
+                .is_some_and(|waiters| !waiters.is_empty())
+        }) {
             // The ordinary exit turn installed this barrier before the exiting
-            // thread resumed. Keep every sibling parked until the backend has
-            // observed the final kernel exit and the child-TID word is clear.
+            // thread resumed. Keep scheduling parked while a matching joiner
+            // depends on the backend observing the final kernel exit and clearing
+            // the child-TID word.
+            // A barrier with no matching waiter must not suppress unrelated
+            // scheduler stages or terminal-deadlock reporting.
             std::thread::yield_now();
             return Err(SkipTurn);
         }
@@ -6715,6 +6723,34 @@ mod test {
         assert!(scheduler.child_tid_was_cleared(child_tid_futex, child.as_raw()));
         assert!(scheduler.run_queue.contains_tid(leader));
         assert!(scheduler.step2_process_blocked(&global_time).is_ok());
+    }
+
+    #[test]
+    fn physical_thread_exit_without_matching_waiter_reaches_deadlock_reporting() {
+        let config = Config {
+            backend_reports_physical_process_exits: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let waiter = DetTid::from_raw(100);
+        let exiting = DetTid::from_raw(101);
+        let mm = MmId::initial(DetPid::from_raw(100));
+        let exit_futex = FutexID::private(mm, 0x1234);
+        let unrelated_futex = FutexID::private(mm, 0x5678);
+        register_known_thread(&mut scheduler, waiter);
+        scheduler.sleep_futex_waiter(&waiter, unrelated_futex, None, u32::MAX);
+        scheduler
+            .pending_physical_thread_exits
+            .insert(exiting, exit_futex);
+
+        assert!(scheduler.step2_process_blocked(&global_time).is_err());
+        assert!(scheduler.take_terminal_deadlock().is_some());
+        assert!(
+            scheduler
+                .pending_physical_thread_exits
+                .contains_key(&exiting)
+        );
     }
 
     #[test]
