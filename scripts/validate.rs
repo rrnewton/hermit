@@ -8131,7 +8131,7 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
         planned_test_nodes: test_nodes_of(&cfg),
         cfg,
         profile: "generated-validation-dag".into(),
-        selection_mode: "generator".into(),
+        selection_mode: "generator",
         cacheable: false,
         ..Default::default()
     })
@@ -9658,7 +9658,8 @@ fn manifest_node_vacuity_profile_bracket(
         .iter()
         .map(|step| (step.tag(), step.deps.clone()))
         .collect::<BTreeMap<_, _>>();
-    for consumer in [committed_scorecard_tag] {
+    {
+        let consumer = committed_scorecard_tag;
         if !before
             .get(consumer)
             .is_some_and(|deps| deps.iter().any(|dep| dep == withheld_tag))
@@ -9670,7 +9671,8 @@ fn manifest_node_vacuity_profile_bracket(
     }
     let mut expected = before.clone();
     expected.remove(withheld_tag);
-    for consumer in [committed_scorecard_tag] {
+    {
+        let consumer = committed_scorecard_tag;
         let deps = expected
             .get_mut(consumer)
             .ok_or_else(|| format!("node vacuity: {label} lost result consumer {consumer}"))?;
