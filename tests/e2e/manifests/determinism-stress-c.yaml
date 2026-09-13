@@ -590,6 +590,8 @@ test:
         guest_args:
           ptrace:
             - contention
+          kvm:
+            - contention
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately

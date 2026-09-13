@@ -219,8 +219,16 @@ test:
           kvm: [multi]
 ```
 
-Every `guest_args` key must name an enabled backend. Omitted backends receive
-no guest arguments.
+Every `guest_args` key must name a backend listed in either `backends_enabled`
+or `backends_disabled`. This lets an explicit `--probe-disabled` run give an
+unselected backend its own scenario arguments without selecting that backend
+for ordinary validation. The test harness, manifest CLI, and `--guest-args`
+exporter look up the requested backend's arguments exactly, without inheriting
+another backend's arguments; an omitted backend receives no guest arguments.
+The exporter uses JSON Lines so empty strings, tabs, newlines, and explicitly
+empty vectors retain their exact argument boundaries.
+The only valid backend for `naked` is `native`; other modes accept only the five
+Hermit backends.
 
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for

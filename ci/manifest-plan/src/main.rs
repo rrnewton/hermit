@@ -1263,19 +1263,19 @@ fn validate_mode_with_cpu(
             .as_table()
             .unwrap_or_else(|| die(format!("{id}: modes.{mode}.guest_args must be a table")));
         for (backend, args) in guest_args {
-            if !enabled_names.contains(backend.as_str()) {
-                die(format!(
-                    "{id}: modes.{mode}.guest_args.{backend} names a backend that is not enabled"
-                ));
-            }
-            if string_array(
-                Some(args),
-                &format!("{id}.modes.{mode}.guest_args.{backend}"),
-            )
-            .is_empty()
+            if !enabled_names.contains(backend.as_str()) && !disabled_set.contains(backend.as_str())
             {
                 die(format!(
-                    "{id}: modes.{mode}.guest_args.{backend} must contain at least one argument"
+                    "{id}: modes.{mode}.guest_args.{backend} names a backend outside backends_enabled/backends_disabled"
+                ));
+            }
+            let args = string_array(
+                Some(args),
+                &format!("{id}.modes.{mode}.guest_args.{backend}"),
+            );
+            if args.iter().any(|argument| argument.contains('\0')) {
+                die(format!(
+                    "{id}: modes.{mode}.guest_args.{backend} contains a NUL byte, which Linux argv cannot represent"
                 ));
             }
         }
@@ -2186,14 +2186,41 @@ backends_enabled = []
     }
 
     #[test]
-    #[should_panic(expected = "names a backend that is not enabled")]
-    fn rejects_guest_args_for_disabled_backend() {
+    fn accepts_guest_args_for_disabled_backend() {
         let spec = parse_mode(
             r#"
 ci = false
 ci_disabled_reason = "fixture cell: ptrace only, other backends unmeasured here"
 backends_enabled = ["ptrace"]
-guest_args = { kvm = ["--kvm"] }
+guest_args = { ptrace = [], kvm = ["--kvm"] }
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#,
+        );
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "verify",
+            90,
+            &spec,
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "names a backend outside backends_enabled/backends_disabled")]
+    fn rejects_guest_args_for_unknown_backend() {
+        let spec = parse_mode(
+            r#"
+ci = false
+ci_disabled_reason = "fixture cell: ptrace only, other backends unmeasured here"
+backends_enabled = ["ptrace"]
+guest_args = { unknown = ["--unknown"] }
 
 [backends_disabled]
 dbt = "unsupported"

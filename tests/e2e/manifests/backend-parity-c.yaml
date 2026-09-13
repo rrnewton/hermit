@@ -5445,6 +5445,8 @@ test:
         guest_args:
           ptrace:
             - workdir
+          kvm:
+            - workdir
         assert:
           bitwise_parity: true
         backends_disabled:
