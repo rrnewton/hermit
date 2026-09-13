@@ -392,7 +392,7 @@ fn pinned_root_command(step: &Step) -> String {
 
 fn pinned_root_fetch() -> Result<Step, String> {
     let text = format!(
-        r#"{{"description":"Pinned-root fetch node","steps":[{{"group":"setup","job":"pinned_root_fetch","desc":"Fetch locked Cargo inputs","description":"Fetch locked Cargo inputs before network-disabled pinned-root commands.","cmd":{},"deps":[],"env":{{"VALIDATE_VERBOSITY":"1"}},"labels":[],"result_manifests":[],"timeout":600,"cpu_timeout":600,"hint":{{"hard_mem_max_bytes":1073741824}},"fail_fast_family":"setup.pinned_root_fetch"}}]}}"#,
+        r#"{{"description":"Pinned-root fetch node","steps":[{{"group":"setup","job":"pinned_root_fetch","desc":"Fetch locked Cargo inputs","description":"Fetch locked Cargo inputs before network-disabled pinned-root commands.","cmd":{},"deps":[],"env":{{"VALIDATE_VERBOSITY":"1"}},"labels":[],"result_manifests":[],"timeout":600,"cpu_timeout":600,"hint":{{"rss_baseline_bytes":1073741824,"hard_mem_max_bytes":1073741824}},"fail_fast_family":"setup.pinned_root_fetch"}}]}}"#,
         serde_json::to_string(PINNED_ROOT_FETCH_COMMAND).expect("constant is serializable")
     );
     let mut step = dag_from_json(&text)
@@ -633,7 +633,7 @@ fn materialize_focused_preflight(cfg: &mut DagConfig) -> Result<(), String> {
             if !pinned_preparation && !gate_ancestors.contains(&tag) {
                 step.deps.push(gate.into());
             }
-            if !pin_ancestors.contains(&tag) {
+            if !pin_ancestors.contains(&tag) && !gate_ancestors.contains(&tag) {
                 step.deps.push(pin.into());
             }
             // Manifest commands need their canonical test-harness producer

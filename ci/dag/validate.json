@@ -95,8 +95,7 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build -p hermit-manifest-plan --bins",
       "result_manifests": [],
       "deps": [
-        "build.rust_scripts",
-        "pre.reverie_pin"
+        "build.rust_scripts"
       ],
       "env": {},
       "networkonly": false,
@@ -130,7 +129,6 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness validate",
       "result_manifests": [],
       "deps": [
-        "pre.reverie_pin",
         "setup.manifest_plan"
       ],
       "env": {},
@@ -18816,8 +18814,7 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build -p hermit-manifest-plan --bins",
       "result_manifests": [],
       "deps": [
-        "build.rust_scripts_on_host",
-        "pre.reverie_pin_on_host"
+        "build.rust_scripts_on_host"
       ],
       "env": {},
       "networkonly": false,
@@ -18849,7 +18846,6 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness validate",
       "result_manifests": [],
       "deps": [
-        "pre.reverie_pin_on_host",
         "setup.manifest_plan_on_host"
       ],
       "env": {},
@@ -58910,7 +58906,7 @@
       "hint": {
         "resources": {},
         "est_duration_s": 0.0,
-        "rss_baseline_bytes": null,
+        "rss_baseline_bytes": 1073741824,
         "hard_mem_max_bytes": 1073741824,
         "classification": "light",
         "preferred_inner_jobs": null,
@@ -59229,7 +59225,6 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build -p hermit-manifest-plan --bins",
       "result_manifests": [],
       "deps": [
-        "pre.reverie_pin",
         "quick-super-build.rust_scripts"
       ],
       "env": {},
@@ -59263,7 +59258,6 @@
       "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness validate",
       "result_manifests": [],
       "deps": [
-        "pre.reverie_pin",
         "quick-super-setup.manifest_plan"
       ],
       "env": {},
