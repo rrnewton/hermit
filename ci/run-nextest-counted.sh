@@ -47,11 +47,19 @@ function run_nextest {
     set +e
     # nextest's stderr remains presentation. The versioned stdout event stream
     # is the only input to the aggregate count and per-test result adapter.
-    NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest \
-        --config-file "$nextest_config" run --color never \
-        --message-format libtest-json-plus --message-format-version 0.1 \
-        "$@" >"$events_log"
-    status=$?
+    if [[ ${HERMIT_PREPARED_NEXTEST_REQUIRED:-0} == 1 ]]; then
+        NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 "$SCRIPT_DIR/nextest-binaries.rs" run \
+            --config-file "$nextest_config" --color never \
+            --message-format libtest-json-plus --message-format-version 0.1 \
+            "$@" >"$events_log"
+        status=$?
+    else
+        NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest \
+            --config-file "$nextest_config" run --color never \
+            --message-format libtest-json-plus --message-format-version 0.1 \
+            "$@" >"$events_log"
+        status=$?
+    fi
     set -e
     cleanup_nextest_config
 
