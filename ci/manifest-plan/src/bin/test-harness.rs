@@ -39,6 +39,7 @@ use hermit_manifest_plan::stress_series::HostCapabilities;
 use hermit_manifest_plan::stress_series::HostCapability;
 #[cfg(test)]
 use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
+use hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD;
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
@@ -1041,7 +1042,14 @@ fn command_runs_exactly(command: &str, inner: &str) -> bool {
     let Some(rest) = command.strip_prefix(PINNED_COMMAND_PREFIX) else {
         return false;
     };
-    let Some((forwarded, quoted_inner)) = rest.split_once(PINNED_COMMAND_SEPARATOR) else {
+    let current_separator = format!(
+        " -- bash -c {} bash ",
+        shell_quote_one(PINNED_ROOT_COMMAND_GUARD)
+    );
+    let Some((forwarded, quoted_inner)) = rest
+        .split_once(&current_separator)
+        .or_else(|| rest.split_once(PINNED_COMMAND_SEPARATOR))
+    else {
         return false;
     };
     let words = forwarded.split_whitespace().collect::<Vec<_>>();
@@ -1229,6 +1237,21 @@ fn audit_validation_levels_policy(workflow: &str) -> Result<(), String> {
     Ok(())
 }
 
+// Match the actual hosted selector and shard-coverage consumer: an exact name
+// wins; only an existing hosted counterpart can resolve a public selector.
+// Keep the public name in the budget baseline and inspect the resolved node's
+// real timeout. Unknown or removed nodes remain errors.
+fn portable_shard_step<'a>(
+    steps: &std::collections::BTreeMap<String, &'a dagrun::Step>,
+    node: &str,
+) -> Result<&'a dagrun::Step, String> {
+    steps
+        .get(node)
+        .or_else(|| steps.get(&format!("{node}_on_host")))
+        .copied()
+        .ok_or_else(|| format!("portable shard names missing DAG node {node}"))
+}
+
 fn audit_budget_ordering(root: &Path) -> Result<(), String> {
     audit_workflow_run_dag_runners(root)?;
     let committed = read_dag(&root.join("ci/dag/validate.json"))?;
@@ -1294,9 +1317,7 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
             let node = node
                 .as_str()
                 .ok_or_else(|| format!("{key} contains a non-string node"))?;
-            let step = portable_steps
-                .get(node)
-                .ok_or_else(|| format!("portable shard names missing DAG node {node}"))?;
+            let step = portable_shard_step(&portable_steps, node)?;
             let timeout = u64::try_from(step.timeout).map_err(|_| {
                 format!("portable node {node} has invalid timeout {}", step.timeout)
             })?;
@@ -1990,17 +2011,14 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                     result.test,
                     result.mode,
                     result.backend.as_deref().unwrap_or("native"),
-                    result.reason.as_deref().unwrap_or("infrastructure error")
+                    result.reason_for_display()
                 );
             }
             // A FAILURE MUST SAY ENOUGH TO BE CLASSIFIED, NOT JUST COUNTED.
             let located = if result.outcome == "PASS" {
                 String::new()
             } else if result.outcome == "HOST-INAPPLICABLE" {
-                format!(
-                    " {}",
-                    result.reason.as_deref().unwrap_or("host-inapplicable")
-                )
+                format!(" {}", result.reason_for_display())
             } else {
                 let coords = [
                     ("turn", result.first_divergent_scheduler_turn),
@@ -2015,8 +2033,8 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 if !coords.is_empty() {
                     suffix.push_str(&format!(" [{}]", coords.join(" ")));
                 }
-                if let Some(reason) = result.reason.as_deref() {
-                    suffix.push_str(&format!(" {reason}"));
+                if result.outcome != "PASS" {
+                    suffix.push_str(&format!(" {}", result.reason_for_display()));
                 }
                 suffix.push_str(&format!("\n    evidence: {}", result.artifact_dir));
                 suffix
@@ -2307,6 +2325,104 @@ mod tests {
 "#;
 
     #[test]
+    fn portable_shard_budgets_resolve_actual_hosted_nodes_without_losing_checks() {
+        let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json"))
+            .expect("actual committed graph");
+        let hosted = dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()])
+            .expect("actual hosted selection");
+        let mut steps = hosted
+            .steps
+            .iter()
+            .map(|step| (step.tag(), step))
+            .collect::<BTreeMap<_, _>>();
+        let shards: serde_json::Value =
+            serde_json::from_str(include_str!("../../../portable-shards.json")).unwrap();
+        let expected_aliases = [
+            "test.hermit_unit",
+            "test.detcore_unit",
+            "test.detcore_misc",
+            "test.detcore_parallel",
+            "test.regular_crates",
+            "test.hermit_integration",
+            "test.arbitrary_binaries",
+            "test.applications_e2e",
+            "test.app_strict_verify",
+            "test.command_strict_verify",
+            "test.ignored_syscall_regressions",
+            "test.envelope_levels",
+            "test.rr_suite_contract",
+            "test.dbt_parity",
+            "test.sabre_examples",
+            "test.liteinst_strict",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        let mut actual_aliases = std::collections::BTreeSet::new();
+        let mut resolved = std::collections::BTreeSet::new();
+        let mut physical_rows = 0;
+        for key in ["debug_shards", "release_shards"] {
+            for shard in shards[key].as_array().unwrap() {
+                for public in shard["nodes"].as_array().unwrap() {
+                    let public = public.as_str().unwrap();
+                    let step = super::portable_shard_step(&steps, public).unwrap();
+                    let expected = if expected_aliases.contains(public) {
+                        assert!(
+                            !steps.contains_key(public),
+                            "must exercise actual renamed node"
+                        );
+                        actual_aliases.insert(public);
+                        format!("{public}_on_host")
+                    } else {
+                        public.to_string()
+                    };
+                    assert_eq!(step.tag(), expected);
+                    assert!(std::ptr::eq(step, steps[&expected]));
+                    assert!(
+                        resolved.insert(step.tag()),
+                        "duplicate physical shard target"
+                    );
+                    physical_rows += 1;
+                }
+            }
+        }
+        assert_eq!(physical_rows, 23);
+        assert_eq!(resolved.len(), 23);
+        assert_eq!(actual_aliases, expected_aliases);
+        // Run the complete real budget audit too: all original workflow,
+        // critical-path and exact inversion-baseline comparisons remain active.
+        super::audit_budget_ordering(&super::root()).unwrap();
+
+        let hosted_name = "test.hermit_unit_on_host";
+        let host = *steps.get(hosted_name).unwrap();
+        assert_eq!(host.timeout, 900);
+        assert!(std::ptr::eq(
+            super::portable_shard_step(&steps, hosted_name).unwrap(),
+            host
+        ));
+        let mut exact = (*host).clone();
+        exact.job = "hermit_unit".into();
+        exact.timeout = 17;
+        let mut exact_steps = steps.clone();
+        exact_steps.insert("test.hermit_unit".into(), &exact);
+        let selected = super::portable_shard_step(&exact_steps, "test.hermit_unit").unwrap();
+        assert!(
+            std::ptr::eq(selected, &exact),
+            "exact selector must win over hosted twin"
+        );
+        assert_eq!(
+            selected.timeout, 17,
+            "use actual selected budget, never a public-name default"
+        );
+        assert!(steps.remove(hosted_name).is_some());
+        for unknown in ["test.hermit_unit", hosted_name, "test.no_such_shard_node"] {
+            assert_eq!(
+                super::portable_shard_step(&steps, unknown).unwrap_err(),
+                format!("portable shard names missing DAG node {unknown}")
+            );
+        }
+    }
+
+    #[test]
     fn validation_levels_cannot_rewrite_committed_graph_policy() {
         let workflow = include_str!("../../../../.github/workflows/validation-levels.yml");
         assert!(audit_validation_levels_policy(workflow).is_ok());
@@ -2505,6 +2621,26 @@ mod tests {
         rows.sort_unstable();
         assert_eq!(rows, (0..8).map(|index| (index, index)).collect::<Vec<_>>());
         assert!(maximum.load(Ordering::SeqCst) > 1);
+    }
+    #[test]
+    fn retry_policy_retries_only_classified_product_failures() {
+        assert!(cell_result_is_retryable(
+            "FAIL",
+            Some(FailureClass::ProductFailure)
+        ));
+        for (outcome, class) in [
+            ("PASS", None),
+            ("HOST-INAPPLICABLE", None),
+            ("FAIL", None),
+            ("FAIL", Some(FailureClass::UnderstoodInfrastructureFailure)),
+            ("ERROR", Some(FailureClass::NoResult)),
+            ("ERROR", Some(FailureClass::UnderstoodPrerequisiteFailure)),
+        ] {
+            assert!(
+                !cell_result_is_retryable(outcome, class),
+                "{outcome} {class:?}"
+            );
+        }
     }
 
     #[test]
@@ -2994,6 +3130,50 @@ mod tests {
             ),
             inner
         ));
+
+        let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json"))
+            .expect("the committed validation DAG must parse");
+        for lane in ["portable", "privileged"] {
+            let dag = dagrun::select_steps_by_labels(&committed, &[lane.to_string()]).unwrap();
+            let inner =
+                format!("target/debug/test-harness build --lane {lane} --ci-only --allow-empty");
+            let matches = dag
+                .steps
+                .iter()
+                .filter(|step| command_runs_exactly(&step.cmd, &inner))
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 2, "{lane}: host and pinned build commands");
+            let pinned = matches
+                .iter()
+                .find(|step| step.cmd.starts_with(PINNED_COMMAND_PREFIX))
+                .expect("the generated pinned command must match");
+            for malformed in [
+                pinned
+                    .cmd
+                    .replace("/src/ci/hermetic/assert-no-network.sh && ", ""),
+                pinned
+                    .cmd
+                    .replace("/src/ci/hermetic/assert-build-dependencies.sh && ", ""),
+                pinned
+                    .cmd
+                    .replace("hermit_payload=$1", "hermit_payload=true"),
+                format!("{} --unexpected", pinned.cmd),
+                pinned.cmd.replace(
+                    "--env E2E_RESULT_ROOT ",
+                    "--env E2E_RESULT_ROOT --env E2E_RESULT_ROOT ",
+                ),
+                pinned
+                    .cmd
+                    .replace("--env E2E_RESULT_ROOT ", "--env lowercase "),
+                pinned.cmd.replace(&inner, &format!("{inner} --jobs 2")),
+            ] {
+                assert_ne!(malformed, pinned.cmd, "control must alter the command");
+                assert!(
+                    !command_runs_exactly(&malformed, &inner),
+                    "accepted malformed or nonmatching command: {malformed}"
+                );
+            }
+        }
     }
 
     #[test]

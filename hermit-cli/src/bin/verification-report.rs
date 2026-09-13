@@ -9,6 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
+use hermit::canonical_verdict::NoResultReason;
 use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
 
@@ -36,10 +37,23 @@ fn refuse(message: impl std::fmt::Display) -> ExitCode {
 fn read_current_report(path: &Path) -> Result<VerificationReport, String> {
     let bytes =
         fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    let value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("{} is not valid JSON: {error}", path.display()))?;
-    VerificationReport::from_current_json_value(value)
+    VerificationReport::from_current_json_slice(&bytes)
         .map_err(|error| format!("{}: {error}", path.display()))
+}
+fn no_result_detail(report: &VerificationReport) -> String {
+    match report.no_result_reason.as_ref() {
+        Some(NoResultReason::NotRun) => "the invocation did not run".into(),
+        Some(NoResultReason::FirstRunRejected {
+            exit_code,
+            signal,
+            stdout_bytes,
+            stderr_bytes,
+        }) => format!(
+            "the first run was rejected: exit_code={exit_code:?} signal={signal:?} stdout_bytes={stdout_bytes} stderr_bytes={stderr_bytes}"
+        ),
+        Some(NoResultReason::ComparisonRefused { detail }) => detail.clone(),
+        None => "the producer recorded no specific no-result cause".into(),
+    }
 }
 
 fn require_match(report: &VerificationReport) -> Result<(), String> {
@@ -54,9 +68,10 @@ fn require_match(report: &VerificationReport) -> Result<(), String> {
         Verdict::Diverged => {
             Err("verdict is diverged but verified is true; the typed fields disagree".into())
         }
-        Verdict::NoResult if !report.verified => {
-            Err("verification verdict is no_result, not matched".into())
-        }
+        Verdict::NoResult if !report.verified => Err(format!(
+            "verification verdict is no_result, not matched: {}",
+            no_result_detail(report)
+        )),
         Verdict::NoResult => {
             Err("verdict is no_result but verified is true; the typed fields disagree".into())
         }

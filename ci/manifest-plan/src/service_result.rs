@@ -437,8 +437,8 @@ mod tests {
             selection_mode: Some("full".into()),
             final_validate_status: FinalValidateStatus::CouldNotRun,
             detail: Some(vec![
-                "REFUSED ON COMPLETENESS: ZERO tests executed".into(),
-                "0 test(s) executed, 0 passed, 4 filtered".into(),
+                "refused by: pre.reverie_pin".into(),
+                "recorded pin is not an ancestor".into(),
             ]),
             exit_code: 75,
             executed_nodes: 0,
@@ -452,14 +452,14 @@ mod tests {
             result.final_validate_status,
             FinalValidateStatus::CouldNotRun
         );
+        assert_eq!(result.scorecard_writeback, None);
         assert_eq!(
             result.detail,
             Some(vec![
-                "REFUSED ON COMPLETENESS: ZERO tests executed".into(),
-                "0 test(s) executed, 0 passed, 4 filtered".into(),
+                "refused by: pre.reverie_pin".into(),
+                "recorded pin is not an ancestor".into()
             ])
         );
-        assert_eq!(result.scorecard_writeback, None);
     }
 
     #[test]
@@ -546,7 +546,6 @@ mod tests {
                 .contains("schema 5 expected")
         );
     }
-
     #[test]
     fn current_detail_is_required_nullable_and_only_names_no_result() {
         let mut missing = serde_json::to_value(valid()).unwrap();

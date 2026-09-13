@@ -34,6 +34,8 @@ pub use crate::canonical_verdict::VerificationRuntime;
 use crate::ci_selection::CiDisabledReasonSpec;
 use crate::ci_selection::CiSelection;
 use crate::ci_selection::CiSelectionSpec;
+use crate::environmental_block::EnvBlockClass;
+use crate::environmental_block::environmental_block_observation;
 use crate::host_capability::probe_host_capabilities;
 use crate::stress_series::HostCapabilities;
 use crate::stress_series::HostCapability;
@@ -895,7 +897,7 @@ pub fn validate_mode_workdir(
     id: &str,
     mode: &str,
     workdir: Option<&str>,
-    backends_enabled: &[String],
+    _backends_enabled: &[String],
 ) -> Result<(), String> {
     let Some(workdir) = workdir else {
         return Ok(());
@@ -908,20 +910,11 @@ pub fn validate_mode_workdir(
     if !Path::new(workdir).is_absolute() {
         return Err(format!("{id}: {mode} workdir must be an absolute path"));
     }
-    // The pinned DBT launcher preserves Command::current_dir, but it does not
-    // enter Hermit's container and therefore cannot see a workdir supplied by
-    // Hermit's mount namespace. Refuse until the requested path is established
-    // in the namespace the DBT guest actually uses.
-    if backends_enabled.iter().any(|backend| backend == "dbt") {
-        return Err(format!(
-            "{id}: {mode} workdir is unsupported when DBT is enabled because DBT does not enter the Hermit mount namespace"
-        ));
-    }
     Ok(())
 }
 
-fn supports_test_workdir(mode: &str, backend: &str) -> bool {
-    matches!(mode, "verify" | "replay" | "chaos" | "custom") && backend != "dbt"
+fn supports_test_workdir(mode: &str, _backend: &str) -> bool {
+    matches!(mode, "verify" | "replay" | "chaos" | "custom")
 }
 
 fn cell_relaxations(cell: &SelectedCell) -> Vec<String> {
@@ -1004,6 +997,8 @@ pub enum ObservedResult {
     CrashError,
     Timeout,
     Oom,
+    SandboxDenied,
+    InfrastructureError,
 }
 
 impl ObservedResult {
@@ -1016,6 +1011,10 @@ impl ObservedResult {
             "crash-error" => Ok(Self::CrashError),
             "timeout" => Ok(Self::Timeout),
             "oom" => Ok(Self::Oom),
+            "sandbox-denied" => Err(
+                "pressure summary contains a sandbox-denied operation; refusing to store it as product behavior"
+                    .into(),
+            ),
             "infrastructure-error" => Err(
                 "pressure summary contains an infrastructure error; refusing to store it as product behavior"
                     .into(),
@@ -1033,6 +1032,8 @@ impl ObservedResult {
             Self::CrashError => "crash-error",
             Self::Timeout => "timeout",
             Self::Oom => "oom",
+            Self::SandboxDenied => "sandbox-denied",
+            Self::InfrastructureError => "infrastructure-error",
         }
     }
 
@@ -1051,6 +1052,9 @@ impl ObservedResult {
             | Self::ReplayFailure
             | Self::CrashError => Some(FailureClass::ProductFailure),
             Self::Timeout | Self::Oom => Some(FailureClass::NoResult),
+            Self::SandboxDenied | Self::InfrastructureError => {
+                Some(FailureClass::UnderstoodInfrastructureFailure)
+            }
         }
     }
 }
@@ -1302,6 +1306,19 @@ pub struct CellResult {
 }
 
 impl CellResult {
+    /// Human-facing explanation without manufacturing a cause the producer did
+    /// not record.
+    pub fn reason_for_display(&self) -> &str {
+        self.reason
+            .as_deref()
+            .unwrap_or(match self.outcome.as_str() {
+                "FAIL" => "no specific failure reason was recorded",
+                "ERROR" => "no specific error reason was recorded",
+                "HOST-INAPPLICABLE" => "no prerequisite reason was recorded",
+                _ => "no reason was recorded",
+            })
+    }
+
     /// Validate the additive timeout fields while keeping earlier schema-4 rows
     /// readable. `timeout_seconds` retains its original wall-bound meaning;
     /// only rows carrying both new fields claim the execution CPU/backstop
@@ -1382,6 +1399,10 @@ impl CellResult {
                 }
             }
             "ERROR" => match (self.result, self.failure_class) {
+                (
+                    Some(ObservedResult::SandboxDenied | ObservedResult::InfrastructureError),
+                    Some(FailureClass::UnderstoodInfrastructureFailure),
+                ) => {}
                 (
                     None,
                     Some(
@@ -1837,7 +1858,9 @@ fn prepare_test_until(
         _ => return Err(format!("{} has unsupported program kind", cell.test.id)),
     };
     guest.extend(guest_args);
-    if context.isolated_workdir.is_some() || supports_test_workdir(&cell.id.mode, backend) {
+    if context.isolated_workdir.is_some()
+        || (backend != "dbt" && supports_test_workdir(&cell.id.mode, backend))
+    {
         resolve_repo_guest_args(&context.root, &mut guest);
     }
     Ok((guest, cpu_usage_usec))
@@ -2089,6 +2112,7 @@ pub fn build_spec(
             }
             append_execution_root_args(
                 &mut argv,
+                backend,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
                 bound_workdir_source,
@@ -2126,6 +2150,7 @@ pub fn build_spec(
             ]);
             append_execution_root_args(
                 &mut argv,
+                backend,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
                 bound_workdir_source,
@@ -2161,6 +2186,7 @@ pub fn build_spec(
             ]);
             append_execution_root_args(
                 &mut argv,
+                backend,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
                 bound_workdir_source,
@@ -2188,6 +2214,7 @@ pub fn build_spec(
             }
             append_execution_root_args(
                 &mut argv,
+                backend,
                 context.isolated_workdir.as_deref(),
                 mode_recipe.workdir.as_deref(),
                 bound_workdir_source,
@@ -2216,6 +2243,9 @@ pub fn build_spec(
     })
 }
 
+fn current_verification_report(bytes: &[u8]) -> Result<VerificationReport, String> {
+    VerificationReport::from_current_json_slice(bytes)
+}
 pub fn execute_spec(spec: &CellRunSpec) -> Result<AttemptResult, String> {
     execute_spec_until(
         spec,
@@ -2386,7 +2416,11 @@ fn execute_spec_until(
     if unclassified_internal_failure {
         outcome = "ERROR".into();
         error_kind = Some("incomplete-verification-evidence".into());
-        reason = Some("Hermit reported cli-error without a more specific result".into());
+        reason = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("Error: "))
+            .filter(|detail| !detail.trim().is_empty())
+            .map(str::to_owned);
     }
     let producer_failure_classified = launch_refusal
         || backend_unavailable
@@ -2417,7 +2451,7 @@ fn execute_spec_until(
             Ok(bytes) => {
                 report_sha = Some(hex_digest(&bytes));
                 report_json = Some(String::from_utf8_lossy(&bytes).into_owned());
-                match VerificationReport::from_json_slice(&bytes) {
+                match current_verification_report(&bytes) {
                     Ok(report) => {
                         runtime = report.runtime.clone();
                         // Recorded BEFORE the classification chain below,
@@ -2466,6 +2500,23 @@ fn execute_spec_until(
                                     ),
                                 });
                             }
+                        } else if report.verdict == Verdict::NoResult
+                            && matches!(
+                                report.no_result_reason,
+                                Some(
+                                    crate::canonical_verdict::NoResultReason::ComparisonRefused { .. }
+                                )
+                            )
+                        {
+                            let Some(crate::canonical_verdict::NoResultReason::ComparisonRefused {
+                                detail,
+                            }) = report.no_result_reason.as_ref()
+                            else {
+                                unreachable!()
+                            };
+                            outcome = "ERROR".into();
+                            error_kind = Some("incomplete-verification-evidence".into());
+                            reason = Some(detail.clone());
                         } else if report.verdict == Verdict::NoResult
                             && matches!(
                                 report.no_result_reason,
@@ -2909,12 +2960,46 @@ fn cell_artifact_dir(context: &RunContext, cell: &SelectedCell) -> PathBuf {
 
 fn verification_verdict(attempt: &AttemptResult) -> Option<Verdict> {
     let report = attempt.verification_report.as_deref()?;
-    VerificationReport::from_json_slice(report.as_bytes())
+    current_verification_report(report.as_bytes())
         .ok()
         .map(|report| report.verdict)
 }
 
 fn observed_result(
+    mode: &str,
+    outcome: &str,
+    attempts: &[AttemptResult],
+    error_kind: Option<&str>,
+) -> Option<ObservedResult> {
+    // Preserve the existing terminal evidence and timeout guards before using
+    // a typed product verdict. Incidental diagnostic text cannot erase a valid
+    // comparison, but an earlier divergence cannot revive an unusable terminal
+    // framework/evidence result either.
+    let typed = observed_result_from_typed_evidence(mode, outcome, attempts, error_kind);
+    if matches!(
+        typed,
+        Some(
+            ObservedResult::Pass
+                | ObservedResult::DeterminismFailure
+                | ObservedResult::ReplayFailure
+        )
+    ) {
+        return typed;
+    }
+    if let Some(class) = attempts.iter().find_map(|attempt| {
+        let output = format!("{}\n{}", attempt.stdout, attempt.stderr);
+        environmental_block_observation(&output).block_class()
+    }) {
+        return Some(if class == EnvBlockClass::BpfjailerBanner {
+            ObservedResult::SandboxDenied
+        } else {
+            ObservedResult::InfrastructureError
+        });
+    }
+    typed
+}
+
+fn observed_result_from_typed_evidence(
     mode: &str,
     outcome: &str,
     attempts: &[AttemptResult],
@@ -2972,6 +3057,12 @@ fn failure_class(
 ) -> Option<FailureClass> {
     if outcome == "PASS" {
         return None;
+    }
+    if matches!(
+        result,
+        Some(ObservedResult::SandboxDenied | ObservedResult::InfrastructureError)
+    ) {
+        return Some(FailureClass::UnderstoodInfrastructureFailure);
     }
     if let Some(failure_class) = non_product_failure_class(error_kind) {
         return Some(failure_class);
@@ -3745,19 +3836,19 @@ pub fn write_junit(path: &Path, results: &[CellResult]) -> Result<(), String> {
         if result.outcome == "FAIL" {
             out.push_str(&format!(
                 "<failure>{}</failure>",
-                xml(result.reason.as_deref().unwrap_or("failed"))
+                xml(result.reason_for_display())
             ));
         }
         if result.outcome == "ERROR" {
             out.push_str(&format!(
                 "<error>{}</error>",
-                xml(result.reason.as_deref().unwrap_or("error"))
+                xml(result.reason_for_display())
             ));
         }
         if result.outcome == "HOST-INAPPLICABLE" {
             out.push_str(&format!(
                 "<skipped message=\"{}\"/>",
-                xml(result.reason.as_deref().unwrap_or("host-inapplicable"))
+                xml(result.reason_for_display())
             ));
         }
         out.push_str("</testcase>\n");
@@ -3971,12 +4062,19 @@ fn require_minimal_base_env(argv: &mut Vec<String>) -> Result<(), String> {
 ///      per-attempt directory at `/tmp/test`.
 fn append_execution_root_args(
     argv: &mut Vec<String>,
+    backend: &str,
     isolated_workdir: Option<&Path>,
     requested_workdir: Option<&str>,
     fixed_workdir_source: Option<&Path>,
 ) {
     if let Some(workdir) = isolated_workdir {
-        argv.push(format!("--mount=type=tmpfs,target={}", workdir.display()));
+        // The marked DBT adapter establishes a fresh namespace and /test tmpfs
+        // for each physical execution before constructing its runtime. It still
+        // refuses the general --mount CLI surface, so pass only the workdir.
+        // Other backends create their per-invocation tmpfs from this argument.
+        if backend != "dbt" {
+            argv.push(format!("--mount=type=tmpfs,target={}", workdir.display()));
+        }
         argv.extend(["--workdir".into(), workdir.to_string_lossy().into_owned()]);
     } else if let Some(workdir) = requested_workdir {
         // Outside the explicit hermetic path, a manifest that names its own
@@ -4112,6 +4210,37 @@ fn execute_observed_until(
 mod tests {
     use super::*;
     use crate::ci_selection::BackendCiDisabledReason;
+
+    #[test]
+    fn current_runner_reports_refuse_duplicate_fields() {
+        let mut report = VerificationReport::no_result();
+        report.no_result_reason = None;
+        let raw = serde_json::to_string(&report).unwrap();
+        current_verification_report(raw.as_bytes()).unwrap();
+        for (needle, replacement) in [
+            (r#""verified":false"#, r#""verified":true,"verified":false"#),
+            (
+                r#""verified":false"#,
+                r#""verified":false,"verified":false"#,
+            ),
+            (
+                r#""no_result_reason":null"#,
+                r#""no_result_reason":{"kind":"not_run"},"no_result_reason":null"#,
+            ),
+            (
+                r#""no_result_reason":null"#,
+                r#""no_result_reason":null,"no_result_reason":null"#,
+            ),
+        ] {
+            assert_eq!(raw.matches(needle).count(), 1);
+            let duplicated = raw.replacen(needle, replacement, 1);
+            assert!(
+                current_verification_report(duplicated.as_bytes())
+                    .unwrap_err()
+                    .contains("duplicate field")
+            );
+        }
+    }
 
     #[test]
     fn failure_class_schema_matches_serialized_enum() {
@@ -5386,6 +5515,34 @@ mod tests {
     }
 
     #[test]
+    fn junit_names_absent_failure_reasons_instead_of_guessing() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-junit-absent-reason-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut failed = cell_result_that_located_nothing();
+        failed.outcome = "FAIL".into();
+        failed.reason = None;
+        let mut errored = cell_result_that_located_nothing();
+        errored.outcome = "ERROR".into();
+        errored.reason = None;
+        let junit = root.join("junit.xml");
+        write_junit(&junit, &[failed, errored]).unwrap();
+        let xml = fs::read_to_string(&junit).unwrap();
+        assert!(
+            xml.contains("<failure>no specific failure reason was recorded</failure>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<error>no specific error reason was recorded</error>"),
+            "{xml}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn retry_preserves_a_divergence_when_the_later_row_passes() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-durable-row-bracket-{}",
@@ -5642,7 +5799,7 @@ backends_disabled:
     }
 
     #[test]
-    fn workdir_accepts_ptrace_and_rejects_dbt_or_mixed_modes() {
+    fn workdir_accepts_every_hermit_run_backend() {
         let ptrace = vec!["ptrace".into()];
         assert_eq!(
             validate_mode_workdir("fixture/test", "verify", Some("/tmp"), &ptrace),
@@ -5652,11 +5809,8 @@ backends_disabled:
         for mode in ["verify", "chaos", "custom"] {
             for backends in [vec!["dbt".into()], vec!["ptrace".into(), "dbt".into()]] {
                 assert_eq!(
-                    validate_mode_workdir("fixture/test", mode, Some("/tmp"), &backends)
-                        .unwrap_err(),
-                    format!(
-                        "fixture/test: {mode} workdir is unsupported when DBT is enabled because DBT does not enter the Hermit mount namespace"
-                    )
+                    validate_mode_workdir("fixture/test", mode, Some("/tmp"), &backends),
+                    Ok(())
                 );
             }
         }
@@ -5913,6 +6067,50 @@ backends_disabled:
         assert_eq!(argv[2], root.join("README.md").to_string_lossy());
         assert_eq!(argv[3], ".");
         assert_eq!(argv[4], "missing/path");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ordinary_dbt_arguments_remain_literal_until_isolation_is_requested() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-dbt-literal-args-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.as_path().join("literal.txt"), b"fixture").unwrap();
+        let mut cell = ptrace_cell("verify");
+        cell.id.backend = Some("dbt".into());
+        cell.test.program = None;
+        let original = vec![
+            "/bin/echo".to_owned(),
+            "literal.txt".to_owned(),
+            "./literal.txt".to_owned(),
+            ".".to_owned(),
+            "missing/path".to_owned(),
+        ];
+        cell.test.direct = Some(DirectCommand::Argv(original.clone()));
+        let mut context = run_context(root.as_path());
+        let dir = root.as_path().join("results/cell");
+        assert_eq!(prepare_test(&context, &cell, &dir).unwrap(), original);
+
+        context.isolated_workdir = Some(PathBuf::from("/test"));
+        let isolated = prepare_test(&context, &cell, &dir).unwrap();
+        assert_eq!(
+            isolated,
+            vec![
+                original[0].clone(),
+                root.as_path()
+                    .join("literal.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+                root.as_path()
+                    .join("./literal.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+                original[3].clone(),
+                original[4].clone(),
+            ]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6646,16 +6844,31 @@ backends_disabled:
         timeout.result = Some(ObservedResult::Timeout);
         timeout.failure_class = Some(FailureClass::NoResult);
         timeout.require_current_classification().unwrap();
+
+        let mut sandbox_denied = cell_result_that_located_nothing();
+        sandbox_denied.outcome = "ERROR".into();
+        sandbox_denied.result = Some(ObservedResult::SandboxDenied);
+        sandbox_denied.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+        sandbox_denied
+            .require_current_classification()
+            .expect("typed sandbox denial is a current non-product result");
     }
 
     #[test]
     fn framework_classifies_divergence_and_crash_before_pressure_reads_them() {
         let mut divergence = attempt_with_sabre_evidence("");
         divergence.outcome = "FAIL".into();
-        divergence.verification_report = Some(
-            r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1"},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right"}"#
-                .into(),
-        );
+        let mut report = canonical_verification_report();
+        report.verified = false;
+        report.bitwise_parity = false;
+        report.verdict = Verdict::Diverged;
+        report.first_divergent_scheduler_turn = Some(4);
+        report.first_divergent_virtual_nanoseconds = Some(7);
+        report.first_divergent_record = Some(9);
+        report.first_divergent_syscall = Some(2);
+        report.first_divergent_left_message = Some("left".into());
+        report.first_divergent_right_message = Some("right".into());
+        divergence.verification_report = Some(serde_json::to_string(&report).unwrap());
         let divergence_result = observed_result(
             "verify",
             &divergence.outcome,
@@ -6726,6 +6939,172 @@ backends_disabled:
                 invalid_evidence.error_kind.as_deref()
             ),
             Some(FailureClass::NoResult)
+        );
+    }
+
+    #[test]
+    fn framework_keeps_typed_product_results_with_incidental_environment_text() {
+        let report = r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1","display_name":"BitwiseInfoV1","compare_io_buffers":true,"log_scope":"info","virtualize_time":true,"strip_lines":false,"canonicalize_addresses":true,"full_trace":true,"exact_remainder":true,"stripped_prefixes":["real-wall-clock-prefix/v1"],"canonicalizations":["host-address-to-first-appearance-ordinal/v1"],"ignore_lines":false,"skip_commit":false,"skip_detlog":false},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right","no_result_reason":null,"infrastructure_error":null,"guest_exit_code":null,"guest_signal":null}"#;
+        current_verification_report(report.as_bytes())
+            .expect("the product-precedence fixture must be a current report")
+            .require_canonical_comparison()
+            .expect("the product-precedence fixture must retain canonical evidence");
+        for banner in [
+            "An action was blocked on this server based on a security policy!",
+            "fatal: Could not resolve proxy",
+        ] {
+            for (mode, expected) in [
+                ("verify", ObservedResult::DeterminismFailure),
+                ("replay", ObservedResult::ReplayFailure),
+            ] {
+                for earlier in [false, true] {
+                    let mut divergence = attempt_with_sabre_evidence("");
+                    divergence.outcome = "FAIL".into();
+                    divergence.status = Some(1);
+                    divergence.verification_report = Some(report.into());
+                    let mut diagnostic = divergence.clone();
+                    diagnostic.verification_report = None;
+                    diagnostic.stderr = banner.into();
+                    let attempts = if earlier {
+                        vec![diagnostic, divergence]
+                    } else {
+                        divergence.stderr = banner.into();
+                        vec![divergence]
+                    };
+                    let bytes = serde_json::to_vec(&attempts).unwrap();
+                    let result = observed_result(mode, "FAIL", &attempts, None);
+                    assert_eq!(
+                        result,
+                        Some(expected),
+                        "{mode}, earlier={earlier}, {banner}"
+                    );
+                    assert_eq!(
+                        failure_class("FAIL", result, None),
+                        Some(FailureClass::ProductFailure)
+                    );
+                    assert_eq!(serde_json::to_vec(&attempts).unwrap(), bytes);
+                }
+                let mut passed = attempt_with_sabre_evidence("");
+                passed.stderr = banner.into();
+                assert_eq!(
+                    observed_result(mode, "PASS", &[passed], None),
+                    Some(ObservedResult::Pass)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn framework_terminal_refusal_cannot_revive_incidental_divergence() {
+        let mut divergence = attempt_with_sabre_evidence("");
+        divergence.outcome = "FAIL".into();
+        divergence.status = Some(1);
+        divergence.verification_report = Some(
+            r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1","display_name":"BitwiseInfoV1","compare_io_buffers":true,"log_scope":"info","virtualize_time":true,"strip_lines":false,"canonicalize_addresses":true,"full_trace":true,"exact_remainder":true,"stripped_prefixes":["real-wall-clock-prefix/v1"],"canonicalizations":["host-address-to-first-appearance-ordinal/v1"],"ignore_lines":false,"skip_commit":false,"skip_detlog":false},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right","no_result_reason":null,"infrastructure_error":null,"guest_exit_code":null,"guest_signal":null}"#.into(),
+        );
+        current_verification_report(divergence.verification_report.as_ref().unwrap().as_bytes())
+            .expect("the terminal-refusal fixture must start with a valid current divergence")
+            .require_canonical_comparison()
+            .expect("the terminal-refusal fixture must retain canonical evidence");
+        for error in [
+            "infrastructure",
+            "result-publication",
+            "invalid-backend-evidence",
+            "incomplete-verification-evidence",
+        ] {
+            for (banner, expected) in [
+                (
+                    "An action was blocked on this server based on a security policy!",
+                    ObservedResult::SandboxDenied,
+                ),
+                (
+                    "fatal: Could not resolve proxy",
+                    ObservedResult::InfrastructureError,
+                ),
+            ] {
+                let mut terminal = attempt_with_sabre_evidence("");
+                terminal.outcome = "ERROR".into();
+                terminal.error_kind = Some(error.into());
+                terminal.stderr = banner.into();
+                let attempts = [divergence.clone(), terminal];
+                let bytes = serde_json::to_vec(&attempts).unwrap();
+                for mode in ["verify", "replay"] {
+                    let result = observed_result(mode, "ERROR", &attempts, Some(error));
+                    assert_eq!(result, Some(expected), "{mode}, {error}, {banner}");
+                    assert_eq!(
+                        failure_class("ERROR", result, Some(error)),
+                        Some(FailureClass::UnderstoodInfrastructureFailure)
+                    );
+                }
+                assert_eq!(serde_json::to_vec(&attempts).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn framework_serializes_environmental_results_from_captured_output() {
+        let mut sandbox_denied = attempt_with_sabre_evidence("");
+        sandbox_denied.outcome = "ERROR".into();
+        sandbox_denied.error_kind = Some("incomplete-verification-evidence".into());
+        sandbox_denied.stderr =
+            "An action was blocked on this server based on a security policy!\n\
+             Enforcer: FS, Reason: FILE_OPEN\n"
+                .into();
+        let sandbox_result = observed_result(
+            "verify",
+            &sandbox_denied.outcome,
+            std::slice::from_ref(&sandbox_denied),
+            sandbox_denied.error_kind.as_deref(),
+        );
+        assert_eq!(sandbox_result, Some(ObservedResult::SandboxDenied));
+        assert_eq!(
+            failure_class(
+                &sandbox_denied.outcome,
+                sandbox_result,
+                sandbox_denied.error_kind.as_deref()
+            ),
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+
+        let mut proxy_denied = sandbox_denied.clone();
+        proxy_denied.stderr = "fatal: unable to access repository: Could not resolve proxy".into();
+        let infrastructure_result = observed_result(
+            "verify",
+            &proxy_denied.outcome,
+            std::slice::from_ref(&proxy_denied),
+            proxy_denied.error_kind.as_deref(),
+        );
+        assert_eq!(
+            infrastructure_result,
+            Some(ObservedResult::InfrastructureError)
+        );
+        assert_eq!(
+            failure_class(
+                &proxy_denied.outcome,
+                infrastructure_result,
+                proxy_denied.error_kind.as_deref()
+            ),
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+
+        let mut ordinary = sandbox_denied;
+        ordinary.outcome = "FAIL".into();
+        ordinary.error_kind = None;
+        ordinary.stderr = "ordinary guest assertion failed".into();
+        let ordinary_result = observed_result(
+            "verify",
+            &ordinary.outcome,
+            std::slice::from_ref(&ordinary),
+            ordinary.error_kind.as_deref(),
+        );
+        assert_eq!(ordinary_result, Some(ObservedResult::CrashError));
+        assert_eq!(
+            failure_class(
+                &ordinary.outcome,
+                ordinary_result,
+                ordinary.error_kind.as_deref()
+            ),
+            Some(FailureClass::ProductFailure)
         );
     }
 
@@ -6992,18 +7371,18 @@ backends_disabled:
     /// bracket exercises both directions through real subprocesses.
     #[test]
     fn an_unavailable_backend_is_not_reported_as_a_silent_one() {
-        let no_result = r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null}"#;
+        let no_result = serde_json::to_string(&VerificationReport::no_result()).unwrap();
         let unavailable = attempt_from_script(
             "sabre",
             "printf %s \"$1\" > \"$2\"; \
              printf '%s\\n' 'HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=sabre' \
              'Error: backend \x60sabre\x60 is unavailable: HERMIT_SABRE_BINARY=/nonexistent/sabre is not an executable file' >&2; exit 1",
-            Some(no_result),
+            Some(&no_result),
         );
         let silent = attempt_from_script(
             "sabre",
             "printf %s \"$1\" > \"$2\"; exit 0",
-            Some(no_result),
+            Some(&no_result),
         );
 
         assert_eq!(unavailable.outcome, "ERROR");
@@ -7068,20 +7447,20 @@ backends_disabled:
 
     #[test]
     fn backend_unavailable_requires_the_requested_backend_and_empty_stdout() {
-        let no_result = r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null}"#;
+        let no_result = serde_json::to_string(&VerificationReport::no_result()).unwrap();
         let wrong_backend = attempt_from_script(
             "sabre",
             "printf %s \"$1\" > \"$2\"; \
              printf '%s\\n' 'HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=dbt' \
              'Error: backend \x60dbt\x60 is unavailable: no SDK' >&2; exit 7",
-            Some(no_result),
+            Some(&no_result),
         );
         let guest_output = attempt_from_script(
             "sabre",
             "printf %s \"$1\" > \"$2\"; printf 'guest-started\\n'; \
              printf '%s\\n' 'HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=sabre' \
              'Error: backend \x60sabre\x60 is unavailable: spoofed' >&2; exit 8",
-            Some(no_result),
+            Some(&no_result),
         );
 
         for result in [wrong_backend, guest_output] {
@@ -7115,10 +7494,13 @@ backends_disabled:
             );
         }
 
+        let mut unspecified = VerificationReport::no_result();
+        unspecified.no_result_reason = None;
+        let unspecified = serde_json::to_string(&unspecified).unwrap();
         let ordinary_failure = attempt_from_script(
             "sabre",
             "printf %s \"$1\" > \"$2\"; printf 'guest-started\\n'; exit 8",
-            Some(no_result),
+            Some(&unspecified),
         );
         assert_eq!(ordinary_failure.outcome, "FAIL");
         let observed = observed_result(
@@ -7165,20 +7547,20 @@ backends_disabled:
 
     #[test]
     fn launch_refusal_requires_the_producer_class_line() {
-        let no_result = r#"{"verified":false,"bitwise_parity":false,"verdict":"no_result","comparison":null,"compared_log_messages":null}"#;
+        let no_result = serde_json::to_string(&VerificationReport::no_result()).unwrap();
         let typed = attempt_from_script(
             "ptrace",
             "printf %s \"$1\" > \"$2\"; printf '%s\\n' \
              'HERMIT_INTERNAL_FAILURE class=guest-program-not-found' \
              'Error: Program /missing does not exist' >&2; exit 127",
-            Some(no_result),
+            Some(&no_result),
         );
         let prose_only = attempt_from_script(
             "ptrace",
             "printf %s \"$1\" > \"$2\"; printf '%s\\n' \
              'HERMIT_INTERNAL_FAILURE class=cli-error' \
              'Error: Program /missing does not exist' >&2; exit 127",
-            Some(no_result),
+            Some(&no_result),
         );
 
         assert_eq!(typed.error_kind.as_deref(), Some("guest-launch-refused"));
@@ -7202,6 +7584,33 @@ backends_disabled:
             Some(FailureClass::NoResult),
             "English launch prose without the producer class must remain no-result"
         );
+    }
+    #[test]
+    fn cli_error_preserves_the_producer_cause_without_inventing_one() {
+        let vector_13 = attempt_from_script(
+            "kvm",
+            "printf '%s\\n' \
+             'HERMIT_INTERNAL_FAILURE class=cli-error' \
+             'Error: KVM guest execution failed: guest exception vector 13' >&2; exit 1",
+            None,
+        );
+        assert_eq!(vector_13.outcome, "ERROR");
+        assert_eq!(
+            vector_13.error_kind.as_deref(),
+            Some("incomplete-verification-evidence")
+        );
+        assert_eq!(
+            vector_13.reason.as_deref(),
+            Some("KVM guest execution failed: guest exception vector 13")
+        );
+
+        let no_detail = attempt_from_script(
+            "kvm",
+            "printf '%s\\n' 'HERMIT_INTERNAL_FAILURE class=cli-error' >&2; exit 1",
+            None,
+        );
+        assert_eq!(no_detail.outcome, "ERROR");
+        assert_eq!(no_detail.reason, None, "absence must remain honest absence");
     }
 
     #[test]
@@ -7734,7 +8143,7 @@ backends_disabled:
     fn fixed_workdir_is_bound_by_default_and_withheld_where_it_would_lie() {
         let source = Path::new("/cells/x/workdir/attempt-7");
         let mut argv: Vec<String> = Vec::new();
-        append_execution_root_args(&mut argv, None, None, Some(source));
+        append_execution_root_args(&mut argv, "ptrace", None, None, Some(source));
         assert_eq!(
             argv,
             vec![
@@ -7746,11 +8155,11 @@ backends_disabled:
         );
 
         let mut argv: Vec<String> = Vec::new();
-        append_execution_root_args(&mut argv, None, Some("/tmp"), Some(source));
+        append_execution_root_args(&mut argv, "ptrace", None, Some("/tmp"), Some(source));
         assert_eq!(argv, vec!["--workdir".to_string(), "/tmp".to_string()]);
 
         let mut argv: Vec<String> = Vec::new();
-        append_execution_root_args(&mut argv, None, None, None);
+        append_execution_root_args(&mut argv, "ptrace", None, None, None);
         assert!(
             argv.is_empty(),
             "a cell that cannot honour a workdir must be given none, got {argv:?}"
@@ -7762,6 +8171,7 @@ backends_disabled:
         let mut argv: Vec<String> = Vec::new();
         append_execution_root_args(
             &mut argv,
+            "ptrace",
             Some(Path::new(HERMETIC_TEST_WORKDIR)),
             Some("/tmp"),
             Some(Path::new("/cells/x/workdir/attempt-7")),
@@ -7779,15 +8189,29 @@ backends_disabled:
             !argv.iter().any(|arg| arg.starts_with("--bind")),
             "the ordinary-host bind leaked into the /test path: {argv:?}"
         );
+
+        let mut dbt_argv = Vec::new();
+        append_execution_root_args(
+            &mut dbt_argv,
+            "dbt",
+            Some(Path::new(HERMETIC_TEST_WORKDIR)),
+            None,
+            None,
+        );
+        assert_eq!(
+            dbt_argv,
+            vec!["--workdir".to_string(), HERMETIC_TEST_WORKDIR.to_string()],
+            "DBT's marked physical adapter supplies /test without accepting the generic mount option"
+        );
     }
 
     #[test]
     fn test_workdir_support_matches_the_modes_that_can_honour_it() {
         for mode in ["verify", "replay", "chaos", "custom"] {
             assert!(supports_test_workdir(mode, "ptrace"), "mode={mode}");
+            assert!(supports_test_workdir(mode, "dbt"), "mode={mode}");
         }
         assert!(!supports_test_workdir("naked", "native"));
-        assert!(!supports_test_workdir("verify", "dbt"));
     }
 
     #[test]

@@ -116,6 +116,17 @@ fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("per-cell result has no nonempty {key}"))
 }
+fn preserved_reason<'a>(row: &'a Value, attempt: Option<&'a Value>) -> Option<&'a str> {
+    attempt
+        .and_then(|value| value.get("reason"))
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.trim().is_empty())
+        .or_else(|| {
+            row.get("reason")
+                .and_then(Value::as_str)
+                .filter(|reason| !reason.trim().is_empty())
+        })
+}
 
 fn identity(value: &Value) -> Result<CellIdentity, String> {
     Ok(CellIdentity {
@@ -155,12 +166,13 @@ fn require_current_timeout_policy(row: &Value) -> Result<(), String> {
 
 fn canonical_report(
     value: Value,
+    bytes: &[u8],
     expected_virtualize_time: bool,
 ) -> Result<Option<(VerificationReport, ComparisonSpec, ComparedLogCounts)>, String> {
     // `VerificationReport` owns the complete current top-level report. The
     // ledger types additionally deny unknown comparison/count fields, which
     // preserves schema 7's exact shape without a second hard-coded key list.
-    let report = VerificationReport::from_current_json_value(value.clone())?;
+    let report = VerificationReport::from_current_json_slice(bytes)?;
     if report.verdict == VerificationVerdict::InfrastructureError {
         return Err(match report.infrastructure_error.as_ref() {
             Some(InfrastructureError::SkidOvershoot { count }) => format!(
@@ -218,17 +230,22 @@ fn cell_verdict(row: &Value) -> Result<CellVerdict, String> {
     let Some(attempts) = row.get("attempts").and_then(Value::as_array) else {
         return Ok(CellVerdict::UnavailableWithReason {
             comparison_tier: ComparisonTier::DeclaredButUnverifiable,
-            reason: "cell emitted no typed attempts".into(),
+            reason: preserved_reason(row, None)
+                .unwrap_or("cell emitted no typed attempts")
+                .into(),
         });
     };
     let mut reports = Vec::new();
     let mut unavailable_reason = None;
     for (index, attempt) in attempts.iter().enumerate() {
+        let preserved_reason = preserved_reason(row, Some(attempt)).map(str::to_owned);
         let Some(raw) = attempt.get("verification_report").and_then(Value::as_str) else {
-            unavailable_reason = Some(format!(
-                "attempt {} emitted no typed verification report",
-                index + 1
-            ));
+            unavailable_reason = Some(preserved_reason.clone().unwrap_or_else(|| {
+                format!(
+                    "attempt {} emitted no typed verification report",
+                    index + 1
+                )
+            }));
             continue;
         };
         let expected_sha = attempt
@@ -247,15 +264,21 @@ fn cell_verdict(row: &Value) -> Result<CellVerdict, String> {
                 index + 1
             )
         })?;
-        match canonical_report(value, expected_virtualize_time) {
+        match canonical_report(value, raw.as_bytes(), expected_virtualize_time) {
             Ok(Some(report)) => reports.push(report),
             Ok(None) => {
-                unavailable_reason = Some(format!(
-                    "attempt {} did not compare canonical nonzero INFO evidence",
-                    index + 1
-                ));
+                unavailable_reason = Some(preserved_reason.clone().unwrap_or_else(|| {
+                    format!(
+                        "attempt {} did not compare canonical nonzero INFO evidence",
+                        index + 1
+                    )
+                }));
             }
-            Err(error) => unavailable_reason = Some(format!("attempt {} {error}", index + 1)),
+            Err(error) => {
+                unavailable_reason = Some(
+                    preserved_reason.unwrap_or_else(|| format!("attempt {} {error}", index + 1)),
+                )
+            }
         }
     }
     let classify = |(report, _, _): &(VerificationReport, ComparisonSpec, ComparedLogCounts)| {
@@ -281,8 +304,11 @@ fn cell_verdict(row: &Value) -> Result<CellVerdict, String> {
     if reports.is_empty() || unavailable_reason.is_some() {
         return Ok(CellVerdict::UnavailableWithReason {
             comparison_tier: ComparisonTier::DeclaredButUnverifiable,
-            reason: unavailable_reason
-                .unwrap_or_else(|| "cell emitted no typed verification report".into()),
+            reason: unavailable_reason.unwrap_or_else(|| {
+                preserved_reason(row, None)
+                    .unwrap_or("cell emitted no typed verification report")
+                    .into()
+            }),
         });
     }
     if reports.iter().any(|report| !classify(report).0) {
@@ -777,6 +803,7 @@ mod tests {
             "verified": matched,
             "verdict": verdict,
             "bitwise_parity": matched,
+            "no_result_reason": null,
             "infrastructure_error": null,
             "comparison": {
                 "strictness": "canonical",
@@ -844,6 +871,41 @@ mod tests {
             "execution_wall_timeout_seconds": 57,
             "attempts": [attempt(&matched)]
         })
+    }
+
+    #[test]
+    fn duplicate_report_fields_cannot_become_compared_cell_evidence() {
+        let row = result_row("fixture", "1515151515151515151515151515151515151515");
+        assert!(matches!(
+            cell_verdict(&row).unwrap(),
+            CellVerdict::ComparedAndMatched { .. }
+        ));
+        let raw = row["attempts"][0]["verification_report"].as_str().unwrap();
+        for (needle, replacement) in [
+            (r#""verified":true"#, r#""verified":false,"verified":true"#),
+            (r#""verified":true"#, r#""verified":true,"verified":true"#),
+            (
+                r#""no_result_reason":null"#,
+                r#""no_result_reason":{"kind":"not_run"},"no_result_reason":null"#,
+            ),
+            (
+                r#""no_result_reason":null"#,
+                r#""no_result_reason":null,"no_result_reason":null"#,
+            ),
+            (r#""left":123"#, r#""left":0,"left":123"#),
+            (r#""left":123"#, r#""left":123,"left":123"#),
+        ] {
+            assert_eq!(raw.matches(needle).count(), 1);
+            let duplicated = raw.replacen(needle, replacement, 1);
+            let mut bad = row.clone();
+            bad["attempts"][0] = attempt(&duplicated);
+            match cell_verdict(&bad).unwrap() {
+                CellVerdict::UnavailableWithReason { reason, .. } => {
+                    assert!(reason.contains("duplicate field"), "{reason}");
+                }
+                other => panic!("duplicate report produced compared evidence: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1323,6 +1385,38 @@ mod tests {
         row["reason"] = Value::String("SaBRe interception path was incomplete".into());
         let verdict = cell_verdict(&row).unwrap();
         assert!(matches!(verdict, CellVerdict::UnavailableWithReason { .. }));
+    }
+    #[test]
+    fn unavailable_cell_prefers_exact_attempt_then_row_reason() {
+        let mut row = result_row("exact-reason", "3434343434343434343434343434343434343434");
+        row["outcome"] = Value::String("ERROR".into());
+        row["reason"] = Value::String("row fallback".into());
+        row["attempts"] = serde_json::json!([{
+            "reason": "KVM guest execution failed: guest exception vector 13"
+        }]);
+
+        let exact = match cell_verdict(&row).unwrap() {
+            CellVerdict::UnavailableWithReason { reason, .. } => reason,
+            other => panic!("untyped attempt became {other:?}"),
+        };
+        assert_eq!(
+            exact,
+            "KVM guest execution failed: guest exception vector 13"
+        );
+
+        row["attempts"] = serde_json::json!([{}]);
+        let fallback = match cell_verdict(&row).unwrap() {
+            CellVerdict::UnavailableWithReason { reason, .. } => reason,
+            other => panic!("untyped attempt became {other:?}"),
+        };
+        assert_eq!(fallback, "row fallback");
+
+        row["reason"] = Value::Null;
+        let absent = match cell_verdict(&row).unwrap() {
+            CellVerdict::UnavailableWithReason { reason, .. } => reason,
+            other => panic!("untyped attempt became {other:?}"),
+        };
+        assert_eq!(absent, "attempt 1 emitted no typed verification report");
     }
 
     #[test]

@@ -189,17 +189,202 @@ const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str = "./ci/nextest-binaries.rs assert
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1"#;
 
 
+fn integration_artifact_producer(command: &str) -> &'static str {
+    if command.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
+        "build.e2e_artifact_in_pinned_root"
+    } else {
+        "build.e2e_artifact"
+    }
+}
+
 fn hermit_integration_uses_published_artifact(step: &Step) -> bool {
-    step
-        .cmd
+    let Ok(source) = guarded_command_source(&step.tag(), &step.cmd) else {
+        return false;
+    };
+    source
         .strip_prefix(RUST_SCRIPT_COMMAND_PREFIX)
         .is_some_and(|command| command.starts_with(INTEGRATION_ARTIFACT_WRAPPER))
         && step
             .deps
             .iter()
-            .any(|dependency| dependency == "build.e2e_artifact")
+            .any(|dependency| dependency == integration_artifact_producer(&step.cmd))
 }
 
+// Only the self-test mutations use this reconstruction. Decode the same exact
+// guard first, then replace the payload while preserving every outer argument.
+fn bracket_command_with_payload(step: &Step, payload: &str) -> Result<String, String> {
+    guarded_command_source(&step.tag(), &step.cmd)?;
+    if !step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
+        return Ok(payload.to_owned());
+    }
+    let mut argv = shell_words::split(&step.cmd).map_err(|error| error.to_string())?;
+    let boundary = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .expect("decoded boundary");
+    argv[boundary + 5] = payload.to_owned();
+    Ok(format!(
+        "{} {}",
+        argv[0],
+        argv[1..]
+            .iter()
+            .map(|arg| validate_plan::shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ))
+}
+
+fn integration_artifact_bracket(integration: &Step) -> Result<(), String> {
+    if !hermit_integration_uses_published_artifact(integration) {
+        return Err(format!(
+            "full-plan bracket: Hermit integration tests can consume a mutable Hermit binary: cmd={} deps={:?}",
+            integration.cmd, integration.deps
+        ));
+    }
+    let source = guarded_command_source(&integration.tag(), &integration.cmd)?;
+    let after_rust_script_prefix = source
+        .strip_prefix(RUST_SCRIPT_COMMAND_PREFIX)
+        .ok_or("full-plan bracket: integration node lost its rust-script prefix")?;
+    let without_wrapper = after_rust_script_prefix
+        .strip_prefix(INTEGRATION_ARTIFACT_WRAPPER)
+        .ok_or("full-plan bracket: cannot plant missing integration artifact wrapper")?;
+    let mut missing_wrapper = integration.clone();
+    missing_wrapper.cmd = bracket_command_with_payload(
+        integration,
+        &format!("{RUST_SCRIPT_COMMAND_PREFIX}{without_wrapper}"),
+    )?;
+    if hermit_integration_uses_published_artifact(&missing_wrapper) {
+        return Err(
+            "full-plan bracket: removing the integration artifact wrapper was accepted".into(),
+        );
+    }
+    let producer = integration_artifact_producer(&integration.cmd);
+    let mut missing_dependency = integration.clone();
+    missing_dependency
+        .deps
+        .retain(|dependency| dependency != producer);
+    if hermit_integration_uses_published_artifact(&missing_dependency) {
+        return Err(
+            "full-plan bracket: removing the integration artifact dependency was accepted".into(),
+        );
+    }
+    let other_producer = if producer == "build.e2e_artifact" {
+        "build.e2e_artifact_in_pinned_root"
+    } else {
+        "build.e2e_artifact"
+    };
+    missing_dependency.deps.push(other_producer.into());
+    if hermit_integration_uses_published_artifact(&missing_dependency) {
+        return Err(
+            "full-plan bracket: the other execution root's artifact producer was accepted".into(),
+        );
+    }
+    if integration
+        .cmd
+        .starts_with("./ci/hermetic/run-in-pinned-root.sh ")
+    {
+        let mut argv =
+            shell_words::split(&missing_wrapper.cmd).map_err(|error| error.to_string())?;
+        let out = argv
+            .iter()
+            .position(|arg| arg == "--out")
+            .ok_or("full-plan bracket: no outer output fixture")?;
+        argv[out + 1] = format!("/tmp/artifact-decoy {source}");
+        missing_wrapper.cmd = format!(
+            "{} {}",
+            argv[0],
+            argv[1..]
+                .iter()
+                .map(|arg| validate_plan::shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        if hermit_integration_uses_published_artifact(&missing_wrapper) {
+            return Err("full-plan bracket: outer artifact-wrapper decoy was accepted".into());
+        }
+        let mut malformed = integration.clone();
+        malformed.cmd = malformed
+            .cmd
+            .replacen("hermit_payload=$1", "hermit_payload=ignored", 1);
+        if hermit_integration_uses_published_artifact(&malformed) {
+            return Err("full-plan bracket: malformed pinned-root guard was accepted".into());
+        }
+    }
+    Ok(())
+}
+
+// Test-consumer checks inspect the exact authored payload. The container's
+// --cargo-home path ends in "cargo "; it is not a Cargo invocation in that payload.
+fn prepared_nextest_commands_bracket(workspace: &Step, privileged: &Step) -> Result<(), String> {
+    let workspace_command = guarded_command_source(&workspace.tag(), &workspace.cmd)?;
+    let privileged_command = guarded_command_source(&privileged.tag(), &privileged.cmd)?;
+    if !privileged_command
+        .contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
+        || !privileged_command.contains(NEXTEST_PRIVILEGED_ASSERT_COMMAND)
+        || !privileged_command.contains(TESTS_MISC_EXECUTABLE_READ_COMMAND)
+        || privileged_command.contains("cargo ")
+        || !workspace_command.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND)
+    {
+        return Err("full-plan bracket: prepared Nextest population must come from the workspace producer and the privileged barrier must verify it without Cargo compilation".into());
+    }
+    Ok(())
+}
+
+fn prebuilt_cpuid_command_bracket(cpuid: &Step) -> Result<(), String> {
+    let command = guarded_command_source(&cpuid.tag(), &cpuid.cmd)?;
+    if command.contains("cargo ") || !command.contains("rdrand_rdseed_is_masked") {
+        return Err(
+            "full-plan bracket: CPUID test does not directly execute the prebuilt binary".into(),
+        );
+    }
+    Ok(())
+}
+
+fn privileged_artifact_barriers(build: &Step) -> Result<(), String> {
+    for required in [
+        "build.e2e_artifact_in_pinned_root",
+        "build.liteinst_runtime_release_in_pinned_root",
+    ] {
+        if !build.deps.iter().any(|dependency| dependency == required) {
+            return Err(format!(
+                "full-plan bracket: privileged build can start before required build barrier {required}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod artifact_plan_tests {
+    use super::*;
+
+    #[test]
+    fn actual_host_and_pinned_consumers_require_their_artifact_and_resource_producers() {
+        let cfg = validate_plan::validation_config(&repo_root()).unwrap();
+        for tag in ["test.hermit_integration", "test.hermit_integration_on_host"] {
+            let step = cfg.steps.iter().find(|step| step.tag() == tag).unwrap();
+            integration_artifact_bracket(step).unwrap();
+        }
+        let build = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "privileged-build.privileged_tests")
+            .unwrap();
+        privileged_artifact_barriers(build).unwrap();
+        for required in [
+            "build.e2e_artifact_in_pinned_root",
+            "build.liteinst_runtime_release_in_pinned_root",
+        ] {
+            let mut missing = build.clone();
+            missing.deps.retain(|dependency| dependency != required);
+            missing
+                .deps
+                .push(required.strip_suffix("_in_pinned_root").unwrap().into());
+            let error = privileged_artifact_barriers(&missing).unwrap_err();
+            assert!(error.contains(required), "{error}");
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ValidationStepIdentity {
@@ -2925,37 +3110,7 @@ cleared-caps refusal names {} starved step(s)",
             .iter()
             .find(|s| s.tag() == "test.hermit_integration")
             .ok_or("full-plan bracket: Hermit integration node disappeared")?;
-        if !hermit_integration_uses_published_artifact(integration) {
-            return Err(format!(
-                "full-plan bracket: Hermit integration tests can consume a mutable Hermit binary: cmd={} deps={:?}",
-                integration.cmd, integration.deps
-            ));
-        }
-        let mut missing_wrapper = integration.clone();
-        let after_rust_script_prefix = missing_wrapper
-            .cmd
-            .strip_prefix(RUST_SCRIPT_COMMAND_PREFIX)
-            .ok_or("full-plan bracket: integration node lost its rust-script prefix")?;
-        let without_wrapper = after_rust_script_prefix
-            .strip_prefix(INTEGRATION_ARTIFACT_WRAPPER)
-            .ok_or("full-plan bracket: cannot plant missing integration artifact wrapper")?;
-        missing_wrapper.cmd = format!("{RUST_SCRIPT_COMMAND_PREFIX}{without_wrapper}");
-        if hermit_integration_uses_published_artifact(&missing_wrapper) {
-            return Err(
-                "full-plan bracket: removing the integration artifact wrapper was accepted"
-                    .into(),
-            );
-        }
-        let mut missing_dependency = integration.clone();
-        missing_dependency
-            .deps
-            .retain(|dependency| dependency != "build.e2e_artifact");
-        if hermit_integration_uses_published_artifact(&missing_dependency) {
-            return Err(
-                "full-plan bracket: removing the integration artifact dependency was accepted"
-                    .into(),
-            );
-        }
+        integration_artifact_bracket(integration)?;
         let manifest_consumers: Vec<_> = full
             .cfg
             .steps
@@ -3071,21 +3226,8 @@ cleared-caps refusal names {} starved step(s)",
             .iter()
             .find(|s| s.tag() == "privileged-build.privileged_tests")
             .ok_or("full-plan bracket: privileged focused build disappeared")?;
-        for required in ["build.e2e_artifact", "build.liteinst_runtime_release"] {
-            if !privileged_build.deps.iter().any(|dependency| dependency == required) {
-                return Err(format!(
-                    "full-plan bracket: privileged build can start before required build barrier {required}"
-                ));
-            }
-        }
-        if !privileged_build.cmd.contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
-            || !privileged_build.cmd.contains(NEXTEST_PRIVILEGED_ASSERT_COMMAND)
-            || !privileged_build.cmd.contains(TESTS_MISC_EXECUTABLE_READ_COMMAND)
-            || privileged_build.cmd.contains("cargo ")
-            || !portable_build.cmd.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND)
-        {
-            return Err("full-plan bracket: prepared Nextest population must come from the workspace producer and the privileged barrier must verify it without Cargo compilation".into());
-        }
+        privileged_artifact_barriers(privileged_build)?;
+        prepared_nextest_commands_bracket(portable_build, privileged_build)?;
         let prepared = hermit_manifest_plan::nextest_binaries::profile_selections(&root, "portable")?;
         for required in hermit_manifest_plan::nextest_binaries::profile_selections(&root, "privileged")?.keys() {
             if !prepared.contains_key(required) {
@@ -3148,12 +3290,7 @@ cleared-caps refusal names {} starved step(s)",
             .iter()
             .find(|s| s.tag() == "privileged-cpuid.faulting")
             .ok_or("full-plan bracket: privileged CPUID node disappeared")?;
-        if cpuid.cmd.contains("cargo ") || !cpuid.cmd.contains("rdrand_rdseed_is_masked") {
-            return Err(
-                "full-plan bracket: CPUID test does not directly execute the prebuilt binary"
-                    .into(),
-            );
-        }
+        prebuilt_cpuid_command_bracket(cpuid)?;
         if !cpuid
             .deps
             .iter()
@@ -4034,17 +4171,40 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .map(Step::tag)
         .collect::<BTreeSet<_>>();
+    // The pinned-root command consumes its prepared script producer and locked
+    // input fetch even off record. Ordinary artifact/manifest builds remain
+    // outside this focused selection; name the exact required set explicitly.
     let expected_off_record = [
         "pre.submodules".to_string(),
         PIN_GATE_TAG.to_string(),
         "test.detcore_unit".to_string(),
+        "build.rust_scripts_in_pinned_root".to_string(),
+        "setup.pinned_root_fetch".to_string(),
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
-    if off_record_tags != expected_off_record {
-        return Err(format!(
-            "only bracket: off-record selection did not retain exactly requested ID plus minimal preflight: expected={expected_off_record:?} actual={off_record_tags:?}"
-        ));
+    let check_off_record_tags = |tags: &BTreeSet<String>| -> Result<(), String> {
+        if tags != &expected_off_record {
+            return Err(format!(
+                "only bracket: off-record selection did not retain exactly requested ID plus minimal preflight and required pinned-root producers: expected={expected_off_record:?} actual={tags:?}"
+            ));
+        }
+        Ok(())
+    };
+    check_off_record_tags(&off_record_tags)?;
+    for required in ["build.rust_scripts_in_pinned_root", "setup.pinned_root_fetch"] {
+        let mut missing = off_record_tags.clone();
+        if !missing.remove(required) || check_off_record_tags(&missing).is_ok() {
+            return Err(format!(
+                "only bracket: missing required producer {required} was not refused"
+            ));
+        }
+    }
+    let mut unrelated = off_record_tags.clone();
+    if !unrelated.insert("setup.manifest_plan".into())
+        || check_off_record_tags(&unrelated).is_ok()
+    {
+        return Err("only bracket: unrelated manifest producer was not refused".into());
     }
 
     let unknown_args = parse_argv(&[
@@ -4259,6 +4419,16 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
+mod focused_only_tests {
+    use super::*;
+
+    #[test]
+    fn actual_focused_selection_keeps_exact_producers_and_all_refusals() {
+        only_plan_bracket(&repo_root()).unwrap();
+    }
+}
+
 fn super_plan_bracket() -> Result<(), String> {
     let root = repo_root();
     let tmp = std::env::temp_dir().join(format!("validate-super-plan-{}", std::process::id()));
@@ -4339,6 +4509,139 @@ fn super_plan_bracket() -> Result<(), String> {
     Ok(())
 }
 
+fn envelope_verbosity_bracket(tag: &str, command: &str) -> Result<(), String> {
+    // The same guarded shell decoder used by timeout accounting exposes the
+    // real payload. Outer wrapper quoting and arguments are not probe evidence.
+    let source = manifest_command_source(tag, command)?;
+    for fixture in [
+        "run_probe true '/bin/true'",
+        "run_probe echo '/bin/echo hermit-envelope'",
+        "run_probe date '/bin/date -u +%Y'",
+    ] {
+        if !source.contains(fixture) {
+            return Err(format!(
+                "verbosity: envelope lost stable identity fixture {fixture:?}"
+            ));
+        }
+    }
+    if !source.contains("printf '##TEST-START %s\\n' \"$id\" >&2")
+        || !source.contains("printf '##TEST-END %s PASS\\n' \"$id\" >&2")
+    {
+        return Err(
+            "verbosity: envelope START/END must use the same whitespace-free identity".into(),
+        );
+    }
+    if source.matches("\"$id\" >&2").count() != 2 || source.matches("</dev/null >&2").count() != 4 {
+        return Err(
+            "verbosity: envelope markers and Hermit diagnostics must share stderr ordering".into(),
+        );
+    }
+    for fixture in [
+        "trap publish_counts EXIT",
+        "EXECUTED=$((EXECUTED + 1))",
+        "RESULTS+=(\"envelope/$id\" pass 1)",
+        "RESULTS+=(\"envelope/$CURRENT_TEST\" fail 1)",
+        "./ci/write-structured-test-counts.sh \"$EXECUTED\" 0 \"${RESULTS[@]}\"",
+    ] {
+        if !source.contains(fixture) {
+            return Err(format!(
+                "verbosity: envelope lost structured count fixture {fixture:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod envelope_verbosity_tests {
+    use super::*;
+
+    #[test]
+    fn actual_envelope_payload_preserves_markers_and_refuses_outer_decoys() {
+        let root = Path::new(file!()).parent().unwrap().parent().unwrap();
+        let cfg = validate_plan::validation_config(root).unwrap();
+        let step = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.envelope_levels")
+            .unwrap();
+        let host = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.envelope_levels_on_host")
+            .unwrap();
+        let source = manifest_command_source(&step.tag(), &step.cmd).unwrap();
+        let host_source = manifest_command_source(&host.tag(), &host.cmd).unwrap();
+        // The portable source adds only its already-shipped execution root.
+        // Every other payload byte must equal the raw hosted counterpart.
+        let original_args =
+            "ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled'";
+        let isolated_args = "ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test'";
+        assert_eq!(host_source.matches(original_args).count(), 1);
+        assert_eq!(
+            source,
+            host_source.replacen(original_args, isolated_args, 1)
+        );
+        envelope_verbosity_bracket(&step.tag(), &step.cmd).unwrap();
+        envelope_verbosity_bracket(&host.tag(), &host.cmd).unwrap();
+
+        let argv = shell_words::split(&step.cmd).unwrap();
+        let boundary = argv.iter().position(|arg| arg == "--").unwrap();
+        let render = |args: &[String]| {
+            format!(
+                "{} {}",
+                args[0],
+                args[1..]
+                    .iter()
+                    .map(|arg| validate_plan::shell_quote(arg))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+        for (before, after, diagnostic) in [
+            (
+                "run_probe true '/bin/true'",
+                "run_probe true '/bin/false'",
+                "lost stable identity fixture",
+            ),
+            ("##TEST-START", "##TEST-REMOVED", "START/END"),
+            ("</dev/null >&2", "</dev/null", "share stderr ordering"),
+            (
+                "trap publish_counts EXIT",
+                "trap publish_counts RETURN",
+                "lost structured count fixture",
+            ),
+        ] {
+            assert!(argv[boundary + 5].contains(before));
+            let mut changed = argv.clone();
+            changed[boundary + 5] = changed[boundary + 5].replacen(before, after, 1);
+            // A complete, correct-looking decoy in the outer output-path value
+            // must not supply evidence missing from the decoded command.
+            let out = changed.iter().position(|arg| arg == "--out").unwrap();
+            changed[out + 1] = format!("/tmp/envelope-decoy {}", argv[boundary + 5]);
+            let error = envelope_verbosity_bracket(&step.tag(), &render(&changed)).unwrap_err();
+            assert!(error.contains(diagnostic), "{diagnostic}: {error}");
+        }
+        let mut guard = argv.clone();
+        guard[boundary + 3].push_str("; true");
+        let error = envelope_verbosity_bracket(&step.tag(), &render(&guard)).unwrap_err();
+        assert!(
+            error.contains("unrecognized pinned-root invocation"),
+            "{error}"
+        );
+        let mut extra = argv.clone();
+        extra.push("extra".into());
+        let error = envelope_verbosity_bracket(&step.tag(), &render(&extra)).unwrap_err();
+        assert!(
+            error.contains("unrecognized pinned-root invocation"),
+            "{error}"
+        );
+        let error =
+            envelope_verbosity_bracket(&step.tag(), &(step.cmd.clone() + " '")).unwrap_err();
+        assert!(error.contains("invalid wrapper quoting"), "{error}");
+    }
+}
+
 fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
     let level = |args: &[&str]| -> Result<i64, String> {
         parse_argv(&args.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
@@ -4367,44 +4670,7 @@ fn verbosity_cli_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|step| step.tag() == "test.envelope_levels")
         .ok_or("verbosity: full plan lost test.envelope_levels")?;
-    for fixture in [
-        "run_probe true '/bin/true'",
-        "run_probe echo '/bin/echo hermit-envelope'",
-        "run_probe date '/bin/date -u +%Y'",
-    ] {
-        if !envelope.cmd.contains(fixture) {
-            return Err(format!("verbosity: envelope lost stable identity fixture {fixture:?}"));
-        }
-    }
-    if !envelope
-        .cmd
-        .contains("printf '##TEST-START %s\\n' \"$id\" >&2")
-        || !envelope
-            .cmd
-            .contains("printf '##TEST-END %s PASS\\n' \"$id\" >&2")
-    {
-        return Err("verbosity: envelope START/END must use the same whitespace-free identity".into());
-    }
-    if envelope.cmd.matches("\"$id\" >&2").count() != 2
-        || envelope.cmd.matches("</dev/null >&2").count() != 4
-    {
-        return Err(
-            "verbosity: envelope markers and Hermit diagnostics must share stderr ordering".into(),
-        );
-    }
-    for fixture in [
-        "trap publish_counts EXIT",
-        "EXECUTED=$((EXECUTED + 1))",
-        "RESULTS+=(\"envelope/$id\" pass 1)",
-        "RESULTS+=(\"envelope/$CURRENT_TEST\" fail 1)",
-        "./ci/write-structured-test-counts.sh \"$EXECUTED\" 0 \"${RESULTS[@]}\"",
-    ] {
-        if !envelope.cmd.contains(fixture) {
-            return Err(format!(
-                "verbosity: envelope lost structured count fixture {fixture:?}"
-            ));
-        }
-    }
+    envelope_verbosity_bracket(&envelope.tag(), &envelope.cmd)?;
     let non_nextest_test_nodes = plan
         .cfg
         .steps
@@ -7421,9 +7687,21 @@ fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
         .collect()
 }
 
-const EXPECTED_SHARED_INTEGRATION_TESTS: [(&str, &str, &str); 2] = [
-    ("cli", "test.cli", "privileged-test.cli_kvm"),
-    ("hermit_modes", "test.hermit_modes", "privileged-test.pmu_buck_chaos_cases"),
+// These literal consumer sets include the dedicated DBT workdir node, which
+// uses the same prepared CLI binary and already carries the same resource token.
+const EXPECTED_SHARED_INTEGRATION_TESTS: [(&str, &[&str]); 2] = [
+    (
+        "cli",
+        &[
+            "privileged-test.cli_kvm",
+            "test.cli",
+            "test.isolated_dbt_workdir",
+        ],
+    ),
+    (
+        "hermit_modes",
+        &["privileged-test.pmu_buck_chaos_cases", "test.hermit_modes"],
+    ),
 ];
 const SHARED_INTEGRATION_TEST_BUILDER: &str = "privileged-build.privileged_tests";
 
@@ -7440,8 +7718,9 @@ fn assert_committed_shared_integration_test_consumers(steps: &[Step]) -> Result<
             && consumers.iter().any(|tag| !tag.starts_with("privileged-"))
     });
     if by_binary.len() != EXPECTED_SHARED_INTEGRATION_TESTS.len()
-        || EXPECTED_SHARED_INTEGRATION_TESTS.iter().any(|(binary, portable, privileged)| {
-            by_binary.get(binary) != Some(&vec![(*privileged).into(), (*portable).into()])
+        || EXPECTED_SHARED_INTEGRATION_TESTS.iter().any(|(binary, consumers)| {
+            let expected = consumers.iter().map(|tag| (*tag).to_string()).collect::<Vec<_>>();
+            by_binary.get(binary) != Some(&expected)
         })
     {
         return Err(format!(
@@ -7465,13 +7744,11 @@ fn assert_committed_shared_integration_test_serialization(
     if resource_count != EXPECTED_SHARED_INTEGRATION_TESTS.len() {
         return Err(format!("fused shared integration-test resource count changed: {resource_count}"));
     }
-    for (binary, portable, privileged) in EXPECTED_SHARED_INTEGRATION_TESTS {
+    for (binary, consumers) in EXPECTED_SHARED_INTEGRATION_TESTS {
         let resource = format!("integration_test_binaries.{binary}");
-        let expected = vec![
-            (SHARED_INTEGRATION_TEST_BUILDER.to_string(), 1),
-            (privileged.to_string(), 1),
-            (portable.to_string(), 1),
-        ];
+        let mut expected = vec![(SHARED_INTEGRATION_TEST_BUILDER.to_string(), 1)];
+        expected.extend(consumers.iter().map(|tag| ((*tag).to_string(), 1)));
+        expected.sort();
         let mut actual: Vec<(String, i64)> = steps
             .iter()
             .filter_map(|step| step.hint.resources.get(&resource).map(|n| (step.tag(), *n)))
@@ -7532,7 +7809,11 @@ fn expand_strict_compat_alias(
     let compat = cfg
         .steps
         .iter()
-        .filter(|step| step.tag() == "compatprep.fixtures" || step.group == "compat")
+        .filter(|step| {
+            step.group == "compat"
+                || (step.group == "compatprep"
+                    && matches!(step.job.as_str(), "fixtures" | "fixtures_on_host"))
+        })
         .map(Step::tag)
         .collect::<Vec<_>>();
     if compat.is_empty() {
@@ -7589,6 +7870,25 @@ fn map_privileged_public_tags(tags: &mut BTreeSet<String>, label: &str) {
         }
         tags.insert(committed);
     }
+}
+
+/// Hosted shards retain the public selectors shared with local validation.
+/// Resolve only an exact counterpart present in the selected committed graph;
+/// unknown names must still reach select_steps_by_tags and refuse there.
+fn map_hosted_portable_tags(cfg: &DagConfig, tags: &mut BTreeSet<String>, label: &str) {
+    if label != "hosted-portable" {
+        return;
+    }
+    let available = cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    *tags = tags.iter().map(|tag| {
+        let hosted = format!("{tag}_on_host");
+        if !available.contains(tag) && available.contains(&hosted) {
+            println!("Selective validation: portable public node {tag} maps to committed node {hosted}");
+            hosted
+        } else {
+            tag.clone()
+        }
+    }).collect();
 }
 
 fn requalification_identity_field<'a>(
@@ -7715,6 +8015,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         let lane_cfg = dagrun::select_steps_by_labels(&committed, std::slice::from_ref(lane))?;
         let mut tags = requested_step_ids(nodes, "--only")?;
         map_privileged_public_tags(&mut tags, lane);
+        map_hosted_portable_tags(&lane_cfg, &mut tags, lane);
         expand_strict_compat_alias(&lane_cfg, &mut tags, lane)?;
         let preflight: &[&str] = match (lane.as_str(), args.allow_local_off_the_record_run) {
             ("hosted-privileged", true) => &["pre.reverie_pin_on_host"],
@@ -7901,6 +8202,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         if let Some(selected) = args.selected.as_deref() {
             let mut tags = requested_step_ids(selected, "--selected")?;
             map_privileged_public_tags(&mut tags, label);
+            map_hosted_portable_tags(&cfg, &mut tags, label);
             expand_strict_compat_alias(&cfg, &mut tags, label)?;
             cfg = dagrun::select_steps_by_tags(
                 &cfg,
@@ -11459,7 +11761,7 @@ fn require_resolved_outer_timeout_headroom(
 // Decode the known pinned-root shell transport before inspecting the actual
 // harness argv. A filename or an outer-wrapper argument named --prebuilt must
 // never remove the fixture-preparation window from timeout accounting.
-fn manifest_command_source(tag: &str, command: &str) -> Result<String, String> {
+fn guarded_command_source(tag: &str, command: &str) -> Result<String, String> {
     let mut source = command.to_owned();
     if command.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
         let argv = shell_words::split(command)
@@ -11470,12 +11772,17 @@ fn manifest_command_source(tag: &str, command: &str) -> Result<String, String> {
             .ok_or_else(|| format!("retry bounds: {tag} has no pinned-root command boundary"))?;
         let tail = &argv[boundary..];
         if tail.len() != 6 || tail[1] != "bash" || tail[2] != "-c" || tail[4] != "bash"
-            || tail[3] != "/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\""
+            || tail[3] != hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD
         {
             return Err(format!("retry bounds: {tag} has an unrecognized pinned-root invocation"));
         }
         source = tail[5].clone();
     }
+    Ok(source)
+}
+
+fn manifest_command_source(tag: &str, command: &str) -> Result<String, String> {
+    let source = guarded_command_source(tag, command)?;
     let source = source
         .strip_prefix(RUST_SCRIPT_COMMAND_PREFIX)
         .unwrap_or(&source);
@@ -21030,6 +21337,254 @@ fn stop_test_seam(
 mod committed_selection_preservation_tests {
     use super::*;
 
+    #[test]
+    fn hosted_shard_consumers_resolve_public_names_without_losing_coverage() {
+        let root = Path::new(file!()).parent().and_then(Path::parent).unwrap();
+        let (committed, _, _) = load_committed_validation_dag(root).unwrap();
+        let hosted = dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()]).unwrap();
+        let plan = serde_json::json!({
+            "profile": "hosted-portable", "selection_mode": "label",
+            "dags": [{"steps": hosted.steps.iter().map(|step| serde_json::json!({
+                "tag": step.tag(), "deps": step.deps,
+            })).collect::<Vec<_>>()}],
+        });
+        let shards: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("ci/portable-shards.json")).unwrap())
+                .unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let fixture = scratch.path();
+        for path in [
+            "ci/hermetic/run-split-validate.sh",
+            "ci/check-shard-coverage.sh",
+            "ci/expected-e2e-plan.json",
+            ".github/workflows/ci-portable.yml",
+        ] {
+            let dest = fixture.join(path);
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::copy(root.join(path), dest).unwrap();
+        }
+        std::fs::create_dir(fixture.join("scripts")).unwrap();
+        let driver = fixture.join("scripts/validate.rs");
+        // Only the plan transport is replaced: both real shell consumers and
+        // their complete shard/workflow inputs execute unchanged. The plan is
+        // the actual committed hosted selection loaded above.
+        std::fs::write(&driver, "#!/usr/bin/env bash\nset -euo pipefail\n[[ $# == 3 && $1 == --hosted-portable-only && $2 == --show-plan-json && $3 == --skip-inner-dirty-working-tree-and-rebase-freshness-checks ]] || exit 90\ncat ./plan.json\n").unwrap();
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = |script: &str, selected: &serde_json::Value, exported: &serde_json::Value| {
+            std::fs::write(
+                fixture.join("ci/portable-shards.json"),
+                serde_json::to_vec(selected).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                fixture.join("plan.json"),
+                serde_json::to_vec(exported).unwrap(),
+            )
+            .unwrap();
+            let mut command = Command::new("bash");
+            command
+                .arg(fixture.join(script))
+                .current_dir(fixture)
+                .env("LC_ALL", "C.UTF-8");
+            if script.contains("run-split") {
+                command.arg("--dry-run");
+            }
+            command.output().unwrap()
+        };
+        for script in [
+            "ci/hermetic/run-split-validate.sh",
+            "ci/check-shard-coverage.sh",
+        ] {
+            let output = run(script, &shards, &plan);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{script}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if script.contains("run-split") {
+                // Feed the exact emitted public argv through the real driver's
+                // selector logic. Together the two partitions must cover each
+                // committed hosted node once, with no dependency expansion.
+                let mut actual = BTreeSet::new();
+                let mut partitions = 0;
+                for line in stdout.lines() {
+                    let Some(selected) = line.trim().strip_prefix("ci/run-node.sh portable ") else {
+                        continue;
+                    };
+                    partitions += 1;
+                    let args = parse_argv(&[
+                        "--hosted-portable-only".into(),
+                        "--selected".into(),
+                        selected.into(),
+                        "--ignore-selected-deps".into(),
+                        ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+                    ])
+                    .unwrap();
+                    let part = build_plan(root, &args, fixture).unwrap();
+                    for step in part.cfg.steps {
+                        assert!(
+                            actual.insert(step.tag()),
+                            "duplicate physical node across partitions"
+                        );
+                    }
+                }
+                assert_eq!(partitions, 2);
+                assert_eq!(actual, hosted.steps.iter().map(Step::tag).collect());
+                assert!(
+                    stdout.contains("test.hermit_unit,test.detcore_unit"),
+                    "public selectors changed: {stdout}"
+                );
+                assert!(
+                    stdout.contains("190 strict compatibility"),
+                    "the fixture must accompany all 189 cases: {stdout}"
+                );
+            } else {
+                assert!(
+                    stdout.contains(
+                        "251 committed hosted-portable steps each assigned to exactly one hosted job"
+                    ),
+                    "{stdout}"
+                );
+            }
+            for (case, marker) in [
+                ("missing", "test.hermit_unit_on_host"),
+                ("duplicate-public", "test.hermit_unit_on_host"),
+                ("duplicate-resolved", "test.hermit_unit_on_host"),
+                ("duplicate-fixture", "compatprep.fixtures_on_host"),
+                ("unknown", "test.no_such_shard_node"),
+                ("missing-strict", "expected exactly one"),
+            ] {
+                let mut broken = shards.clone();
+                let nodes = broken["debug_shards"][0]["nodes"].as_array_mut().unwrap();
+                match case {
+                    "missing" => {
+                        assert_eq!(nodes.remove(0), "test.hermit_unit");
+                    }
+                    "duplicate-public" => nodes.push("test.hermit_unit".into()),
+                    "duplicate-resolved" => nodes.push("test.hermit_unit_on_host".into()),
+                    "duplicate-fixture" => nodes.push("compatprep.fixtures_on_host".into()),
+                    "unknown" => nodes.push("test.no_such_shard_node".into()),
+                    "missing-strict" => broken["strict_compat_nodes"] = serde_json::json!([]),
+                    _ => unreachable!(),
+                }
+                let output = run(script, &broken, &plan);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let (expected_status, marker) =
+                    if case == "missing-strict" && script.contains("run-split") {
+                        (5, "no strict compatibility steps")
+                    } else {
+                        (1, marker)
+                    };
+                eprintln!(
+                    "SHARD_CONSUMER_CONTROL {script} {case}: status={:?} stderr={stderr:?}",
+                    output.status.code()
+                );
+                assert_eq!(
+                    output.status.code(),
+                    Some(expected_status),
+                    "{script} {case}: {stderr}"
+                );
+                assert!(stderr.contains(marker), "{script} {case}: {stderr}");
+            }
+        }
+        let mut duplicate_plan = plan.clone();
+        let rows = duplicate_plan["dags"][0]["steps"].as_array_mut().unwrap();
+        rows.push(rows[0].clone());
+        let output = run(
+            "ci/hermetic/run-split-validate.sh",
+            &shards,
+            &duplicate_plan,
+        );
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("duplicate constructed step"));
+
+        // Set coverage is still complete, but this dependency is owned by a
+        // different, later shard. Resolving public selectors must not hide it.
+        let mut bad_dependency = plan.clone();
+        let row = bad_dependency["dags"][0]["steps"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["tag"] == "test.hermit_unit_on_host")
+            .unwrap();
+        row["deps"]
+            .as_array_mut()
+            .unwrap()
+            .push("test.hermit_integration_on_host".into());
+        let output = run("ci/check-shard-coverage.sh", &shards, &bad_dependency);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("debug shard unit drops constructed predecessor"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("test.hermit_integration_on_host"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn hosted_portable_public_selection_retains_exact_nodes_and_compat_fixture() {
+        let root = Path::new(file!()).parent().and_then(Path::parent).unwrap();
+        let (committed, _, _) = load_committed_validation_dag(root).unwrap();
+        let public = [
+            "test.app_strict_verify", "test.applications_e2e", "test.arbitrary_binaries",
+            "test.command_strict_verify", "test.dbt_parity", "test.detcore_misc",
+            "test.detcore_parallel", "test.detcore_unit", "test.envelope_levels",
+            "test.hermit_integration", "test.hermit_unit", "test.ignored_syscall_regressions",
+            "test.liteinst_strict", "test.regular_crates", "test.rr_suite_contract",
+            "test.sabre_examples",
+        ];
+        let hosted = dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()]).unwrap();
+        let mut expected = public.iter().map(|tag| format!("{tag}_on_host")).collect::<BTreeSet<_>>();
+        let compat = hosted.steps.iter().filter(|step| step.group == "compat")
+            .map(Step::tag).collect::<BTreeSet<_>>();
+        assert_eq!(compat.len(), 189);
+        expected.extend(compat);
+        expected.insert("compatprep.fixtures_on_host".into());
+        assert_eq!(expected.len(), 206);
+        let requested = [public.join(","), STRICT_COMPAT_SELECTION_ALIAS.into()].join(",");
+        for only in [false, true] {
+            let mut argv = if only {
+                vec!["--only".into(), "hosted-portable".into(), requested.clone()]
+            } else {
+                vec!["--hosted-portable-only".into(), "--selected".into(), requested.clone(), "--ignore-selected-deps".into()]
+            };
+            argv.push(ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into());
+            let args = parse_argv(&argv).unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let plan = build_plan(root, &args, temp.path()).unwrap();
+            let mut expected = expected.clone();
+            if only { expected.extend(["pre.submodules".into(), PIN_GATE_TAG.into()]); }
+            assert_eq!(plan.cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>(), expected);
+            for actual in &plan.cfg.steps {
+                let source = hosted.steps.iter().find(|step| step.tag() == actual.tag()).unwrap();
+                let mut source = source.clone();
+                source.deps.retain(|dependency| expected.contains(dependency));
+                assert_eq!(
+                    dag_to_json(&hosted.with_steps(vec![actual.clone()])),
+                    dag_to_json(&hosted.with_steps(vec![source])),
+                );
+            }
+        }
+        // Already committed names stay exact; absent names never acquire a
+        // fabricated counterpart, and the local profile retains local IDs.
+        for (profile, selected, expected) in [
+            ("--hosted-portable-only", "test.regular_crates_on_host", "test.regular_crates_on_host"),
+            ("--portable-only", "test.regular_crates", "test.regular_crates"),
+        ] {
+            let args = parse_argv(&[profile.into(), "--selected".into(), selected.into(), "--ignore-selected-deps".into(), ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into()]).unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let plan = build_plan(root, &args, temp.path()).unwrap();
+            assert_eq!(plan.cfg.steps.iter().map(Step::tag).collect::<Vec<_>>(), [expected]);
+        }
+        let args = parse_argv(&["--hosted-portable-only".into(), "--selected".into(), "test.no_such_public_node".into(), ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into()]).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        assert!(build_plan(root, &args, temp.path()).err().expect("unknown selector must refuse").contains("unknown step tag"));
+    }
+
     fn inert_step(source: &Step, command: String) -> Step {
         let mut step = step_with_caps(
             &source.group, &source.job, "committed dependency/resource fixture",
@@ -21174,7 +21729,27 @@ mod fused_privileged_build_tests {
         let workspace = committed.steps.iter().find(|step| step.tag() == "build.workspace").unwrap();
         assert!(workspace.cmd.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND));
         let preparation = &workspace.cmd[workspace.cmd.len() - NEXTEST_PORTABLE_PREPARE_COMMAND.len()..];
-        let consumer = committed.steps.iter().find(|step| step.tag() == "privileged-build.privileged_tests").unwrap();
+        let mut consumer = committed.steps.iter().find(|step| step.tag() == "privileged-build.privileged_tests").unwrap().clone();
+        // This fixture supplies a fake Cargo executable and an empty target.
+        // Preserve its full cold/prepared contract against the exact authored
+        // payload, after checking each newly committed container boundary.
+        fn pinned_payload(command: &str) -> String {
+            assert!(command.starts_with("./ci/hermetic/run-in-pinned-root.sh "));
+            let argv = shell_words::split(command).unwrap();
+            let boundary = argv.iter().position(|argument| argument == "--").unwrap();
+            assert_eq!(
+                &argv[boundary + 1..boundary + 5],
+                [
+                    "bash",
+                    "-c",
+                    hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD,
+                    "bash",
+                ]
+            );
+            assert_eq!(argv.len(), boundary + 6);
+            argv[boundary + 5].clone()
+        }
+        consumer.cmd = pinned_payload(&consumer.cmd);
         assert!(!consumer.cmd.contains("cargo "), "the barrier must not rebuild shared test executables");
         let query = Command::new(repository.join("ci/nextest-binaries.rs")).arg("--print-executable").output().unwrap();
         assert!(query.status.success(), "{}", String::from_utf8_lossy(&query.stderr));
@@ -21269,7 +21844,8 @@ mod fused_privileged_build_tests {
         let privileged_selections = hermit_manifest_plan::nextest_binaries::profile_selections(repository, "privileged").unwrap();
         assert_eq!(privileged_selections.len(), 3);
         assert!(privileged_selections.values().any(|args| args == &["-p", "hermit-detcore", "--test", "tests_misc"]));
-        let direct = committed.steps.iter().find(|step| step.tag() == "privileged-only-cpuid.faulting").unwrap();
+        let mut direct = committed.steps.iter().find(|step| step.tag() == "privileged-only-cpuid.faulting").unwrap().clone();
+        direct.cmd = pinned_payload(&direct.cmd);
         let declaration = direct.env.get(hermit_manifest_plan::nextest_binaries::SELECTION_ENV).unwrap();
         let prefix = format!("export HERMIT_PREPARED_NEXTEST_REQUIRED=1; export NEXTEST_PREPARED_BUILD_SELECTION={}; ", validate_plan::shell_quote(declaration));
         let before = std::fs::read_to_string(&privileged_log).unwrap();
@@ -21291,6 +21867,69 @@ mod fused_privileged_build_tests {
             assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "failed preparation must not enable consumer compilation");
         }
     }
+    #[test]
+    fn prepared_nextest_preserves_renderer_width_and_ignored_filter_tail() {
+        let repository = Path::new(file!()).parent().and_then(Path::parent).unwrap();
+        let cfg = validate_plan::validation_config(repository).unwrap();
+        let step = cfg.steps.iter().find(|step| step.tag() == "test.isolated_dbt_workdir").unwrap();
+        assert_eq!(step.jobs_flag.as_deref(), Some(""));
+        assert_eq!(step.jobs_env.as_deref(), Some("NEXTEST_TEST_THREADS"));
+        let selection = serde_json::from_str::<Vec<String>>(&step.env["NEXTEST_PREPARED_BUILD_SELECTION"]).unwrap();
+        assert_eq!(selection, ["-p", "hermit", "--features", "third-party-backends", "--test", "cli"]);
+        let query = Command::new(repository.join("ci/nextest-binaries.rs")).arg("--print-executable").output().unwrap();
+        assert!(query.status.success(), "{}", String::from_utf8_lossy(&query.stderr));
+        let helper = PathBuf::from(String::from_utf8(query.stdout).unwrap().trim());
+        let (root, bin, log) = cold_fixture(repository, &helper);
+        // The real prepared adapter invokes this Cargo fixture. Record its
+        // inherited worker setting separately without changing the old log.
+        std::fs::rename(bin.join("cargo"), bin.join("cargo-fixture")).unwrap();
+        write_executable(&bin.join("cargo"), r#"#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+if os.environ.get('NEXTEST_WIDTH_LOG'):
+    with open(os.environ['NEXTEST_WIDTH_LOG'], 'a') as out:
+        out.write(json.dumps({'argv':sys.argv[1:],'threads':os.environ.get('NEXTEST_TEST_THREADS')})+'\n')
+os.execv(sys.executable,[sys.executable,str(Path(__file__).with_name('cargo-fixture')),*sys.argv[1:]])
+"#);
+        let prepared = run_build("./ci/nextest-binaries.rs prepare portable", root.path(), &bin, &log, "current");
+        assert!(prepared.status.success(), "{}", String::from_utf8_lossy(&prepared.stderr));
+        let before = std::fs::read_to_string(&log).unwrap();
+        let width_log = root.path().join("target/width.jsonl");
+        let mut paths = vec![bin.clone()];
+        if let Some(existing) = std::env::var_os("PATH") { paths.extend(std::env::split_paths(&existing)); }
+        let path = std::env::join_paths(paths).unwrap();
+        let tail = ["-E", "test(=run_dbt_verifies_fresh_physical_workdirs) | test(=run_dbt_strict_returns_with_blocked_stdin_source)", "--", "--include-ignored"];
+        for width in [1, 3] {
+            let (name, value) = dagrun::model::env_with_inner_jobs(step, &cfg.default_jobs_env, Some(width)).unwrap();
+            assert_eq!(dagrun::model::command_with_inner_jobs(step, &cfg.default_jobs_flag, Some(width)), step.cmd);
+            let output = Command::new(&helper).arg("run").args(&selection).args(tail)
+                .current_dir(root.path()).env("PATH", &path)
+                .env("CARGO_CALL_LOG", &log).env("CARGO_ARTIFACT_MODE", "current")
+                .env("NEXTEST_WIDTH_LOG", &width_log)
+                .env("HERMIT_PREPARED_NEXTEST_REQUIRED", "1")
+                .env("NEXTEST_PREPARED_BUILD_SELECTION", serde_json::to_string(&selection).unwrap())
+                .env("HERMIT_NEXTEST_CPU_WRAPPER_BIN", root.path().join("custom-cargo-target/debug/nextest-cpu-wrapper"))
+                .env("NEXTEST_TEST_THREADS", "99").env(name, value)
+                .output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        }
+        let rows = std::fs::read_to_string(&width_log).unwrap().lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        for (row, expected) in rows.iter().zip(["1", "3"]) {
+            assert_eq!(row["threads"], expected);
+            let args = serde_json::from_value::<Vec<String>>(row["argv"].clone()).unwrap();
+            assert_eq!(&args[..2], ["nextest", "run"]);
+            assert!(args.iter().any(|arg| arg == "--cargo-metadata"));
+            assert!(args.iter().any(|arg| arg == "--binaries-metadata"));
+            assert!(args.ends_with(&tail.map(String::from)));
+            assert!(!args.iter().any(|arg| arg == "-j" || arg == "--test-threads"));
+        }
+        let after = std::fs::read_to_string(&log).unwrap();
+        let calls = after.strip_prefix(&before).unwrap().lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2, "prepared consumers must not rebuild or relist Cargo targets");
+        assert!(calls.iter().all(|args| args[..2] == ["nextest", "run"]));
+    }
+
 }
 
 
@@ -21498,6 +22137,211 @@ mod typed_termination_tests {
             println!(
                 "TYPED_GATE_FIXTURE {}",
                 serde_json::to_string(&row).unwrap()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod prepared_command_tests {
+    use super::*;
+
+    fn outer_decoy(step: &Step, payload: &str, decoy: &str) -> Step {
+        let mut changed = step.clone();
+        changed.cmd = bracket_command_with_payload(step, payload).unwrap();
+        let mut argv = shell_words::split(&changed.cmd).unwrap();
+        argv.splice(1..1, ["--out".to_string(), decoy.to_string()]);
+        changed.cmd = format!(
+            "{} {}",
+            argv[0],
+            argv[1..]
+                .iter()
+                .map(|arg| validate_plan::shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        changed
+    }
+
+    #[test]
+    fn actual_prepared_commands_preserve_no_compilation_and_refuse_outer_decoys() {
+        let root = repo_root();
+        let cfg = validate_plan::validation_config(&root).unwrap();
+        let find = |tag: &str| cfg.steps.iter().find(|step| step.tag() == tag).unwrap();
+        let host = find("build.workspace");
+        let pinned = find("build.workspace_in_pinned_root");
+        let barrier = find("privileged-build.privileged_tests");
+        let cpuid = find("privileged-cpuid.faulting");
+        let barrier_payload = guarded_command_source(&barrier.tag(), &barrier.cmd).unwrap();
+        let cpuid_payload = guarded_command_source(&cpuid.tag(), &cpuid.cmd).unwrap();
+        // Both current workspace producers retain the exact preparation suffix.
+        prepared_nextest_commands_bracket(host, barrier).unwrap();
+        prepared_nextest_commands_bracket(pinned, barrier).unwrap();
+        prebuilt_cpuid_command_bracket(cpuid).unwrap();
+        assert!(barrier.cmd.contains("cargo "));
+        assert!(cpuid.cmd.contains("cargo "));
+        assert!(!barrier_payload.contains("cargo "));
+        assert!(!cpuid_payload.contains("cargo "));
+
+        for required in [
+            "verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path",
+            NEXTEST_PRIVILEGED_ASSERT_COMMAND,
+            TESTS_MISC_EXECUTABLE_READ_COMMAND,
+        ] {
+            let payload = barrier_payload.replacen(required, "missing-required-check", 1);
+            let changed = outer_decoy(barrier, &payload, required);
+            assert!(changed.cmd.contains(required));
+            assert!(prepared_nextest_commands_bracket(host, &changed).is_err());
+        }
+        let mut changed = barrier.clone();
+        changed.cmd =
+            bracket_command_with_payload(barrier, &format!("{barrier_payload} && cargo build"))
+                .unwrap();
+        assert!(prepared_nextest_commands_bracket(host, &changed).is_err());
+
+        for workspace in [host, pinned] {
+            let payload = guarded_command_source(&workspace.tag(), &workspace.cmd).unwrap();
+            let mut changed = workspace.clone();
+            changed.cmd = bracket_command_with_payload(
+                workspace,
+                &format!("{payload} --planted-after-preparation"),
+            )
+            .unwrap();
+            assert!(prepared_nextest_commands_bracket(&changed, barrier).is_err());
+        }
+        let payload = guarded_command_source(&pinned.tag(), &pinned.cmd).unwrap();
+        let changed = outer_decoy(
+            pinned,
+            &payload.replacen(NEXTEST_PORTABLE_PREPARE_COMMAND, "missing-preparation", 1),
+            NEXTEST_PORTABLE_PREPARE_COMMAND,
+        );
+        assert!(prepared_nextest_commands_bracket(&changed, barrier).is_err());
+
+        let changed = outer_decoy(
+            cpuid,
+            &cpuid_payload.replacen("rdrand_rdseed_is_masked", "missing-test", 1),
+            "rdrand_rdseed_is_masked",
+        );
+        assert!(prebuilt_cpuid_command_bracket(&changed).is_err());
+        let mut changed = cpuid.clone();
+        changed.cmd =
+            bracket_command_with_payload(cpuid, &format!("{cpuid_payload}; cargo test")).unwrap();
+        assert!(prebuilt_cpuid_command_bracket(&changed).is_err());
+
+        for original in [pinned, barrier, cpuid] {
+            let mut changed = original.clone();
+            let mut argv = shell_words::split(&changed.cmd).unwrap();
+            let boundary = argv.iter().position(|arg| arg == "--").unwrap();
+            argv[boundary + 3] = "exec bash -c \"$1\"".into();
+            changed.cmd = format!(
+                "{} {}",
+                argv[0],
+                argv[1..]
+                    .iter()
+                    .map(|arg| validate_plan::shell_quote(arg))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            assert!(guarded_command_source(&changed.tag(), &changed.cmd).is_err());
+            if original.tag() == cpuid.tag() {
+                assert!(prebuilt_cpuid_command_bracket(&changed).is_err());
+            } else if original.tag() == pinned.tag() {
+                assert!(prepared_nextest_commands_bracket(&changed, barrier).is_err());
+            } else {
+                assert!(prepared_nextest_commands_bracket(host, &changed).is_err());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod shared_consumer_tests {
+    use super::*;
+
+    #[test]
+    fn actual_shared_cli_population_requires_the_workdir_consumer_and_every_resource() {
+        let cfg = validate_plan::validation_config(&repo_root()).unwrap();
+        let full = dagrun::select_steps_by_labels(&cfg, &["full".into()]).unwrap();
+        assert_committed_shared_integration_test_serialization(&full.steps, &full.resource_caps)
+            .unwrap();
+        let isolated = full
+            .steps
+            .iter()
+            .find(|s| s.tag() == "test.isolated_dbt_workdir")
+            .unwrap();
+        assert_eq!(
+            isolated.integration_test_binaries.as_deref(),
+            Some(["cli".to_string()].as_slice())
+        );
+        assert_eq!(
+            isolated.hint.resources.get("integration_test_binaries.cli"),
+            Some(&1)
+        );
+        for tag in [
+            "test.cli",
+            "privileged-test.cli_kvm",
+            "test.isolated_dbt_workdir",
+        ] {
+            let mut missing = full.steps.clone();
+            missing.retain(|step| step.tag() != tag);
+            assert!(
+                assert_committed_shared_integration_test_consumers(&missing).is_err(),
+                "missing consumer {tag} accepted"
+            );
+        }
+        let mut extra = full.steps.clone();
+        let mut unexpected = isolated.clone();
+        unexpected.job = "unexpected_cli_consumer".into();
+        extra.push(unexpected);
+        assert!(assert_committed_shared_integration_test_consumers(&extra).is_err());
+
+        // Keep exact cap/demand equality, including the original shared builder
+        // and consumers as well as the newly enumerated workdir consumer.
+        for (resource, tags) in [
+            (
+                "integration_test_binaries.cli",
+                vec![
+                    "privileged-build.privileged_tests",
+                    "privileged-test.cli_kvm",
+                    "test.cli",
+                    "test.isolated_dbt_workdir",
+                ],
+            ),
+            (
+                "integration_test_binaries.hermit_modes",
+                vec![
+                    "privileged-build.privileged_tests",
+                    "privileged-test.pmu_buck_chaos_cases",
+                    "test.hermit_modes",
+                ],
+            ),
+        ] {
+            for tag in tags {
+                let mut missing = full.steps.clone();
+                missing
+                    .iter_mut()
+                    .find(|step| step.tag() == tag)
+                    .unwrap()
+                    .hint
+                    .resources
+                    .remove(resource);
+                assert!(
+                    assert_committed_shared_integration_test_serialization(
+                        &missing,
+                        &full.resource_caps
+                    )
+                    .is_err(),
+                    "missing resource {resource} on {tag} accepted"
+                );
+            }
+            let mut caps = full.resource_caps.clone();
+            caps.remove(resource);
+            assert!(
+                assert_committed_shared_integration_test_serialization(&full.steps, &caps).is_err()
+            );
+            caps.insert(resource.into(), 2);
+            assert!(
+                assert_committed_shared_integration_test_serialization(&full.steps, &caps).is_err()
             );
         }
     }
