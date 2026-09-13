@@ -1317,8 +1317,10 @@ impl ResultRow {
             if raw.get("verdict").and_then(JsonValue::as_str) != Some("no_result") {
                 return Ok(None);
             }
-            let report = canonical_verdict::VerificationReport::from_current_json_slice(report_text.as_bytes())
-                .map_err(|error| format!("attempt {} {error}", index + 1))?;
+            let report = canonical_verdict::VerificationReport::from_current_json_slice(
+                report_text.as_bytes(),
+            )
+            .map_err(|error| format!("attempt {} {error}", index + 1))?;
             reports.push((index, attempt, report));
         }
 
@@ -1634,9 +1636,10 @@ impl ResultRow {
                     index + 1
                 ));
             }
-            let report =
-                canonical_verdict::VerificationReport::from_current_json_slice(report_text.as_bytes())
-                    .map_err(|error| format!("attempt {} {error}", index + 1))?;
+            let report = canonical_verdict::VerificationReport::from_current_json_slice(
+                report_text.as_bytes(),
+            )
+            .map_err(|error| format!("attempt {} {error}", index + 1))?;
             report.require_canonical_comparison().map_err(|error| {
                 format!(
                     "attempt {} cannot support a scorecard result: {error}",
@@ -1762,9 +1765,10 @@ impl ResultRow {
                     index + 1
                 )
             })?;
-            let report =
-                canonical_verdict::VerificationReport::from_current_json_slice(report_text.as_bytes())
-                    .map_err(|error| format!("attempt {} {error}", index + 1))?;
+            let report = canonical_verdict::VerificationReport::from_current_json_slice(
+                report_text.as_bytes(),
+            )
+            .map_err(|error| format!("attempt {} {error}", index + 1))?;
             operand_verifications.push(report.clone());
 
             if matches!(
@@ -1995,7 +1999,10 @@ impl ResultRow {
                     None => {
                         saw_no_result = true;
                         unavailable.get_or_insert_with(|| {
-                            format!("NO_RESULT: attempt {} recorded no specific cause", index + 1)
+                            format!(
+                                "NO_RESULT: attempt {} recorded no specific cause",
+                                index + 1
+                            )
                         });
                     }
                 },
@@ -2186,18 +2193,24 @@ struct Derived {
 
 fn retained_import_cells(derived: &Derived) -> BTreeSet<CellId> {
     let mut eligible = derived.enabled.clone();
-    eligible.extend(derived.population.iter().filter(|candidate| {
-        if candidate.mode != "verify"
-            || matches!(candidate.backend.as_str(), "ptrace" | "native")
-        {
-            return false;
-        }
-        let reference = CellId {
-            backend: "ptrace".into(),
-            ..(*candidate).clone()
-        };
-        derived.green.contains(&reference)
-    }).cloned());
+    eligible.extend(
+        derived
+            .population
+            .iter()
+            .filter(|candidate| {
+                if candidate.mode != "verify"
+                    || matches!(candidate.backend.as_str(), "ptrace" | "native")
+                {
+                    return false;
+                }
+                let reference = CellId {
+                    backend: "ptrace".into(),
+                    ..(*candidate).clone()
+                };
+                derived.green.contains(&reference)
+            })
+            .cloned(),
+    );
     eligible
 }
 
@@ -3002,9 +3015,7 @@ for by either this table or the comparable green cells above.\n\n\
     out
 }
 
-fn latest_backend_parity(
-    cell: &TrackedCell,
-) -> Option<&RecordedBackendParityComparison> {
+fn latest_backend_parity(cell: &TrackedCell) -> Option<&RecordedBackendParityComparison> {
     let candidates = cell
         .observations
         .iter()
@@ -3054,9 +3065,7 @@ fn render_backend_parity_section(tracked: &TrackedCells) -> String {
         .cells
         .iter()
         .filter(|cell| {
-            cell.id.mode == "verify"
-                && cell.id.backend != "ptrace"
-                && cell.id.backend != "native"
+            cell.id.mode == "verify" && cell.id.backend != "ptrace" && cell.id.backend != "native"
         })
         .map(|cell| cell.id.backend.as_str())
         .collect::<BTreeSet<_>>();
@@ -3894,13 +3903,14 @@ fn observation_tree_counts(tracked: &TrackedCells, head_tree: &str) -> (usize, u
         .cells
         .iter()
         .flat_map(|cell| cell.observations.iter())
-        .fold((0, 0), |(different, unknown), observation| {
-            match observation.detcore_tree.as_deref() {
+        .fold(
+            (0, 0),
+            |(different, unknown), observation| match observation.detcore_tree.as_deref() {
                 Some(tree) if tree != head_tree => (different + 1, unknown),
                 None => (different, unknown + 1),
                 _ => (different, unknown),
-            }
-        })
+            },
+        )
 }
 
 fn render_evidence_coverage(root: &Path) -> Result<String, String> {
@@ -4522,8 +4532,7 @@ fn apply_validate_results(
                 .then(left.evidence_identity.cmp(&right.evidence_identity))
         });
         let mut distinct = Vec::with_capacity(classified.len());
-        let mut identities_by_attempt =
-            BTreeMap::<(String, u64), (String, Option<String>)>::new();
+        let mut identities_by_attempt = BTreeMap::<(String, u64), (String, Option<String>)>::new();
         for (candidate, evidence) in classified {
             let key = (candidate.row.run_id.clone(), candidate.row.attempt);
             let classification_identity = (candidate.row.result.is_some()
@@ -4587,12 +4596,9 @@ fn apply_validate_results(
                     None,
                     None,
                 ),
-                ValidateRowEvidence::ParityMatched { report } => (
-                    Some(ObservedResult::Pass),
-                    None,
-                    Some(report),
-                    None,
-                ),
+                ValidateRowEvidence::ParityMatched { report } => {
+                    (Some(ObservedResult::Pass), None, Some(report), None)
+                }
                 ValidateRowEvidence::ParityDiverged { report } => (
                     Some(ObservedResult::ParityFailure),
                     None,
@@ -5644,24 +5650,23 @@ fn validate_observation_identity_namespace(cells: &TrackedCells) -> Result<(), S
             }
             for event_id in &observation.event_ids {
                 if event_id.trim().is_empty() || !seen_event_ids.insert(event_id) {
-                    return Err(format!("invalid or repeated projected event_id {event_id:?}"));
+                    return Err(format!(
+                        "invalid or repeated projected event_id {event_id:?}"
+                    ));
                 }
             }
             for comparison in &observation.backend_parity_comparisons {
                 let outputs_match = comparison.reference_exit_code
                     == comparison.candidate_exit_code
                     && comparison.reference_signal == comparison.candidate_signal
-                    && comparison.reference_stdout_sha256
-                        == comparison.candidate_stdout_sha256
-                    && comparison.reference_stderr_sha256
-                        == comparison.candidate_stderr_sha256;
-                let expected_result = if outputs_match
-                    && comparison.log_verdict == LogDiffVerdict::Matched
-                {
-                    ObservedResult::Pass
-                } else {
-                    ObservedResult::ParityFailure
-                };
+                    && comparison.reference_stdout_sha256 == comparison.candidate_stdout_sha256
+                    && comparison.reference_stderr_sha256 == comparison.candidate_stderr_sha256;
+                let expected_result =
+                    if outputs_match && comparison.log_verdict == LogDiffVerdict::Matched {
+                        ObservedResult::Pass
+                    } else {
+                        ObservedResult::ParityFailure
+                    };
                 if comparison.reference_backend != "ptrace"
                     || comparison.candidate_backend != cell.id.backend
                     || comparison.result != expected_result
@@ -5669,8 +5674,7 @@ fn validate_observation_identity_namespace(cells: &TrackedCells) -> Result<(), S
                         comparison.log_verdict,
                         LogDiffVerdict::Matched | LogDiffVerdict::Diverged
                     )
-                    || comparison.record_envelope
-                        != RecordEnvelopePolicy::CrossBackendDetcoreV1
+                    || comparison.record_envelope != RecordEnvelopePolicy::CrossBackendDetcoreV1
                     || comparison.compared_records == 0
                     || comparison.reference_info_messages == 0
                     || comparison.candidate_info_messages == 0
@@ -5970,12 +5974,7 @@ fn apply_series_rows(
     projection_source: Option<&str>,
 ) -> Result<ProjectObservationsOutcome, String> {
     let mut updated = tracked.clone();
-    let outcome = apply_series_rows_inner(
-        ambient_git_root,
-        &mut updated,
-        rows,
-        projection_source,
-    )?;
+    let outcome = apply_series_rows_inner(ambient_git_root, &mut updated, rows, projection_source)?;
     *tracked = updated;
     Ok(outcome)
 }
@@ -7802,16 +7801,22 @@ fn pressure_invocation_matches(
     existing: &ObservedInvocation,
     incoming: &ObservedInvocation,
 ) -> bool {
-    let reconstructs = |command: &str, cwd: &str, env: &BTreeMap<String, String>, argv: &[String]| {
-        command.is_empty() || command == literal_shell_command(cwd, env, argv)
-    };
+    let reconstructs =
+        |command: &str, cwd: &str, env: &BTreeMap<String, String>, argv: &[String]| {
+            command.is_empty() || command == literal_shell_command(cwd, env, argv)
+        };
     if !reconstructs(
         &existing.shell_command,
         &existing.cwd,
         &existing.env,
         &existing.argv,
     ) || existing.attempts.iter().any(|attempt| {
-        !reconstructs(&attempt.shell_command, &attempt.cwd, &attempt.env, &attempt.argv)
+        !reconstructs(
+            &attempt.shell_command,
+            &attempt.cwd,
+            &attempt.env,
+            &attempt.argv,
+        )
     }) {
         return false;
     }
@@ -7943,19 +7948,36 @@ fn self_test() -> Result<(), String> {
     let mut additional_depth = current_last_tested.depth.clone();
     additional_depth.insert(
         "reverie".into(),
-        SourceDepth { commits: 30, first_parent: 25 },
+        SourceDepth {
+            commits: 30,
+            first_parent: 25,
+        },
     );
     for depth in [&additional_depth, &BTreeMap::new()] {
         if should_replace_retained_last_tested(
-            Some(&current_last_tested), "current-sha", "current-tree", Some(true), depth,
+            Some(&current_last_tested),
+            "current-sha",
+            "current-tree",
+            Some(true),
+            depth,
         ) {
-            return Err("retained reimport replaced the same code identity's recorded depths".into());
+            return Err(
+                "retained reimport replaced the same code identity's recorded depths".into(),
+            );
         }
     }
     if !should_replace_retained_last_tested(
-        None, "current-sha", "current-tree", Some(true), &additional_depth,
+        None,
+        "current-sha",
+        "current-tree",
+        Some(true),
+        &additional_depth,
     ) || !should_replace_retained_last_tested(
-        Some(&current_last_tested), "current-sha", "different-tree", Some(true), &additional_depth,
+        Some(&current_last_tested),
+        "current-sha",
+        "different-tree",
+        Some(true),
+        &additional_depth,
     ) {
         return Err("retained stamp preservation hid absent or conflicting code identity".into());
     }
@@ -8134,8 +8156,7 @@ fn self_test() -> Result<(), String> {
     let current_report: JsonValue = serde_json::from_str(current_report_text).unwrap();
     if current_report.get("no_result_reason") != Some(&JsonValue::Null) {
         return Err(
-            "a current verification report did not serialize explicit null no_result_reason"
-                .into(),
+            "a current verification report did not serialize explicit null no_result_reason".into(),
         );
     }
     current_identity
@@ -8158,8 +8179,7 @@ fn self_test() -> Result<(), String> {
     let missing_report = serde_json::to_string(&missing_report).unwrap();
     missing_current_reason.attempts[0]["verification_report_sha256"] =
         JsonValue::String(format!("{:x}", Sha256::digest(missing_report.as_bytes())));
-    missing_current_reason.attempts[0]["verification_report"] =
-        JsonValue::String(missing_report);
+    missing_current_reason.attempts[0]["verification_report"] = JsonValue::String(missing_report);
     for error in [
         missing_current_reason
             .bitwise_info_comparison()
@@ -8202,6 +8222,75 @@ fn self_test() -> Result<(), String> {
                 return Err(format!(
                     "duplicate-field scorecard refusal lost its cause: {error}"
                 ));
+            }
+        }
+    }
+
+    // Exercise the real scorecard readers with hash-consistent original bytes,
+    // including both operands and the new exact-output evidence object.
+    let current_value: JsonValue =
+        serde_json::from_str(current_report_text).map_err(|error| error.to_string())?;
+    let output_report_text =
+        serde_json::to_string(&current_value).map_err(|error| error.to_string())?;
+    let outputs = serde_json::to_string(&current_value["compared_outputs"])
+        .map_err(|error| error.to_string())?;
+    let mut output_duplicates = Vec::new();
+    for first in ["null", outputs.as_str()] {
+        output_duplicates.push(output_report_text.replacen(
+            &format!("\"compared_outputs\":{outputs}"),
+            &format!("\"compared_outputs\":{first},\"compared_outputs\":{outputs}"),
+            1,
+        ));
+    }
+    for side in ["left", "right"] {
+        let output = &current_value["compared_outputs"][side];
+        let original = serde_json::to_string(output).map_err(|error| error.to_string())?;
+        for field in [
+            "exit_code",
+            "signal",
+            "stdout_sha256",
+            "stdout_bytes",
+            "stderr_sha256",
+            "stderr_bytes",
+        ] {
+            let field_value =
+                serde_json::to_string(&output[field]).map_err(|error| error.to_string())?;
+            let conflicting = match field {
+                "exit_code" | "signal" => "7",
+                "stdout_bytes" | "stderr_bytes" => "123",
+                _ => "\"different-digest\"",
+            };
+            for first in [field_value.as_str(), conflicting] {
+                let changed = original.replacen(
+                    &format!("\"{field}\":{field_value}"),
+                    &format!("\"{field}\":{first},\"{field}\":{field_value}"),
+                    1,
+                );
+                let changed_outputs = outputs.replacen(
+                    &format!("\"{side}\":{original}"),
+                    &format!("\"{side}\":{changed}"),
+                    1,
+                );
+                output_duplicates.push(output_report_text.replacen(&outputs, &changed_outputs, 1));
+            }
+        }
+    }
+    for duplicated in output_duplicates {
+        assert_ne!(duplicated, output_report_text);
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&duplicated).map_err(|error| error.to_string())?,
+            current_value
+        );
+        let mut duplicate_row = current_identity.clone();
+        duplicate_row.attempts[0]["verification_report_sha256"] =
+            JsonValue::String(format!("{:x}", Sha256::digest(duplicated.as_bytes())));
+        duplicate_row.attempts[0]["verification_report"] = JsonValue::String(duplicated);
+        for error in [
+            duplicate_row.bitwise_info_comparison().unwrap_err(),
+            duplicate_row.comparison_evidence().unwrap_err(),
+        ] {
+            if !error.contains("duplicate field") {
+                return Err(format!("output duplicate refusal lost its cause: {error}"));
             }
         }
     }
@@ -8931,8 +9020,7 @@ red/`measured-and-passed` count is **0**.",
         ));
         attempt
     };
-    let parity_row =
-        |id: &CellId, verdict: BackendParityVerdict| -> Result<ResultRow, String> {
+    let parity_row = |id: &CellId, verdict: BackendParityVerdict| -> Result<ResultRow, String> {
         let candidate_attempt = parity_attempt(&id.backend, "1");
         let reference_attempt = parity_attempt("ptrace", "parity-reference");
         let parse_verification = |attempt: &JsonValue| {
@@ -9074,6 +9162,37 @@ red/`measured-and-passed` count is **0**.",
 
     let mut matching_parity = parity_tracked();
     let matching_row = parity_row(&parity_id, BackendParityVerdict::Matched)?;
+    let mut unequal_raw_populations = matching_row.clone();
+    let comparison = &mut unequal_raw_populations
+        .backend_parity
+        .as_mut()
+        .unwrap()
+        .comparison;
+    comparison.records.available_left = 4;
+    comparison.records.available_right = 7;
+    comparison.records.compared = 4;
+    unequal_raw_populations.comparison_evidence()?;
+    for (compared, left, right) in [(3, 3, 3), (5, 3, 3), (4, 2, 3), (4, 5, 5)] {
+        let mut inconsistent = unequal_raw_populations.clone();
+        let comparison = &mut inconsistent.backend_parity.as_mut().unwrap().comparison;
+        comparison.records.compared = compared;
+        comparison.selected_messages = LogDiffMessageCounts { left, right };
+        if inconsistent.comparison_evidence().is_ok() {
+            return Err(format!(
+                "scorecard admitted contradictory parity counts {compared}/{left}/{right}"
+            ));
+        }
+    }
+    let mut unequal_selected_divergence = unequal_raw_populations;
+    unequal_selected_divergence.outcome = "FAIL".into();
+    unequal_selected_divergence.result = Some(ObservedResult::ParityFailure);
+    unequal_selected_divergence.failure_class = Some(FailureClass::ProductFailure);
+    let report = unequal_selected_divergence.backend_parity.as_mut().unwrap();
+    report.verdict = BackendParityVerdict::Diverged;
+    report.comparison.verdict = LogDiffVerdict::Diverged;
+    report.comparison.selected_messages.right = 4;
+    unequal_selected_divergence.comparison_evidence()?;
+
     let mut disabled_without_parity = candidate("PASS").row;
     disabled_without_parity.classification = "disabled".into();
     let ingest_fixture = tempfile::tempdir()
@@ -9094,14 +9213,13 @@ red/`measured-and-passed` count is **0**.",
         return Err("observe-results reader discarded a disabled backend-parity probe".into());
     }
     if ingested.contains_key(&id) {
-        return Err("observe-results reader admitted a disabled row without parity evidence".into());
+        return Err(
+            "observe-results reader admitted a disabled row without parity evidence".into(),
+        );
     }
     apply_validate_results(
         &mut matching_parity,
-        &BTreeMap::from([(
-            parity_id.clone(),
-            vec![parity_candidate(matching_row)?],
-        )]),
+        &BTreeMap::from([(parity_id.clone(), vec![parity_candidate(matching_row)?])]),
         "sha-1",
         "tree-1",
         &depth_fixture,
@@ -9192,10 +9310,8 @@ red/`measured-and-passed` count is **0**.",
     reference_attempt["outcome"] = JsonValue::String("FAIL".into());
     reference_attempt["status"] = serde_json::json!(1);
     reference_attempt["verification_report"] = JsonValue::String(reference_report.clone());
-    reference_attempt["verification_report_sha256"] = JsonValue::String(format!(
-        "{:x}",
-        Sha256::digest(reference_report.as_bytes())
-    ));
+    reference_attempt["verification_report_sha256"] =
+        JsonValue::String(format!("{:x}", Sha256::digest(reference_report.as_bytes())));
     let mut reference_failure_tracked = parity_tracked();
     let reference_failure_fold = apply_validate_results(
         &mut reference_failure_tracked,
@@ -9233,10 +9349,7 @@ red/`measured-and-passed` count is **0**.",
     let divergent_row = parity_row(&parity_id, BackendParityVerdict::Diverged)?;
     apply_validate_results(
         &mut divergent_parity,
-        &BTreeMap::from([(
-            parity_id.clone(),
-            vec![parity_candidate(divergent_row)?],
-        )]),
+        &BTreeMap::from([(parity_id.clone(), vec![parity_candidate(divergent_row)?])]),
         "sha-1",
         "tree-1",
         &depth_fixture,
@@ -9251,12 +9364,10 @@ red/`measured-and-passed` count is **0**.",
         .expect("divergent parity cell remains tracked");
     let divergent_markdown = render_backend_parity_section(&divergent_parity);
     if divergent_cell.measurement != MeasurementState::Diverged
-        || divergent_cell.observations[0].results
-            != BTreeSet::from([ObservedResult::ParityFailure])
+        || divergent_cell.observations[0].results != BTreeSet::from([ObservedResult::ParityFailure])
         || !divergent_markdown.contains("| `kvm` | 1 | 1 | 0 | 1 | 0 |")
-        || !divergent_markdown.contains(
-            "| `fixture/backend-parity` | `kvm` | `parity-failure` | 3 | 3 | 3 |",
-        )
+        || !divergent_markdown
+            .contains("| `fixture/backend-parity` | `kvm` | `parity-failure` | 3 | 3 | 3 |")
     {
         return Err(
             "deliberate ptrace/KVM divergence did not become a scorecard parity failure".into(),
@@ -9385,13 +9496,17 @@ red/`measured-and-passed` count is **0**.",
                     .map(|mut invocation| {
                         if legacy_fields & 1 != 0 {
                             invocation.shell_command = literal_shell_command(
-                                &invocation.cwd, &invocation.env, &invocation.argv,
+                                &invocation.cwd,
+                                &invocation.env,
+                                &invocation.argv,
                             );
                         }
                         if legacy_fields & 2 != 0 {
                             for attempt in &mut invocation.attempts {
                                 attempt.shell_command = literal_shell_command(
-                                    &attempt.cwd, &attempt.env, &attempt.argv,
+                                    &attempt.cwd,
+                                    &attempt.env,
+                                    &attempt.argv,
                                 );
                             }
                         }
@@ -9425,7 +9540,13 @@ red/`measured-and-passed` count is **0**.",
     if !pressure_invocation_matches(&legacy, &compact) {
         return Err("valid legacy pressure invocation differs from its compact form".into());
     }
-    for change in ["command", "attempt-command", "attempt-status", "attempt-index", "run-id"] {
+    for change in [
+        "command",
+        "attempt-command",
+        "attempt-status",
+        "attempt-index",
+        "run-id",
+    ] {
         let mut distinct = legacy.clone();
         match change {
             "command" => distinct.shell_command.push_str(" ; false"),
@@ -9436,7 +9557,9 @@ red/`measured-and-passed` count is **0**.",
             _ => unreachable!(),
         }
         if pressure_invocation_matches(&distinct, &compact) {
-            return Err(format!("pressure invocation identity discarded distinct {change} evidence"));
+            return Err(format!(
+                "pressure invocation identity discarded distinct {change} evidence"
+            ));
         }
     }
     let same_engine = pressure_summary("sha-doc", "tree-1", vec![pressure_row("pass", None, None)]);
@@ -10533,8 +10656,7 @@ red/`measured-and-passed` count is **0**.",
         })
         .map(|cell| cell.id.clone())
         .ok_or("scorecard fixture has no disabled KVM cell with a Green ptrace reference")?;
-    let mut command_parity_row =
-        parity_row(&command_parity_id, BackendParityVerdict::Matched)?;
+    let mut command_parity_row = parity_row(&command_parity_id, BackendParityVerdict::Matched)?;
     command_parity_row.hermit_sha = fixture_head.clone();
     command_parity_row.run_id = "front-door-disabled-parity".into();
     let mut ordinary_disabled_row = command_parity_row.clone();
@@ -10557,18 +10679,23 @@ red/`measured-and-passed` count is **0**.",
             .find(|cell| cell.id == command_parity_id)
             .is_some_and(|cell| {
                 let parity_admitted = cell.observations.iter().any(|observation| {
-                    observation.backend_parity_comparisons.iter().any(|comparison| {
-                        comparison.run_id == command_parity_row.run_id
-                            && comparison.result == ObservedResult::Pass
-                    })
-                });
-                let ordinary_excluded = cell.observations.iter().all(|observation| {
-                    observation.invocations.iter().all(|invocation| {
-                        invocation.run_id != ordinary_disabled_row.run_id
-                    }) && observation
+                    observation
                         .backend_parity_comparisons
                         .iter()
-                        .all(|comparison| comparison.run_id != ordinary_disabled_row.run_id)
+                        .any(|comparison| {
+                            comparison.run_id == command_parity_row.run_id
+                                && comparison.result == ObservedResult::Pass
+                        })
+                });
+                let ordinary_excluded = cell.observations.iter().all(|observation| {
+                    observation
+                        .invocations
+                        .iter()
+                        .all(|invocation| invocation.run_id != ordinary_disabled_row.run_id)
+                        && observation
+                            .backend_parity_comparisons
+                            .iter()
+                            .all(|comparison| comparison.run_id != ordinary_disabled_row.run_id)
                 });
                 parity_admitted && ordinary_excluded
             })
@@ -10654,8 +10781,7 @@ red/`measured-and-passed` count is **0**.",
         "{:x}",
         Sha256::digest(prior_verify_report.as_bytes())
     ));
-    prior_verify_row.attempts[0]["verification_report"] =
-        JsonValue::String(prior_verify_report);
+    prior_verify_row.attempts[0]["verification_report"] = JsonValue::String(prior_verify_report);
     write_result_row(&prior_verify_row)?;
     let seeded = run_result_command("observe-results", None)?;
     if !seeded.status.success() {
@@ -11549,8 +11675,7 @@ red/`measured-and-passed` count is **0**.",
             || fold.reads_all_green()
             || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
             || tracked.cells[0].observations.len() != 1
-            || tracked.cells[0].observations[0].results
-                != BTreeSet::from([ObservedResult::Timeout])
+            || tracked.cells[0].observations[0].results != BTreeSet::from([ObservedResult::Timeout])
             || tracked.cells[0].last_tested.is_none()
         {
             return Err(format!(
@@ -12951,10 +13076,7 @@ red/`measured-and-passed` count is **0**.",
     let mut native_projection = TrackedCells {
         schema: SCHEMA,
         projection: None,
-        cells: vec![
-            boundary_cell(Vec::new(), CellStatus::Green),
-            native_cell,
-        ],
+        cells: vec![boundary_cell(Vec::new(), CellStatus::Green), native_cell],
     };
     let native_pass = series_row(
         "fixture/boundary/naked/native",
@@ -13378,19 +13500,17 @@ red/`measured-and-passed` count is **0**.",
     series_unavailable.series.run_index = 2;
     series_unavailable.series.attempt = Some(2);
     series_unavailable.series.no_verdict_evidence = Some(no_verdict_evidence(false));
-    let project_series_fixture = |rows: &[SeriesRow]| -> Result<
-        (TrackedCells, ProjectObservationsOutcome),
-        String,
-    > {
-        let mut tracked = TrackedCells {
-            schema: SCHEMA,
-            projection: None,
-            cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+    let project_series_fixture =
+        |rows: &[SeriesRow]| -> Result<(TrackedCells, ProjectObservationsOutcome), String> {
+            let mut tracked = TrackedCells {
+                schema: SCHEMA,
+                projection: None,
+                cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+            };
+            let outcome = apply_series_rows(&root, &mut tracked, rows, None)?;
+            refresh_measurement(&mut tracked);
+            Ok((tracked, outcome))
         };
-        let outcome = apply_series_rows(&root, &mut tracked, rows, None)?;
-        refresh_measurement(&mut tracked);
-        Ok((tracked, outcome))
-    };
     let (projected_timeout, _) = project_series_fixture(&[series_timeout.clone()])?;
     let (direct_timeout, _) = fold_fixture_row(not_run_row.clone())?;
     if projected_timeout.cells[0].measurement != direct_timeout.cells[0].measurement
@@ -13429,10 +13549,7 @@ red/`measured-and-passed` count is **0**.",
     disposition.status = Some(0);
     let (projected_noncanonical, _) = project_series_fixture(&[series_noncanonical])?;
     let mut direct_noncanonical_rows = coordinate_less_row(&unlocated_id, "PASS");
-    let direct_noncanonical = &mut direct_noncanonical_rows
-        .get_mut(&unlocated_id)
-        .unwrap()[0]
-        .row;
+    let direct_noncanonical = &mut direct_noncanonical_rows.get_mut(&unlocated_id).unwrap()[0].row;
     let mut report: JsonValue = serde_json::from_str(
         direct_noncanonical.attempts[0]["verification_report"]
             .as_str()
@@ -13461,9 +13578,7 @@ red/`measured-and-passed` count is **0**.",
         || projected_noncanonical.cells[0].observations[0].results
             != direct_noncanonical_tracked.cells[0].observations[0].results
     {
-        return Err(
-            "noncanonical comparison changed between direct and series paths".into(),
-        );
+        return Err("noncanonical comparison changed between direct and series paths".into());
     }
 
     let (projected_no_verdict, projected_no_verdict_outcome) =
@@ -13668,34 +13783,30 @@ red/`measured-and-passed` count is **0**.",
 
     let procfs_cell = "c-programs/procfs-positioned-probe/verify/ptrace";
     let legacy_row = |key: usize, outcome: SeriesOutcome, detcore_tree: Option<String>| {
-            let commit = ambient_commits.get(key).unwrap_or(&ambient_commits[0]);
-            let mut row = series_row(
-                procfs_cell,
-                outcome,
-                SeriesProducer::Validate,
-                1,
-                detcore_tree,
-                None,
-            );
-            row.schema = SeriesSchema::V2;
-            row.event_id = format!("ambient-event-{key}");
-            row.run_id = format!("ambient-run-{key}");
-            row.emitted_at = format!("2026-08-27T05:00:{key:02}Z");
-            row.series.tree = (*commit).into();
-            row.series.result = None;
-            row.series.failure_class = None;
-            row
-        };
+        let commit = ambient_commits.get(key).unwrap_or(&ambient_commits[0]);
+        let mut row = series_row(
+            procfs_cell,
+            outcome,
+            SeriesProducer::Validate,
+            1,
+            detcore_tree,
+            None,
+        );
+        row.schema = SeriesSchema::V2;
+        row.event_id = format!("ambient-event-{key}");
+        row.run_id = format!("ambient-run-{key}");
+        row.emitted_at = format!("2026-08-27T05:00:{key:02}Z");
+        row.series.tree = (*commit).into();
+        row.series.result = None;
+        row.series.failure_class = None;
+        row
+    };
     let mut ambient_rows = (0..ambient_commits.len())
         .map(|index| legacy_row(index, SeriesOutcome::Passed, None))
         .collect::<Vec<_>>();
     ambient_rows.extend([
         legacy_row(6, SeriesOutcome::Diverged, None),
-        legacy_row(
-            7,
-            SeriesOutcome::Passed,
-            Some(ambient_commits[0].into()),
-        ),
+        legacy_row(7, SeriesOutcome::Passed, Some(ambient_commits[0].into())),
     ]);
 
     let source_commit = "a".repeat(40);
@@ -13823,8 +13934,7 @@ red/`measured-and-passed` count is **0**.",
     ] {
         let mut direct_json: JsonValue = serde_json::from_str(&object_store_outputs[0])
             .map_err(|e| format!("cannot decode projected fixture for result refusal: {e}"))?;
-        direct_json["cells"][0]["observations"][0]["results"] =
-            serde_json::json!([rendered]);
+        direct_json["cells"][0]["observations"][0]["results"] = serde_json::json!([rendered]);
         let direct_error = serde_json::from_value::<TrackedCells>(direct_json)
             .expect_err("direct tracked serde accepted a non-product observation result")
             .to_string();
@@ -14384,15 +14494,14 @@ red/`measured-and-passed` count is **0**.",
     let embedded_root = format!("--hermit={foreign_root}/target/debug/hermit");
     let path_root = format!("/usr/bin:{foreign_root}/bin");
     let interior_root = format!("prefix{foreign_root}/target/debug/hermit");
-    let foreign_env: BTreeMap<String, String> =
-        [
-            ("HOME".to_string(), format!("{foreign_root}/home")),
-            ("PATH".to_string(), path_root),
-            ("SIBLING".to_string(), sibling_root.clone()),
-            ("INTERIOR".to_string(), interior_root.clone()),
-        ]
-            .into_iter()
-            .collect();
+    let foreign_env: BTreeMap<String, String> = [
+        ("HOME".to_string(), format!("{foreign_root}/home")),
+        ("PATH".to_string(), path_root),
+        ("SIBLING".to_string(), sibling_root.clone()),
+        ("INTERIOR".to_string(), interior_root.clone()),
+    ]
+    .into_iter()
+    .collect();
     let mut fixture = ObservedInvocation {
         hermit_sha: "fixture-sha".into(),
         run_id: "fixture-run".into(),
