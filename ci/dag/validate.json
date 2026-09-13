@@ -178,7 +178,7 @@
         "rss_baseline_bytes": 1073741824,
         "hard_mem_max_bytes": 2147483648,
         "classification": "cpu-bound",
-        "preferred_inner_jobs": 8,
+        "preferred_inner_jobs": 1,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
@@ -19020,7 +19020,7 @@
         "rss_baseline_bytes": 1073741824,
         "hard_mem_max_bytes": 2147483648,
         "classification": "cpu-bound",
-        "preferred_inner_jobs": 8,
+        "preferred_inner_jobs": 1,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
@@ -67146,7 +67146,7 @@
         "rss_baseline_bytes": 1073741824,
         "hard_mem_max_bytes": 2147483648,
         "classification": "cpu-bound",
-        "preferred_inner_jobs": 8,
+        "preferred_inner_jobs": 1,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
@@ -67544,7 +67544,7 @@
         "rss_baseline_bytes": 2147483648,
         "hard_mem_max_bytes": 2147483648,
         "classification": "cpu-bound",
-        "preferred_inner_jobs": 8,
+        "preferred_inner_jobs": 1,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
@@ -67652,7 +67652,7 @@
         "rss_baseline_bytes": 2147483648,
         "hard_mem_max_bytes": 2147483648,
         "classification": "cpu-bound",
-        "preferred_inner_jobs": 8,
+        "preferred_inner_jobs": 1,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
