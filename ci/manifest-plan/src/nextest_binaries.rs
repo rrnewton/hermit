@@ -968,8 +968,9 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    // A single rename publishes all selections together. The previous record
-    // remains usable if any preparation or verification step fails.
+    // A single rename publishes all selections together. Failure leaves the
+    // previous record in place; it remains usable only while its recorded
+    // inputs still match, since earlier Cargo commands may have changed them.
     fs::rename(staging, artifacts.root.join("current.json")).map_err(|e| e.to_string())?;
     eprintln!(
         "prepared-nextest: published {} selections and {} Cargo guests for {profile}",
