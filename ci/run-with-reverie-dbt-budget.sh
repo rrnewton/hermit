@@ -195,7 +195,16 @@ fi
 # The intervening commit changes only reverie-kvm runtime behavior and its
 # static-ELF tests. The measured native DBT build budget carries unchanged;
 # fresh Hermit validation is still required for the KVM runtime change.
-expected_pin=8c8c0a57649c9ffbf8a7a14291a64320f64b935f
+# CARRY TO 07712539 (2026-09-13): both DynamoRIO build inputs are identical
+# to 8c8c0a57 by Git object identity:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+# The pin does not change CMAKE or CMAKE_GENERATOR. The current pinned image
+# also supplies the same CMake, compiler and native build-tool bytes. Keep
+# the existing measured native-build budget; this is not a new measurement.
+# The intervening Rust runtime and GDB changes require fresh Hermit builds
+# and execution evidence; the earlier Demo 2 failure remains unresolved.
+expected_pin=0771253923fac12de6b1e1352227318548165c70
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

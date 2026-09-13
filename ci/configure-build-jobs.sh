@@ -222,8 +222,17 @@ fi
 # The intervening commit changes only reverie-kvm runtime behavior and its
 # static-ELF tests. The measured native DBT build budget carries unchanged;
 # fresh Hermit validation is still required for the KVM runtime change.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8c8c0a57649c9ffbf8a7a14291a64320f64b935f ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 8c8c0a57649c9ffbf8a7a14291a64320f64b935f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 07712539 (2026-09-13): both DynamoRIO build inputs are identical
+# to 8c8c0a57 by Git object identity:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+# The pin does not change CMAKE or CMAKE_GENERATOR. The current pinned image
+# also supplies the same CMake, compiler and native build-tool bytes. Keep
+# the existing measured native-build budget; this is not a new measurement.
+# The intervening Rust runtime and GDB changes require fresh Hermit builds
+# and execution evidence; the earlier Demo 2 failure remains unresolved.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0771253923fac12de6b1e1352227318548165c70 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0771253923fac12de6b1e1352227318548165c70 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
