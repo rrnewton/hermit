@@ -194,8 +194,8 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.isolated_dbt_workdir", 2),
     ("test.isolated_detcore_workdir", 1),
-    ("test.regular_crates", 470),
-    ("test.hermit_unit", 531),
+    ("test.regular_crates", 486),
+    ("test.hermit_unit", 533),
     ("test.detcore_unit", 667),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
@@ -224,10 +224,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_parallel_on_host", 5),
     ("test.detcore_unit_on_host", 667),
     ("test.hermit_integration_on_host", 156),
-    ("test.hermit_unit_on_host", 531),
+    ("test.hermit_unit_on_host", 533),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
-    ("test.regular_crates_on_host", 470),
+    ("test.regular_crates_on_host", 486),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
