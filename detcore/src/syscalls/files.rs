@@ -39,6 +39,7 @@ use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Whence;
 use reverie::syscalls::family::StatFamily;
+use reverie::syscalls::family::WriteFamily;
 use tracing::error;
 use tracing::info;
 use tracing::trace;
@@ -2008,53 +2009,110 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
-    /// Put a regular inherited stdio description at EOF before a write when the
-    /// guest has logically enabled O_APPEND. The kernel flag is deliberately
-    /// absent from the shared supervisor description, so Detcore supplies the
-    /// behavior without leaving the flag behind. Pipes and sockets need no
-    /// adjustment because append has no effect on them.
-    async fn position_inherited_append<G: Guest<Self>>(
+    // TODO-HUMAN-REVIEW(PR-2694): Per-call append must preserve Linux error
+    // precedence, the original OFD offset contract, and record/replay effects.
+    /// Execute a write after its resource admission. Read the shared logical
+    /// flags here: another admitted thread may have changed them while this
+    /// writer waited. Regular inherited streams use one kernel RWF_APPEND
+    /// operation; neither their shared host flags nor their offset are changed
+    /// before that operation. Cached nonregular descriptors keep their original
+    /// syscall path. A capturing backend still owns its output-alias semantics
+    /// if the initial metadata instead came from a regular host stdout file.
+    async fn record_or_replay_inherited_write<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        fd: RawFd,
-    ) -> Result<(), Error> {
-        let append = guest.thread_state().with_detfd(fd, |detfd| {
-            is_inherited_container_stdio(detfd.resource())
-                && detfd.status_flags() & libc::O_APPEND != 0
+        call: impl Into<WriteFamily>,
+    ) -> Result<i64, Error> {
+        let call = call.into();
+        let append = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            inherited_regular_file_has_logical_append(detfd)
         })?;
-        if append {
-            match guest
-                .inject_with_retry(Syscall::Lseek(
-                    syscalls::Lseek::new()
-                        .with_fd(fd)
-                        .with_offset(0)
-                        .with_whence(Whence::SEEK_END),
-                ))
-                .await
-            {
-                Ok(_) | Err(Errno::ESPIPE) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(())
-    }
-
-    /// Return the current end of an inherited regular-file stream when the
-    /// guest has logically enabled O_APPEND. Positional writes do not advance
-    /// the open file description's offset, so they cannot use
-    /// `position_inherited_append`; they must write at this explicit offset.
-    async fn inherited_append_offset<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        fd: RawFd,
-    ) -> Result<Option<i64>, Error> {
-        let append = guest
-            .thread_state()
-            .with_detfd(fd, |detfd| inherited_regular_file_has_logical_append(detfd))?;
         if !append {
-            return Ok(None);
+            return self
+                .record_or_replay_preserving_tool_errors(guest, Syscall::from(call))
+                .await;
         }
-        Ok(Some(self.inject_fstat(guest, fd).await?.st_size))
+
+        let scalar = match &call {
+            WriteFamily::Write(call) => Some((call.buf(), call.len(), -1)),
+            WriteFamily::Pwrite64(call) => Some((call.buf(), call.len(), call.offset())),
+            _ => None,
+        };
+        if let Some((buffer, length, offset)) = scalar {
+            let injected = syscalls::Pwritev2::new()
+                .with_fd(call.fd())
+                .with_pos_l(offset as u64)
+                .with_pos_h(0)
+                .with_flags(libc::RWF_APPEND);
+            if length > isize::MAX as usize {
+                // Scalar write rejects this access range with EFAULT. A vector
+                // with this length instead fails import with EINVAL. An invalid
+                // iovec lets the kernel preserve its descriptor/seekability
+                // checks before producing the required EFAULT on x86-64.
+                return self
+                    .record_or_replay_preserving_tool_errors(
+                        guest,
+                        injected
+                            .with_iov(Addr::from_raw(usize::MAX))
+                            .with_iov_len(1),
+                    )
+                    .await;
+            }
+            let mut stack = guest.stack().await;
+            // Two entries deliberately retain the multi-iovec import path.
+            // The one-entry kernel optimization truncates a huge length before
+            // access_ok, unlike scalar write, and can spuriously write a prefix.
+            let iovecs = [
+                libc::iovec {
+                    iov_base: buffer.map_or(std::ptr::null_mut(), |addr| {
+                        addr.as_raw() as *mut libc::c_void
+                    }),
+                    iov_len: length,
+                },
+                libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                },
+            ];
+            let iov = stack.push(iovecs).cast();
+            let _guard = stack.commit()?;
+            // Keep the scratch alive through the nested tool as well as the
+            // injection. Recorder observes RWF_APPEND/-1, and Replayer reads
+            // these same live input vectors when reproducing output bytes.
+            return self
+                .record_or_replay_preserving_tool_errors(
+                    guest,
+                    injected.with_iov(Some(iov)).with_iov_len(2),
+                )
+                .await;
+        }
+
+        let injected = match call {
+            WriteFamily::Writev(call) => syscalls::Pwritev2::new()
+                .with_fd(call.fd())
+                .with_iov(call.iov())
+                .with_iov_len(call.len() as u64)
+                .with_pos_l(u64::MAX)
+                .with_pos_h(0)
+                .with_flags(libc::RWF_APPEND),
+            WriteFamily::Pwritev(call) => syscalls::Pwritev2::new()
+                .with_fd(call.fd())
+                .with_iov(call.iov())
+                .with_iov_len(call.iov_len() as u64)
+                .with_pos_l(call.pos_l())
+                .with_pos_h(call.pos_h())
+                .with_flags(libc::RWF_APPEND),
+            WriteFamily::Pwritev2(call) => {
+                if call.flags() & libc::RWF_NOAPPEND != 0 {
+                    call
+                } else {
+                    call.with_flags(call.flags() | libc::RWF_APPEND)
+                }
+            }
+            WriteFamily::Write(_) | WriteFamily::Pwrite64(_) => unreachable!(),
+        };
+        self.record_or_replay_preserving_tool_errors(guest, injected)
+            .await
     }
 
     /// SYS_write system call.
@@ -2093,8 +2151,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             touch_file(guest, r).await;
         }
 
-        self.position_inherited_append(guest, call.fd()).await?;
-
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::W);
             if should_tag_sabre_internal_pipe_io(
@@ -2131,10 +2187,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
 
             loop {
-                match self
-                    .record_or_replay_preserving_tool_errors(guest, call)
-                    .await
-                {
+                match self.record_or_replay_inherited_write(guest, call).await {
                     Ok(res) => {
                         remaining_buf -= res as usize;
                         total_written_bytes += res;
@@ -2160,8 +2213,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
         } else {
-            self.record_or_replay_preserving_tool_errors(guest, call)
-                .await
+            self.record_or_replay_inherited_write(guest, call).await
         };
 
         resource_release_all(guest).await;
@@ -2207,19 +2259,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
 
-        if let Some(offset) = self.inherited_append_offset(guest, call.fd()).await? {
-            call = call.with_offset(offset);
-        }
-
         let result = if guest.config().deterministic_io {
             let mut total_written = 0_i64;
             let mut remaining = call.len();
 
             loop {
-                match self
-                    .record_or_replay_preserving_tool_errors(guest, call)
-                    .await
-                {
+                match self.record_or_replay_inherited_write(guest, call).await {
                     Ok(written) => {
                         let Ok(written) = usize::try_from(written) else {
                             break Err(Errno::EIO.into());
@@ -2263,8 +2308,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
         } else {
-            self.record_or_replay_preserving_tool_errors(guest, call)
-                .await
+            self.record_or_replay_inherited_write(guest, call).await
         };
 
         if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
@@ -2312,8 +2356,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
         })?;
 
-        self.position_inherited_append(guest, call.fd()).await?;
-
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::W);
             if should_tag_sabre_internal_pipe_io(
@@ -2335,8 +2377,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             self.execute_nonblockable_fd_syscall(guest, call).await
         } else {
-            self.record_or_replay_preserving_tool_errors(guest, call)
-                .await
+            self.record_or_replay_inherited_write(guest, call).await
         };
 
         if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
@@ -2518,7 +2559,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub async fn handle_pwritev<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        mut call: syscalls::Pwritev,
+        call: syscalls::Pwritev,
     ) -> Result<i64, Error> {
         // Validate the caller's offset before logical append can replace it
         // with EOF. pwritev has no pwritev2-style -1 offset exception.
@@ -2551,19 +2592,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
 
-        if let Some(offset) = self.inherited_append_offset(guest, call.fd()).await? {
-            let offset = offset as u64;
-            let (low, high) = if std::mem::size_of::<usize>() == 8 {
-                (offset, 0)
-            } else {
-                (offset & u64::from(u32::MAX), offset >> 32)
-            };
-            call = call.with_pos_l(low).with_pos_h(high);
-        }
-
-        let result = self
-            .record_or_replay_preserving_tool_errors(guest, call)
-            .await;
+        let result = self.record_or_replay_inherited_write(guest, call).await;
 
         if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
             let inode = raw_ino.expect("virtualized metadata requires stat data for tracked fds");
@@ -2581,7 +2610,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub async fn handle_pwritev2<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        mut call: syscalls::Pwritev2,
+        call: syscalls::Pwritev2,
     ) -> Result<i64, Error> {
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
             let offset = vectored_offset(call.pos_l(), call.pos_h());
@@ -2621,18 +2650,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, request).await;
         }
 
-        let inherited_append = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            inherited_regular_file_has_logical_append(detfd)
-        })?;
-        if inherited_append && call.flags() & libc::RWF_NOAPPEND == 0 {
-            // RWF_APPEND supplies Linux's append behavior for this one call
-            // without changing the supervisor's shared file-description flags.
-            call = call.with_flags(call.flags() | libc::RWF_APPEND);
-        }
-
-        let result = self
-            .record_or_replay_preserving_tool_errors(guest, call)
-            .await;
+        let result = self.record_or_replay_inherited_write(guest, call).await;
 
         if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
             let inode = raw_ino.expect("virtualized metadata requires stat data for tracked fds");
@@ -4958,3 +4976,7 @@ mod test {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "files/append_tests.rs"]
+mod append_tests;
