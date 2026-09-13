@@ -287,8 +287,8 @@ How it runs:
   budgets from the typed manifest tool. The in-memory graph then reuses the
   canonical Hermit/resource build commands and their submodule, pin, script,
   and manifest prerequisites from ci/dag/validate.json. It does not run the
-  full validation graph. Fixture preparation is serialized. Every selected-cell repetition then runs in its own safe-ci
-  cgroup. Existing resource caps admit
+  full validation graph. Fixture preparation is serialized. Every selected-cell
+  repetition then runs in its own safe-ci cgroup. Existing resource caps admit
   four manifest guests at once, including KVM guests. A failure, timeout, OOM, or missing result does not
   intentionally stop later selected checks.
   The combined crash/error bucket contains remaining nonzero harness exits,
@@ -6890,6 +6890,19 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     if !required_builds_complete(&repeated_build_results, &repeated_metadata) {
         return Err("repeated exact ptrace setup refused its direct Hermit build".into());
+    }
+    for tag in ["pre.submodules", "pre.reverie_pin", "build.rust_scripts", "gate.manifest"] {
+        let marker = build_marker(&repeated_build_results, tag);
+        fs::remove_file(&marker)
+            .map_err(|e| format!("cannot remove prerequisite marker {tag}: {e}"))?;
+        if required_builds_complete(&repeated_build_results, &repeated_metadata) {
+            return Err(format!("otherwise complete setup accepted missing prerequisite marker {tag}"));
+        }
+        fs::write(&marker, "ok\n")
+            .map_err(|e| format!("cannot restore prerequisite marker {tag}: {e}"))?;
+        if !required_builds_complete(&repeated_build_results, &repeated_metadata) {
+            return Err(format!("restoring prerequisite marker {tag} did not restore completed setup"));
+        }
     }
 
     let red_batch_selection = CellSelection {
