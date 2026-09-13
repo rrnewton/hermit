@@ -15,6 +15,9 @@ args = sys.argv[1:]
 with open(os.environ["CARGO_CALL_LOG"], "a", encoding="utf-8") as log:
     log.write(json.dumps(args) + "\n")
 
+if args[:2] == ["nextest", "list"] and os.environ.get("CARGO_ARTIFACT_MODE") == "declined":
+    raise SystemExit(75)
+
 
 def package_id(name):
     return f"path+file://{root}/{name}#{name}@1.0.0"
