@@ -3901,6 +3901,19 @@ mod tests {
                 }
             }
 
+            impl ControlGuest {
+                fn second_command(&self) -> child_exit::Command {
+                    let mut delivery = self.command.delivery.clone();
+                    delivery.id = 2;
+                    delivery.child = DetPid::from_raw(7);
+                    delivery.child_mm = MmId::initial(delivery.child);
+                    delivery.exit.status = 38;
+                    delivery.exit.user_ticks = 24;
+                    delivery.exit.system_ticks = 12;
+                    child_exit::Command::new(self.command.operation, delivery)
+                }
+            }
+
             #[async_trait::async_trait]
             impl GlobalRPC<GlobalState> for ControlGuest {
                 async fn send_rpc(
@@ -3931,6 +3944,12 @@ mod tests {
                                     },
                                 }
                             );
+                            if self.mode == "multiple-controls" {
+                                return (
+                                    None,
+                                    GlobalResponse::DeliverChildExit(self.second_command()),
+                                );
+                            }
                             if self.mode == "drop-ack" {
                                 eprintln!("CHILD_EXIT_ACK_SUSPENDED: requests=1 queues=1 acks=1");
                                 return std::future::pending().await;
@@ -3943,6 +3962,27 @@ mod tests {
                                 assert_eq!(self.mode, "late-accepted");
                                 (None, GlobalResponse::ThreadExited)
                             }
+                        }
+                        2 => {
+                            assert_eq!(self.mode, "multiple-controls");
+                            assert_eq!(self.queued, 2);
+                            let command = self.second_command();
+                            assert_eq!(
+                                request,
+                                GlobalRequest::AcknowledgeChildExit {
+                                    operation: command.operation,
+                                    delivery_id: command.delivery.id,
+                                    outcome: child_exit::Outcome::Accepted {
+                                        disposition: child_exit::Disposition::PendingBlocked,
+                                        pending_generation: 42,
+                                        coalesced: false,
+                                    },
+                                }
+                            );
+                            (
+                                Some(LogicalTime::from_secs(1)),
+                                GlobalResponse::RequestResources(ResumeStatus::Normal),
+                            )
                         }
                         _ => panic!("the original resource request was published twice"),
                     }
@@ -3995,6 +4035,28 @@ mod tests {
                     event: reverie::SignalEvent,
                 ) -> reverie::ChildExitSignalOutcome {
                     self.queued += 1;
+                    if self.mode == "multiple-controls" && self.queued == 2 {
+                        assert_eq!(self.calls.load(Ordering::SeqCst), 2);
+                        assert_eq!(
+                            event.target(),
+                            reverie::SignalTarget::Process {
+                                pid: Pid::from_raw(123_456)
+                            }
+                        );
+                        assert_eq!(event.signal(), libc::SIGCHLD);
+                        assert_eq!(event.siginfo(), self.second_command().siginfo);
+                        let bytes = event.siginfo();
+                        assert_eq!(i32::from_ne_bytes(bytes[16..20].try_into().unwrap()), 7);
+                        assert_eq!(i32::from_ne_bytes(bytes[24..28].try_into().unwrap()), 38);
+                        assert_eq!(u64::from_ne_bytes(bytes[32..40].try_into().unwrap()), 24);
+                        assert_eq!(u64::from_ne_bytes(bytes[40..48].try_into().unwrap()), 12);
+                        return reverie::ChildExitSignalOutcome::Accepted {
+                            disposition: reverie::ChildExitSignalDisposition::PendingBlocked,
+                            pending_generation: 42,
+                            coalesced: false,
+                        };
+                    }
+
                     assert_eq!(self.queued, 1);
                     assert_eq!(self.calls.load(Ordering::SeqCst), 1);
                     assert_eq!(
@@ -4043,6 +4105,28 @@ mod tests {
                 fn read_clock(&mut self) -> Result<u64, reverie::Error> {
                     panic!("control read backend clock")
                 }
+            }
+
+            #[test]
+            fn child_exit_two_callbacks_keep_one_resource_request_and_one_final_time_update() {
+                let mut guest = ControlGuest::new("multiple-controls");
+                let GlobalRequest::RequestResources(resources, _) = guest.base.request.clone()
+                else {
+                    unreachable!()
+                };
+                let result =
+                    crate::tool_global::resource_request(&mut guest, resources).now_or_never();
+                assert_eq!(result, Some(ResumeStatus::Normal));
+                assert_eq!(guest.calls.load(Ordering::SeqCst), 3);
+                assert_eq!(guest.queued, 2);
+                assert_eq!(guest.base.cancellations, 0);
+                let mut expected = DetTime::zero();
+                expected.add_syscall();
+                expected.advance_to(LogicalTime::from_secs(1));
+                assert_eq!(
+                    serde_json::to_value(&guest.base.state.thread_logical_time).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
             }
 
             #[test]

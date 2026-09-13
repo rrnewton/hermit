@@ -381,6 +381,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_child_exit_controls_preserve_one_original_request_and_one_commit() {
+        let (config, state, parent, child, original) = state();
+        let before_req = state.sched.lock().unwrap().next_turns[&parent].req.clone();
+        let clock = DetTime::new(&config);
+        let mut response = Box::pin(state.receive_rpc(
+            Tid::from_raw(parent.as_raw()),
+            (
+                clock.clone(),
+                MmId::initial(parent),
+                GlobalRequest::RequestResources(original.clone(), parent),
+            ),
+        ));
+        assert!(poll!(response.as_mut()).is_pending());
+        due(&state, parent, child);
+        let second_child = DetPid::from_raw(19);
+        {
+            let mut scheduler = state.sched.lock().unwrap();
+            scheduler.thread_tree.add_child(parent, second_child, true);
+            scheduler.logically_kill_thread(
+                &second_child,
+                &second_child,
+                MmId::initial(second_child),
+            );
+            let mut second = scheduler.child_exits.due[&1].clone();
+            second.id = 2;
+            second.child = second_child;
+            second.child_mm = MmId::initial(second_child);
+            second.exit.status = 38;
+            scheduler.child_exits.due.insert(2, second);
+        }
+        let last = Err(SkipTurn);
+        let mut turn = Box::pin(do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &last,
+        ));
+        let mut operation_id = None;
+        for (delivery_id, expected_child, expected_status) in
+            [(1, child, 37), (2, second_child, 38)]
+        {
+            assert!(poll!(turn.as_mut()).is_pending());
+            let (None, GlobalResponse::DeliverChildExit(command)) = response.await else {
+                panic!("missing ordered child control")
+            };
+            assert_eq!(command.delivery.id, delivery_id);
+            assert_eq!(command.delivery.child, expected_child);
+            assert_eq!(command.delivery.exit.status, expected_status);
+            if let Some(id) = operation_id {
+                assert_eq!(command.operation, id);
+            } else {
+                operation_id = Some(command.operation);
+            }
+            {
+                let scheduler = state.sched.lock().unwrap();
+                assert_eq!(scheduler.turn, 0);
+                assert_eq!(scheduler.next_turns[&parent].req, before_req);
+                assert_eq!(
+                    scheduler.child_exits.operations[&command.operation].original,
+                    original
+                );
+                assert_eq!(scheduler.child_exits.sequences[&parent], 1);
+            }
+            let before_time = state.global_time.lock().unwrap().as_nanos();
+            let mut poisoned = clock.clone();
+            for _ in 0..100 {
+                poisoned.add_syscall();
+            }
+            response = Box::pin(state.receive_rpc(
+                Tid::from_raw(parent.as_raw()),
+                (
+                    poisoned,
+                    MmId::initial(parent),
+                    GlobalRequest::AcknowledgeChildExit {
+                        operation: command.operation,
+                        delivery_id,
+                        outcome: Outcome::Accepted {
+                            disposition: Disposition::PendingBlocked,
+                            pending_generation: 9,
+                            coalesced: delivery_id == 2,
+                        },
+                    },
+                ),
+            ));
+            assert!(poll!(response.as_mut()).is_pending());
+            assert_eq!(state.global_time.lock().unwrap().as_nanos(), before_time);
+        }
+        assert_eq!(turn.await.unwrap(), original);
+        assert_eq!(
+            response.await.1,
+            GlobalResponse::RequestResources(ResumeStatus::Normal)
+        );
+        let scheduler = state.sched.lock().unwrap();
+        assert_eq!(scheduler.turn, 1);
+        assert_eq!(scheduler.child_exits.sequences[&parent], 1);
+        assert!(scheduler.child_exits.operations.is_empty());
+        assert!(scheduler.child_exits.current.is_empty());
+        assert!(scheduler.child_exits.due.is_empty());
+    }
+
+    #[tokio::test]
     async fn unconsumed_delivery_retirement_settles_without_callback_or_grant() {
         let (config, state, parent, child, original) = state();
         let request = state.receive_rpc(
