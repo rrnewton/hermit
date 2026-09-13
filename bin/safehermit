@@ -397,12 +397,14 @@ capper "$max_log_bytes" "$log_file" "$unit" < "$fifo" >&2 &
 capper_pid=$!
 
 started=$(date +%s)
+started_monotonic_usec="$(python3 -c 'import time; print(time.monotonic_ns() // 1000)' 2>/dev/null)"
 if [ "$runner_state" = APPLIED ]; then
     "${runner[@]}" "$hermit_bin" "$@" 2>"$fifo"
 else
     "$hermit_bin" "$@" 2>"$fifo"
 fi
 rc=$?
+runner_rc=$rc
 wait "$capper_pid" 2>/dev/null
 rm -f "$fifo"
 elapsed=$(( $(date +%s) - started ))
@@ -417,7 +419,7 @@ fi
 field elapsed_secs  "$elapsed"
 field bytes_written "$wrote"
 field truncated     "$trunc"
-field exit_code     "$rc"
+field runner_exit_code "$runner_rc"
 if [ "$trunc" = true ]; then
     field killed_at_cap "${killed:-unknown}"
     # A distinct code, because "255" tells a caller nothing about WHY.
@@ -449,6 +451,59 @@ unit_result=""
 if [ "$runner_state" = APPLIED ] && [ "$unit" != none ]; then
     unit_result="$(systemctl --user show "$unit.service" -p Result --value 2>/dev/null)"
     field unit_result "${unit_result:-UNREADABLE}"
+    case "$unit_result" in
+        exit-code|signal|core-dump)
+            # systemd-run reports core-dump as 1 and signal as 255, not the
+            # shell's 128 + signal number. Read the completed process before
+            # resetting its failed unit; never infer an abort from exit 1.
+            termination_text="$(timeout 5 systemctl --user show "$unit.service" \
+                -p Id -p LoadState -p ActiveState -p SubState -p Result \
+                -p ExecMainPID -p ExecMainCode -p ExecMainStatus \
+                -p ExecMainStartTimestampMonotonic 2>/dev/null)"
+            termination_query_rc=$?
+            declare -A termination=()
+            termination_valid=1
+            while IFS='=' read -r key value; do
+                case "$key" in
+                    Id|LoadState|ActiveState|SubState|Result|ExecMainPID|ExecMainCode|ExecMainStatus|ExecMainStartTimestampMonotonic)
+                        [ -z "${termination[$key]+present}" ] || termination_valid=0
+                        termination[$key]="$value" ;;
+                    *) termination_valid=0 ;;
+                esac
+            done <<<"$termination_text"
+            if [ "$termination_query_rc" -eq 0 ] && [ "$termination_valid" -eq 1 ] \
+                && [ "${#termination[@]}" -eq 9 ] \
+                && [ "${termination[Id]:-}" = "$unit.service" ] \
+                && [ "${termination[LoadState]:-}" = loaded ] \
+                && [ "${termination[ActiveState]:-}" = failed ] \
+                && [ "${termination[SubState]:-}" = failed ] \
+                && [ "${termination[Result]:-}" = "$unit_result" ] \
+                && [[ "${termination[ExecMainPID]:-}" =~ ^[1-9][0-9]*$ ]] \
+                && [[ "$started_monotonic_usec" =~ ^[1-9][0-9]{0,17}$ ]] \
+                && [[ "${termination[ExecMainStartTimestampMonotonic]:-}" =~ ^[1-9][0-9]{0,17}$ ]] \
+                && [ "${termination[ExecMainStartTimestampMonotonic]}" -ge "$started_monotonic_usec" ]; then
+                field exec_main_pid "${termination[ExecMainPID]}"
+                field exec_main_code "${termination[ExecMainCode]}"
+                field exec_main_status "${termination[ExecMainStatus]}"
+                field exec_main_start_monotonic_usec "${termination[ExecMainStartTimestampMonotonic]}"
+                if { [ "$unit_result" = signal ] && [ "${termination[ExecMainCode]}" = 2 ]; } \
+                    || { [ "$unit_result" = core-dump ] && [ "${termination[ExecMainCode]}" = 3 ]; }; then
+                    if [[ "${termination[ExecMainStatus]}" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]] \
+                        && [ "$runner_rc" -ne 0 ]; then
+                        field process_signal "${termination[ExecMainStatus]}"
+                        # A deliberate cap verdict keeps its original priority.
+                        [ "$rc" -eq 125 ] || rc=$((128 + termination[ExecMainStatus]))
+                    else
+                        say "PROCESS STATUS UNREADABLE: invalid signal status; retaining runner exit $runner_rc."
+                    fi
+                elif [ "$unit_result" != exit-code ]; then
+                    say "PROCESS STATUS UNREADABLE: termination code differs from Result; retaining runner exit $runner_rc."
+                fi
+            else
+                say "PROCESS STATUS UNREADABLE: completed unit identity or properties differ; retaining runner exit $runner_rc."
+            fi
+            ;;
+    esac
     # Clean up explicitly, since --collect is deliberately not used. A timed-out unit
     # is left in the failed state otherwise, and its name stays taken.
     systemctl --user reset-failed "$unit.service" >/dev/null 2>&1 || true
@@ -463,6 +518,7 @@ elif [ -z "$unit_result" ] && [ "$no_deadline" != 1 ] && [ "$runner_state" = APP
     rc=124
 fi
 
+field exit_code "$rc"
 if [ -f "$reg" ]; then
     python3 - "$reg" "$rc" "$trunc" <<'PY' 2>/dev/null || true
 import json, sys
