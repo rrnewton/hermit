@@ -1329,6 +1329,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/fork-exec-pipeline",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/fork-exec-pipeline",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -1791,6 +1798,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/pipe-ipc",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/pipe-ipc",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -1995,6 +2009,13 @@
           "test": "backend-parity-c/set-tid-address",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/short-io-split-identity",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -2594,6 +2615,13 @@
           "category": "c-programs",
           "test": "c-programs/dbt-copied-tiocgpgrp",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-copied-tiocgpgrp",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -2798,6 +2826,13 @@
           "test": "c-programs/futex-wake-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/get-robust-list-child",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -4141,6 +4176,13 @@
           "category": "c-programs",
           "test": "c-programs/ptrace-seize-eperm",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ptrace-seize-eperm",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -5254,6 +5296,13 @@
           "category": "c-programs",
           "test": "c-programs/wait-on-child",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/wait-on-child",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -5400,6 +5449,13 @@
           "test": "data-handling/dd-partial-transfers",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "data-handling",
+          "test": "data-handling/jq-json-transform",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -5607,7 +5663,21 @@
           "category": "determinism-stress-c",
           "test": "determinism-stress-c/pipe-chain",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
+          "test": "determinism-stress-c/pipe-chain",
+          "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
+          "test": "determinism-stress-c/pipe-prefill",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -5711,6 +5781,13 @@
           "category": "determinism-stress",
           "test": "determinism-stress/example-race",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/example-race",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -5740,6 +5817,13 @@
           "test": "determinism-stress/thread-interleaving",
           "mode": "chaos",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/thread-output",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -5885,6 +5969,13 @@
           "category": "language-runtimes",
           "test": "language-runtimes/m4-macro-mkstemp",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/m4-macro-mkstemp",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -5913,6 +6004,13 @@
           "category": "language-runtimes",
           "test": "language-runtimes/perl-io-subprocess-time",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/perl-io-subprocess-time",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -5934,6 +6032,13 @@
           "category": "language-runtimes",
           "test": "language-runtimes/python-dict-hash-iteration",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-dict-hash-iteration",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -5949,6 +6054,13 @@
           "test": "language-runtimes/python-hash-determinism",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-io-subprocess-time",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -5991,6 +6103,13 @@
           "test": "language-runtimes/rust-hashmap-iteration",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/tcl-rand-clock",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -6156,6 +6275,13 @@
           "category": "system-utils",
           "test": "system-utils/date-nanoseconds",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/date-nanoseconds",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -6290,6 +6416,13 @@
           "test": "system-utils/nscd-neutralised",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/openssl-enc",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -6436,6 +6569,13 @@
           "category": "system-utils",
           "test": "system-utils/shm-coherency-identity",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/shm-coherency-identity",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -6458,6 +6598,13 @@
           "test": "system-utils/sort-random",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/ssh-keygen-ed25519",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -13655,6 +13802,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/fork-exec-pipeline",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/fork-exec-pipeline",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -14117,6 +14271,13 @@
           "category": "backend-parity-c",
           "test": "backend-parity-c/pipe-ipc",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/pipe-ipc",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -14321,6 +14482,13 @@
           "test": "backend-parity-c/set-tid-address",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "backend-parity-c",
+          "test": "backend-parity-c/short-io-split-identity",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -14873,6 +15041,13 @@
           "category": "c-programs",
           "test": "c-programs/dbt-copied-tiocgpgrp",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-copied-tiocgpgrp",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -15077,6 +15252,13 @@
           "test": "c-programs/futex-wake-enosys",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/get-robust-list-child",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -16420,6 +16602,13 @@
           "category": "c-programs",
           "test": "c-programs/ptrace-seize-eperm",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ptrace-seize-eperm",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17533,6 +17722,13 @@
           "category": "c-programs",
           "test": "c-programs/wait-on-child",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/wait-on-child",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17667,6 +17863,13 @@
           "test": "data-handling/dd-partial-transfers",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "data-handling",
+          "test": "data-handling/jq-json-transform",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17862,7 +18065,21 @@
           "category": "determinism-stress-c",
           "test": "determinism-stress-c/pipe-chain",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
+          "test": "determinism-stress-c/pipe-chain",
+          "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
+          "test": "determinism-stress-c/pipe-prefill",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -17960,6 +18177,13 @@
           "category": "determinism-stress",
           "test": "determinism-stress/example-race",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/example-race",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -17989,6 +18213,13 @@
           "test": "determinism-stress/thread-interleaving",
           "mode": "chaos",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/thread-output",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18128,6 +18359,13 @@
           "category": "language-runtimes",
           "test": "language-runtimes/m4-macro-mkstemp",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/m4-macro-mkstemp",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -18156,6 +18394,13 @@
           "category": "language-runtimes",
           "test": "language-runtimes/perl-io-subprocess-time",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/perl-io-subprocess-time",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -18177,6 +18422,13 @@
           "category": "language-runtimes",
           "test": "language-runtimes/python-dict-hash-iteration",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-dict-hash-iteration",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -18192,6 +18444,13 @@
           "test": "language-runtimes/python-hash-determinism",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-io-subprocess-time",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18234,6 +18493,13 @@
           "test": "language-runtimes/rust-hashmap-iteration",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/tcl-rand-clock",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18387,6 +18653,13 @@
           "category": "system-utils",
           "test": "system-utils/date-nanoseconds",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/date-nanoseconds",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -18521,6 +18794,13 @@
           "test": "system-utils/nscd-neutralised",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/openssl-enc",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18667,6 +18947,13 @@
           "category": "system-utils",
           "test": "system-utils/shm-coherency-identity",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/shm-coherency-identity",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -18689,6 +18976,13 @@
           "test": "system-utils/sort-random",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/ssh-keygen-ed25519",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
