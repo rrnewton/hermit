@@ -4064,7 +4064,11 @@ fn apply_pressure_summary(
         // invocation and appends every coordinate again.
         normalise_invocation_root(&mut observed_invocation);
         clear_reconstructable_shell_commands(&mut observed_invocation);
-        let inserted = observation.invocations.insert(observed_invocation);
+        let inserted = !observation
+            .invocations
+            .iter()
+            .any(|existing| pressure_invocation_matches(existing, &observed_invocation))
+            && observation.invocations.insert(observed_invocation);
         if inserted {
             observation.first_divergent_scheduler_turn.record(turn);
             observation
@@ -7265,6 +7269,32 @@ fn clear_reconstructable_shell_commands(invocation: &mut ObservedInvocation) {
     }
 }
 
+/// Compare a stored invocation with an already validated, normalized compact
+/// import without rewriting the stored evidence. A present legacy command must
+/// reconstruct exactly before its redundant representation can be ignored.
+fn pressure_invocation_matches(
+    existing: &ObservedInvocation,
+    incoming: &ObservedInvocation,
+) -> bool {
+    let reconstructs = |command: &str, cwd: &str, env: &BTreeMap<String, String>, argv: &[String]| {
+        command.is_empty() || command == literal_shell_command(cwd, env, argv)
+    };
+    if !reconstructs(
+        &existing.shell_command,
+        &existing.cwd,
+        &existing.env,
+        &existing.argv,
+    ) || existing.attempts.iter().any(|attempt| {
+        !reconstructs(&attempt.shell_command, &attempt.cwd, &attempt.env, &attempt.argv)
+    }) {
+        return false;
+    }
+    let mut comparable = existing.clone();
+    normalise_invocation_root(&mut comparable);
+    clear_reconstructable_shell_commands(&mut comparable);
+    comparable == *incoming
+}
+
 fn normalise_recorded_root(row: &mut ResultRow) {
     let root = row.cwd.clone();
     // An empty, relative, or already-normalised root has nothing to strip.
@@ -8293,6 +8323,73 @@ red/`measured-and-passed` count is **0**.",
             "reapplying one pressure summary after a write/read round trip duplicated coordinates"
                 .into(),
         );
+    }
+    // Older stored observations retain the derived command text, while new
+    // imports omit it. Reload each representation before repeating the same
+    // campaign: neither the stored evidence nor the coordinate samples may grow.
+    for legacy_fields in [1, 2, 3] {
+        let mut legacy: TrackedCells = serde_json::from_str(&once)
+            .map_err(|error| format!("cannot load legacy pressure fixture: {error}"))?;
+        for cell in &mut legacy.cells {
+            for observation in &mut cell.observations {
+                observation.invocations = std::mem::take(&mut observation.invocations)
+                    .into_iter()
+                    .map(|mut invocation| {
+                        if legacy_fields & 1 != 0 {
+                            invocation.shell_command = literal_shell_command(
+                                &invocation.cwd, &invocation.env, &invocation.argv,
+                            );
+                        }
+                        if legacy_fields & 2 != 0 {
+                            for attempt in &mut invocation.attempts {
+                                attempt.shell_command = literal_shell_command(
+                                    &attempt.cwd, &attempt.env, &attempt.argv,
+                                );
+                            }
+                        }
+                        invocation
+                    })
+                    .collect();
+            }
+        }
+        let legacy_bytes = encoded_cells(&legacy)?;
+        let mut reloaded: TrackedCells = serde_json::from_str(&legacy_bytes)
+            .map_err(|error| format!("cannot reload legacy pressure fixture: {error}"))?;
+        apply_pressure_summary(&mut reloaded, &campaign, "sha-1", "tree-1", &depth_fixture)
+            .map_err(|error| format!("legacy pressure reimport failed: {error}"))?;
+        if encoded_cells(&reloaded)? != legacy_bytes {
+            return Err(format!(
+                "reimport changed legacy pressure evidence or duplicated coordinates (command fields {legacy_fields})"
+            ));
+        }
+    }
+    let compact = observed.cells[0].observations[0]
+        .invocations
+        .iter()
+        .next()
+        .ok_or("pressure identity fixture has no invocation")?
+        .clone();
+    let mut legacy = compact.clone();
+    legacy.shell_command = literal_shell_command(&legacy.cwd, &legacy.env, &legacy.argv);
+    for attempt in &mut legacy.attempts {
+        attempt.shell_command = literal_shell_command(&attempt.cwd, &attempt.env, &attempt.argv);
+    }
+    if !pressure_invocation_matches(&legacy, &compact) {
+        return Err("valid legacy pressure invocation differs from its compact form".into());
+    }
+    for change in ["command", "attempt-command", "attempt-status", "attempt-index", "run-id"] {
+        let mut distinct = legacy.clone();
+        match change {
+            "command" => distinct.shell_command.push_str(" ; false"),
+            "attempt-command" => distinct.attempts[0].shell_command.push_str(" ; false"),
+            "attempt-status" => distinct.attempts[0].status = Some(37),
+            "attempt-index" => distinct.attempts[0].index.push_str("-different"),
+            "run-id" => distinct.run_id.push_str("-different"),
+            _ => unreachable!(),
+        }
+        if pressure_invocation_matches(&distinct, &compact) {
+            return Err(format!("pressure invocation identity discarded distinct {change} evidence"));
+        }
     }
     let same_engine = pressure_summary("sha-doc", "tree-1", vec![pressure_row("pass", None, None)]);
     apply_pressure_summary(
