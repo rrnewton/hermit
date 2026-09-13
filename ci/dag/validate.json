@@ -734,11 +734,12 @@
         "hosted-portable",
         "portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/nextest-binaries.rs prepare portable",
       "result_manifests": [],
       "deps": [
         "gate.manifest",
-        "pre.reverie_pin"
+        "pre.reverie_pin",
+        "setup.nextest"
       ],
       "env": {},
       "networkonly": false,
@@ -912,7 +913,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category applications --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_applications/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category applications --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_applications/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "applications"
@@ -995,7 +996,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --jobs 8 --results \"$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category backend-parity-c --ci-only --allow-empty --prebuilt --jobs 8 --results \"$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_backend_parity_c/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "backend-parity-c"
@@ -2338,7 +2339,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category bin-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_bin_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_bin_c/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category bin-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_bin_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_bin_c/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "bin-c"
@@ -2414,7 +2415,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --jobs 8 --results \"$E2E_RESULT_ROOT/portable/manifest_c_programs/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_c_programs/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category c-programs --ci-only --allow-empty --prebuilt --jobs 8 --results \"$E2E_RESULT_ROOT/portable/manifest_c_programs/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_c_programs/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "c-programs"
@@ -5311,7 +5312,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category chaos-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_chaos_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_chaos_c/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category chaos-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_chaos_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_chaos_c/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "chaos-c"
@@ -5380,7 +5381,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category data-handling --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_data_handling/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_data_handling/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category data-handling --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_data_handling/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_data_handling/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "data-handling"
@@ -5477,7 +5478,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category debugger-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_debugger_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_debugger_c/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category debugger-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_debugger_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_debugger_c/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "debugger-c"
@@ -5560,7 +5561,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category determinism-stress-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress_c/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category determinism-stress-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress_c/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "determinism-stress-c"
@@ -5699,7 +5700,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category determinism-stress --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category determinism-stress --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_determinism_stress/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "determinism-stress"
@@ -5796,7 +5797,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category language-runtimes --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_language_runtimes/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_language_runtimes/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category language-runtimes --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_language_runtimes/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_language_runtimes/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "language-runtimes"
@@ -6047,7 +6048,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category shared-futex-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_shared_futex_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_shared_futex_c/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category shared-futex-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_shared_futex_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_shared_futex_c/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "shared-futex-c"
@@ -6102,7 +6103,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category system-utils --ci-only --allow-empty --prebuilt --jobs 1 --results \"$E2E_RESULT_ROOT/portable/manifest_system_utils/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_system_utils/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category system-utils --ci-only --allow-empty --prebuilt --jobs 1 --results \"$E2E_RESULT_ROOT/portable/manifest_system_utils/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_system_utils/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "system-utils"
@@ -6570,7 +6571,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category util-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_util_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_util_c/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category util-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/portable/manifest_util_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/portable/manifest_util_c/junit.xml\"'",
       "manifest": {
         "lane": "portable",
         "category": "util-c"
@@ -6793,7 +6794,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "406"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "406",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -6839,7 +6842,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "496"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "496",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -6885,7 +6890,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "656"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "656",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -6931,7 +6938,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "27"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "27",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_misc\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -6977,7 +6986,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "5"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "5",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_parallelism\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7069,7 +7080,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "138"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "138",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"aio_nr_determinism\",\"--test\",\"arch_status_determinism\",\"--test\",\"chaos_sched_yield_progress\",\"--test\",\"chaos_stress_pmu_detection\",\"--test\",\"chown_virtual_root_identity\",\"--test\",\"clock_determinism\",\"--test\",\"clock_discipline_determinism\",\"--test\",\"container_init_deadline\",\"--test\",\"cpufreq_avg_determinism\",\"--test\",\"epoll_determinism\",\"--test\",\"epoll_pwait_zero_timeout_progress\",\"--test\",\"file_nr_determinism\",\"--test\",\"fp_reduction_determinism\",\"--test\",\"futex2_refusal\",\"--test\",\"hashseed_determinism\",\"--test\",\"inode_nr_determinism\",\"--test\",\"kernel_keyring\",\"--test\",\"key_users_determinism\",\"--test\",\"mmap_determinism\",\"--test\",\"node_vmstat_determinism\",\"--test\",\"numa_maps_determinism\",\"--test\",\"perf_event_refusal\",\"--test\",\"pidfd_creation\",\"--test\",\"process_isolation_refusals\",\"--test\",\"proc_fdinfo_determinism\",\"--test\",\"proc_locks_determinism\",\"--test\",\"procfs_determinism\",\"--test\",\"procfs_positioned_determinism\",\"--test\",\"pty_nr_determinism\",\"--test\",\"python_stdlib\",\"--test\",\"robust_futex_owner_death\",\"--test\",\"self_sched_determinism\",\"--test\",\"self_schedstat_determinism\",\"--test\",\"signal_determinism\",\"--test\",\"smaps_determinism\",\"--test\",\"smaps_rollup_determinism\",\"--test\",\"softnet_stat_determinism\",\"--test\",\"sockstat_determinism\",\"--test\",\"swaps_determinism\",\"--test\",\"thp_stats_determinism\",\"--test\",\"verification_report_cli\",\"--test\",\"verification_report_consumers\",\"--test\",\"writev_determinism\",\"--test\",\"zero_copy_pipe_fallback\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7118,7 +7131,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "3"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "3",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"arbitrary_binaries\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7167,7 +7182,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "76"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "76",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7217,7 +7234,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "76"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "76",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7267,7 +7286,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "23"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "23",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"liteinst_advanced\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7316,7 +7337,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "5"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "5",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"sabre_examples\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7364,7 +7387,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "18"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "18",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"hermit_modes\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7413,7 +7438,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "18"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "18",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"hermit_modes\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7462,7 +7489,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "6"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "6",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"app_strict_verify\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7511,7 +7540,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "9"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "9",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"command_strict_verify\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7561,7 +7592,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "2"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "2",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"epoll_determinism\",\"--test\",\"rcx_canonicalization\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7610,7 +7643,9 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "1"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"rr_suite\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7725,7 +7760,7 @@
       "labels": [
         "full"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; mkdir -p target/ci; tests_misc_json=\"target/ci/tests-misc.cargo.jsonl.tmp.$$\"; tests_misc_pointer_tmp=\"target/ci/tests-misc.path.tmp.$$\"; if ! CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run --message-format=json > \"$tests_misc_json\"; then exit 1; fi; mapfile -t tests_misc_bins < <(jq -er 'select(.reason == \"compiler-artifact\" and .profile.test == true and .target.name == \"tests_misc\" and .executable != null) | .executable' \"$tests_misc_json\" | sort -u); if ((${#tests_misc_bins[@]} != 1)); then printf 'privileged build: expected one Cargo-reported tests_misc executable, found %d\\n' \"${#tests_misc_bins[@]}\" >&2; exit 1; fi; tests_misc=\"${tests_misc_bins[0]}\"; if [ ! -f \"$tests_misc\" ] || [ -L \"$tests_misc\" ] || [ ! -x \"$tests_misc\" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\\n' \"$tests_misc\" >&2; exit 1; fi; printf '%s\\n' \"$tests_misc\" > \"$tests_misc_pointer_tmp\"; mv -f \"$tests_misc_pointer_tmp\" target/ci/tests-misc.path; mv -f \"$tests_misc_json\" target/ci/tests-misc.cargo.jsonl; CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run || exit 1; if [ ! -s target/ci/tests-misc.path ]; then printf 'privileged build: Cargo-reported tests_misc path is missing\\n' >&2; exit 1; fi; mapfile -t tests_misc_paths < target/ci/tests-misc.path; if ((${#tests_misc_paths[@]} != 1)); then printf 'privileged build: Cargo-reported tests_misc path must contain exactly one line, found %d\\n' \"${#tests_misc_paths[@]}\" >&2; exit 1; fi; tests_misc=\"${tests_misc_paths[0]}\"; case \"$tests_misc\" in \"$PWD\"/target/*) ;; *) printf 'privileged build: Cargo-reported tests_misc path is outside this target directory: %s\\n' \"$tests_misc\" >&2; exit 1 ;; esac; case \"${tests_misc##*/}\" in tests_misc-*) ;; *) printf 'privileged build: Cargo-reported path does not name tests_misc: %s\\n' \"$tests_misc\" >&2; exit 1 ;; esac; if [ ! -f \"$tests_misc\" ] || [ -L \"$tests_misc\" ] || [ ! -x \"$tests_misc\" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\\n' \"$tests_misc\" >&2; exit 1; fi",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null && ./ci/nextest-binaries.rs assert privileged && tests_misc=\"$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)\" || exit 1",
       "result_manifests": [],
       "deps": [
         "build.e2e_artifact",
@@ -7764,7 +7799,7 @@
         "full",
         "cpuid-faulting"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; if [ ! -s target/ci/tests-misc.path ]; then printf 'privileged build: Cargo-reported tests_misc path is missing\\n' >&2; exit 1; fi; mapfile -t tests_misc_paths < target/ci/tests-misc.path; if ((${#tests_misc_paths[@]} != 1)); then printf 'privileged build: Cargo-reported tests_misc path must contain exactly one line, found %d\\n' \"${#tests_misc_paths[@]}\" >&2; exit 1; fi; tests_misc=\"${tests_misc_paths[0]}\"; case \"$tests_misc\" in \"$PWD\"/target/*) ;; *) printf 'privileged build: Cargo-reported tests_misc path is outside this target directory: %s\\n' \"$tests_misc\" >&2; exit 1 ;; esac; case \"${tests_misc##*/}\" in tests_misc-*) ;; *) printf 'privileged build: Cargo-reported path does not name tests_misc: %s\\n' \"$tests_misc\" >&2; exit 1 ;; esac; if [ ! -f \"$tests_misc\" ] || [ -L \"$tests_misc\" ] || [ ! -x \"$tests_misc\" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\\n' \"$tests_misc\" >&2; exit 1; fi; timeout 30 \"$tests_misc\" rdrand_rdseed_is_masked --exact",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; tests_misc=\"$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)\" || exit 1; timeout 30 \"$tests_misc\" rdrand_rdseed_is_masked --exact",
       "result_manifests": [],
       "deps": [
         "gate.manifest",
@@ -7851,7 +7886,9 @@
         "privileged-pmu.preemption"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "6"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "6",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"hermit_modes\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7916,7 +7953,7 @@
       "labels": [
         "full"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_applications/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_applications/junit.xml\"'",
       "manifest": {
         "lane": "privileged",
         "category": "applications"
@@ -7976,7 +8013,7 @@
       "labels": [
         "full"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_backend_parity_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_backend_parity_c/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_backend_parity_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_backend_parity_c/junit.xml\"'",
       "manifest": {
         "lane": "privileged",
         "category": "backend-parity-c"
@@ -8044,7 +8081,7 @@
         "full",
         "kvm"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -8062,7 +8099,9 @@
         "privileged-build.privileged_tests"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "24"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "24",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -8186,11 +8225,12 @@
       "labels": [
         "quick"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --workspace --features third-party-backends",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --workspace --features third-party-backends && ./ci/nextest-binaries.rs prepare quick",
       "result_manifests": [],
       "deps": [
         "pre.reverie_pin",
-        "quick-super-gate.manifest"
+        "quick-super-gate.manifest",
+        "quick-super-setup.nextest"
       ],
       "env": {},
       "networkonly": false,
@@ -8253,7 +8293,7 @@
       "labels": [
         "quick"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only'",
       "result_manifests": [
         {
           "lane": "portable",
@@ -10695,7 +10735,10 @@
         "quick-super-setup.nextest",
         "quick.build"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 1800,
@@ -10824,11 +10867,12 @@
       "labels": [
         "super"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --workspace --features third-party-backends",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --workspace --features third-party-backends && ./ci/nextest-binaries.rs prepare super",
       "result_manifests": [],
       "deps": [
         "pre.reverie_pin",
-        "quick-super-gate.manifest"
+        "quick-super-gate.manifest",
+        "quick-super-setup.nextest"
       ],
       "env": {},
       "networkonly": false,
@@ -10904,7 +10948,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"relaxed_flag_matrix\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 1800,
@@ -10945,7 +10992,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_parallelism\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
@@ -10986,7 +11036,10 @@
         "quick-super-gate.manifest",
         "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_parallelism\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
@@ -11027,7 +11080,10 @@
         "quick-super-gate.manifest",
         "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_parallelism\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
@@ -11068,7 +11124,10 @@
         "quick-super-gate.manifest",
         "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_parallelism\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
@@ -11109,7 +11168,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"pselect6_simulation\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 300,
@@ -11150,7 +11212,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"record_replay\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 300,
@@ -11191,7 +11256,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"app_strict_verify\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 300,
@@ -11232,7 +11300,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_misc\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 180,
@@ -11273,7 +11344,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_misc\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 180,
@@ -11314,7 +11388,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"ipc_determinism\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 180,
@@ -11355,7 +11432,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"random_determinism\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 180,
@@ -11396,7 +11476,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"integration_matrix\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 300,
@@ -11437,7 +11520,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 300,
@@ -11478,7 +11564,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"hermit_modes\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 300,
@@ -11519,7 +11608,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 300,
@@ -11560,7 +11652,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 180,
@@ -11601,7 +11696,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 180,
@@ -11642,7 +11740,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 30,
@@ -11683,7 +11784,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 120,
@@ -11724,7 +11828,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"hermit_modes\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
@@ -11765,7 +11872,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"stress_suite\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
@@ -11806,7 +11916,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"stress_suite\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
@@ -11847,7 +11960,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"hermit_modes\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
@@ -11889,7 +12005,10 @@
         "quick-super-setup.nextest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"analyze\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
@@ -11964,7 +12083,10 @@
         "quick-super-gate.manifest",
         "super.build_pinned_leveldb_super_fixture"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"leveldb\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
@@ -12005,7 +12127,10 @@
         "quick-super-gate.manifest",
         "super.build_workspace"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"sqlite_veryquick\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 600,
@@ -12032,7 +12157,7 @@
       "labels": [
         "privileged"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run && CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && ./ci/nextest-binaries.rs prepare privileged",
       "result_manifests": [],
       "deps": [
         "gate.manifest",
@@ -12152,7 +12277,9 @@
         "privileged-only-pmu.preemption"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "6"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "6",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"hermit_modes\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -12180,7 +12307,7 @@
       "labels": [
         "privileged"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_applications/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category applications --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_applications/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_applications/junit.xml\"'",
       "manifest": {
         "lane": "privileged",
         "category": "applications"
@@ -12239,7 +12366,7 @@
       "labels": [
         "privileged"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_backend_parity_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_backend_parity_c/junit.xml\"'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh target/debug/test-harness run --lane privileged --category backend-parity-c --ci-only --allow-empty --prebuilt --results \"$E2E_RESULT_ROOT/privileged/manifest_backend_parity_c/results.jsonl\" --junit \"$E2E_RESULT_ROOT/privileged/manifest_backend_parity_c/junit.xml\"'",
       "manifest": {
         "lane": "privileged",
         "category": "backend-parity-c"
@@ -12306,7 +12433,7 @@
         "privileged",
         "kvm"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -12324,7 +12451,9 @@
         "privileged-only-build.privileged_tests"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "24"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "24",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -12423,10 +12552,11 @@
       "labels": [
         "liteinst-compat-only"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --release --locked -p hermit --features third-party-backends",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --release --locked -p hermit --features third-party-backends && ./ci/nextest-binaries.rs prepare liteinst-compat-only",
       "result_manifests": [],
       "deps": [
-        "gate.manifest"
+        "gate.manifest",
+        "setup.nextest"
       ],
       "env": {},
       "networkonly": false,
@@ -12500,7 +12630,10 @@
         "liteinst.runtime",
         "setup.nextest"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"liteinst_advanced\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 900,
@@ -18875,7 +19008,7 @@
       "labels": [
         "hosted-privileged"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run && CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && ./ci/nextest-binaries.rs prepare privileged",
       "result_manifests": [],
       "deps": [
         "gate.manifest_on_host",
@@ -18994,7 +19127,9 @@
         "privileged-only-pmu.preemption_on_host"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "6"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "6",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"hermit_modes\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -19171,7 +19306,7 @@
       "labels": [
         "hosted-privileged"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -19189,7 +19324,9 @@
         "privileged-only-build.privileged_tests_on_host"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "24"
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "24",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -58925,7 +59062,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build -p hermit-manifest-plan --bins'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build -p hermit-manifest-plan --bins'",
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
@@ -58962,7 +59099,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/prepare-rust-scripts.sh'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/prepare-rust-scripts.sh'",
       "result_manifests": [],
       "deps": [
         "pre.reverie_pin",
@@ -58998,7 +59135,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/nextest-binaries.rs prepare portable'",
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
@@ -59035,7 +59172,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo clean --release -p reverie-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt && HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-runtime ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbt -p detcore-sabre -p hermit-install && mkdir -p target/ci && install -m 755 target/release/hermit target/ci/hermit-strict && sha256sum target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo clean --release -p reverie-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt && HERMIT_INSTALL_FORCE_RESTAGE=${GITHUB_RUN_ID:-local}-runtime ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbt -p detcore-sabre -p hermit-install && mkdir -p target/ci && install -m 755 target/release/hermit target/ci/hermit-strict && sha256sum target/install_pkg/rsrcs/sabre && cat target/install_pkg/rsrcs/sabre.revision'",
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
@@ -59072,7 +59209,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path target/install_pkg'",
       "result_manifests": [],
       "deps": [
         "build.runtime_release_in_pinned_root",
@@ -59111,7 +59248,7 @@
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness build --lane portable --ci-only --allow-empty'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness build --lane portable --ci-only --allow-empty'",
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
@@ -59149,7 +59286,7 @@
         "full",
         "privileged"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness build --lane privileged --ci-only --allow-empty'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness build --lane privileged --ci-only --allow-empty'",
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
@@ -59186,7 +59323,7 @@
       "labels": [
         "privileged"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run && CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && ./ci/nextest-binaries.rs prepare privileged'",
       "result_manifests": [],
       "deps": [
         "build.rust_scripts_in_pinned_root",
@@ -59357,7 +59494,7 @@
         "quick",
         "super"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build -p hermit-manifest-plan --bins'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build -p hermit-manifest-plan --bins'",
       "result_manifests": [],
       "deps": [
         "pre.reverie_pin",
@@ -59394,7 +59531,7 @@
         "quick",
         "super"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/prepare-rust-scripts.sh'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c \"$1\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/prepare-rust-scripts.sh'",
       "result_manifests": [],
       "deps": [
         "pre.reverie_pin",

@@ -5,6 +5,8 @@ pub mod cli_help;
 pub mod host_capability;
 pub mod ledger;
 pub mod manifest_value;
+pub mod nextest_binaries;
+mod nextest_build_selections;
 pub mod runner;
 pub mod service_result;
 pub mod stress_series;

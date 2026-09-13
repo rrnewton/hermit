@@ -176,9 +176,10 @@ const INTEGRATION_ARTIFACT_WRAPPER: &str =
 /// placeholder tag. The committed DAG contains the real `compat.*` population;
 /// this name is never a node and never triggers runtime graph generation.
 const STRICT_COMPAT_SELECTION_ALIAS: &str = "test.strict_compat";
-const DETCORE_MISC_TEST_PREBUILD_COMMAND: &str = r#"mkdir -p target/ci; tests_misc_json="target/ci/tests-misc.cargo.jsonl.tmp.$$"; tests_misc_pointer_tmp="target/ci/tests-misc.path.tmp.$$"; if ! CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run --message-format=json > "$tests_misc_json"; then exit 1; fi; mapfile -t tests_misc_bins < <(jq -er 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "tests_misc" and .executable != null) | .executable' "$tests_misc_json" | sort -u); if ((${#tests_misc_bins[@]} != 1)); then printf 'privileged build: expected one Cargo-reported tests_misc executable, found %d\n' "${#tests_misc_bins[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_bins[0]}"; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi; printf '%s\n' "$tests_misc" > "$tests_misc_pointer_tmp"; mv -f "$tests_misc_pointer_tmp" target/ci/tests-misc.path; mv -f "$tests_misc_json" target/ci/tests-misc.cargo.jsonl"#;
-const HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND: &str = "CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run";
-const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"if [ ! -s target/ci/tests-misc.path ]; then printf 'privileged build: Cargo-reported tests_misc path is missing\n' >&2; exit 1; fi; mapfile -t tests_misc_paths < target/ci/tests-misc.path; if ((${#tests_misc_paths[@]} != 1)); then printf 'privileged build: Cargo-reported tests_misc path must contain exactly one line, found %d\n' "${#tests_misc_paths[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_paths[0]}"; case "$tests_misc" in "$PWD"/target/*) ;; *) printf 'privileged build: Cargo-reported tests_misc path is outside this target directory: %s\n' "$tests_misc" >&2; exit 1 ;; esac; case "${tests_misc##*/}" in tests_misc-*) ;; *) printf 'privileged build: Cargo-reported path does not name tests_misc: %s\n' "$tests_misc" >&2; exit 1 ;; esac; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi"#;
+const NEXTEST_PORTABLE_PREPARE_COMMAND: &str = "./ci/nextest-binaries.rs prepare portable";
+const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str = "./ci/nextest-binaries.rs assert privileged";
+const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1"#;
+
 
 fn hermit_integration_uses_published_artifact(step: &Step) -> bool {
     step
@@ -2986,40 +2987,19 @@ cleared-caps refusal names {} starved step(s)",
                 ));
             }
         }
-        if !privileged_build
-            .cmd
-            .contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
-            || !privileged_build
-                .cmd
-                .contains(DETCORE_MISC_TEST_PREBUILD_COMMAND)
-            || !privileged_build
-                .cmd
-                .contains(HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND)
-            || !privileged_build
-                .cmd
-                .contains(TESTS_MISC_EXECUTABLE_READ_COMMAND)
+        if !privileged_build.cmd.contains("verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path")
+            || !privileged_build.cmd.contains(NEXTEST_PRIVILEGED_ASSERT_COMMAND)
+            || !privileged_build.cmd.contains(TESTS_MISC_EXECUTABLE_READ_COMMAND)
+            || privileged_build.cmd.contains("cargo ")
+            || !portable_build.cmd.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND)
         {
-            return Err(
-                "full-plan bracket: privileged build did not assert the artifact and prebuild the exact downstream test binaries".into(),
-            );
+            return Err("full-plan bracket: prepared Nextest population must come from the workspace producer and the privileged barrier must verify it without Cargo compilation".into());
         }
-        let detcore_prebuild_at = privileged_build
-            .cmd
-            .find(DETCORE_MISC_TEST_PREBUILD_COMMAND)
-            .expect("presence checked above");
-        let hermit_prebuild_at = privileged_build
-            .cmd
-            .find(HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND)
-            .expect("presence checked above");
-        let artifact_scan_at = privileged_build
-            .cmd
-            .find(TESTS_MISC_EXECUTABLE_READ_COMMAND)
-            .expect("presence checked above");
-        if !(detcore_prebuild_at < hermit_prebuild_at && hermit_prebuild_at < artifact_scan_at) {
-            return Err(format!(
-                "full-plan bracket: privileged build does not create tests_misc before later prebuilds and the artifact check: {}",
-                privileged_build.cmd
-            ));
+        let prepared = hermit_manifest_plan::nextest_binaries::profile_selections(&root, "portable")?;
+        for required in hermit_manifest_plan::nextest_binaries::profile_selections(&root, "privileged")?.keys() {
+            if !prepared.contains_key(required) {
+                return Err(format!("full-plan bracket: portable preparation omits privileged Cargo selection {required}"));
+            }
         }
         if ["test.cli", "test.hermit_modes"]
             .iter()
@@ -20754,6 +20734,7 @@ mod committed_selection_preservation_tests {
 #[cfg(test)]
 mod fused_privileged_build_tests {
     use super::*;
+    include!("../ci/cargo-guest-binaries.rs");
 
     fn write_executable(path: &Path, contents: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -20763,152 +20744,93 @@ mod fused_privileged_build_tests {
         std::fs::set_permissions(path, permissions).unwrap();
     }
 
-    fn cold_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    fn cold_fixture(repository: &Path, helper: &Path) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let cargo_log = root.path().join("cargo-calls");
-        write_executable(
-            &root.path().join("ci/verify-hermit-e2e-artifact.sh"),
-            "#!/bin/sh\nexit 0\n",
-        );
-        write_executable(
-            &root.path().join("bin/cargo"),
-            r#"#!/bin/sh
-set -eu
-printf '%s\n' "$*" >> "$CARGO_CALL_LOG"
-case "$*" in
-  "test -p hermit-detcore --test tests_misc --no-run --message-format=json")
-    case "${CARGO_ARTIFACT_MODE:-current}" in
-      current)
-        artifact="$PWD/target/debug/build/hermit-detcore/cold/out/tests_misc-cold-fixture"
-        mkdir -p "$(dirname "$artifact")"
-        : > "$artifact"
-        chmod 700 "$artifact"
-        ;;
-      missing)
-        artifact="$PWD/target/debug/build/hermit-detcore/cold/out/tests_misc-missing"
-        ;;
-      wrong)
-        artifact="$PWD/target/debug/hermit"
-        mkdir -p "$(dirname "$artifact")"
-        : > "$artifact"
-        chmod 700 "$artifact"
-        ;;
-      ambiguous)
-        artifact="$PWD/target/debug/build/hermit-detcore/one/out/tests_misc-one"
-        second="$PWD/target/debug/build/hermit-detcore/two/out/tests_misc-two"
-        mkdir -p "$(dirname "$artifact")" "$(dirname "$second")"
-        : > "$artifact"
-        : > "$second"
-        chmod 700 "$artifact" "$second"
-        printf '{"reason":"compiler-artifact","profile":{"test":true},"target":{"name":"tests_misc"},"executable":"%s"}\n' "$second"
-        ;;
-      *)
-        exit 65
-        ;;
-    esac
-    printf '{"reason":"compiler-artifact","profile":{"test":true},"target":{"name":"tests_misc"},"executable":"%s"}\n' "$artifact"
-    ;;
-  "test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run")
-    :
-    ;;
-  *)
-    exit 64
-    ;;
-esac
-"#,
-        );
+        write_executable(&root.path().join("ci/verify-hermit-e2e-artifact.sh"), "#!/bin/sh\nexit 0\n");
+        write_executable(&root.path().join("ci/run-with-reverie-dbt-budget.sh"), "#!/bin/sh\nexec \"$@\"\n");
+        write_executable(&root.path().join("bin/cargo"), include_str!("../ci/tests/nextest-preparation-cargo-fixture.py"));
+        std::os::unix::fs::symlink(helper, root.path().join("ci/nextest-binaries.rs")).unwrap();
+        std::fs::create_dir_all(root.path().join("ci/dag")).unwrap();
+        std::fs::copy(repository.join("ci/dag/validate.json"), root.path().join("ci/dag/validate.json")).unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.path().join("guest-names.json"), serde_json::to_vec(&CARGO_GUEST_BINARIES).unwrap()).unwrap();
+        std::fs::write(root.path().join(".gitignore"), "/target/\n/custom-cargo-target/\n/cargo-calls\n").unwrap();
+        for args in [vec!["init", "-q"], vec!["add", "."], vec!["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"]] {
+            let output = Command::new("git").args(args).current_dir(root.path()).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        }
         let bin = root.path().join("bin");
         (root, bin, cargo_log)
     }
 
-    fn run_build(
-        command: &str,
-        root: &Path,
-        bin: &Path,
-        cargo_log: &Path,
-        artifact_mode: &str,
-    ) -> std::process::ExitStatus {
+    fn run_build(command: &str, root: &Path, bin: &Path, cargo_log: &Path, artifact_mode: &str) -> std::process::Output {
         let mut path = vec![bin.to_path_buf()];
-        if let Some(existing) = std::env::var_os("PATH") {
-            path.extend(std::env::split_paths(&existing));
-        }
-        Command::new("bash")
-            .arg("-c")
-            .arg(command)
-            .current_dir(root)
+        if let Some(existing) = std::env::var_os("PATH") { path.extend(std::env::split_paths(&existing)); }
+        Command::new("bash").arg("-c").arg(command).current_dir(root)
             .env("PATH", std::env::join_paths(path).unwrap())
-            .env("CARGO_CALL_LOG", cargo_log)
-            .env("CARGO_ARTIFACT_MODE", artifact_mode)
-            .status()
-            .unwrap()
+            .env("CARGO_CALL_LOG", cargo_log).env("CARGO_ARTIFACT_MODE", artifact_mode)
+            .output().unwrap()
     }
 
     #[test]
     fn fused_privileged_build_creates_tests_misc_in_a_cold_target_before_consumers() {
-        let committed = validate_plan::validation_config(Path::new(file!()).parent().and_then(Path::parent).expect("validate.rs has a repository parent")).unwrap();
-        let command = committed.steps.iter()
-            .find(|step| step.tag() == "privileged-build.privileged_tests")
-            .expect("committed privileged builder exists").cmd.clone();
-        let missing_producer =
-            command.replacen(&format!("{DETCORE_MISC_TEST_PREBUILD_COMMAND}; "), "", 1);
-        assert_ne!(missing_producer, command);
+        let repository = Path::new(file!()).parent().and_then(Path::parent).unwrap();
+        let committed = validate_plan::validation_config(repository).unwrap();
+        let workspace = committed.steps.iter().find(|step| step.tag() == "build.workspace").unwrap();
+        assert!(workspace.cmd.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND));
+        let preparation = &workspace.cmd[workspace.cmd.len() - NEXTEST_PORTABLE_PREPARE_COMMAND.len()..];
+        let consumer = committed.steps.iter().find(|step| step.tag() == "privileged-build.privileged_tests").unwrap();
+        assert!(!consumer.cmd.contains("cargo "), "the barrier must not rebuild shared test executables");
+        let query = Command::new(repository.join("ci/nextest-binaries.rs")).arg("--print-executable").output().unwrap();
+        assert!(query.status.success(), "{}", String::from_utf8_lossy(&query.stderr));
+        let helper = PathBuf::from(String::from_utf8(query.stdout).unwrap().trim());
+        assert!(helper.is_absolute() && helper.is_file());
 
-        let (old_root, old_bin, old_log) = cold_fixture();
-        assert!(
-            !run_build(
-                &missing_producer,
-                old_root.path(),
-                &old_bin,
-                &old_log,
-                "current",
-            )
-            .success(),
-            "the pre-fix command must fail from an empty target rather than consume a missing tests_misc binary"
-        );
-        assert!(!old_root
-            .path()
-            .join("target/ci/tests-misc.path")
-            .exists());
-
-        let (fixed_root, fixed_bin, fixed_log) = cold_fixture();
-        assert!(
-            run_build(
-                &command,
-                fixed_root.path(),
-                &fixed_bin,
-                &fixed_log,
-                "current",
-            )
-            .success()
-        );
-        assert!(fixed_root
-            .path()
-            .join("target/debug/build/hermit-detcore/cold/out/tests_misc-cold-fixture")
-            .is_file());
-        assert_eq!(
-            std::fs::read_to_string(fixed_root.path().join("target/ci/tests-misc.path"))
-                .unwrap(),
-            format!(
-                "{}/target/debug/build/hermit-detcore/cold/out/tests_misc-cold-fixture\n",
-                fixed_root.path().display()
-            )
-        );
-        assert_eq!(
-            std::fs::read_to_string(fixed_log).unwrap(),
-            format!(
-                "test -p hermit-detcore --test tests_misc --no-run --message-format=json\n{}\n",
-                HERMIT_PRIVILEGED_TEST_PREBUILD_COMMAND
-                    .strip_prefix("CARGO_BUILD_JOBS=8 cargo ")
-                    .unwrap()
-            )
-        );
+        let (root, bin, log) = cold_fixture(repository, &helper);
+        let unprepared = run_build(&consumer.cmd, root.path(), &bin, &log, "current");
+        assert!(!unprepared.status.success(), "a cold consumer cannot invent the missing preparation");
+        assert!(!log.exists(), "the consumer must not fall back to Cargo");
+        let prepared = run_build(preparation, root.path(), &bin, &log, "current");
+        assert!(prepared.status.success(), "{}", String::from_utf8_lossy(&prepared.stderr));
+        let before = std::fs::read_to_string(&log).unwrap();
+        let expected = hermit_manifest_plan::nextest_binaries::profile_selections(repository, "portable").unwrap();
+        let calls = before.lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
+        let builds = calls.iter().filter(|args| args.get(0).map(String::as_str) == Some("nextest") && !args.iter().any(|arg| arg == "--binaries-metadata")).collect::<Vec<_>>();
+        assert_eq!(builds.len(), expected.len(), "each distinct selection is prepared once");
+        for selection in expected.values() {
+            assert_eq!(builds.iter().filter(|args| args.ends_with(selection)).count(), 1, "missing or duplicated selection {selection:?}");
+        }
+        assert_eq!(calls.iter().filter(|args| args.first().map(String::as_str) == Some("build")).count(), 1, "the 21 Cargo guests are built together once");
+        let read_only = run_build(&consumer.cmd, root.path(), &bin, &log, "current");
+        assert!(read_only.status.success(), "{}", String::from_utf8_lossy(&read_only.stderr));
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "the privileged consumer must not invoke Cargo after preparation");
+        let executable = run_build("./ci/nextest-binaries.rs executable hermit-detcore tests_misc", root.path(), &bin, &log, "current");
+        assert!(executable.status.success());
+        let executable = PathBuf::from(String::from_utf8(executable.stdout).unwrap().trim());
+        assert_eq!(executable, root.path().join("custom-cargo-target/debug/build/hermit-detcore/out/tests_misc"));
+        assert!(executable.is_file(), "the exact Cargo target must exist before the consumer");
+        assert!(!root.path().join("target/debug").exists(), "the producer must not silently remap to the default target");
+        let changed_build = run_build(&format!("export SOURCE_DATE_EPOCH=946684800; {}", consumer.cmd), root.path(), &bin, &log, "current");
+        assert!(!changed_build.status.success(), "a changed build timestamp must refuse prepared metadata");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "a stale build setting must not compile a replacement");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n# changed source\n").unwrap();
+        assert!(!run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "changed source must refuse old metadata");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "a stale source must not compile a replacement");
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        assert!(run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "restoring exact inputs must restore acceptance");
+        std::fs::write(&executable, "#!/bin/sh\nexit 17\n").unwrap();
+        assert!(!run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "changed bytes at the same path must be stale");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "stale refusal must not compile a replacement");
 
         for mode in ["missing", "wrong", "ambiguous"] {
-            let (root, bin, log) = cold_fixture();
-            assert!(
-                !run_build(&command, root.path(), &bin, &log, mode).success(),
-                "the fused build must refuse Cargo artifact mode {mode}"
-            );
+            let (root, bin, log) = cold_fixture(repository, &helper);
+            let result = run_build(preparation, root.path(), &bin, &log, mode);
+            assert!(!result.status.success(), "the actual producer accepted Cargo artifact mode {mode}");
+            assert!(!root.path().join("target/ci/nextest-binaries/current.json").exists(), "a failed producer must not publish partial selections");
+            let before = std::fs::read_to_string(&log).unwrap();
+            assert!(!run_build(&consumer.cmd, root.path(), &bin, &log, mode).status.success());
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "failed preparation must not enable consumer compilation");
         }
     }
 }
