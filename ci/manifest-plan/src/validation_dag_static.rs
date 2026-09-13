@@ -227,7 +227,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.hermit_unit_on_host", 496),
     ("test.ignored_syscall_regressions_on_host", 2),
     ("test.liteinst_strict_on_host", 23),
-    ("test.regular_crates_on_host", 438),
+    ("test.regular_crates_on_host", 443),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 5),
 ];
