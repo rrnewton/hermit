@@ -159,6 +159,7 @@ impl std::fmt::Display for UnsupportedSyscallError {
 impl std::error::Error for UnsupportedSyscallError {}
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
+pub use tool_local::InheritedStdioAliasError;
 /// Returns whether the audited runtime policy classifies `sysno` as unsupported.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the copied-DBT-child classification surface.
@@ -1517,6 +1518,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             ))
                         }
                     },
+                    inherited_stdio_alias_error: pts.1.inherited_stdio_alias_error.clone(),
                     discover_live_file_metadata: pts.1.discover_live_file_metadata,
                     // Linux copies the creating thread's current timer slack
                     // into both fields of every new task (thread or process).
@@ -1622,6 +1624,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     }
 
     async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        // init_thread_state cannot return an error. Refuse before any registration
+        // or scheduler RPC, and retain the failure if a backend retries this hook.
+        if let Some(error) = &guest.thread_state().inherited_stdio_alias_error {
+            return Err(Error::Tool(anyhow::Error::new(error.clone())));
+        }
         let new_dettid = DetTid::from_raw(guest.tid().into()); // TODO(T78538674): virtualize pid/tid:
         assert_eq!(new_dettid, guest.thread_state().dettid);
         let detpid = select_thread_start_detpid(guest.thread_state().detpid, guest.pid());
