@@ -619,6 +619,56 @@ fn kvm_exact_child_waits_guest() -> &'static Path {
     })
 }
 
+fn assert_guest_pipe_status_hides_scheduler_nonblocking(backend: &str) {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let guest = directory.path().join("nonstdio_status_flags");
+    let compilation = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/nonstdio_status_flags.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the nonstdio status-flags guest");
+    assert!(
+        compilation.status.success(),
+        "nonstdio status-flags guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compilation.stdout),
+        String::from_utf8_lossy(&compilation.stderr),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--backend", backend, "--"])
+        .arg(&guest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run the {backend} nonstdio guest: {error}"));
+    assert!(
+        output.status.success(),
+        "{backend} nonstdio status-flags guest failed: {:?}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(output.stdout, b"nonstdio-status-flags-ok\n");
+}
+
+#[test]
+fn run_ptrace_guest_pipe_status_hides_scheduler_nonblocking() {
+    assert_guest_pipe_status_hides_scheduler_nonblocking("ptrace");
+}
+
+#[test]
+fn run_kvm_guest_pipe_status_hides_scheduler_nonblocking() {
+    if !Path::new("/dev/kvm").exists() {
+        return;
+    }
+    assert_guest_pipe_status_hides_scheduler_nonblocking("kvm");
+}
+
 fn stdio_status_flag_containment_guest() -> &'static Path {
     STDIO_STATUS_FLAG_CONTAINMENT_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
