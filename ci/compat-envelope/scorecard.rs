@@ -4905,9 +4905,10 @@ fn update_observations(
         )?;
         if retained {
             for (previous, current) in previous_last_tested.iter().zip(&mut tracked.cells) {
-                if !should_replace_last_tested_at(
+                if !should_replace_retained_last_tested(
                     previous.as_ref(),
                     &summary.hermit_sha,
+                    &summary.detcore_tree,
                     main_ancestry,
                     &depth,
                 ) {
@@ -5363,6 +5364,23 @@ fn series_observation_identity(row: &SeriesRow) -> Result<SeriesObservationIdent
             row.series.tree
         )),
     }
+}
+
+/// Reimporting the same retained code identity must preserve its recorded stamp,
+/// even when a different checkout can resolve more or fewer repository depths.
+fn should_replace_retained_last_tested(
+    previous: Option<&LastTested>,
+    hermit_sha: &str,
+    detcore_tree: &str,
+    main_ancestry: Option<bool>,
+    depth: &BTreeMap<String, SourceDepth>,
+) -> bool {
+    if previous.is_some_and(|previous| {
+        previous.hermit_sha == hermit_sha && previous.detcore_tree == detcore_tree
+    }) {
+        return false;
+    }
+    should_replace_last_tested_at(previous, hermit_sha, main_ancestry, depth)
 }
 
 fn should_replace_last_tested_at(
@@ -7413,6 +7431,25 @@ fn self_test() -> Result<(), String> {
             "retained pressure evidence did not preserve newer last_tested evidence or fill an absent value"
                 .into(),
         );
+    }
+    let mut additional_depth = current_last_tested.depth.clone();
+    additional_depth.insert(
+        "reverie".into(),
+        SourceDepth { commits: 30, first_parent: 25 },
+    );
+    for depth in [&additional_depth, &BTreeMap::new()] {
+        if should_replace_retained_last_tested(
+            Some(&current_last_tested), "current-sha", "current-tree", Some(true), depth,
+        ) {
+            return Err("retained reimport replaced the same code identity's recorded depths".into());
+        }
+    }
+    if !should_replace_retained_last_tested(
+        None, "current-sha", "current-tree", Some(true), &additional_depth,
+    ) || !should_replace_retained_last_tested(
+        Some(&current_last_tested), "current-sha", "different-tree", Some(true), &additional_depth,
+    ) {
+        return Err("retained stamp preservation hid absent or conflicting code identity".into());
     }
 
     for error_kind in [
