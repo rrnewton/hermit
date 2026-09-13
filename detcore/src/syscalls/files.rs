@@ -2859,7 +2859,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .with_detfd(fd, |detfd| detfd.status_flags())?,
                     ));
                 }
-                Ok(self.record_or_replay(guest, call).await?)
+                // Scheduler-owned pipes and sockets may be physically nonblocking
+                // while the guest still requested blocking I/O. Preserve that
+                // logical view for every description outside inherited stdio.
+                let physical_flags = self.record_or_replay(guest, call).await?;
+                let logical_nonblocking = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.is_nonblocking())?;
+                let nonblocking = i64::from(OFlag::O_NONBLOCK.bits());
+                if logical_nonblocking {
+                    Ok(physical_flags | nonblocking)
+                } else {
+                    Ok(physical_flags & !nonblocking)
+                }
             }
             F_SETFL(flags) => {
                 let (contained, current) = guest.thread_state().with_detfd(fd, |detfd| {
