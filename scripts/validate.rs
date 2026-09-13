@@ -10428,6 +10428,12 @@ struct NodeAttempt {
     /// fact unless it is written down here.
     reported: bool,
     returncode: Option<i64>,
+    /// Typed scheduler termination facts. `None` means no completion payload
+    /// arrived; it must not be flattened into false or zero.
+    oomed: Option<bool>,
+    oom_kills: Option<i64>,
+    timed_out: Option<bool>,
+    cpu_timed_out: Option<bool>,
     /// The runner's typed failure reason for THIS attempt; `""` when it passed
     /// or was never reported. A later attempt never overwrites it.
     reason: String,
@@ -10493,7 +10499,7 @@ fn outcome_failure_class(outcome: &StepOutcome) -> Option<FailureClass> {
     } else if outcome_is_no_result(outcome)
         || outcome.returncode.is_none()
         || outcome_hit_its_budget(outcome)
-        || reason_is_oom(&outcome.reason)
+        || outcome.oomed
     {
         Some(FailureClass::NoResult)
     } else {
@@ -10535,6 +10541,10 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
         ok: Some(outcome.ok),
         reported: true,
         returncode: outcome.returncode,
+        oomed: Some(outcome.oomed),
+        oom_kills: Some(outcome.oom_kills),
+        timed_out: Some(outcome.timed_out),
+        cpu_timed_out: Some(outcome.cpu_timed_out),
         reason: outcome.reason.clone(),
         duration_s: outcome.duration_s,
         aborted: outcome.aborted,
@@ -10561,6 +10571,10 @@ fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
         ok: None,
         reported: false,
         returncode: None,
+        oomed: None,
+        oom_kills: None,
+        timed_out: None,
+        cpu_timed_out: None,
         reason: "no completion payload was reported for this node".into(),
         duration_s: 0.0,
         aborted: false,
@@ -13784,56 +13798,21 @@ fn print_retry_ledger(attempts: &[NodeAttempt]) {
     }
 }
 
-/// The exact renderings `step_failure_reason` produces for the two budget
-/// breaches, as prefixes. Everything after them is a number, so a prefix is an
-/// exact identification of the arm rather than a search for a word.
-const WALL_BUDGET_REASON_PREFIX: &str = "TIMEOUT >";
-const CPU_BUDGET_REASON_PREFIX: &str = "CPU-TIMEOUT >";
-
 /// Was this node killed by its wall or CPU budget?
 ///
-/// WHY THIS IS NOT A SUBSTRING TEST, which is what it used to be. `reason` is a
-/// closed set produced by `dagrun::model::step_failure_reason`, and
-/// one member of that set reads:
-///
-///   `received SIGSEGV with no validate timeout, pids guard, or child-cgroup OOM recorded`
-///
-/// A `contains("timeout")` test matches that string — INSIDE THE CLAUSE SAYING
-/// THERE WAS NO TIMEOUT. Every signal-killed node therefore read as a budget
-/// breach, so a segfault, an abort and a SIGKILL were all retry-eligible and
-/// would each be re-run to `max` for the same deterministic answer. That is
-/// precisely the waste the eligibility rule exists to prevent.
-///
-/// A SUBSTRING TEST AGAINST A HUMAN-READABLE MESSAGE IS NOT A PREDICATE. The
-/// message is written for a reader and can carry the word in a negating
-/// context. The typed `timed_out`/`cpu_timed_out` inputs are the real facts, but
-/// `StepOutcome` does not carry them — `StepOutcome::failed` takes them and
-/// keeps only the rendered string. So this matches the two arms EXACTLY, and
-/// `budget_reason_bracket` below pins that match by calling the real producer
-/// with the typed inputs rather than by restating its wording here.
+/// The scheduler retains these facts independently of its human-readable
+/// reason. Presentation text may contain the word "timeout" while explicitly
+/// saying no timeout occurred, and an OOM message may hide a simultaneous
+/// budget breach because the display has a precedence order.
 fn outcome_hit_its_budget(outcome: &StepOutcome) -> bool {
-    reason_is_budget_breach(&outcome.reason)
+    outcome.timed_out || outcome.cpu_timed_out
 }
 
-/// The same rule over a bare reason string, so the bracket can exercise it
-/// against producer output without building a whole `StepOutcome`.
-fn reason_is_budget_breach(reason: &str) -> bool {
-    reason.starts_with(WALL_BUDGET_REASON_PREFIX) || reason.starts_with(CPU_BUDGET_REASON_PREFIX)
-}
-
-/// The OOM spelling is produced by dagrun's `step_failure_reason`. Keep the
-/// exact owned prefix beside the timeout predicate so a resource exhaustion is
-/// recorded as `no_result` without an outer reader interpreting prose.
-fn reason_is_oom(reason: &str) -> bool {
-    reason.starts_with("OOM-KILLED (hit inner MemoryMax;")
-}
-
-/// Pin the budget-breach predicate to the PRODUCER, not to a copy of its text.
+/// Pin budget detection to the typed producer facts, not its text.
 ///
-/// Every case below is built by calling `step_failure_reason` itself with the
-/// typed inputs, then asserting the predicate agrees with `timed_out ||
-/// cpu_timed_out`. Nothing here hardcodes a message, so a reworded reason does
-/// not silently drift past the predicate — it fails here instead.
+/// The reason is deliberately replaced after construction. If this test ever
+/// starts following presentation text again, the positive and negative arms
+/// fail independently.
 fn budget_reason_bracket() -> Result<String, String> {
     use dagrun::model::step_failure_reason;
     // (label, returncode, oomed, timed_out, pids_tripped, detail_failure, cpu_timed_out)
@@ -13872,7 +13851,26 @@ fn budget_reason_bracket() -> Result<String, String> {
             "",
         );
         let want = *timed_out || *cpu_timed_out;
-        let got = reason_is_budget_breach(&reason);
+        let mut outcome = StepOutcome::failed(
+            (*label).into(),
+            0.0,
+            String::new(),
+            *rc,
+            *oomed,
+            if *oomed { 1 } else { 0 },
+            *timed_out,
+            600,
+            *cpu_timed_out,
+            300,
+            300,
+            1.0,
+            "",
+            false,
+            None,
+            None,
+        );
+        outcome.reason = reason.clone();
+        let got = outcome_hit_its_budget(&outcome);
         if got != want {
             return Err(format!(
                 "budget reason: {label} rendered {reason:?}; retry-eligible={got} but the typed                  inputs say timed_out={timed_out} cpu_timed_out={cpu_timed_out}. A reason that                  merely MENTIONS a timeout is not a timeout."
@@ -13880,6 +13878,22 @@ fn budget_reason_bracket() -> Result<String, String> {
         }
         if got {
             eligible.push(*label);
+        }
+        // Test both misleading positive words and missing classification words.
+        // Every one of the ten original producer cases must retain its facts.
+        for presentation in [
+            "TIMEOUT >1s",
+            "CPU-TIMEOUT >1s",
+            "OOM-KILLED (hit inner MemoryMax; 1 oom_kill event(s))",
+            "unrelated presentation",
+            "",
+        ] {
+            outcome.reason = presentation.into();
+            if outcome_hit_its_budget(&outcome) != want || outcome.oomed != *oomed {
+                return Err(format!(
+                    "budget reason: {label} followed presentation text {presentation:?}"
+                ));
+            }
         }
     }
     // The negative direction, stated as its own assertion rather than left
@@ -13905,15 +13919,95 @@ fn budget_reason_bracket() -> Result<String, String> {
             "budget reason: the signal arm no longer contains the word 'timeout' ({segv:?}); this              bracket exists because it DOES, so re-check the producer before relaxing it"
         ));
     }
-    if reason_is_budget_breach(&segv) {
-        return Err(format!("budget reason: signal-killed reason {segv:?} is retry-eligible"));
+    let mut segv_outcome = StepOutcome::failed(
+        "segv".into(),
+        0.0,
+        String::new(),
+        Some(-11),
+        false,
+        0,
+        false,
+        600,
+        false,
+        300,
+        300,
+        1.0,
+        "",
+        false,
+        None,
+        None,
+    );
+    segv_outcome.reason = segv.clone();
+    if outcome_hit_its_budget(&segv_outcome) {
+        return Err(format!(
+            "budget reason: signal-killed reason {segv:?} is retry-eligible"
+        ));
+    }
+    // The producer's presentation has a precedence order; all independent
+    // termination facts must survive that order and later detail replacement.
+    for bits in 0_u8..8 {
+        let oomed = bits & 1 != 0;
+        let timed_out = bits & 2 != 0;
+        let cpu_timed_out = bits & 4 != 0;
+        let mut outcome = StepOutcome::failed(
+            format!("combined-{bits}"),
+            0.0,
+            String::new(),
+            Some(-9),
+            oomed,
+            if oomed { 2 } else { 0 },
+            timed_out,
+            600,
+            cpu_timed_out,
+            300,
+            300,
+            1.0,
+            "",
+            false,
+            None,
+            None,
+        );
+        let expected_prefix = if oomed {
+            "OOM-KILLED"
+        } else if cpu_timed_out {
+            "CPU-TIMEOUT"
+        } else if timed_out {
+            "TIMEOUT"
+        } else {
+            "received SIGKILL"
+        };
+        if !outcome.reason.starts_with(expected_prefix) {
+            return Err(format!(
+                "budget reason: producer precedence changed for {bits}: {:?}",
+                outcome.reason
+            ));
+        }
+        let expected_class = if bits == 0 {
+            FailureClass::ProductFailure
+        } else {
+            FailureClass::NoResult
+        };
+        for presentation in [
+            outcome.reason.clone(),
+            "unrelated presentation".into(),
+            "TIMEOUT >1s OOM-KILLED".into(),
+            String::new(),
+        ] {
+            outcome.reason = presentation;
+            if outcome_hit_its_budget(&outcome) != (timed_out || cpu_timed_out)
+                || outcome_failure_class(&outcome) != Some(expected_class)
+            {
+                return Err(format!(
+                    "budget reason: independent facts or failure attribution lost for {bits}: {:?}",
+                    outcome.reason
+                ));
+            }
+        }
     }
     Ok(format!(
-        "budget reason: 10 producer-rendered reason(s) classified; retry-eligible = {eligible:?};          the SIGSEGV arm contains the word \"timeout\" and is correctly NOT eligible"
+        "budget reason: 10 producer-rendered reason(s) classified; retry-eligible = {eligible:?};          the SIGSEGV arm contains the word \"timeout\" and is correctly NOT eligible; all eight independent OOM/CPU/wall combinations retain their typed attribution through poisoned presentation text"
     ))
 }
-
-/// Nodes the runner reported as killed by their wall or CPU budget.
 
 /// Nodes the runner reported as killed by their wall or CPU budget.
 fn timed_out_nodes(outcomes: &[StepOutcome]) -> Vec<String> {
@@ -15278,6 +15372,10 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
         "name": outcome.tag,
         "result": ledger_gate_result(outcome),
         "exit_code": outcome.returncode,
+        "oomed": outcome.oomed,
+        "oom_kills": outcome.oom_kills,
+        "timed_out": outcome.timed_out,
+        "cpu_timed_out": outcome.cpu_timed_out,
         "reason": outcome.reason,
         "aborted": outcome.aborted,
         "real_seconds": outcome.duration_s,
@@ -15322,6 +15420,10 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
                 "reported": a.reported,
                 "execution": a.execution.as_str(),
                 "exit_code": a.returncode,
+                "oomed": a.oomed,
+                "oom_kills": a.oom_kills,
+                "timed_out": a.timed_out,
+                "cpu_timed_out": a.cpu_timed_out,
                 "reason": a.reason,
                 "aborted": a.aborted,
                 "real_seconds": a.reported.then_some(a.duration_s),
@@ -15359,6 +15461,10 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
     if let Some(attempt) = latest {
         gate["result"] = serde_json::json!(attempt_result(attempt));
         gate["exit_code"] = serde_json::json!(attempt.returncode);
+        gate["oomed"] = serde_json::json!(attempt.oomed);
+        gate["oom_kills"] = serde_json::json!(attempt.oom_kills);
+        gate["timed_out"] = serde_json::json!(attempt.timed_out);
+        gate["cpu_timed_out"] = serde_json::json!(attempt.cpu_timed_out);
         gate["reason"] = serde_json::json!(attempt.reason);
         gate["aborted"] = serde_json::json!(attempt.aborted);
         gate["real_seconds"] = serde_json::json!(attempt.reported.then_some(attempt.duration_s));
@@ -15386,6 +15492,100 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
     gate
 }
 
+fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
+    let fields = ["oomed", "oom_kills", "timed_out", "cpu_timed_out"];
+    let mut fixtures = Vec::new();
+    for bits in 0_u8..8 {
+        let outcome = StepOutcome::failed(
+            "test.typed-termination".into(),
+            1.0,
+            String::new(),
+            Some(-9),
+            bits & 1 != 0,
+            if bits & 1 != 0 { 2 } else { 0 },
+            bits & 2 != 0,
+            600,
+            bits & 4 != 0,
+            300,
+            300,
+            1.0,
+            "",
+            false,
+            None,
+            None,
+        );
+        let first = reported_attempt(&outcome, 1);
+        let expected = serde_json::json!({
+            "oomed": bits & 1 != 0,
+            "oom_kills": if bits & 1 != 0 { 2 } else { 0 },
+            "timed_out": bits & 2 != 0,
+            "cpu_timed_out": bits & 4 != 0,
+        });
+        let fallback = ledger_gate(&outcome);
+        let reported = ledger_gate_with_attempts(&outcome, std::slice::from_ref(&first));
+        for row in [&fallback, &reported, &reported["attempts"][0]] {
+            for field in fields {
+                if row.get(field) != expected.get(field) {
+                    return Err(format!("typed gate {bits}: {field} was lost: {row}"));
+                }
+            }
+        }
+        let pass =
+            StepOutcome::passed(outcome.tag.clone(), 1.0, String::new(), Some(0), None, None);
+        let passed =
+            ledger_gate_with_attempts(&outcome, &[first.clone(), reported_attempt(&pass, 2)]);
+        let unknown = ledger_gate_with_attempts(
+            &outcome,
+            &[first, unreported_attempt(outcome.tag.clone(), 2)],
+        );
+        for field in fields {
+            let passed_value = if field == "oom_kills" {
+                serde_json::json!(0)
+            } else {
+                serde_json::json!(false)
+            };
+            if passed.get(field) != Some(&passed_value)
+                || passed["attempts"][1].get(field) != Some(&passed_value)
+                || unknown.get(field) != Some(&serde_json::Value::Null)
+                || unknown["attempts"][1].get(field) != Some(&serde_json::Value::Null)
+                || unknown["attempts"][0].get(field) != expected.get(field)
+            {
+                return Err(format!(
+                    "typed gate {bits}: {field} failed latest-attempt replacement: pass={passed} unknown={unknown}"
+                ));
+            }
+        }
+        if passed["result"] != "pass"
+            || passed.get("failure_class").is_some()
+            || unknown.get("result") != Some(&serde_json::Value::Null)
+            || unknown["failure_class"] != "no_result"
+            || unknown["failure_detail"] != "no completion payload was reported for this node"
+        {
+            return Err(format!(
+                "typed gate {bits}: latest verdict did not follow its attempt"
+            ));
+        }
+        for row in [fallback, reported, passed, unknown] {
+            // The parent imports this exact shared type. Additive fields remain
+            // in its extra map, including explicit null and the full attempt list.
+            let parsed: hermit_manifest_plan::ledger::GateHistoryRow =
+                serde_json::from_value(row.clone())
+                    .map_err(|error| format!("typed gate reader refused emitted row: {error}"))?;
+            let restored = serde_json::to_value(parsed)
+                .map_err(|error| format!("typed gate reader could not serialize row: {error}"))?;
+            for field in fields.into_iter().chain(["attempts"]) {
+                if row.get(field) != restored.get(field) {
+                    return Err(format!(
+                        "typed gate shared reader lost {field}: before={row} after={restored}"
+                    ));
+                }
+            }
+            fixtures.push(row);
+        }
+    }
+    Ok(fixtures)
+}
+
 fn ledger_gate_origin_bracket() -> Result<(), String> {
     let failed = StepOutcome {
         tag: "test.fixture".into(),
@@ -15407,10 +15607,13 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
     if row["failure_origin"] != "outer_gate"
         || row["failed_substeps"] != serde_json::json!([])
         || row["failure_class"] != "product_failure"
+        || row["oomed"] != false
+        || row["oom_kills"] != 0
+        || row["timed_out"] != false
+        || row["cpu_timed_out"] != false
     {
         return Err(
-            "ledger gate origin: failed outer gate did not carry its typed product class and known-empty substep list"
-                .into(),
+            "ledger gate origin: failed outer gate did not carry its typed product class, termination facts and known-empty substep list".into(),
         );
     }
     let mut passed = failed.clone();
@@ -15445,44 +15648,43 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
     // The stop-path integration test reaches the real write_ledger function but
     // deliberately has no scheduler attempts. Bracket the production serializer's
     // latest-attempt override separately, including stale cumulative outcomes.
-    let assert_attempt_gate =
-        |label: &str,
-         outcome: &StepOutcome,
-         attempts: &[NodeAttempt],
-         expected_result: Option<&str>,
-         expected_reported: bool,
-         expected_execution: &str,
-         expected_failure: bool|
-         -> Result<(), String> {
-            let row = ledger_gate_with_attempts(outcome, attempts);
-            let latest = row["attempts"]
-                .as_array()
-                .and_then(|attempts| attempts.last())
-                .ok_or_else(|| format!("ledger gate origin: {label} omitted attempt history"))?;
-            let result = row.get("result").and_then(serde_json::Value::as_str);
-            let origin = row
-                .get("failure_origin")
-                .and_then(serde_json::Value::as_str);
-            let failure_evidence_matches = if expected_failure {
-                origin == Some("outer_gate")
-                    && row.get("failed_substeps") == Some(&serde_json::json!([]))
-            } else {
-                origin.is_none() && row.get("failed_substeps").is_none()
-            };
-            if result != expected_result
-                || row["reported"].as_bool() != Some(expected_reported)
-                || row["execution"].as_str() != Some(expected_execution)
-                || latest.get("result").and_then(serde_json::Value::as_str) != expected_result
-                || latest["reported"].as_bool() != Some(expected_reported)
-                || latest["execution"].as_str() != Some(expected_execution)
-                || !failure_evidence_matches
-            {
-                return Err(format!(
-                    "ledger gate origin: {label} did not follow the latest attempt: {row}"
-                ));
-            }
-            Ok(())
+    let assert_attempt_gate = |label: &str,
+                               outcome: &StepOutcome,
+                               attempts: &[NodeAttempt],
+                               expected_result: Option<&str>,
+                               expected_reported: bool,
+                               expected_execution: &str,
+                               expected_failure: bool|
+     -> Result<(), String> {
+        let row = ledger_gate_with_attempts(outcome, attempts);
+        let latest = row["attempts"]
+            .as_array()
+            .and_then(|attempts| attempts.last())
+            .ok_or_else(|| format!("ledger gate origin: {label} omitted attempt history"))?;
+        let result = row.get("result").and_then(serde_json::Value::as_str);
+        let origin = row
+            .get("failure_origin")
+            .and_then(serde_json::Value::as_str);
+        let failure_evidence_matches = if expected_failure {
+            origin == Some("outer_gate")
+                && row.get("failed_substeps") == Some(&serde_json::json!([]))
+        } else {
+            origin.is_none() && row.get("failed_substeps").is_none()
         };
+        if result != expected_result
+            || row["reported"].as_bool() != Some(expected_reported)
+            || row["execution"].as_str() != Some(expected_execution)
+            || latest.get("result").and_then(serde_json::Value::as_str) != expected_result
+            || latest["reported"].as_bool() != Some(expected_reported)
+            || latest["execution"].as_str() != Some(expected_execution)
+            || !failure_evidence_matches
+        {
+            return Err(format!(
+                "ledger gate origin: {label} did not follow the latest attempt: {row}"
+            ));
+        }
+        Ok(())
+    };
 
     let failed_attempt = reported_attempt(&failed, 1);
     let passed_attempt = reported_attempt(&passed, 1);
@@ -15539,6 +15741,31 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         "unknown",
         false,
     )?;
+    let unreported_retry = unreported_attempt(failed.tag.clone(), 2);
+    let fail_then_unreported = [failed_attempt.clone(), unreported_retry];
+    let unreported_gate = ledger_gate_with_attempts(&failed, &fail_then_unreported);
+    for row in [&unreported_gate, &unreported_gate["attempts"][1]] {
+        for field in ["oomed", "oom_kills", "timed_out", "cpu_timed_out"] {
+            if row.get(field) != Some(&serde_json::Value::Null) {
+                return Err(format!(
+                    "ledger gate origin: latest unreported {field} must be present and null: {row}"
+                ));
+            }
+        }
+    }
+    if !unreported_gate["oomed"].is_null()
+        || !unreported_gate["oom_kills"].is_null()
+        || !unreported_gate["timed_out"].is_null()
+        || !unreported_gate["cpu_timed_out"].is_null()
+        || !unreported_gate["attempts"][1]["oomed"].is_null()
+        || !unreported_gate["attempts"][1]["oom_kills"].is_null()
+        || !unreported_gate["attempts"][1]["timed_out"].is_null()
+        || !unreported_gate["attempts"][1]["cpu_timed_out"].is_null()
+    {
+        return Err(format!(
+            "ledger gate origin: an unreported attempt fabricated typed termination facts: {unreported_gate}"
+        ));
+    }
     let mut failed_retry = failed_attempt;
     failed_retry.attempt = 2;
     let pass_then_failure = [passed_attempt, failed_retry];
@@ -15586,9 +15813,8 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
             ));
         }
     }
-    println!(
-        "  ledger gate origin: fallback, terminal attempts, and failure classes stayed typed"
-    );
+    typed_gate_round_trip_bracket()?;
+    println!("  ledger gate origin: fallback, terminal attempts, and failure classes stayed typed");
     Ok(())
 }
 
@@ -20731,4 +20957,29 @@ mod e2e_attempt_tests {
         assert!(!ordinary.env.contains_key("E2E_ATTEMPT"));
     }
 
+}
+
+#[cfg(test)]
+mod typed_termination_tests {
+    use super::*;
+
+    #[test]
+    fn typed_budget_and_oom_facts_survive_presentation_precedence() {
+        budget_reason_bracket().unwrap();
+    }
+
+    #[test]
+    fn gate_and_attempt_termination_fields_preserve_latest_unknown() {
+        ledger_gate_origin_bracket().unwrap();
+    }
+
+    #[test]
+    fn emitted_gate_rows_round_trip_through_the_shared_parent_reader() {
+        for row in typed_gate_round_trip_bracket().unwrap() {
+            println!(
+                "TYPED_GATE_FIXTURE {}",
+                serde_json::to_string(&row).unwrap()
+            );
+        }
+    }
 }

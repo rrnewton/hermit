@@ -1069,7 +1069,7 @@ fn default_pressure_jobs() -> i64 {
     default_jobs()
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RunnerEvidence {
     seen: bool,
     ok: bool,
@@ -1078,7 +1078,31 @@ struct RunnerEvidence {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct RetainedOutcome {
+    tag: String,
+    ok: bool,
+    duration_s: f64,
+    returncode: Option<i64>,
+    oomed: bool,
+    oom_kills: i64,
+    timed_out: bool,
+    cpu_timed_out: bool,
+    reason: String,
+    aborted: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedExecution {
+    schema: u64,
+    scheduler_passes: usize,
+    outcomes: Vec<RetainedOutcome>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedOutcomeV1 {
     tag: String,
     ok: bool,
     duration_s: f64,
@@ -1088,9 +1112,11 @@ struct RetainedOutcome {
 }
 
 #[derive(Debug, Deserialize)]
-struct RetainedExecution {
+#[serde(deny_unknown_fields)]
+struct RetainedExecutionV1 {
     schema: u64,
-    outcomes: Vec<RetainedOutcome>,
+    scheduler_passes: usize,
+    outcomes: Vec<RetainedOutcomeV1>,
 }
 
 struct ExecutionEvidence {
@@ -1099,6 +1125,39 @@ struct ExecutionEvidence {
 }
 
 fn outcome_evidence(outcome: &StepOutcome) -> RunnerEvidence {
+    RunnerEvidence {
+        seen: true,
+        ok: outcome.ok,
+        timed_out: outcome.timed_out || outcome.cpu_timed_out,
+        oom: outcome.oomed,
+    }
+}
+
+fn retained_outcome_evidence(outcome: &RetainedOutcome) -> Result<RunnerEvidence, String> {
+    if outcome.oom_kills < 0 || outcome.oomed != (outcome.oom_kills > 0) {
+        return Err(format!(
+            "typed scheduler outcome {} disagrees about oomed={} and oom_kills={}",
+            outcome.tag, outcome.oomed, outcome.oom_kills
+        ));
+    }
+    if outcome.ok && (outcome.oomed || outcome.timed_out || outcome.cpu_timed_out) {
+        return Err(format!(
+            "typed scheduler outcome {} is both successful and terminated by a resource bound",
+            outcome.tag
+        ));
+    }
+    Ok(RunnerEvidence {
+        seen: true,
+        ok: outcome.ok,
+        timed_out: outcome.timed_out || outcome.cpu_timed_out,
+        oom: outcome.oomed,
+    })
+}
+
+fn retained_outcome_v1_evidence(outcome: &RetainedOutcomeV1) -> RunnerEvidence {
+    // Schema 1 predates typed termination facts. Keep that exact historical
+    // interpretation readable; only schema 2 can establish the current typed
+    // contract, and there is no schema-1 write path.
     let reason = outcome.reason.to_ascii_uppercase();
     RunnerEvidence {
         seen: true,
@@ -1224,15 +1283,19 @@ fn retain_execution_evidence(
             ok: outcome.ok,
             duration_s: outcome.duration_s,
             returncode: outcome.returncode,
+            oomed: outcome.oomed,
+            oom_kills: outcome.oom_kills,
+            timed_out: outcome.timed_out,
+            cpu_timed_out: outcome.cpu_timed_out,
             reason: outcome.reason.clone(),
             aborted: outcome.aborted,
         })
         .collect();
-    let document = json!({
-        "schema": 1,
-        "scheduler_passes": execution.passes,
-        "outcomes": retained,
-    });
+    let document = RetainedExecution {
+        schema: 2,
+        scheduler_passes: execution.passes,
+        outcomes: retained,
+    };
     let mut text = serde_json::to_string_pretty(&document)
         .map_err(|error| format!("cannot serialize typed scheduler outcomes: {error}"))?;
     text.push('\n');
@@ -1259,39 +1322,73 @@ fn load_retained_runner_evidence(
     if !path.is_file() {
         return Ok(None);
     }
-    let retained: RetainedExecution = serde_json::from_str(
-        &fs::read_to_string(&path)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?,
-    )
-    .map_err(|error| format!("invalid {}: {error}", path.display()))?;
-    if retained.schema != 1 {
-        return Err(format!(
-            "unsupported typed scheduler outcome schema {}",
-            retained.schema
-        ));
-    }
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let value: JsonValue = serde_json::from_str(&text)
+        .map_err(|error| format!("invalid {}: {error}", path.display()))?;
+    let schema = value
+        .get("schema")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| format!("invalid {}: missing integer schema", path.display()))?;
     let mut evidence = BTreeMap::new();
-    for outcome in retained.outcomes {
-        if outcome.aborted {
-            return Err(format!(
-                "typed scheduler evidence retained aborted outcome {} as terminal",
-                outcome.tag
-            ));
+    match schema {
+        1 => {
+            let retained: RetainedExecutionV1 = serde_json::from_str(&text)
+                .map_err(|error| format!("invalid historical {}: {error}", path.display()))?;
+            debug_assert_eq!(retained.schema, 1);
+            let _ = retained.scheduler_passes;
+            for outcome in retained.outcomes {
+                if outcome.aborted {
+                    return Err(format!(
+                        "historical scheduler evidence retained aborted outcome {} as terminal",
+                        outcome.tag
+                    ));
+                }
+                if !outcome.tag.starts_with("cell.") {
+                    continue;
+                }
+                let _ = (outcome.duration_s, outcome.returncode);
+                let row = retained_outcome_v1_evidence(&outcome);
+                if evidence.insert(outcome.tag.clone(), row).is_some() {
+                    return Err(format!(
+                        "historical scheduler evidence contains duplicate outcome {}",
+                        outcome.tag
+                    ));
+                }
+            }
         }
-        if !outcome.tag.starts_with("cell.") {
-            continue;
+        2 => {
+            let retained: RetainedExecution = serde_json::from_str(&text)
+                .map_err(|error| format!("invalid current {}: {error}", path.display()))?;
+            debug_assert_eq!(retained.schema, 2);
+            let _ = retained.scheduler_passes;
+            for outcome in retained.outcomes {
+                if outcome.aborted {
+                    return Err(format!(
+                        "typed scheduler evidence retained aborted outcome {} as terminal",
+                        outcome.tag
+                    ));
+                }
+                if !outcome.tag.starts_with("cell.") {
+                    continue;
+                }
+                let _ = (
+                    outcome.duration_s,
+                    outcome.returncode,
+                    outcome.reason.as_str(),
+                );
+                let row = retained_outcome_evidence(&outcome)?;
+                if evidence.insert(outcome.tag.clone(), row).is_some() {
+                    return Err(format!(
+                        "typed scheduler evidence contains duplicate outcome {}",
+                        outcome.tag
+                    ));
+                }
+            }
         }
-        let reason = outcome.reason.to_ascii_uppercase();
-        let row = RunnerEvidence {
-            seen: true,
-            ok: outcome.ok,
-            timed_out: reason.contains("TIMEOUT"),
-            oom: reason.contains("OOM-KILLED"),
-        };
-        if evidence.insert(outcome.tag.clone(), row).is_some() {
+        _ => {
             return Err(format!(
-                "typed scheduler evidence contains duplicate outcome {}",
-                outcome.tag
+                "unsupported typed scheduler outcome schema {schema}"
             ));
         }
     }
@@ -5115,7 +5212,221 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
     Ok(())
 }
 
+fn retained_termination_self_test(scratch: &Path) -> Result<(), String> {
+    let results = scratch.join("typed-termination");
+    fs::create_dir_all(&results).map_err(|error| error.to_string())?;
+    let path = results.join("runner-outcomes.json");
+    let presentations = [
+        "unrelated presentation",
+        "TIMEOUT >1s",
+        "CPU-TIMEOUT >1s",
+        "OOM-KILLED",
+        "",
+    ];
+    let mut outcomes = Vec::new();
+    for bits in 0_u8..8 {
+        for (index, presentation) in presentations.iter().enumerate() {
+            let mut outcome = StepOutcome::failed(
+                format!("cell.flags-{bits}-text-{index}"),
+                1.0,
+                String::new(),
+                Some(-9),
+                bits & 1 != 0,
+                if bits & 1 != 0 { 2 } else { 0 },
+                bits & 2 != 0,
+                600,
+                bits & 4 != 0,
+                300,
+                300,
+                DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+                "",
+                false,
+                None,
+                None,
+            );
+            outcome.reason = (*presentation).into();
+            outcomes.push(outcome);
+        }
+    }
+    let execution = ExecutionEvidence {
+        outcomes,
+        passes: 1,
+    };
+    let immediate = retain_execution_evidence(&results, &execution)?;
+    let retained_bytes = fs::read(&path).map_err(|error| error.to_string())?;
+    let retained: JsonValue =
+        serde_json::from_slice(&retained_bytes).map_err(|error| error.to_string())?;
+    if retained["schema"] != 2 || retained["scheduler_passes"] != 1 {
+        return Err("typed termination writer did not emit the current schema".into());
+    }
+    let loaded =
+        load_retained_runner_evidence(&results)?.ok_or("typed termination file disappeared")?;
+    if immediate.len() != 40 || immediate != loaded {
+        return Err("typed termination retention lost an identity or changed its facts".into());
+    }
+    for bits in 0_u8..8 {
+        for index in 0..presentations.len() {
+            let tag = format!("cell.flags-{bits}-text-{index}");
+            let row = loaded
+                .get(&tag)
+                .ok_or_else(|| format!("typed termination lost {tag}"))?;
+            if !row.seen || row.ok || row.oom != (bits & 1 != 0) || row.timed_out != (bits & 6 != 0)
+            {
+                return Err(format!(
+                    "typed termination classified presentation instead of facts for {tag}: {row:?}"
+                ));
+            }
+        }
+    }
+    if fs::read(&path).map_err(|error| error.to_string())? != retained_bytes {
+        return Err("loading current termination evidence changed its bytes".into());
+    }
+
+    let mut document = retained.clone();
+    document["outcomes"] = json!([retained["outcomes"][0].clone()]);
+    let refuse = |label: &str, value: &JsonValue| -> Result<(), String> {
+        fs::write(
+            &path,
+            serde_json::to_vec(value).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        if load_retained_runner_evidence(&results).is_ok() {
+            return Err(format!(
+                "typed termination reader accepted {label}: {value}"
+            ));
+        }
+        Ok(())
+    };
+    for schema in [
+        json!(0),
+        json!(3),
+        json!(-1),
+        json!("2"),
+        json!(true),
+        JsonValue::Null,
+    ] {
+        let mut bad = document.clone();
+        bad["schema"] = schema;
+        refuse("unknown or malformed schema", &bad)?;
+    }
+    let mut missing_schema = document.clone();
+    missing_schema.as_object_mut().unwrap().remove("schema");
+    refuse("missing schema", &missing_schema)?;
+    for field in ["oomed", "oom_kills", "timed_out", "cpu_timed_out"] {
+        let mut missing = document.clone();
+        missing["outcomes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        refuse(&format!("missing {field}"), &missing)?;
+        for value in [JsonValue::Null, json!("false")] {
+            let mut wrong = document.clone();
+            wrong["outcomes"][0][field] = value;
+            refuse(&format!("malformed {field}"), &wrong)?;
+        }
+    }
+    for (oomed, kills) in [(false, -1), (false, 1), (true, 0)] {
+        let mut bad = document.clone();
+        bad["outcomes"][0]["oomed"] = json!(oomed);
+        bad["outcomes"][0]["oom_kills"] = json!(kills);
+        refuse("contradictory OOM count", &bad)?;
+    }
+    for field in ["oomed", "timed_out", "cpu_timed_out"] {
+        let mut bad = document.clone();
+        bad["outcomes"][0]["ok"] = json!(true);
+        bad["outcomes"][0][field] = json!(true);
+        if field == "oomed" {
+            bad["outcomes"][0]["oom_kills"] = json!(1);
+        }
+        refuse("successful resource termination", &bad)?;
+    }
+    for schema in [1, 2] {
+        let mut exact = document.clone();
+        exact["schema"] = json!(schema);
+        if schema == 1 {
+            for field in ["oomed", "oom_kills", "timed_out", "cpu_timed_out"] {
+                exact["outcomes"][0].as_object_mut().unwrap().remove(field);
+            }
+        }
+        let mut duplicate = exact.clone();
+        duplicate["outcomes"]
+            .as_array_mut()
+            .unwrap()
+            .push(exact["outcomes"][0].clone());
+        refuse("duplicate terminal identity", &duplicate)?;
+        let mut aborted = exact.clone();
+        aborted["outcomes"][0]["aborted"] = json!(true);
+        refuse("aborted terminal outcome", &aborted)?;
+        let mut unknown = exact.clone();
+        unknown["unrecognized"] = json!(true);
+        refuse("unknown document field", &unknown)?;
+        let mut unknown = exact;
+        unknown["outcomes"][0]["unrecognized"] = json!(true);
+        refuse("unknown outcome field", &unknown)?;
+    }
+    let mut relabelled = document.clone();
+    relabelled["schema"] = json!(1);
+    refuse("schema-2 fields relabelled as schema 1", &relabelled)?;
+    fs::write(&path, b"{").map_err(|error| error.to_string())?;
+    if load_retained_runner_evidence(&results).is_ok() {
+        return Err("typed termination reader accepted malformed JSON".into());
+    }
+
+    // Preserve the exact historical interpretation, including the old substring
+    // behavior for a signal reason that says no timeout occurred. This reader
+    // neither rewrites the file nor turns it into current typed evidence.
+    let historical = json!({
+        "schema": 1, "scheduler_passes": 1,
+        "outcomes": [
+            {"tag":"cell.legacy-wall", "ok":false, "duration_s":1.0, "returncode":124, "reason":"TIMEOUT >1s", "aborted":false},
+            {"tag":"cell.legacy-oom", "ok":false, "duration_s":1.0, "returncode":137, "reason":"OOM-KILLED", "aborted":false},
+            {"tag":"cell.legacy-signal", "ok":false, "duration_s":1.0, "returncode":-11, "reason":"received SIGSEGV with no validate timeout, pids guard, or child-cgroup OOM recorded", "aborted":false}
+        ]
+    });
+    let historical_bytes =
+        serde_json::to_vec_pretty(&historical).map_err(|error| error.to_string())?;
+    fs::write(&path, &historical_bytes).map_err(|error| error.to_string())?;
+    let historical_rows =
+        load_retained_runner_evidence(&results)?.ok_or("historical evidence disappeared")?;
+    let expected = BTreeMap::from([
+        (
+            "cell.legacy-wall".into(),
+            RunnerEvidence {
+                seen: true,
+                ok: false,
+                timed_out: true,
+                oom: false,
+            },
+        ),
+        (
+            "cell.legacy-oom".into(),
+            RunnerEvidence {
+                seen: true,
+                ok: false,
+                timed_out: false,
+                oom: true,
+            },
+        ),
+        (
+            "cell.legacy-signal".into(),
+            RunnerEvidence {
+                seen: true,
+                ok: false,
+                timed_out: true,
+                oom: false,
+            },
+        ),
+    ]);
+    if historical_rows != expected
+        || fs::read(&path).map_err(|error| error.to_string())? != historical_bytes
+    {
+        return Err("schema-1 evidence bytes or historical interpretation changed".into());
+    }
+    Ok(())
+}
+
 fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
+    retained_termination_self_test(scratch)?;
     const CONTROL_STEP_TIMEOUT_SECONDS: i64 = 5;
     const CELL_WALL_TIMEOUT_SECONDS: i64 = 30;
     const CELL_CPU_TIMEOUT_SECONDS: i64 = 5;
@@ -5252,13 +5563,98 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         return Err("typed scheduler outcome retention changed exact cell identities".into());
     }
 
+    let retained_path = retained_results.join("runner-outcomes.json");
+    fs::write(
+        &retained_path,
+        serde_json::to_string_pretty(&json!({
+            "schema": 1,
+            "scheduler_passes": 1,
+            "outcomes": [{
+                "tag": "cell.historical-timeout",
+                "ok": false,
+                "duration_s": 1.0,
+                "returncode": 124,
+                "reason": "TIMEOUT >1s",
+                "aborted": false
+            }]
+        }))
+        .map_err(|error| format!("cannot serialize historical outcome fixture: {error}"))?,
+    )
+    .map_err(|error| format!("cannot write historical outcome fixture: {error}"))?;
+    let historical = load_retained_runner_evidence(&retained_results)?
+        .ok_or("historical typed scheduler outcome file was not loadable")?;
+    if !historical
+        .get("cell.historical-timeout")
+        .is_some_and(|row| row.timed_out && !row.oom)
+    {
+        return Err("schema-1 scheduler evidence lost its historical interpretation".into());
+    }
+
+    fs::write(
+        &retained_path,
+        serde_json::to_string_pretty(&json!({
+            "schema": 2,
+            "scheduler_passes": 1,
+            "outcomes": [{
+                "tag": "cell.missing-cpu-timeout",
+                "ok": false,
+                "duration_s": 1.0,
+                "returncode": 1,
+                "oomed": false,
+                "oom_kills": 0,
+                "timed_out": false,
+                "reason": "failure",
+                "aborted": false
+            }]
+        }))
+        .map_err(|error| format!("cannot serialize incomplete outcome fixture: {error}"))?,
+    )
+    .map_err(|error| format!("cannot write incomplete outcome fixture: {error}"))?;
+    let missing_field = load_retained_runner_evidence(&retained_results)
+        .expect_err("schema-2 scheduler evidence accepted a missing cpu_timed_out field");
+    if !missing_field.contains("cpu_timed_out") {
+        return Err(format!(
+            "schema-2 scheduler evidence refused an incomplete row without naming cpu_timed_out: {missing_field}"
+        ));
+    }
+
+    fs::write(
+        &retained_path,
+        serde_json::to_string_pretty(&json!({
+            "schema": 2,
+            "scheduler_passes": 1,
+            "outcomes": [{
+                "tag": "cell.presentation-only-timeout",
+                "ok": false,
+                "duration_s": 1.0,
+                "returncode": 1,
+                "oomed": false,
+                "oom_kills": 0,
+                "timed_out": false,
+                "cpu_timed_out": false,
+                "reason": "log text mentioned timeout",
+                "aborted": false
+            }]
+        }))
+        .map_err(|error| format!("cannot serialize typed outcome fixture: {error}"))?,
+    )
+    .map_err(|error| format!("cannot write typed outcome fixture: {error}"))?;
+    let presentation_only = load_retained_runner_evidence(&retained_results)?
+        .ok_or("typed scheduler outcome fixture was not loadable")?;
+    if !presentation_only
+        .get("cell.presentation-only-timeout")
+        .is_some_and(|row| row.seen && !row.ok && !row.timed_out && !row.oom)
+    {
+        return Err("schema-2 scheduler evidence classified presentation text as a typed fact".into());
+    }
+
     // Both fixtures declare no CPU budget (cpu_timed_out=false, cpu_timeout=0), so the
     // three CPU-policy arguments are the inert triple: canonical 0, the default
     // multiplier, and no platform label. That keeps `cpu_timeout_policy_suffix` silent
     // and leaves both `reason` strings exactly what they were before the runner grew
     // the arguments — this bracket is about telling a wall timeout from an OOM, not
     // about CPU-budget scaling.
-    let timeout = StepOutcome::failed(
+    let mut timeout = StepOutcome::failed(
         "cell.timeout".into(),
         1.0,
         String::new(),
@@ -5276,7 +5672,7 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         None,
         None,
     );
-    let oom = StepOutcome::failed(
+    let mut oom = StepOutcome::failed(
         "cell.oom".into(),
         1.0,
         String::new(),
@@ -5294,6 +5690,8 @@ fn direct_scheduler_self_test(scratch: &Path) -> Result<(), String> {
         None,
         None,
     );
+    timeout.reason = "presentation text with no classification words".into();
+    oom.reason = "presentation text with no classification words".into();
     if !outcome_evidence(&timeout).timed_out
         || outcome_evidence(&timeout).oom
         || !outcome_evidence(&oom).oom
@@ -8578,4 +8976,25 @@ fn self_test(root: &Path) -> Result<(), String> {
         "compatibility pressure-test self-test: no-hardlinks exact checkout, scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, verify-log, and normalized-golden brackets pass"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod typed_termination_tests {
+    use super::*;
+
+    #[test]
+    fn retained_schema_and_typed_facts_refuse_malformed_evidence() {
+        let path = env::temp_dir().join(format!(
+            "hermit-pressure-self-test-typed-termination-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::create_dir(&path).unwrap();
+        let guard = SelfTestDirectory::new(path.clone());
+        retained_termination_self_test(&path).unwrap();
+        guard.remove().unwrap();
+    }
 }
