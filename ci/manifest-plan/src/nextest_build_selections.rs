@@ -29,6 +29,10 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         ]),
         "test.detcore_unit" => Some(&["-p", "hermit-detcore", "--lib", "--bins"]),
         "test.detcore_misc"
+        | "privileged-build.privileged_tests"
+        | "privileged-cpuid.faulting"
+        | "privileged-only-cpuid.faulting"
+        | "privileged-only-cpuid.faulting_on_host"
         | "super.post_fork_scheduling_diagnostics"
         | "super.network_syscall_determinism_diagnostic" => {
             Some(&["-p", "hermit-detcore", "--test", "tests_misc"])
@@ -372,6 +376,33 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
             ));
         }
     }
+    let direct = "nextest-binaries.rs executable ";
+    if let Some((_, rest)) = step.cmd.split_once(direct) {
+        if step.cmd.matches(direct).count() != 1 {
+            return Err(format!("{tag} has ambiguous prepared executable lookups"));
+        }
+        let arguments = rest
+            .split_once(')')
+            .ok_or_else(|| format!("{tag} has no executable lookup boundary"))?
+            .0;
+        let arguments = shell_words::split(arguments).map_err(|e| format!("{tag}: {e}"))?;
+        if arguments.len() != 2 {
+            return Err(format!(
+                "{tag} must name one prepared package and test target"
+            ));
+        }
+        let actual = vec![
+            "-p".to_string(),
+            arguments[0].clone(),
+            "--test".to_string(),
+            arguments[1].clone(),
+        ];
+        if actual != expected {
+            return Err(format!(
+                "{tag} executable lookup selects {actual:?}, declared {expected:?}"
+            ));
+        }
+    }
     if step.cmd.contains("cargo nextest list") || step.cmd.contains("cargo nextest run") {
         return Err(format!("{tag} can bypass prepared metadata and compile"));
     }
@@ -450,6 +481,21 @@ mod tests {
             .find(|step| step.tag() == "privileged-test.cli_kvm")
             .unwrap();
         assert_command_selection(original).unwrap();
+        let direct = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "privileged-only-cpuid.faulting")
+            .unwrap();
+        assert_command_selection(direct).unwrap();
+        let mut wrong_target = direct.clone();
+        wrong_target.cmd = wrong_target.cmd.replace(
+            "executable hermit-detcore tests_misc",
+            "executable hermit-detcore tests_parallelism",
+        );
+        assert!(assert_command_selection(&wrong_target).is_err());
+        let mut missing_direct = direct.clone();
+        missing_direct.env.remove(SELECTION_ENV);
+        assert!(assert_command_selection(&missing_direct).is_err());
         for mutation in ["required", "selection", "run", "list", "raw-cargo"] {
             let mut changed = original.clone();
             match mutation {
