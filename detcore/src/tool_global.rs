@@ -3281,7 +3281,7 @@ where
     }
 }
 
-/// Wait without requesting a scheduler turn for a backend's physical-exit report to be applied.
+/// Wait at the scheduler barrier until a backend's physical-exit report has been applied.
 pub async fn await_exact_child_physical_exit<G, T>(
     guest: &mut G,
     child: DetPid,
