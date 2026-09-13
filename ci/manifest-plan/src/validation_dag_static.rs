@@ -174,7 +174,7 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 /// an empty or narrowed run refuse. Update these only after enumerating the
 /// corresponding shipped command and accounting for changed test identities.
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
-    ("test.regular_crates", 406),
+    ("test.regular_crates", 418),
     ("test.hermit_unit", 496),
     ("test.detcore_unit", 656),
     ("test.detcore_misc", 27),
@@ -331,18 +331,22 @@ impl StaticStepSpec {
                 "{tag} declares NEXTEST_EXPECTED_EXECUTED twice"
             );
         }
-        if producer == Some(StructuredResultProducerKind::Nextest) {
+        if producer == Some(StructuredResultProducerKind::Nextest)
+            || self.cmd.contains("nextest-binaries.rs executable ")
+        {
             let selection = crate::nextest_build_selections::for_step(&tag)
                 .unwrap_or_else(|| panic!("{tag} has no declared Cargo build selection"));
-            assert!(env
-                .insert(
+            assert!(
+                env.insert(
                     crate::nextest_binaries::SELECTION_ENV.into(),
                     serde_json::to_string(selection).expect("string list is serializable"),
                 )
-                .is_none());
-            assert!(env
-                .insert(crate::nextest_binaries::REQUIRED_ENV.into(), "1".into())
-                .is_none());
+                .is_none()
+            );
+            assert!(
+                env.insert(crate::nextest_binaries::REQUIRED_ENV.into(), "1".into())
+                    .is_none()
+            );
         }
         Step {
             group: self.group.into(),
@@ -1086,7 +1090,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"gate.manifest"########,
+        deps: &[
+            r########"gate.manifest"########,
             r########"setup.nextest"########,
         ],
         env: &[],
@@ -3067,7 +3072,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"gate.manifest"########,
+        deps: &[
+            r########"gate.manifest"########,
             r########"setup.nextest"########,
         ],
         env: &[],
@@ -3282,7 +3288,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"gate.manifest"########,
+        deps: &[
+            r########"gate.manifest"########,
             r########"setup.nextest"########,
         ],
         env: &[],
@@ -4189,8 +4196,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"gate.manifest"########,
-        ],
+        deps: &[r########"gate.manifest"########],
         env: &[],
         hint: HintSpec {
             resources: &[],
@@ -4493,7 +4499,8 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"gate.manifest"########,
+        deps: &[
+            r########"gate.manifest"########,
             r########"setup.nextest"########,
         ],
         env: &[],
@@ -5773,8 +5780,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"gate.manifest_on_host"########,
-        ],
+        deps: &[r########"gate.manifest_on_host"########],
         env: &[],
         hint: HintSpec {
             resources: &[],

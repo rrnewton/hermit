@@ -569,7 +569,7 @@ pub fn profile_selections(
     config_selections(&graph, profile)
 }
 
-pub(super) fn config_selections(
+pub fn config_selections(
     graph: &dagrun::model::DagConfig,
     profile: &str,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
@@ -1059,8 +1059,21 @@ pub fn executable(root: &Path, package: &str, name: &str) -> Result<PathBuf, Str
             "prepared package {package} is missing or ambiguous"
         ));
     }
+    let required_selection = if std::env::var(REQUIRED_ENV).as_deref() == Ok("1") {
+        let raw = std::env::var(SELECTION_ENV)
+            .map_err(|_| "prepared executable lookup has no declared build selection")?;
+        let args: Vec<String> = serde_json::from_str(&raw)
+            .map_err(|e| format!("invalid executable build selection: {e}"))?;
+        Some(verify_selection(&record, &cargo, &args)?)
+    } else {
+        None
+    };
+    let selections = match required_selection.as_ref() {
+        Some(selection) => vec![selection],
+        None => record.selections.values().collect(),
+    };
     let mut matches = BTreeSet::new();
-    for selection in record.selections.values() {
+    for selection in selections {
         for binary in &selection.binaries {
             if ids.contains(binary.package_id.as_str())
                 && binary.binary_name == name
@@ -1369,9 +1382,20 @@ mod tests {
         assert_eq!(sources(&f.cargo, &f.root).unwrap(), before);
         // Hermit's build script embeds HEAD even when an empty commit leaves
         // the complete source tree unchanged.
-        git_bytes(&f.root, &["-c", "user.name=Fixture", "-c",
-            "user.email=fixture@example.invalid", "commit", "--allow-empty",
-            "-qm", "same tree, different build identity"]).unwrap();
+        git_bytes(
+            &f.root,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "same tree, different build identity",
+            ],
+        )
+        .unwrap();
         assert_ne!(sources(&f.cargo, &f.root).unwrap(), before);
     }
 }
