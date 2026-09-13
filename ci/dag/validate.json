@@ -6795,7 +6795,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "406",
+        "NEXTEST_EXPECTED_EXECUTED": "418",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -7768,7 +7768,10 @@
         "gate.manifest",
         "pre.reverie_pin"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_misc\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 120,
@@ -7806,7 +7809,10 @@
         "pre.reverie_pin",
         "privileged-build.privileged_tests"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_misc\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 40,
@@ -12191,14 +12197,17 @@
         "privileged",
         "cpuid-faulting"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; status=0; timeout --kill-after=5s 30s cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact || status=$?; if [ \"$status\" -eq 124 ] || [ \"$status\" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact Cargo timeout: exit %s)\\n' \"$status\" >&2; fi; exit \"$status\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; tests_misc=\"$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)\" || exit 1; status=0; timeout --kill-after=5s 30s \"$tests_misc\" rdrand_rdseed_is_masked --exact || status=$?; if [ \"$status\" -eq 124 ] || [ \"$status\" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact test timeout: exit %s)\\n' \"$status\" >&2; fi; exit \"$status\"",
       "result_manifests": [],
       "deps": [
         "gate.manifest",
         "pre.reverie_pin",
         "privileged-only-build.privileged_tests"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_misc\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 40,
@@ -19041,14 +19050,17 @@
       "labels": [
         "hosted-privileged"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; status=0; timeout --kill-after=5s 30s cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact || status=$?; if [ \"$status\" -eq 124 ] || [ \"$status\" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact Cargo timeout: exit %s)\\n' \"$status\" >&2; fi; exit \"$status\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; tests_misc=\"$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)\" || exit 1; status=0; timeout --kill-after=5s 30s \"$tests_misc\" rdrand_rdseed_is_masked --exact || status=$?; if [ \"$status\" -eq 124 ] || [ \"$status\" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact test timeout: exit %s)\\n' \"$status\" >&2; fi; exit \"$status\"",
       "result_manifests": [],
       "deps": [
         "gate.manifest_on_host",
         "pre.reverie_pin_on_host",
         "privileged-only-build.privileged_tests_on_host"
       ],
-      "env": {},
+      "env": {
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--test\",\"tests_misc\"]"
+      },
       "networkonly": false,
       "engine_only": false,
       "timeout": 40,

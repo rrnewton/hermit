@@ -20823,6 +20823,26 @@ mod fused_privileged_build_tests {
         assert!(!run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "changed bytes at the same path must be stale");
         assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "stale refusal must not compile a replacement");
 
+        // The standalone privileged lane must prepare tests_misc even though
+        // CPUID executes its harness directly rather than through Nextest.
+        let (privileged_root, privileged_bin, privileged_log) = cold_fixture(repository, &helper);
+        let privileged = run_build("./ci/nextest-binaries.rs prepare privileged", privileged_root.path(), &privileged_bin, &privileged_log, "current");
+        assert!(privileged.status.success(), "{}", String::from_utf8_lossy(&privileged.stderr));
+        let privileged_selections = hermit_manifest_plan::nextest_binaries::profile_selections(repository, "privileged").unwrap();
+        assert_eq!(privileged_selections.len(), 3);
+        assert!(privileged_selections.values().any(|args| args == &["-p", "hermit-detcore", "--test", "tests_misc"]));
+        let direct = committed.steps.iter().find(|step| step.tag() == "privileged-only-cpuid.faulting").unwrap();
+        let declaration = direct.env.get(hermit_manifest_plan::nextest_binaries::SELECTION_ENV).unwrap();
+        let prefix = format!("export HERMIT_PREPARED_NEXTEST_REQUIRED=1; export NEXTEST_PREPARED_BUILD_SELECTION={}; ", validate_plan::shell_quote(declaration));
+        let before = std::fs::read_to_string(&privileged_log).unwrap();
+        let direct_result = run_build(&format!("{prefix}{}", direct.cmd), privileged_root.path(), &privileged_bin, &privileged_log, "current");
+        assert!(direct_result.status.success(), "{}", String::from_utf8_lossy(&direct_result.stderr));
+        let missing_declaration = run_build("export HERMIT_PREPARED_NEXTEST_REQUIRED=1; unset NEXTEST_PREPARED_BUILD_SELECTION; ./ci/nextest-binaries.rs executable hermit-detcore tests_misc", privileged_root.path(), &privileged_bin, &privileged_log, "current");
+        assert!(!missing_declaration.status.success(), "the required direct selection cannot be omitted");
+        let wrong_declaration = run_build("export HERMIT_PREPARED_NEXTEST_REQUIRED=1; export NEXTEST_PREPARED_BUILD_SELECTION='[\"-p\",\"hermit-detcore\",\"--lib\"]'; ./ci/nextest-binaries.rs executable hermit-detcore tests_misc", privileged_root.path(), &privileged_bin, &privileged_log, "current");
+        assert!(!wrong_declaration.status.success(), "a different build selection cannot satisfy the direct target");
+        assert_eq!(std::fs::read_to_string(&privileged_log).unwrap(), before, "direct consumers and refusals must not invoke Cargo");
+
         for mode in ["missing", "wrong", "ambiguous"] {
             let (root, bin, log) = cold_fixture(repository, &helper);
             let result = run_build(preparation, root.path(), &bin, &log, mode);

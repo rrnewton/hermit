@@ -259,7 +259,12 @@ fn cargo_command_packages(
     let mut command_index = 0;
     while command_index < tokens.len() {
         let counted_nextest = tokens[command_index].ends_with("/ci/run-nextest-counted.sh");
-        if tokens[command_index] != "cargo" && !counted_nextest {
+        let prepared_nextest = tokens[command_index].ends_with("/ci/nextest-binaries.rs")
+            && matches!(
+                tokens.get(command_index + 1).map(String::as_str),
+                Some("run" | "list")
+            );
+        if tokens[command_index] != "cargo" && !counted_nextest && !prepared_nextest {
             command_index += 1;
             continue;
         }
@@ -268,9 +273,13 @@ fn cargo_command_packages(
             .map(String::as_str)
             .unwrap_or_default();
         let recognized = counted_nextest
+            || prepared_nextest
             || matches!(subcommand, "build" | "test" | "clippy" | "fmt" | "doc")
             || (subcommand == "nextest"
-                && tokens.get(command_index + 2).map(String::as_str) == Some("run"));
+                && matches!(
+                    tokens.get(command_index + 2).map(String::as_str),
+                    Some("run" | "list")
+                ));
         if !recognized {
             command_index += 1;
             continue;
@@ -329,12 +338,55 @@ fn cargo_command_packages(
     result
 }
 
+fn prepared_command_packages(
+    command: &str,
+    graph: &dagrun::model::DagConfig,
+    all: &BTreeSet<String>,
+    defaults: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, String> {
+    let tokens = shell_tokens(command);
+    let mut result = BTreeSet::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if !token.ends_with("/ci/nextest-binaries.rs")
+            || tokens.get(index + 1).map(String::as_str) != Some("prepare")
+        {
+            continue;
+        }
+        let profile = tokens
+            .get(index + 2)
+            .ok_or("prepared command has no profile")?;
+        let selections = hermit_manifest_plan::nextest_binaries::config_selections(graph, profile)?;
+        for args in selections.values() {
+            // These are validated Cargo build selectors from the graph. This
+            // string is only parsed for package names; it is never executed.
+            result.extend(cargo_command_packages(
+                &format!("cargo test {}", args.join(" ")),
+                all,
+                defaults,
+            ));
+            if args
+                .windows(2)
+                .any(|args| args == ["--test", "hermit_modes"])
+            {
+                let guests = "hermetic_infra_hermit_tests";
+                if !all.contains(guests) {
+                    return Err("prepared hermit_modes profile has no Cargo guest package".into());
+                }
+                result.insert(guests.into());
+            }
+        }
+    }
+    Ok(result)
+}
+
 fn load_dag_targets(
     dag: &Value,
     packages: &BTreeMap<String, Package>,
     defaults: &BTreeSet<String>,
 ) -> (BTreeSet<String>, BTreeMap<String, BTreeSet<String>>) {
     let all_packages: BTreeSet<String> = packages.keys().cloned().collect();
+    let graph = dagrun::io::dag_from_json(&dag.to_string())
+        .unwrap_or_else(|error| die(format!("{DAG}: {error}")));
     let steps = dag["steps"]
         .as_array()
         .unwrap_or_else(|| die(format!("{DAG}: `steps` must be an array")));
@@ -362,10 +414,12 @@ fn load_dag_targets(
         if !all_nodes.insert(node.clone()) {
             die(format!("{DAG}: duplicate node {node}"));
         }
-        targets.insert(
-            node,
-            cargo_command_packages(command, &all_packages, defaults),
+        let mut selected_packages = cargo_command_packages(command, &all_packages, defaults);
+        selected_packages.extend(
+            prepared_command_packages(command, &graph, &all_packages, defaults)
+                .unwrap_or_else(|error| die(format!("{DAG}: {node}: {error}"))),
         );
+        targets.insert(node, selected_packages);
     }
     (all_nodes, targets)
 }
@@ -682,7 +736,90 @@ mod tests {
             cargo_command_packages("/tmp/tree/ci/run-nextest-counted.sh -p b", &all, &defaults),
             BTreeSet::from(["b".into()])
         );
+        assert_eq!(
+            cargo_command_packages(
+                "cargo nextest list --workspace --exclude b && ./ci/nextest-binaries.rs list -p b",
+                &all,
+                &defaults
+            ),
+            BTreeSet::from(["a".into(), "b".into(), "c".into()])
+        );
         assert!(cargo_command_packages("cargo nextest show-config", &all, &defaults).is_empty());
+    }
+
+    #[test]
+    fn prepared_profiles_follow_graph_selections_and_include_cargo_guests() {
+        use hermit_manifest_plan::nextest_binaries::REQUIRED_ENV;
+        use hermit_manifest_plan::nextest_binaries::SELECTION_ENV;
+        let mut graph = dagrun::io::dag_from_json(&json!({"steps": [
+            {"group": "test", "job": "modes", "cmd": "true", "labels": ["portable"],
+             "env": {REQUIRED_ENV: "1", SELECTION_ENV: "[\"-p\",\"hermit\",\"--test\",\"hermit_modes\"]"}},
+            {"group": "test", "job": "unit", "cmd": "true", "labels": ["quick"],
+             "env": {REQUIRED_ENV: "1", SELECTION_ENV: "[\"-p\",\"hermit-detcore\",\"--lib\"]"}}
+        ]}).to_string()).unwrap();
+        let all = BTreeSet::from(
+            [
+                "hermit",
+                "hermit-detcore",
+                "hermetic_infra_hermit_tests",
+                "other",
+            ]
+            .map(String::from),
+        );
+        let defaults = BTreeSet::from(["other".into()]);
+        assert_eq!(
+            prepared_command_packages(
+                "./ci/nextest-binaries.rs prepare portable",
+                &graph,
+                &all,
+                &defaults
+            )
+            .unwrap(),
+            BTreeSet::from(["hermit".into(), "hermetic_infra_hermit_tests".into()])
+        );
+        assert_eq!(
+            prepared_command_packages(
+                "./ci/nextest-binaries.rs prepare quick",
+                &graph,
+                &all,
+                &defaults
+            )
+            .unwrap(),
+            BTreeSet::from(["hermit-detcore".into()])
+        );
+        assert!(
+            prepared_command_packages(
+                "./ci/nextest-binaries.rs prepare absent",
+                &graph,
+                &all,
+                &defaults
+            )
+            .is_err()
+        );
+        let mut no_guests = all.clone();
+        no_guests.remove("hermetic_infra_hermit_tests");
+        assert!(
+            prepared_command_packages(
+                "./ci/nextest-binaries.rs prepare portable",
+                &graph,
+                &no_guests,
+                &defaults
+            )
+            .is_err()
+        );
+        graph.steps[1]
+            .env
+            .insert(SELECTION_ENV.into(), "[\"-p\",\"other\",\"--lib\"]".into());
+        assert_eq!(
+            prepared_command_packages(
+                "./ci/nextest-binaries.rs prepare quick",
+                &graph,
+                &all,
+                &defaults
+            )
+            .unwrap(),
+            BTreeSet::from(["other".into()])
+        );
     }
 
     #[test]

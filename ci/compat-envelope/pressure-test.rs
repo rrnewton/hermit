@@ -79,11 +79,12 @@ const PORTABLE_DAG: &str = "ci/dag/validate.json";
 const TRACKED_CELLS_SCHEMA: u64 = 7;
 const RUN_SCHEMA: u64 = 3;
 const SUMMARY_SCHEMA: u64 = 4;
-const REQUIRED_BUILD_TAGS: [&str; 9] = [
+const REQUIRED_BUILD_TAGS: [&str; 10] = [
     "pre.submodules",
     "pre.reverie_pin",
     "build.rust_scripts",
     "setup.manifest_plan",
+    "setup.nextest",
     "gate.manifest",
     "build.workspace",
     "build.runtime_release",
@@ -5196,8 +5197,8 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
             }
         } else {
             let execution = result?;
-            if execution.outcomes.len() != 9 || execution.outcomes.iter().any(|outcome| !outcome.ok) {
-                return Err("positive prerequisite fixture did not execute all nine nodes".into());
+            if execution.outcomes.len() != 10 || execution.outcomes.iter().any(|outcome| !outcome.ok) {
+                return Err("positive prerequisite fixture did not execute all ten nodes".into());
             }
             expected.extend(original.keys().cloned());
         }
@@ -5208,7 +5209,7 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
             return Err(format!("prerequisite failure {failed:?} admitted a consumer or lost an ancestor: expected={expected:?} actual={actual:?}"));
         }
     }
-    println!("  prerequisite scheduler: nine-node positive and four failed-preflight controls retain exact execution identities");
+    println!("  prerequisite scheduler: ten-node positive and four failed-preflight controls retain exact execution identities");
     Ok(())
 }
 
@@ -7534,9 +7535,9 @@ fn self_test(root: &Path) -> Result<(), String> {
             "build.rust_scripts" => BTreeSet::from(["pre.reverie_pin"]),
             "setup.manifest_plan" => BTreeSet::from(["build.rust_scripts"]),
             "gate.manifest" => BTreeSet::from(["setup.manifest_plan"]),
-            "build.workspace" | "build.runtime_release" => {
-                BTreeSet::from(["gate.manifest", "pre.reverie_pin"])
-            }
+            "setup.nextest" => BTreeSet::from(["build.rust_scripts", "gate.manifest", "pre.reverie_pin"]),
+            "build.workspace" => BTreeSet::from(["gate.manifest", "pre.reverie_pin", "setup.nextest"]),
+            "build.runtime_release" => BTreeSet::from(["gate.manifest", "pre.reverie_pin"]),
             "build.e2e_artifact" => BTreeSet::from([
                 "build.workspace", "build.runtime_release", "gate.manifest", "pre.reverie_pin",
             ]),
@@ -7556,6 +7557,27 @@ fn self_test(root: &Path) -> Result<(), String> {
         {
             return Err("green batch replaced the canonical prebuilt artifact publisher".into());
         }
+    }
+    let batch_build_results = scratch.join("batch-nextest-build-markers");
+    fs::create_dir_all(batch_build_results.join("state"))
+        .map_err(|e| format!("cannot create batch build marker fixture: {e}"))?;
+    for tag in &expected_green_build_tags {
+        fs::write(build_marker(&batch_build_results, tag), "ok\n")
+            .map_err(|e| format!("cannot write batch marker {tag}: {e}"))?;
+    }
+    if !required_builds_complete(&batch_build_results, &green_batch_metadata) {
+        return Err("batch setup refused its complete prerequisite markers".into());
+    }
+    let nextest_marker = build_marker(&batch_build_results, "setup.nextest");
+    fs::remove_file(&nextest_marker)
+        .map_err(|e| format!("cannot remove Nextest marker: {e}"))?;
+    if required_builds_complete(&batch_build_results, &green_batch_metadata) {
+        return Err("otherwise complete batch setup accepted missing Nextest preparation".into());
+    }
+    fs::write(&nextest_marker, "ok\n")
+        .map_err(|e| format!("cannot restore Nextest marker: {e}"))?;
+    if !required_builds_complete(&batch_build_results, &green_batch_metadata) {
+        return Err("restoring the Nextest marker did not restore completed batch setup".into());
     }
     let green_batch_cell_count = green_batch_dag
         .steps
