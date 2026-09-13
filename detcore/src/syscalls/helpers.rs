@@ -743,7 +743,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             None
         };
         let blocked_mask_addr = stack.push(blocked_mask);
-        let old_mask_addr = stack.reserve::<libc::sigset_t>();
+        let old_mask_addr = stack.reserve::<KernelSigset>();
         let action_addr = stack.reserve::<KernelSigaction>();
         let _mask_guard = stack.commit()?;
         let guest_signal_mask =
@@ -840,7 +840,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let blocked_mask = blocked_signal_mask();
         let mut stack = guest.stack().await;
         let blocked_mask_addr = stack.push(blocked_mask);
-        let old_mask_addr = stack.reserve::<libc::sigset_t>();
+        let old_mask_addr = stack.reserve::<KernelSigset>();
         let action_addr = stack.reserve::<KernelSigaction>();
         let _mask_guard = stack.commit()?;
         let guest_signal_mask =
