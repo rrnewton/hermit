@@ -570,9 +570,9 @@ pub struct Scheduler {
     /// gone and its request is `ThreadExited`). `ReplaceThenAdmit` is the one
     /// Linux exception: a nonleader exec has installed a fresh registration at
     /// the destroyed leader's raw TID, but the old incarnation's physical queue
-    /// slot must still be removed. Both are filtered from
-    /// [`Scheduler::are_all_quiesced`] until this drain establishes the intended
-    /// physical queue state.
+    /// slot must still be removed. Quiescence skips both old physical slots;
+    /// a paired replacement admission still waits for its fresh request before
+    /// the time snapshot and this drain establish the next scheduling state.
     ///
     /// The map is drained before admissions. Ordinary retirement cancels a
     /// buffered admission for the same raw TID; the explicitly classified exec
@@ -1712,15 +1712,29 @@ impl Scheduler {
 
     /// Returns None if all are parked, otherwise the unfilled request of the next we're waiting on.
     fn are_all_quiesced(&self) -> Option<Ivar<SchedRequest>> {
-        // Skip raw TIDs whose old run-queue incarnation is pending removal.
-        // `Retire` targets have no `next_turns` entry, while
-        // `ReplaceThenAdmit` targets have a fresh registration that must not be
-        // waited on until the drain removes the old physical slot and admits
-        // that replacement.
+        // Skip old physical queue slots pending removal. A Retire target cannot
+        // participate again; a ReplaceThenAdmit target has a fresh registration
+        // whose request is checked below through the paired pending admission,
+        // before the drain removes its old physical slot.
         self.run_queue
             .tids()
             .filter(|dt| !self.pending_run_queue_removals.contains_key(dt))
             .find_map(|dt| self.check_request(dt))
+            .or_else(|| {
+                // Step2 admits these identities before selection. Their startup RPC
+                // publishes a clock contribution before filling its request, so wait
+                // for that request before step1 takes the global-time snapshot too.
+                // Retire cancels admission; ReplaceThenAdmit instead names the fresh
+                // registration and must wait on its own request, never the old one.
+                self.pending_run_queue_admissions
+                    .keys()
+                    .filter(|dt| {
+                        self.pending_run_queue_removals.get(dt) != Some(&RemovalDisposition::Retire)
+                    })
+                    // The admission drain likewise discards a missing registration.
+                    .filter_map(|dt| self.next_turns.get(dt))
+                    .find_map(|next| next.req.try_read().is_none().then(|| next.req.clone()))
+            })
     }
 
     /// Try to pop the next event from the sorted list of stacktrace_events, if it matches the given
@@ -1980,10 +1994,10 @@ impl Scheduler {
         // buffers it to the same deterministic `step2` drain. The old leader's
         // removal is explicitly classified as `ReplaceThenAdmit`, so the drain
         // removes its physical queue slot without cancelling the new
-        // incarnation. `are_all_quiesced` filters every pending removal key;
-        // ordinary targets are logically dead, while the replacement key is not
-        // runnable until that old slot has been removed and its admission
-        // applied. No handler mutates the queue inside a tentative window.
+        // incarnation. Quiescence skips the old physical slot and waits on the
+        // fresh replacement request through its pending admission. The replacement
+        // is not runnable until the old slot is removed and its admission applied.
+        // No handler mutates the queue inside a tentative window.
         self.replace_retired_run_queue_incarnation(new_leader, AdmitIntent::Fixed(AdmitSide::Back));
         self.started_up.try_put(());
 
@@ -5628,6 +5642,10 @@ mod test {
 
         // The thread is retired before the drain: its next_turns entry is gone.
         sched.next_turns.remove(&tid);
+        assert!(
+            sched.are_all_quiesced().is_none(),
+            "missing retired startup is not a live waiter"
+        );
         sched.drain_pending_run_queue_removals();
         sched.drain_pending_run_queue_admissions();
 
@@ -5691,6 +5709,19 @@ mod test {
             "old-leader cleanup must not remove the replacement leader's PIDFD_THREAD"
         );
 
+        let fresh_request = sched.next_turns[&leader].req.clone();
+        assert_ne!(fresh_request, old_leader_request);
+        assert_eq!(sched.are_all_quiesced(), Some(fresh_request.clone()));
+        let global_time = Mutex::new(GlobalTime::new(&config));
+        let before = sched.committed_time;
+        assert_eq!(
+            sched.step1_check_quiescence(&global_time, &Err(SkipTurn)),
+            Some(fresh_request.clone()),
+        );
+        assert_eq!(sched.committed_time, before);
+        fresh_request.put(Ok(Resources::new(leader)));
+        assert!(sched.are_all_quiesced().is_none());
+
         sched.drain_pending_run_queue_removals();
         sched.drain_pending_run_queue_admissions();
 
@@ -5733,6 +5764,10 @@ mod test {
         );
         assert!(!sched.pending_run_queue_admissions.contains_key(&leader));
 
+        assert!(
+            sched.are_all_quiesced().is_none(),
+            "a retired replacement cannot hold the snapshot"
+        );
         sched.drain_pending_run_queue_removals();
         sched.drain_pending_run_queue_admissions();
 
@@ -5839,6 +5874,11 @@ mod test {
 
             register_known_thread(&mut s, lower);
             register_known_thread(&mut s, higher);
+            // These unrelated synthetic children have already published startup
+            // requests; this fixture varies the exec caller's admission boundary.
+            for child in [lower, higher] {
+                s.next_turns[&child].req.put(Ok(Resources::new(child)));
+            }
             s.admit_to_run_queue(lower, AdmitIntent::PostFork(RunsPostFork::Random));
             s.admit_to_run_queue(higher, AdmitIntent::PostFork(RunsPostFork::Random));
             // `step2` drains first, then this unresolved barrier returns
@@ -5859,6 +5899,11 @@ mod test {
                 detpid,
                 pre_exec_mm,
             );
+            // A successful replacement publishes its own startup request before
+            // the daemon may take the next quiescent snapshot.
+            sched.lock().unwrap().next_turns[&leader]
+                .req
+                .put(Ok(Resources::new(leader)));
         } else if matches!(timing, ExecReconnectTiming::CallerResolvedBeforeReconnect) {
             caller_request.put(Ok(Resources::new(caller)));
         }
@@ -5890,6 +5935,11 @@ mod test {
                 detpid,
                 pre_exec_mm,
             );
+            // A successful replacement publishes its own startup request before
+            // the daemon may take the next quiescent snapshot.
+            sched.lock().unwrap().next_turns[&leader]
+                .req
+                .put(Ok(Resources::new(leader)));
         }
 
         assert!(turn.await.expect("scheduler task panicked").is_err());
