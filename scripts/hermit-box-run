@@ -265,6 +265,7 @@ PY
   local unit runner_pid="" cgpath=""
   local cgroup_resolved=0 final_usage_observed=0 runner_waited=0
   local payload_completed=0 payload_status_file="" payload_release_file="" hold_dir=""
+  local receipt_pid="" completed_cpu_observed=0 completed_cpu_nsec="" maximum_usage=0 accounting_failed=0
   local budget_usec=$(( cpu_budget * 1000000 ))
   local reaped=0 last_usage=0 termination="completed" status=0
   unit="hermit-box-run-$$-$(date +%s%N).scope"
@@ -316,7 +317,9 @@ PY
   _pt_capture_final_usage() {
     local observed=""
     if observed="$(_pt_read_usage)"; then
+      [ "$observed" -ge "$maximum_usage" ] || { accounting_failed=1; return 1; }
       last_usage="$observed"
+      maximum_usage="$observed"
       final_usage_observed=1
       return 0
     fi
@@ -354,6 +357,317 @@ PY
     done
     systemctl --user --no-block stop "$unit" >/dev/null 2>&1 || true
   }
+  _pt_start_cpu_reference() {
+    # Keep completed unit accounting readable after the held scope is reaped.
+    /usr/bin/python3 - "$unit" "$cgpath" "$hold_dir" "$$" <<'CPU_REFERENCE_PY' &
+"""Keep one authenticated user unit's actual results alive through scope teardown."""
+
+import ctypes, os, re, time
+
+
+class BusError(ctypes.Structure):
+    _fields_ = [
+        ("name", ctypes.c_char_p),
+        ("message", ctypes.c_char_p),
+        ("need_free", ctypes.c_int),
+    ]
+
+
+class UnitReference:
+    def __init__(self, library, unit):
+        assert re.fullmatch(r"hermit-box-run-[0-9]+-[0-9]+\.scope", unit)
+        self.unit = unit
+        self.calls = []
+        self.bus = ctypes.c_void_p()
+        self.held = False
+        self.lib = ctypes.CDLL(library)
+        self.lib.sd_bus_open_user.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        self.lib.sd_bus_open_user.restype = ctypes.c_int
+        self.lib.sd_bus_set_method_call_timeout.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+        ]
+        self.lib.sd_bus_set_method_call_timeout.restype = ctypes.c_int
+        self.lib.sd_bus_call_method.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(BusError),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_char_p,
+        ]
+        self.lib.sd_bus_call_method.restype = ctypes.c_int
+        self.lib.sd_bus_get_property.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(BusError),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_char_p,
+        ]
+        self.lib.sd_bus_get_property.restype = ctypes.c_int
+        self.lib.sd_bus_message_read.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self.lib.sd_bus_message_read.restype = ctypes.c_int
+        self.lib.sd_bus_message_unref.argtypes = [ctypes.c_void_p]
+        self.lib.sd_bus_message_unref.restype = ctypes.c_void_p
+        self.lib.sd_bus_error_free.argtypes = [ctypes.POINTER(BusError)]
+        self.lib.sd_bus_error_free.restype = ctypes.POINTER(BusError)
+        self.lib.sd_bus_flush_close_unref.argtypes = [ctypes.c_void_p]
+        self.lib.sd_bus_flush_close_unref.restype = ctypes.c_void_p
+        status = self.lib.sd_bus_open_user(ctypes.byref(self.bus))
+        self.calls.append({"function": "sd_bus_open_user", "status": status})
+        if status < 0:
+            raise OSError(-status, os.strerror(-status))
+        status = self.lib.sd_bus_set_method_call_timeout(self.bus, 5_000_000)
+        self.calls.append(
+            {
+                "function": "sd_bus_set_method_call_timeout",
+                "microseconds": 5_000_000,
+                "status": status,
+            }
+        )
+        if status < 0:
+            self.close()
+            raise OSError(-status, os.strerror(-status))
+
+    def call_timeout(self, deadline):
+        remaining = 5_000_000 if deadline is None else int((deadline - time.monotonic()) * 1_000_000)
+        if remaining <= 0:
+            raise TimeoutError("completed scope CPU query deadline")
+        status = self.lib.sd_bus_set_method_call_timeout(self.bus, remaining)
+        if status < 0:
+            raise OSError(-status, os.strerror(-status))
+
+    def method(self, member, deadline=None):
+        self.call_timeout(deadline)
+        assert member in ["RefUnit", "UnrefUnit", "GetUnit"]
+        error = BusError()
+        reply = ctypes.c_void_p()
+        started = time.monotonic()
+        try:
+            status = self.lib.sd_bus_call_method(
+                self.bus,
+                b"org.freedesktop.systemd1",
+                b"/org/freedesktop/systemd1",
+                b"org.freedesktop.systemd1.Manager",
+                member.encode(),
+                ctypes.byref(error),
+                ctypes.byref(reply),
+                b"s",
+                ctypes.c_char_p(self.unit.encode()),
+            )
+            row = {
+                "function": "sd_bus_call_method",
+                "destination": "org.freedesktop.systemd1",
+                "path": "/org/freedesktop/systemd1",
+                "interface": "org.freedesktop.systemd1.Manager",
+                "member": member,
+                "signature": "s",
+                "arguments": [self.unit],
+                "status": status,
+                "seconds": time.monotonic() - started,
+                "error_name": error.name.decode() if error.name else None,
+                "error_message": error.message.decode() if error.message else None,
+            }
+            self.calls.append(row)
+            if status < 0:
+                raise OSError(-status, str(row))
+            if member == "GetUnit":
+                value = ctypes.c_char_p()
+                read = self.lib.sd_bus_message_read(reply, b"o", ctypes.byref(value))
+                if read <= 0:
+                    raise RuntimeError(("GetUnit reply", read))
+                return value.value.decode()
+        finally:
+            if reply:
+                self.lib.sd_bus_message_unref(reply)
+            self.lib.sd_bus_error_free(ctypes.byref(error))
+
+    def property(self, path, interface, name, deadline):
+        self.call_timeout(deadline)
+        error = BusError()
+        reply = ctypes.c_void_p()
+        signature = b"t" if name == "CPUUsageNSec" else b"s"
+        started = time.monotonic()
+        try:
+            status = self.lib.sd_bus_get_property(
+                self.bus,
+                b"org.freedesktop.systemd1",
+                path.encode(),
+                interface.encode(),
+                name.encode(),
+                ctypes.byref(error),
+                ctypes.byref(reply),
+                signature,
+            )
+            row = {
+                "function": "sd_bus_get_property",
+                "path": path,
+                "interface": interface,
+                "property": name,
+                "status": status,
+                "seconds": time.monotonic() - started,
+                "error_name": error.name.decode() if error.name else None,
+                "error_message": error.message.decode() if error.message else None,
+            }
+            self.calls.append(row)
+            if status < 0:
+                raise OSError(-status, str(row))
+            value = ctypes.c_uint64() if signature == b"t" else ctypes.c_char_p()
+            read = self.lib.sd_bus_message_read(reply, signature, ctypes.byref(value))
+            if read <= 0:
+                raise RuntimeError(("property reply", name, read))
+            return value.value if signature == b"t" else value.value.decode()
+        finally:
+            if reply:
+                self.lib.sd_bus_message_unref(reply)
+            self.lib.sd_bus_error_free(ctypes.byref(error))
+
+    def properties(self, deadline):
+        # Use the already-held connection: a cancellable box must not leave an
+        # independently running systemctl query outside its measured scope.
+        path = self.method("GetUnit", deadline)
+        values = {
+            name: self.property(path, "org.freedesktop.systemd1.Unit", name, deadline)
+            for name in ["Id", "LoadState", "ActiveState", "SubState"]
+        }
+        values["CPUUsageNSec"] = self.property(
+            path, "org.freedesktop.systemd1.Scope", "CPUUsageNSec", deadline
+        )
+        return values
+
+    def acquire(self):
+        assert self.bus and not self.held
+        self.method("RefUnit")
+        self.held = True
+
+    def close(self):
+        if self.bus:
+            try:
+                if self.held:
+                    self.method("UnrefUnit")
+                    self.held = False
+            finally:
+                self.lib.sd_bus_flush_close_unref(self.bus)
+                self.bus = ctypes.c_void_p()
+                self.calls.append(
+                    {"function": "sd_bus_flush_close_unref", "connection_closed": True}
+                )
+
+
+if __name__ == "__main__":
+    from pathlib import Path
+    import json, os, signal, sys, time
+
+    unit, group_raw, directory_raw, owner_raw = sys.argv[1:]
+    group = Path(group_raw)
+    directory = Path(directory_raw)
+    owner = int(owner_raw)
+
+    def owner_identity():
+        raw = Path("/proc", str(owner), "stat").read_text()
+        return int(raw[raw.rindex(")") + 2 :].split()[19])
+
+    original_owner = owner_identity()
+
+    def atomic(name, data):
+        temporary = directory / (name + ".tmp")
+        temporary.write_text(data)
+        temporary.replace(directory / name)
+
+    def interrupted(number, frame):
+        raise RuntimeError("CPU reference client interrupted: " + str(number))
+
+    for number in [signal.SIGTERM, signal.SIGINT, signal.SIGHUP]:
+        signal.signal(number, interrupted)
+    reference = None
+    try:
+        reference = UnitReference("libsystemd.so.0", unit)
+        reference.acquire()
+        atomic("cpu.ready", unit + "\n")
+        while not (directory / "cpu.finish").exists():
+            assert (
+                owner_identity() == original_owner
+            ), "original box owner disappeared or changed"
+            time.sleep(0.02)
+        # Completion is requested only after the box kills its own scope and
+        # waits for the real launcher. Do not retain a pre-kill snapshot as final.
+        deadline = time.monotonic() + 5
+        while True:
+            values = reference.properties(deadline)
+            assert time.monotonic() <= deadline, "completed scope CPU query deadline"
+            assert values["Id"] == unit and values["LoadState"] == "loaded", values
+            try:
+                group.stat()
+                events = dict(
+                    line.split()
+                    for line in (group / "cgroup.events").read_text().splitlines()
+                )
+                empty = events["populated"] == "0"
+            except FileNotFoundError:
+                assert (
+                    not group.exists()
+                ), "cgroup events unavailable while group remains"
+                empty = True
+            if (
+                values["ActiveState"] in ["inactive", "failed"]
+                and values["SubState"] in ["dead", "failed"]
+                and empty
+            ):
+                break
+            assert time.monotonic() < deadline, (
+                "scope has not completed",
+                values,
+                empty,
+            )
+            time.sleep(0.01)
+        nanoseconds = int(values["CPUUsageNSec"])
+        assert 0 <= nanoseconds < 2**64 - 1, values
+        minimum_usage = int((directory / "cpu.finish").read_text())
+        assert minimum_usage >= 0
+        # Compare the raw counter before unit conversion: rounding upward
+        # must not conceal even a one-nanosecond regression.
+        assert nanoseconds >= minimum_usage * 1000, (nanoseconds, minimum_usage)
+        usage = (nanoseconds + 999) // 1000
+        # The shell independently refuses a final value below any earlier
+        # observed counter, rather than clamping this actual result.
+        atomic("cpu.final", str(nanoseconds) + " " + str(usage) + "\n")
+        atomic(
+            "cpu.readback",
+            json.dumps(
+                {
+                    "unit": unit,
+                    "source": "systemd CPUUsageNSec after scope exit",
+                    "properties": values,
+                    "cgroup_empty": empty,
+                    "calls": reference.calls,
+                }
+            )
+            + "\n",
+        )
+        reference.close()
+    except BaseException as error:
+        atomic("cpu.error", repr(error) + "\n")
+        raise
+    finally:
+        if reference is not None:
+            reference.close()
+CPU_REFERENCE_PY
+    receipt_pid=$!
+    local attempt
+    for attempt in $(seq 1 100); do
+      [ -f "$hold_dir/cpu.ready" ] && return 0
+      kill -0 "$receipt_pid" 2>/dev/null || return 1
+      sleep 0.05
+    done
+    kill -KILL "$receipt_pid" 2>/dev/null || true
+    wait "$receipt_pid" 2>/dev/null || true
+    return 1
+  }
   _pt_teardown() {
     local status=$1
     trap - TERM INT HUP
@@ -366,7 +680,12 @@ PY
     if [ -n "$runner_pid" ]; then
       wait "$runner_pid" 2>/dev/null || true
     fi
+    if [ -n "$receipt_pid" ]; then
+      kill -KILL "$receipt_pid" 2>/dev/null || true
+      wait "$receipt_pid" 2>/dev/null || true
+    fi
     if [ -n "$hold_dir" ]; then
+      rm -f -- "$hold_dir"/cpu.{ready,ready.tmp,finish,finish.tmp,final,final.tmp,readback,readback.tmp,error,error.tmp}
       rm -f -- "$payload_status_file" "$payload_status_file.tmp" \
         "$payload_release_file" 2>/dev/null || true
       rmdir -- "$hold_dir" 2>/dev/null || true
@@ -393,7 +712,8 @@ PY
     # Keep one inert process in the scope after the payload exits. Otherwise
     # systemd can remove the transient cgroup between wait(2) and the final
     # cpu.stat read, making a completed run lose its receipt. The parent freezes
-    # the held cgroup, reads the final total, and then kills its own scope.
+    # the held cgroup, records its CPU counter, and kills its own scope. The
+    # retained unit then supplies the completed total including that teardown.
     scope_command=(bash -c '
       status_file=$1
       release_file=$2
@@ -450,6 +770,11 @@ PY
     fi
   else
     diag "cgroup=$cgpath"
+    if [ -n "$actual_json" ] && ! _pt_start_cpu_reference; then
+      accounting_failed=1
+      diag "ERROR: could not retain completed scope CPU accounting."
+      _pt_kill_scope
+    fi
     # Wall deadline (real-clock backstop for a blocked/hung child that burns no CPU). The
     # memory cap needs no polling: the kernel OOM-kills the subtree at memory.max directly.
     local wall_deadline=0
@@ -470,7 +795,15 @@ PY
         break
       fi
       if usage_sample="$(_pt_read_usage)"; then
+        if [ "$usage_sample" -lt "$maximum_usage" ]; then
+          accounting_failed=1
+          final_usage_observed=0
+          diag "ERROR: observed cgroup CPU counter decreased."
+          _pt_kill_scope
+          break
+        fi
         last_usage="$usage_sample"
+        maximum_usage="$usage_sample"
       fi
       if [ "${last_usage:-0}" -gt "$budget_usec" ]; then
         diag "CPU-TIMEOUT: usage_usec=$last_usage exceeded budget=${budget_usec} (${cpu_budget}s) — reaping via cgroup.kill"
@@ -507,18 +840,35 @@ PY
   if [ "$cgroup_resolved" -eq 1 ]; then
     _pt_capture_final_usage || true
   fi
+  if [ -n "$actual_json" ] && [ -n "$receipt_pid" ]; then
+    printf '%s\n' "$maximum_usage" >"$hold_dir/cpu.finish.tmp"
+    mv -- "$hold_dir/cpu.finish.tmp" "$hold_dir/cpu.finish"
+    local receipt_status=0
+    wait "$receipt_pid" 2>/dev/null || receipt_status=$?
+    receipt_pid=""
+    if [ "$receipt_status" -eq 0 ] && [ -f "$hold_dir/cpu.final" ] && \
+       read -r completed_cpu_nsec usage_sample <"$hold_dir/cpu.final" && \
+       [[ $completed_cpu_nsec =~ ^[0-9]+$ && $usage_sample =~ ^[0-9]+$ ]] && \
+       [ "$usage_sample" -ge "$maximum_usage" ]; then
+      last_usage="$usage_sample"
+      completed_cpu_observed=1
+    else
+      diag "ERROR: completed scope CPU is missing or below an earlier observation."
+    fi
+  fi
   # cgroup.kill-FIRST teardown: systemd-run returns when the MAIN scope process exits, but a
   # setsid/double-fork escapee it reparented can still linger in the scope cgroup — the exact
   # leak this wrapper prevents. Sweep the whole scope subtree unconditionally on exit so no
   # process survives us. (Only ever our OWN scope's cgroup.kill; never an external/broad kill.)
   _pt_kill_scope 1
   if [ -n "$hold_dir" ]; then
+    rm -f -- "$hold_dir"/cpu.{ready,ready.tmp,finish,finish.tmp,final,final.tmp,readback,readback.tmp,error,error.tmp}
     rm -f -- "$payload_status_file" "$payload_status_file.tmp" \
       "$payload_release_file" 2>/dev/null || true
     rmdir -- "$hold_dir" 2>/dev/null || true
   fi
   local actual_refused=0
-  if [ -n "$actual_json" ] && { [ "$cgroup_resolved" -eq 0 ] || [ "$final_usage_observed" -eq 0 ]; }; then
+  if [ -n "$actual_json" ] && { [ "$cgroup_resolved" -eq 0 ] || [ "$final_usage_observed" -eq 0 ] || [ "$completed_cpu_observed" -eq 0 ] || [ "$accounting_failed" -eq 1 ]; }; then
     actual_refused=1
     status=3
     diag "ERROR: authoritative cgroup CPU unavailable; refusing --actual-json publication."
@@ -531,7 +881,7 @@ PY
   fi
   if [ -n "$actual_json" ] && [ "$actual_refused" -eq 0 ]; then
     python3 - "$actual_json" "$label" "$unit" "$cpu_budget" "${wall:-0}" \
-      "${last_usage:-0}" "$reaped" "$termination" "$status" <<'PY'
+      "${last_usage:-0}" "$reaped" "$termination" "$status" "$completed_cpu_nsec" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -548,6 +898,7 @@ import sys
     reaped,
     termination,
     exit_code,
+    completed_cpu_nsec,
 ) = sys.argv[1:]
 destination = Path(destination_raw)
 destination.parent.mkdir(parents=True, exist_ok=True)
@@ -556,7 +907,8 @@ payload = {
     "schema": "hermit-box-run-actual/v1",
     "label": label,
     "scope": scope,
-    "cpu_source": "cgroup-v2 cpu.stat usage_usec",
+    "cpu_source": "systemd CPUUsageNSec after scope exit",
+    "cpu_usage_nsec": int(completed_cpu_nsec),
     "cgroup_usage_usec": usage,
     "cpu_seconds": usage / 1_000_000,
     "cpu_budget_seconds": int(cpu_budget),
