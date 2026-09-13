@@ -60,13 +60,6 @@ static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static STDIO_STATUS_FLAG_CONTAINMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static NONBLOCKING_STDIN_RECV_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static STDIO_NONBLOCK_THEN_APPEND_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static STDIO_INITIAL_NONBLOCKING_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static STDIO_STATUS_ALIAS_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static STDIO_UNSUPPORTED_STATUS_FLAGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
-static STDIO_APPEND_WRITE_PATHS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
@@ -669,31 +662,28 @@ fn run_kvm_guest_pipe_status_hides_scheduler_nonblocking() {
     assert_guest_pipe_status_hides_scheduler_nonblocking("kvm");
 }
 
-fn stdio_status_flag_containment_guest() -> &'static Path {
-    STDIO_STATUS_FLAG_CONTAINMENT_GUEST.get_or_init(|| {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        let build_root =
-            Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-status-flag-containment");
-        fs::create_dir_all(&build_root)
-            .expect("failed to create stdio status-flag containment guest directory");
-        let guest = build_root.join("stdio_status_flag_containment");
-        let output = Command::new("cc")
-            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/stdio_status_flag_containment.c"))
-            .arg("-o")
-            .arg(&guest)
-            .output()
-            .expect("failed to compile the stdio status-flag containment guest");
-        assert!(
-            output.status.success(),
-            "stdio status-flag containment guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        guest
-    })
+fn stdio_status_flag_containment_guest(directory: &Path) -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = directory.join("stdio-status-flag-containment");
+    fs::create_dir_all(&build_root)
+        .expect("failed to create stdio status-flag containment guest directory");
+    let guest = build_root.join("stdio_status_flag_containment");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/stdio_status_flag_containment.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the stdio status-flag containment guest");
+    assert!(
+        output.status.success(),
+        "stdio status-flag containment guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    guest
 }
 
 /// A guest must be able to change what IT sees about its own stdout without
@@ -720,9 +710,8 @@ fn stdio_status_flag_containment_guest() -> &'static Path {
 /// remain unchanged.
 fn assert_guest_cannot_mutate_hermits_stdout_flags(backend: &str) {
     let _guard = hermit_run_guard();
-    let guest = stdio_status_flag_containment_guest();
-
     let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let guest = stdio_status_flag_containment_guest(directory.path());
     let hermit_stdout_path = directory.path().join("hermit.out");
     // Opened WITHOUT O_APPEND, so "the bit turned on" is unambiguous.
     let mut hermit_stdout = fs::OpenOptions::new()
@@ -751,7 +740,7 @@ fn assert_guest_cannot_mutate_hermits_stdout_flags(backend: &str) {
 
     let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
         .args(["run", "--backend", backend, "--"])
-        .arg(guest)
+        .arg(&guest)
         .stdin(Stdio::null())
         // `Stdio::from` dups this onto the child's fd 1, so hermit's stdout and
         // `hermit_stdout` are the SAME open file description -- exactly the
@@ -809,7 +798,7 @@ fn assert_guest_cannot_mutate_hermits_stdout_flags(backend: &str) {
     assert_ne!(append_before & libc::O_APPEND, 0);
     let clear = Command::new(env!("CARGO_BIN_EXE_hermit"))
         .args(["run", "--backend", backend, "--"])
-        .arg(guest)
+        .arg(&guest)
         .arg("clear")
         .stdin(Stdio::null())
         .stdout(Stdio::from(
@@ -838,33 +827,31 @@ fn assert_guest_cannot_mutate_hermits_stdout_flags(backend: &str) {
     assert_eq!(append_after, append_before);
 }
 
-fn stdio_initial_nonblocking_guest() -> &'static Path {
-    STDIO_INITIAL_NONBLOCKING_GUEST.get_or_init(|| {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-initial-nonblocking");
-        fs::create_dir_all(&build_root)
-            .expect("failed to create initial-nonblocking guest directory");
-        let guest = build_root.join("stdio_initial_nonblocking");
-        let output = Command::new("cc")
-            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/stdio_initial_nonblocking.c"))
-            .arg("-o")
-            .arg(&guest)
-            .output()
-            .expect("failed to compile the initial-nonblocking guest");
-        assert!(
-            output.status.success(),
-            "initial-nonblocking guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        guest
-    })
+fn stdio_initial_nonblocking_guest(directory: &Path) -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = directory.join("stdio-initial-nonblocking");
+    fs::create_dir_all(&build_root).expect("failed to create initial-nonblocking guest directory");
+    let guest = build_root.join("stdio_initial_nonblocking");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/stdio_initial_nonblocking.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the initial-nonblocking guest");
+    assert!(
+        output.status.success(),
+        "initial-nonblocking guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    guest
 }
 
 fn run_with_nonblocking_stdin(backend: &str, mode: &str) -> Output {
+    let directory = tempfile::tempdir().expect("failed to create a temporary directory");
     let mut sockets = [-1_i32; 2];
     // SAFETY: sockets is a writable pair of ints, which is what socketpair fills.
     let paired = unsafe {
@@ -907,7 +894,7 @@ fn run_with_nonblocking_stdin(backend: &str, mode: &str) -> Output {
 
     Command::new(env!("CARGO_BIN_EXE_hermit"))
         .args(["run", "--backend", backend, "--"])
-        .arg(stdio_initial_nonblocking_guest())
+        .arg(stdio_initial_nonblocking_guest(directory.path()))
         .arg(mode)
         .stdin(Stdio::from(guest_end))
         .stdout(Stdio::piped())
@@ -946,29 +933,27 @@ fn assert_direct_setfl_preserves_initial_nonblocking(backend: &str) {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "recv=1 byte=65\n");
 }
 
-fn stdio_status_alias_guest() -> &'static Path {
-    STDIO_STATUS_ALIAS_GUEST.get_or_init(|| {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-status-alias");
-        fs::create_dir_all(&build_root).expect("failed to create status-alias guest directory");
-        let guest = build_root.join("stdio_status_alias");
-        let output = Command::new("cc")
-            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/stdio_status_alias.c"))
-            .arg("-o")
-            .arg(&guest)
-            .output()
-            .expect("failed to compile the status-alias guest");
-        assert!(
-            output.status.success(),
-            "status-alias guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        guest
-    })
+fn stdio_status_alias_guest(directory: &Path) -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = directory.join("stdio-status-alias");
+    fs::create_dir_all(&build_root).expect("failed to create status-alias guest directory");
+    let guest = build_root.join("stdio_status_alias");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/stdio_status_alias.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the status-alias guest");
+    assert!(
+        output.status.success(),
+        "status-alias guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    guest
 }
 
 fn assert_inherited_stdio_aliases_share_status_flags(backend: &str) {
@@ -991,7 +976,7 @@ fn assert_inherited_stdio_aliases_share_status_flags(backend: &str) {
 
     let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
         .args(["run", "--backend", backend, "--"])
-        .arg(stdio_status_alias_guest())
+        .arg(stdio_status_alias_guest(directory.path()))
         .stdin(Stdio::null())
         .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::from(child_stderr))
@@ -1009,30 +994,28 @@ fn assert_inherited_stdio_aliases_share_status_flags(backend: &str) {
     );
 }
 
-fn stdio_append_write_paths_guest() -> &'static Path {
-    STDIO_APPEND_WRITE_PATHS_GUEST.get_or_init(|| {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-append-write-paths");
-        fs::create_dir_all(&build_root)
-            .expect("failed to create stdio append write-path guest directory");
-        let guest = build_root.join("stdio_append_write_paths");
-        let output = Command::new("cc")
-            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/stdio_append_write_paths.c"))
-            .arg("-o")
-            .arg(&guest)
-            .output()
-            .expect("failed to compile stdio append write-path guest");
-        assert!(
-            output.status.success(),
-            "stdio append write-path guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        guest
-    })
+fn stdio_append_write_paths_guest(directory: &Path) -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = directory.join("stdio-append-write-paths");
+    fs::create_dir_all(&build_root)
+        .expect("failed to create stdio append write-path guest directory");
+    let guest = build_root.join("stdio_append_write_paths");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/stdio_append_write_paths.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile stdio append write-path guest");
+    assert!(
+        output.status.success(),
+        "stdio append write-path guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    guest
 }
 
 /// Every accepted write-like syscall must agree with the guest-visible
@@ -1046,7 +1029,8 @@ fn stdio_append_write_paths_guest() -> &'static Path {
 /// physical bit was deliberately withheld from the supervisor's descriptor.
 fn assert_inherited_stdio_append_write_paths(backend: &str, operations: &[&str]) {
     let _guard = hermit_run_guard();
-    let guest = stdio_append_write_paths_guest();
+    let fixture_directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let guest = stdio_append_write_paths_guest(fixture_directory.path());
 
     for operation in operations {
         let directory = tempfile::tempdir().expect("failed to create a temporary directory");
@@ -1076,7 +1060,7 @@ fn assert_inherited_stdio_append_write_paths(backend: &str, operations: &[&str])
 
         let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
             .args(["run", "--backend", backend, "--"])
-            .arg(guest)
+            .arg(&guest)
             .arg(operation)
             .stdin(Stdio::null())
             .stdout(Stdio::from(
@@ -1153,7 +1137,7 @@ fn assert_inherited_stdio_append_write_paths(backend: &str, operations: &[&str])
     // restricted to regular-file output rather than all inherited stdout.
     let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
         .args(["run", "--backend", backend, "--"])
-        .arg(guest)
+        .arg(&guest)
         .arg("sendfile-pipe")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1175,30 +1159,27 @@ fn assert_inherited_stdio_append_write_paths(backend: &str, operations: &[&str])
     );
 }
 
-fn nonblocking_stdin_recv_guest() -> &'static Path {
-    NONBLOCKING_STDIN_RECV_GUEST.get_or_init(|| {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("nonblocking-stdin-recv");
-        fs::create_dir_all(&build_root)
-            .expect("failed to create nonblocking stdin guest directory");
-        let guest = build_root.join("nonblocking_stdin_recv");
-        let output = Command::new("cc")
-            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/nonblocking_stdin_recv.c"))
-            .arg("-o")
-            .arg(&guest)
-            .output()
-            .expect("failed to compile the nonblocking stdin guest");
-        assert!(
-            output.status.success(),
-            "nonblocking stdin guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        guest
-    })
+fn nonblocking_stdin_recv_guest(directory: &Path) -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = directory.join("nonblocking-stdin-recv");
+    fs::create_dir_all(&build_root).expect("failed to create nonblocking stdin guest directory");
+    let guest = build_root.join("nonblocking_stdin_recv");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/nonblocking_stdin_recv.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the nonblocking stdin guest");
+    assert!(
+        output.status.success(),
+        "nonblocking stdin guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    guest
 }
 
 /// Setting `O_NONBLOCK` on the container's stdin and then reading from it must
@@ -1218,7 +1199,8 @@ fn nonblocking_stdin_recv_guest() -> &'static Path {
 /// and would make the regression less direct.
 fn assert_nonblocking_stdin_does_not_abort_the_container(backend: &str) {
     let _guard = hermit_run_guard();
-    let guest = nonblocking_stdin_recv_guest();
+    let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let guest = nonblocking_stdin_recv_guest(directory.path());
 
     let mut sockets = [-1_i32; 2];
     // SAFETY: sockets is a writable pair of ints, which is what socketpair fills.
@@ -1273,30 +1255,27 @@ fn assert_nonblocking_stdin_does_not_abort_the_container(backend: &str) {
     );
 }
 
-fn stdio_nonblock_then_append_guest() -> &'static Path {
-    STDIO_NONBLOCK_THEN_APPEND_GUEST.get_or_init(|| {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-nonblock-then-append");
-        fs::create_dir_all(&build_root)
-            .expect("failed to create nonblock-then-append guest directory");
-        let guest = build_root.join("stdio_nonblock_then_append");
-        let output = Command::new("cc")
-            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/stdio_nonblock_then_append.c"))
-            .arg("-o")
-            .arg(&guest)
-            .output()
-            .expect("failed to compile the nonblock-then-append guest");
-        assert!(
-            output.status.success(),
-            "nonblock-then-append guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        guest
-    })
+fn stdio_nonblock_then_append_guest(directory: &Path) -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = directory.join("stdio-nonblock-then-append");
+    fs::create_dir_all(&build_root).expect("failed to create nonblock-then-append guest directory");
+    let guest = build_root.join("stdio_nonblock_then_append");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/stdio_nonblock_then_append.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the nonblock-then-append guest");
+    assert!(
+        output.status.success(),
+        "nonblock-then-append guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    guest
 }
 
 /// Going nonblocking must not turn containment off for everything else.
@@ -1313,9 +1292,8 @@ fn stdio_nonblock_then_append_guest() -> &'static Path {
 /// pins the physical/logical consistency that currently requires forwarding it.
 fn assert_nonblocking_does_not_unlatch_containment(backend: &str) {
     let _guard = hermit_run_guard();
-    let guest = stdio_nonblock_then_append_guest();
-
     let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let guest = stdio_nonblock_then_append_guest(directory.path());
     let hermit_stderr_path = directory.path().join("hermit.err");
     let hermit_stderr = fs::OpenOptions::new()
         .write(true)
@@ -7805,31 +7783,28 @@ fn the_stderr_deadline_is_spent_once_across_writes_not_restarted_by_each() {
     );
 }
 
-fn stdio_unsupported_status_flags_guest() -> &'static Path {
-    STDIO_UNSUPPORTED_STATUS_FLAGS_GUEST.get_or_init(|| {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli should be inside the repository");
-        let build_root =
-            Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-unsupported-status-flags");
-        fs::create_dir_all(&build_root)
-            .expect("failed to create stdio unsupported status-flag guest directory");
-        let guest = build_root.join("stdio_unsupported_status_flags");
-        let output = Command::new("cc")
-            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
-            .arg(repository.join("tests/c/stdio_unsupported_status_flags.c"))
-            .arg("-o")
-            .arg(&guest)
-            .output()
-            .expect("failed to compile the stdio unsupported status-flag guest");
-        assert!(
-            output.status.success(),
-            "stdio unsupported status-flag guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        guest
-    })
+fn stdio_unsupported_status_flags_guest(directory: &Path) -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = directory.join("stdio-unsupported-status-flags");
+    fs::create_dir_all(&build_root)
+        .expect("failed to create stdio unsupported status-flag guest directory");
+    let guest = build_root.join("stdio_unsupported_status_flags");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/stdio_unsupported_status_flags.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the stdio unsupported status-flag guest");
+    assert!(
+        output.status.success(),
+        "stdio unsupported status-flag guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    guest
 }
 
 /// A status flag Detcore does not implement for inherited stdio must be REFUSED,
@@ -7857,9 +7832,8 @@ fn stdio_unsupported_status_flags_guest() -> &'static Path {
 /// failed" would accept it.
 fn assert_unimplemented_status_flags_are_refused(backend: &str) {
     let _guard = hermit_run_guard();
-    let guest = stdio_unsupported_status_flags_guest();
-
     let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let guest = stdio_unsupported_status_flags_guest(directory.path());
     let hermit_stdout_path = directory.path().join("hermit.out");
     let hermit_stdout = fs::OpenOptions::new()
         .read(true)
