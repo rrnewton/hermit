@@ -640,14 +640,34 @@ impl FileMetadata {
     /// Hermit. Their status flags are live input, not an empty placeholder, and
     /// aliases that already name the same Linux open file description must
     /// share one modeled description too.
-    fn setup_stdio(self, owner: DetTid) -> Result<Self, InheritedStdioAliasError> {
-        self.setup_stdio_with(owner, [0, 1, 2], same_open_file_description)
+    fn setup_stdio(
+        self,
+        owner: DetTid,
+        discover_live_file_metadata: bool,
+    ) -> Result<Self, InheritedStdioAliasError> {
+        self.setup_inherited_stdio_with(
+            owner,
+            [0, 1, 2],
+            discover_live_file_metadata,
+            same_open_file_description,
+        )
     }
 
+    #[cfg(test)]
     fn setup_stdio_with(
+        self,
+        owner: DetTid,
+        inherited: [RawFd; 3],
+        same_description: impl FnMut(RawFd, RawFd) -> Result<bool, InheritedStdioAliasError>,
+    ) -> Result<Self, InheritedStdioAliasError> {
+        self.setup_inherited_stdio_with(owner, inherited, false, same_description)
+    }
+
+    fn setup_inherited_stdio_with(
         mut self,
         owner: DetTid,
         inherited: [RawFd; 3],
+        discover_live_file_metadata: bool,
         mut same_description: impl FnMut(RawFd, RawFd) -> Result<bool, InheritedStdioAliasError>,
     ) -> Result<Self, InheritedStdioAliasError> {
         for (fd, host_fd) in inherited.into_iter().enumerate() {
@@ -660,7 +680,11 @@ impl FileMetadata {
             );
             // SAFETY: the descriptor was just confirmed live by fcntl.
             let raw_stat = stat::fstat(unsafe { BorrowedFd::borrow_raw(host_fd) }).unwrap();
-            let mut flags = OFlag::from_bits_truncate(status_flags);
+            // F_GETFL can contain Linux status bits that the libc-backed
+            // OFlag constants do not name (for example raw O_LARGEFILE on
+            // x86-64 GNU). Keep the entire word; only F_SETFL's existing mask
+            // determines which bits a later guest request may change.
+            let mut flags = OFlag::from_bits_retain(status_flags);
             if fd_flags & libc::FD_CLOEXEC != 0 {
                 flags.insert(OFlag::O_CLOEXEC);
             }
@@ -680,17 +704,17 @@ impl FileMetadata {
                 }
             }
             let detfd = alias.unwrap_or_else(|| {
-                // Preserve setup_stdio's existing Regular classification. The
-                // socket-specific handlers still identify recv/send by syscall,
-                // while changing this classification would alter the ordinary
-                // read/write scheduling policy beyond status-flag containment.
-                DetFd::new(
-                    fd,
-                    flags,
-                    FdType::Regular,
-                    self.allocate_open_file_id(owner, FdType::Regular),
-                )
-                .with_stat(DetStat::from(raw_stat))
+                // Both initializers share exact inherited OFD equivalence,
+                // but retain their existing scheduling classifications. Normal
+                // setup deliberately uses Regular even for host pipes/sockets;
+                // SaBRe discovers their actual type and nonblocking state.
+                let ty = if discover_live_file_metadata {
+                    discovered_fd_type(raw_stat.st_mode)
+                } else {
+                    FdType::Regular
+                };
+                DetFd::new(fd, flags, ty, self.allocate_open_file_id(owner, ty))
+                    .with_stat(DetStat::from(raw_stat))
             });
 
             // Prefer an output name when stdin aliases an output description,
@@ -710,7 +734,16 @@ impl FileMetadata {
 
             // These descriptions existed before Detcore began observing the
             // guest, so they may already carry flock state that we cannot query.
-            detfd.mark_flock_mode_unobserved();
+            if discover_live_file_metadata {
+                // Preserve live discovery's conservative unknown-provenance
+                // flock state, including its may-be-stale distinction.
+                detfd.forget_flock_mode();
+                if detfd.ty() == FdType::Pipe && flags.contains(OFlag::O_NONBLOCK) {
+                    detfd.set_physically_nonblocking();
+                }
+            } else {
+                detfd.mark_flock_mode_unobserved();
+            }
             self.add_detfd(detfd);
         }
         Ok(self)
@@ -730,15 +763,8 @@ impl FileMetadata {
         }
         let raw_stat =
             stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).map_err(|_| Errno::last())?;
-        let file_type = stat::SFlag::from_bits_truncate(raw_stat.st_mode);
-        let ty = if file_type.contains(stat::SFlag::S_IFIFO) {
-            FdType::Pipe
-        } else if file_type.contains(stat::SFlag::S_IFSOCK) {
-            FdType::Socket
-        } else {
-            FdType::Regular
-        };
-        let mut flags = OFlag::from_bits_truncate(status_flags);
+        let ty = discovered_fd_type(raw_stat.st_mode);
+        let mut flags = OFlag::from_bits_retain(status_flags);
         let physically_nonblocking = flags.contains(OFlag::O_NONBLOCK);
         // Discovered descriptors have unknown provenance, so an observed
         // O_NONBLOCK bit must remain guest-visible. Detcore-created scheduler
@@ -879,6 +905,19 @@ fn stdio_resource(fd: RawFd) -> Option<ResourceID> {
         1 => Some(ResourceID::Device(Device::ContainerStdout)),
         2 => Some(ResourceID::Device(Device::ContainerStderr)),
         _ => None,
+    }
+}
+
+/// Preserve live discovery's descriptor classification independently of alias
+/// initialization, which must be shared with the ordinary stdio route.
+fn discovered_fd_type(mode: libc::mode_t) -> FdType {
+    let file_type = stat::SFlag::from_bits_truncate(mode);
+    if file_type.contains(stat::SFlag::S_IFIFO) {
+        FdType::Pipe
+    } else if file_type.contains(stat::SFlag::S_IFSOCK) {
+        FdType::Socket
+    } else {
+        FdType::Regular
     }
 }
 
@@ -1064,6 +1103,384 @@ mod inherited_stdio_alias_tests {
             0
         );
         let config = Config::default();
+        let mut state = ThreadState::new(DetTid::from_raw(17), &config, ());
+        let expected = InheritedStdioAliasError {
+            left: 0,
+            right: 1,
+            errno,
+        };
+        assert_eq!(state.inherited_stdio_alias_error, Some(expected.clone()));
+        assert!(
+            state.file_metadata.lock().unwrap().file_handles.is_empty(),
+            "no partial root table survives the failed comparison"
+        );
+        assert_eq!(
+            state.file_metadata.lock().unwrap().next_open_file_sequence,
+            0
+        );
+        use reverie::Tool;
+        let tool = <Detcore as Tool>::new(Pid::from_raw(17), &config);
+        for flags in [
+            CloneFlags::empty(),
+            CloneFlags::CLONE_FILES,
+            CloneFlags::CLONE_VM | CloneFlags::CLONE_THREAD | CloneFlags::CLONE_FILES,
+        ] {
+            state.clone_flags = Some(flags);
+            let child =
+                tool.init_thread_state(Pid::from_raw(18), Some((Pid::from_raw(17), &state)));
+            assert_eq!(child.inherited_stdio_alias_error, Some(expected.clone()));
+            assert!(child.file_metadata.lock().unwrap().file_handles.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod inherited_stdio_initialization_tests {
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Command;
+    use std::time::Instant;
+
+    use reverie::Pid;
+
+    use super::*;
+
+    fn wait_for_control(child: &mut std::process::Child) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let status = child.wait().unwrap();
+                panic!("isolated live stdio control timed out: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // The actual ThreadState::new path must see our inherited descriptors.
+    // Execute only this case in a child so neither FD_CLOEXEC nor its stdio
+    // mapping can affect another libtest case or the parent test runner.
+    #[test]
+    fn live_stdio_configuration_preserves_inherited_aliases() {
+        const CHILD: &str = "HERMIT_LIVE_STDIO_ALIAS_CONTROL";
+        let Ok(mode) = std::env::var(CHILD) else {
+            for mode in [
+                "outputs",
+                "stdin-stdout",
+                "stdin-stderr",
+                "all",
+                "independent",
+            ] {
+                let file = tempfile::NamedTempFile::new().unwrap();
+                let independent = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(file.path())
+                    .unwrap();
+                let input = tempfile::tempfile().unwrap();
+                let f = file.as_file();
+                let descriptors = match mode {
+                    "outputs" => [&input, f, f],
+                    "stdin-stdout" => [f, f, &independent],
+                    "stdin-stderr" => [f, &independent, f],
+                    "all" => [f, f, f],
+                    "independent" => [&input, f, &independent],
+                    _ => unreachable!(),
+                };
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "tool_local::inherited_stdio_initialization_tests::live_stdio_configuration_preserves_inherited_aliases", "--nocapture"])
+                    .env(CHILD, mode)
+                    .stdin(descriptors[0].try_clone().unwrap())
+                    .stdout(descriptors[1].try_clone().unwrap())
+                    .stderr(descriptors[2].try_clone().unwrap())
+                    .spawn()
+                    .unwrap();
+                let status = wait_for_control(&mut child);
+                assert!(
+                    status.success(),
+                    "isolated {mode} control: {status}; child output: {}",
+                    std::fs::read_to_string(file.path()).unwrap()
+                );
+            }
+            return;
+        };
+        let groups = match mode.as_str() {
+            "outputs" => [0, 1, 1],
+            "stdin-stdout" => [0, 0, 1],
+            "stdin-stderr" => [0, 1, 0],
+            "all" => [0, 0, 0],
+            "independent" => [0, 1, 2],
+            _ => panic!("unknown live stdio topology {mode}"),
+        };
+        for left in 0..3 {
+            for right in left + 1..3 {
+                assert_eq!(
+                    same_open_file_description(left, right),
+                    Ok(groups[left as usize] == groups[right as usize])
+                );
+            }
+        }
+        // Both outputs always name the same inode, even when independently
+        // opened. Neither path nor inode equality may replace OFD comparison.
+        let stdout_stat = stat::fstat(unsafe { BorrowedFd::borrow_raw(1) }).unwrap();
+        let stderr_stat = stat::fstat(unsafe { BorrowedFd::borrow_raw(2) }).unwrap();
+        assert_eq!(
+            (stdout_stat.st_dev, stdout_stat.st_ino),
+            (stderr_stat.st_dev, stderr_stat.st_ino)
+        );
+        assert_eq!(unsafe { libc::fcntl(1, libc::F_SETFD, 0) }, 0);
+        assert_eq!(
+            unsafe { libc::fcntl(2, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+        let raw_flags = [0, 1, 2].map(|fd| unsafe { libc::fcntl(fd, libc::F_GETFL) });
+        assert!(raw_flags.iter().all(|flags| *flags >= 0));
+        let config = Config {
+            discover_live_file_metadata: true,
+            ..Config::default()
+        };
+        let state = ThreadState::new(DetTid::from_raw(17), &config, ());
+        assert!(state.discover_live_file_metadata);
+        assert_eq!(state.inherited_stdio_alias_error(), None);
+        assert_eq!(state.file_metadata.lock().unwrap().file_handles.len(), 3);
+        for fd in 0..3 {
+            let group = groups[fd as usize];
+            let canonical = if group == groups[1] {
+                Device::ContainerStdout
+            } else if group == groups[2] {
+                Device::ContainerStderr
+            } else {
+                Device::ContainerStdin
+            };
+            state
+                .with_detfd(fd, |detfd| {
+                    assert_eq!(detfd.status_flags(), raw_flags[fd as usize]);
+                    assert_eq!(detfd.ty(), FdType::Regular);
+                    assert_eq!(
+                        detfd.resource(),
+                        Some(ResourceID::Device(canonical.clone()))
+                    );
+                    assert_eq!(detfd.is_cloexec(), fd == 2);
+                    assert_eq!(detfd.known_flock_mode(), None);
+                    assert!(detfd.flock_mode_may_be_stale());
+                })
+                .unwrap();
+            for other in fd + 1..3 {
+                let left = state.with_detfd(fd, |detfd| detfd.open_file_id()).unwrap();
+                let right = state
+                    .with_detfd(other, |detfd| detfd.open_file_id())
+                    .unwrap();
+                assert_eq!(left == right, groups[fd as usize] == groups[other as usize]);
+            }
+        }
+        state
+            .with_detfd(1, |detfd| {
+                detfd.set_logical_status_flags(raw_flags[1] | libc::O_APPEND)
+            })
+            .unwrap();
+        for fd in 0..3 {
+            let expected = raw_flags[fd as usize]
+                | if groups[fd as usize] == groups[1] {
+                    libc::O_APPEND
+                } else {
+                    0
+                };
+            assert_eq!(
+                state.with_detfd(fd, |detfd| detfd.status_flags()).unwrap(),
+                expected
+            );
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_GETFL) },
+                raw_flags[fd as usize]
+            );
+            assert_eq!(
+                state.with_detfd(fd, |detfd| detfd.is_cloexec()).unwrap(),
+                fd == 2
+            );
+        }
+    }
+
+    #[test]
+    fn stdio_initializers_retain_live_types_nonblocking_and_raw_status() {
+        let owner = DetTid::from_raw(17);
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) },
+            0
+        );
+        let pipe_read = unsafe { std::fs::File::from_raw_fd(pipe_fds[0]) };
+        let _pipe_write = unsafe { std::fs::File::from_raw_fd(pipe_fds[1]) };
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let file = tempfile::tempfile().unwrap();
+        let descriptors = [pipe_read.as_raw_fd(), socket.as_raw_fd(), file.as_raw_fd()];
+        let raw_flags = descriptors.map(|fd| unsafe { libc::fcntl(fd, libc::F_GETFL) });
+        assert!(raw_flags.iter().all(|flags| *flags >= 0));
+        const RAW_O_LARGEFILE: i32 = 0x8000;
+        assert_eq!(
+            OFlag::from_bits_truncate(RAW_O_LARGEFILE).bits(),
+            0,
+            "the raw-bit control must cover a bit unnamed by the pinned GNU OFlag constants"
+        );
+        assert_ne!(
+            raw_flags[2] & RAW_O_LARGEFILE,
+            0,
+            "the real regular descriptor must supply the Linux raw status bit"
+        );
+        for discover_live in [false, true] {
+            let mut metadata = FileMetadata::new(owner)
+                .setup_inherited_stdio_with(
+                    owner,
+                    descriptors,
+                    discover_live,
+                    same_open_file_description,
+                )
+                .unwrap();
+            for fd in 0..3 {
+                metadata
+                    .with_detfd(fd, |detfd| {
+                        let expected_type = if discover_live {
+                            [FdType::Pipe, FdType::Socket, FdType::Regular][fd as usize]
+                        } else {
+                            FdType::Regular
+                        };
+                        assert_eq!(detfd.ty(), expected_type);
+                        assert_eq!(detfd.status_flags(), raw_flags[fd as usize]);
+                        let nonblocking = raw_flags[fd as usize] & libc::O_NONBLOCK != 0;
+                        assert_eq!(
+                            (detfd.is_nonblocking(), detfd.physically_nonblocking()),
+                            (nonblocking, nonblocking)
+                        );
+                        let fd_flags =
+                            unsafe { libc::fcntl(descriptors[fd as usize], libc::F_GETFD) };
+                        assert!(fd_flags >= 0);
+                        assert_eq!(detfd.is_cloexec(), fd_flags & libc::FD_CLOEXEC != 0);
+                        assert_eq!(detfd.flock_mode_may_be_stale(), discover_live);
+                    })
+                    .unwrap();
+            }
+        }
+        // Higher inherited descriptors still use the real on-demand reader;
+        // retaining the raw word must not be limited to the three root slots.
+        assert!(file.as_raw_fd() > 2);
+        let mut discovered = FileMetadata::new(owner);
+        discovered
+            .discover_fd_from_current_process(owner, file.as_raw_fd())
+            .unwrap();
+        assert_eq!(
+            discovered
+                .with_detfd(file.as_raw_fd(), |detfd| detfd.status_flags())
+                .unwrap(),
+            raw_flags[2]
+        );
+    }
+
+    #[test]
+    fn live_stdio_late_comparison_error_rejects_partial_table() {
+        let file = tempfile::tempfile().unwrap();
+        let owner = DetTid::from_raw(17);
+        for errno in [libc::EPERM, libc::EBADF] {
+            let mut calls = 0;
+            let result = FileMetadata::new(owner).setup_inherited_stdio_with(
+                owner,
+                [file.as_raw_fd(); 3],
+                true,
+                |left, right| {
+                    calls += 1;
+                    if calls == 1 {
+                        Ok(true)
+                    } else {
+                        Err(InheritedStdioAliasError { left, right, errno })
+                    }
+                },
+            );
+            assert_eq!(
+                calls, 2,
+                "the failure follows an already accepted live alias"
+            );
+            let error = result.unwrap_err();
+            assert_eq!(
+                (error.left, error.right, error.errno),
+                (file.as_raw_fd(), file.as_raw_fd(), errno)
+            );
+        }
+    }
+
+    // Run only this test in its own executed process: the seccomp filter is
+    // permanent and must not contaminate other libtest cases or host stdio.
+    #[test]
+    fn live_stdio_kernel_errors_leave_empty_state_and_survive_clones() {
+        const CHILD: &str = "HERMIT_LIVE_STDIO_ALIAS_ERROR_CONTROL";
+        let Ok(value) = std::env::var(CHILD) else {
+            for errno in [libc::EPERM, libc::EBADF] {
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "tool_local::inherited_stdio_initialization_tests::live_stdio_kernel_errors_leave_empty_state_and_survive_clones", "--nocapture"])
+                    .env(CHILD, errno.to_string())
+                    .spawn().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let status = loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        break status;
+                    }
+                    if Instant::now() >= deadline {
+                        child.kill().unwrap();
+                        let status = child.wait().unwrap();
+                        panic!("isolated alias control timed out: {status}");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                assert!(status.success(), "isolated errno {errno} control: {status}");
+            }
+            return;
+        };
+        let errno: i32 = value.parse().unwrap();
+        assert!([libc::EPERM, libc::EBADF].contains(&errno));
+        let filter = [
+            libc::sock_filter {
+                code: 0x20,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            }, // seccomp_data.nr
+            libc::sock_filter {
+                code: 0x15,
+                jt: 0,
+                jf: 1,
+                k: libc::SYS_kcmp as u32,
+            },
+            libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ERRNO | errno as u32,
+            },
+            libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            },
+        ];
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr().cast_mut(),
+        };
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) },
+            0
+        );
+        let config = Config {
+            discover_live_file_metadata: true,
+            ..Config::default()
+        };
         let mut state = ThreadState::new(DetTid::from_raw(17), &config, ());
         let expected = InheritedStdioAliasError {
             left: 0,
@@ -2325,20 +2742,11 @@ impl<T> ThreadState<T> {
         let thread_logical_time = DetTime::new(cfg);
         let last_accounted_user_time = thread_logical_time.user_cpu_time();
         let last_accounted_system_time = thread_logical_time.system_cpu_time();
-        let (file_metadata, inherited_stdio_alias_error) = if cfg.discover_live_file_metadata {
-            let mut metadata = FileMetadata::new(pid);
-            for fd in 0..=2 {
-                metadata
-                    .discover_fd_from_current_process(pid, fd)
-                    .expect("SaBRe guest stdio must be open");
-            }
-            (metadata, None)
-        } else {
-            match FileMetadata::new(pid).setup_stdio(pid) {
+        let (file_metadata, inherited_stdio_alias_error) =
+            match FileMetadata::new(pid).setup_stdio(pid, cfg.discover_live_file_metadata) {
                 Ok(metadata) => (metadata, None),
                 Err(error) => (FileMetadata::new(pid), Some(error)),
-            }
-        };
+            };
         ThreadState {
             dettid: pid,
             detpid: None, // Initialized later.
