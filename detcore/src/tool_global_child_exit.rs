@@ -234,6 +234,40 @@ mod tests {
         );
     }
 
+    async fn reconnect_parent(state: &GlobalState, config: &Config, parent: DetTid) -> MmId {
+        let old_mm = MmId::initial(parent);
+        let new_mm = old_mm.for_exec(parent);
+        state.pending_exec_states.lock().unwrap().insert(
+            parent,
+            PendingExecState {
+                caller: parent,
+                process: parent,
+                mm: old_mm,
+                fd_blocking: Default::default(),
+            },
+        );
+        let reconnect = state
+            .receive_rpc(
+                Tid::from_raw(parent.as_raw()),
+                (
+                    DetTime::new(config),
+                    MmId::initial(parent),
+                    GlobalRequest::CreateChildThread(
+                        parent,
+                        parent,
+                        0,
+                        None,
+                        libc::SIGCHLD,
+                        None,
+                        Some(DEFAULT_PRIORITY),
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(reconnect.1, GlobalResponse::CreateChildThread(Some(new_mm)));
+        new_mm
+    }
+
     #[tokio::test]
     async fn delivery_acknowledgement_preserves_wait_request_and_single_commit() {
         for event_first in [false, true] {
@@ -516,6 +550,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_exit_ack_after_exec_never_resumes_the_pre_exec_request() {
+        let (config, state, parent, child, original) = state();
+        let old_mm = MmId::initial(parent);
+        let new_mm = old_mm.for_exec(parent);
+        let mut request = Box::pin(state.receive_rpc(
+            Tid::from_raw(parent.as_raw()),
+            (
+                DetTime::new(&config),
+                old_mm,
+                GlobalRequest::RequestResources(original.clone(), parent),
+            ),
+        ));
+        assert!(poll!(request.as_mut()).is_pending());
+        due(&state, parent, child);
+        let last = Err(SkipTurn);
+        let mut turn = Box::pin(do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &last,
+        ));
+        assert!(poll!(turn.as_mut()).is_pending());
+        let (_, GlobalResponse::DeliverChildExit(command)) = request.await else {
+            panic!("missing control before exec")
+        };
+        let operation =
+            state.sched.lock().unwrap().child_exits.operations[&command.operation].clone();
+        // This deliberately retains a callback across exec. A single-thread guest
+        // cannot ordinarily initiate exec while its own callback is suspended.
+        // Exercise the real reconnect RPC to test its defensive old-mm boundary.
+        assert_eq!(reconnect_parent(&state, &config, parent).await, new_mm);
+        {
+            let scheduler = state.sched.lock().unwrap();
+            assert!(scheduler.rpc_incarnation_matches(parent, new_mm));
+            assert!(!scheduler.rpc_incarnation_matches(parent, old_mm));
+            assert!(!scheduler.thread_is_logically_killed(parent));
+            assert!(scheduler.next_turns[&parent].req.try_read().is_none());
+        }
+        let mut acknowledgement = Box::pin(state.receive_rpc(
+            Tid::from_raw(parent.as_raw()),
+            (
+                DetTime::new(&config),
+                old_mm,
+                GlobalRequest::AcknowledgeChildExit {
+                    operation: command.operation,
+                    delivery_id: command.delivery.id,
+                    outcome: Outcome::Accepted {
+                        disposition: Disposition::PendingBlocked,
+                        pending_generation: 9,
+                        coalesced: false,
+                    },
+                },
+            ),
+        ));
+        let reply = poll!(acknowledgement.as_mut());
+        let next_turn = poll!(turn.as_mut());
+        assert_eq!(operation.original, original);
+        assert_eq!(
+            state.sched.lock().unwrap().turn,
+            0,
+            "exec granted the old resource request before the new image requested anything: {next_turn:?}"
+        );
+        assert_eq!(reply, Poll::Ready((None, GlobalResponse::ThreadExited)));
+        assert!(next_turn.is_pending());
+        let fresh = Resources::new(parent);
+        let mut new_request = Box::pin(state.receive_rpc(
+            Tid::from_raw(parent.as_raw()),
+            (
+                DetTime::new(&config),
+                new_mm,
+                GlobalRequest::RequestResources(fresh.clone(), parent),
+            ),
+        ));
+        assert!(poll!(new_request.as_mut()).is_pending());
+        assert_eq!(turn.await.unwrap(), fresh);
+        assert_eq!(
+            new_request.await.1,
+            GlobalResponse::RequestResources(ResumeStatus::Normal)
+        );
+        let scheduler = state.sched.lock().unwrap();
+        assert_eq!(scheduler.turn, 1);
+        assert_eq!(scheduler.child_exits.sequences[&parent], 2);
+        assert!(scheduler.child_exits.current.is_empty());
+        assert!(scheduler.child_exits.due.is_empty());
+        assert!(matches!(*operation.phase.lock().unwrap(), Phase::Retired));
+    }
+
+    #[tokio::test]
+    async fn child_exit_exec_preserves_unconsumed_events_and_never_repeats_in_flight_delivery() {
+        for delivered in [true, false] {
+            let (config, state, parent, child, original) = state();
+            let mut request = Box::pin(state.receive_rpc(
+                Tid::from_raw(parent.as_raw()),
+                (
+                    DetTime::new(&config),
+                    MmId::initial(parent),
+                    GlobalRequest::RequestResources(original.clone(), parent),
+                ),
+            ));
+            assert!(poll!(request.as_mut()).is_pending());
+            due(&state, parent, child);
+            let last = Err(SkipTurn);
+            let mut turn = Box::pin(do_a_turn_blocking(
+                state.sched.clone(),
+                state.global_time.clone(),
+                &last,
+            ));
+            assert!(poll!(turn.as_mut()).is_pending());
+            let operation = {
+                let scheduler = state.sched.lock().unwrap();
+                scheduler.child_exits.operations[&scheduler.child_exits.current[&parent]].clone()
+            };
+            let old_command = if delivered {
+                let Poll::Ready((None, GlobalResponse::DeliverChildExit(command))) =
+                    poll!(request.as_mut())
+                else {
+                    panic!("missing old control")
+                };
+                Some(command)
+            } else {
+                None
+            };
+            let new_mm = reconnect_parent(&state, &config, parent).await;
+            let fresh = Resources::new(parent);
+            let mut new_request = Box::pin(state.receive_rpc(
+                Tid::from_raw(parent.as_raw()),
+                (
+                    DetTime::new(&config),
+                    new_mm,
+                    GlobalRequest::RequestResources(fresh.clone(), parent),
+                ),
+            ));
+            assert!(poll!(new_request.as_mut()).is_pending());
+            for _ in 0..3 {
+                assert!(poll!(turn.as_mut()).is_pending());
+                assert!(
+                    poll!(new_request.as_mut()).is_pending(),
+                    "a possibly committed delivery escaped to a second callback"
+                );
+                assert_eq!(state.sched.lock().unwrap().turn, 0);
+            }
+            let accepted = Outcome::Accepted {
+                disposition: Disposition::PendingBlocked,
+                pending_generation: 9,
+                coalesced: false,
+            };
+            let final_reply = if let Some(command) = old_command {
+                let reply = state
+                    .receive_rpc(
+                        Tid::from_raw(parent.as_raw()),
+                        (
+                            DetTime::new(&config),
+                            command.operation.mm,
+                            GlobalRequest::AcknowledgeChildExit {
+                                operation: command.operation,
+                                delivery_id: command.delivery.id,
+                                outcome: accepted,
+                            },
+                        ),
+                    )
+                    .await;
+                assert_eq!(reply, (None, GlobalResponse::ThreadExited));
+                assert_eq!(turn.await.unwrap(), fresh);
+                new_request.await
+            } else {
+                assert_eq!(request.await, (None, GlobalResponse::ThreadExited));
+                assert!(poll!(turn.as_mut()).is_pending());
+                let (None, GlobalResponse::DeliverChildExit(command)) = new_request.await else {
+                    panic!("exec lost an undelivered child event")
+                };
+                assert_eq!(command.operation.mm, new_mm);
+                assert_eq!(command.operation.sequence, 2);
+                assert_eq!(command.delivery.id, 1);
+                assert_eq!(command.delivery.child, child);
+                assert_eq!(command.delivery.exit.status, 37);
+                let mut acknowledgement = Box::pin(state.receive_rpc(
+                    Tid::from_raw(parent.as_raw()),
+                    (
+                        DetTime::new(&config),
+                        new_mm,
+                        GlobalRequest::AcknowledgeChildExit {
+                            operation: command.operation,
+                            delivery_id: command.delivery.id,
+                            outcome: accepted,
+                        },
+                    ),
+                ));
+                assert!(poll!(acknowledgement.as_mut()).is_pending());
+                assert_eq!(turn.await.unwrap(), fresh);
+                acknowledgement.await
+            };
+            assert_eq!(
+                final_reply.1,
+                GlobalResponse::RequestResources(ResumeStatus::Normal)
+            );
+            let scheduler = state.sched.lock().unwrap();
+            assert_eq!(scheduler.turn, 1);
+            assert_eq!(operation.original, original);
+            assert!(scheduler.child_exits.due.is_empty());
+            assert!(scheduler.child_exits.current.is_empty());
+            assert!(scheduler.outstanding_child_exit_completion().is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn child_exit_negative_acknowledgement_releases_both_waiters_without_grant() {
         for outcome in [
             Outcome::RejectedBeforeCommit {
@@ -661,7 +899,7 @@ mod tests {
                             if attempt.phase == AttemptPhase::Settled
                                 && matches!(attempt.completion.try_read(), Some(ControlResult::TargetRetired))));
                         assert!(
-                            tokio::time::timeout(Duration::from_secs(1), turn)
+                            tokio::time::timeout(Duration::from_secs(1), turn.as_mut())
                                 .await
                                 .unwrap()
                                 .is_err()
@@ -739,12 +977,26 @@ mod tests {
                             assert!(scheduler.outstanding_child_exit_completion().is_some());
                         }
                         assert!(
-                            tokio::time::timeout(Duration::from_secs(1), turn)
+                            tokio::time::timeout(Duration::from_secs(1), turn.as_mut())
                                 .await
                                 .unwrap()
                                 .is_err()
                         );
                     }
+                    let mut new_request_after_exec = None;
+                    if case.starts_with("exec-") {
+                        let new_mm = reconnect_parent(&state, &config, parent).await;
+                        let mut next = Box::pin(state.receive_rpc(Tid::from_raw(parent.as_raw()), (
+                            DetTime::new(&config), new_mm,
+                            GlobalRequest::RequestResources(Resources::new(parent), parent),
+                        )));
+                        assert!(poll!(next.as_mut()).is_pending());
+                        assert!(poll!(turn.as_mut()).is_pending());
+                        assert!(poll!(next.as_mut()).is_pending());
+                        assert!(operation.awaiting_completion().is_some());
+                        new_request_after_exec = Some(next);
+                    }
+                    let _keep_new_request_alive = new_request_after_exec;
                     let outcome = if case.ends_with("unsupported") {
                         Outcome::RejectedBeforeCommit {
                             kind: child_exit::ErrorKind::Unsupported,
@@ -798,6 +1050,9 @@ mod tests {
             ("retired-backend", 125, libc::EIO, "BeforeCommit"),
             ("live-postcommit", 125, libc::EPIPE, "AfterCommit"),
             ("retired-postcommit", 125, libc::EPIPE, "AfterCommit"),
+            ("exec-unsupported", 122, libc::ENOSYS, "BeforeCommit"),
+            ("exec-backend", 125, libc::EIO, "BeforeCommit"),
+            ("exec-postcommit", 125, libc::EPIPE, "AfterCommit"),
             ("protocol-sender", 125, libc::EPROTO, "Protocol"),
             ("protocol-request-mm", 125, libc::EPROTO, "Protocol"),
             ("protocol-operation", 125, libc::EPROTO, "Protocol"),

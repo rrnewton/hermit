@@ -282,6 +282,21 @@ impl Scheduler {
         }
         let target = targets[0];
         let nextturn = self.next_turns[&target].clone();
+        // Exec can leave the destination PID alive while an old image's
+        // callback still owns this delivery. Wait for that exact attempt;
+        // never submit the same event to a second backend callback. A late
+        // negative reply remains a fatal outcome, even after retirement.
+        for operation in self.child_exits.operations.values() {
+            let phase = operation.phase.lock().unwrap();
+            if let Phase::Delivering(attempt) = &*phase
+                && attempt.command.delivery.id == delivery.id
+                && attempt.phase == AttemptPhase::TerminalAwaitingCallback
+            {
+                return Ok(Some(ControlWait::Acknowledgement(
+                    attempt.completion.clone(),
+                )));
+            }
+        }
         let operation = self
             .child_exits
             .current

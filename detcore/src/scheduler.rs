@@ -1989,6 +1989,30 @@ impl Scheduler {
         self.exec_incarnations.insert(new_leader, post_exec_mm);
 
         if caller == new_leader {
+            if self
+                .child_exits
+                .current
+                .get(&caller)
+                .is_some_and(|id| id.mm == pre_exec_mm)
+            {
+                // An old callback cannot grant its saved request to the new image.
+                // Retain its exact attempt for a late (including negative) reply,
+                // but give the surviving leader fresh one-shot channels. This is
+                // a registration replacement, not a logical process exit.
+                self.retire_child_exit_operation(caller, pre_exec_mm);
+                self.deschedule_or_defer(caller);
+                self.remove_blocking_entries(&caller);
+                let nextturn = self.next_turns.get_mut(&caller).unwrap();
+                let old_request = std::mem::take(&mut nextturn.req);
+                let old_response = std::mem::take(&mut nextturn.resp);
+                nextturn.child_tid_addr = child_tid_addr;
+                old_request.try_put(Err(ThreadExited));
+                old_response.try_put(SchedResponse::Signaled(None));
+                self.replace_retired_run_queue_incarnation(
+                    caller,
+                    AdmitIntent::Fixed(AdmitSide::Back),
+                );
+            }
             let siblings: Vec<_> = group.into_iter().filter(|tid| *tid != caller).collect();
             for sibling in &siblings {
                 self.logically_kill_thread(sibling, &detpid, pre_exec_mm);
