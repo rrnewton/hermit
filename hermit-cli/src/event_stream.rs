@@ -590,3 +590,7 @@ mod tests {
         assert!(error.to_string().contains("identity mismatch"));
     }
 }
+
+#[cfg(test)]
+#[path = "event_stream/append_record_replay_test.rs"]
+mod append_record_replay_test;
