@@ -638,7 +638,13 @@ fn materialize_focused_preflight(cfg: &mut DagConfig) -> Result<(), String> {
             }
             // Manifest commands need their canonical test-harness producer
             // even when focused selection uses other already-built artifacts.
-            if is_manifest_run(step) || step.job == "manifest_guests" {
+            if is_manifest_run(step)
+                || step
+                    .job
+                    .strip_suffix(HOSTED_VARIANT_SUFFIX)
+                    .unwrap_or(&step.job)
+                    == "manifest_guests"
+            {
                 step.deps.push(manifest_producer.into());
                 if step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
                     step.deps.push("setup.manifest_plan_in_pinned_root".into());

@@ -19026,7 +19026,8 @@
       "result_manifests": [],
       "deps": [
         "gate.manifest_on_host",
-        "pre.reverie_pin_on_host"
+        "pre.reverie_pin_on_host",
+        "setup.manifest_plan_on_host"
       ],
       "env": {},
       "networkonly": false,
