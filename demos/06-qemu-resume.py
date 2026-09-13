@@ -36,6 +36,7 @@ from demo_common import (  # noqa: E402
     run_checked,
     save_anchor,
     save_metadata,
+    safehermit_path,
     stop_process,
     wait_for_process,
 )
@@ -59,7 +60,7 @@ TIMEOUT = int(os.environ.get("QEMU_TIMEOUT", "120"))
 # demo's own start_new_session comment describes -- still writing hermit-info.log at
 # ~45 GiB/h with ppid=1 after the demo exited -- was reaped by the group kill but was
 # never byte-bounded while it lived.
-SAFEHERMIT = ROOT / "bin/safehermit"
+SAFEHERMIT = safehermit_path(ROOT)
 # MEASURED ON THIS DEMO, NOT GUESSED -- and measured MORE THAN ONCE, which is the
 # only reason this number is right. On the Demo 6 QEMU measurement host recorded in
 # docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts" (hermit 0.2.0

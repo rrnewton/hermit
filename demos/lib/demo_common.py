@@ -460,6 +460,12 @@ def canonicalize_qcow2_snapshot_timestamp(path: Path, snapshot_name: str) -> Non
     raise ValueError("snapshot {!r} not found in {}".format(snapshot_name, path))
 
 
+def safehermit_path(root: Path) -> Path:
+    """Honor the same explicit wrapper selection as the shell demo entrypoints."""
+    override = os.environ.get("SAFEHERMIT")
+    return Path(override).resolve() if override else Path(root) / "bin/safehermit"
+
+
 def _tool_version(command: Sequence[str]) -> str:
     try:
         result = subprocess.run(
@@ -516,7 +522,7 @@ def save_metadata(
         "info_log_sha256": hash_file(info_log),
         "hermit_version": _tool_version(
             [
-                str(Path(__file__).resolve().parents[2] / "bin/safehermit"),
+                str(safehermit_path(Path(__file__).resolve().parents[2])),
                 os.environ.get("HERMIT_RELEASE", "hermit"),
                 "--version",
             ]

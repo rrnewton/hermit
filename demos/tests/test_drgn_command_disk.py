@@ -46,7 +46,7 @@ class CommandDiskProtocolTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "bin").mkdir()
-            for name in ("bin/safehermit", "hermit", "qemu", "kernel", "initrd", "snapshot", "vmlinux"):
+            for name in ("bin/safehermit", "selected-safehermit", "hermit", "qemu", "kernel", "initrd", "snapshot", "vmlinux"):
                 (root / name).touch()
             config = dh.GuestConfig(
                 root=root, hermit=root / "hermit", qemu=root / "qemu",
@@ -56,7 +56,9 @@ class CommandDiskProtocolTest(unittest.TestCase):
             )
             program = dh.HermitGuestProgram(config)
             relocated = root / "short.sock"
-            with mock.patch.object(dh, "ensure_vmlinux", return_value=config.vmlinux), mock.patch.object(
+            with mock.patch.dict(dh.os.environ, {"SAFEHERMIT": str(root / "selected-safehermit")}), mock.patch.object(
+                dh, "ensure_vmlinux", return_value=config.vmlinux
+            ), mock.patch.object(
                 dh, "make_socket_path", return_value=relocated
             ) as socket_path, mock.patch.object(
                 dh.subprocess, "Popen", side_effect=StopBeforeLaunch
@@ -68,6 +70,7 @@ class CommandDiskProtocolTest(unittest.TestCase):
             socket_path.assert_called_once_with(preferred, "drgn")
             self.assertIn("unix:{},server=on,wait=off".format(relocated), launch.call_args.args[0])
             self.assertEqual(program._qmp_socket, relocated)
+            self.assertEqual(launch.call_args.args[0][0], str(root / "selected-safehermit"))
 
     def test_close_removes_the_recorded_qmp_socket(self):
         with tempfile.TemporaryDirectory() as directory:

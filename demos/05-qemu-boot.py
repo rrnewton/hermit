@@ -36,6 +36,7 @@ from demo_common import (  # noqa: E402
     report_safehermit,
     run_checked,
     save_metadata,
+    safehermit_path,
     stop_process,
     wait_for_process,
 )
@@ -55,7 +56,7 @@ TIMEOUT = int(os.environ.get("QEMU_TIMEOUT", "600"))
 # ~45 GiB/h once wrote 38 GiB of orphaned hermit-info.log in a single session and
 # tripped the disk headroom alarm twice; start_new_session below reaps the tree the
 # demo knows about, but nothing bounded the bytes.
-SAFEHERMIT = ROOT / "bin/safehermit"
+SAFEHERMIT = safehermit_path(ROOT)
 # MEASURED ON THIS DEMO, NOT GUESSED. Four healthy full boots on the Demo 5 QEMU
 # measurement host recorded in docs/TESTING_ENVIRONMENTS.md under "Named measurement
 # hosts" (hermit 0.2.0 g770b95c505fa, QEMU 10.1.2) wrote 253,386,127 / 253,585,587 / 253,643,026 /

@@ -128,6 +128,38 @@ class DefaultQemuAssetsTest(unittest.TestCase):
                 namespace = runpy.run_path(str(DEMO_DIR / script))
                 self.assertEqual(namespace["ASSETS"], Path(chosen))
 
+    def test_wrapper_default_matches_the_shell_entrypoints(self):
+        with mock.patch.dict(os.environ, {"SAFEHERMIT": ""}):
+            self.assertEqual(dc.safehermit_path(DEMO_DIR.parent), DEMO_DIR.parent / "bin/safehermit")
+
+    def test_python_entrypoints_and_boot_version_use_selected_wrapper(self):
+        chosen = Path("/operator/selected-safehermit")
+        with mock.patch.dict(os.environ, {"SAFEHERMIT": str(chosen)}):
+            for script in ("05-qemu-boot.py", "06-qemu-resume.py"):
+                namespace = runpy.run_path(str(DEMO_DIR / script))
+                self.assertEqual(namespace["SAFEHERMIT"], chosen)
+                if script == "05-qemu-boot.py":
+                    result = subprocess.CompletedProcess([], 0, stdout="hermit version\n", stderr="")
+                    with mock.patch.object(subprocess, "run", return_value=result) as run:
+                        namespace["_hermit_version"](Path("/selected/hermit"))
+                    self.assertEqual(run.call_args.args[0], [str(chosen), "/selected/hermit", "--version"])
+
+    def test_metadata_version_probe_uses_selected_wrapper(self):
+        class StopBeforeProbe(Exception):
+            pass
+
+        chosen = Path("/operator/selected-safehermit")
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            info_log = run_dir / "info.log"
+            info_log.write_text("retained INFO\n")
+            with mock.patch.dict(os.environ, {"SAFEHERMIT": str(chosen), "HERMIT_RELEASE": "/selected/hermit"}), mock.patch.object(
+                dc, "_tool_version", side_effect=StopBeforeProbe
+            ) as version:
+                with self.assertRaises(StopBeforeProbe):
+                    dc.save_metadata(run_dir, None, info_log)
+            version.assert_called_once_with([str(chosen), "/selected/hermit", "--version"])
+
     def test_make_uses_shared_default_and_preserves_override(self):
         self.assertEqual(_make_default(), dc.default_qemu_assets(DEMO_DIR.parent))
         chosen = Path("/var/tmp/operator-selected-qemu-assets")

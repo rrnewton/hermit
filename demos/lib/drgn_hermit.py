@@ -23,7 +23,7 @@ import tempfile
 import time
 from typing import Iterator, Optional, Tuple
 
-from demo_common import hermit_tmp_args, make_socket_path, report_safehermit
+from demo_common import hermit_tmp_args, make_socket_path, report_safehermit, safehermit_path
 
 
 XZ_MAGIC = b"\xfd7zXZ\x00"
@@ -620,7 +620,7 @@ class HermitGuestProgram:
         self._safehermit_report = None  # type: Optional[Path]
 
     def start(self) -> "HermitGuestProgram":
-        safehermit = self.config.root / "bin/safehermit"
+        safehermit = safehermit_path(self.config.root)
         for path in (
             safehermit,
             self.config.hermit,
