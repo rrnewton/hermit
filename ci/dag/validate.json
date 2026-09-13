@@ -6885,7 +6885,7 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "656"
+        "NEXTEST_EXPECTED_EXECUTED": "658"
       },
       "networkonly": false,
       "engine_only": false,
@@ -7007,7 +7007,7 @@
         "hosted-portable",
         "portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test chown_virtual_root_identity --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test robust_futex_owner_death --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test writev_determinism --test zero_copy_pipe_fallback -j 1",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test aio_nr_determinism --test arch_status_determinism --test chaos_sched_yield_progress --test chaos_stress_pmu_detection --test chown_virtual_root_identity --test clock_determinism --test clock_discipline_determinism --test container_init_deadline --test cpufreq_avg_determinism --test epoll_determinism --test epoll_pwait_zero_timeout_progress --test file_nr_determinism --test fp_reduction_determinism --test futex2_refusal --test hashseed_determinism --test inode_nr_determinism --test kernel_keyring --test key_users_determinism --test mmap_determinism --test node_vmstat_determinism --test numa_maps_determinism --test perf_event_refusal --test pidfd_creation --test preadv2_pwritev2_pipe --test process_isolation_refusals --test proc_fdinfo_determinism --test proc_locks_determinism --test procfs_determinism --test procfs_positioned_determinism --test pty_nr_determinism --test python_stdlib --test robust_futex_owner_death --test self_sched_determinism --test self_schedstat_determinism --test signal_determinism --test smaps_determinism --test smaps_rollup_determinism --test softnet_stat_determinism --test sockstat_determinism --test swaps_determinism --test thp_stats_determinism --test verification_report_cli --test verification_report_consumers --test writev_determinism --test zero_copy_pipe_fallback -j 1",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -7040,6 +7040,7 @@
         "numa_maps_determinism",
         "perf_event_refusal",
         "pidfd_creation",
+        "preadv2_pwritev2_pipe",
         "process_isolation_refusals",
         "proc_fdinfo_determinism",
         "proc_locks_determinism",
@@ -7069,7 +7070,7 @@
         "setup.nextest"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "138"
+        "NEXTEST_EXPECTED_EXECUTED": "143"
       },
       "networkonly": false,
       "engine_only": false,
@@ -8038,13 +8039,13 @@
     {
       "group": "privileged-test",
       "job": "cli_kvm",
-      "desc": "All 24 run_kvm_ CLI tests",
-      "description": "Runs all KVM-specific hermit CLI tests on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource.",
+      "desc": "All 25 run_kvm_ CLI and vectored I/O tests",
+      "description": "Runs all KVM-specific hermit CLI tests and the current-position vectored-I/O test on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 25 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource.",
       "labels": [
         "full",
         "kvm"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli --test kvm_preadv2_pwritev2 -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 25' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 25 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli --test kvm_preadv2_pwritev2 -j 1 -E 'test(/^run_kvm_/)'; exit $?",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -8054,7 +8055,8 @@
         }
       ],
       "integration_test_binaries": [
-        "cli"
+        "cli",
+        "kvm_preadv2_pwritev2"
       ],
       "deps": [
         "gate.manifest",
@@ -8062,7 +8064,7 @@
         "privileged-build.privileged_tests"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "24"
+        "NEXTEST_EXPECTED_EXECUTED": "25"
       },
       "networkonly": false,
       "engine_only": false,
@@ -12300,13 +12302,13 @@
     {
       "group": "privileged-only-test",
       "job": "cli_kvm",
-      "desc": "All 24 run_kvm_ CLI tests",
-      "description": "Runs all KVM-specific hermit CLI tests on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource.",
+      "desc": "All 25 run_kvm_ CLI and vectored I/O tests",
+      "description": "Runs all KVM-specific hermit CLI tests and the current-position vectored-I/O test on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 25 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource.",
       "labels": [
         "privileged",
         "kvm"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli --test kvm_preadv2_pwritev2 -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 25' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 25 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli --test kvm_preadv2_pwritev2 -j 1 -E 'test(/^run_kvm_/)'; exit $?",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -12316,7 +12318,8 @@
         }
       ],
       "integration_test_binaries": [
-        "cli"
+        "cli",
+        "kvm_preadv2_pwritev2"
       ],
       "deps": [
         "gate.manifest",
@@ -12324,7 +12327,7 @@
         "privileged-only-build.privileged_tests"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "24"
+        "NEXTEST_EXPECTED_EXECUTED": "25"
       },
       "networkonly": false,
       "engine_only": false,
@@ -19166,12 +19169,12 @@
     {
       "group": "privileged-only-test",
       "job": "cli_kvm_on_host",
-      "desc": "All 24 run_kvm_ CLI tests",
-      "description": "Runs all KVM-specific hermit CLI tests on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource.",
+      "desc": "All 25 run_kvm_ CLI and vectored I/O tests",
+      "description": "Runs all KVM-specific hermit CLI tests and the current-position vectored-I/O test on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 25 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource.",
       "labels": [
         "hosted-privileged"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 24' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f \"$log\"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli --test kvm_preadv2_pwritev2 -E 'test(/^run_kvm_/)' --message-format json >\"$log\"; then exit 1; fi; if ! jq -e '[.\"rust-suites\"[] | .testcases | to_entries[] | select(.value.\"filter-match\".status == \"matches\")] | length == 25' \"$log\" >/dev/null; then printf 'test.cli_kvm: expected exactly 25 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli --test kvm_preadv2_pwritev2 -j 1 -E 'test(/^run_kvm_/)'; exit $?",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -19181,7 +19184,8 @@
         }
       ],
       "integration_test_binaries": [
-        "cli"
+        "cli",
+        "kvm_preadv2_pwritev2"
       ],
       "deps": [
         "gate.manifest_on_host",
@@ -19189,7 +19193,7 @@
         "privileged-only-build.privileged_tests_on_host"
       ],
       "env": {
-        "NEXTEST_EXPECTED_EXECUTED": "24"
+        "NEXTEST_EXPECTED_EXECUTED": "25"
       },
       "networkonly": false,
       "engine_only": false,

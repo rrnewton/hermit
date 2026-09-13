@@ -9,46 +9,14 @@
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
 
+#[path = "common/vectored_io_guest.rs"]
+mod vectored_io_guest;
+
 use std::fs;
-use std::path::Path;
 use std::process::Command;
-use std::process::Output;
-use std::sync::Mutex;
 
-static KVM_RUN_LOCK: Mutex<()> = Mutex::new(());
-
-fn command_output(mut command: Command, label: &str) -> Output {
-    let rendered = format!("{command:?}");
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to start {label}: {rendered}: {error}"));
-    assert!(
-        output.status.success(),
-        "{label} failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    output
-}
-
-fn compile_guest() -> std::path::PathBuf {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("preadv2-pwritev2-pipe");
-    fs::create_dir_all(&build_root).expect("failed to create p*v2 guest build directory");
-    let guest = build_root.join("preadv2_pwritev2_pipe");
-
-    let mut compile = Command::new("cc");
-    compile
-        .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread"])
-        .arg(repository.join("tests/c/preadv2_pwritev2_pipe.c"))
-        .arg("-o")
-        .arg(&guest);
-    command_output(compile, "p*v2 pipe guest compilation");
-    guest
-}
+use vectored_io_guest::command_output;
+use vectored_io_guest::compile_guest;
 
 fn snapshot_addresses(stdout: &str, marker: &str) -> [String; 3] {
     let line = stdout
@@ -119,7 +87,7 @@ fn assert_snapshot_iobuf_evidence(stdout: &str, stderr: &str) {
 
 #[test]
 fn current_position_preadv2_and_pwritev2_match_blocking_pipe_semantics() {
-    let guest = compile_guest();
+    let (_guest_dir, guest) = compile_guest();
 
     let mut trace = Command::new("timeout");
     trace
@@ -215,7 +183,7 @@ fn current_position_preadv2_and_pwritev2_match_blocking_pipe_semantics() {
 
 #[test]
 fn pwritev2_pipe_retry_refuses_a_replaced_descriptor() {
-    let guest = compile_guest();
+    let (_guest_dir, guest) = compile_guest();
     let report_dir = tempfile::tempdir().expect("failed to create verification directory");
     let report_path = report_dir.path().join("verify.json");
     let mut verify = Command::new("timeout");
@@ -254,7 +222,7 @@ fn pwritev2_pipe_retry_refuses_a_replaced_descriptor() {
 
 #[test]
 fn current_position_pipe_attempts_run_through_record_mode() {
-    let guest = compile_guest();
+    let (_guest_dir, guest) = compile_guest();
     let build_root = guest.parent().expect("p*v2 guest should have a parent");
     let recording = build_root.join("recording");
     let _ = fs::remove_dir_all(&recording);
@@ -311,7 +279,7 @@ fn current_position_pipe_attempts_run_through_record_mode() {
 
 #[test]
 fn pwritev2_partial_progress_is_interrupted_on_a_non_root_writer() {
-    let guest = compile_guest();
+    let (_guest_dir, guest) = compile_guest();
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "5s", "30s"])
@@ -339,32 +307,4 @@ fn pwritev2_partial_progress_is_interrupted_on_a_non_root_writer() {
         "trace did not prove the parked pwritev2 was resumed through the signal path\n\
          stderr:\n{stderr}",
     );
-}
-
-#[test]
-#[ignore = "requires combined PR529 per-thread scratch + PR538 vectored support"]
-fn kvm_current_position_vectored_descriptor_matrix_requires_pr529_and_pr538() {
-    let _guard = KVM_RUN_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let guest = compile_guest();
-    let mut command = Command::new("timeout");
-    command
-        .args(["--kill-after", "10s", "90s"])
-        .arg(hermit_test::hermit_binary())
-        .args([
-            "--log=info",
-            "run",
-            "--backend=kvm",
-            "--strict",
-            "--verify",
-            "--verify-strict",
-            "--base-env=minimal",
-            "--",
-        ])
-        .arg(&guest)
-        .arg("matrix");
-    let output = command_output(command, "KVM vectored descriptor matrix");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("vectored-descriptor-matrix-ok"));
 }
