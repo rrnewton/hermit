@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,7 +30,9 @@ static void fail(const char *what) {
 int main(int argc, char **argv) {
   if (argc != 2) {
     fprintf(stderr,
-            "usage: %s sendfile|sendfile-pipe|pwrite|pwritev|pwritev2|pwritev2-noappend\n",
+            "usage: %s sendfile|sendfile-pipe|pwrite|pwritev|pwritev2|"
+            "pwritev2-noappend|pwrite-negative|pwritev-negative|"
+            "pwrite-min-offset|pwritev-min-offset\n",
             argv[0]);
     return 2;
   }
@@ -63,6 +66,14 @@ int main(int argc, char **argv) {
     result = pwrite(STDOUT_FILENO, "guest\n", 6, 0);
   } else if (strcmp(argv[1], "pwritev") == 0) {
     result = pwritev(STDOUT_FILENO, &iov, 1, 0);
+  } else if (strcmp(argv[1], "pwrite-negative") == 0) {
+    result = pwrite(STDOUT_FILENO, "guest\n", 6, -1);
+  } else if (strcmp(argv[1], "pwritev-negative") == 0) {
+    result = pwritev(STDOUT_FILENO, &iov, 1, -1);
+  } else if (strcmp(argv[1], "pwrite-min-offset") == 0) {
+    result = pwrite(STDOUT_FILENO, "guest\n", 6, INT64_MIN);
+  } else if (strcmp(argv[1], "pwritev-min-offset") == 0) {
+    result = pwritev(STDOUT_FILENO, &iov, 1, INT64_MIN);
   } else if (strcmp(argv[1], "pwritev2") == 0) {
     result = syscall(SYS_pwritev2, STDOUT_FILENO, &iov, 1, 0, 0, 0);
   } else if (strcmp(argv[1], "pwritev2-noappend") == 0) {
@@ -86,5 +97,10 @@ int main(int argc, char **argv) {
     return !(result == -1 && operation_errno == EINVAL && input_offset == 0);
   if (strcmp(argv[1], "sendfile-pipe") == 0)
     return !(result == 6 && operation_errno == 0 && input_offset == 6);
+  if (strcmp(argv[1], "pwrite-negative") == 0 ||
+      strcmp(argv[1], "pwritev-negative") == 0 ||
+      strcmp(argv[1], "pwrite-min-offset") == 0 ||
+      strcmp(argv[1], "pwritev-min-offset") == 0)
+    return !(result == -1 && operation_errno == EINVAL);
   return !(result == 6 && operation_errno == 0);
 }
