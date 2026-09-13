@@ -1,0 +1,12 @@
+source_pr=https://github.com/rrnewton/hermit/pull/3002
+source_state=OPEN
+source_draft=true
+source_branch=nextest-cpu-enforcement/inner-cpu-time-enforcement
+source_head=410f0fb4a33efb837675dd6d0796f2fa6212540d
+proposed_title=Add opt-in per-attempt CPU limits to Nextest validation
+proposed_branch=nextest-cpu-enforcement/inner-cpu-time-enforcement-805ecd004-20260913
+base=805ecd0042c9746c2eeaadfa5bac2c08490fd733
+head=ed5bc5a141b91b4afb3ac3b2968fc7430cb0b815
+tree=cdf327063d81810f30cbdfe2006dcff0324d1231
+body_sha256=8272e466c1732a2dbba4f6b37c2ed7d07da6a91155e840f812ebe455a1af2f86
+publication=draft-only; append-only branch; leave source PR and branch untouched
