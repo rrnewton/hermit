@@ -41,3 +41,115 @@ fn missing_arguments_remain_a_refusal() {
     assert!(stderr.contains("usage:"), "{stderr}");
     assert!(output.stdout.is_empty(), "{output:?}");
 }
+#[test]
+fn no_result_prints_the_typed_cause() {
+    let report = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        report.path(),
+        serde_json::to_vec(&serde_json::json!({
+            "verified": false,
+            "bitwise_parity": false,
+            "verdict": "no_result",
+            "no_result_reason": {
+                "kind": "comparison_refused",
+                "detail": "the first log was truncated at the configured size bound"
+            },
+            "infrastructure_error": null,
+            "comparison": null,
+            "compared_log_messages": null,
+            "guest_exit_code": 1,
+            "guest_signal": null,
+            "first_divergent_scheduler_turn": null,
+            "first_divergent_virtual_nanoseconds": null,
+            "first_divergent_record": null,
+            "first_divergent_syscall": null,
+            "first_divergent_left_message": null,
+            "first_divergent_right_message": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run(&["matched", report.path().to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the first log was truncated at the configured size bound"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn no_result_prints_explicit_absence_without_calling_it_omission() {
+    let report = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        report.path(),
+        serde_json::to_vec(&serde_json::json!({
+            "verified": false,
+            "bitwise_parity": false,
+            "verdict": "no_result",
+            "no_result_reason": null,
+            "infrastructure_error": null,
+            "comparison": null,
+            "compared_log_messages": null,
+            "guest_exit_code": 1,
+            "guest_signal": null,
+            "first_divergent_scheduler_turn": null,
+            "first_divergent_virtual_nanoseconds": null,
+            "first_divergent_record": null,
+            "first_divergent_syscall": null,
+            "first_divergent_left_message": null,
+            "first_divergent_right_message": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run(&["matched", report.path().to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the producer recorded no specific no-result cause"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("omitted"),
+        "explicit null must not be reported as a missing field: {stderr}"
+    );
+}
+
+#[test]
+fn duplicate_report_fields_are_a_refusal_with_no_inspection_output() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut report = hermit::canonical_verdict::VerificationReport::no_result();
+    report.no_result_reason = None;
+    let raw = serde_json::to_string(&report).unwrap();
+    std::fs::write(file.path(), &raw).unwrap();
+    let output = run(&["--json", "matched", file.path().to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!output.stdout.is_empty());
+    for (needle, replacement) in [
+        (r#""verified":false"#, r#""verified":true,"verified":false"#),
+        (
+            r#""verified":false"#,
+            r#""verified":false,"verified":false"#,
+        ),
+        (
+            r#""no_result_reason":null"#,
+            r#""no_result_reason":{"kind":"not_run"},"no_result_reason":null"#,
+        ),
+        (
+            r#""no_result_reason":null"#,
+            r#""no_result_reason":null,"no_result_reason":null"#,
+        ),
+    ] {
+        assert_eq!(raw.matches(needle).count(), 1);
+        std::fs::write(file.path(), raw.replacen(needle, replacement, 1)).unwrap();
+        let output = run(&["--json", "matched", file.path().to_str().unwrap()]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("duplicate field") && stderr.contains("REFUSED"),
+            "{stderr}"
+        );
+    }
+}
