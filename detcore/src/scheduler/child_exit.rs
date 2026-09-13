@@ -49,7 +49,7 @@ impl Scheduler {
             sequence: *sequence,
         };
         if original.tid != tid || self.child_exits.current.contains_key(&tid) {
-            return Err(self.fail_child_exit(Failure::protocol(id, 0, parent)));
+            return Err(self.child_exit_protocol_failure(id, 0));
         }
         let operation = Arc::new(Operation {
             id,
@@ -73,6 +73,24 @@ impl Scheduler {
             .fatal
             .get_or_insert_with(|| FatalRecord::new(failure))
             .clone()
+    }
+
+    pub(crate) fn child_exit_protocol_failure(
+        &mut self,
+        id: OperationId,
+        delivery_id: u64,
+    ) -> Arc<FatalRecord> {
+        let mut failure = Failure::protocol_without_child(id, delivery_id);
+        // Supplied operation/delivery IDs describe the invalid request. Only a
+        // retained attempt can authenticate its child; never substitute a sender
+        // or parent ID when that evidence is unavailable.
+        if let Some(operation) = self.child_exits.operations.get(&id) {
+            let phase = operation.phase.lock().unwrap();
+            if let Phase::Delivering(attempt) = &*phase {
+                failure.child = Some(attempt.command.delivery.child);
+            }
+        }
+        self.fail_child_exit(failure)
     }
 
     pub(crate) fn retire_child_exit_operation(&mut self, tid: DetTid, mm: MmId) {
@@ -105,11 +123,11 @@ impl Scheduler {
         id: OperationId,
     ) -> Result<(), Arc<FatalRecord>> {
         let Some(operation) = self.child_exits.operations.get(&id).cloned() else {
-            return Err(self.fail_child_exit(Failure::protocol(id, 0, id.tid)));
+            return Err(self.child_exit_protocol_failure(id, 0));
         };
         let granted = matches!(*operation.phase.lock().unwrap(), Phase::Granted);
         if !granted {
-            return Err(self.fail_child_exit(Failure::protocol(id, 0, operation.parent)));
+            return Err(self.child_exit_protocol_failure(id, 0));
         }
         self.child_exits.current.remove(&id.tid);
         self.child_exits.operations.remove(&id);
@@ -233,7 +251,7 @@ impl Scheduler {
                 mm: MmId::initial(tid),
                 sequence: 0,
             });
-        let mut failure = Failure::protocol(operation, 0, tid);
+        let mut failure = Failure::protocol_without_child(operation, 0);
         failure.errno = libc::ENOSYS;
         failure.stage = FailureStage::UnsupportedRoute;
         failure.unsupported = true;
@@ -332,12 +350,12 @@ impl Scheduler {
         outcome: Outcome,
     ) -> Result<Option<ResumedOperation>, Arc<FatalRecord>> {
         let Some(operation) = self.child_exits.operations.get(&id).cloned() else {
-            return Err(self.fail_child_exit(Failure::protocol(id, delivery_id, id.tid)));
+            return Err(self.child_exit_protocol_failure(id, delivery_id));
         };
         let mut phase = operation.phase.lock().unwrap();
         let Phase::Delivering(attempt) = &mut *phase else {
             drop(phase);
-            return Err(self.fail_child_exit(Failure::protocol(id, delivery_id, id.tid)));
+            return Err(self.child_exit_protocol_failure(id, delivery_id));
         };
         if attempt.command.delivery.id != delivery_id
             || !matches!(
@@ -346,7 +364,7 @@ impl Scheduler {
             )
         {
             drop(phase);
-            return Err(self.fail_child_exit(Failure::protocol(id, delivery_id, id.tid)));
+            return Err(self.child_exit_protocol_failure(id, delivery_id));
         }
         if let Some(failure) = Failure::from_outcome(&attempt.command, outcome) {
             let fatal = self.fail_child_exit(failure);
@@ -375,7 +393,7 @@ impl Scheduler {
         let resp = Ivar::new();
         let Some(nextturn) = self.next_turns.get_mut(&id.tid) else {
             drop(phase);
-            return Err(self.fail_child_exit(Failure::protocol(id, delivery_id, id.tid)));
+            return Err(self.child_exit_protocol_failure(id, delivery_id));
         };
         nextturn.resp = resp.clone();
         let acknowledgement = attempt.acknowledgement.clone();

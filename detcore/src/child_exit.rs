@@ -233,7 +233,7 @@ pub(crate) enum FailureStage {
 pub(crate) struct Failure {
     pub operation: OperationId,
     pub delivery: u64,
-    pub child: DetPid,
+    pub child: Option<DetPid>,
     pub errno: i32,
     pub stage: FailureStage,
     pub unsupported: bool,
@@ -242,10 +242,16 @@ pub(crate) struct Failure {
 
 impl Failure {
     pub fn protocol(operation: OperationId, delivery: u64, child: DetPid) -> Self {
+        let mut failure = Self::protocol_without_child(operation, delivery);
+        failure.child = Some(child);
+        failure
+    }
+
+    pub fn protocol_without_child(operation: OperationId, delivery: u64) -> Self {
         Self {
             operation,
             delivery,
-            child,
+            child: None,
             errno: libc::EPROTO,
             stage: FailureStage::Protocol,
             unsupported: false,
@@ -266,7 +272,7 @@ impl Failure {
         Some(Self {
             operation: command.operation,
             delivery: command.delivery.id,
-            child: command.delivery.child,
+            child: Some(command.delivery.child),
             errno,
             stage,
             unsupported,
@@ -305,6 +311,9 @@ impl FatalRecord {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let failure = &self.failure;
+        let child = failure
+            .child
+            .map_or_else(|| "unavailable".to_owned(), |child| child.to_string());
         let message = format!(
             "HERMIT_CHILD_EXIT_FAILURE: exit={} tid={} mm={:?} operation={} delivery={} child={} errno={} stage={:?} outcome={:?}\n",
             failure.exit_status(),
@@ -312,7 +321,7 @@ impl FatalRecord {
             failure.operation.mm,
             failure.operation.sequence,
             failure.delivery,
-            failure.child,
+            child,
             failure.errno,
             failure.stage,
             failure.outcome

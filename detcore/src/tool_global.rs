@@ -815,11 +815,7 @@ impl GlobalTool for GlobalState {
             let transition = {
                 let mut state = self.sched.lock().unwrap();
                 if operation.tid != dtid || operation.mm != request_mm {
-                    Err(state.fail_child_exit(child_exit::Failure::protocol(
-                        operation,
-                        delivery_id,
-                        dtid,
-                    )))
+                    Err(state.child_exit_protocol_failure(operation, delivery_id))
                 } else {
                     state.acknowledge_child_exit(operation, delivery_id, outcome)
                 }

@@ -681,6 +681,53 @@ mod tests {
                     assert!(matches!(&*operation.phase.lock().unwrap(),
                         Phase::Delivering(attempt)
                         if attempt.phase == AttemptPhase::InCallback));
+                    if case.starts_with("protocol-") {
+                        let accepted = Outcome::Accepted {
+                            disposition: Disposition::PendingBlocked,
+                            pending_generation: 73,
+                            coalesced: false,
+                        };
+                        let mut supplied_operation = command.operation;
+                        let mut supplied_delivery = command.delivery.id;
+                        let mut sender = Tid::from_raw(parent.as_raw());
+                        let mut supplied_mm = MmId::initial(parent);
+                        match case.as_str() {
+                            "protocol-sender" => sender = Tid::from_raw(999),
+                            "protocol-request-mm" => supplied_mm = supplied_mm.for_exec(parent),
+                            "protocol-operation" => supplied_operation.sequence += 1,
+                            "protocol-delivery" => supplied_delivery += 1,
+                            "protocol-incarnation" => {
+                                supplied_operation.mm = supplied_operation.mm.for_exec(parent);
+                                supplied_mm = supplied_operation.mm;
+                            }
+                            "protocol-duplicate" => {
+                                let mut first = Box::pin(state.receive_rpc(sender, (
+                                    DetTime::new(&config), supplied_mm,
+                                    GlobalRequest::AcknowledgeChildExit {
+                                        operation: supplied_operation,
+                                        delivery_id: supplied_delivery,
+                                        outcome: accepted,
+                                    },
+                                )));
+                                assert!(poll!(first.as_mut()).is_pending());
+                                assert!(matches!(*operation.phase.lock().unwrap(), Phase::Waiting));
+                                assert_eq!(state.sched.lock().unwrap().turn, 0);
+                                drop(first);
+                            }
+                            _ => panic!("unknown protocol fixture"),
+                        }
+                        assert_eq!(operation.original, original);
+                        assert_eq!(state.sched.lock().unwrap().turn, 0);
+                        state.receive_rpc(sender, (
+                            DetTime::new(&config), supplied_mm,
+                            GlobalRequest::AcknowledgeChildExit {
+                                operation: supplied_operation,
+                                delivery_id: supplied_delivery,
+                                outcome: accepted,
+                            },
+                        )).await;
+                        panic!("malformed acknowledgement returned instead of failing the run");
+                    }
                     if case.starts_with("retired-") {
                         {
                             let mut scheduler = state.sched.lock().unwrap();
@@ -751,6 +798,12 @@ mod tests {
             ("retired-backend", 125, libc::EIO, "BeforeCommit"),
             ("live-postcommit", 125, libc::EPIPE, "AfterCommit"),
             ("retired-postcommit", 125, libc::EPIPE, "AfterCommit"),
+            ("protocol-sender", 125, libc::EPROTO, "Protocol"),
+            ("protocol-request-mm", 125, libc::EPROTO, "Protocol"),
+            ("protocol-operation", 125, libc::EPROTO, "Protocol"),
+            ("protocol-delivery", 125, libc::EPROTO, "Protocol"),
+            ("protocol-incarnation", 125, libc::EPROTO, "Protocol"),
+            ("protocol-duplicate", 125, libc::EPROTO, "Protocol"),
         ] {
             let start = Instant::now();
             let mut child = Command::new(std::env::current_exe().unwrap())
@@ -784,10 +837,15 @@ mod tests {
                     stderr.contains(&format!("errno={errno} stage={stage}")),
                     "{case}: {stderr}"
                 );
-                assert!(
-                    stderr.contains("operation=1 delivery=1 child=18"),
-                    "{case}: {stderr}"
-                );
+                let expected_identity = match case {
+                    "protocol-operation" => "operation=2 delivery=1 child=unavailable",
+                    "protocol-delivery" => "operation=1 delivery=2 child=18",
+                    "protocol-incarnation" | "protocol-duplicate" => {
+                        "operation=1 delivery=1 child=unavailable"
+                    }
+                    _ => "operation=1 delivery=1 child=18",
+                };
+                assert!(stderr.contains(expected_identity), "{case}: {stderr}");
                 if case.ends_with("postcommit") {
                     assert!(
                         stderr.contains("pending_generation: 73"),
