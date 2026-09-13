@@ -1106,6 +1106,15 @@ fn assert_inherited_stdio_append_write_paths(backend: &str, operations: &[&str])
                 "{backend} sendfile did not return EINVAL without consuming input:\n{diagnostics}",
             );
             b"prefix\n".as_slice()
+        } else if matches!(
+            *operation,
+            "pwrite-negative" | "pwritev-negative" | "pwrite-min-offset" | "pwritev-min-offset"
+        ) {
+            assert!(
+                diagnostics.contains("result=-1 errno=22 input_offset=0"),
+                "{backend} {operation} did not reject the negative offset:\n{diagnostics}",
+            );
+            b"prefix\n".as_slice()
         } else if *operation == "pwritev2-noappend" {
             assert!(
                 diagnostics.contains("result=6 errno=0"),
@@ -1468,6 +1477,10 @@ fn run_ptrace_inherited_stdio_append_covers_write_like_syscalls() {
             "pwritev",
             "pwritev2",
             "pwritev2-noappend",
+            "pwrite-negative",
+            "pwritev-negative",
+            "pwrite-min-offset",
+            "pwritev-min-offset",
         ],
     );
 }
