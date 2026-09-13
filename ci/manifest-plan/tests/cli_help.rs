@@ -81,6 +81,7 @@ fn every_manifest_cli_has_conventional_help() {
             "generate-test-footprints",
             env!("CARGO_BIN_EXE_generate-test-footprints"),
         ),
+        ("manifest-metadata", env!("CARGO_BIN_EXE_manifest-metadata")),
     ] {
         assert_help(binary, name, &non_repo);
     }
@@ -279,6 +280,23 @@ fn help_does_not_turn_missing_or_unknown_arguments_into_success() {
         String::from_utf8_lossy(&unknown_plan_option.stderr).contains("unknown argument"),
         "{unknown_plan_option:?}"
     );
+
+    for args in [
+        vec!["--definitely-unknown"],
+        vec!["--help", "--definitely-unknown"],
+        vec!["unexpected-positional"],
+    ] {
+        let output = run(env!("CARGO_BIN_EXE_manifest-metadata"), &args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(
+            output.stdout.is_empty(),
+            "invalid invocation exported metadata"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unexpected argument"),
+            "{args:?}: {output:?}"
+        );
+    }
 }
 
 #[test]
