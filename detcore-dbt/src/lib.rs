@@ -902,6 +902,23 @@ fn append_copied_syscall_record(sysnum: i64) {
     };
 }
 
+fn report_inherited_stdio_alias_error(error: &detcore::InheritedStdioAliasError) {
+    emit_runtime_diagnostic(&format!("detcore-dbt: {error}\n"));
+}
+
+// This initialization failure is a run refusal, not a guest syscall result.
+// Keep other startup-error behavior unchanged in the lazy callback.
+fn report_inherited_stdio_alias_failure(error: &Error) -> bool {
+    if let Error::Tool(error) = error
+        && let Some(error) = error.downcast_ref::<detcore::InheritedStdioAliasError>()
+    {
+        report_inherited_stdio_alias_error(error);
+        true
+    } else {
+        false
+    }
+}
+
 fn error_result(error: Error) -> i64 {
     match error {
         Error::Errno(errno) => -(errno.into_raw() as i64),
@@ -1376,7 +1393,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
         initialized: false,
         post_exec_pending: host_tid == pid && inherited_parent.is_none(),
     });
-    if reverie_dbt::run_tool_thread_start(
+    if let Err(error) = reverie_dbt::run_tool_thread_start(
         tool,
         context as usize,
         Pid::from_raw(det_tid.into()),
@@ -1388,9 +1405,8 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_init(
         invoke_syscall,
         read_registers,
         write_registers,
-    )
-    .is_err()
-    {
+    ) {
+        report_inherited_stdio_alias_failure(&error);
         return -1;
     }
     thread.initialized = true;
@@ -1972,6 +1988,52 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
         pid,
         tid,
     );
+    // Establish local descriptor identity before any guest-memory probe or
+    // rewritten result. This construction does not register with the scheduler;
+    // the ordinary start hook remains below the original input validation.
+    let host_pid = Pid::from_raw(pid);
+    let det_tid = Pid::from_raw(det_tid.into());
+    let tool = runtime
+        .tool
+        .get_or_init(|| Detcore::new(det_pid, &runtime.config));
+    if first_event {
+        emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore thread state\n");
+    }
+    if scratch.runtime_state.is_null() {
+        if first_event {
+            emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore thread state\n");
+        }
+        let mut state = init_dbt_thread_state(
+            tool,
+            Tid::from_raw(det_tid.into()),
+            DetTid::from_raw(det_pid.into()),
+            tid,
+            None,
+        );
+        let Some(open_file_creator) = runtime.abi.open_file_creator(scratch.virtual_tid, tid)
+        else {
+            unsafe { result.write(-(Errno::EIO.into_raw() as i64)) };
+            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
+            return 1;
+        };
+        state.set_open_file_creator(open_file_creator);
+        if first_event {
+            emit_lifecycle_marker(emit, b"detcore-dbt: Detcore thread state constructed\n");
+        }
+        scratch.runtime_state = Box::into_raw(Box::new(ThreadRuntime {
+            tid: det_tid,
+            state,
+            initialized: false,
+            post_exec_pending: true,
+        }));
+    }
+    let thread = unsafe { &mut *scratch.runtime_state };
+    let det_tid = thread.tid;
+    if let Some(error) = thread.state.inherited_stdio_alias_error() {
+        report_inherited_stdio_alias_error(error);
+        return -1;
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1065): Review fault-safe DBT prlimit64 input validation.
     if !prlimit_new_limit_is_readable(sysnum, raw_args, |address, bytes| unsafe {
@@ -2012,48 +2074,10 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     };
 
     // Clone-family and exec syscalls return through native lifecycle handling
-    // below. Initialize the local Detcore state before that early return so a
-    // process whose first intercepted syscall is fork/clone/exec still has a
-    // parent state for the post-clone callback and can send PrepareExec.
+    // below. Complete the original start hook here, after input validation,
+    // so the first fork/clone/exec still has an admitted parent state and can
+    // send PrepareExec. Local construction above does not move this RPC point.
     TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
-    let host_pid = Pid::from_raw(pid);
-    let det_tid = Pid::from_raw(det_tid.into());
-    let tool = runtime
-        .tool
-        .get_or_init(|| Detcore::new(det_pid, &runtime.config));
-    if first_event {
-        emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore thread state\n");
-    }
-    if scratch.runtime_state.is_null() {
-        if first_event {
-            emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore thread state\n");
-        }
-        let mut state = init_dbt_thread_state(
-            tool,
-            Tid::from_raw(det_tid.into()),
-            DetTid::from_raw(det_pid.into()),
-            tid,
-            None,
-        );
-        let Some(open_file_creator) = runtime.abi.open_file_creator(scratch.virtual_tid, tid)
-        else {
-            unsafe { result.write(-(Errno::EIO.into_raw() as i64)) };
-            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-            return 1;
-        };
-        state.set_open_file_creator(open_file_creator);
-        if first_event {
-            emit_lifecycle_marker(emit, b"detcore-dbt: Detcore thread state constructed\n");
-        }
-        scratch.runtime_state = Box::into_raw(Box::new(ThreadRuntime {
-            tid: det_tid,
-            state,
-            initialized: false,
-            post_exec_pending: true,
-        }));
-    }
-    let thread = unsafe { &mut *scratch.runtime_state };
-    let det_tid = thread.tid;
     if !thread.initialized {
         if first_event {
             emit_lifecycle_marker(emit, b"detcore-dbt: running Detcore thread-start hook\n");
@@ -2071,6 +2095,11 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
             read_registers,
             write_registers,
         ) {
+            if report_inherited_stdio_alias_failure(&error) {
+                // The native client treats a negative action as fatal. Do not
+                // overwrite the syscall result, mark initialized, or resume it.
+                return -1;
+            }
             unsafe { result.write(error_result(error)) };
             TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
             return 1;
@@ -3793,6 +3822,285 @@ mod tests {
             None
         );
         assert!(!invoked);
+    }
+
+    fn run_isolated_stdio_alias_refusal(lazy: bool, sysnum: i64) {
+        const CHILD: &str = "HERMIT_DBT_STDIO_ALIAS_ERROR_CONTROL";
+        let test = match (lazy, sysnum) {
+            (true, libc::SYS_prlimit64) => {
+                "tests::lazy_thread_start_alias_error_precedes_prlimit_read"
+            }
+            (true, libc::SYS_getrandom) => {
+                "tests::lazy_thread_start_alias_error_precedes_getrandom_write"
+            }
+            (true, libc::SYS_getuid) => {
+                "tests::lazy_thread_start_alias_error_returns_fatal_without_guest_result"
+            }
+            (false, libc::SYS_getuid) => {
+                "tests::eager_thread_start_alias_error_returns_fatal_without_publishing_state"
+            }
+            _ => panic!("unknown isolated alias control"),
+        };
+        let Ok(value) = std::env::var(CHILD) else {
+            for errno in [libc::EPERM, libc::EBADF] {
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", test, "--nocapture"])
+                    .env(CHILD, errno.to_string())
+                    .spawn()
+                    .unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let status = loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        break status;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        child.kill().unwrap();
+                        let status = child.wait().unwrap();
+                        panic!("isolated DBT alias control timed out: {status}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                };
+                assert!(
+                    status.success(),
+                    "isolated DBT errno {errno} control: {status}"
+                );
+            }
+            return;
+        };
+        let errno: i32 = value.parse().unwrap();
+        assert!([libc::EPERM, libc::EBADF].contains(&errno));
+        // This executed child alone receives the permanent filter. All other
+        // libtest processes retain their own unmodified syscall environment.
+        let filter = [
+            libc::sock_filter {
+                code: 0x20,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            },
+            libc::sock_filter {
+                code: 0x15,
+                jt: 0,
+                jf: 1,
+                k: libc::SYS_kcmp as u32,
+            },
+            libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ERRNO | errno as u32,
+            },
+            libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: libc::SECCOMP_RET_ALLOW,
+            },
+        ];
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr().cast_mut(),
+        };
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) },
+            0
+        );
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let runtime = Arc::new(Runtime {
+            abi: RuntimeAbi::Current,
+            global: GlobalState::init_for_external_scheduler(&config),
+            config,
+            tool: OnceLock::new(),
+            next_child_ordinal: AtomicU64::new(1),
+        });
+        assert!(RUNTIME.write().unwrap().replace(runtime).is_none());
+        static CALLBACKS: AtomicU64 = AtomicU64::new(0);
+        static WRITABLE_BUFFER: AtomicU64 = AtomicU64::new(0);
+        static DIAGNOSTICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        unsafe extern "C" fn capture_diagnostic(bytes: *const u8, length: usize) {
+            let bytes = unsafe { std::slice::from_raw_parts(bytes, length) };
+            DIAGNOSTICS
+                .lock()
+                .unwrap()
+                .push(String::from_utf8(bytes.to_vec()).unwrap());
+        }
+        DBT_DIAGNOSTIC_EMITTER.set(capture_diagnostic).unwrap();
+        assert!(!report_inherited_stdio_alias_failure(&Error::Errno(
+            Errno::EINVAL
+        )));
+        assert!(!report_inherited_stdio_alias_failure(&Error::Tool(
+            io::Error::other("unrelated startup failure").into()
+        )));
+        unsafe extern "C" fn invoke(_context: usize, _sysno: i64, _args: *const u64) -> i64 {
+            CALLBACKS.fetch_add(1, Ordering::Relaxed);
+            -(libc::ENOSYS as i64)
+        }
+        unsafe extern "C" fn registers(_context: usize, _regs: *mut libc::user_regs_struct) -> i32 {
+            CALLBACKS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        unsafe extern "C" fn set_registers(
+            _context: usize,
+            _regs: *const libc::user_regs_struct,
+        ) -> i32 {
+            CALLBACKS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        unsafe extern "C" fn read(_address: usize, _buffer: *mut u8, _length: usize) -> i32 {
+            CALLBACKS.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        unsafe extern "C" fn write(address: usize, buffer: *const u8, length: usize) -> usize {
+            CALLBACKS.fetch_add(1, Ordering::Relaxed);
+            if address as u64 == WRITABLE_BUFFER.load(Ordering::Relaxed) && length <= 16 {
+                // The test publishes its live 16-byte buffer before dispatch.
+                unsafe { std::ptr::copy_nonoverlapping(buffer, address as *mut u8, length) };
+                length
+            } else {
+                0
+            }
+        }
+        let mut scratch = NativeThreadScratch {
+            branches: 0,
+            observed_syscalls: 0,
+            rewritten_syscalls: 0,
+            runtime_state: std::ptr::null_mut(),
+            pending_thread_clone: 0,
+            thread_clone_flags: 0,
+            thread_clone_ctid: 0,
+            pending_thread_start: 0,
+            virtual_pid: 3,
+            virtual_ppid: 1,
+            virtual_tid: 3,
+            pending_virtual_child: 0,
+            pending_clone_flags: 0,
+        };
+        let host_pid = unsafe { libc::getpid() };
+        let scratch_ptr = std::ptr::from_mut(&mut scratch).cast();
+        if lazy {
+            let mut guest_buffer = [0x5a_u8; 16];
+            let address = guest_buffer.as_mut_ptr() as u64;
+            WRITABLE_BUFFER.store(address, Ordering::Relaxed);
+            let args = match sysnum {
+                libc::SYS_prlimit64 => [0, libc::RLIMIT_NOFILE as u64, 1, 0, 0, 0],
+                libc::SYS_getrandom => [address, guest_buffer.len() as u64, 0, 0, 0, 0],
+                _ => [0_u64; 6],
+            };
+            let mut result = 0x12345678_i64;
+            let mut deferred_number = -777_i64;
+            let mut deferred_args = [0xfeed_u64; 6];
+            let rewritten = TOTAL_REWRITTEN.load(Ordering::Relaxed);
+            for _ in 0..2 {
+                let status = unsafe {
+                    reverie_dbt_runtime_pre_syscall(
+                        std::ptr::null_mut(),
+                        scratch_ptr,
+                        host_pid,
+                        host_pid,
+                        0,
+                        sysnum,
+                        args.as_ptr(),
+                        0,
+                        &mut result,
+                        &mut deferred_number,
+                        deferred_args.as_mut_ptr(),
+                        invoke,
+                        registers,
+                        set_registers,
+                        read,
+                        write,
+                        test_emit,
+                    )
+                };
+                assert_eq!(
+                    status, -1,
+                    "startup refusal must use the native fatal action"
+                );
+                assert_eq!(result, 0x12345678, "no rewritten guest EIO");
+                assert_eq!(
+                    guest_buffer, [0x5a; 16],
+                    "no getrandom probe may modify guest memory before refusal"
+                );
+                assert_eq!(
+                    CALLBACKS.load(Ordering::Relaxed),
+                    0,
+                    "no guest input probe before refusal"
+                );
+                assert_eq!(deferred_number, -777);
+                assert_eq!(deferred_args, [0xfeed; 6]);
+                assert_eq!(TOTAL_REWRITTEN.load(Ordering::Relaxed), rewritten);
+                let thread = unsafe { &*scratch.runtime_state };
+                assert!(!thread.initialized);
+                assert_eq!(
+                    thread.state.inherited_stdio_alias_error(),
+                    Some(&detcore::InheritedStdioAliasError {
+                        left: 0,
+                        right: 1,
+                        errno
+                    }),
+                );
+            }
+            drop(unsafe { Box::from_raw(scratch.runtime_state) });
+            scratch.runtime_state = std::ptr::null_mut();
+        } else {
+            let status = unsafe {
+                reverie_dbt_runtime_thread_init(
+                    scratch_ptr,
+                    std::ptr::null_mut(),
+                    host_pid,
+                    host_pid,
+                    -1,
+                    0,
+                    0,
+                    invoke,
+                    registers,
+                    set_registers,
+                )
+            };
+            assert_eq!(status, -1);
+            assert!(
+                scratch.runtime_state.is_null(),
+                "failed eager state must not be published"
+            );
+        }
+        assert_eq!(CALLBACKS.load(Ordering::Relaxed), 0);
+        let expected_diagnostic = format!(
+            "detcore-dbt: cannot compare inherited stdio descriptors 0 and 1 with kcmp(KCMP_FILE): {} (errno {errno})\n",
+            io::Error::from_raw_os_error(errno),
+        );
+        assert_eq!(
+            *DIAGNOSTICS.lock().unwrap(),
+            vec![expected_diagnostic; if lazy { 2 } else { 1 }]
+        );
+        assert!(scratch.runtime_state.is_null());
+        RUNTIME.write().unwrap().take();
+    }
+
+    #[test]
+    fn eager_thread_start_alias_error_returns_fatal_without_publishing_state() {
+        run_isolated_stdio_alias_refusal(false, libc::SYS_getuid);
+    }
+
+    #[test]
+    fn lazy_thread_start_alias_error_returns_fatal_without_guest_result() {
+        run_isolated_stdio_alias_refusal(true, libc::SYS_getuid);
+    }
+
+    #[test]
+    fn lazy_thread_start_alias_error_precedes_prlimit_read() {
+        run_isolated_stdio_alias_refusal(true, libc::SYS_prlimit64);
+    }
+
+    #[test]
+    fn lazy_thread_start_alias_error_precedes_getrandom_write() {
+        run_isolated_stdio_alias_refusal(true, libc::SYS_getrandom);
     }
 
     #[test]
