@@ -33,6 +33,7 @@ rust_library(
         },
     },
     test_deps = [
+        "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:test-case",

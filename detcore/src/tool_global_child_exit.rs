@@ -268,6 +268,91 @@ mod tests {
         new_mm
     }
 
+    #[test_case::test_case(false, false; "resources_none")]
+    #[test_case::test_case(false, true; "resources_some")]
+    #[test_case::test_case(true, false; "deregistration_none")]
+    #[test_case::test_case(true, true; "deregistration_some")]
+    fn child_exit_metadata_round_trips_through_positional_rpc(deregister: bool, present: bool) {
+        let tid = DetPid::from_raw(17);
+        let mm = MmId::initial(tid).for_exec(tid);
+        let normal_exit = present.then_some(NormalExit {
+            status: 37,
+            uid: 0,
+            user_ticks: 23,
+            system_ticks: 11,
+        });
+        let request = if deregister {
+            GlobalRequest::DeregisterThread(ThreadDeregistration {
+                dettid: tid,
+                detpid: tid,
+                mm,
+                timeslice_stats: TimesliceStats {
+                    count: 2,
+                    sum_ns: 73,
+                    min_ns: 31,
+                    max_ns: 42,
+                },
+                syscall_count: 99,
+                chaos_epochs: Vec::new(),
+                normal_exit,
+            })
+        } else {
+            let mut resources = Resources::new(tid);
+            resources.insert(ResourceID::SchedYield, Permission::RW);
+            resources.poll_attempt = 2;
+            resources.fyi("positional transport control");
+            resources.signal_interrupt_errno = Some(libc::EINTR);
+            resources.normal_exit = normal_exit;
+            GlobalRequest::RequestResources(resources, tid)
+        };
+        let mut clock = DetTime::zero();
+        clock.add_syscall();
+        type Request = <GlobalState as GlobalTool>::Request;
+        // Match Reverie ptrace's actual debug RPC serializer/configuration,
+        // including the full clock/mm/request tuple and exact byte consumption.
+        let tuple: Request = (clock, mm, request);
+        let bytes = bincode::serde::encode_to_vec(&tuple, bincode::config::legacy()).unwrap();
+        let (decoded, consumed): (Request, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::legacy())
+                .expect("actual RPC request must deserialize");
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap(),
+            serde_json::to_value(&tuple).unwrap()
+        );
+        let marked = (&tuple, 0xfeed_cafe_1234_5678u64);
+        let bytes = bincode::serde::encode_to_vec(marked, bincode::config::legacy()).unwrap();
+        let (decoded, consumed): ((Request, u64), usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(
+            decoded.1, marked.1,
+            "omitted metadata consumed the following value"
+        );
+        assert_eq!(
+            serde_json::to_value(decoded.0).unwrap(),
+            serde_json::to_value(&tuple).unwrap()
+        );
+        // Previously stored human-readable records may omit the new optional
+        // metadata. They must continue to decode as None, independently of the
+        // positional binary representation.
+        let mut old_json = serde_json::to_value(&tuple).unwrap();
+        let body = if deregister {
+            &mut old_json[2]["DeregisterThread"]
+        } else {
+            &mut old_json[2]["RequestResources"][0]
+        };
+        body.as_object_mut().unwrap().remove("normal_exit");
+        let old: Request = serde_json::from_value(old_json).unwrap();
+        match old.2 {
+            GlobalRequest::RequestResources(resources, _) => {
+                assert!(resources.normal_exit.is_none())
+            }
+            GlobalRequest::DeregisterThread(record) => assert!(record.normal_exit.is_none()),
+            _ => unreachable!(),
+        }
+    }
+
     #[tokio::test]
     async fn delivery_acknowledgement_preserves_wait_request_and_single_commit() {
         for event_first in [false, true] {

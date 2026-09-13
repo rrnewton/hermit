@@ -2306,7 +2306,8 @@ pub struct ThreadDeregistration {
     pub(crate) syscall_count: u64,
     pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
     /// Actual backend exit outcome and final virtual CPU accounting, if normally exited.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Positional RPC encoding must include the None discriminant as well.
+    #[serde(default)]
     pub(crate) normal_exit: Option<child_exit::NormalExit>,
 }
 

@@ -368,7 +368,8 @@ pub struct Resources {
     #[serde(default)]
     pub(crate) signal_interrupt_errno: Option<i32>,
     /// Normal exit metadata captured before the scheduler authorizes the exit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Positional RPC encoding must include the None discriminant as well.
+    #[serde(default)]
     pub(crate) normal_exit: Option<crate::child_exit::NormalExit>,
 }
 
