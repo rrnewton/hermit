@@ -18,6 +18,9 @@
 //! prerequisites for that verdict: repeated input must match, and a changed
 //! syscall-buffer hash in the retained stream must make verification fail.
 
+#[path = "common/hermit_binary.rs"]
+mod hermit_test;
+
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -85,9 +88,125 @@ __attribute__((noreturn)) void _start(void) {
 }
 "#;
 
-fn compile_source_guest(name: &str, source_text: &str, extra_args: &[&str]) -> PathBuf {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-info-log-determinism");
-    fs::create_dir_all(&build_root).expect("failed to create guest build directory");
+const SENDMMSG_BUFFER_MUTATOR_SOURCE: &str = r#"
+typedef unsigned int u32;
+typedef unsigned long usize;
+
+struct iovec {
+  void *iov_base;
+  usize iov_len;
+};
+
+struct msghdr {
+  void *msg_name;
+  u32 msg_namelen;
+  struct iovec *msg_iov;
+  usize msg_iovlen;
+  void *msg_control;
+  usize msg_controllen;
+  u32 msg_flags;
+};
+
+struct mmsghdr {
+  struct msghdr msg_hdr;
+  u32 msg_len;
+};
+
+static inline long syscall1(long number, long arg1) {
+  register long rax __asm__("rax") = number;
+  register long rdi __asm__("rdi") = arg1;
+  __asm__ volatile("syscall"
+                   : "+a"(rax)
+                   : "D"(rdi)
+                   : "rcx", "r11", "memory");
+  return rax;
+}
+
+static inline long syscall4(long number, long arg1, long arg2, long arg3,
+                            long arg4) {
+  register long rax __asm__("rax") = number;
+  register long rdi __asm__("rdi") = arg1;
+  register long rsi __asm__("rsi") = arg2;
+  register long rdx __asm__("rdx") = arg3;
+  register long r10 __asm__("r10") = arg4;
+  __asm__ volatile("syscall"
+                   : "+a"(rax)
+                   : "D"(rdi), "S"(rsi), "d"(rdx), "r"(r10)
+                   : "rcx", "r11", "memory");
+  return rax;
+}
+
+static inline long syscall6(long number, long arg1, long arg2, long arg3,
+                            long arg4, long arg5, long arg6) {
+  register long rax __asm__("rax") = number;
+  register long rdi __asm__("rdi") = arg1;
+  register long rsi __asm__("rsi") = arg2;
+  register long rdx __asm__("rdx") = arg3;
+  register long r10 __asm__("r10") = arg4;
+  register long r8 __asm__("r8") = arg5;
+  register long r9 __asm__("r9") = arg6;
+  __asm__ volatile("syscall"
+                   : "+a"(rax)
+                   : "D"(rdi), "S"(rsi), "d"(rdx), "r"(r10), "r"(r8), "r"(r9)
+                   : "rcx", "r11", "memory");
+  return rax;
+}
+
+__attribute__((noreturn)) void _start(void) {
+  static const char path[] = "@STATE_PATH@";
+  static const char replacement[16] = {
+      66, 66, 66, 66, 66, 66, 66, 66,
+      66, 66, 66, 66, 66, 66, 66, 66,
+  };
+  static int sockets[2];
+  static struct iovec iovecs[2];
+  static struct mmsghdr message;
+  long result = 0;
+  long fd = syscall4(257, -100, (long)path, 2 | 02000000, 0);
+  long mapping = fd < 0 ? -1 : syscall6(9, 0, 16, 1, 2, fd, 0);
+  if (fd < 0 || mapping < 0) {
+    result = 65;
+  } else if (syscall4(53, 1, 2 | 02000000, 0, (long)sockets) != 0) {
+    result = 66;
+  } else {
+    iovecs[0].iov_base = (void *)mapping;
+    iovecs[0].iov_len = 4;
+    iovecs[1].iov_base = (void *)(mapping + 4);
+    iovecs[1].iov_len = 12;
+    message.msg_hdr.msg_iov = iovecs;
+    message.msg_hdr.msg_iovlen = 2;
+    long sent = syscall4(307, sockets[0], (long)&message, 1, 0);
+    if (sent != 1) {
+      result = sent < 0 ? 100 - sent : 80 + sent;
+    } else if (message.msg_len != 16) {
+      result = 70;
+    } else if (syscall4(18, fd, (long)replacement, sizeof(replacement), 0) !=
+               (long)sizeof(replacement)) {
+      result = 68;
+    } else if (syscall1(74, fd) != 0) {
+      result = 69;
+    }
+    syscall1(3, sockets[0]);
+    syscall1(3, sockets[1]);
+  }
+  if (fd >= 0) syscall1(3, fd);
+  syscall1(231, result);
+  __builtin_unreachable();
+}
+"#;
+
+fn compile_source_guest(
+    name: &str,
+    source_text: &str,
+    extra_args: &[&str],
+) -> (tempfile::TempDir, PathBuf) {
+    let artifact_root = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    fs::create_dir_all(artifact_root).expect("failed to create guest artifact root");
+    let directory = tempfile::Builder::new()
+        .prefix("kvm-info-log-determinism-")
+        .tempdir_in(artifact_root)
+        .expect("failed to create private guest build directory");
+    let build_root = directory.path();
     let source = build_root.join(format!("{name}.c"));
     fs::write(&source, source_text).expect("failed to write guest source");
     let binary = build_root.join(name);
@@ -104,17 +223,17 @@ fn compile_source_guest(name: &str, source_text: &str, extra_args: &[&str]) -> P
         "failed to compile {name}:\n{}",
         String::from_utf8_lossy(&output.stderr),
     );
-    binary
+    (directory, binary)
 }
 
-fn compile_guest(name: &str, extra_args: &[&str]) -> PathBuf {
+fn compile_guest(name: &str, extra_args: &[&str]) -> (tempfile::TempDir, PathBuf) {
     compile_source_guest(name, "int main(void) { return 0; }\n", extra_args)
 }
 
 fn run_kvm_log(binary: &Path, log_level: &str, extra_run_flags: &[&str]) -> String {
     let output = Command::new("timeout")
         .args(["--kill-after", "10s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg(hermit_test::hermit_binary())
         .args(["--log", log_level, "--backend", "kvm"])
         .args(["run", "--strict"])
         .args(extra_run_flags)
@@ -202,7 +321,8 @@ fn strip_ansi_sgr(input: &str) -> String {
     output
 }
 
-fn run_kvm_verify(
+fn run_verify(
+    backend: &str,
     binary: &Path,
     state_path: &Path,
     initial: &[u8; 16],
@@ -210,7 +330,7 @@ fn run_kvm_verify(
     extra_run_flags: &[&str],
 ) -> (Output, serde_json::Value) {
     fs::write(state_path, initial).expect("failed to seed io-buffer state");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-info-log-determinism");
+    let build_root = binary.parent().expect("guest binary has a build directory");
     let report_path = build_root.join(format!("{label}.json"));
     let log_dir = build_root.join(format!("{label}-logs"));
     let _ = fs::remove_file(&report_path);
@@ -219,8 +339,8 @@ fn run_kvm_verify(
 
     let output = Command::new("timeout")
         .args(["--kill-after", "10s", "90s"])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log", "info", "--backend", "kvm"])
+        .arg(hermit_test::hermit_binary())
+        .args(["--log", "info", "--backend", backend])
         .args([
             "run",
             "--strict",
@@ -237,16 +357,28 @@ fn run_kvm_verify(
         .arg("--")
         .arg(binary)
         .output()
-        .unwrap_or_else(|error| panic!("failed to verify io-buffer guest under KVM: {error}"));
+        .unwrap_or_else(|error| {
+            panic!("failed to verify io-buffer guest under {backend}: {error}")
+        });
     let report = serde_json::from_slice(&fs::read(&report_path).unwrap_or_else(|error| {
         panic!(
-            "KVM verification did not write {}: {error}; stderr:\n{}",
+            "{backend} verification did not write {}: {error}; stderr:\n{}",
             report_path.display(),
             String::from_utf8_lossy(&output.stderr),
         )
     }))
     .expect("KVM verification report was not valid JSON");
     (output, report)
+}
+
+fn run_kvm_verify(
+    binary: &Path,
+    state_path: &Path,
+    initial: &[u8; 16],
+    label: &str,
+    extra_run_flags: &[&str],
+) -> (Output, serde_json::Value) {
+    run_verify("kvm", binary, state_path, initial, label, extra_run_flags)
 }
 
 #[test]
@@ -267,7 +399,7 @@ fn kvm_verify_compares_retained_io_buffer_hashes() {
         "@STATE_PATH@",
         state_path.to_str().expect("state path was not UTF-8"),
     );
-    let binary = compile_source_guest(
+    let (_guest_dir, binary) = compile_source_guest(
         "io-buffer-mutator",
         &source,
         &[
@@ -346,6 +478,178 @@ fn kvm_verify_compares_retained_io_buffer_hashes() {
     let _ = fs::remove_file(state_path);
 }
 
+// This reaches the shared Detcore logging path through ptrace. KVM currently
+// returns ENOSYS for sendmmsg, so a KVM version would test syscall support
+// rather than the buffer comparison implemented here. The unit tests above
+// cover extraction of the completed message prefix independently of backend
+// execution.
+#[test]
+fn ptrace_verify_compares_sendmmsg_iovec_prefixes() {
+    let _guard = KVM_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let state_path = Path::new("/tmp").join(format!(
+        "hermit-ptrace-sendmmsg-verification-{}",
+        std::process::id()
+    ));
+    let source = SENDMMSG_BUFFER_MUTATOR_SOURCE.replace(
+        "@STATE_PATH@",
+        state_path.to_str().expect("state path was not UTF-8"),
+    );
+    let (_guest_dir, binary) = compile_source_guest(
+        "sendmmsg-buffer-mutator",
+        &source,
+        &[
+            "-nostdlib",
+            "-static",
+            "-Wl,-e,_start",
+            "-fno-pie",
+            "-no-pie",
+        ],
+    );
+
+    let (mutation, mutation_report) = run_verify(
+        "ptrace",
+        &binary,
+        &state_path,
+        b"AAAAAAAAAAAAAAAA",
+        "sendmmsg-mutation",
+        &[],
+    );
+    let mutation_stderr = strip_ansi_sgr(&String::from_utf8_lossy(&mutation.stderr));
+    assert!(
+        !mutation.status.success(),
+        "A-to-B sendmmsg mutation was accepted by ptrace verification:\n{mutation_stderr}"
+    );
+    assert_eq!(mutation_report["verified"], false);
+    assert_eq!(
+        mutation_report["verdict"], "diverged",
+        "ptrace sendmmsg mutation produced no comparison result:\n{mutation_stderr}"
+    );
+    assert_eq!(mutation_report["comparison"]["compare_io_buffers"], true);
+    for marker in ["[iobuf]", "sendmmsg out", "+4->", "+12->"] {
+        assert!(
+            mutation_stderr.contains(marker),
+            "ptrace sendmmsg mutation failure did not name {marker:?}:\n{mutation_stderr}"
+        );
+    }
+
+    let (stable, stable_report) = run_verify(
+        "ptrace",
+        &binary,
+        &state_path,
+        b"BBBBBBBBBBBBBBBB",
+        "sendmmsg-stable",
+        &[],
+    );
+    assert!(
+        stable.status.success(),
+        "identical B-to-B sendmmsg input failed ptrace verification:\n{}",
+        String::from_utf8_lossy(&stable.stderr)
+    );
+    assert_eq!(stable_report["verified"], true);
+    assert_eq!(stable_report["verdict"], "matched");
+
+    let _ = fs::remove_file(state_path);
+}
+
+#[test]
+fn ptrace_sendmmsg_output_aliases_preserve_returns_and_buffer_hashes() {
+    let (_guest_dir, binary) = compile_source_guest(
+        "sendmmsg-observation",
+        include_str!("../../tests/c/sendmmsg_observation.c"),
+        &[],
+    );
+    let native = Command::new(&binary)
+        .output()
+        .expect("failed to run native sendmmsg guest");
+    assert!(
+        native.status.success(),
+        "native sendmmsg guest failed: {native:?}"
+    );
+    let run = |verify: bool| {
+        let report_path = binary.parent().unwrap().join("alias-verify.json");
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after", "10s", "90s"])
+            .arg(hermit_test::hermit_binary())
+            .args([
+                "--log=info",
+                "run",
+                "--backend=ptrace",
+                "--strict",
+                "--base-env=minimal",
+            ]);
+        if verify {
+            command
+                .args(["--verify", "--verify-strict", "--verify-json"])
+                .arg(&report_path);
+        }
+        let output = command
+            .arg("--")
+            .arg(&binary)
+            .output()
+            .expect("failed to run sendmmsg alias guest");
+        assert!(
+            output.status.success(),
+            "sendmmsg alias guest failed: {output:?}"
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("sendmmsg-output-aliases-ok"));
+        if verify {
+            let report: serde_json::Value =
+                serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+            assert_eq!(report["verdict"], "matched", "{report}");
+            assert_eq!(report["verified"], true, "{report}");
+            assert_eq!(report["bitwise_parity"], true, "{report}");
+            assert_eq!(report["comparison"]["strictness"], "canonical", "{report}");
+            assert_eq!(report["comparison"]["compare_io_buffers"], true, "{report}");
+            for side in ["left", "right"] {
+                assert!(
+                    report["compared_log_messages"][side]
+                        .as_u64()
+                        .is_some_and(|count| count > 0),
+                    "{report}"
+                );
+            }
+        }
+        output
+    };
+    let trace = run(false);
+    let stdout = String::from_utf8_lossy(&trace.stdout);
+    let stderr = String::from_utf8_lossy(&trace.stderr);
+    let records = stderr
+        .lines()
+        .filter(|line| line.contains("[iobuf]") && line.contains("sendmmsg out"))
+        .collect::<Vec<_>>();
+    let evidence = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("sendmmsg-evidence:"))
+        .collect::<Vec<_>>();
+    assert_eq!(evidence.len(), 6, "{stdout}");
+    assert_eq!(records.len(), 6, "{stderr}");
+    for (expected, observed) in evidence.iter().zip(records) {
+        let fields = expected.split(':').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 4, "{expected}");
+        let address = usize::from_str_radix(fields[1], 16).unwrap();
+        let length: usize = fields[2].parse().unwrap();
+        let (hex_bytes, remainder) = fields[3].as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty(), "incomplete byte in {expected}");
+        let bytes = hex_bytes
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(bytes.len(), length, "{expected}");
+        let digest = detcore::Digest::new(&bytes);
+        assert!(
+            observed.contains(&format!("{address:#x}+{length}->{digest}")),
+            "wrong bytes for {}: {observed}",
+            fields[0]
+        );
+    }
+    run(true);
+}
+
 #[test]
 fn kvm_info_stream_repeats_exactly_across_two_runs() {
     // Host limitation, not a product result: without /dev/kvm there is no KVM
@@ -358,7 +662,7 @@ fn kvm_info_stream_repeats_exactly_across_two_runs() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let binary = compile_guest("guest", &[]);
+    let (_guest_dir, binary) = compile_guest("guest", &[]);
     let first_log = run_kvm_log(&binary, "info", &[]);
     let second_log = run_kvm_log(&binary, "info", &[]);
     let debug_log = run_kvm_log(&binary, "debug", &[]);
@@ -540,7 +844,7 @@ fn kvm_memory_hashes_repeat_for_a_static_guest() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let binary = compile_guest("static_guest", &["-static"]);
+    let (_guest_dir, binary) = compile_guest("static_guest", &["-static"]);
     let flags = ["--detlog-stack", "--detlog-heap"];
     let first = canonical_info(&run_kvm_log(&binary, "info", &flags));
     let second = canonical_info(&run_kvm_log(&binary, "info", &flags));

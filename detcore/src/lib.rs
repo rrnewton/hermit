@@ -1500,6 +1500,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     pedigree: child_pedigree.clone(),
                     stats: ThreadStats::new(),
                     pending_iovec_snapshot: None,
+                    pending_sendmmsg_snapshot: None,
                     file_metadata: {
                         debug!(
                             "[init_thread-state, parent dtid = {}] child thread {}, clone_flags = {:x?}",
@@ -2752,6 +2753,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // evidence logging is disabled or the syscall failed, so it can never
         // leak into a later syscall on the same thread.
         let iovec_snapshot = guest.thread_state_mut().pending_iovec_snapshot.take();
+        let sendmmsg_snapshot = guest.thread_state_mut().pending_sendmmsg_snapshot.take();
         self.detlog_memory_maps(guest)?;
         // Same control point again, for the bytes this syscall moved through a guest buffer.
         // Unlike the two mapping hashes above, the extent comes from the syscall's OWN
@@ -2769,6 +2771,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 iovec_snapshot
                     .as_ref()
                     .map(|snapshot| snapshot.iovecs.as_slice()),
+                sendmmsg_snapshot.as_ref(),
             )?;
         }
 

@@ -348,9 +348,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         G: Guest<Self>,
         S: Into<Syscall>,
     {
+        let syscall = syscall.into();
+        crate::io_buffers::capture_sendmmsg_attempt(guest, syscall);
         preserve_record_or_replay_error(
             self.record_or_replay
-                .handle_syscall_event(&mut guest.into_guest(), syscall.into())
+                .handle_syscall_event(&mut guest.into_guest(), syscall)
                 .await,
         )?
         .map_err(Error::from)
@@ -1672,6 +1674,11 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) pending_iovec_snapshot: Option<VectoredIoSnapshot>,
 
+    /// Entry output-field bytes for the final physical sendmmsg attempt.
+    /// Used only by post-syscall observation, never written back to the guest.
+    #[serde(skip)]
+    pub(crate) pending_sendmmsg_snapshot: Option<crate::io_buffers::sendmmsg::Snapshot>,
+
     /// In chaos mode with --replay-preemptions-from, we hold a list of our future preemption points.
     pub preemption_points: Option<ThreadHistoryIterator>,
 
@@ -2094,6 +2101,7 @@ impl<T> ThreadState<T> {
             pedigree: Pedigree::new(), // Root thread.
             stats: ThreadStats::new(),
             pending_iovec_snapshot: None,
+            pending_sendmmsg_snapshot: None,
             file_metadata: Arc::new(Mutex::new(file_metadata)),
             discover_live_file_metadata: cfg.discover_live_file_metadata,
             timer_slack_ns: DEFAULT_TIMER_SLACK_NS,

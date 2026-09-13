@@ -1964,6 +1964,13 @@ where
                     .record_or_replay_preserving_tool_errors(guest, call)
                     .await
             }
+            None if matches!(call.into(), Syscall::Sendmmsg(_)) => loop {
+                crate::io_buffers::capture_sendmmsg_attempt(guest, call.into());
+                match guest.inject(call).await {
+                    Err(Errno::EINTR) | Err(Errno::ERESTARTSYS) => continue,
+                    result => break result.map_err(Error::from),
+                }
+            },
             None => guest.inject_with_retry(call).await.map_err(Error::from),
         };
         let syscall_result = match res {

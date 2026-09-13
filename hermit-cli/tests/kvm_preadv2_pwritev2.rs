@@ -12,6 +12,7 @@ mod hermit_test;
 mod vectored_io_guest;
 
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
 
@@ -20,12 +21,7 @@ use vectored_io_guest::compile_guest;
 
 static KVM_RUN_LOCK: Mutex<()> = Mutex::new(());
 
-#[test]
-fn run_kvm_current_position_vectored_io_matches_linux() {
-    let _guard = KVM_RUN_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (_guest_dir, guest) = compile_guest();
+fn verify_guest(guest: &Path, mode: Option<&str>, markers: &[&str]) {
     let report_dir = tempfile::tempdir().expect("failed to create KVM verification directory");
     let report_path = report_dir.path().join("verify.json");
     let mut command = Command::new("timeout");
@@ -43,20 +39,13 @@ fn run_kvm_current_position_vectored_io_matches_linux() {
         ])
         .arg(format!("--verify-json={}", report_path.display()))
         .arg("--")
-        .arg(&guest);
+        .arg(guest);
+    if let Some(mode) = mode {
+        command.arg(mode);
+    }
     let output = command_output(command, "KVM current-position vectored I/O");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for marker in [
-        "preadv2-pwritev2-nowait-and-errors-ok",
-        "vectored-self-alias-ok",
-        "preadv2-snapshot-ok",
-        "pwritev2-atomic-snapshot-ok",
-        "pwritev2-large-ok",
-        "preadv2-signal-ok",
-        "pwritev2-signal-ok",
-        "vectored-descriptor-matrix-ok",
-        "preadv2-pwritev2-pipe-ok",
-    ] {
+    for marker in markers {
         assert!(
             stdout.contains(marker),
             "KVM guest omitted {marker}\n{stdout}"
@@ -76,5 +65,41 @@ fn run_kvm_current_position_vectored_io_matches_linux() {
     assert_eq!(
         report["comparison"]["compare_io_buffers"], true,
         "verify report: {report}"
+    );
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "KVM verification compared no INFO messages on {side}: {report}"
+        );
+    }
+}
+
+#[test]
+fn run_kvm_current_position_vectored_io_matches_linux() {
+    let _guard = KVM_RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_guest_dir, guest) = compile_guest();
+    verify_guest(
+        &guest,
+        None,
+        &[
+            "preadv2-pwritev2-nowait-and-errors-ok",
+            "vectored-self-alias-ok",
+            "preadv2-snapshot-ok",
+            "pwritev2-atomic-snapshot-ok",
+            "pwritev2-large-ok",
+            "preadv2-signal-ok",
+            "pwritev2-signal-ok",
+            "vectored-descriptor-matrix-ok",
+            "preadv2-pwritev2-pipe-ok",
+        ],
+    );
+    verify_guest(
+        &guest,
+        Some("partial-signal"),
+        &["pwritev2-partial-signal-ok:4096"],
     );
 }
