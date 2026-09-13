@@ -307,13 +307,65 @@ pub struct SelectedCell {
     pub cpu_timeout_seconds: u64,
 }
 
-impl ManifestSet {
-    pub fn load(root: &Path) -> Result<Self, String> {
+/// Named manifest bytes captured once for shared parsing and provenance.
+/// Keeping these inputs together prevents a consumer from hashing one revision
+/// while independently parsing another revision at the same paths.
+pub(crate) struct ManifestInputs {
+    sources: Vec<(PathBuf, String)>,
+}
+
+impl ManifestInputs {
+    pub(crate) fn read(root: &Path) -> Result<Self, String> {
         let dir = root.join("tests/e2e/manifests");
         let defaults_path = dir.join(DEFAULTS_FILE);
         let defaults_source = fs::read_to_string(&defaults_path)
             .map_err(|e| format!("cannot read {}: {e}", defaults_path.display()))?;
-        let defaults: ManifestDefaults = serde_yaml::from_str(&defaults_source)
+        let mut paths = fs::read_dir(&dir)
+            .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.path())
+                    .map_err(|e| format!("cannot read an entry in {}: {e}", dir.display()))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|path| {
+                path.extension().is_some_and(|ext| ext == "yaml")
+                    && path.file_name().is_some_and(|name| name != DEFAULTS_FILE)
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        if paths.is_empty() {
+            return Err(format!("no YAML manifests found in {}", dir.display()));
+        }
+        let mut sources = vec![(defaults_path, defaults_source)];
+        for path in paths {
+            let source = fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            sources.push((path, source));
+        }
+        sources.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(Self { sources })
+    }
+
+    pub(crate) fn named_sources(&self) -> impl Iterator<Item = (&Path, &str)> {
+        self.sources
+            .iter()
+            .map(|(path, source)| (path.as_path(), source.as_str()))
+    }
+}
+
+impl ManifestSet {
+    pub fn load(root: &Path) -> Result<Self, String> {
+        Self::from_inputs(root, &ManifestInputs::read(root)?)
+    }
+
+    pub(crate) fn from_inputs(root: &Path, inputs: &ManifestInputs) -> Result<Self, String> {
+        let (defaults_path, defaults_source) = inputs
+            .named_sources()
+            .find(|(path, _)| path.file_name().is_some_and(|name| name == DEFAULTS_FILE))
+            .ok_or_else(|| "captured manifest inputs lack defaults.yaml".to_string())?;
+        let defaults: ManifestDefaults = serde_yaml::from_str(defaults_source)
             .map_err(|e| format!("{}: invalid YAML: {e}", defaults_path.display()))?;
         if defaults.schema != MANIFEST_SCHEMA {
             return Err(format!(
@@ -350,25 +402,13 @@ impl ManifestSet {
                 ));
             }
         }
-        let mut paths = fs::read_dir(&dir)
-            .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension().is_some_and(|ext| ext == "yaml")
-                    && path.file_name().is_some_and(|name| name != DEFAULTS_FILE)
-            })
-            .collect::<Vec<_>>();
-        paths.sort();
-        if paths.is_empty() {
-            return Err(format!("no YAML manifests found in {}", dir.display()));
-        }
         let mut documents = Vec::new();
         let mut tests = BTreeMap::new();
-        for path in paths {
-            let source = fs::read_to_string(&path)
-                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-            let document: ManifestDocument = serde_yaml::from_str(&source)
+        for (path, source) in inputs
+            .named_sources()
+            .filter(|(path, _)| path.file_name().is_some_and(|name| name != DEFAULTS_FILE))
+        {
+            let document: ManifestDocument = serde_yaml::from_str(source)
                 .map_err(|e| format!("{}: invalid YAML: {e}", path.display()))?;
             let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or_default();
             validate_document_with_cpu(
