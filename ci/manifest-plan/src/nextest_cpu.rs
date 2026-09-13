@@ -207,9 +207,15 @@ impl AttemptIdentity {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AttemptCompletion {
-    Exit { code: i32 },
-    Signal { signal: i32 },
-    SupervisorSignal { signal: i32 },
+    Exit {
+        code: i32,
+    },
+    Signal {
+        signal: i32,
+    },
+    SupervisorSignal {
+        signal: i32,
+    },
     CpuTimeout {
         cpu_budget_usec: u64,
         observed_cpu_usec: u64,
