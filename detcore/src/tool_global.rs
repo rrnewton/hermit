@@ -3626,6 +3626,246 @@ mod tests {
     use crate::types::Op;
     use crate::types::SchedEvent;
 
+    mod startup_quiescence {
+        use std::pin::pin;
+        use std::task::Poll;
+
+        use futures::poll;
+
+        use super::*;
+        use crate::resources::Permission;
+        use crate::resources::ResourceID;
+        use crate::scheduler::SkipTurn;
+        use crate::scheduler::do_a_turn_blocking;
+
+        #[test_case::test_case(false; "killed_before_wait")]
+        #[test_case::test_case(true; "killed_while_waiting")]
+        #[tokio::test]
+        async fn retired_startup_releases_quiescence_without_a_child_grant(wait_first: bool) {
+            let config = Config {
+                sequentialize_threads: true,
+                cancel_killed_thread_rpcs: true,
+                runs_post_fork: detcore_model::config::RunsPostFork::Child,
+                ..Config::default()
+            };
+            let state = GlobalState::initialize(&config, false);
+            let parent = DetTid::from_raw(17);
+            let child = DetTid::from_raw(18);
+            let mm = MmId::initial(parent);
+            let mut time = DetTime::new(&config);
+            time.add_syscall_with_cost(4_890_750);
+            {
+                let mut scheduler = state.sched.lock().unwrap();
+                scheduler.thread_tree.add_child(parent, parent, true);
+                scheduler.next_turns.insert(
+                    parent,
+                    ThreadNextTurn {
+                        dettid: parent,
+                        child_tid_addr: 0,
+                        req: Ivar::new(),
+                        resp: Ivar::new(),
+                    },
+                );
+                scheduler.priorities.insert(parent, DEFAULT_PRIORITY);
+                scheduler.runqueue_push_back(parent);
+            }
+            let mut create = pin!(state.receive_rpc(
+                reverie::Tid::from_raw(parent.as_raw()),
+                (
+                    time.clone(),
+                    mm,
+                    GlobalRequest::CreateChildThread(
+                        child,
+                        parent,
+                        0,
+                        Some(
+                            reverie::syscalls::CloneFlags::CLONE_THREAD
+                                | reverie::syscalls::CloneFlags::CLONE_VM
+                        ),
+                        0,
+                        None,
+                        Some(DEFAULT_PRIORITY),
+                    )
+                ),
+            ));
+            assert!(poll!(&mut create).is_pending());
+            let request = state.sched.lock().unwrap().next_turns[&child].req.clone();
+            let last = Err(SkipTurn);
+            let mut turn = pin!(do_a_turn_blocking(
+                state.sched.clone(),
+                state.global_time.clone(),
+                &last
+            ));
+            if wait_first {
+                assert!(poll!(&mut turn).is_pending());
+                assert_eq!(request.to_string(), "<ivar HasWaiter>");
+                assert_eq!(state.sched.lock().unwrap().turn, 0);
+            }
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .logically_kill_thread(&child, &parent, mm);
+            assert!(matches!(request.try_read(), Some(Err(_))));
+            let granted = match poll!(&mut turn) {
+                Poll::Ready(Ok(resources)) => resources,
+                other => panic!("retired startup stranded the parent: {other:?}"),
+            };
+            assert_eq!(granted.tid, parent);
+            assert_eq!(granted.resources.len(), 1);
+            assert!(
+                granted
+                    .resources
+                    .contains_key(&ResourceID::ParentContinue { parent, child })
+            );
+            assert_eq!(
+                poll!(&mut create),
+                Poll::Ready((None, GlobalResponse::CreateChildThread(None)))
+            );
+            assert_eq!(state.sched.lock().unwrap().turn, 1);
+            assert!(!state.sched.lock().unwrap().next_turns.contains_key(&child));
+            assert!(!state.sched.lock().unwrap().run_queue.contains_tid(child));
+            assert!(!state.global_time.lock().unwrap().contains_thread(child));
+            let late = state
+                .receive_rpc(
+                    reverie::Tid::from_raw(child.as_raw()),
+                    (time, mm, GlobalRequest::StartNewThread(child, parent, None)),
+                )
+                .await;
+            assert_eq!(late, (None, GlobalResponse::ThreadExited));
+            assert!(!state.global_time.lock().unwrap().contains_thread(child));
+            assert_eq!(state.sched.lock().unwrap().turn, 1);
+        }
+
+        #[test_case::test_case(false; "delayed_child")]
+        #[test_case::test_case(true; "published_child")]
+        #[tokio::test]
+        async fn child_start_clock_precedes_scheduler_snapshot(published_child: bool) {
+            let config = Config {
+                sequentialize_threads: true,
+                cancel_killed_thread_rpcs: true,
+                runs_post_fork: detcore_model::config::RunsPostFork::Child,
+                ..Config::default()
+            };
+            let state = GlobalState::initialize(&config, false);
+            let parent = DetTid::from_raw(17);
+            let child = DetTid::from_raw(18);
+            let mm = MmId::initial(parent);
+            let mut time = DetTime::new(&config);
+            time.add_syscall_with_cost(4_890_750);
+            {
+                let mut scheduler = state.sched.lock().unwrap();
+                scheduler.thread_tree.add_child(parent, parent, true);
+                scheduler.next_turns.insert(
+                    parent,
+                    ThreadNextTurn {
+                        dettid: parent,
+                        child_tid_addr: 0,
+                        req: Ivar::new(),
+                        resp: Ivar::new(),
+                    },
+                );
+                scheduler.priorities.insert(parent, DEFAULT_PRIORITY);
+                scheduler.runqueue_push_back(parent);
+            }
+            let mut create = pin!(state.receive_rpc(
+                reverie::Tid::from_raw(parent.as_raw()),
+                (
+                    time.clone(),
+                    mm,
+                    GlobalRequest::CreateChildThread(
+                        child,
+                        parent,
+                        0,
+                        Some(
+                            reverie::syscalls::CloneFlags::CLONE_THREAD
+                                | reverie::syscalls::CloneFlags::CLONE_VM
+                        ),
+                        0,
+                        None,
+                        Some(DEFAULT_PRIORITY),
+                    ),
+                ),
+            ));
+            assert!(poll!(&mut create).is_pending());
+            let (parent_request, child_request, before) = {
+                let scheduler = state.sched.lock().unwrap();
+                assert!(!scheduler.run_queue.contains_tid(child));
+                (
+                    scheduler.next_turns[&parent].req.clone(),
+                    scheduler.next_turns[&child].req.clone(),
+                    scheduler.committed_time,
+                )
+            };
+            assert!(matches!(parent_request.try_read(), Some(Ok(_))));
+            assert!(child_request.try_read().is_none());
+            assert!(!state.global_time.lock().unwrap().contains_thread(child));
+            let mut start = pin!(state.receive_rpc(
+                reverie::Tid::from_raw(child.as_raw()),
+                (time, mm, GlobalRequest::StartNewThread(child, parent, None)),
+            ));
+            if published_child {
+                assert!(poll!(&mut start).is_pending());
+                assert!(poll!(&mut start).is_pending());
+                assert!(matches!(child_request.try_read(), Some(Ok(_))));
+            }
+            let last = Err(SkipTurn);
+            let mut turn = pin!(do_a_turn_blocking(
+                state.sched.clone(),
+                state.global_time.clone(),
+                &last,
+            ));
+            if !published_child {
+                assert!(poll!(&mut turn).is_pending());
+                {
+                    let scheduler = state.sched.lock().unwrap();
+                    assert_eq!(scheduler.turn, 0);
+                    assert_eq!(
+                        scheduler.committed_time, before,
+                        "scheduler sampled time before the pending child's startup RPC",
+                    );
+                    assert!(!scheduler.run_queue.contains_tid(child));
+                    assert!(!scheduler.run_queue.tentative_pop_in_progress());
+                }
+                // The real RPC first publishes its inherited clock, then yields before
+                // filling the startup request. Neither boundary may permit a snapshot.
+                assert!(poll!(&mut start).is_pending());
+                assert!(state.global_time.lock().unwrap().contains_thread(child));
+                assert!(child_request.try_read().is_none());
+                assert!(poll!(&mut turn).is_pending());
+                assert_eq!(state.sched.lock().unwrap().committed_time, before);
+                assert!(poll!(&mut start).is_pending());
+                assert!(matches!(child_request.try_read(), Some(Ok(_))));
+            }
+            let granted = match poll!(&mut turn) {
+                Poll::Ready(Ok(resources)) => resources,
+                other => panic!("startup request was not granted: {other:?}"),
+            };
+            assert_eq!(granted.tid, child);
+            assert_eq!(granted.resources.len(), 1);
+            assert_eq!(
+                granted.resources.get(&ResourceID::MemAddrSpace(parent)),
+                Some(&Permission::RW)
+            );
+            let expected = DetTime::new(&config).as_nanos() + LogicalTime::from_nanos(9_781_500);
+            {
+                let scheduler = state.sched.lock().unwrap();
+                assert_eq!(scheduler.turn, 1);
+                assert_eq!(scheduler.committed_time, expected);
+                assert_eq!(scheduler.next_turns[&parent].req, parent_request);
+                assert!(!scheduler.run_queue.tentative_pop_in_progress());
+            }
+            assert_eq!(
+                poll!(&mut start),
+                Poll::Ready((None, GlobalResponse::StartNewThread(None)))
+            );
+            assert!(
+                poll!(&mut create).is_pending(),
+                "parent grant was duplicated with child startup"
+            );
+        }
+    }
+
     mod terminal_rpc {
         use std::sync::atomic::AtomicUsize;
         use std::sync::atomic::Ordering;
