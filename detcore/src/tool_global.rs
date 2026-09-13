@@ -2401,7 +2401,7 @@ pub enum GlobalRequest {
 #[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
 pub enum GlobalResponse {
     /// The scheduler permanently removed this raw TID. Guest-side RPC handling consumes this by
-    /// tail-injecting a thread exit before any per-operation caller can resume.
+    /// cancelling the current guest thread before any per-operation caller can resume.
     ThreadExited,
     RequestResources(ResumeStatus),
     ReleaseResources(()),
@@ -2551,10 +2551,9 @@ where
             "[detcore, dtid {}] exiting after terminal scheduler cancellation",
             dettid
         );
-        // The terminal response must never return to an operation-specific RPC caller. Reverie
-        // SaBRe runs exactly-once Tool cleanup for this non-original thread exit, then executes the
-        // raw exit without restoring the callback's guest frame.
-        guest.tail_inject(reverie::syscalls::Exit::default()).await
+        // The terminal response must never return to an operation-specific RPC caller. The
+        // backend owns thread cleanup, including callbacks without a syscall return frame.
+        guest.cancel_current_thread().await
     }
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review applying the coordinator clock after exec reload.
@@ -3485,6 +3484,232 @@ mod tests {
     use crate::types::MmId;
     use crate::types::Op;
     use crate::types::SchedEvent;
+
+    mod terminal_rpc {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        use futures::FutureExt;
+        use reverie::GlobalRPC;
+        use reverie::Guest;
+        use reverie::Never;
+        use reverie::Pid;
+        use reverie::Stack;
+        use reverie::TimerSchedule;
+        use reverie::syscalls::Addr;
+        use reverie::syscalls::AddrMut;
+        use reverie::syscalls::Errno;
+        use reverie::syscalls::LocalMemory;
+        use reverie::syscalls::SyscallInfo;
+
+        use super::*;
+        use crate::record_or_replay::NoopTool;
+        use crate::resources::Permission;
+        use crate::resources::ResourceID;
+        use crate::tool_global::ResumeStatus;
+        use crate::tool_global::send_and_update_time;
+        use crate::tool_local::Detcore;
+        use crate::tool_local::ThreadState;
+
+        // The RPC helper must not access guest memory, registers, or a syscall continuation.
+        struct UnusedStack;
+
+        impl Drop for UnusedStack {
+            fn drop(&mut self) {}
+        }
+
+        impl Stack for UnusedStack {
+            type StackGuard = Self;
+
+            fn size(&self) -> usize {
+                panic!("RPC helper accessed guest stack")
+            }
+
+            fn capacity(&self) -> usize {
+                panic!("RPC helper accessed guest stack")
+            }
+
+            fn push<'stack, T>(&mut self, _value: T) -> Addr<'stack, T> {
+                panic!("RPC helper accessed guest stack")
+            }
+
+            fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+                panic!("RPC helper accessed guest stack")
+            }
+
+            fn commit(self) -> Result<Self::StackGuard, Errno> {
+                panic!("RPC helper accessed guest stack")
+            }
+        }
+
+        struct RpcGuest {
+            cfg: Config,
+            state: ThreadState<()>,
+            request: GlobalRequest,
+            response: (Option<LogicalTime>, GlobalResponse),
+            initial_clock: serde_json::Value,
+            rpc_calls: AtomicUsize,
+            cancellations: usize,
+        }
+
+        impl RpcGuest {
+            fn new(response: (Option<LogicalTime>, GlobalResponse)) -> Self {
+                let cfg = Config::default();
+                let mut state = ThreadState::new(DetPid::from_raw(4), &cfg, ());
+                state.thread_logical_time = DetTime::zero();
+                state.thread_logical_time.add_syscall();
+                let mut resources = Resources::new(state.dettid);
+                resources.insert(
+                    ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
+                    Permission::RW,
+                );
+                Self {
+                    initial_clock: serde_json::to_value(&state.thread_logical_time).unwrap(),
+                    request: GlobalRequest::RequestResources(resources, DetPid::from_raw(3)),
+                    cfg,
+                    state,
+                    response,
+                    rpc_calls: AtomicUsize::new(0),
+                    cancellations: 0,
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl GlobalRPC<GlobalState> for RpcGuest {
+            async fn send_rpc(
+                &self,
+                (clock, mm, request): (DetTime, MmId, GlobalRequest),
+            ) -> (Option<LogicalTime>, GlobalResponse) {
+                assert_eq!(self.rpc_calls.fetch_add(1, Ordering::SeqCst), 0);
+                assert_eq!(serde_json::to_value(clock).unwrap(), self.initial_clock);
+                assert_eq!(mm, self.state.mm_id);
+                assert_eq!(request, self.request);
+                self.response.clone()
+            }
+
+            fn config(&self) -> &Config {
+                &self.cfg
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Guest<Detcore<NoopTool>> for RpcGuest {
+            type Memory = LocalMemory;
+            type Stack = UnusedStack;
+
+            fn tid(&self) -> Pid {
+                Pid::from_raw(4)
+            }
+
+            fn pid(&self) -> Pid {
+                Pid::from_raw(3)
+            }
+
+            fn ppid(&self) -> Option<Pid> {
+                None
+            }
+
+            fn memory(&self) -> Self::Memory {
+                panic!("RPC helper accessed guest memory")
+            }
+
+            fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+                &mut self.state
+            }
+
+            fn thread_state(&self) -> &ThreadState<()> {
+                &self.state
+            }
+
+            async fn regs(&mut self) -> libc::user_regs_struct {
+                panic!("RPC helper accessed guest registers")
+            }
+
+            async fn stack(&mut self) -> Self::Stack {
+                panic!("RPC helper accessed guest stack")
+            }
+
+            async fn daemonize(&mut self) {
+                panic!("RPC helper daemonized guest")
+            }
+
+            async fn inject<S: SyscallInfo>(&mut self, _syscall: S) -> Result<i64, Errno> {
+                panic!("RPC helper injected a syscall")
+            }
+
+            async fn tail_inject<S: SyscallInfo>(&mut self, _syscall: S) -> Never {
+                panic!("terminal cancellation used a syscall return frame")
+            }
+
+            async fn cancel_current_thread(&mut self) -> Never {
+                self.cancellations += 1;
+                assert_eq!(
+                    serde_json::to_value(&self.state.thread_logical_time).unwrap(),
+                    self.initial_clock,
+                );
+                std::future::pending().await
+            }
+
+            fn set_timer(&mut self, _schedule: TimerSchedule) -> Result<(), reverie::Error> {
+                panic!("RPC helper set a timer")
+            }
+
+            fn set_timer_precise(
+                &mut self,
+                _schedule: TimerSchedule,
+            ) -> Result<(), reverie::Error> {
+                panic!("RPC helper set a timer")
+            }
+
+            fn read_clock(&mut self) -> Result<u64, reverie::Error> {
+                panic!("RPC helper read the backend clock")
+            }
+        }
+
+        #[test]
+        fn terminal_rpc_cancels_without_returning_or_updating_time() {
+            for time in [None, Some(LogicalTime::from_secs(1))] {
+                let mut guest = RpcGuest::new((time, GlobalResponse::ThreadExited));
+                let request = guest.request.clone();
+                assert!(
+                    send_and_update_time(&mut guest, request)
+                        .now_or_never()
+                        .is_none()
+                );
+                assert_eq!(guest.rpc_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(guest.cancellations, 1);
+                assert_eq!(
+                    serde_json::to_value(&guest.state.thread_logical_time).unwrap(),
+                    guest.initial_clock,
+                );
+            }
+        }
+
+        #[test]
+        fn ordinary_rpc_returns_and_applies_coordinator_time_without_cancelling() {
+            for time in [None, Some(LogicalTime::from_secs(1))] {
+                let response = (time, GlobalResponse::RequestResources(ResumeStatus::Normal));
+                let mut guest = RpcGuest::new(response.clone());
+                let request = guest.request.clone();
+                let mut expected_clock = guest.state.thread_logical_time.clone();
+                if let Some(time) = time {
+                    assert!(time > expected_clock.as_nanos());
+                    expected_clock.advance_to(time);
+                }
+                assert_eq!(
+                    send_and_update_time(&mut guest, request).now_or_never(),
+                    Some(response)
+                );
+                assert_eq!(guest.rpc_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(guest.cancellations, 0);
+                assert_eq!(
+                    serde_json::to_value(&guest.state.thread_logical_time).unwrap(),
+                    serde_json::to_value(expected_clock).unwrap(),
+                );
+            }
+        }
+    }
 
     #[test]
     fn fdinfo_mount_ids_preserve_raw_equivalence_and_distinctness() {
