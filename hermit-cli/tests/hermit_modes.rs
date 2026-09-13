@@ -118,55 +118,31 @@ fn compile_rust(source: &Path, output: &Path) {
     command_output(command, "Rust workload compilation");
 }
 
-const CARGO_GUEST_BINARIES: [&str; 21] = [
-    "rustbin_bind_connect_race",
-    "rustbin_clock_gettime",
-    "rustbin_clock_total_order",
-    "rustbin_exit_group",
-    "rustbin_futex_and_print",
-    "rustbin_futex_timeout",
-    "rustbin_futex_wait_child",
-    "rustbin_futex_wake_some",
-    "rustbin_interrogate_tty",
-    "rustbin_nanosleep",
-    "rustbin_network_hello_world",
-    "rustbin_pipe_basics",
-    "rustbin_poll",
-    "rustbin_poll_spin",
-    "rustbin_print_clock_nanosleep_monotonic_abs_race",
-    "rustbin_print_clock_nanosleep_monotonic_race",
-    "rustbin_print_clock_nanosleep_realtime_abs_race",
-    "rustbin_print_nanosleep_race",
-    "rustbin_sched_yield",
-    "rustbin_socketpair",
-    "rustbin_thread_random",
-];
+#[path = "../../ci/cargo-guest-binaries.rs"]
+mod cargo_guests;
+use cargo_guests::CARGO_GUEST_BINARIES;
 
-fn cargo_guest_workloads(repository: &Path) -> Vec<Workload> {
-    let binary_directory = Path::new(env!("CARGO_BIN_EXE_hermit"))
-        .parent()
-        .expect("Hermit binary should have a parent directory");
-    if CARGO_GUEST_BINARIES
-        .iter()
-        .any(|name| !binary_directory.join(name).is_file())
-    {
-        let mut command = Command::new(env!("CARGO"));
-        command.current_dir(repository).args([
-            "build",
-            "-p",
-            "hermetic_infra_hermit_tests",
-            "--bins",
-        ]);
-        command_output(command, "Cargo guest workload compilation");
-    }
-
+fn cargo_guest_workloads(_repository: &Path) -> Vec<Workload> {
+    let raw = std::env::var("HERMIT_PREPARED_CARGO_GUESTS").expect(
+        "Cargo guests must be prepared and verified by ci/nextest-binaries.rs before hermit_modes runs",
+    );
+    let guests: std::collections::BTreeMap<String, PathBuf> =
+        serde_json::from_str(&raw).expect("prepared Cargo guest paths must be a JSON object");
+    assert_eq!(
+        guests
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        CARGO_GUEST_BINARIES.into_iter().collect(),
+        "prepared Cargo guest identities must match every hermit_modes fixture",
+    );
     CARGO_GUEST_BINARIES
         .iter()
         .map(|&name| {
-            let path = binary_directory.join(name);
+            let path = guests[name].clone();
             assert!(
                 path.is_file(),
-                "missing Cargo guest binary: {}",
+                "missing prepared Cargo guest: {}",
                 path.display()
             );
             workload(name, path)
