@@ -201,6 +201,16 @@ pub struct SeriesNoVerdictEvidence {
     pub attempts: Vec<SeriesAttemptDisposition>,
 }
 
+fn is_prelaunch_timeout_disposition(disposition: &SeriesAttemptDisposition) -> bool {
+    disposition.timed_out
+        && disposition.status.is_none()
+        && disposition.signal.is_none()
+        && matches!(
+            disposition.error_kind.as_deref(),
+            Some("incomplete-verification-evidence" | "cpu-timeout" | "wall-timeout")
+        )
+}
+
 fn one_run() -> u64 {
     1
 }
@@ -552,11 +562,7 @@ impl SeriesRow {
                     } else {
                         SeriesOutcome::NoResult
                     };
-                    let no_process_timeout = disposition.timed_out
-                        && disposition.status.is_none()
-                        && disposition.signal.is_none()
-                        && disposition.error_kind.as_deref()
-                            == Some("incomplete-verification-evidence");
+                    let no_process_timeout = is_prelaunch_timeout_disposition(disposition);
                     if disposition.attempt_outcome != "ERROR"
                         || disposition.disposition != expected
                         || disposition
@@ -1118,6 +1124,101 @@ mod tests {
                 .unwrap_err()
                 .contains("supported only by stress-series/v3")
         );
+    }
+
+    #[test]
+    fn current_prelaunch_timeouts_remain_failed_typed_evidence() {
+        for error_kind in ["cpu-timeout", "wall-timeout"] {
+            let mut fixture = no_verdict_row();
+            fixture.series.outcome = SeriesOutcome::Timeout;
+            fixture.series.result = Some(ObservedResult::Timeout);
+            let disposition = &mut fixture
+                .series
+                .no_verdict_evidence
+                .as_mut()
+                .unwrap()
+                .attempts[0];
+            disposition.error_kind = Some(error_kind.into());
+            disposition.disposition = SeriesOutcome::Timeout;
+            disposition.status = None;
+            disposition.signal = None;
+            disposition.timed_out = true;
+            for mode in ["verify", "replay", "chaos"] {
+                fixture.series.cell = format!("fixture/test/{mode}/ptrace");
+                fixture.validate_for_read().unwrap_or_else(|error| {
+                    panic!("current {mode} prelaunch {error_kind} was refused: {error}")
+                });
+                fixture.validate_for_write().unwrap();
+                fixture.validate_for_projection().unwrap();
+            }
+
+            for mutation in [
+                "missing error kind",
+                "unrelated error kind",
+                "empty error kind",
+                "not timed out",
+                "successful attempt",
+                "non-timeout disposition",
+                "zero status",
+                "zero signal",
+                "status and signal",
+                "missing report",
+                "invalid report hash",
+                "successful series",
+                "missing exact result",
+                "product failure classification",
+            ] {
+                let mut invalid = fixture.clone();
+                let disposition = &mut invalid
+                    .series
+                    .no_verdict_evidence
+                    .as_mut()
+                    .unwrap()
+                    .attempts[0];
+                match mutation {
+                    "missing error kind" => disposition.error_kind = None,
+                    "unrelated error kind" => {
+                        disposition.error_kind = Some("infrastructure".into())
+                    }
+                    "empty error kind" => disposition.error_kind = Some(String::new()),
+                    "not timed out" => disposition.timed_out = false,
+                    "successful attempt" => disposition.attempt_outcome = "PASS".into(),
+                    "non-timeout disposition" => disposition.disposition = SeriesOutcome::NoResult,
+                    "zero status" => disposition.status = Some(0),
+                    "zero signal" => disposition.signal = Some(0),
+                    "status and signal" => {
+                        disposition.status = Some(1);
+                        disposition.signal = Some(15);
+                    }
+                    "missing report" => disposition.verification_report_sha256 = None,
+                    "invalid report hash" => {
+                        disposition.verification_report_sha256 = Some("bad".into())
+                    }
+                    "successful series" => {
+                        invalid.series.outcome = SeriesOutcome::Passed;
+                        invalid.series.result = Some(ObservedResult::Pass);
+                        invalid.series.failure_class = None;
+                    }
+                    "missing exact result" => invalid.series.result = None,
+                    "product failure classification" => {
+                        invalid.series.failure_class = Some(FailureClass::ProductFailure);
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    invalid.validate_for_read().is_err(),
+                    "{error_kind}: accepted {mutation} on read"
+                );
+                assert!(
+                    invalid.validate_for_write().is_err(),
+                    "{error_kind}: accepted {mutation} on write"
+                );
+                assert!(
+                    invalid.validate_for_projection().is_err(),
+                    "{error_kind}: accepted {mutation} on projection"
+                );
+            }
+        }
     }
 
     #[test]
