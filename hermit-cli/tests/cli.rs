@@ -614,7 +614,8 @@ fn kvm_exact_child_waits_guest() -> &'static Path {
 
 fn assert_guest_pipe_status_hides_scheduler_nonblocking(backend: &str) {
     let _guard = hermit_run_guard();
-    let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create a temporary directory");
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
@@ -709,7 +710,8 @@ fn stdio_status_flag_containment_guest(directory: &Path) -> PathBuf {
 /// remain unchanged.
 fn assert_guest_cannot_mutate_hermits_stdout_flags(backend: &str) {
     let _guard = hermit_run_guard();
-    let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create a temporary directory");
     let guest = stdio_status_flag_containment_guest(directory.path());
     let hermit_stdout_path = directory.path().join("hermit.out");
     // Opened WITHOUT O_APPEND, so "the bit turned on" is unambiguous.
@@ -848,7 +850,8 @@ fn stdio_initial_nonblocking_guest(directory: &Path) -> PathBuf {
 }
 
 fn run_with_nonblocking_stdin(backend: &str, mode: &str) -> Output {
-    let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create a temporary directory");
     let mut sockets = [-1_i32; 2];
     // SAFETY: sockets is a writable pair of ints, which is what socketpair fills.
     let paired = unsafe {
@@ -954,7 +957,8 @@ fn stdio_status_alias_guest(directory: &Path) -> PathBuf {
 
 fn assert_inherited_stdio_aliases_share_status_flags(backend: &str) {
     let _guard = hermit_run_guard();
-    let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create a temporary directory");
     let output_path = directory.path().join("aliased-output");
     let output_file = fs::OpenOptions::new()
         .read(true)
@@ -1024,7 +1028,8 @@ fn stdio_append_write_paths_guest(directory: &Path) -> PathBuf {
 /// physical bit was deliberately withheld from the supervisor's descriptor.
 fn assert_inherited_stdio_append_write_paths(backend: &str, operations: &[&str]) {
     let _guard = hermit_run_guard();
-    let fixture_directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let fixture_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create a temporary directory");
     let guest = stdio_append_write_paths_guest(fixture_directory.path());
 
     for operation in operations {
@@ -1192,7 +1197,8 @@ fn nonblocking_stdin_recv_guest(directory: &Path) -> PathBuf {
 /// and would make the regression less direct.
 fn assert_nonblocking_stdin_does_not_abort_the_container(backend: &str) {
     let _guard = hermit_run_guard();
-    let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create a temporary directory");
     let guest = nonblocking_stdin_recv_guest(directory.path());
 
     let mut sockets = [-1_i32; 2];
@@ -1284,7 +1290,8 @@ fn stdio_nonblock_then_append_guest(directory: &Path) -> PathBuf {
 /// pins the physical/logical consistency that currently requires forwarding it.
 fn assert_nonblocking_does_not_unlatch_containment(backend: &str) {
     let _guard = hermit_run_guard();
-    let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create a temporary directory");
     let guest = stdio_nonblock_then_append_guest(directory.path());
     let hermit_stderr_path = directory.path().join("hermit.err");
     let hermit_stderr = fs::OpenOptions::new()
@@ -7823,7 +7830,8 @@ fn stdio_unsupported_status_flags_guest(directory: &Path) -> PathBuf {
 /// failed" would accept it.
 fn assert_unimplemented_status_flags_are_refused(backend: &str) {
     let _guard = hermit_run_guard();
-    let directory = tempfile::tempdir().expect("failed to create a temporary directory");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create a temporary directory");
     let guest = stdio_unsupported_status_flags_guest(directory.path());
     let hermit_stdout_path = directory.path().join("hermit.out");
     let hermit_stdout = fs::OpenOptions::new()
