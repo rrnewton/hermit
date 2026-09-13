@@ -21,16 +21,20 @@ Demo-Green-Review: reviewer=<agent-id> demo=<demos/path[,demos/path...]|all> res
 ```
 
 - `reviewer=` — the reviewing agent, which **must differ from the implementer**
-  named by the commit's `role=impl` disclosure (independence; the review is
-  adversarial). A trailer cannot turn the implementer's own run into an
-  independent review.
+  named by a `role=impl` disclosure on a commit that changes the covered path
+  in the inspected range (independence; the review is adversarial). The
+  attestation commit's own disclosure is also checked. A later empty commit
+  cannot turn the implementer's own run into an independent review. Historical
+  commits without an explicit identity retain their prior treatment; Git
+  authorship is not used to infer an agent identity.
 - `demo=` — which demo was run (or `all`).
 - `result=GREEN` — the demo reached its success state (e.g. demo5 boots to the
   serial shell and exits rc=0). Anything other than GREEN does not satisfy the gate.
 - `evidence=` — a link/path/SHA to the run log or artifact.
 
 A `result=GREEN` trailer is invalid when the same commit body reports only a
-non-green mechanical result such as `PARTIAL` or `FAILURE` for a demo covered by
+non-green mechanical result such as `PARTIAL`, `FAILURE`, `FAIL`, or `SKIP`
+(including run-all human, TSV, and Markdown summary rows) for a demo covered by
 that trailer. Deliberate failing checks remain compatible with a later reported
 successful real run; the checker does not treat the presence of a negative
 control as a failed review.

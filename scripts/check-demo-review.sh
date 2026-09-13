@@ -104,16 +104,26 @@ claim_covers_demo_number() {  # $1 = comma-separated demo= value, $2 = number
 claim_contradicts_body() {  # $1 = commit message, $2 = demo= value
     local text="$1" claims="$2" line number result
     declare -A green=() nongreen=()
+    local summary_re='^[[:space:]]*demo0*([0-9]+)[[:space:]]+(pass|fail|skip)[[:space:]]+(exit=)?[0-9]+([[:space:]]|$)'
+    local markdown_re='^[[:space:]]*\|[[:space:]]*`demo0*([0-9]+)`[[:space:]]*\|[[:space:]]*\*\*(pass|fail|skip)\*\*[[:space:]]*\|[[:space:]]*[0-9]+[[:space:]]*\|'
     while IFS= read -r line; do
-        if [[ "${line,,}" =~ ^[[:space:]]*(=+[[:space:]]*)?demo[[:space:]]*0*([0-9]+)[^:]*:[[:space:]]*(first[[:space:]]+run[[:space:]]+saved,[[:space:]]*)?([a-z_-]+) ]]; then
+        # run-all.sh writes aligned human rows, TSV and GitHub-summary rows.
+        # Inspect their explicit status before the legacy colon/banner form:
+        # a colon in a retained log pathname must not replace the row's status.
+        if [[ "${line,,}" =~ $summary_re ]] || [[ "${line,,}" =~ $markdown_re ]]; then
+            number="${BASH_REMATCH[1]}"
+            result="${BASH_REMATCH[2]}"
+        elif [[ "${line,,}" =~ ^[[:space:]]*(=+[[:space:]]*)?demo[[:space:]]*0*([0-9]+)[^:]*:[[:space:]]*(first[[:space:]]+run[[:space:]]+saved,[[:space:]]*)?([a-z_-]+) ]]; then
             number="${BASH_REMATCH[2]}"
             result="${BASH_REMATCH[4]}"
-            case "$result" in
-                green|pass|success) green[$((10#$number))]=1 ;;
-                partial|fail|failure|failed|red|skip|skipped|incomplete|no_result|no-result|error)
-                    nongreen[$((10#$number))]=1 ;;
-            esac
+        else
+            continue
         fi
+        case "$result" in
+            green|pass|success) green[$((10#$number))]=1 ;;
+            partial|fail|failure|failed|red|skip|skipped|incomplete|no_result|no-result|error)
+                nongreen[$((10#$number))]=1 ;;
+        esac
     done <<<"$text"
     for number in "${!nongreen[@]}"; do
         [ "${green[$number]:-0}" = 1 ] && continue
@@ -143,8 +153,9 @@ single_trailer_field() {  # $1 = trailer line, $2 = field, $3 = value pattern
 # cover several exact paths with a comma-separated demo= value; `all` and
 # directory coverage retain their documented meanings. Invalid trailers are
 # reported and withheld while later valid trailers remain usable.
-attested_demos() {  # $1 = text blob, $2 = report rejected trailers (optional)
-    local text="$1" report="${2:-}" line reviewer demos result implementer self_review
+attested_demos() {  # $1 = text, $2 = report, $3 = known path implementers, $4 = path
+    local text="$1" report="${2:-}" known_implementers="${3:-}" path="${4:-}"
+    local line reviewer demos result implementer self_review value covers
     while IFS= read -r line; do
         printf '%s\n' "$line" | grep -qE '^[[:space:]]*Demo-Green-Review:' || continue
         reviewer=$(single_trailer_field "$line" reviewer '[^[:space:]]+') || {
@@ -164,16 +175,28 @@ attested_demos() {  # $1 = text blob, $2 = report rejected trailers (optional)
             continue
         }
         [ "$result" = GREEN ] || continue
+        if [ -n "$path" ]; then
+            covers=0
+            while IFS= read -r value; do
+                if demo_value_covers "$value" "$path"; then
+                    covers=1
+                    break
+                fi
+            done < <(printf '%s\n' "$demos" | tr ',' '\n')
+            [ "$covers" = 1 ] || continue
+        fi
         self_review=0
         while IFS= read -r implementer; do
             if [ "$reviewer" = "$implementer" ]; then
                 self_review=1
                 break
             fi
-        done < <(implementer_identities "$text")
+        done < <(implementer_identities "$text"; printf '%s\n' "$known_implementers")
         if [ "$self_review" = 1 ]; then
             if [ "$report" = report ]; then
                 echo "demo-review gate: REFUSED trailer: reviewer=$reviewer is also the role=impl identity" >&2
+            elif [ -n "$path" ]; then
+                echo "demo-review gate: REFUSED trailer: reviewer=$reviewer implemented $path in the inspected range" >&2
             fi
             continue
         fi
@@ -262,6 +285,15 @@ stale=""
 
 if [ "$mode" = range ]; then
     for path in $touched; do
+        path_commits=$(git log --full-history --format='%H' "$range" -- "$path" 2>/dev/null) \
+            || git_refused "changes to $path in range $range"
+        known_implementers=""
+        for implementation in $path_commits; do
+            implementation_msg=$(git log -1 --format='%B' "$implementation" 2>/dev/null) \
+                || git_refused "implementation commit $implementation"
+            identities=$(implementer_identities "$implementation_msg")
+            known_implementers+=$'\n'"$identities"
+        done
         last_change=$(git log --format='%H' -1 "$range" -- "$path" 2>/dev/null) \
             || git_refused "last change to $path in range $range"
         if [ -z "$last_change" ]; then
@@ -274,7 +306,7 @@ if [ "$mode" = range ]; then
             candidate_msg=$(git log -1 --format='%B' "$candidate" 2>/dev/null) \
                 || git_refused "commit $candidate"
             value_covers=0
-            for value in $(attested_demos "$candidate_msg"); do
+            for value in $(attested_demos "$candidate_msg" "" "$known_implementers" "$path"); do
                 if demo_value_covers "$value" "$path"; then
                     value_covers=1
                     break

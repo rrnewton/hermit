@@ -292,5 +292,108 @@ run_range "$r" 1
 check "successful banner after a deliberate failure passes" 0 "$RC" "$OUT"
 rm -rf "$r"
 
+# Exercise the actual aligned, TSV and GitHub summary formats from run-all.sh
+# through both entrypoints. Keep the same PASS and per-demo scope semantics.
+summary_case() {  # label, expected status, body
+    local label=$1 expected=$2 body=$3 message
+    r=$(new_repo)
+    mkdir -p "$r/demos"
+    printf 'v1\n' >"$r/demos/08-h.sh"
+    git -C "$r" add demos/08-h.sh
+    message="[hermit2, implementer, unresolved, host, role=impl] touch demo 8
+
+$body
+
+Demo-Green-Review: reviewer=other demo=demos/08-h.sh result=GREEN evidence=log.txt"
+    printf '%s\n' "$message" >"$r/message"
+    OUT=$(cd "$r" && "$GATE" --staged --message-file "$r/message" 2>&1); RC=$?
+    check "$label (staged)" "$expected" "$RC" "$OUT"
+    git -C "$r" commit -q -F "$r/message"
+    run_range "$r" 1
+    check "$label (range)" "$expected" "$RC" "$OUT"
+    rm -rf "$r"
+}
+
+for format in human tsv markdown; do
+    for status in FAIL SKIP PASS; do
+        case "$format" in
+            human) row="demo8    $status exit=0   duration=   0s log=/tmp/demo8.log" ;;
+            tsv) printf -v row 'demo8\t%s\t0\t0\t/tmp/demo8.log' "$status" ;;
+            markdown) printf -v row '| `demo8` | **%s** | 0 | 0s |' "$status" ;;
+        esac
+        expected=1
+        [ "$status" != PASS ] || expected=0
+        summary_case "$format $status summary has its actual result" "$expected" "$row"
+        if [ "$status" = FAIL ]; then
+            summary_case "$format result for another demo remains scoped" 0 "${row/demo8/demo5}"
+            summary_case "$format negative control followed by PASS remains valid" 0 "$row
+${row/FAIL/PASS}"
+        fi
+    done
+done
+summary_case 'a colon in a failed row log path cannot supply PASS' 1 \
+    'demo8    FAIL exit=1   duration=   0s log=/tmp/control:PASS'
+
+# A later empty review commit must be independent of the explicitly known
+# implementation identities for the path, not merely its own commit body.
+for reviewer in implementer other; do
+    r=$(new_repo)
+    commit_demo "$r" demos/08-h.sh v1 '[hermit2, implementer, unresolved, host, role=impl] implement demo 8'
+    git -C "$r" commit -q --allow-empty -m "[hermit2, $reviewer, unresolved, host, role=reviewer] later review
+
+Demo-Green-Review: reviewer=$reviewer demo=demos/08-h.sh result=GREEN evidence=log.txt"
+    expected=0
+    [ "$reviewer" != implementer ] || expected=1
+    run_range "$r" 2
+    check "later $reviewer review respects implementation identity" "$expected" "$RC" "$OUT"
+    rm -rf "$r"
+done
+
+# Implementing one demo does not disqualify an independent review of another.
+r=$(new_repo)
+commit_demo "$r" demos/01-a.sh v1 '[hermit2, first, unresolved, host, role=impl] implement demo 1'
+commit_demo "$r" demos/08-h.sh v1 '[hermit2, second, unresolved, host, role=impl] implement demo 8'
+git -C "$r" commit -q --allow-empty -m 'independent cross-review
+
+Demo-Green-Review: reviewer=second demo=demos/01-a.sh result=GREEN evidence=first.log
+Demo-Green-Review: reviewer=first demo=demos/08-h.sh result=GREEN evidence=second.log'
+run_range "$r" 3
+check 'independent cross-review of separate paths passes' 0 "$RC" "$OUT"
+rm -rf "$r"
+
+# A broad trailer cannot hide self-review behind another covered path.
+r=$(new_repo)
+commit_demo "$r" demos/01-a.sh v1 '[hermit2, first, unresolved, host, role=impl] implement demo 1'
+commit_demo "$r" demos/08-h.sh v1 '[hermit2, second, unresolved, host, role=impl] implement demo 8'
+git -C "$r" commit -q --allow-empty -m 'later broad review
+
+Demo-Green-Review: reviewer=first demo=all result=GREEN evidence=log.txt'
+run_range "$r" 3
+check 'multi-path coverage refuses self-review of one covered path' 1 "$RC" "$OUT"
+rm -rf "$r"
+
+# Every explicitly named implementation contributor to a path counts, even
+# when a different contributor made its last edit.
+r=$(new_repo)
+commit_demo "$r" demos/08-h.sh v1 '[hermit2, first, unresolved, host, role=impl] first edit'
+commit_demo "$r" demos/08-h.sh v2 '[hermit2, second, unresolved, host, role=impl] later edit'
+git -C "$r" commit -q --allow-empty -m 'later review
+
+Demo-Green-Review: reviewer=first demo=demos/08-h.sh result=GREEN evidence=log.txt'
+run_range "$r" 3
+check 'an earlier implementation contributor cannot review the same path' 1 "$RC" "$OUT"
+rm -rf "$r"
+
+# Git authorship alone is not an agent identity. Historical commits without a
+# disclosure keep their prior behavior; the checker must not invent one.
+r=$(new_repo)
+commit_demo "$r" demos/08-h.sh v1 'historical implementation without a disclosure'
+git -C "$r" commit -q --allow-empty -m '[hermit2, t, unresolved, host, role=reviewer] later review
+
+Demo-Green-Review: reviewer=t demo=demos/08-h.sh result=GREEN evidence=log.txt'
+run_range "$r" 2
+check 'absent historical identity is not inferred from the Git author' 0 "$RC" "$OUT"
+rm -rf "$r"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
