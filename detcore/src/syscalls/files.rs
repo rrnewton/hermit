@@ -2176,12 +2176,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         mut call: syscalls::Pwrite64,
     ) -> Result<i64, Error> {
+        // Unlike pwritev2's special -1 offset, pwrite64 rejects every negative
+        // offset, including when O_APPEND would otherwise select EOF.
+        if call.offset() < 0 {
+            return Err(Errno::EINVAL.into());
+        }
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
-            return Err(if call.offset() < 0 {
-                Errno::EINVAL.into()
-            } else {
-                Errno::ESPIPE.into()
-            });
+            return Err(Errno::ESPIPE.into());
         }
 
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
@@ -2519,13 +2520,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         mut call: syscalls::Pwritev,
     ) -> Result<i64, Error> {
+        // Validate the caller's offset before logical append can replace it
+        // with EOF. pwritev has no pwritev2-style -1 offset exception.
+        if vectored_offset(call.pos_l(), call.pos_h()) < 0 {
+            return Err(Errno::EINVAL.into());
+        }
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
-            let offset = vectored_offset(call.pos_l(), call.pos_h());
-            return if offset < 0 {
-                Err(Errno::EINVAL.into())
-            } else {
-                Err(Errno::ESPIPE.into())
-            };
+            return Err(Errno::ESPIPE.into());
         }
 
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
