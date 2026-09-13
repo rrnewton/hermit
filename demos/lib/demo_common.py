@@ -900,7 +900,7 @@ def hermit_log_diff(log1: Path, log2: Path) -> str:
 def compare_runs(
     anchor: QemuRunMetadata, current: QemuRunMetadata
 ) -> Tuple[bool, List[str]]:
-    """Compare exact artifacts and timestamp-stripped logs."""
+    """Compare exact artifacts and logs under the documented demo normalization."""
     passed = True
     report: List[str] = []
     if anchor.kind is not current.kind:
@@ -945,7 +945,7 @@ def compare_runs(
             )
 
     # Normalize only the documented host-physical fields above. Any remaining
-    # INFO difference is canonical execution evidence and must fail the repeat,
+    # INFO difference is execution evidence and must fail the repeat,
     # even when the VM artifacts happen to be byte-identical. In particular, a
     # difference that begins during Python startup can propagate into virtual
     # clock values and the QEMU execution; its origin does not make the later
@@ -964,7 +964,7 @@ def compare_runs(
             report.append(
                 "WARN: Hermit INFO log differs from first run after normalizing "
                 "wallclock timestamps, host inode numbers, and env-dependent guest "
-                "addresses; canonical repeat verification failed\n{}".format(
+                "addresses; demo repeat comparison failed\n{}".format(
                     difference
                 )
             )
@@ -978,7 +978,7 @@ def compare_runs(
         passed = False
         report.append(
             "WARN: Hermit INFO logs not compared because the first-run or current "
-            "log is unavailable; canonical repeat verification requires both logs"
+            "log is unavailable; demo repeat comparison requires both logs"
         )
     return passed, report
 

@@ -390,7 +390,7 @@ class InfoLogAdmissionTest(unittest.TestCase):
                 passed, "a canonical INFO divergence must make the demo red"
             )
             self.assertTrue(
-                any("canonical repeat verification failed" in line for line in report)
+                any("demo repeat comparison failed" in line for line in report)
             )
 
     def test_missing_info_log_fails_repeat_verification(self):
@@ -407,7 +407,7 @@ class InfoLogAdmissionTest(unittest.TestCase):
             self.assertFalse(passed, "missing INFO evidence must not produce SUCCESS")
             self.assertTrue(
                 any(
-                    "canonical repeat verification requires both logs" in line
+                    "demo repeat comparison requires both logs" in line
                     for line in report
                 )
             )
@@ -428,7 +428,7 @@ class InfoLogAdmissionTest(unittest.TestCase):
             )
             self.assertTrue(
                 any(
-                    "canonical repeat verification requires both logs" in line
+                    "demo repeat comparison requires both logs" in line
                     for line in report
                 )
             )

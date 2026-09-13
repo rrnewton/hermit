@@ -188,7 +188,7 @@ if [ -x "$brs" ]; then
     log_dir="$("$brs" create --limit "$disk_limit" --tag "safehermit-$run_id" --base "$LOG_ROOT" 2>/dev/null)"
     rc=$?
     if [ $rc -eq 0 ] && [ -n "$log_dir" ]; then
-        disk_state="APPLIED:$disk_limit"
+        disk_state="APPLIED:$disk_limit for log_dir only; guest paths and explicit log files elsewhere are outside this bound"
     elif [ -n "$log_dir" ]; then
         # exit 10: the space exists but nothing caps it. RELAY IT -- this is the
         # case bounded-run-space exists to make impossible to miss.
@@ -200,7 +200,7 @@ fi
 if [ -z "$log_dir" ]; then
     log_dir="$LOG_ROOT/$run_id"
     mkdir -p "$log_dir" || die "cannot create log dir $log_dir"
-    [ -n "$disk_state" ] || disk_state="NOT_APPLIED:scripts/bounded-run-space not present (branch runner-bounded-run-space_20260819 is unlanded)"
+    [ -n "$disk_state" ] || disk_state="NOT_APPLIED:scripts/bounded-run-space not present; retained log directory is not capped"
 fi
 log_file="$log_dir/hermit.log"
 
@@ -275,7 +275,9 @@ if [ "$systemd_ok" = 1 ]; then
     # hard-coded index -- "${runner[@]:0:5}" ... "${runner[@]:5}" -- which silently
     # means something different the moment a flag is added or removed above it, as
     # removing --collect just did. Nothing here depends on position now.
-    runner=(systemd-run --user "--unit=$unit" --quiet
+    # Guest arguments can contain shell expressions intended for the guest.
+    # systemd-run otherwise expands $VAR/${VAR} and collapses $$ before exec.
+    runner=(systemd-run --user "--unit=$unit" --quiet --expand-environment=no
             "--property=MemoryMax=$mem_max" "--property=MemorySwapMax=0")
     [ "$no_deadline" = 1 ] || runner+=("--property=RuntimeMaxSec=$deadline")
     runner+=("--working-directory=$PWD" "${setenv_args[@]}" --pipe --wait --)

@@ -39,6 +39,49 @@ class CommandDiskProtocolTest(unittest.TestCase):
             payload[len(prefix) :], b"\0" * (dh.COMMAND_IMAGE_BYTES - len(prefix))
         )
 
+    def test_start_uses_the_bounded_qmp_path_before_launch(self):
+        class StopBeforeLaunch(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "bin").mkdir()
+            for name in ("bin/safehermit", "hermit", "qemu", "kernel", "initrd", "snapshot", "vmlinux"):
+                (root / name).touch()
+            config = dh.GuestConfig(
+                root=root, hermit=root / "hermit", qemu=root / "qemu",
+                kernel=root / "kernel", initrd=root / "initrd", vmlinux=root / "vmlinux",
+                snapshot_disk=root / "snapshot", snapshot_name="hermit-boot",
+                advance_command="echo deterministic", artifact_dir=root / ("long" * 30),
+            )
+            program = dh.HermitGuestProgram(config)
+            relocated = root / "short.sock"
+            with mock.patch.object(dh, "ensure_vmlinux", return_value=config.vmlinux), mock.patch.object(
+                dh, "make_socket_path", return_value=relocated
+            ) as socket_path, mock.patch.object(
+                dh.subprocess, "Popen", side_effect=StopBeforeLaunch
+            ) as launch:
+                with self.assertRaises(StopBeforeLaunch):
+                    program.start()
+            preferred = program.run_dir / "qmp.sock"
+            self.assertGreater(len(str(preferred).encode()), 107)
+            socket_path.assert_called_once_with(preferred, "drgn")
+            self.assertIn("unix:{},server=on,wait=off".format(relocated), launch.call_args.args[0])
+            self.assertEqual(program._qmp_socket, relocated)
+
+    def test_close_removes_the_recorded_qmp_socket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recorded = Path(directory) / "recorded.sock"
+            other = Path(directory) / "other.sock"
+            recorded.touch()
+            other.touch()
+            program = dh.HermitGuestProgram(SimpleNamespace())
+            program._qmp_socket = recorded
+            program.close()
+            self.assertFalse(recorded.exists())
+            self.assertTrue(other.exists())
+            self.assertIsNone(program._qmp_socket)
+
     def test_advance_resumes_preloaded_disk_without_serial_injection(self):
         qmp = FakeQmp()
         program = dh.HermitGuestProgram(

@@ -126,7 +126,7 @@ elif [[ $pinned_py != "$pinned_rs" ]] || [[ $pinned_py != "$exported" ]]; then
 fi
 
 # The ad-hoc Hermit box must use the same tracked, source-invoked runner order as
-# the CI entry points: common/bin first, py/bin second, then PATH. Exercise the
+# the pinned checkout: common/bin first, py/bin second. Exercise the
 # real script from a temporary checkout shape so a stale path cannot pass merely
 # because this working tree happens to have another runner installed.
 box_runner_scratch=$(mktemp -d)
@@ -163,10 +163,12 @@ if ! PATH=/usr/bin:/bin "$box_runner_scratch/scripts/hermit-box-run" -- /bin/tru
 fi
 
 rm -f "$box_runner_scratch/agent-utils/py/bin/dagrun" "$python_marker"
+mkdir -p "$box_runner_scratch/unpinned"
+write_fake_runner "$box_runner_scratch/unpinned/dagrun" "$box_runner_scratch/path.used"
 runner_rc=0
-PATH=/usr/bin:/bin "$box_runner_scratch/scripts/hermit-box-run" -- /bin/true \
+PATH="$box_runner_scratch/unpinned:/usr/bin:/bin" "$box_runner_scratch/scripts/hermit-box-run" -- /bin/true \
     >"$runner_output" 2>&1 || runner_rc=$?
-if [[ $runner_rc -ne 2 ]] || ! grep -q 'dagrun not found' "$runner_output"; then
+if [[ $runner_rc -ne 2 || -f $box_runner_scratch/path.used ]] || ! grep -q 'dagrun not found' "$runner_output"; then
     echo "check-dagrun-naming: hermit-box-run did not refuse a missing runner with exit 2" >&2
     status=1
 fi

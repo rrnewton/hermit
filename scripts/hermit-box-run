@@ -12,7 +12,7 @@
 # cgroup-scoped dagrun nodes do not.
 #
 # This wrapper closes that gap WITHOUT new engine code: it emits a ONE-step DAG (with a
-# CPU-TIME budget) and drives it through dagrun, reusing verbatim
+# CPU-TIME budget) and drives it through the canonical dagrun, reusing verbatim
 #   * boxing ON by default + exit 3 when cgroup-v2/systemd --user scope is unavailable,
 #   * the per-step CPU-time budget kill in scheduler._monitor (reads cgroup cpu.stat
 #     usage_usec — immune to wall-clock slowdown under load), and
@@ -28,7 +28,8 @@
 #
 # USAGE
 #   hermit-box-run [--cpu-budget SECS] [--wall SECS] [--mem SIZE] [--cores K]
-#                  [--label NAME] [--perf-dir DIR] [--allow-cgroup-failure] -- CMD [ARGS...]
+#                  [--label NAME] [--perf-dir DIR] [--actual-json FILE]
+#                  [--allow-cgroup-failure] -- CMD [ARGS...]
 #
 #   THREE INDEPENDENT CGROUP LIMITS (set any combination; each fires its own clean kill):
 #   --cpu-budget SECS  whole-subtree CPU-TIME budget (user+system CPU-s, cgroup cpu.stat);
@@ -49,6 +50,9 @@
 #                      Absent = no core pin.
 #   --label NAME       label used for the DAG step tag (default: box).
 #   --perf-dir DIR     write per-step + whole-run resource-usage CSVs there.
+#   --actual-json FILE (passthrough only) atomically write one versioned JSON record with
+#                      observed cgroup CPU usage, limits, termination, and exit. Refuse with
+#                      exit 3 and do not replace FILE when final cgroup CPU is unavailable.
 #   --allow-cgroup-failure  downgrade to a best-effort UNBOXED run instead of exit 3 when
 #                      cgroup boxing cannot be established. NOT recommended (defeats the
 #                      whole point); provided for parity with the underlying runner.
@@ -91,6 +95,7 @@ mem=""
 cores=""
 label="box"
 perf_dir=""
+actual_json=""
 allow_cgroup_failure=0
 passthrough=0
 diag_fd=""
@@ -112,10 +117,6 @@ find_runner() {
     printf '%s\n' "$base/py/bin/dagrun"
     return 0
   fi
-  if command -v dagrun >/dev/null 2>&1; then
-    command -v dagrun
-    return 0
-  fi
   return 1
 }
 
@@ -135,6 +136,8 @@ while [ $# -gt 0 ]; do
     --label=*)    label="${1#*=}"; shift ;;
     --perf-dir)   [ $# -ge 2 ] || die "--perf-dir needs a value"; perf_dir="$2"; shift 2 ;;
     --perf-dir=*) perf_dir="${1#*=}"; shift ;;
+    --actual-json) [ $# -ge 2 ] || die "--actual-json needs a value"; actual_json="$2"; shift 2 ;;
+    --actual-json=*) actual_json="${1#*=}"; shift ;;
     --allow-cgroup-failure) allow_cgroup_failure=1; shift ;;
     --passthrough|--exec) passthrough=1; shift ;;
     --diag-fd)    [ $# -ge 2 ] || die "--diag-fd needs a value"; diag_fd="$2"; shift 2 ;;
@@ -184,6 +187,7 @@ if [ -n "$diag_fd" ]; then case "$diag_fd" in ''|*[!0-9]*) die "--diag-fd must b
 if [ "$passthrough" -eq 0 ]; then
   [ -z "$diag_fd" ]  || die "--diag-fd is only valid with --passthrough"
   [ -z "$diag_log" ] || die "--diag-log is only valid with --passthrough"
+  [ -z "$actual_json" ] || die "--actual-json is only valid with --passthrough"
 fi
 
 # ---------------------------------------------------------------------------
@@ -258,10 +262,15 @@ PY
     [ -n "$allowed_cpus" ] && diag "core pin: --cores $cores -> AllowedCPUs=$allowed_cpus"
   fi
 
-  local unit
+  local unit runner_pid="" cgpath=""
+  local cgroup_resolved=0 final_usage_observed=0 runner_waited=0
+  local payload_completed=0 payload_status_file="" payload_release_file="" hold_dir=""
+  local budget_usec=$(( cpu_budget * 1000000 ))
+  local reaped=0 last_usage=0 termination="completed" status=0
   unit="hermit-box-run-$$-$(date +%s%N).scope"
   local -a sr=(systemd-run --user --scope --quiet --unit="$unit"
-               --description="hermit-box-run passthrough: $*")
+               --description="hermit-box-run passthrough: $*"
+               -p "KillMode=control-group")
   [ -n "$allowed_cpus" ] && sr+=(-p "AllowedCPUs=$allowed_cpus")
   # Memory cap -> cgroup memory.max with swap disabled, so the kernel HARD-OOM-kills the
   # subtree at the cap instead of swapping past it (matches the outer safe-ci.slice policy).
@@ -276,44 +285,168 @@ PY
   # fds 7/8/9 closed so no box bookkeeping fd leaks into the guest.
   exec 7>&1 8>&2
   exec 1>&9 2>&9
-  "${sr[@]}" -- "$@" 1>&7 2>&8 7>&- 8>&- 9>&- &
-  local runner_pid=$!
+
+  # Arm cleanup BEFORE the first process can enter the scope. An outer runner
+  # (ORC included) signals only this direct PID, so a TERM during systemd-run's
+  # registration window must be able to find the known unit even though its
+  # cgroup path and runner PID may still be only partially initialized.
+  _pt_resolve_cgroup() {
+    local discovered=""
+    if [ -n "$cgpath" ] && [ -r "$cgpath/cgroup.procs" ]; then
+      return 0
+    fi
+    cgpath=""
+    discovered="$(systemctl --user show -p ControlGroup --value "$unit" 2>/dev/null || true)"
+    if [ -n "$discovered" ] && [ -r "/sys/fs/cgroup$discovered/cgroup.procs" ]; then
+      cgpath="/sys/fs/cgroup$discovered"
+      return 0
+    fi
+    return 1
+  }
+  _pt_read_usage() {
+    local observed=""
+    [ -n "$cgpath" ] && [ -r "$cgpath/cpu.stat" ] || return 1
+    observed="$(awk '$1 == "usage_usec" { print $2; exit }' \
+      "$cgpath/cpu.stat" 2>/dev/null)" || return 1
+    case "$observed" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$observed"
+  }
+  _pt_capture_final_usage() {
+    local observed=""
+    if observed="$(_pt_read_usage)"; then
+      last_usage="$observed"
+      final_usage_observed=1
+      return 0
+    fi
+    return 1
+  }
+  _pt_freeze_and_capture() {
+    local attempt
+    [ -n "$cgpath" ] && [ -w "$cgpath/cgroup.freeze" ] || return 1
+    echo 1 >"$cgpath/cgroup.freeze" 2>/dev/null || return 1
+    for attempt in $(seq 1 40); do
+      if awk '$1 == "frozen" && $2 == "1" { found=1 } END { exit !found }' \
+          "$cgpath/cgroup.events" 2>/dev/null; then
+        _pt_capture_final_usage
+        return $?
+      fi
+      sleep 0.01
+    done
+    return 1
+  }
+  _pt_kill_scope() {
+    local attempts=${1:-20} attempt
+    for attempt in $(seq 1 "$attempts"); do
+      if _pt_resolve_cgroup && [ -w "$cgpath/cgroup.kill" ]; then
+        echo 1 > "$cgpath/cgroup.kill" 2>/dev/null || true
+        return 0
+      fi
+      # The unit name is authority even before ControlGroup becomes readable.
+      # Retry briefly because systemd-run may have submitted creation just as
+      # the outer process delivered TERM.
+      if systemctl --user kill --kill-whom=all --signal=KILL "$unit" \
+          >/dev/null 2>&1; then
+        return 0
+      fi
+      [ "$attempt" -ge "$attempts" ] || sleep 0.02
+    done
+    systemctl --user --no-block stop "$unit" >/dev/null 2>&1 || true
+  }
+  _pt_teardown() {
+    local status=$1
+    trap - TERM INT HUP
+    # Stop the launcher immediately, then sweep any scope it already submitted.
+    # Either variable may still be empty; cleanup is deliberately partial-init-safe.
+    if [ -n "$runner_pid" ]; then
+      kill -KILL "$runner_pid" 2>/dev/null || true
+    fi
+    _pt_kill_scope
+    if [ -n "$runner_pid" ]; then
+      wait "$runner_pid" 2>/dev/null || true
+    fi
+    if [ -n "$hold_dir" ]; then
+      rm -f -- "$payload_status_file" "$payload_status_file.tmp" \
+        "$payload_release_file" 2>/dev/null || true
+      rmdir -- "$hold_dir" 2>/dev/null || true
+    fi
+    exit "$status"
+  }
+  trap '_pt_teardown 143' TERM
+  trap '_pt_teardown 130' INT
+  trap '_pt_teardown 129' HUP
+
+  local -a scope_command=("$@")
+  if [ -n "$actual_json" ]; then
+    hold_dir="$(mktemp -d -t hermit-box-run-hold.XXXXXX)" || {
+      echo "hermit-box-run: could not create cgroup receipt hold directory (exit 3)" >&8
+      exit 3
+    }
+    payload_status_file="$hold_dir/status"
+    payload_release_file="$hold_dir/release"
+    mkfifo -- "$payload_release_file" || {
+      echo "hermit-box-run: could not create cgroup receipt hold pipe (exit 3)" >&8
+      rmdir -- "$hold_dir" 2>/dev/null || true
+      exit 3
+    }
+    # Keep one inert process in the scope after the payload exits. Otherwise
+    # systemd can remove the transient cgroup between wait(2) and the final
+    # cpu.stat read, making a completed run lose its receipt. The parent freezes
+    # the held cgroup, reads the final total, and then kills its own scope.
+    scope_command=(bash -c '
+      status_file=$1
+      release_file=$2
+      shift 2
+      rc=0
+      "$@" || rc=$?
+      printf "%s\n" "$rc" >"$status_file.tmp"
+      mv -- "$status_file.tmp" "$status_file"
+      IFS= read -r _ <"$release_file"
+      exit "$rc"
+    ' bash "$payload_status_file" "$payload_release_file" "$@")
+  fi
+
+  "${sr[@]}" -- "${scope_command[@]}" 1>&7 2>&8 7>&- 8>&- 9>&- &
+  runner_pid=$!
 
   # Resolve the scope's cgroup path (may take a beat to register).
-  local cg="" cgpath=""
   # `_` because the counter bounds the retry loop and is never read.
   for _ in $(seq 1 40); do
-    cg="$(systemctl --user show -p ControlGroup --value "$unit" 2>/dev/null || true)"
-    if [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/cpu.stat" ]; then
-      cgpath="/sys/fs/cgroup$cg"; break
+    if _pt_resolve_cgroup && [ -r "$cgpath/cpu.stat" ]; then
+      cgroup_resolved=1
+      break
     fi
     kill -0 "$runner_pid" 2>/dev/null || break   # child already finished
     sleep 0.05
   done
 
-  # If we are ourselves signalled (e.g. an outer wall `timeout` sends SIGTERM), tear the WHOLE
-  # scope down via cgroup.kill so no setsid/double-fork escapee survives us, then exit with the
-  # 128+signal convention. cgpath/runner_pid are visible here via bash dynamic scope.
-  _pt_teardown() {
-    if [ -n "$cgpath" ] && [ -w "$cgpath/cgroup.kill" ]; then echo 1 > "$cgpath/cgroup.kill" 2>/dev/null || true; fi
-    kill "$runner_pid" 2>/dev/null || true
-    wait "$runner_pid" 2>/dev/null || true
-    exit 143
-  }
-  trap _pt_teardown TERM INT HUP
+  # A fast child can exit between systemd-run registering the scope and the
+  # first ControlGroup query. Reap it to reserve its status, then make one last
+  # query while the transient unit may still be readable. Never infer cgroup
+  # availability merely from the child's exit.
+  if [ "$cgroup_resolved" -eq 0 ] && ! kill -0 "$runner_pid" 2>/dev/null; then
+    wait "$runner_pid" 2>/dev/null || status=$?
+    runner_waited=1
+    if _pt_resolve_cgroup && [ -r "$cgpath/cpu.stat" ]; then
+      cgroup_resolved=1
+    fi
+  fi
 
-  local budget_usec=$(( cpu_budget * 1000000 ))
-  local reaped=0 last_usage=0
-  if [ -z "$cgpath" ]; then
-    # Could not establish the reaper cgroup. Fail closed: tear down our own child, exit 3.
-    if kill -0 "$runner_pid" 2>/dev/null; then
-      diag "ERROR: could not resolve scope cgroup for $unit; killing own child and failing closed."
-      kill "$runner_pid" 2>/dev/null || true
-      wait "$runner_pid" 2>/dev/null || true
-      if [ "$allow_cgroup_failure" -eq 0 ]; then
-        echo "hermit-box-run: could not establish reaper cgroup (exit 3)" >&8  # fd8 = real stderr
-        exit 3
-      fi
+  if [ "$cgroup_resolved" -eq 0 ]; then
+    # Could not establish the reaper cgroup. Sweep the named unit even when the
+    # direct child has already exited; with fail-closed boxing this invocation
+    # is a refusal, never a successful run with invented zero usage.
+    diag "ERROR: could not resolve scope cgroup for $unit; sweeping own unit and failing closed."
+    _pt_kill_scope
+    if [ "$runner_waited" -eq 0 ]; then
+      kill -KILL "$runner_pid" 2>/dev/null || true
+      wait "$runner_pid" 2>/dev/null || status=$?
+      runner_waited=1
+    fi
+    if [ "$allow_cgroup_failure" -eq 0 ]; then
+      echo "hermit-box-run: could not establish reaper cgroup (exit 3)" >&8  # fd8 = real stderr
+      status=3
     fi
   else
     diag "cgroup=$cgpath"
@@ -323,16 +456,35 @@ PY
     [ -n "$wall" ] && wall_deadline=$(( $(date +%s) + wall ))
     # Monitor loop: poll CPU-time usage + wall deadline; reap cgroup.kill-first on overrun.
     while kill -0 "$runner_pid" 2>/dev/null; do
-      last_usage="$(awk '/^usage_usec/{print $2}' "$cgpath/cpu.stat" 2>/dev/null || echo "$last_usage")"
+      local usage_sample=""
+      if [ -n "$payload_status_file" ] && [ -f "$payload_status_file" ]; then
+        if IFS= read -r status <"$payload_status_file" && \
+           [[ $status =~ ^[0-9]+$ ]] && [ "$status" -le 255 ]; then
+          payload_completed=1
+        else
+          status=3
+          diag "ERROR: payload exit status was absent or malformed."
+        fi
+        _pt_freeze_and_capture || true
+        _pt_kill_scope
+        break
+      fi
+      if usage_sample="$(_pt_read_usage)"; then
+        last_usage="$usage_sample"
+      fi
       if [ "${last_usage:-0}" -gt "$budget_usec" ]; then
         diag "CPU-TIMEOUT: usage_usec=$last_usage exceeded budget=${budget_usec} (${cpu_budget}s) — reaping via cgroup.kill"
-        echo 1 > "$cgpath/cgroup.kill" 2>/dev/null || true
+        termination="cpu_budget"
+        _pt_freeze_and_capture || true
+        _pt_kill_scope
         reaped=1
         break
       fi
       if [ "$wall_deadline" -gt 0 ] && [ "$(date +%s)" -ge "$wall_deadline" ]; then
         diag "WALL-TIMEOUT: exceeded ${wall}s wall-clock — reaping via cgroup.kill"
-        echo 1 > "$cgpath/cgroup.kill" 2>/dev/null || true
+        termination="wall_backstop"
+        _pt_freeze_and_capture || true
+        _pt_kill_scope
         reaped=1
         break
       fi
@@ -340,16 +492,103 @@ PY
     done
   fi
 
-  local status=0
-  wait "$runner_pid" 2>/dev/null || status=$?
+  if [ "$runner_waited" -eq 0 ]; then
+    local runner_status=0
+    wait "$runner_pid" 2>/dev/null || runner_status=$?
+    if [ "$payload_completed" -eq 0 ]; then
+      status=$runner_status
+    fi
+    runner_waited=1
+  fi
+  # On normal completion, capture the final subtree total while the cgroup
+  # still exists. A capped run may already have captured its last observable
+  # numeric sample immediately before destructive teardown; a successful
+  # post-wait read supersedes that sample.
+  if [ "$cgroup_resolved" -eq 1 ]; then
+    _pt_capture_final_usage || true
+  fi
   # cgroup.kill-FIRST teardown: systemd-run returns when the MAIN scope process exits, but a
   # setsid/double-fork escapee it reparented can still linger in the scope cgroup — the exact
   # leak this wrapper prevents. Sweep the whole scope subtree unconditionally on exit so no
   # process survives us. (Only ever our OWN scope's cgroup.kill; never an external/broad kill.)
-  if [ -n "$cgpath" ] && [ -w "$cgpath/cgroup.kill" ]; then
-    echo 1 > "$cgpath/cgroup.kill" 2>/dev/null || true
+  _pt_kill_scope 1
+  if [ -n "$hold_dir" ]; then
+    rm -f -- "$payload_status_file" "$payload_status_file.tmp" \
+      "$payload_release_file" 2>/dev/null || true
+    rmdir -- "$hold_dir" 2>/dev/null || true
   fi
-  diag "final usage_usec=${last_usage:-0} reaped=${reaped} exit=${status}"
+  local actual_refused=0
+  if [ -n "$actual_json" ] && { [ "$cgroup_resolved" -eq 0 ] || [ "$final_usage_observed" -eq 0 ]; }; then
+    actual_refused=1
+    status=3
+    diag "ERROR: authoritative cgroup CPU unavailable; refusing --actual-json publication."
+    echo "hermit-box-run: authoritative cgroup CPU unavailable; refusing --actual-json (exit 3)" >&8
+  fi
+  if [ "$final_usage_observed" -eq 1 ]; then
+    diag "final usage_usec=$last_usage reaped=${reaped} termination=${termination} exit=${status}"
+  else
+    diag "final usage_usec=unavailable reaped=${reaped} termination=${termination} exit=${status}"
+  fi
+  if [ -n "$actual_json" ] && [ "$actual_refused" -eq 0 ]; then
+    python3 - "$actual_json" "$label" "$unit" "$cpu_budget" "${wall:-0}" \
+      "${last_usage:-0}" "$reaped" "$termination" "$status" <<'PY'
+import json
+import os
+from pathlib import Path
+import tempfile
+import sys
+
+(
+    destination_raw,
+    label,
+    scope,
+    cpu_budget,
+    wall_backstop,
+    usage_usec,
+    reaped,
+    termination,
+    exit_code,
+) = sys.argv[1:]
+destination = Path(destination_raw)
+destination.parent.mkdir(parents=True, exist_ok=True)
+usage = int(usage_usec)
+payload = {
+    "schema": "hermit-box-run-actual/v1",
+    "label": label,
+    "scope": scope,
+    "cpu_source": "cgroup-v2 cpu.stat usage_usec",
+    "cgroup_usage_usec": usage,
+    "cpu_seconds": usage / 1_000_000,
+    "cpu_budget_seconds": int(cpu_budget),
+    "wall_backstop_seconds": int(wall_backstop) or None,
+    "reaped": bool(int(reaped)),
+    "termination": termination,
+    "exit_code": int(exit_code),
+}
+descriptor, temporary_raw = tempfile.mkstemp(
+    dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp"
+)
+temporary = Path(temporary_raw)
+try:
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, destination)
+    directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+except BaseException:
+    try:
+        temporary.unlink()
+    except FileNotFoundError:
+        pass
+    raise
+PY
+  fi
   if [ -n "$perf_dir" ]; then
     mkdir -p "$perf_dir" 2>/dev/null || true
     { printf 'label,scope,cpu_budget_s,usage_usec,reaped,exit\n'

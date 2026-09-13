@@ -265,9 +265,12 @@ guest; it exists only as QEMU's VM-state store. Demo 5 then exits QEMU over QMP
 and records the image hash, raw INFO log, Hermit and QEMU versions, QEMU binary
 SHA-256, and timestamp. The first run becomes `run-metadata.json` under the
 resolved QEMU asset directory; later runs compare their exact qcow2,
-serial-output, and QEMU binary hashes. INFO logs are compared byte-for-byte
-after removing only each line's leading ISO-8601 wallclock timestamp. No
-address, path, virtual time, scheduler count, or other number is normalized.
+serial-output, and QEMU binary hashes. INFO logs are compared after removing the leading wallclock timestamp,
+normalizing FileContents inode values, and mapping selected userspace addresses
+to their first-appearance identities across the log. This preserves address
+aliasing and order but cannot detect a consistent relabelling of addresses.
+Virtual time, scheduler counts, and the remaining payload are compared exactly.
+This is the demo comparator, not Hermit's canonical BitwiseInfoV1 comparator.
 `demo_common.py` owns the complete kind-specific `run-metadata.json` type.
 Schema 2 requires every value used by repeat comparison, so two omitted values
 cannot compare equal and report a pass. Retained schema-1 boot and resume rows
@@ -319,11 +322,11 @@ an explicit paired override for intentional public-kernel updates;
 `QEMU_KERNEL_MANIFOLD_PATH` takes precedence over the default public URL.
 `BUSYBOX`, `QEMU_BIN`, and `QEMU_ASSETS` retain their existing overrides.
 
-The boot and every resume use `--strict`, `--no-rcb-time`,
-`--target-timeslice 100000`, and `--max-timeslice disabled`. Strict mode fails
-closed on unsupported operations. This syscall-rich workload advances logical
-time by deterministic scheduler check-ins and does not need PMU preemption,
-whose hardware skid would otherwise perturb internal timing logs. The scripts
+Boot uses `--strict`, `--target-timeslice 100000`, and
+`--max-timeslice 2000000000`, with RCB timing and PMU preemption enabled. Resume
+uses `--strict`, `--no-rcb-time`, `--target-timeslice 100000`, and
+`--max-timeslice disabled`. Strict mode fails closed on unsupported operations;
+the resume workload advances logical time through scheduler check-ins. The scripts
 enable Detcore INFO logging so the raw log includes syscall entries and results
 as well as scheduler records. Console output remains concise because it prints
 only a timestamp-free tail.
@@ -331,7 +334,8 @@ only a timestamp-free tail.
 ### 6. QEMU Snapshot Resume
 
 Demo 6 starts the same QEMU machine with `-loadvm hermit-boot`, connects to its
-serial pipe, and injects one shell command. It prints the guest output
+serial pipe, and executes the shell command preloaded on a fixed-size command
+disk before the restore. It prints the guest output
 and timestamp-free Hermit INFO tail, then saves a post-command snapshot unless
 `--no-save-snapshot` is passed. For example:
 
@@ -345,7 +349,7 @@ and timestamp-free Hermit INFO tail, then saves a post-command snapshot unless
 The command's SHA-256 selects its metadata directory. The first run anchors the
 guest-output hash, post-command qcow2 hash, QEMU identity, and raw INFO log.
 Repeating that command compares every field and reports the first log
-divergence after stripping only the wallclock prefix.
+divergence under the demo INFO-log comparison described above.
 
 ## Scope And Next Steps
 

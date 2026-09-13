@@ -23,7 +23,7 @@ import tempfile
 import time
 from typing import Iterator, Optional, Tuple
 
-from demo_common import hermit_tmp_args, report_safehermit
+from demo_common import hermit_tmp_args, make_socket_path, report_safehermit
 
 
 XZ_MAGIC = b"\xfd7zXZ\x00"
@@ -602,6 +602,7 @@ class HermitGuestProgram:
         self._tracer_tgid = None  # type: Optional[int]
         self._memory = None  # type: Optional[int]
         self._qmp = None  # type: Optional[QmpClient]
+        self._qmp_socket = None  # type: Optional[Path]
         self._serial_read_fd = None  # type: Optional[int]
         self._serial_write_fd = None  # type: Optional[int]
         self._ram_first = 0
@@ -636,7 +637,8 @@ class HermitGuestProgram:
         self.serial_log = self.run_dir / "serial.log"
         hermit_log = self.run_dir / "hermit.log"
         self._safehermit_report = self.run_dir / "safehermit-report.txt"
-        qmp_socket = self.run_dir / "qmp.sock"
+        qmp_socket = make_socket_path(self.run_dir / "qmp.sock", "drgn")
+        self._qmp_socket = qmp_socket
         # Bidirectional serial over a `-serial pipe:` FIFO pair, not a unix
         # socket: a socket chardev's poll fd starves the -icount vCPU under
         # `hermit --no-rcb-time` (the demo-5 boot bug). QEMU opens (does not
@@ -919,6 +921,9 @@ class HermitGuestProgram:
             if self._safehermit_report is not None:
                 report_safehermit(self._safehermit_report, self._process.returncode)
                 self._safehermit_report = None
+        if self._qmp_socket is not None:
+            self._qmp_socket.unlink(missing_ok=True)
+            self._qmp_socket = None
 
 
 @contextmanager
