@@ -53,9 +53,9 @@ pub enum ExactChildWaitState {
     Running,
     /// Detcore observed logical exit, but this backend cannot report physical waitability.
     LogicallyExited,
-    /// The backend has not yet reported the child's final kernel exit status.
+    /// The scheduler has not yet applied the backend's final kernel exit status.
     PhysicalExitPending,
-    /// The backend has reported the child's final kernel exit status.
+    /// The scheduler has applied the backend's final kernel exit status.
     PhysicallyExited,
 }
 

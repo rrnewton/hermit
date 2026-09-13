@@ -604,7 +604,8 @@ impl GlobalState {
     ///
     /// This only records a barrier observation when the backend advertises physical-exit
     /// reporting; it is therefore a no-op for ptrace, DBT, KVM, and LiteInst execution. The
-    /// exact process's barrier is released at this physical-waitability boundary.
+    /// scheduler releases the exact process's barrier at its next loop-top
+    /// maintenance point rather than on this host-driven call.
     pub fn complete_physical_process_exit(&self, raw_pid: i32) {
         let detpid = DetPid::from_raw(raw_pid);
         self.pending_exec_states.lock().unwrap().remove(&detpid);
@@ -622,18 +623,18 @@ impl GlobalState {
         }
     }
 
-    /// Releases all physical-process-exit barriers after a backend supervisor has drained every
-    /// tracee and no guest thread can race another lifecycle event.
+    /// Reports every remaining physical process exit after a backend supervisor has drained every
+    /// tracee. The scheduler releases the barriers at its next loop-top maintenance point.
     pub fn release_all_physical_process_exits(&self) {
         self.pending_exec_states.lock().unwrap().clear();
         self.post_exec_fd_blocking.lock().unwrap().clear();
-        let released = self
+        let reported = self
             .sched
             .lock()
             .unwrap()
             .release_all_physical_process_exits();
-        if released != 0 {
-            trace!("released {released} final physical process-exit barrier(s)");
+        if reported != 0 {
+            trace!("reported {reported} final physical process exit(s)");
         }
     }
 
@@ -3280,7 +3281,7 @@ where
     }
 }
 
-/// Wait without requesting a scheduler turn for a backend's physical-exit report.
+/// Wait without requesting a scheduler turn for a backend's physical-exit report to be applied.
 pub async fn await_exact_child_physical_exit<G, T>(
     guest: &mut G,
     child: DetPid,
@@ -4493,6 +4494,95 @@ mod tests {
         state.complete_physical_process_exit(detpid.as_raw());
         assert!(state.pending_exec_states.lock().unwrap().is_empty());
         assert!(state.post_exec_fd_blocking.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn physical_exit_public_report_waits_for_actual_scheduler_completion() {
+        for report_all in [false, true] {
+            let config = Config {
+                backend_reports_physical_process_exits: true,
+                ..Config::default()
+            };
+            let state = std::sync::Arc::new(GlobalState::initialize(&config, false));
+            let parent = DetPid::from_raw(100);
+            let child = DetPid::from_raw(200);
+            {
+                let mut scheduler = state.sched.lock().unwrap();
+                scheduler.thread_tree.add_child(parent, parent, true);
+                scheduler.thread_tree.add_child(parent, child, true);
+                scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
+                scheduler.started_up.put(());
+                assert_eq!(
+                    scheduler.exact_child_wait_state(parent, child),
+                    crate::types::ExactChildWaitState::PhysicalExitPending
+                );
+            }
+
+            if report_all {
+                state.release_all_physical_process_exits();
+            } else {
+                state.complete_physical_process_exit(child.as_raw());
+            }
+            assert_eq!(
+                state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .exact_child_wait_state(parent, child),
+                crate::types::ExactChildWaitState::PhysicalExitPending,
+                "the backend callback applied the report before scheduler maintenance"
+            );
+
+            let (completed, received) = std::sync::mpsc::channel();
+            let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let worker_state = state.clone();
+            let worker_observed = observed.clone();
+            let worker = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(worker_state.run_external_scheduler(std::sync::Arc::new(
+                    move |event| worker_observed.lock().unwrap().push(event),
+                )));
+                completed.send(()).unwrap();
+            });
+            received
+                .recv_timeout(Duration::from_secs(1))
+                .expect("actual external scheduler did not apply the final report and complete");
+            worker.join().unwrap();
+            assert_eq!(
+                *observed.lock().unwrap(),
+                vec![
+                    "daemon task starting; waiting for guest thread",
+                    "guest registered; deterministic scheduler proceeding",
+                    "run queue empty; scheduler completed",
+                ]
+            );
+            assert_eq!(
+                state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .exact_child_wait_state(parent, child),
+                crate::types::ExactChildWaitState::PhysicallyExited
+            );
+            assert!(
+                state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .consume_child_wait(parent, child)
+            );
+            assert_eq!(
+                state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .exact_child_wait_state(parent, child),
+                crate::types::ExactChildWaitState::Unknown
+            );
+        }
     }
 
     #[test]
