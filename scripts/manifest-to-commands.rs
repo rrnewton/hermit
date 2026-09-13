@@ -21,6 +21,7 @@
 //! ```cargo
 //! [dependencies]
 //! serde = { version = "1", features = ["derive"] }
+//! serde_json = "1"
 //! serde_yaml = "0.9"
 //! toml = "0.8"
 //! ```
@@ -49,6 +50,8 @@ use timeouts::MAX_TIMEOUT_SECONDS;
 use timeouts::MIN_TIMEOUT_SECONDS;
 use timeouts::resolve_timeout_seconds;
 
+const HERMIT_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+const NAKED_BACKENDS: [&str; 1] = ["native"];
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
@@ -68,6 +71,26 @@ fn repo_root() -> PathBuf {
 }
 
 fn shell_quote(value: &str) -> String {
+    if value.bytes().any(|byte| !(b' '..=b'~').contains(&byte)) {
+        let mut quoted = String::from("$'");
+        for byte in value.bytes() {
+            match byte {
+                b'\\' => quoted.push_str("\\\\"),
+                b'\'' => quoted.push_str("\\'"),
+                b'\n' => quoted.push_str("\\n"),
+                b'\r' => quoted.push_str("\\r"),
+                b'\t' => quoted.push_str("\\t"),
+                b' '..=b'~' => quoted.push(char::from(byte)),
+                _ => {
+                    quoted.push_str("\\x");
+                    quoted.push(char::from(b"0123456789abcdef"[(byte >> 4) as usize]));
+                    quoted.push(char::from(b"0123456789abcdef"[(byte & 0x0f) as usize]));
+                }
+            }
+        }
+        quoted.push('\'');
+        return quoted;
+    }
     if !value.is_empty()
         && value
             .bytes()
@@ -266,14 +289,23 @@ fn mode_guest_args(spec: &Value, mode: &str, backend: &str, id: &str) -> Vec<Str
     let by_backend = by_backend
         .as_table()
         .unwrap_or_else(|| fail(format!("{id}.modes.{mode}.guest_args must be a table")));
-    string_array(
+    let args = string_array(
         by_backend.get(backend),
         &format!("{id}.modes.{mode}.guest_args.{backend}"),
-    )
+    );
+    if args.iter().any(|argument| argument.contains('\0')) {
+        fail(format!(
+            "{id}: modes.{mode}.guest_args.{backend} contains a NUL byte, which Linux argv cannot represent"
+        ));
+    }
+    args
 }
 
-/// Append the guest's own arguments to an already-quoted guest word.
-fn guest_with_args(guest: &str, guest_args: &[String]) -> String {
+/// Append the guest's own arguments to an already-quoted guest command.
+///
+/// `sh -c` consumes the next word as `$0`, so string-form direct commands need
+/// an explicit placeholder when (and only when) manifest arguments follow.
+fn guest_with_args(test: &Value, guest: &str, guest_args: &[String]) -> String {
     if guest_args.is_empty() {
         return guest.to_owned();
     }
@@ -282,7 +314,12 @@ fn guest_with_args(guest: &str, guest_args: &[String]) -> String {
         .map(|arg| shell_quote(arg))
         .collect::<Vec<_>>()
         .join(" ");
-    format!("{guest} {rendered}")
+    let argv0 = if matches!(test.get("direct"), Some(Value::String(_))) {
+        " --"
+    } else {
+        ""
+    };
+    format!("{guest}{argv0} {rendered}")
 }
 
 fn hermit_command(
@@ -388,6 +425,8 @@ fn commands_for_test(test: &Value, bucket: &str, inherited_timeout_seconds: i64)
             let runs = spec.get("runs").and_then(Value::as_integer).unwrap_or(3);
             let timeout =
                 cell_timeout_seconds(spec, "native", inherited_timeout_seconds, &id, mode);
+            let guest_args = mode_guest_args(spec, mode, "native", &id);
+            let guest = guest_with_args(test, &guest, &guest_args);
             let run = format!("{RUN_ENV} {guest}");
             lines.push(format!(
                 "{} # {id} mode=naked backend=native",
@@ -427,7 +466,7 @@ fn commands_for_test(test: &Value, bucket: &str, inherited_timeout_seconds: i64)
             let timeout =
                 cell_timeout_seconds(spec, &backend, inherited_timeout_seconds, &id, mode);
             let guest_args = mode_guest_args(spec, mode, &backend, &id);
-            let guest = guest_with_args(&guest, &guest_args);
+            let guest = guest_with_args(test, &guest, &guest_args);
             let mut invocations = Vec::new();
             for seed in &seeds {
                 let seed = (mode == "chaos").then_some(*seed);
@@ -460,17 +499,24 @@ fn commands_for_test(test: &Value, bucket: &str, inherited_timeout_seconds: i64)
     lines
 }
 
-/// Emit every declared per-backend guest-argument vector as TSV on stdout:
-/// `<test-id>\t<mode>\t<backend>\t<arg>...`, sorted, one line per cell.
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize)]
+struct GuestArgsRecord {
+    test_id: String,
+    mode: String,
+    backend: String,
+    args: Vec<String>,
+}
+
+/// Emit every declared per-backend guest-argument vector as JSON Lines on
+/// stdout, sorted by test id, mode, and backend.
 ///
 /// This is the machine-readable form of the same `guest_args` the generated
 /// commands embed, so an out-of-tree harness (the `compat-envelope` corpus
 /// collector) can invoke a guest correctly without maintaining a second copy of
-/// the argument list, which would drift. Cells with no declared arguments are
-/// omitted rather than emitted empty, so a consumer can distinguish "declared
-/// nothing" from "not in the manifests" only by the test id's absence.
-fn guest_args_tsv(tests: &[(String, i64, Value)]) -> Vec<String> {
-    let mut lines = Vec::new();
+/// the argument list, which would drift. JSON preserves empty strings, tabs,
+/// newlines, and explicitly empty vectors without delimiter ambiguity.
+fn guest_args_json_lines(tests: &[(String, i64, Value)]) -> Result<Vec<String>, String> {
+    let mut records = Vec::new();
     for (bucket, _, test) in tests {
         let id = test_id(test, bucket);
         let Some(modes) = test.get("modes").and_then(Value::as_table) else {
@@ -480,23 +526,55 @@ fn guest_args_tsv(tests: &[(String, i64, Value)]) -> Vec<String> {
         mode_names.sort_unstable();
         for mode in mode_names {
             let spec = &modes[mode];
-            let backends = match spec.get("backends_enabled") {
-                Some(value) => {
-                    string_array(Some(value), &format!("{id}.modes.{mode}.backends_enabled"))
-                }
-                None => continue,
+            let known_backends = if mode == "naked" {
+                &NAKED_BACKENDS[..]
+            } else {
+                &HERMIT_BACKENDS[..]
             };
+            let Some(by_backend) = spec.get("guest_args") else {
+                continue;
+            };
+            let by_backend = by_backend
+                .as_table()
+                .unwrap_or_else(|| fail(format!("{id}.modes.{mode}.guest_args must be a table")));
+            let enabled = string_array(
+                spec.get("backends_enabled"),
+                &format!("{id}.modes.{mode}.backends_enabled"),
+            );
+            let disabled = spec.get("backends_disabled").and_then(Value::as_table);
+            let mut backends = by_backend.keys().map(String::as_str).collect::<Vec<_>>();
+            backends.sort_unstable();
             for backend in backends {
-                let args = mode_guest_args(spec, mode, &backend, &id);
-                if args.is_empty() {
-                    continue;
+                if !known_backends.contains(&backend) {
+                    return Err(format!(
+                        "{id}: modes.{mode}.guest_args.{backend} names unknown backend for this mode; expected one of {known_backends:?}"
+                    ));
                 }
-                lines.push(format!("{id}\t{mode}\t{backend}\t{}", args.join("\t")));
+                if !enabled.iter().any(|name| name == backend)
+                    && !disabled.is_some_and(|backends| backends.contains_key(backend))
+                {
+                    return Err(format!(
+                        "{id}: modes.{mode}.guest_args.{backend} names a backend outside backends_enabled/backends_disabled"
+                    ));
+                }
+                let args = mode_guest_args(spec, mode, backend, &id);
+                records.push(GuestArgsRecord {
+                    test_id: id.clone(),
+                    mode: mode.to_owned(),
+                    backend: backend.to_owned(),
+                    args,
+                });
             }
         }
     }
-    lines.sort();
-    lines
+    records.sort();
+    records
+        .iter()
+        .map(|record| {
+            serde_json::to_string(record)
+                .map_err(|error| format!("cannot encode guest arguments as JSON: {error}"))
+        })
+        .collect()
 }
 
 // TODO-HUMAN-REVIEW(PR-1081): Review the manifest-to-command CLI and generated shell contract.
@@ -508,7 +586,7 @@ YAML manifests in tests/e2e/manifests/. It discovers the repo root from git and
 rewrites the generated *.txt files in place.
 
   --guest-args  Write nothing; print the declared per-backend guest arguments as
-                TSV (`<test-id> <mode> <backend> <arg>...`) on stdout instead.";
+                JSON Lines records on stdout instead.";
 
 /// Parse every manifest under `manifests`, resolving the inherited timeout and
 /// returning `(bucket, timeout_seconds, test)` tuples in file order.
@@ -602,7 +680,9 @@ fn main() -> ExitCode {
     let root = repo_root();
     let manifests = root.join("tests/e2e/manifests");
     if std::env::args().skip(1).any(|a| a == "--guest-args") {
-        for line in guest_args_tsv(&load_manifest_tests(&manifests)) {
+        let lines = guest_args_json_lines(&load_manifest_tests(&manifests))
+            .unwrap_or_else(|error| fail(error));
+        for line in lines {
             println!("{line}");
         }
         return ExitCode::SUCCESS;
@@ -679,9 +759,12 @@ test:
     modes:
       verify:
         backends_enabled: [ptrace, liteinst]
+        backends_disabled:
+          kvm: not selected for ordinary validation
         guest_args:
           ptrace: [multi, value with spaces]
           liteinst: [edge]
+          kvm: [kvm-edge]
 "#;
 
     /// POSITIVE side: a declared argument vector must reach the guest word, and
@@ -693,7 +776,7 @@ test:
         let args = mode_guest_args(spec, "verify", "ptrace", "c-programs/example");
         assert_eq!(args, vec!["multi", "value with spaces"]);
         assert_eq!(
-            guest_with_args("\"$cell/guest\"", &args),
+            guest_with_args(&tests[0].2, "\"$cell/guest\"", &args),
             "\"$cell/guest\" multi 'value with spaces'"
         );
     }
@@ -732,7 +815,161 @@ test:
         let spec = &tests[0].2["modes"]["verify"];
         let args = mode_guest_args(spec, "verify", "ptrace", "c-programs/bare");
         assert!(args.is_empty());
-        assert_eq!(guest_with_args("\"$cell/guest\"", &args), "\"$cell/guest\"");
+        assert_eq!(
+            guest_with_args(&tests[0].2, "\"$cell/guest\"", &args),
+            "\"$cell/guest\""
+        );
+    }
+
+    #[test]
+    fn string_direct_commands_are_one_line_and_preserve_exact_arguments() {
+        let without_args = manifest(
+            r#"
+test:
+  - id: c-programs/direct-string-empty
+    direct: 'printf "%s\0" "$0" "$@"'
+    modes:
+      naked:
+        backends_enabled: [native]
+        runs: 3
+        guest_args:
+          native: []
+"#,
+        );
+        let (_, guest) = setup_prefix(&without_args[0].2, "c-programs/direct-string-empty");
+        assert_eq!(
+            guest_with_args(&without_args[0].2, &guest, &[]),
+            "sh -c 'printf \"%s\\0\" \"$0\" \"$@\"'"
+        );
+        let commands = commands_for_test(&without_args[0].2, "c-programs", 15);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].lines().count(), commands.len());
+        let empty_dir =
+            std::env::temp_dir().join(format!("manifest-direct-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty_dir);
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&commands[0])
+            .current_dir(&empty_dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"sh\0sh\0sh\0");
+        std::fs::remove_dir_all(empty_dir).unwrap();
+
+        let with_args = manifest(
+            r#"
+test:
+  - id: c-programs/direct-string-arguments
+    direct: 'printf "%s\0" "$0" "$@"'
+    modes:
+      naked:
+        backends_enabled: [native]
+        runs: 3
+        guest_args:
+          native: ['', "tab\tinside", "line\ninside"]
+"#,
+        );
+        let (_, guest) = setup_prefix(&with_args[0].2, "c-programs/direct-string-arguments");
+        assert_eq!(
+            guest_with_args(
+                &with_args[0].2,
+                &guest,
+                &["".into(), "tab\tinside".into(), "line\ninside".into()]
+            ),
+            "sh -c 'printf \"%s\\0\" \"$0\" \"$@\"' -- '' $'tab\\tinside' $'line\\ninside'"
+        );
+        let commands = commands_for_test(&with_args[0].2, "c-programs", 15);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].lines().count(), commands.len());
+        let args_dir =
+            std::env::temp_dir().join(format!("manifest-direct-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&args_dir);
+        std::fs::create_dir_all(&args_dir).unwrap();
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&commands[0])
+            .current_dir(&args_dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout,
+            b"--\0\0tab\tinside\0line\ninside\0--\0\0tab\tinside\0line\ninside\0--\0\0tab\tinside\0line\ninside\0"
+        );
+        std::fs::remove_dir_all(args_dir).unwrap();
+    }
+
+    #[test]
+    fn program_commands_are_one_line_and_preserve_exact_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let work = std::env::temp_dir().join(format!("manifest-program-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let script = work.join("argv.sh");
+        std::fs::write(
+            &script,
+            b"#!/usr/bin/env bash\ncase \"$1\" in --prepare) exit 0;; --run) shift; printf '%s\\0' \"$@\";; *) exit 2;; esac\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let tests = manifest(&format!(
+            r#"
+test:
+  - id: c-programs/program-arguments
+    program: {}
+    modes:
+      naked:
+        backends_enabled: [native]
+        runs: 3
+        guest_args:
+          native: ['', "tab\tinside", "line\ninside"]
+"#,
+            script.display()
+        ));
+        let commands = commands_for_test(&tests[0].2, "c-programs", 15);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].lines().count(), commands.len());
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&commands[0])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            output.stdout,
+            b"\0tab\tinside\0line\ninside\0\0tab\tinside\0line\ninside\0\0tab\tinside\0line\ninside\0"
+        );
+        std::fs::remove_dir_all(work).unwrap();
+    }
+
+    #[test]
+    fn naked_command_appends_native_guest_arguments() {
+        let tests = manifest(
+            r#"
+test:
+  - id: c-programs/native-args
+    direct: [/bin/echo]
+    modes:
+      naked:
+        backends_enabled: [native]
+        guest_args:
+          native: [native-scenario]
+"#,
+        );
+        let commands = commands_for_test(&tests[0].2, "c-programs", 15);
+        assert_eq!(commands.len(), 1);
+        assert!(
+            commands[0].contains("native-scenario"),
+            "naked command omitted its explicit native guest argument: {}",
+            commands[0]
+        );
     }
 
     /// A backend that is enabled but not named in `guest_args` gets nothing,
@@ -755,12 +992,11 @@ test:
         assert!(mode_guest_args(spec, "verify", "kvm", "c-programs/partial").is_empty());
     }
 
-    /// The TSV dump is the out-of-tree harness's only source for these
+    /// The JSON Lines dump is the out-of-tree harness's only source for these
     /// arguments, so its shape is a contract: one line per (id, mode, backend)
-    /// that declares arguments, sorted, tab-separated, and cells declaring
-    /// nothing omitted entirely.
+    /// that declares arguments, sorted, and cells declaring nothing omitted.
     #[test]
-    fn guest_args_tsv_emits_one_sorted_line_per_declaring_cell() {
+    fn guest_args_json_lines_emit_one_sorted_record_per_declaring_cell() {
         let mut tests = manifest(DECLARED);
         tests.extend(manifest(
             r#"
@@ -772,17 +1008,108 @@ test:
         backends_enabled: [ptrace]
 "#,
         ));
-        let lines = guest_args_tsv(&tests);
+        let lines = guest_args_json_lines(&tests).expect("valid guest_args must export");
         assert_eq!(
             lines,
             vec![
-                "c-programs/example\tverify\tliteinst\tedge",
-                "c-programs/example\tverify\tptrace\tmulti\tvalue with spaces",
+                r#"{"test_id":"c-programs/example","mode":"verify","backend":"kvm","args":["kvm-edge"]}"#,
+                r#"{"test_id":"c-programs/example","mode":"verify","backend":"liteinst","args":["edge"]}"#,
+                r#"{"test_id":"c-programs/example","mode":"verify","backend":"ptrace","args":["multi","value with spaces"]}"#,
             ]
         );
         assert!(
             !lines.iter().any(|line| line.starts_with("c-programs/bare")),
             "a cell declaring no guest_args must not appear in the dump"
+        );
+    }
+
+    #[test]
+    fn guest_args_json_lines_reject_a_globally_unknown_disabled_backend() {
+        let tests = manifest(
+            r#"
+test:
+  - id: c-programs/unknown-backend
+    program: tests/c/unknown-backend.c
+    modes:
+      verify:
+        backends_enabled: [ptrace]
+        backends_disabled:
+          kvm: not selected for ordinary validation
+          ptrcae: misspelled backend must never be exported
+        guest_args:
+          ptrcae: [multi]
+"#,
+        );
+        let error = guest_args_json_lines(&tests).expect_err("unknown backend must be rejected");
+        assert_eq!(
+            error,
+            "c-programs/unknown-backend: modes.verify.guest_args.ptrcae names unknown backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
+        );
+    }
+
+    #[test]
+    fn guest_args_json_lines_accept_native_only_for_naked_mode() {
+        let naked = manifest(
+            r#"
+test:
+  - id: c-programs/native-args
+    program: tests/c/native-args.c
+    modes:
+      naked:
+        backends_enabled: [native]
+        guest_args:
+          native: [native-scenario]
+"#,
+        );
+        assert_eq!(
+            guest_args_json_lines(&naked).expect("native is the naked-mode backend"),
+            [
+                r#"{"test_id":"c-programs/native-args","mode":"naked","backend":"native","args":["native-scenario"]}"#
+            ]
+        );
+
+        let normal = manifest(
+            r#"
+test:
+  - id: c-programs/native-args
+    program: tests/c/native-args.c
+    modes:
+      verify:
+        backends_enabled: [ptrace]
+        backends_disabled:
+          native: invalid outside naked mode
+        guest_args:
+          native: [native-scenario]
+"#,
+        );
+        assert_eq!(
+            guest_args_json_lines(&normal).expect_err("native must be rejected outside naked mode"),
+            "c-programs/native-args: modes.verify.guest_args.native names unknown backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
+        );
+    }
+
+    #[test]
+    fn guest_args_json_lines_preserve_empty_vectors_and_special_arguments() {
+        let tests = manifest(
+            r#"
+test:
+  - id: c-programs/empty-args
+    program: tests/c/empty-args.c
+    modes:
+      verify:
+        backends_enabled: [ptrace, kvm]
+        guest_args:
+          kvm: []
+          ptrace: ['', "tab\tinside", "line\ninside"]
+"#,
+        );
+        let lines = guest_args_json_lines(&tests).expect("Linux-valid arguments must export");
+        assert_eq!(
+            lines,
+            [
+                r#"{"test_id":"c-programs/empty-args","mode":"verify","backend":"kvm","args":[]}"#,
+                r#"{"test_id":"c-programs/empty-args","mode":"verify","backend":"ptrace","args":["","tab\tinside","line\ninside"]}"#,
+            ]
         );
     }
 
