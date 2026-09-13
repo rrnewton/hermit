@@ -73,6 +73,8 @@ const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     "E2E_RESULT_ROOT",
     "E2E_RUN_ID",
     "HERMIT_E2E_EMPTY_WORKDIR",
+    crate::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV,
+    crate::timeouts::TEST_WALL_TIMEOUT_MULTIPLIER_ENV,
     "HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT",
     "L4_REPS",
     "PR_NUMBER",
@@ -390,6 +392,33 @@ fn pinned_root_command(step: &Step) -> String {
         .join(" ")
 }
 
+// The authored source already contains wrapped manifest commands. Keep their
+// command payload unchanged while carrying the current environment policy into
+// the outer wrapper; otherwise only newly cloned producers see added settings.
+fn refresh_pinned_root_environment(tag: &str, command: &str) -> Result<String, String> {
+    let (header, payload) = command
+        .split_once(" -- bash -c ")
+        .ok_or_else(|| format!("{tag} has an unrecognized pinned-root command boundary"))?;
+    let words = header.split_whitespace().collect::<Vec<_>>();
+    let mut refreshed = header.to_owned();
+    for name in PINNED_ROOT_FORWARDED_ENV {
+        let count = words
+            .windows(2)
+            .filter(|pair| pair[0] == "--env" && pair[1] == *name)
+            .count();
+        match count {
+            0 => refreshed.push_str(&format!(" --env {name}")),
+            1 => {}
+            _ => {
+                return Err(format!(
+                    "{tag} forwards pinned-root environment name {name} more than once"
+                ));
+            }
+        }
+    }
+    Ok(format!("{refreshed} -- bash -c {payload}"))
+}
+
 fn pinned_root_fetch() -> Result<Step, String> {
     let text = format!(
         r#"{{"description":"Pinned-root fetch node","steps":[{{"group":"setup","job":"pinned_root_fetch","desc":"Fetch locked Cargo inputs","description":"Fetch locked Cargo inputs before network-disabled pinned-root commands.","cmd":{},"deps":[],"env":{{"VALIDATE_VERBOSITY":"1"}},"labels":[],"result_manifests":[],"timeout":600,"cpu_timeout":600,"hint":{{"rss_baseline_bytes":1073741824,"hard_mem_max_bytes":1073741824}},"fail_fast_family":"setup.pinned_root_fetch"}}]}}"#,
@@ -430,8 +459,8 @@ fn materialize_hosted_portable_selection(cfg: &mut DagConfig) {
 /// This transform belongs to maintenance-time generation. Runtime validation
 /// sends the selected committed graph to dagrun without cloning producers or
 /// rewriting commands/dependencies. Existing twins are replaced from their
-/// host-side producers, while already-wrapped manifest commands remain the
-/// authored source text in the sole committed DAG.
+/// host-side producers. Already-wrapped manifest commands retain their authored
+/// inner commands while their outer environment forwarding follows this policy.
 fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
     cfg.steps.retain(|step| {
         step.tag() != PINNED_ROOT_FETCH_TAG && !step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX)
@@ -494,6 +523,8 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
         step.deps.dedup();
         if !step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
             step.cmd = pinned_root_command(step);
+        } else {
+            step.cmd = refresh_pinned_root_environment(&step.tag(), &step.cmd)?;
         }
     }
 
