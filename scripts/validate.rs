@@ -20662,7 +20662,7 @@ mod committed_selection_preservation_tests {
                 let mut argv = vec!["--only".into(), lane.into(), target.into()];
                 if off_record { argv.push(ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into()); }
                 let args = parse_argv(&argv).unwrap();
-                let plan = build_plan(&root, &args, temp.path()).unwrap();
+                let plan = build_plan(root, &args, temp.path()).unwrap();
                 assert!(plan.cfg.steps.iter().any(|step| step.tag() == failed_gate));
                 let fixture = plan.cfg.with_steps(plan.cfg.steps.iter().map(|source| {
                     let cmd = match source.tag().as_str() {
@@ -20693,7 +20693,7 @@ mod committed_selection_preservation_tests {
     #[test]
     fn portable_failure_preserves_independent_privileged_work_and_shared_exclusion() {
         let root = Path::new(file!()).parent().and_then(Path::parent).expect("validate.rs has a repository parent");
-        let committed = validate_plan::validation_config(&root).unwrap();
+        let committed = validate_plan::validation_config(root).unwrap();
         let tags = ["test.cli", "privileged-build.privileged_tests", "privileged-test.cli_kvm"];
         let selected = dagrun::select_steps_by_tags(&committed, &tags.iter().map(|tag| tag.to_string()).collect::<Vec<_>>(), true).unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -20796,7 +20796,7 @@ mod fused_privileged_build_tests {
         let before = std::fs::read_to_string(&log).unwrap();
         let expected = hermit_manifest_plan::nextest_binaries::profile_selections(repository, "portable").unwrap();
         let calls = before.lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
-        let builds = calls.iter().filter(|args| args.get(0).map(String::as_str) == Some("nextest") && !args.iter().any(|arg| arg == "--binaries-metadata")).collect::<Vec<_>>();
+        let builds = calls.iter().filter(|args| args.first().map(String::as_str) == Some("nextest") && !args.iter().any(|arg| arg == "--binaries-metadata")).collect::<Vec<_>>();
         assert_eq!(builds.len(), expected.len(), "each distinct selection is prepared once");
         for selection in expected.values() {
             assert_eq!(builds.iter().filter(|args| args.ends_with(selection)).count(), 1, "missing or duplicated selection {selection:?}");
