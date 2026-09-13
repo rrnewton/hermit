@@ -246,15 +246,18 @@ impl Scheduler {
         if let Some(fatal) = &self.child_exits.fatal {
             return Err(fatal.clone());
         }
-        let Some(delivery) = self.child_exits.due.values().next().cloned() else {
-            return Ok(None);
-        };
-        let targets = self.process_signal_targets(delivery.parent);
-        if targets.is_empty() {
-            // The whole destination process has retired. No replacement task owns its event.
+        let (delivery, targets) = loop {
+            let Some(delivery) = self.child_exits.due.values().next().cloned() else {
+                return Ok(None);
+            };
+            let targets = self.process_signal_targets(delivery.parent);
+            if !targets.is_empty() {
+                break (delivery, targets);
+            }
+            // The whole destination process has retired. No replacement task owns
+            // its event. Iterate in the same delivery order without growing the stack.
             self.child_exits.due.remove(&delivery.id);
-            return self.dispatch_child_exit_control();
-        }
+        };
         if targets.len() != 1 {
             self.refuse_virtual_signal_route(delivery.parent);
             return Err(self.child_exits.fatal.clone().unwrap());
@@ -422,6 +425,83 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_child_exit_destinations_preserve_the_first_live_delivery() {
+        let config = Config {
+            backend_uses_virtual_signal_targets: true,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let parent = DetPid::from_raw(3);
+        let child = DetPid::from_raw(4);
+        scheduler.thread_tree.add_child(parent, parent, true);
+        let original = Resources::new(parent);
+        let request = Ivar::full(Ok(original.clone()));
+        let response = Ivar::new();
+        scheduler.next_turns.insert(
+            parent,
+            ThreadNextTurn {
+                dettid: parent,
+                child_tid_addr: 0,
+                req: request.clone(),
+                resp: response.clone(),
+            },
+        );
+        let operation = scheduler
+            .begin_child_exit_operation(
+                parent,
+                MmId::initial(parent),
+                parent,
+                original.clone(),
+                LogicalTime::ZERO,
+            )
+            .unwrap();
+        let first_live = Delivery {
+            id: 513,
+            child,
+            child_mm: MmId::initial(child),
+            parent,
+            exit: NormalExit {
+                status: 37,
+                uid: 0,
+                user_ticks: 23,
+                system_ticks: 11,
+            },
+            deadline: LogicalTime::from_nanos(1),
+        };
+        // Insert in the opposite order. Selection must retain the delivery IDs'
+        // existing order while discarding every already-retired destination.
+        for id in (1..=514).rev() {
+            let mut delivery = first_live.clone();
+            delivery.id = id;
+            if id < first_live.id {
+                delivery.parent = DetPid::from_raw(999);
+            }
+            scheduler.child_exits.due.insert(id, delivery);
+        }
+        assert!(matches!(
+            scheduler.dispatch_child_exit_control().unwrap(),
+            Some(ControlWait::Acknowledgement(_))
+        ));
+        let Some(SchedResponse::DeliverChildExit(command)) = response.try_read() else {
+            panic!("the first live delivery was lost")
+        };
+        assert_eq!(command.operation, operation.id);
+        assert_eq!(command.delivery, first_live);
+        assert_eq!(
+            scheduler
+                .child_exits
+                .due
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![513, 514]
+        );
+        assert_eq!(scheduler.next_turns[&parent].req, request);
+        assert_eq!(operation.original, original);
+        assert_eq!(scheduler.turn, 0);
+    }
 
     #[test]
     fn zero_clone_exit_signal_keeps_wait_evidence_without_child_notification() {
