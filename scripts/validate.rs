@@ -20805,6 +20805,14 @@ mod fused_privileged_build_tests {
         let read_only = run_build(&consumer.cmd, root.path(), &bin, &log, "current");
         assert!(read_only.status.success(), "{}", String::from_utf8_lossy(&read_only.stderr));
         assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "the privileged consumer must not invoke Cargo after preparation");
+        let record_path = root.path().join("target/ci/nextest-binaries/current.json");
+        let published_record = std::fs::read(&record_path).unwrap();
+        let declined = run_build(preparation, root.path(), &bin, &log, "declined");
+        assert_eq!(declined.status.code(), Some(75), "a declined Cargo preparation must remain no-result");
+        assert_eq!(std::fs::read(&record_path).unwrap(), published_record, "a declined replacement must preserve the prior complete record");
+        let before = std::fs::read_to_string(&log).unwrap();
+        assert!(run_build(&consumer.cmd, root.path(), &bin, &log, "current").status.success(), "unchanged prior preparation must remain usable after a declined replacement");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), before, "using the prior preparation must not invoke Cargo");
         let executable = run_build("./ci/nextest-binaries.rs executable hermit-detcore tests_misc", root.path(), &bin, &log, "current");
         assert!(executable.status.success());
         let executable = PathBuf::from(String::from_utf8(executable.stdout).unwrap().trim());

@@ -64,7 +64,8 @@ the same committed superset on demand.
 
 The workspace producers prepare each distinct Cargo test selection before its
 Nextest consumers run. The committed graph records the exact Cargo selectors
-for every counted runner, including the KVM inventory commands. The generator
+for every counted runner, the embedded KVM inventory commands, and the direct
+CPUID `tests_misc` lookup. The generator
 checks those declarations against the command arguments and requires a producer
 in each consumer's dependency ancestry. The full privileged barrier verifies
 its three selections without rebuilding shared test executables.
@@ -93,6 +94,12 @@ The quick build now depends on Nextest setup because preparation needs it.
 This adds the existing 600-second setup timeout to its worst-case dependency
 path (8580 to 9180 seconds); individual node timeouts and CPU caps are unchanged.
 These sums are scheduling bounds, not measured preparation or execution times.
+The pressure runner's batch preparation similarly retains the Nextest setup
+prerequisite: ten nodes including LiteInst, or nine without it. This adds 600
+seconds to those declared preparation paths (6000 and 5100 seconds), while
+preserving the existing 7200-second whole-run bound and the smaller exact-cell
+preparation sets. The pinned image already includes Nextest 0.9.100; its
+separate mounted Cargo target keeps image metadata distinct from host metadata.
 
 ### Runner dependency
 
