@@ -466,12 +466,12 @@ def safehermit_path(root: Path) -> Path:
     return Path(override).resolve() if override else Path(root) / "bin/safehermit"
 
 
-def _tool_version(command: Sequence[str]) -> str:
+def _tool_version(command: Sequence[str], *, merge_stderr: bool = True) -> str:
     try:
         result = subprocess.run(
             list(command),
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
             check=False,
             text=True,
             timeout=20,
@@ -525,7 +525,10 @@ def save_metadata(
                 str(safehermit_path(Path(__file__).resolve().parents[2])),
                 os.environ.get("HERMIT_RELEASE", "hermit"),
                 "--version",
-            ]
+            ],
+            # safehermit reports bounds on stderr before the binary prints its
+            # version. Preserve that separation when recording the identity.
+            merge_stderr=False,
         ),
         "qemu_version": _tool_version([qemu, "--version"]),
         "qemu_binary_sha256": _tool_sha256(qemu),

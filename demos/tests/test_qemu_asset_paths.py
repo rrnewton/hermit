@@ -158,7 +158,18 @@ class DefaultQemuAssetsTest(unittest.TestCase):
             ) as version:
                 with self.assertRaises(StopBeforeProbe):
                     dc.save_metadata(run_dir, None, info_log)
-            version.assert_called_once_with([str(chosen), "/selected/hermit", "--version"])
+            version.assert_called_once_with(
+                [str(chosen), "/selected/hermit", "--version"], merge_stderr=False
+            )
+
+    def test_version_stdout_is_not_replaced_by_wrapper_diagnostics(self):
+        command = [
+            sys.executable, "-c",
+            "import sys; sys.stderr.write('safehermit: unit=fixture\\n'); "
+            "sys.stderr.flush(); sys.stdout.write('hermit fixture-version\\n')",
+        ]
+        self.assertEqual(dc._tool_version(command, merge_stderr=False), "hermit fixture-version")
+        self.assertEqual(dc._tool_version(command), "safehermit: unit=fixture")
 
     def test_make_uses_shared_default_and_preserves_override(self):
         self.assertEqual(_make_default(), dc.default_qemu_assets(DEMO_DIR.parent))
