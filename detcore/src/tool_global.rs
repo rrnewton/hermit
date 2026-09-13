@@ -3853,6 +3853,313 @@ mod tests {
                 );
             }
         }
+        mod child_exit_callback {
+            use std::process::Command as ProcessCommand;
+            use std::process::Stdio;
+            use std::time::Duration;
+            use std::time::Instant;
+
+            use super::*;
+            use crate::child_exit;
+
+            struct ControlGuest {
+                base: RpcGuest,
+                command: child_exit::Command,
+                mode: String,
+                calls: AtomicUsize,
+                queued: usize,
+            }
+
+            impl ControlGuest {
+                fn new(mode: &str) -> Self {
+                    let mut base = RpcGuest::new((None, GlobalResponse::ThreadExited));
+                    base.cfg.sequentialize_threads = true;
+                    base.state.detpid = Some(DetPid::from_raw(3));
+                    let command = child_exit::Command::new(
+                        child_exit::OperationId {
+                            tid: base.state.dettid,
+                            mm: base.state.mm_id,
+                            sequence: 1,
+                        },
+                        child_exit::Delivery {
+                            id: 1,
+                            child: DetPid::from_raw(6),
+                            child_mm: MmId::initial(DetPid::from_raw(6)),
+                            parent: DetPid::from_raw(3),
+                            exit: child_exit::NormalExit {
+                                status: 37,
+                                uid: 0,
+                                user_ticks: 23,
+                                system_ticks: 11,
+                            },
+                            deadline: LogicalTime::from_nanos(91),
+                        },
+                    );
+                    Self {
+                        base,
+                        command,
+                        mode: mode.into(),
+                        calls: AtomicUsize::new(0),
+                        queued: 0,
+                    }
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl GlobalRPC<GlobalState> for ControlGuest {
+                async fn send_rpc(
+                    &self,
+                    (clock, mm, request): (DetTime, MmId, GlobalRequest),
+                ) -> (Option<LogicalTime>, GlobalResponse) {
+                    assert_eq!(
+                        serde_json::to_value(clock).unwrap(),
+                        self.base.initial_clock
+                    );
+                    assert_eq!(mm, self.base.state.mm_id);
+                    match self.calls.fetch_add(1, Ordering::SeqCst) {
+                        0 => {
+                            assert_eq!(request, self.base.request);
+                            (None, GlobalResponse::DeliverChildExit(self.command.clone()))
+                        }
+                        1 => {
+                            assert_eq!(self.queued, 1);
+                            assert_eq!(
+                                request,
+                                GlobalRequest::AcknowledgeChildExit {
+                                    operation: self.command.operation,
+                                    delivery_id: self.command.delivery.id,
+                                    outcome: child_exit::Outcome::Accepted {
+                                        disposition: child_exit::Disposition::PendingBlocked,
+                                        pending_generation: 41,
+                                        coalesced: true,
+                                    },
+                                }
+                            );
+                            if self.mode == "drop-ack" {
+                                eprintln!("CHILD_EXIT_ACK_SUSPENDED: requests=1 queues=1 acks=1");
+                                return std::future::pending().await;
+                            }
+                            if self.mode.starts_with("ordinary-") {
+                                let time = (self.mode == "ordinary-clock")
+                                    .then_some(LogicalTime::from_secs(1));
+                                (time, GlobalResponse::RequestResources(ResumeStatus::Normal))
+                            } else {
+                                assert_eq!(self.mode, "late-accepted");
+                                (None, GlobalResponse::ThreadExited)
+                            }
+                        }
+                        _ => panic!("the original resource request was published twice"),
+                    }
+                }
+
+                fn config(&self) -> &Config {
+                    &self.base.cfg
+                }
+            }
+
+            #[async_trait::async_trait]
+            impl Guest<Detcore<NoopTool>> for ControlGuest {
+                type Memory = LocalMemory;
+                type Stack = UnusedStack;
+                fn tid(&self) -> Pid {
+                    Pid::from_raw(123_457)
+                }
+                fn pid(&self) -> Pid {
+                    Pid::from_raw(123_456)
+                }
+                fn ppid(&self) -> Option<Pid> {
+                    None
+                }
+                fn memory(&self) -> LocalMemory {
+                    panic!("control accessed guest memory")
+                }
+                fn thread_state(&self) -> &ThreadState<()> {
+                    &self.base.state
+                }
+                fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+                    &mut self.base.state
+                }
+                async fn regs(&mut self) -> libc::user_regs_struct {
+                    panic!("control accessed registers")
+                }
+                async fn stack(&mut self) -> UnusedStack {
+                    panic!("control accessed stack")
+                }
+                async fn daemonize(&mut self) {
+                    panic!("control daemonized guest")
+                }
+                async fn inject<S: SyscallInfo>(&mut self, _: S) -> Result<i64, Errno> {
+                    panic!("control injected a syscall")
+                }
+                async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> Never {
+                    panic!("control cancellation used a syscall return frame")
+                }
+                async fn queue_child_exit_signal(
+                    &mut self,
+                    event: reverie::SignalEvent,
+                ) -> reverie::ChildExitSignalOutcome {
+                    self.queued += 1;
+                    assert_eq!(self.queued, 1);
+                    assert_eq!(self.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(
+                        event.target(),
+                        reverie::SignalTarget::Process {
+                            pid: Pid::from_raw(123_456)
+                        }
+                    );
+                    assert_eq!(event.signal(), libc::SIGCHLD);
+                    assert_eq!(event.siginfo(), self.command.siginfo);
+                    let bytes = event.siginfo();
+                    assert_eq!(i32::from_ne_bytes(bytes[16..20].try_into().unwrap()), 6);
+                    assert_eq!(i32::from_ne_bytes(bytes[24..28].try_into().unwrap()), 37);
+                    assert_eq!(u64::from_ne_bytes(bytes[32..40].try_into().unwrap()), 23);
+                    assert_eq!(u64::from_ne_bytes(bytes[40..48].try_into().unwrap()), 11);
+                    if self.mode == "drop-backend" {
+                        eprintln!("CHILD_EXIT_BACKEND_SUSPENDED: requests=1 queues=1 acks=0");
+                        return std::future::pending().await;
+                    }
+                    reverie::ChildExitSignalOutcome::Accepted {
+                        disposition: reverie::ChildExitSignalDisposition::PendingBlocked,
+                        pending_generation: 41,
+                        coalesced: true,
+                    }
+                }
+                async fn cancel_current_thread(&mut self) -> Never {
+                    self.base.cancellations += 1;
+                    assert_eq!(self.base.cancellations, 1);
+                    assert_eq!(self.calls.load(Ordering::SeqCst), 2);
+                    assert_eq!(self.queued, 1);
+                    assert_eq!(
+                        serde_json::to_value(&self.base.state.thread_logical_time).unwrap(),
+                        self.base.initial_clock
+                    );
+                    eprintln!(
+                        "CHILD_EXIT_TERMINAL_CANCELLATION: requests=1 queues=1 acks=1 clock=unchanged"
+                    );
+                    std::future::pending().await
+                }
+                fn set_timer(&mut self, _: TimerSchedule) -> Result<(), reverie::Error> {
+                    panic!("control set timer")
+                }
+                fn set_timer_precise(&mut self, _: TimerSchedule) -> Result<(), reverie::Error> {
+                    panic!("control set timer")
+                }
+                fn read_clock(&mut self) -> Result<u64, reverie::Error> {
+                    panic!("control read backend clock")
+                }
+            }
+
+            #[test]
+            fn child_exit_callback_drop_and_terminal_disarm_use_the_actual_resource_helper() {
+                const CASE: &str = "HERMIT_TEST_CHILD_EXIT_CALLBACK_CASE";
+                const TEST: &str = "tool_global::tests::terminal_rpc::child_exit_callback::child_exit_callback_drop_and_terminal_disarm_use_the_actual_resource_helper";
+                if let Ok(case) = std::env::var(CASE) {
+                    let mut guest = ControlGuest::new(&case);
+                    let GlobalRequest::RequestResources(resources, _) = guest.base.request.clone()
+                    else {
+                        unreachable!()
+                    };
+                    // now_or_never polls and then drops the actual helper future at its
+                    // pending await. A missing disarm would fail even the late Accepted case.
+                    let result =
+                        crate::tool_global::resource_request(&mut guest, resources).now_or_never();
+                    if case.starts_with("ordinary-") {
+                        assert_eq!(result, Some(ResumeStatus::Normal));
+                        assert_eq!(guest.base.cancellations, 0);
+                        let mut expected = DetTime::zero();
+                        expected.add_syscall();
+                        if case == "ordinary-clock" {
+                            expected.advance_to(LogicalTime::from_secs(1));
+                        }
+                        assert_eq!(
+                            serde_json::to_value(&guest.base.state.thread_logical_time).unwrap(),
+                            serde_json::to_value(expected).unwrap()
+                        );
+                        eprintln!(
+                            "CHILD_EXIT_ORDINARY_COMPLETION: requests=1 queues=1 acks=1 cancellations=0"
+                        );
+                    } else {
+                        assert_eq!(case, "late-accepted", "abandoned callback returned");
+                        assert_eq!(result, None);
+                        assert_eq!(guest.base.cancellations, 1);
+                    }
+                    assert_eq!(guest.calls.load(Ordering::SeqCst), 2);
+                    assert_eq!(guest.queued, 1);
+                    return;
+                }
+                for (case, status, marker) in [
+                    (
+                        "drop-backend",
+                        125,
+                        "CHILD_EXIT_BACKEND_SUSPENDED: requests=1 queues=1 acks=0",
+                    ),
+                    (
+                        "drop-ack",
+                        125,
+                        "CHILD_EXIT_ACK_SUSPENDED: requests=1 queues=1 acks=1",
+                    ),
+                    (
+                        "late-accepted",
+                        0,
+                        "CHILD_EXIT_TERMINAL_CANCELLATION: requests=1 queues=1 acks=1 clock=unchanged",
+                    ),
+                    (
+                        "ordinary-no-clock",
+                        0,
+                        "CHILD_EXIT_ORDINARY_COMPLETION: requests=1 queues=1 acks=1 cancellations=0",
+                    ),
+                    (
+                        "ordinary-clock",
+                        0,
+                        "CHILD_EXIT_ORDINARY_COMPLETION: requests=1 queues=1 acks=1 cancellations=0",
+                    ),
+                ] {
+                    let start = Instant::now();
+                    let mut child = ProcessCommand::new(std::env::current_exe().unwrap())
+                        .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                        .env(CASE, case)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    let actual = loop {
+                        if let Some(status) = child.try_wait().unwrap() {
+                            break status;
+                        }
+                        if start.elapsed() >= Duration::from_secs(2) {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            panic!("{case}: callback control failed to terminate");
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    };
+                    let output = child.wait_with_output().unwrap();
+                    let stderr = String::from_utf8(output.stderr).unwrap();
+                    assert_eq!(actual.code(), Some(status), "{case}: {stderr}");
+                    assert!(start.elapsed() < Duration::from_secs(1), "{case}: {stderr}");
+                    assert!(stderr.contains(marker), "{case}: {stderr}");
+                    if status == 125 {
+                        assert!(
+                            stderr.contains(&format!(
+                                "errno={} stage=CallbackAbandoned",
+                                libc::EPROTO
+                            )),
+                            "{case}: {stderr}"
+                        );
+                        assert!(
+                            stderr.contains("operation=1 delivery=1 child=6"),
+                            "{case}: {stderr}"
+                        );
+                    } else {
+                        assert!(
+                            !stderr.contains("HERMIT_CHILD_EXIT_FAILURE"),
+                            "{case}: {stderr}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

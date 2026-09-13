@@ -514,4 +514,287 @@ mod tests {
             assert_eq!(operation.original, original);
         }
     }
+
+    #[tokio::test]
+    async fn child_exit_negative_acknowledgement_releases_both_waiters_without_grant() {
+        for outcome in [
+            Outcome::RejectedBeforeCommit {
+                kind: child_exit::ErrorKind::Unsupported,
+                errno: libc::ENOSYS,
+            },
+            Outcome::RejectedBeforeCommit {
+                kind: child_exit::ErrorKind::Backend,
+                errno: libc::EIO,
+            },
+            Outcome::FailedAfterCommit {
+                errno: libc::EPIPE,
+                pending_generation: 73,
+            },
+        ] {
+            let (config, state, parent, child, original) = state();
+            let request = state.receive_rpc(
+                Tid::from_raw(parent.as_raw()),
+                (
+                    DetTime::new(&config),
+                    MmId::initial(parent),
+                    GlobalRequest::RequestResources(original.clone(), parent),
+                ),
+            );
+            let mut request = pin!(request);
+            assert!(poll!(request.as_mut()).is_pending());
+            due(&state, parent, child);
+            let last = Err(SkipTurn);
+            let mut turn = pin!(do_a_turn_blocking(
+                state.sched.clone(),
+                state.global_time.clone(),
+                &last,
+            ));
+            assert!(poll!(turn.as_mut()).is_pending());
+            let (_, GlobalResponse::DeliverChildExit(command)) = request.await else {
+                panic!("missing control")
+            };
+            let clock = state.global_time.lock().unwrap().as_nanos();
+            let mut scheduler = state.sched.lock().unwrap();
+            let operation = scheduler.child_exits.operations[&command.operation].clone();
+            let (acknowledgement, completion) = {
+                let phase = operation.phase.lock().unwrap();
+                let Phase::Delivering(attempt) = &*phase else {
+                    panic!("the live delivery attempt disappeared")
+                };
+                assert_eq!(attempt.phase, AttemptPhase::InCallback);
+                (attempt.acknowledgement.clone(), attempt.completion.clone())
+            };
+            assert!(acknowledgement.try_read().is_none());
+            assert!(completion.try_read().is_none());
+            let original_request = scheduler.next_turns[&parent].req.clone();
+            let original_response = scheduler.next_turns[&parent].resp.clone();
+            let failure = scheduler
+                .acknowledge_child_exit(command.operation, command.delivery.id, outcome)
+                .unwrap_err();
+            for waiter in [acknowledgement, completion] {
+                assert!(
+                    matches!(waiter.try_read(), Some(ControlResult::Failed(record))
+                    if Arc::ptr_eq(&record, &failure))
+                );
+            }
+            assert_eq!(failure.failure.outcome, Some(outcome));
+            assert_eq!(operation.original, original);
+            assert!(
+                matches!(&*operation.phase.lock().unwrap(), Phase::Failed(record)
+                if Arc::ptr_eq(record, &failure))
+            );
+            assert!(Arc::ptr_eq(
+                scheduler.child_exits.fatal.as_ref().unwrap(),
+                &failure
+            ));
+            assert_eq!(scheduler.next_turns[&parent].req, original_request);
+            assert_eq!(scheduler.next_turns[&parent].resp, original_response);
+            assert!(!scheduler.child_exits.current.contains_key(&parent));
+            assert_eq!(scheduler.turn, 0);
+            drop(scheduler);
+            assert_eq!(state.global_time.lock().unwrap().as_nanos(), clock);
+            // Polling the scheduler again would take the already-measured fatal
+            // disposition. This control inspects its exact release state first.
+        }
+    }
+
+    #[test]
+    fn child_exit_actual_receive_drop_and_early_negative_rpc_are_bounded() {
+        use std::process::Command;
+        use std::process::Stdio;
+        use std::time::Instant;
+
+        const CASE: &str = "HERMIT_TEST_CHILD_EXIT_TRANSPORT_CASE";
+        const TEST: &str = "tool_global::child_exit_control::tests::child_exit_actual_receive_drop_and_early_negative_rpc_are_bounded";
+        if let Ok(case) = std::env::var(CASE) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (config, state, parent, child, original) = state();
+                    let mut request = Box::pin(state.receive_rpc(
+                        Tid::from_raw(parent.as_raw()),
+                        (
+                            DetTime::new(&config),
+                            MmId::initial(parent),
+                            GlobalRequest::RequestResources(original.clone(), parent),
+                        ),
+                    ));
+                    assert!(poll!(request.as_mut()).is_pending());
+                    due(&state, parent, child);
+                    let last = Err(SkipTurn);
+                    let mut turn = Box::pin(do_a_turn_blocking(
+                        state.sched.clone(),
+                        state.global_time.clone(),
+                        &last,
+                    ));
+                    assert!(poll!(turn.as_mut()).is_pending());
+                    let operation = {
+                        let scheduler = state.sched.lock().unwrap();
+                        assert_eq!(scheduler.turn, 0);
+                        let id = scheduler.child_exits.current[&parent];
+                        scheduler.child_exits.operations[&id].clone()
+                    };
+                    assert_eq!(operation.original, original);
+                    assert!(matches!(&*operation.phase.lock().unwrap(),
+                        Phase::Delivering(attempt)
+                        if attempt.phase == AttemptPhase::NotReturned));
+
+                    if case.starts_with("receive-drop-") {
+                        if case == "receive-drop-retired" {
+                            let mut scheduler = state.sched.lock().unwrap();
+                            scheduler.logically_kill_thread(
+                                &parent,
+                                &parent,
+                                MmId::initial(parent),
+                            );
+                            assert!(scheduler.outstanding_child_exit_completion().is_some());
+                        }
+                        // Drop the actual receive_rpc future after control publication.
+                        // Its guard is nested inside await_child_exit_resources, and no
+                        // scheduler or operation mutex is held at this ownership boundary.
+                        drop(request);
+                        assert_eq!(case, "receive-drop-retired", "live abandonment returned");
+                        assert!(matches!(&*operation.phase.lock().unwrap(),
+                            Phase::Delivering(attempt)
+                            if attempt.phase == AttemptPhase::Settled
+                                && matches!(attempt.completion.try_read(), Some(ControlResult::TargetRetired))));
+                        assert!(
+                            tokio::time::timeout(Duration::from_secs(1), turn)
+                                .await
+                                .unwrap()
+                                .is_err()
+                        );
+                        let scheduler = state.sched.lock().unwrap();
+                        assert_eq!(scheduler.turn, 0);
+                        assert!(scheduler.outstanding_child_exit_completion().is_none());
+                        assert_eq!(operation.original, original);
+                        eprintln!("CHILD_EXIT_RETIRED_RECEIVE_DROPPED: turn=0 callback=0");
+                        return;
+                    }
+
+                    let (time, GlobalResponse::DeliverChildExit(command)) = request.await else {
+                        panic!("the actual resource receiver did not return its control")
+                    };
+                    assert_eq!(time, None);
+                    assert!(matches!(&*operation.phase.lock().unwrap(),
+                        Phase::Delivering(attempt)
+                        if attempt.phase == AttemptPhase::InCallback));
+                    if case.starts_with("retired-") {
+                        {
+                            let mut scheduler = state.sched.lock().unwrap();
+                            scheduler.logically_kill_thread(
+                                &parent,
+                                &parent,
+                                MmId::initial(parent),
+                            );
+                            assert!(scheduler.outstanding_child_exit_completion().is_some());
+                        }
+                        assert!(
+                            tokio::time::timeout(Duration::from_secs(1), turn)
+                                .await
+                                .unwrap()
+                                .is_err()
+                        );
+                    }
+                    let outcome = if case.ends_with("unsupported") {
+                        Outcome::RejectedBeforeCommit {
+                            kind: child_exit::ErrorKind::Unsupported,
+                            errno: libc::ENOSYS,
+                        }
+                    } else if case.ends_with("backend") {
+                        Outcome::RejectedBeforeCommit {
+                            kind: child_exit::ErrorKind::Backend,
+                            errno: libc::EIO,
+                        }
+                    } else {
+                        assert!(case.ends_with("postcommit"));
+                        Outcome::FailedAfterCommit {
+                            errno: libc::EPIPE,
+                            pending_generation: 73,
+                        }
+                    };
+                    assert_eq!(state.sched.lock().unwrap().turn, 0);
+                    assert_eq!(operation.original, original);
+                    // This invokes the complete early handler, including its real
+                    // nonreturning disposition, rather than calling the transition alone.
+                    let mut poisoned_clock = DetTime::new(&config);
+                    for _ in 0..100 {
+                        poisoned_clock.add_syscall();
+                    }
+                    state
+                        .receive_rpc(
+                            Tid::from_raw(parent.as_raw()),
+                            (
+                                poisoned_clock,
+                                MmId::initial(parent),
+                                GlobalRequest::AcknowledgeChildExit {
+                                    operation: command.operation,
+                                    delivery_id: command.delivery.id,
+                                    outcome,
+                                },
+                            ),
+                        )
+                        .await;
+                    panic!("negative acknowledgement returned instead of failing the run");
+                });
+            return;
+        }
+
+        for (case, status, errno, stage) in [
+            ("receive-drop-live", 125, libc::EPROTO, "ReceiveAbandoned"),
+            ("receive-drop-retired", 0, 0, ""),
+            ("live-unsupported", 122, libc::ENOSYS, "BeforeCommit"),
+            ("retired-unsupported", 122, libc::ENOSYS, "BeforeCommit"),
+            ("live-backend", 125, libc::EIO, "BeforeCommit"),
+            ("retired-backend", 125, libc::EIO, "BeforeCommit"),
+            ("live-postcommit", 125, libc::EPIPE, "AfterCommit"),
+            ("retired-postcommit", 125, libc::EPIPE, "AfterCommit"),
+        ] {
+            let start = Instant::now();
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CASE, case)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let actual = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if start.elapsed() >= Duration::from_secs(2) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{case}: control termination waited for an acknowledgement or hook");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let output = child.wait_with_output().unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(actual.code(), Some(status), "{case}: {stderr}");
+            assert!(start.elapsed() < Duration::from_secs(1), "{case}: {stderr}");
+            if status == 0 {
+                assert!(stderr.contains("CHILD_EXIT_RETIRED_RECEIVE_DROPPED: turn=0 callback=0"));
+                assert!(!stderr.contains("HERMIT_CHILD_EXIT_FAILURE"));
+            } else {
+                assert!(
+                    stderr.contains(&format!("errno={errno} stage={stage}")),
+                    "{case}: {stderr}"
+                );
+                assert!(
+                    stderr.contains("operation=1 delivery=1 child=18"),
+                    "{case}: {stderr}"
+                );
+                if case.ends_with("postcommit") {
+                    assert!(
+                        stderr.contains("pending_generation: 73"),
+                        "{case}: {stderr}"
+                    );
+                }
+            }
+        }
+    }
 }
