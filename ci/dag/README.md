@@ -60,6 +60,40 @@ dispatch. The manual [`ci-dag.yml`](../../.github/workflows/ci-dag.yml)
 workflow selects either the `hosted-portable` or `hosted-privileged` label from
 the same committed superset on demand.
 
+### Prepared Nextest executables
+
+The workspace producers prepare each distinct Cargo test selection before its
+Nextest consumers run. The committed graph records the exact Cargo selectors
+for every counted runner, including the KVM inventory commands. The generator
+checks those declarations against the command arguments and requires a producer
+in each consumer's dependency ancestry. The full privileged barrier verifies
+its three selections without rebuilding shared test executables.
+
+`ci/nextest-binaries.rs prepare PROFILE` writes one atomic record for all of that
+profile's selections. The record binds source trees, compiler identity, Cargo
+configuration and build settings, actual Cargo target/package identities,
+metadata, and the contents of test executables and recorded runtime files.
+The `hermit_modes` preparation also builds all 21 Cargo guest fixtures together
+and supplies their verified Cargo-reported paths to the test process. Missing,
+stale, ambiguous, or wrong-target artifacts cause refusal; a consumer never
+falls back to compiling them. The actual Cargo target directory is retained,
+including a configured `CARGO_TARGET_DIR`; no guessed target remap is applied.
+
+For an explicit local prepared run, first prepare a graph profile, then invoke
+`ci/nextest-binaries.rs run` or `list` with the same Cargo selectors and desired
+Nextest filters. `--profile ci` remains a Nextest runtime setting. Unsupported
+build settings such as `--cargo-profile` and `--release` are refused rather than
+silently interpreted as runtime options. Official counted runs retain their
+versioned test results, exact selected counts, retries and failure status.
+The prebuilt Rust-script producer prepares the helper itself before official
+consumers; ordinary standalone Rust-script invocations can still compile the
+helper during command lookup.
+
+The quick build now depends on Nextest setup because preparation needs it.
+This adds the existing 600-second setup timeout to its worst-case dependency
+path (8580 to 9180 seconds); individual node timeouts and CPU caps are unchanged.
+These sums are scheduling bounds, not measured preparation or execution times.
+
 ### Runner dependency
 
 This change pins `rrnewton/agent-utils` at v0.2.0 as an HTTPS submodule. Portable

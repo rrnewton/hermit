@@ -921,6 +921,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
                 ));
             }
         };
+        if command_kind == Some(StructuredResultProducerKind::Nextest) {
+            crate::nextest_build_selections::assert_command_selection(step)?;
+        }
         if step.cmd.contains("NEXTEST_EXPECTED_EXECUTED") {
             return Err(format!(
                 "{tag} declares NEXTEST_EXPECTED_EXECUTED in command text instead of typed step environment"
@@ -1101,6 +1104,7 @@ fn critical_path_wall_seconds(cfg: &DagConfig) -> Result<i64, String> {
 
 fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
     assert_structured_result_producers(cfg)?;
+    crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
     if cfg.steps.len() != 1388 {
         return Err(format!(
             "superset has {} steps, expected 1388",
@@ -1357,9 +1361,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
                     .collect::<Vec<_>>()
             ));
         }
-        if profile.label == "quick" && critical_path_wall_seconds(&selected)? != 8580 {
+        // Nextest is now required by the build producer itself. Its existing
+        // 600-second setup bound precedes that producer instead of overlapping
+        // it; every node's timeout and CPU cap remains unchanged.
+        if profile.label == "quick" && critical_path_wall_seconds(&selected)? != 8580 + 600 {
             return Err(format!(
-                "quick selected critical path changed from 8580 seconds to {}",
+                "quick selected critical path differs from the preserved 8580 seconds plus required 600-second Nextest setup: {}",
                 critical_path_wall_seconds(&selected)?
             ));
         }

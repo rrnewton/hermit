@@ -331,6 +331,19 @@ impl StaticStepSpec {
                 "{tag} declares NEXTEST_EXPECTED_EXECUTED twice"
             );
         }
+        if producer == Some(StructuredResultProducerKind::Nextest) {
+            let selection = crate::nextest_build_selections::for_step(&tag)
+                .unwrap_or_else(|| panic!("{tag} has no declared Cargo build selection"));
+            assert!(env
+                .insert(
+                    crate::nextest_binaries::SELECTION_ENV.into(),
+                    serde_json::to_string(selection).expect("string list is serializable"),
+                )
+                .is_none());
+            assert!(env
+                .insert(crate::nextest_binaries::REQUIRED_ENV.into(), "1".into())
+                .is_none());
+        }
         Step {
             group: self.group.into(),
             job: self.job.into(),
@@ -1069,11 +1082,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh cargo build --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --workspace --all-targets --features third-party-backends && CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/nextest-binaries.rs prepare portable"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"gate.manifest"########],
+        deps: &[r########"gate.manifest"########,
+            r########"setup.nextest"########,
+        ],
         env: &[],
         hint: HintSpec {
             resources: &[],
@@ -2686,7 +2701,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Build Hermit and the focused test binaries used by the privileged lane"########,
         description: r########"MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which MISSED this privileged-lane build node): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 on all three Cargo commands (was unset -> cargo defaulted build phases to nproc; that cc1plus fan-out is the OOM class the pin bounds; the job-pin is the actual fix). The final command prebuilds the exact cli and hermit_modes integration binaries consumed by the privileged test nodes, so their wall budgets measure test execution instead of Cargo compilation or target-lock waiting. After the bin build, the content-addressed publisher verifies source type/mode/size, hashes before and after copying, verifies the published hash and atomically updates the pointer before any later Cargo invocation can relink target/debug/hermit. This privileged lane deliberately publishes a binary-only artifact; unlike portable DBT/SaBRe/LiteInst cells, it does not consume install_pkg resources. Cap KEPT at the existing generous 8.0GiB: a warm/incremental measurement read peak_bytes~1.64GiB @j8, but that reused build.workspace artifacts and UNDER-estimates a cold from-scratch privileged build, so the 8.0GiB headroom is retained rather than tightened on an unreliable warm figure. rss_baseline=5.0GiB (scheduling reservation). hermit@b384187e."########,
         labels: &[r########"full"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null || exit 1; mkdir -p target/ci; tests_misc_json="target/ci/tests-misc.cargo.jsonl.tmp.$$"; tests_misc_pointer_tmp="target/ci/tests-misc.path.tmp.$$"; if ! CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run --message-format=json > "$tests_misc_json"; then exit 1; fi; mapfile -t tests_misc_bins < <(jq -er 'select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "tests_misc" and .executable != null) | .executable' "$tests_misc_json" | sort -u); if ((${#tests_misc_bins[@]} != 1)); then printf 'privileged build: expected one Cargo-reported tests_misc executable, found %d\n' "${#tests_misc_bins[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_bins[0]}"; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi; printf '%s\n' "$tests_misc" > "$tests_misc_pointer_tmp"; mv -f "$tests_misc_pointer_tmp" target/ci/tests-misc.path; mv -f "$tests_misc_json" target/ci/tests-misc.cargo.jsonl; CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run || exit 1; if [ ! -s target/ci/tests-misc.path ]; then printf 'privileged build: Cargo-reported tests_misc path is missing\n' >&2; exit 1; fi; mapfile -t tests_misc_paths < target/ci/tests-misc.path; if ((${#tests_misc_paths[@]} != 1)); then printf 'privileged build: Cargo-reported tests_misc path must contain exactly one line, found %d\n' "${#tests_misc_paths[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_paths[0]}"; case "$tests_misc" in "$PWD"/target/*) ;; *) printf 'privileged build: Cargo-reported tests_misc path is outside this target directory: %s\n' "$tests_misc" >&2; exit 1 ;; esac; case "${tests_misc##*/}" in tests_misc-*) ;; *) printf 'privileged build: Cargo-reported path does not name tests_misc: %s\n' "$tests_misc" >&2; exit 1 ;; esac; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null && ./ci/nextest-binaries.rs assert privileged && tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -2722,7 +2737,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"CPUID-faulting smoke: Detcore masks host RDRAND/RDSEED feature bits"########,
         description: r########"REQUIRES A MACHINE FACILITY, DECLARED 2026-08-12 (hermit#2135, hermit#2148, hermit#2205). rdrand_rdseed_is_masked can only observe Detcore masking host feature bits if the kernel can trap the guest's CPUID, which needs arch_prctl(ARCH_SET_CPUID, 0) to succeed. Where it cannot, this node used to FAIL in 0.11 s with exit 101 and an empty detail block -- indistinguishable from a broken build -- and its eager-exit aborted the twelve other in-flight nodes and filtered twenty-seven more, so a machine that runs 31 of 33 nodes in 3m22s produced no receipt at all. `requires_host_capability` moves that judgement OUT of the node, to an out-of-band probe run during plan construction, and makes the outcome a third recorded state: host-inapplicable, which is neither a pass nor a failure and is written to the ledger as a typed intentional skip. THIS DOES NOT WEAKEN THE TEST. Where the capability is present the node runs unchanged and its assertions keep full force; the probe fails closed toward running, so a probe error or an unexpected errno still runs it. The capability name is checked against the closed vocabulary in scripts/lib/validate_plan.rs::HostCapability, and an unknown name refuses the whole run."########,
         labels: &[r########"full"########, r########"cpuid-faulting"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; if [ ! -s target/ci/tests-misc.path ]; then printf 'privileged build: Cargo-reported tests_misc path is missing\n' >&2; exit 1; fi; mapfile -t tests_misc_paths < target/ci/tests-misc.path; if ((${#tests_misc_paths[@]} != 1)); then printf 'privileged build: Cargo-reported tests_misc path must contain exactly one line, found %d\n' "${#tests_misc_paths[@]}" >&2; exit 1; fi; tests_misc="${tests_misc_paths[0]}"; case "$tests_misc" in "$PWD"/target/*) ;; *) printf 'privileged build: Cargo-reported tests_misc path is outside this target directory: %s\n' "$tests_misc" >&2; exit 1 ;; esac; case "${tests_misc##*/}" in tests_misc-*) ;; *) printf 'privileged build: Cargo-reported path does not name tests_misc: %s\n' "$tests_misc" >&2; exit 1 ;; esac; if [ ! -f "$tests_misc" ] || [ -L "$tests_misc" ] || [ ! -x "$tests_misc" ]; then printf 'privileged build: Cargo-reported tests_misc executable is missing, symlinked, or non-executable: %s\n' "$tests_misc" >&2; exit 1; fi; timeout 30 "$tests_misc" rdrand_rdseed_is_masked --exact"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1; timeout 30 "$tests_misc" rdrand_rdseed_is_masked --exact"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -2931,7 +2946,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"All 24 run_kvm_ CLI tests"########,
         description: r########"Runs all KVM-specific hermit CLI tests on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource."########,
         labels: &[r########"full"########, r########"kvm"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] | length == 24' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] | length == 24' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
@@ -3048,11 +3063,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Build workspace"########,
         description: r########""########,
         labels: &[r########"quick"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --workspace --features third-party-backends"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --workspace --features third-party-backends && ./ci/nextest-binaries.rs prepare quick"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"gate.manifest"########],
+        deps: &[r########"gate.manifest"########,
+            r########"setup.nextest"########,
+        ],
         env: &[],
         hint: HintSpec {
             resources: &[],
@@ -3261,11 +3278,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         desc: r########"Build workspace"########,
         description: r########""########,
         labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --workspace --features third-party-backends"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --workspace --features third-party-backends && ./ci/nextest-binaries.rs prepare super"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"gate.manifest"########],
+        deps: &[r########"gate.manifest"########,
+            r########"setup.nextest"########,
+        ],
         env: &[],
         hint: HintSpec {
             resources: &[],
@@ -4166,11 +4185,12 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Build Hermit and the focused test binaries used by the privileged lane"########,
         description: r########"MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which MISSED this privileged-lane build node): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 on all three Cargo commands (was unset -> cargo defaulted build phases to nproc; that cc1plus fan-out is the OOM class the pin bounds; the job-pin is the actual fix). The final command prebuilds the exact cli and hermit_modes integration binaries consumed by the privileged test nodes, so their wall budgets measure test execution instead of Cargo compilation or target-lock waiting. After the bin build, the content-addressed publisher verifies source type/mode/size, hashes before and after copying, verifies the published hash and atomically updates the pointer before any later Cargo invocation can relink target/debug/hermit. This privileged lane deliberately publishes a binary-only artifact; unlike portable DBT/SaBRe/LiteInst cells, it does not consume install_pkg resources. Cap KEPT at the existing generous 8.0GiB: a warm/incremental measurement read peak_bytes~1.64GiB @j8, but that reused build.workspace artifacts and UNDER-estimates a cold from-scratch privileged build, so the 8.0GiB headroom is retained rather than tightened on an unreliable warm figure. rss_baseline=5.0GiB (scheduling reservation). hermit@b384187e."########,
         labels: &[r########"privileged"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run && CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && ./ci/nextest-binaries.rs prepare privileged"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"gate.manifest"########],
+        deps: &[r########"gate.manifest"########,
+        ],
         env: &[],
         hint: HintSpec {
             resources: &[],
@@ -4198,7 +4218,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
             r########"privileged"########,
             r########"cpuid-faulting"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; status=0; timeout --kill-after=5s 30s cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact || status=$?; if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact Cargo timeout: exit %s)\n' "$status" >&2; fi; exit "$status""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1; status=0; timeout --kill-after=5s 30s "$tests_misc" rdrand_rdseed_is_masked --exact || status=$?; if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact test timeout: exit %s)\n' "$status" >&2; fi; exit "$status""########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -4373,7 +4393,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"All 24 run_kvm_ CLI tests"########,
         description: r########"Runs all KVM-specific hermit CLI tests on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource."########,
         labels: &[r########"privileged"########, r########"kvm"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] | length == 24' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] | length == 24' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
@@ -4469,11 +4489,13 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Release Hermit for LiteInst compatibility"########,
         description: r########""########,
         labels: &[r########"liteinst-compat-only"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --release --locked -p hermit --features third-party-backends"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --release --locked -p hermit --features third-party-backends && ./ci/nextest-binaries.rs prepare liteinst-compat-only"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"gate.manifest"########],
+        deps: &[r########"gate.manifest"########,
+            r########"setup.nextest"########,
+        ],
         env: &[],
         hint: HintSpec {
             resources: &[],
@@ -5747,11 +5769,12 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"Build Hermit and the focused test binaries used by the privileged lane"########,
         description: r########"MEM-CAP DERIVATION 2026-08-04 (follow-on to task memory-caps-must-scale-with-job-count / #1583, which MISSED this privileged-lane build node): pinned_jobs=8 literal via CARGO_BUILD_JOBS=8 on all three Cargo commands (was unset -> cargo defaulted build phases to nproc; that cc1plus fan-out is the OOM class the pin bounds; the job-pin is the actual fix). The final command prebuilds the exact cli and hermit_modes integration binaries consumed by the privileged test nodes, so their wall budgets measure test execution instead of Cargo compilation or target-lock waiting. After the bin build, the content-addressed publisher verifies source type/mode/size, hashes before and after copying, verifies the published hash and atomically updates the pointer before any later Cargo invocation can relink target/debug/hermit. This privileged lane deliberately publishes a binary-only artifact; unlike portable DBT/SaBRe/LiteInst cells, it does not consume install_pkg resources. Cap KEPT at the existing generous 8.0GiB: a warm/incremental measurement read peak_bytes~1.64GiB @j8, but that reused build.workspace artifacts and UNDER-estimates a cold from-scratch privileged build, so the 8.0GiB headroom is retained rather than tightened on an unreliable warm figure. rss_baseline=5.0GiB (scheduling reservation). hermit@b384187e."########,
         labels: &[r########"hosted-privileged"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && CARGO_BUILD_JOBS=8 cargo test -p hermit-detcore --test tests_misc --no-run && CARGO_BUILD_JOBS=8 cargo test -p hermit --features third-party-backends --test cli --test hermit_modes --no-run"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; CARGO_BUILD_JOBS=8 cargo build -p hermit --features third-party-backends --bin hermit && ./ci/publish-hermit-e2e-artifact.sh target/debug/hermit target/ci/hermit-e2e-artifacts target/ci/hermit-e2e-artifact.path && ./ci/nextest-binaries.rs prepare privileged"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
-        deps: &[r########"gate.manifest_on_host"########],
+        deps: &[r########"gate.manifest_on_host"########,
+        ],
         env: &[],
         hint: HintSpec {
             resources: &[],
@@ -5776,7 +5799,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"CPUID-faulting smoke: Detcore masks host RDRAND/RDSEED feature bits"########,
         description: r########"REQUIRES A MACHINE FACILITY, DECLARED 2026-08-12 (hermit#2135, hermit#2148, hermit#2205). rdrand_rdseed_is_masked can only observe Detcore masking host feature bits if the kernel can trap the guest's CPUID, which needs arch_prctl(ARCH_SET_CPUID, 0) to succeed. Where it cannot, this node used to FAIL in 0.11 s with exit 101 and an empty detail block -- indistinguishable from a broken build -- and its eager-exit aborted the twelve other in-flight nodes and filtered twenty-seven more, so a machine that runs 31 of 33 nodes in 3m22s produced no receipt at all. `requires_host_capability` moves that judgement OUT of the node, to an out-of-band probe run during plan construction, and makes the outcome a third recorded state: host-inapplicable, which is neither a pass nor a failure and is written to the ledger as a typed intentional skip. THIS DOES NOT WEAKEN THE TEST. Where the capability is present the node runs unchanged and its assertions keep full force; the probe fails closed toward running, so a probe error or an unexpected errno still runs it. The capability name is checked against the closed vocabulary in scripts/lib/validate_plan.rs::HostCapability, and an unknown name refuses the whole run."########,
         labels: &[r########"hosted-privileged"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; status=0; timeout --kill-after=5s 30s cargo test -p hermit-detcore --test tests_misc rdrand_rdseed_is_masked -- --exact || status=$?; if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact Cargo timeout: exit %s)\n' "$status" >&2; fi; exit "$status""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1; status=0; timeout --kill-after=5s 30s "$tests_misc" rdrand_rdseed_is_masked --exact || status=$?; if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then printf 'test hermit-detcore/tests_misc::rdrand_rdseed_is_masked exceeded 30 s (innermost exact test timeout: exit %s)\n' "$status" >&2; fi; exit "$status""########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -5970,7 +5993,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         desc: r########"All 24 run_kvm_ CLI tests"########,
         description: r########"Runs all KVM-specific hermit CLI tests on the privileged lane after requiring /dev/kvm and verifying that the selected inventory remains exactly 24 tests. The portable lane continues to skip run_kvm_ because these tests self-guard without /dev/kvm and would otherwise report silent passes. KVM consumers may overlap: /dev/kvm supports multiple concurrent guests, and no repository or host constraint establishes it as an exclusive resource."########,
         labels: &[r########"hosted-privileged"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! cargo nextest list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] | length == 24' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; set -uo pipefail; if ! exec 9<>/dev/kvm; then printf 'test.cli_kvm: /dev/kvm could not be opened, so the selected run_kvm_ tests would self-guard and report silent passes. Refusing rather than reporting a green that measured nothing.\n' >&2; exit 1; fi; exec 9<&-; log=$(mktemp); trap 'rm -f "$log"' EXIT; if ! ./ci/nextest-binaries.rs list ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -E 'test(/^run_kvm_/)' --message-format json >"$log"; then exit 1; fi; if ! jq -e '[."rust-suites"[] | .testcases | to_entries[] | select(.value."filter-match".status == "matches")] | length == 24' "$log" >/dev/null; then printf 'test.cli_kvm: expected exactly 24 run_kvm_ tests; the inventory changed. Update the tests and this gate together.\n' >&2; exit 1; fi; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'test(/^run_kvm_/)'; exit $?"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
