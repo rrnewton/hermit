@@ -9,6 +9,9 @@
 //! Detcore tool global state, and centralized methods corresponding to the centralized portion of
 //! the Detcore tool.
 
+#[path = "tool_global_child_exit.rs"]
+mod child_exit_control;
+
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -55,6 +58,7 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
+use crate::child_exit;
 use crate::config::Config;
 use crate::consts::ROOT_DETPID;
 use crate::ivar::Ivar;
@@ -800,6 +804,40 @@ impl GlobalTool for GlobalState {
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let (guest_time, request_mm, request) = gr;
         let time_from_guest = guest_time.as_nanos();
+        if let GlobalRequest::AcknowledgeChildExit {
+            operation,
+            delivery_id,
+            outcome,
+        } = request
+        {
+            // Only an exact outstanding delivery can bypass ordinary tombstone admission.
+            // A negative acknowledgement after retirement must retain the original error.
+            let transition = {
+                let mut state = self.sched.lock().unwrap();
+                if operation.tid != dtid || operation.mm != request_mm {
+                    Err(state.fail_child_exit(child_exit::Failure::protocol(
+                        operation,
+                        delivery_id,
+                        dtid,
+                    )))
+                } else {
+                    state.acknowledge_child_exit(operation, delivery_id, outcome)
+                }
+            };
+            return match transition {
+                Err(failure) => failure.terminate(),
+                Ok(None) => (None, R::ThreadExited),
+                Ok(Some(resumed)) => {
+                    let operation = resumed.operation;
+                    let original_time = operation.guest_time;
+                    let response = self
+                        .await_child_exit_resources(operation, resumed.response)
+                        .await;
+                    self.resource_response_time(dtid, request_mm, original_time, response)
+                }
+            };
+        }
+
         let is_deregister = matches!(&request, GlobalRequest::DeregisterThread(_));
 
         let (exec_reconnect, is_exec_caller_after_local_mm_swap) = {
@@ -893,13 +931,26 @@ impl GlobalTool for GlobalState {
         // threads' own clock happens through shared memory.)
         #[allow(clippy::unit_arg)]
         let resp = match request {
+            GlobalRequest::AcknowledgeChildExit { .. } => {
+                unreachable!("acknowledgement handled before clock admission")
+            }
             GlobalRequest::RequestResources(rs, pid) => {
-                let (response, _endtime) = self
-                    .recv_request_resources(from, pid, rs, Some(request_mm))
-                    .await;
-                match response {
-                    SchedulerRpcResult::Continue(response) => R::RequestResources(response),
-                    SchedulerRpcResult::ThreadExited => R::ThreadExited,
+                if self.cfg.backend_uses_virtual_signal_targets {
+                    let response = self
+                        .recv_child_exit_resources(dtid, request_mm, pid, rs)
+                        .await;
+                    if matches!(response, R::DeliverChildExit(_)) {
+                        return (None, response);
+                    }
+                    response
+                } else {
+                    let (response, _endtime) = self
+                        .recv_request_resources(from, pid, rs, Some(request_mm))
+                        .await;
+                    match response {
+                        SchedulerRpcResult::Continue(response) => R::RequestResources(response),
+                        SchedulerRpcResult::ThreadExited => R::ThreadExited,
+                    }
                 }
             }
             GlobalRequest::ReleaseResources(rs) => {
@@ -1360,6 +1411,18 @@ impl GlobalState {
             dettid, &resp2, rs
         );
         let answer = resp2.get().await; // Block on the scheduler allowing our guest to proceed.
+        self.finish_resource_response(from, detpid, rs, request_mm, answer)
+    }
+
+    fn finish_resource_response(
+        &self,
+        from: Tid,
+        detpid: DetPid,
+        rs: Resources,
+        request_mm: Option<MmId>,
+        answer: SchedResponse,
+    ) -> (SchedulerRpcResult<ResumeStatus>, Option<LogicalTime>) {
+        let dettid = DetTid::from_raw(from.into());
         let request_became_stale = {
             let sched = self.sched.lock().unwrap();
             sched.thread_is_logically_killed(dettid)
@@ -1406,6 +1469,9 @@ impl GlobalState {
         }
 
         match answer {
+            SchedResponse::DeliverChildExit(_) => {
+                unreachable!("uncontrolled resource consumer received a delivery command")
+            }
             // In this context, SchedValue
             SchedResponse::Go(Some(schedval)) => {
                 trace!(
@@ -1689,6 +1755,7 @@ impl GlobalState {
                     poll_attempt: 0,
                     fyi: String::new(),
                     signal_interrupt_errno: None,
+                    normal_exit: None,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
@@ -1784,6 +1851,7 @@ impl GlobalState {
             timeslice_stats,
             syscall_count,
             chaos_epochs,
+            normal_exit,
         } = deregistration;
         // A fatal signal can tear down the caller after its local state has advanced to the
         // candidate exec image but before the successful reconnect (or failed-exec cancel).
@@ -1820,12 +1888,19 @@ impl GlobalState {
                 writer.insert_chaos_epoch(dettid, transition);
             }
         }
+        if self.cfg.backend_uses_virtual_signal_targets && dettid == detpid {
+            sched.verify_normal_child_exit(detpid, mm, normal_exit);
+        }
         sched.record_timeslice_stats(dettid, timeslice_stats);
         sched.record_syscall_count(dettid, syscall_count);
         if !sched.thread_is_logically_killed(dettid) {
             sched.logically_kill_thread(&dettid, &detpid, mm);
         }
+        let failure = sched.child_exits.fatal.clone();
         drop(sched);
+        if let Some(failure) = failure {
+            failure.terminate();
+        }
         trace!(
             "[detcore, dtid {}] thread deregistered, removed from sched structures.",
             dettid
@@ -1899,6 +1974,9 @@ impl GlobalState {
                 answer
             }
             SchedResponse::Signaled(_) => Some(SchedValue::Value(nix::errno::Errno::EINTR as u64)),
+            SchedResponse::DeliverChildExit(_) => {
+                unreachable!("futex consumer received a resource delivery command")
+            }
         }
     }
 
@@ -2231,6 +2309,9 @@ pub struct ThreadDeregistration {
     pub(crate) timeslice_stats: TimesliceStats,
     pub(crate) syscall_count: u64,
     pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
+    /// Actual backend exit outcome and final virtual CPU accounting, if normally exited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) normal_exit: Option<child_exit::NormalExit>,
 }
 
 /// Messages to the global object.
@@ -2243,6 +2324,15 @@ pub enum GlobalRequest {
     /// Lock the resources
     /// Also contains the `DetPid` of the process containing the thread requesting resources.
     RequestResources(Resources, DetPid),
+    /// Acknowledge one target-owned delivery, including refusals after target retirement.
+    AcknowledgeChildExit {
+        /// Exact retained resource-operation incarnation.
+        operation: child_exit::OperationId,
+        /// Scheduler-ordered child delivery being acknowledged.
+        delivery_id: u64,
+        /// Backend commit stage and disposition, without inference from text.
+        outcome: child_exit::Outcome,
+    },
     /// Release the locks
     ReleaseResources(Resources),
     /// For convenience, release all the resources held by the current TID.
@@ -2404,6 +2494,7 @@ pub enum GlobalResponse {
     /// cancelling the current guest thread before any per-operation caller can resume.
     ThreadExited,
     RequestResources(ResumeStatus),
+    DeliverChildExit(child_exit::Command),
     ReleaseResources(()),
     ReleaseAllResources(()),
     // TODO-HUMAN-REVIEW(PR-643): Review this new Detcore global RPC response.
@@ -2545,6 +2636,17 @@ where
     let mytime = guest.thread_state().thread_logical_time.clone();
     let mm = guest.thread_state().mm_id;
     let resp = guest.send_rpc((mytime, mm, request)).await;
+    apply_rpc_response(guest, resp).await
+}
+
+async fn apply_rpc_response<G, T>(
+    guest: &mut G,
+    resp: (Option<LogicalTime>, GlobalResponse),
+) -> (Option<LogicalTime>, GlobalResponse)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
     if resp.1 == GlobalResponse::ThreadExited {
         let dettid = guest.thread_state().dettid;
         trace!(
@@ -2598,17 +2700,59 @@ where
             "[detcore, dtid {}] BLOCKING on resource_request rpc... {:?}",
             &dettid, r
         );
-        let resp =
-            send_and_update_time(guest, GlobalRequest::RequestResources(r.clone(), detpid)).await;
-        match resp.1 {
-            GlobalResponse::RequestResources(x) => {
-                trace!(
-                    "[detcore, dtid {}] UNBLOCKED, acquired resources: {:?}",
-                    &dettid, r
-                );
-                x
+        let clock = guest.thread_state().thread_logical_time.clone();
+        let mm = guest.thread_state().mm_id;
+        let mut response = guest
+            .send_rpc((
+                clock,
+                mm,
+                GlobalRequest::RequestResources(r.clone(), detpid),
+            ))
+            .await;
+        loop {
+            match response.1 {
+                GlobalResponse::DeliverChildExit(command) => {
+                    let mut guard = child_exit::CallbackGuard::new(command.clone());
+                    if response.0.is_some() {
+                        child_exit::FatalRecord::new(child_exit::Failure::protocol(
+                            command.operation,
+                            command.delivery.id,
+                            command.delivery.child,
+                        ))
+                        .terminate();
+                    }
+                    let outcome = match command.event(dettid, mm, detpid, guest.pid()) {
+                        Ok(event) => {
+                            child_exit::Outcome::from(guest.queue_child_exit_signal(event).await)
+                        }
+                        Err(errno) => child_exit::Outcome::RejectedBeforeCommit {
+                            kind: child_exit::ErrorKind::Invalid,
+                            errno: errno.into_raw(),
+                        },
+                    };
+                    let acknowledgement = GlobalRequest::AcknowledgeChildExit {
+                        operation: command.operation,
+                        delivery_id: command.delivery.id,
+                        outcome,
+                    };
+                    let clock = guest.thread_state().thread_logical_time.clone();
+                    response = guest.send_rpc((clock, mm, acknowledgement)).await;
+                    // Disarm before the ordinary response helper can cancel this thread.
+                    // A second delivery constructs its guard in this same poll before awaiting.
+                    guard.disarm();
+                }
+                _ => {
+                    let response = apply_rpc_response(guest, response).await;
+                    if let GlobalResponse::RequestResources(status) = response.1 {
+                        trace!(
+                            "[detcore, dtid {}] UNBLOCKED, acquired resources: {:?}",
+                            &dettid, r
+                        );
+                        return status;
+                    }
+                    unreachable!("resource request returned an unrelated RPC response");
+                }
             }
-            _ => unreachable!(),
         }
     } else {
         ResumeStatus::Normal
@@ -4116,6 +4260,7 @@ mod tests {
                         timeslice_stats: TimesliceStats::default(),
                         syscall_count: 0,
                         chaos_epochs: Vec::new(),
+                        normal_exit: None,
                     }),
                 ),
             )
@@ -4310,6 +4455,7 @@ mod tests {
                     timeslice_stats: TimesliceStats::default(),
                     syscall_count: 0,
                     chaos_epochs: Vec::new(),
+                    normal_exit: None,
                 },
             )
             .await;
@@ -4335,6 +4481,7 @@ mod tests {
                     timeslice_stats: TimesliceStats::default(),
                     syscall_count: 0,
                     chaos_epochs: Vec::new(),
+                    normal_exit: None,
                 },
             )
             .await;
@@ -4602,6 +4749,7 @@ mod tests {
                         timeslice_stats: final_stats,
                         syscall_count: 17,
                         chaos_epochs: Vec::new(),
+                        normal_exit: None,
                     }),
                 ),
             )
@@ -4635,6 +4783,7 @@ mod tests {
                         timeslice_stats: final_stats,
                         syscall_count: 99,
                         chaos_epochs: Vec::new(),
+                        normal_exit: None,
                     }),
                 ),
             )

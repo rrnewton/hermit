@@ -120,7 +120,7 @@ pub const HERMIT_VERIFICATION_DIVERGENCE_EXIT: i32 = 1;
 ///
 /// REVIEWER RULE: a change to `tests/stress_suite.rs` inside an exit-code head
 /// SHOULD BE REFUSED ON SIGHT AND QUESTIONED.
-pub const HERMIT_INTERNAL_FAILURE_EXIT: i32 = 125;
+pub use detcore_model::HERMIT_INTERNAL_FAILURE_EXIT;
 
 /// A deadline hermit itself was asked to enforce expired: **124**.
 ///
@@ -2343,6 +2343,7 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // none of those backends can safely defer Detcore's modeled transition.
     config.backend_runs_exit_robust_list = backend == Backend::Ptrace;
     config.backend_requires_thread_directed_process_signals = backend == Backend::Dbt;
+    config.backend_uses_virtual_signal_targets = backend == Backend::Kvm;
     // E9patch preprocesses the guest and then uses the ptrace builder. LiteInst,
     // DBT, KVM, and SaBRe re-invoke the Tool callback on ERESTARTSYS instead of
     // resuming through the kernel's ptrace syscall-restart frame.
@@ -3981,6 +3982,7 @@ mod tests {
         assert!(!sabre.backend_runs_exit_robust_list);
         assert!(!sabre.backend_requires_thread_directed_process_signals);
         assert!(!sabre.backend_virtualizes_capability_prctls);
+        assert!(!sabre.backend_uses_virtual_signal_targets);
         assert!(!sabre.backend_defers_vfork_child_registration);
         let ptrace = prepare_backend_config(config, Backend::Ptrace);
         assert!(!ptrace.discover_live_file_metadata);
@@ -3995,6 +3997,7 @@ mod tests {
         assert!(ptrace.backend_runs_exit_robust_list);
         assert!(!ptrace.backend_requires_thread_directed_process_signals);
         assert!(!ptrace.backend_virtualizes_capability_prctls);
+        assert!(!ptrace.backend_uses_virtual_signal_targets);
         assert!(!ptrace.backend_defers_vfork_child_registration);
     }
 
@@ -4008,6 +4011,7 @@ mod tests {
         assert!(!kvm.backend_runs_exit_robust_list);
         assert!(!kvm.backend_requires_thread_directed_process_signals);
         assert!(kvm.backend_virtualizes_capability_prctls);
+        assert!(kvm.backend_uses_virtual_signal_targets);
         assert!(kvm.backend_defers_vfork_child_registration);
     }
 
@@ -4018,6 +4022,7 @@ mod tests {
         assert!(!config.backend_tracks_process_children);
         assert!(!config.backend_runs_exit_robust_list);
         assert!(config.backend_requires_thread_directed_process_signals);
+        assert!(!config.backend_uses_virtual_signal_targets);
         assert!(!config.backend_defers_vfork_child_registration);
     }
 

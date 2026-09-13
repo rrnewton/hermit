@@ -1157,7 +1157,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Exit,
     ) -> Result<i64, Error> {
-        let request = guest.thread_state().mk_request(
+        let mut request = guest.thread_state().mk_request(
             ResourceID::Exit {
                 group: false,
                 process: guest.thread_state().detpid.expect("detpid unset"),
@@ -1165,6 +1165,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             },
             Permission::RW,
         );
+        if self.cfg.backend_uses_virtual_signal_targets {
+            request.normal_exit = Some(crate::child_exit::NormalExit::capture(
+                guest.thread_state_mut(),
+                call.status(),
+            ));
+        }
         resource_request(guest, request).await;
         self.run_robust_list_owner_death(guest).await;
         // It's ok here that we skip running the posthook:
@@ -1177,7 +1183,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::ExitGroup,
     ) -> Result<i64, Error> {
-        let request = guest.thread_state().mk_request(
+        let mut request = guest.thread_state().mk_request(
             ResourceID::Exit {
                 group: true,
                 process: guest.thread_state().detpid.expect("detpid unset"),
@@ -1185,6 +1191,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             },
             Permission::RW,
         );
+        if self.cfg.backend_uses_virtual_signal_targets {
+            request.normal_exit = Some(crate::child_exit::NormalExit::capture(
+                guest.thread_state_mut(),
+                call.status(),
+            ));
+        }
         resource_request(guest, request).await;
         self.stage_thread_group_robust_list_wakes(guest, RobustListExit::ExitGroup)
             .await;

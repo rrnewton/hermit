@@ -22,6 +22,7 @@ pub(crate) mod robust_list;
 mod signal;
 pub(crate) mod socket_timestamp_ioctl;
 mod sysinfo;
+pub(crate) use sysinfo::clock_ticks;
 mod threads;
 pub(crate) mod time;
 

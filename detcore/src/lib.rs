@@ -36,6 +36,7 @@
 #![deny(missing_docs)]
 #![allow(clippy::uninlined_format_args)]
 
+mod child_exit;
 mod config;
 mod consts;
 mod cpuid;
@@ -2878,6 +2879,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 );
             }
         }
+        let normal_exit = if self.cfg.backend_uses_virtual_signal_targets {
+            match exit_status {
+                ExitStatus::Exited(status) => Some(crate::child_exit::NormalExit::capture(
+                    &mut thread_state,
+                    status,
+                )),
+                ExitStatus::Signaled(_, _) => None,
+            }
+        } else {
+            None
+        };
         let pending_chaos_epochs = thread_state.take_pending_chaos_epochs();
         deregister_thread(
             thread_state.thread_logical_time.clone(),
@@ -2890,6 +2902,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 timeslice_stats: thread_state.stats.timeslice_stats,
                 syscall_count: thread_state.stats.syscall_count,
                 chaos_epochs: pending_chaos_epochs,
+                normal_exit,
             },
         )
         .await;

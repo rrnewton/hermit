@@ -23,7 +23,7 @@ const MB: u64 = 1024 * 1024;
 const CLOCK_TICKS_PER_SECOND: u64 = 100;
 const NANOS_PER_CLOCK_TICK: u64 = 1_000_000_000 / CLOCK_TICKS_PER_SECOND;
 
-fn clock_ticks(duration: crate::types::LogicalTime) -> u64 {
+pub(crate) fn clock_ticks(duration: crate::types::LogicalTime) -> u64 {
     duration.as_nanos() / NANOS_PER_CLOCK_TICK
 }
 

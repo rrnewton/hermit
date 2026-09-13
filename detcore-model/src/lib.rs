@@ -43,6 +43,12 @@ pub mod host_capability;
 /// tests asserting a stale exit status for a day after the product moved.
 pub const HERMIT_POLICY_REFUSAL_EXIT: i32 = 122;
 
+/// The Hermit implementation failed, as distinct from a deliberate unsupported-run refusal.
+/// Shared by the CLI and Detcore so both sides use the same established exit status.
+pub const HERMIT_INTERNAL_FAILURE_EXIT: i32 = 125;
+const _: () = assert!(HERMIT_INTERNAL_FAILURE_EXIT == 125);
+const _: () = assert!(HERMIT_INTERNAL_FAILURE_EXIT != HERMIT_POLICY_REFUSAL_EXIT);
+
 // ⚠️ THE VALUE IS PINNED, NOT ONLY NAMED. `tests/cli.rs` and the allocation
 // table both assert 122; a one-character edit here would move every consumer
 // with it and nothing would fail. 0 is called out separately because it is the

@@ -8,6 +8,7 @@
 
 //! Deterministic scheduling algorithm.
 
+mod child_exit;
 mod replayer;
 pub mod runqueue;
 pub mod timed_waiters;
@@ -129,6 +130,8 @@ pub struct Action {
 /// The response from the scheduler that wakes back up a guest thread after a request.
 #[derive(Debug, Clone)]
 pub enum SchedResponse {
+    /// Queue this exact child event through the target callback, without granting resources.
+    DeliverChildExit(Box<crate::child_exit::Command>),
     /// Keep running.
     Go(Option<SchedValue>),
 
@@ -532,6 +535,9 @@ pub struct Scheduler {
     /// tasks directly. The address-space identity prevents stale exec cleanup
     /// from removing a replacement image's descriptor.
     physical_thread_pidfds: BTreeMap<DetTid, (MmId, i32, i32, OwnedFd)>,
+
+    pub(crate) child_exits: crate::child_exit::State,
+    backend_uses_virtual_signal_targets: bool,
 
     /// The current set of actions in the background.
     #[allow(dead_code)]
@@ -1163,6 +1169,32 @@ async fn sched_loop_inner(
         }
         iter += 1;
 
+        let (failure, completion) = {
+            let state = sched.lock().unwrap();
+            let empty = state.run_queue.is_empty()
+                && state.blocked.is_empty()
+                && state.pending_physical_process_exits.is_empty()
+                && state.pending_run_queue_admissions.is_empty()
+                && state.pending_run_queue_removals.is_empty();
+            (
+                state.child_exits.fatal.clone(),
+                if empty {
+                    state.outstanding_child_exit_completion()
+                } else {
+                    None
+                },
+            )
+        };
+        if let Some(failure) = failure {
+            failure.terminate();
+        }
+        if let Some(completion) = completion {
+            if let crate::child_exit::ControlResult::Failed(failure) = completion.get().await {
+                failure.terminate();
+            }
+            continue;
+        }
+
         // If there are NO threads left in the system, then we're truly done:
         {
             let sched = sched.lock().unwrap();
@@ -1192,6 +1224,10 @@ async fn sched_loop_inner(
         // Otherwise we trust the turn function to either choose a runnable thread or wait
         // until something blocked is ready to run again.
         last_res = do_a_turn_blocking(sched.clone(), timer.clone(), &last_res).await;
+        let failure = { sched.lock().unwrap().child_exits.fatal.clone() };
+        if let Some(failure) = failure {
+            failure.terminate();
+        }
 
         // A terminal deadlock ends the run here, alongside the two
         // `--stop-after-*` exits above, rather than by panicking out of the
@@ -1254,12 +1290,49 @@ pub async fn do_a_turn_blocking(
         let _ = req_ivar.await;
     }
 
-    // Here we copy some information while holding the sched lock, and then release it so
-    // we can `.await` below:
+    // Process timed events once. A target-side delivery then waits outside the
+    // scheduler mutex before any tentative selection, COMMIT, or new time step.
+    let (step2, deferred_empty_check, failure) = {
+        let mut state = sched.lock().unwrap();
+        let result = state.step2_process_blocked(&global_time);
+        (
+            result,
+            !state.child_exits.due.is_empty(),
+            state.child_exits.fatal.clone(),
+        )
+    };
+    if let Some(failure) = failure {
+        failure.terminate();
+    }
+    step2?;
+    loop {
+        let control = { sched.lock().unwrap().dispatch_child_exit_control() };
+        match control {
+            Err(failure) => failure.terminate(),
+            Ok(None) => break,
+            Ok(Some(child_exit::ControlWait::Request(request))) => {
+                let _ = request.get().await;
+            }
+            Ok(Some(child_exit::ControlWait::Acknowledgement(acknowledgement))) => {
+                if let crate::child_exit::ControlResult::Failed(failure) =
+                    acknowledgement.get().await
+                {
+                    failure.terminate();
+                }
+                // Only teardown/admission bookkeeping can have changed while all
+                // ordinary selection was stopped. Do not pop another timer or tick time.
+                let mut state = sched.lock().unwrap();
+                state.drain_pending_run_queue_removals();
+                state.drain_pending_run_queue_admissions();
+            }
+        }
+    }
     let (next_dtid, req, resp) = {
-        let mut sched = sched.lock().unwrap();
-        sched.step2_process_blocked(&global_time)?;
-        sched.step3_peek().ok_or(SkipTurn)?
+        let mut state = sched.lock().unwrap();
+        if deferred_empty_check {
+            state.step2d_handle_empty_queue(&global_time)?;
+        }
+        state.step3_peek().ok_or(SkipTurn)?
     };
 
     // Step 1B: wait for the selected thread to make its request.
@@ -1425,6 +1498,8 @@ impl Scheduler {
             turn: 0,
             next_turns: Default::default(),
             physical_thread_pidfds: Default::default(),
+            child_exits: Default::default(),
+            backend_uses_virtual_signal_targets: cfg.backend_uses_virtual_signal_targets,
             bg_action_pool: Default::default(),
             committed_time: Default::default(),
             blocked: Default::default(),
@@ -1827,6 +1902,7 @@ impl Scheduler {
     /// This is IDEMPOTENT, and it may indeed be called twice, both to proactively remove a thread,
     /// and then reactively in response to an exit hook.
     pub fn logically_kill_thread(&mut self, dtid: &DetTid, detpid: &DetPid, mm: MmId) {
+        self.retire_child_exit_operation(*dtid, mm);
         if self.cancel_killed_thread_rpcs {
             self.logically_killed_threads.insert(*dtid);
         }
@@ -2329,7 +2405,9 @@ impl Scheduler {
         self.step2b_process_timed(); // May populate run_queue.
         self.step2c_process_io_blockers()?;
         self.step2e_process_signal_deferred(); // May populate run_queue.
-        self.step2d_handle_empty_queue(global_time)?;
+        if self.child_exits.due.is_empty() {
+            self.step2d_handle_empty_queue(global_time)?;
+        }
         Ok(())
     }
 
@@ -2437,7 +2515,7 @@ impl Scheduler {
             match evt {
                 TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(time_ns, dtid),
                 TimedEvent::SignalEvt(
-                    timed_waiters::SignalTimerId::ChildExit { parent, .. },
+                    timed_waiters::SignalTimerId::ChildExit { child, parent },
                     dtid,
                     sig,
                 ) => {
@@ -2453,6 +2531,10 @@ impl Scheduler {
                     // deadline (rather than only at run-queue quiescence, as
                     // step2e does) is what breaks the redis_deep starvation
                     // deadlock: a busy sibling can no longer starve the reaper.
+                    if self.backend_uses_virtual_signal_targets {
+                        self.child_exit_became_due(child, parent);
+                        return;
+                    }
                     self.blocked.sigchld_ready.insert(parent);
                     if self.blocked.sigchld_deferred.remove(&parent) {
                         self.run_queue.push_eager_io_repoll(parent);
@@ -2709,6 +2791,9 @@ impl Scheduler {
             } else {
                 Ok(())
             }
+        } else if self.backend_uses_virtual_signal_targets {
+            self.refuse_virtual_signal_route(dettid);
+            return;
         } else if self.backend_requires_thread_directed_process_signals {
             self.terminal_deadlock.get_or_insert_with(|| {
                 format!(
@@ -3855,7 +3940,15 @@ impl Scheduler {
             // that pidfd would make the application observe both CLD_EXITED and
             // SI_TKILL for one child, so only the scheduler wait readiness is
             // synthesized on that path.
-            ResourceID::Exit { group, process, .. } => {
+            ResourceID::Exit { group, process, mm } => {
+                if self.backend_uses_virtual_signal_targets {
+                    self.prepare_virtual_child_exit(dettid, *group, *process, *mm);
+                    if self.child_exits.fatal.is_some() {
+                        self.run_queue.undo_tentative_pop();
+                        return Err(SkipTurn);
+                    }
+                    return Ok(());
+                }
                 if *group
                     && let Some(parent) = self.thread_tree.parent_process(process)
                     && self.should_synthesize_child_exit_signal(parent)
@@ -4223,6 +4316,7 @@ impl Scheduler {
     /// Precondition: guest is stopped.
     /// Postcondition: guest is running concurrently with this scheduler/tracer thread.
     fn unblock_guest(&mut self, dtid: DetTid, resp: &Ivar<SchedResponse>) {
+        self.grant_child_exit_operation(dtid);
         self.turn += 1;
         trace!(
             "[sched-step5] Guest unblocking (via {}); clear ivars for the next turn on dettid {}",

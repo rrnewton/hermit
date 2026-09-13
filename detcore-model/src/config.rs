@@ -154,6 +154,12 @@ pub struct Config {
     #[clap(skip = true)]
     pub backend_runs_exit_robust_list: bool,
 
+    /// Scheduler identities denote virtual tasks; host signal syscalls must never use them.
+    /// Delivery requires the selected guest callback and an explicit backend acknowledgement.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_uses_virtual_signal_targets: bool,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1058): Review process-signal identity translation.
     /// The backend cannot execute process-directed signal syscalls using Detcore's guest PID and
@@ -1392,6 +1398,7 @@ mod tests {
         assert!(config.backend_tracks_process_children);
         assert!(config.backend_runs_exit_robust_list);
         assert!(!config.backend_requires_thread_directed_process_signals);
+        assert!(!config.backend_uses_virtual_signal_targets);
         assert!(config.backend_supports_parked_write_signal_interruption);
         assert!(!config.backend_virtualizes_capability_prctls);
         assert!(!config.backend_defers_vfork_child_registration);

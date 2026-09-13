@@ -367,6 +367,9 @@ pub struct Resources {
     /// for the scheduler's cross-task signal wakeup.
     #[serde(default)]
     pub(crate) signal_interrupt_errno: Option<i32>,
+    /// Normal exit metadata captured before the scheduler authorizes the exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) normal_exit: Option<crate::child_exit::NormalExit>,
 }
 
 impl fmt::Debug for Resources {
@@ -393,6 +396,7 @@ impl Resources {
             poll_attempt: 0,
             fyi: String::new(),
             signal_interrupt_errno: None,
+            normal_exit: None,
         }
     }
 
@@ -411,6 +415,11 @@ impl Resources {
                     e.insert(perm2.clone());
                 }
             }
+        }
+        match (self.normal_exit, other.normal_exit) {
+            (None, value) => self.normal_exit = value,
+            (Some(left), Some(right)) => assert_eq!(left, right),
+            (Some(_), None) => {}
         }
         match (self.signal_interrupt_errno, other.signal_interrupt_errno) {
             (None, interrupt) => self.signal_interrupt_errno = interrupt,
