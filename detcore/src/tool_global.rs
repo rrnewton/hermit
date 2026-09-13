@@ -3783,6 +3783,50 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn inherited_stdio_alias_error_refuses_before_any_thread_start_rpc() {
+        use reverie::Tool;
+
+        let config = Config::default();
+        let global = GlobalState::initialize(&config, false);
+        let tool = Detcore::new(reverie::Pid::from_raw(17), &config);
+        for errno in [libc::EPERM, libc::EBADF] {
+            let mut thread = tool.init_thread_state(Tid::from_raw(17), None);
+            let expected = crate::InheritedStdioAliasError {
+                left: 0,
+                right: 1,
+                errno,
+            };
+            thread.inherited_stdio_alias_error = Some(expected.clone());
+            // Leaving detpid unset also ensures no backend identity read or
+            // delayed state initialization precedes the refusal.
+            assert_eq!(thread.detpid, None);
+            let mut guest = ExternalRegistrationGuest {
+                global: &global,
+                config: &config,
+                thread,
+                requests: Mutex::new(Vec::new()),
+            };
+            for _ in 0..2 {
+                let mut start = std::pin::pin!(tool.handle_thread_start(&mut guest));
+                let std::task::Poll::Ready(Err(error)) = futures::poll!(start.as_mut()) else {
+                    panic!("failed initialization must refuse in the first poll");
+                };
+                let reverie::Error::Tool(error) = error.into_errno().unwrap_err() else {
+                    panic!("startup failure must not become a guest errno");
+                };
+                assert_eq!(
+                    error.downcast_ref::<crate::InheritedStdioAliasError>(),
+                    Some(&expected)
+                );
+                assert!(error.to_string().contains(&format!("errno {errno}")));
+            }
+            assert!(guest.requests.lock().unwrap().is_empty());
+            assert_eq!(guest.thread.detpid, None);
+            assert_eq!(guest.thread.inherited_stdio_alias_error, Some(expected));
+        }
+    }
+
     async fn check_external_child_tid_registration(
         flags: CloneFlags,
         supplied_address: usize,
