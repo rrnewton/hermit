@@ -2879,9 +2879,14 @@ cleared-caps refusal names {} starved step(s)",
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        if scorecard_deps != manifest_tags {
+        let expected_scorecard_deps = manifest_tags
+            .iter()
+            .cloned()
+            .chain(["gate.manifest".to_string(), PIN_GATE_TAG.to_string()])
+            .collect::<BTreeSet<_>>();
+        if scorecard_deps != expected_scorecard_deps {
             return Err(format!(
-                "full-plan bracket: compatibility scorecard does not depend on every manifest result node: expected={manifest_tags:?}, actual={scorecard_deps:?}"
+                "full-plan bracket: compatibility scorecard must depend on every manifest result node and both focused preflight gates: expected={expected_scorecard_deps:?}, actual={scorecard_deps:?}"
             ));
         }
         let mut results_paths = BTreeSet::new();
