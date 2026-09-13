@@ -692,9 +692,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         const STACK_IOVECS: usize = 32;
 
-        // The first attempt owns Linux's validation order. In particular, do
-        // not read the iovec array before the kernel has checked fd validity,
-        // access mode, offset, and flags.
+        // A successful read may overwrite its own iovec array. Capture the
+        // metadata before execution, but defer any snapshot error until after
+        // the kernel has validated the operation in its native order.
+        let snapshot = call
+            .iov_count()
+            .and_then(|count| snapshot_vectored_iovecs(&guest.memory(), call.iov_addr(), count));
         let first_result = self
             .execute_vectored_attempt(guest, call.into_syscall())
             .await;
@@ -703,11 +706,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Err(error);
             }
             Err(Error::Errno(Errno::EAGAIN)) => {}
+            Ok(read) if read > 0 => {
+                guest.thread_state_mut().pending_iovec_snapshot = Some(snapshot?);
+                return Ok(read);
+            }
             result => return result,
         }
 
-        let snapshot =
-            snapshot_vectored_iovecs(&guest.memory(), call.iov_addr(), call.iov_count()?)?;
+        let snapshot = snapshot?;
         guest.thread_state_mut().pending_iovec_snapshot = Some(snapshot.clone());
         if snapshot.target == 0 {
             return Err(Errno::EAGAIN.into());

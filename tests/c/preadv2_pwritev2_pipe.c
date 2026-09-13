@@ -168,6 +168,39 @@ static int check_nowait_and_error_order(void) {
   return 0;
 }
 
+static int check_first_read_overwrites_its_iovec(void) {
+  for (int use_preadv2 = 0; use_preadv2 <= 1; ++use_preadv2) {
+    int fds[2];
+    if (pipe(fds) != 0) {
+      perror("self-alias vectored read pipe");
+      return -1;
+    }
+    struct iovec iov = {.iov_base = &iov, .iov_len = sizeof(iov)};
+    const struct iovec payload = {
+        .iov_base = (void *)(uintptr_t)0x4141414141414141UL,
+        .iov_len = 0x4242424242424242UL,
+    };
+    if (write(fds[1], &payload, sizeof(payload)) != (ssize_t)sizeof(payload)) {
+      perror("self-alias vectored read prefill");
+      return -1;
+    }
+    errno = 0;
+    ssize_t count = use_preadv2 ? call_preadv2(fds[0], &iov, 1, -1, 0)
+                              : readv(fds[0], &iov, 1);
+    int saved_errno = errno;
+    close(fds[0]);
+    close(fds[1]);
+    if (count != (ssize_t)sizeof(iov) ||
+        memcmp(&iov, &payload, sizeof(iov)) != 0) {
+      fprintf(stderr, "%s self-alias failed: count=%zd errno=%d\n",
+              use_preadv2 ? "preadv2" : "readv", count, saved_errno);
+      return -1;
+    }
+  }
+  puts("vectored-self-alias-ok");
+  return 0;
+}
+
 struct read_release {
   int write_fd;
   struct iovec *iov;
@@ -986,6 +1019,7 @@ int main(int argc, char **argv) {
   }
 
   if (check_nowait_and_error_order() != 0 ||
+      check_first_read_overwrites_its_iovec() != 0 ||
       check_blocking_preadv2_snapshot() != 0 ||
       check_atomic_pwritev2_snapshot() != 0 || check_large_pwritev2() != 0 ||
       check_descriptor_matrix() != 0 ||

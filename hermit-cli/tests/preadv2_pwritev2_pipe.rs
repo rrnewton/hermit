@@ -139,6 +139,7 @@ fn current_position_preadv2_and_pwritev2_match_blocking_pipe_semantics() {
     let trace_stderr = String::from_utf8_lossy(&trace_output.stderr);
     for marker in [
         "preadv2-pwritev2-nowait-and-errors-ok",
+        "vectored-self-alias-ok",
         "preadv2-snapshot-ok",
         "pwritev2-atomic-snapshot-ok",
         "pwritev2-large-ok",
