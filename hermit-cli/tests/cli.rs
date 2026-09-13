@@ -632,8 +632,7 @@ fn assert_guest_pipe_status_hides_scheduler_nonblocking(backend: &str) {
         String::from_utf8_lossy(&compilation.stdout),
         String::from_utf8_lossy(&compilation.stderr),
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["run", "--backend", backend, "--"])
+    let output = hermit_command(&["run", "--backend", backend, "--"])
         .arg(&guest)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -738,8 +737,7 @@ fn assert_guest_cannot_mutate_hermits_stdout_flags(backend: &str) {
          to mean anything",
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["run", "--backend", backend, "--"])
+    let output = hermit_command(&["run", "--backend", backend, "--"])
         .arg(&guest)
         .stdin(Stdio::null())
         // `Stdio::from` dups this onto the child's fd 1, so hermit's stdout and
@@ -796,8 +794,7 @@ fn assert_guest_cannot_mutate_hermits_stdout_flags(backend: &str) {
         .expect("failed to open append-mode stdout stand-in");
     let append_before = unsafe { libc::fcntl(already_append.as_raw_fd(), libc::F_GETFL) };
     assert_ne!(append_before & libc::O_APPEND, 0);
-    let clear = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["run", "--backend", backend, "--"])
+    let clear = hermit_command(&["run", "--backend", backend, "--"])
         .arg(&guest)
         .arg("clear")
         .stdin(Stdio::null())
@@ -892,8 +889,7 @@ fn run_with_nonblocking_stdin(backend: &str, mode: &str) -> Output {
         std::io::Error::last_os_error()
     );
 
-    Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["run", "--backend", backend, "--"])
+    hermit_command(&["run", "--backend", backend, "--"])
         .arg(stdio_initial_nonblocking_guest(directory.path()))
         .arg(mode)
         .stdin(Stdio::from(guest_end))
@@ -974,8 +970,7 @@ fn assert_inherited_stdio_aliases_share_status_flags(backend: &str) {
         .try_clone()
         .expect("failed to duplicate aliased stderr");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["run", "--backend", backend, "--"])
+    let output = hermit_command(&["run", "--backend", backend, "--"])
         .arg(stdio_status_alias_guest(directory.path()))
         .stdin(Stdio::null())
         .stdout(Stdio::from(child_stdout))
@@ -1058,8 +1053,7 @@ fn assert_inherited_stdio_append_write_paths(backend: &str, operations: &[&str])
             "the supervisor's descriptor must start without O_APPEND",
         );
 
-        let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-            .args(["run", "--backend", backend, "--"])
+        let output = hermit_command(&["run", "--backend", backend, "--"])
             .arg(&guest)
             .arg(operation)
             .stdin(Stdio::null())
@@ -1135,8 +1129,7 @@ fn assert_inherited_stdio_append_write_paths(backend: &str, operations: &[&str])
 
     // O_APPEND has no effect on a pipe. The sendfile refusal is therefore
     // restricted to regular-file output rather than all inherited stdout.
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["run", "--backend", backend, "--"])
+    let output = hermit_command(&["run", "--backend", backend, "--"])
         .arg(&guest)
         .arg("sendfile-pipe")
         .stdin(Stdio::null())
@@ -1226,8 +1219,7 @@ fn assert_nonblocking_stdin_does_not_abort_the_container(backend: &str) {
     let sent = unsafe { libc::send(peer.as_raw_fd(), b"A".as_ptr().cast(), 1, 0) };
     assert_eq!(sent, 1, "failed to prime the guest's stdin socket");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["run", "--backend", backend, "--"])
+    let output = hermit_command(&["run", "--backend", backend, "--"])
         .arg(guest)
         .stdin(Stdio::from(guest_end))
         .stdout(Stdio::piped())
@@ -1312,8 +1304,7 @@ fn assert_nonblocking_does_not_unlatch_containment(backend: &str) {
          to mean anything",
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["run", "--backend", backend, "--"])
+    let output = hermit_command(&["run", "--backend", backend, "--"])
         .arg(guest)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -7847,8 +7838,7 @@ fn assert_unimplemented_status_flags_are_refused(backend: &str) {
     let before = unsafe { libc::fcntl(hermit_stdout.as_raw_fd(), libc::F_GETFL) };
     assert!(before >= 0, "F_GETFL on the supervisor's descriptor failed");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
-        .args(["run", "--backend", backend, "--"])
+    let output = hermit_command(&["run", "--backend", backend, "--"])
         .arg(guest)
         .stdin(Stdio::null())
         .stdout(Stdio::from(
