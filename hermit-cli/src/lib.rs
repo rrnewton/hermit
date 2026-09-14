@@ -29,6 +29,7 @@ mod interp;
 pub mod liteinst_bootstrap;
 pub mod liteinst_record;
 mod metadata;
+pub mod run_evidence;
 
 pub use canonical_verdict::Verdict;
 

@@ -90,7 +90,6 @@ jobs:
     timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"
-      VALIDATE_GATE_TIMEOUT_SECONDS: "3600"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,7 +131,7 @@ jobs:
         # systemd --user scope under $GITHUB_ACTIONS (hosted AND self-hosted) and
         # would otherwise fail-close (exit 3); opt out to best-effort UNBOXED
         # (pre-pin behavior) so this self-hosted lane does not regress RED.
-        run: env DAGRUN_BIN=agent-utils/py/bin/dagrun ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
+        run: env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir "$RUNNER_TEMP/hermit-privileged-dag-perf" -v
       - name: Record/replay compatibility ratchet (139 programs)
         run: ./scripts/validate.rs --rr-compat-only --no-label-pr --verbose
       - name: Upload privileged DAG performance report
@@ -170,8 +169,6 @@ jobs:
     timeout-minutes: 360
     env:
       DETCORE_TEST_RUST_LOG: "off"
-      SUPER_REPETITIONS: "20"
-      VALIDATE_GATE_TIMEOUT_SECONDS: "7200"
     steps:
       - uses: actions/checkout@v4
         with:

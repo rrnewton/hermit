@@ -39,6 +39,7 @@ use hermit_manifest_plan::stress_series::HostCapabilities;
 use hermit_manifest_plan::stress_series::HostCapability;
 #[cfg(test)]
 use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
+use hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD;
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
@@ -1018,10 +1019,64 @@ fn command_jobs(command: &str) -> Result<Option<i64>, String> {
     Ok(jobs)
 }
 
+const PREBUILT_COMMAND_PREFIX: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; "#;
+const PINNED_COMMAND_PREFIX: &str = "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo ";
+const PINNED_COMMAND_SEPARATOR: &str = r#" -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1"' bash "#;
+
+fn shell_quote_one(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"@%+=:,./-_".contains(&byte))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+fn command_runs_exactly(command: &str, inner: &str) -> bool {
+    let expected = format!("{PREBUILT_COMMAND_PREFIX}{inner}");
+    if command == expected {
+        return true;
+    }
+    let Some(rest) = command.strip_prefix(PINNED_COMMAND_PREFIX) else {
+        return false;
+    };
+    let current_separator = format!(
+        " -- bash -c {} bash ",
+        shell_quote_one(PINNED_ROOT_COMMAND_GUARD)
+    );
+    let Some((forwarded, quoted_inner)) = rest
+        .split_once(&current_separator)
+        .or_else(|| rest.split_once(PINNED_COMMAND_SEPARATOR))
+    else {
+        return false;
+    };
+    let words = forwarded.split_whitespace().collect::<Vec<_>>();
+    let (pairs, remainder) = words.as_chunks::<2>();
+    if words.is_empty()
+        || !remainder.is_empty()
+        || pairs.iter().any(|pair| {
+            pair[0] != "--env"
+                || pair[1].is_empty()
+                || !pair[1]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+    {
+        return false;
+    }
+    let unique = pairs.iter().map(|pair| pair[1]).collect::<BTreeSet<_>>();
+    unique.len() == pairs.len() && quoted_inner == shell_quote_one(&expected)
+}
+
 fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), String> {
+    let committed_path = root.join("ci/dag/validate.json");
+    let committed = read_dag(&committed_path)?;
     for lane in ["portable", "privileged"] {
-        let path = root.join(format!("ci/dag/{lane}.json"));
-        let dag = read_dag(&path)?;
+        let path = &committed_path;
+        let dag = dagrun::select_steps_by_labels(&committed, &[lane.to_string()])
+            .map_err(|error| format!("{}: cannot select label {lane}: {error}", path.display()))?;
         if dag
             .steps
             .iter()
@@ -1054,7 +1109,7 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
         if dag
             .steps
             .iter()
-            .filter(|step| step.cmd == "target/debug/test-harness validate")
+            .filter(|step| command_runs_exactly(&step.cmd, "target/debug/test-harness validate"))
             .count()
             != 1
         {
@@ -1065,9 +1120,15 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
         }
         let build =
             format!("target/debug/test-harness build --lane {lane} --ci-only --allow-empty");
-        if dag.steps.iter().filter(|step| step.cmd == build).count() != 1 {
+        if dag
+            .steps
+            .iter()
+            .filter(|step| command_runs_exactly(&step.cmd, &build))
+            .count()
+            != 2
+        {
             return Err(format!(
-                "{} must contain exactly one Rust manifest build node",
+                "{} must contain exactly the host and pinned-root Rust manifest build nodes",
                 path.display()
             ));
         }
@@ -1078,11 +1139,11 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
             .map(|document| document.bucket.clone())
             .collect::<BTreeSet<_>>();
         let mut actual = BTreeSet::new();
-        for step in dag
-            .steps
-            .iter()
-            .filter(|step| step.group == "e2e" && step.job.starts_with("manifest_"))
-        {
+        for step in dag.steps.iter().filter(|step| {
+            step.manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.lane == lane)
+        }) {
             let manifest = step.manifest.as_ref().ok_or_else(|| {
                 format!("{}.{} lacks typed manifest identity", step.group, step.job)
             })?;
@@ -1148,9 +1209,56 @@ fn audit_dag_correspondence(root: &Path, manifests: &ManifestSet) -> Result<(), 
     Ok(())
 }
 
+fn audit_validation_levels_policy(workflow: &str) -> Result<(), String> {
+    for variable in [
+        "VALIDATE_GATE_TIMEOUT_SECONDS",
+        "VALIDATE_GATE_CPU_TIMEOUT_SECONDS",
+        "SUPER_REPETITIONS",
+    ] {
+        if workflow
+            .lines()
+            .any(|line| line.trim_start().starts_with(&format!("{variable}:")))
+        {
+            return Err(format!(
+                "validation-levels.yml still sets {variable}, which would rewrite or conflict with the committed DAG"
+            ));
+        }
+    }
+    for command in [
+        "ci/run-dag.sh privileged",
+        "./scripts/validate.rs super --no-label-pr",
+    ] {
+        if !workflow.contains(command) {
+            return Err(format!(
+                "validation-levels.yml no longer invokes the committed-DAG path {command:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+// Match the actual hosted selector and shard-coverage consumer: an exact name
+// wins; only an existing hosted counterpart can resolve a public selector.
+// Keep the public name in the budget baseline and inspect the resolved node's
+// real timeout. Unknown or removed nodes remain errors.
+fn portable_shard_step<'a>(
+    steps: &std::collections::BTreeMap<String, &'a dagrun::Step>,
+    node: &str,
+) -> Result<&'a dagrun::Step, String> {
+    steps
+        .get(node)
+        .or_else(|| steps.get(&format!("{node}_on_host")))
+        .copied()
+        .ok_or_else(|| format!("portable shard names missing DAG node {node}"))
+}
+
 fn audit_budget_ordering(root: &Path) -> Result<(), String> {
-    let portable = read_dag(&root.join("ci/dag/portable.json"))?;
-    let privileged = read_dag(&root.join("ci/dag/privileged.json"))?;
+    audit_workflow_run_dag_runners(root)?;
+    let committed = read_dag(&root.join("ci/dag/validate.json"))?;
+    let portable = dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()])
+        .map_err(|error| format!("cannot select portable DAG steps: {error}"))?;
+    let privileged = dagrun::select_steps_by_labels(&committed, &["hosted-privileged".into()])
+        .map_err(|error| format!("cannot select privileged DAG steps: {error}"))?;
     for (lane, dag) in [("portable", &portable), ("privileged", &privileged)] {
         for step in &dag.steps {
             if step.timeout <= 0 {
@@ -1209,9 +1317,7 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
             let node = node
                 .as_str()
                 .ok_or_else(|| format!("{key} contains a non-string node"))?;
-            let step = portable_steps
-                .get(node)
-                .ok_or_else(|| format!("portable shard names missing DAG node {node}"))?;
+            let step = portable_shard_step(&portable_steps, node)?;
             let timeout = u64::try_from(step.timeout).map_err(|_| {
                 format!("portable node {node} has invalid timeout {}", step.timeout)
             })?;
@@ -1222,6 +1328,11 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
             }
         }
     }
+
+    let validation_levels =
+        fs::read_to_string(root.join(".github/workflows/validation-levels.yml"))
+            .map_err(|error| error.to_string())?;
+    audit_validation_levels_policy(&validation_levels)?;
 
     let privileged_workflow = fs::read_to_string(root.join(".github/workflows/ci-privileged.yml"))
         .map_err(|e| e.to_string())?;
@@ -1235,18 +1346,11 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
             "privileged workflow must contain exactly one diagnostic continue-on-error".into(),
         );
     }
-    let launcher_bound = privileged_workflow
+    let launcher_line = privileged_workflow
         .lines()
         .find(|line| line.contains("ci/run-dag.sh privileged"))
-        .and_then(|line| {
-            let words = line.split_whitespace().collect::<Vec<_>>();
-            words
-                .iter()
-                .position(|word| *word == "env")
-                .and_then(|index| index.checked_sub(1))
-                .and_then(|index| words[index].strip_suffix('s'))
-                .and_then(|value| value.parse::<u64>().ok())
-        })
+        .ok_or_else(|| "cannot find privileged launcher command".to_string())?;
+    let launcher_bound = command_timeout_seconds(launcher_line)?
         .ok_or_else(|| "cannot derive privileged launcher timeout".to_string())?;
     let privileged_yaml = parse_yaml(&root.join(".github/workflows/ci-privileged.yml"))?;
     let privileged_job_bound = workflow_job_timeout(&privileged_yaml, "privileged")? * 60;
@@ -1303,6 +1407,77 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
             .sum::<usize>(),
         privileged.steps.len()
     );
+    Ok(())
+}
+
+fn audit_workflow_run_dag_runners(root: &Path) -> Result<(), String> {
+    for relative in [
+        ".github/workflows/ci-dag.yml",
+        ".github/workflows/ci-privileged.yml",
+        ".github/workflows/validation-levels.yml",
+    ] {
+        let workflow = parse_yaml(&root.join(relative))?;
+        audit_run_dag_workflow_runner(relative, &workflow)?;
+    }
+    Ok(())
+}
+
+fn audit_run_dag_workflow_runner(label: &str, workflow: &YamlValue) -> Result<(), String> {
+    const PORTABLE: &str = "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable ${{ inputs.max_mem != '' && format('--max-mem {0}', inputs.max_mem) || '' }} -v";
+    const DAG_PRIVILEGED: &str =
+        "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 -v";
+    const VALIDATION_PRIVILEGED: &str = "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
+    const STANDALONE_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\ntimeout --foreground --kill-after=10s 1560s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
+    const FIXTURES: &[&str] = &[
+        "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v",
+        "timeout --foreground --kill-after=10s 1560s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
+    ];
+    let expected: &[(&str, &str)] = match label {
+        ".github/workflows/ci-dag.yml" => &[
+            ("dag-portable", PORTABLE),
+            ("dag-privileged", DAG_PRIVILEGED),
+        ],
+        ".github/workflows/ci-privileged.yml" => &[("privileged", STANDALONE_PRIVILEGED)],
+        ".github/workflows/validation-levels.yml" => &[("full", VALIDATION_PRIVILEGED)],
+        "fixture" => &[],
+        _ => return Err(format!("workflow {label} has no expected run-dag commands")),
+    };
+    let jobs = workflow["jobs"]
+        .as_mapping()
+        .ok_or_else(|| format!("workflow {label} has no jobs mapping"))?;
+    let mut consumers = Vec::new();
+    for (job_name, job) in jobs {
+        let job_name = job_name.as_str().unwrap_or("<non-string job>");
+        let steps = job["steps"]
+            .as_sequence()
+            .ok_or_else(|| format!("workflow {label} job {job_name} has no steps"))?;
+        for (step_index, step) in steps.iter().enumerate() {
+            let Some(run) = step.get("run").and_then(YamlValue::as_str) else {
+                continue;
+            };
+            let normalized = run
+                .chars()
+                .filter(|character| !matches!(character, '\\' | '\'' | '"'))
+                .collect::<String>();
+            if !normalized.contains("ci/run-dag.sh") {
+                continue;
+            }
+            consumers.push((job_name, run.trim_end()));
+            if label == "fixture" && !FIXTURES.contains(&run.trim_end()) {
+                return Err(format!(
+                    "workflow {label} job {job_name} run-dag step {step_index} is not an exact allowed Rust-runner command"
+                ));
+            }
+        }
+    }
+    if label == "fixture" && consumers.len() != 1 {
+        return Err(format!("workflow {label} has no ci/run-dag.sh consumer"));
+    }
+    if label != "fixture" && consumers != expected {
+        return Err(format!(
+            "workflow {label} run-dag commands differ from the exact Rust-runner commands: actual={consumers:?} expected={expected:?}"
+        ));
+    }
     Ok(())
 }
 
@@ -1400,6 +1575,20 @@ fn workflow_job_timeout(workflow: &YamlValue, job: &str) -> Result<u64, String> 
     workflow["jobs"][job]["timeout-minutes"]
         .as_u64()
         .ok_or_else(|| format!("workflow job {job} has no numeric timeout-minutes"))
+}
+
+fn command_timeout_seconds(command: &str) -> Result<Option<u64>, String> {
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    let Some(index) = words.iter().position(|word| *word == "timeout") else {
+        return Ok(None);
+    };
+    let budget = words[index + 1..]
+        .iter()
+        .find(|word| !word.starts_with('-'))
+        .and_then(|word| word.trim_end_matches('\\').strip_suffix('s'))
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| format!("cannot derive timeout budget from `{command}`"))?;
+    Ok(Some(budget))
 }
 
 fn workflow_step_timeout_sum(workflow: &YamlValue, job: &str) -> Result<u64, String> {
@@ -1695,6 +1884,22 @@ fn run_with_retry<T>(
     }
 }
 
+/// Retry only a completed product observation.
+///
+/// The failure class is the producer-owned distinction between a measured
+/// product failure and a run that could not produce a product verdict. Do not
+/// infer retryability from the human-readable reason or from the broad
+/// `FAIL`/`ERROR` presentation outcome: doing so doubled every `no_result` row
+/// in one failed validation without producing any additional information.
+fn cell_result_is_retryable(outcome: &str, failure_class: Option<FailureClass>) -> bool {
+    match failure_class {
+        Some(FailureClass::ProductFailure) => outcome == "FAIL",
+        Some(FailureClass::UnderstoodInfrastructureFailure) => false,
+        Some(FailureClass::UnderstoodPrerequisiteFailure) => false,
+        Some(FailureClass::NoResult) | None => false,
+    }
+}
+
 fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let mut selection = args.selection.clone();
     if selection.population.is_none() {
@@ -1766,7 +1971,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         Err(error) => infrastructure_error_result(&attempt_context, cell, error),
                     }
                 },
-                |result| !matches!(result.outcome.as_str(), "PASS" | "HOST-INAPPLICABLE"),
+                |result| cell_result_is_retryable(result.outcome.as_str(), result.failure_class),
                 emit,
             );
         },
@@ -1806,17 +2011,14 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                     result.test,
                     result.mode,
                     result.backend.as_deref().unwrap_or("native"),
-                    result.reason.as_deref().unwrap_or("infrastructure error")
+                    result.reason_for_display()
                 );
             }
             // A FAILURE MUST SAY ENOUGH TO BE CLASSIFIED, NOT JUST COUNTED.
             let located = if result.outcome == "PASS" {
                 String::new()
             } else if result.outcome == "HOST-INAPPLICABLE" {
-                format!(
-                    " {}",
-                    result.reason.as_deref().unwrap_or("host-inapplicable")
-                )
+                format!(" {}", result.reason_for_display())
             } else {
                 let coords = [
                     ("turn", result.first_divergent_scheduler_turn),
@@ -1831,8 +2033,8 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 if !coords.is_empty() {
                     suffix.push_str(&format!(" [{}]", coords.join(" ")));
                 }
-                if let Some(reason) = result.reason.as_deref() {
-                    suffix.push_str(&format!(" {reason}"));
+                if result.outcome != "PASS" {
+                    suffix.push_str(&format!(" {}", result.reason_for_display()));
                 }
                 suffix.push_str(&format!("\n    evidence: {}", result.artifact_dir));
                 suffix
@@ -1960,6 +2162,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use hermit_manifest_plan::runner::FailureClass;
     use hermit_manifest_plan::runner::ManifestSet;
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 
@@ -1967,16 +2170,25 @@ mod tests {
     use super::EXPECTED_PLAN_SCHEMA;
     use super::HostCapability;
     use super::HostCapabilityVerdict;
+    use super::PINNED_COMMAND_PREFIX;
+    use super::PINNED_COMMAND_SEPARATOR;
+    use super::PREBUILT_COMMAND_PREFIX;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
+    use super::audit_run_dag_workflow_runner;
+    use super::audit_validation_levels_policy;
     use super::build_worker_capacity;
+    use super::cell_result_is_retryable;
     use super::command_jobs;
+    use super::command_runs_exactly;
+    use super::command_timeout_seconds;
     use super::expected_plan_document;
     use super::for_each_parallel;
     use super::host_inapplicable_reason;
     use super::parse;
     use super::run_with_retry;
     use super::scheduled_worker_capacity;
+    use super::shell_quote_one;
     use super::structured_test_results_from_rows;
     use super::unique_plan_rows;
 
@@ -2113,6 +2325,122 @@ mod tests {
 "#;
 
     #[test]
+    fn portable_shard_budgets_resolve_actual_hosted_nodes_without_losing_checks() {
+        let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json"))
+            .expect("actual committed graph");
+        let hosted = dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()])
+            .expect("actual hosted selection");
+        let mut steps = hosted
+            .steps
+            .iter()
+            .map(|step| (step.tag(), step))
+            .collect::<BTreeMap<_, _>>();
+        let shards: serde_json::Value =
+            serde_json::from_str(include_str!("../../../portable-shards.json")).unwrap();
+        let expected_aliases = [
+            "test.hermit_unit",
+            "test.detcore_unit",
+            "test.detcore_misc",
+            "test.detcore_parallel",
+            "test.regular_crates",
+            "test.hermit_integration",
+            "test.arbitrary_binaries",
+            "test.applications_e2e",
+            "test.app_strict_verify",
+            "test.command_strict_verify",
+            "test.ignored_syscall_regressions",
+            "test.envelope_levels",
+            "test.rr_suite_contract",
+            "test.dbt_parity",
+            "test.sabre_examples",
+            "test.liteinst_strict",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        let mut actual_aliases = std::collections::BTreeSet::new();
+        let mut resolved = std::collections::BTreeSet::new();
+        let mut physical_rows = 0;
+        for key in ["debug_shards", "release_shards"] {
+            for shard in shards[key].as_array().unwrap() {
+                for public in shard["nodes"].as_array().unwrap() {
+                    let public = public.as_str().unwrap();
+                    let step = super::portable_shard_step(&steps, public).unwrap();
+                    let expected = if expected_aliases.contains(public) {
+                        assert!(
+                            !steps.contains_key(public),
+                            "must exercise actual renamed node"
+                        );
+                        actual_aliases.insert(public);
+                        format!("{public}_on_host")
+                    } else {
+                        public.to_string()
+                    };
+                    assert_eq!(step.tag(), expected);
+                    assert!(std::ptr::eq(step, steps[&expected]));
+                    assert!(
+                        resolved.insert(step.tag()),
+                        "duplicate physical shard target"
+                    );
+                    physical_rows += 1;
+                }
+            }
+        }
+        assert_eq!(physical_rows, 23);
+        assert_eq!(resolved.len(), 23);
+        assert_eq!(actual_aliases, expected_aliases);
+        // Run the complete real budget audit too: all original workflow,
+        // critical-path and exact inversion-baseline comparisons remain active.
+        super::audit_budget_ordering(&super::root()).unwrap();
+
+        let hosted_name = "test.hermit_unit_on_host";
+        let host = *steps.get(hosted_name).unwrap();
+        assert_eq!(host.timeout, 900);
+        assert!(std::ptr::eq(
+            super::portable_shard_step(&steps, hosted_name).unwrap(),
+            host
+        ));
+        let mut exact = (*host).clone();
+        exact.job = "hermit_unit".into();
+        exact.timeout = 17;
+        let mut exact_steps = steps.clone();
+        exact_steps.insert("test.hermit_unit".into(), &exact);
+        let selected = super::portable_shard_step(&exact_steps, "test.hermit_unit").unwrap();
+        assert!(
+            std::ptr::eq(selected, &exact),
+            "exact selector must win over hosted twin"
+        );
+        assert_eq!(
+            selected.timeout, 17,
+            "use actual selected budget, never a public-name default"
+        );
+        assert!(steps.remove(hosted_name).is_some());
+        for unknown in ["test.hermit_unit", hosted_name, "test.no_such_shard_node"] {
+            assert_eq!(
+                super::portable_shard_step(&steps, unknown).unwrap_err(),
+                format!("portable shard names missing DAG node {unknown}")
+            );
+        }
+    }
+
+    #[test]
+    fn validation_levels_cannot_rewrite_committed_graph_policy() {
+        let workflow = include_str!("../../../../.github/workflows/validation-levels.yml");
+        assert!(audit_validation_levels_policy(workflow).is_ok());
+        for planted in [
+            "VALIDATE_GATE_TIMEOUT_SECONDS: 3600",
+            "VALIDATE_GATE_CPU_TIMEOUT_SECONDS: 3600",
+            "SUPER_REPETITIONS: 7",
+        ] {
+            let changed = format!("{workflow}\nenv:\n  {planted}\n");
+            let error = audit_validation_levels_policy(&changed).unwrap_err();
+            assert!(
+                error.contains(planted.split(':').next().unwrap()),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn privileged_unboxed_execution_requires_the_exact_actions_guard() {
         assert!(audit_privileged_unboxed_guard(GUARDED_WORKFLOW).is_ok());
     }
@@ -2142,6 +2470,108 @@ mod tests {
     fn privileged_unboxed_execution_rejects_broad_boxing_failure_acceptance() {
         let executable = format!("{GUARDED_WORKFLOW}        run: tool --allow-cgroup-failure\n");
         assert!(audit_privileged_unboxed_guard(&executable).is_err());
+    }
+
+    #[test]
+    fn run_dag_workflows_use_a_structured_result_capable_runner() {
+        for command in [
+            "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v",
+            "timeout --foreground --kill-after=10s 1560s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
+        ] {
+            let workflow: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "jobs:\n  validation:\n    steps:\n      - run: {command}\n"
+            ))
+            .unwrap();
+            assert!(audit_run_dag_workflow_runner("fixture", &workflow).is_ok());
+        }
+    }
+
+    #[test]
+    fn run_dag_workflows_refuse_python_overrides_even_when_multiline() {
+        for assignment in [
+            "DAGRUN_BIN=agent-utils/py/bin/dagrun",
+            "DAGRUN_BIN=\"agent-utils/py/bin/dagrun\"",
+            "DAGRUN_ENGINE=python",
+            "DAGRUN_ENGINE='python'",
+            "DAGRUN_ENGINE=py",
+            "DAGRUN_ENGINE='py'",
+        ] {
+            let workflow: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "jobs:\n  validation:\n    steps:\n      - run: |\n          env \\\n            {assignment} \\\n            ci/run-dag.sh privileged -v\n"
+            ))
+            .unwrap();
+            let error = audit_run_dag_workflow_runner("fixture", &workflow)
+                .expect_err("a Python runner cannot consume structured-result DAGs");
+            assert!(
+                error.contains("not an exact allowed Rust-runner command"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_dag_workflows_refuse_python_overrides_from_each_environment_scope() {
+        for workflow in [
+            "env:\n  DAGRUN_ENGINE: py\njobs:\n  validation:\n    steps:\n      - run: ci/run-dag.sh portable -v\n",
+            "jobs:\n  validation:\n    env:\n      DAGRUN_ENGINE: python\n    steps:\n      - run: ci/run-dag.sh portable -v\n",
+            "jobs:\n  validation:\n    steps:\n      - env:\n          DAGRUN_BIN: agent-utils/py/bin/dagrun\n        run: ci/run-dag.sh portable -v\n",
+        ] {
+            let workflow: serde_yaml::Value = serde_yaml::from_str(workflow).unwrap();
+            let error = audit_run_dag_workflow_runner("fixture", &workflow)
+                .expect_err("a Python runner cannot consume structured-result DAGs");
+            assert!(
+                error.contains("not an exact allowed Rust-runner command"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_dag_workflows_follow_binary_precedence_and_refuse_dynamic_commands() {
+        for command in [
+            "DAGRUN_BIN=agent-utils/common/bin/dagrun ci/run-dag.sh portable -v",
+            "export DAGRUN_ENGINE=py; ci/run-dag.sh portable -v",
+            "env 'DAGRUN_ENGINE=py' ci/run-dag.sh portable -v",
+            "env 'DAGRUN_BIN=agent-utils/py/bin/dagrun' ci/run-dag.sh portable -v",
+            "echo 'env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v'",
+            "if false; then env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v; fi",
+            "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v; DAGRUN_ENGINE=py ci/run-dag\\.sh portable -v",
+            "DAGRUN_ENGINE=py ci/run-dag.sh portable -v; ci/run-dag.sh privileged -v",
+        ] {
+            let workflow: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "jobs:\n  validation:\n    steps:\n      - run: {command}\n"
+            ))
+            .unwrap();
+            assert!(audit_run_dag_workflow_runner("fixture", &workflow).is_err());
+        }
+
+        let expression: serde_yaml::Value = serde_yaml::from_str(
+            "env:\n  DAGRUN_ENGINE: ${{ vars.DAGRUN_ENGINE }}\njobs:\n  validation:\n    steps:\n      - run: ci/run-dag.sh portable -v\n",
+        )
+        .unwrap();
+        assert!(audit_run_dag_workflow_runner("fixture", &expression).is_err());
+
+        let inherited_from_github_env: serde_yaml::Value = serde_yaml::from_str(
+            "jobs:\n  validation:\n    steps:\n      - run: echo DAGRUN_ENGINE=py >> \"$GITHUB_ENV\"\n      - run: ci/run-dag.sh portable -v\n",
+        )
+        .unwrap();
+        assert!(audit_run_dag_workflow_runner("fixture", &inherited_from_github_env).is_err());
+
+        let inherited_values_are_cleared: serde_yaml::Value = serde_yaml::from_str(
+            "env:\n  DAGRUN_ENGINE: python\njobs:\n  validation:\n    steps:\n      - run: echo DAGRUN_BIN=agent-utils/py/bin/dagrun >> \"$GITHUB_ENV\"\n      - env:\n          DAGRUN_BIN: agent-utils/py/bin/dagrun\n        run: env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v\n",
+        )
+        .unwrap();
+        assert!(audit_run_dag_workflow_runner("fixture", &inherited_values_are_cleared).is_ok());
+    }
+
+    #[test]
+    fn privileged_launcher_timeout_does_not_depend_on_an_env_prefix() {
+        for command in [
+            "timeout --foreground --kill-after=10s 1560s ci/run-dag.sh privileged -v",
+            "timeout --foreground --kill-after=10s 1560s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
+        ] {
+            assert_eq!(command_timeout_seconds(command).unwrap(), Some(1560));
+        }
     }
 
     #[test]
@@ -2192,6 +2622,26 @@ mod tests {
         assert_eq!(rows, (0..8).map(|index| (index, index)).collect::<Vec<_>>());
         assert!(maximum.load(Ordering::SeqCst) > 1);
     }
+    #[test]
+    fn retry_policy_retries_only_classified_product_failures() {
+        assert!(cell_result_is_retryable(
+            "FAIL",
+            Some(FailureClass::ProductFailure)
+        ));
+        for (outcome, class) in [
+            ("PASS", None),
+            ("HOST-INAPPLICABLE", None),
+            ("FAIL", None),
+            ("FAIL", Some(FailureClass::UnderstoodInfrastructureFailure)),
+            ("ERROR", Some(FailureClass::NoResult)),
+            ("ERROR", Some(FailureClass::UnderstoodPrerequisiteFailure)),
+        ] {
+            assert!(
+                !cell_result_is_retryable(outcome, class),
+                "{outcome} {class:?}"
+            );
+        }
+    }
 
     #[test]
     fn retry_waits_for_publication_and_stops_after_pass() {
@@ -2223,6 +2673,350 @@ mod tests {
         );
         assert_eq!(executions.load(Ordering::SeqCst), 2);
         assert_eq!(rows.into_inner().unwrap(), [(1, true), (2, false)]);
+    }
+
+    #[test]
+    fn retry_policy_is_exhaustive_over_typed_failure_classes() {
+        use FailureClass::NoResult;
+        use FailureClass::ProductFailure;
+        use FailureClass::UnderstoodInfrastructureFailure;
+        use FailureClass::UnderstoodPrerequisiteFailure;
+
+        for (outcome, failure_class, expected) in [
+            ("FAIL", Some(ProductFailure), true),
+            ("ERROR", Some(ProductFailure), false),
+            ("FAIL", Some(NoResult), false),
+            ("ERROR", Some(NoResult), false),
+            ("ERROR", Some(UnderstoodPrerequisiteFailure), false),
+            ("ERROR", Some(UnderstoodInfrastructureFailure), false),
+            (
+                "HOST-INAPPLICABLE",
+                Some(UnderstoodPrerequisiteFailure),
+                false,
+            ),
+            ("PASS", None, false),
+            ("FAIL", None, false),
+        ] {
+            assert_eq!(
+                cell_result_is_retryable(outcome, failure_class),
+                expected,
+                "outcome={outcome} failure_class={failure_class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_result_batch_and_passing_peer_each_execute_once() {
+        const NO_RESULT_CELLS: usize = 178;
+        const CELL_COUNT: usize = NO_RESULT_CELLS + 1;
+
+        let executions = (0..CELL_COUNT)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>();
+        let rows = Mutex::new(Vec::new());
+        for_each_parallel(
+            CELL_COUNT,
+            ScheduledWorkerCapacity::new(8),
+            |index, emit| {
+                run_with_retry(
+                    1,
+                    |attempt| {
+                        executions[index].fetch_add(1, Ordering::SeqCst);
+                        if index < NO_RESULT_CELLS {
+                            (attempt, "ERROR", Some(FailureClass::NoResult))
+                        } else {
+                            (attempt, "PASS", None)
+                        }
+                    },
+                    |(_, outcome, failure_class)| cell_result_is_retryable(outcome, *failure_class),
+                    emit,
+                );
+            },
+            |index, (attempt, _, _), will_retry| {
+                rows.lock().unwrap().push((index, attempt, will_retry));
+                true
+            },
+        );
+
+        assert!(
+            executions
+                .iter()
+                .all(|count| count.load(Ordering::SeqCst) == 1)
+        );
+        let mut rows = rows.into_inner().unwrap();
+        rows.sort_unstable();
+        assert_eq!(rows.len(), CELL_COUNT);
+        assert!(
+            rows.iter()
+                .all(|(_, attempt, will_retry)| *attempt == 1 && !will_retry)
+        );
+    }
+
+    #[test]
+    fn product_failure_keeps_one_retry() {
+        let executions = AtomicUsize::new(0);
+        let mut rows = Vec::new();
+        run_with_retry(
+            1,
+            |attempt| {
+                executions.fetch_add(1, Ordering::SeqCst);
+                if attempt == 1 {
+                    (attempt, "FAIL", Some(FailureClass::ProductFailure))
+                } else {
+                    (attempt, "PASS", None)
+                }
+            },
+            |(_, outcome, failure_class)| cell_result_is_retryable(outcome, *failure_class),
+            |(attempt, _, _), will_retry| {
+                rows.push((attempt, will_retry));
+                true
+            },
+        );
+
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert_eq!(rows, [(1, true), (2, false)]);
+    }
+
+    #[test]
+    fn production_run_retries_only_product_failures() {
+        use std::path::Path;
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::process::ExitCode;
+
+        use hermit_manifest_plan::runner::CellResult;
+        use hermit_manifest_plan::runner::ObservedResult;
+        use serde_json::json;
+
+        const CHILD_FIXTURE: &str = "HERMIT_HARNESS_RETRY_TEST_FIXTURE";
+        const TEST_NAME: &str = "tests::production_run_retries_only_product_failures";
+        if let Some(fixture) = std::env::var_os(CHILD_FIXTURE) {
+            let fixture = PathBuf::from(fixture);
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .canonicalize()
+                .unwrap();
+            let manifests = ManifestSet::load(&fixture).unwrap();
+            let args = parse(
+                [
+                    "--mode".into(),
+                    "naked".into(),
+                    "--jobs".into(),
+                    "2".into(),
+                    "--results".into(),
+                    fixture.join("results.jsonl").to_string_lossy().into_owned(),
+                    "--junit".into(),
+                    fixture.join("junit.xml").to_string_lossy().into_owned(),
+                ]
+                .into_iter(),
+            );
+            super::validate_args("run", &args);
+            // Exercise the real run() callback, publication, result reduction and
+            // epilogue. Its product failure and non-product errors must stay red.
+            assert_eq!(super::run(&root, &manifests, &args), ExitCode::FAILURE);
+            return;
+        }
+
+        let fixture = std::env::temp_dir().join(format!(
+            "hermit-harness-native-retry-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        let manifests = fixture.join("tests/e2e/manifests");
+        fs::create_dir_all(&manifests).unwrap();
+        fs::write(
+            manifests.join("defaults.yaml"),
+            "schema: 3\ntimeout_seconds: 2\ncpu_timeout_seconds: 1\n",
+        )
+        .unwrap();
+        let disabled = json!({
+            "ci": false,
+            "backends_enabled": [],
+            "backends_disabled": {
+                "ptrace": "This control executes native commands only",
+                "dbt": "This control executes native commands only",
+                "kvm": "This control executes native commands only",
+                "sabre": "This control executes native commands only",
+                "liteinst": "This control executes native commands only"
+            }
+        });
+        let modes = json!({
+            "naked": {
+                "ci": false,
+                "ci_disabled_reason": "Native retry control is explicitly selected",
+                "backends_enabled": ["native"],
+                "runs": 1,
+                "assert": {"min_distinct": 1}
+            },
+            "verify": disabled,
+            "chaos": disabled,
+            "replay": disabled,
+            "custom": disabled
+        });
+        let missing = fixture.join("missing-native-program");
+        let recipes = [
+            ("infra", vec![missing.to_string_lossy().into_owned()]),
+            ("pass", vec!["/bin/true".into()]),
+            (
+                "product",
+                vec!["/bin/sh".into(), "-c".into(), "exit 23".into()],
+            ),
+            (
+                "recovers",
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "case \"$E2E_TMPDIR\" in *-attempt-2/tmp) exit 0;; *) exit 23;; esac".into(),
+                ],
+            ),
+            ("timeout", vec!["/bin/sleep".into(), "10".into()]),
+        ]
+        .into_iter()
+        .map(|(id, direct)| {
+            json!({
+                "id": format!("retry/{id}"),
+                "description": "Native production-callback retry control",
+                "lane": "portable",
+                "occasional": false,
+                "direct": direct,
+                "observation": {"status": true, "stdout": true, "stderr": true},
+                "modes": modes
+            })
+        })
+        .collect::<Vec<_>>();
+        fs::write(
+            manifests.join("retry.yaml"),
+            serde_json::to_vec(&json!({"schema": 3, "bucket": "retry", "test": recipes})).unwrap(),
+        )
+        .unwrap();
+        // Only the isolated child receives execution environment changes. A
+        // missing Hermit path makes the optional metadata/help probes inert;
+        // all five cells use the actual native execution path.
+        let output = Command::new("timeout")
+            .args(["--kill-after=2s", "25s"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env(CHILD_FIXTURE, &fixture)
+            .env("HERMIT_BIN", fixture.join("missing-hermit"))
+            .env("E2E_RESULT_ROOT", fixture.join("artifacts"))
+            .env("E2E_BUILD_ROOT", fixture.join("build"))
+            .env("E2E_RUN_ID", "native-retry-control")
+            .env("E2E_MACHINE_SHORTNAME", "native-retry-control")
+            .env("E2E_KERNEL_VERSION", "native-retry-control")
+            .env("DAGRUN_TEST_COUNTS_PATH", fixture.join("counts.json"))
+            .output()
+            .unwrap();
+        fs::write(fixture.join("child.stdout"), &output.stdout).unwrap();
+        fs::write(fixture.join("child.stderr"), &output.stderr).unwrap();
+        assert!(
+            output.status.success(),
+            "native run control failed: {}\n{}\n{}",
+            fixture.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows = fs::read_to_string(fixture.join("results.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<CellResult>(line).unwrap())
+            .collect::<Vec<_>>();
+        let mut histories = BTreeMap::<String, Vec<&CellResult>>::new();
+        for row in &rows {
+            row.require_current_classification().unwrap();
+            row.require_current_timeout_policy().unwrap();
+            assert_eq!(row.mode, "naked");
+            assert_eq!(row.backend, None);
+            assert_eq!(row.execution_cpu_timeout_seconds, Some(1));
+            assert_eq!(row.execution_wall_timeout_seconds, Some(2));
+            assert_eq!(row.timeout_seconds, 2);
+            histories.entry(row.test.clone()).or_default().push(row);
+        }
+        assert_eq!(
+            histories.len(),
+            5,
+            "every selected identity must remain present"
+        );
+        for (id, expected) in [
+            (
+                "infra",
+                vec![(
+                    1,
+                    "ERROR",
+                    Some(FailureClass::UnderstoodInfrastructureFailure),
+                )],
+            ),
+            ("pass", vec![(1, "PASS", None)]),
+            (
+                "product",
+                vec![
+                    (1, "FAIL", Some(FailureClass::ProductFailure)),
+                    (2, "FAIL", Some(FailureClass::ProductFailure)),
+                ],
+            ),
+            (
+                "recovers",
+                vec![
+                    (1, "FAIL", Some(FailureClass::ProductFailure)),
+                    (2, "PASS", None),
+                ],
+            ),
+            ("timeout", vec![(1, "FAIL", Some(FailureClass::NoResult))]),
+        ] {
+            let history = &histories[&format!("retry/{id}")];
+            assert_eq!(
+                history
+                    .iter()
+                    .map(|r| (r.attempt, r.outcome.as_str(), r.failure_class))
+                    .collect::<Vec<_>>(),
+                expected,
+                "actual production retry history for {id}; artifacts: {}",
+                fixture.display()
+            );
+        }
+        assert_eq!(
+            histories["retry/timeout"][0].result,
+            Some(ObservedResult::Timeout)
+        );
+        assert!(histories["retry/timeout"][0].attempts[0].timed_out);
+        assert!(histories["retry/infra"][0].attempts.is_empty());
+        let counts: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.join("counts.json")).unwrap()).unwrap();
+        assert_eq!(
+            counts,
+            json!({
+                "schema": 2,
+                "executed_tests": 5,
+                "filtered_tests": 0,
+                "results": [
+                    {"id": "retry/infra [native/naked]", "result": "fail", "attempts": 1},
+                    {"id": "retry/pass [native/naked]", "result": "pass", "attempts": 1},
+                    {"id": "retry/product [native/naked]", "result": "fail", "attempts": 2},
+                    {"id": "retry/recovers [native/naked]", "result": "pass", "attempts": 2},
+                    {"id": "retry/timeout [native/naked]", "result": "fail", "attempts": 1}
+                ]
+            })
+        );
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.join("summary.json")).unwrap()).unwrap();
+        for (name, expected) in [
+            ("cells", 5),
+            ("passed", 2),
+            ("failed", 2),
+            ("errors", 1),
+            ("host_inapplicable", 0),
+        ] {
+            assert_eq!(summary[name], expected, "summary {name}");
+        }
+        assert!(
+            summary["cell_cpu_usage_usec"].is_null(),
+            "missing CPU evidence must stay unknown"
+        );
+        let junit = fs::read_to_string(fixture.join("junit.xml")).unwrap();
+        assert!(junit.contains("tests=\"5\" failures=\"2\" errors=\"1\" skipped=\"0\""));
+        assert_eq!(junit.matches("<testcase ").count(), 5);
+        fs::remove_dir_all(fixture).unwrap();
     }
 
     #[test]
@@ -2312,6 +3106,74 @@ mod tests {
             |_, _, _| false,
         );
         assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn manifest_command_audit_accepts_only_exact_host_or_pinned_commands() {
+        let inner = "target/debug/test-harness validate";
+        let host = format!("{PREBUILT_COMMAND_PREFIX}{inner}");
+        assert!(command_runs_exactly(&host, inner));
+        let pinned = format!(
+            "{PINNED_COMMAND_PREFIX}--env E2E_RESULT_ROOT --env VALIDATE_VERBOSITY{PINNED_COMMAND_SEPARATOR}{}",
+            shell_quote_one(&host)
+        );
+        assert!(command_runs_exactly(&pinned, inner));
+        assert!(!command_runs_exactly(
+            &format!("{PREBUILT_COMMAND_PREFIX}true # {inner}"),
+            inner
+        ));
+        assert!(!command_runs_exactly(&format!("{pinned} && true"), inner));
+        assert!(!command_runs_exactly(
+            &format!(
+                "{PINNED_COMMAND_PREFIX}--env E2E_RESULT_ROOT --env E2E_RESULT_ROOT{PINNED_COMMAND_SEPARATOR}{}",
+                shell_quote_one(&host)
+            ),
+            inner
+        ));
+
+        let committed = dagrun::dag_from_json(include_str!("../../../dag/validate.json"))
+            .expect("the committed validation DAG must parse");
+        for lane in ["portable", "privileged"] {
+            let dag = dagrun::select_steps_by_labels(&committed, &[lane.to_string()]).unwrap();
+            let inner =
+                format!("target/debug/test-harness build --lane {lane} --ci-only --allow-empty");
+            let matches = dag
+                .steps
+                .iter()
+                .filter(|step| command_runs_exactly(&step.cmd, &inner))
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 2, "{lane}: host and pinned build commands");
+            let pinned = matches
+                .iter()
+                .find(|step| step.cmd.starts_with(PINNED_COMMAND_PREFIX))
+                .expect("the generated pinned command must match");
+            for malformed in [
+                pinned
+                    .cmd
+                    .replace("/src/ci/hermetic/assert-no-network.sh && ", ""),
+                pinned
+                    .cmd
+                    .replace("/src/ci/hermetic/assert-build-dependencies.sh && ", ""),
+                pinned
+                    .cmd
+                    .replace("hermit_payload=$1", "hermit_payload=true"),
+                format!("{} --unexpected", pinned.cmd),
+                pinned.cmd.replace(
+                    "--env E2E_RESULT_ROOT ",
+                    "--env E2E_RESULT_ROOT --env E2E_RESULT_ROOT ",
+                ),
+                pinned
+                    .cmd
+                    .replace("--env E2E_RESULT_ROOT ", "--env lowercase "),
+                pinned.cmd.replace(&inner, &format!("{inner} --jobs 2")),
+            ] {
+                assert_ne!(malformed, pinned.cmd, "control must alter the command");
+                assert!(
+                    !command_runs_exactly(&malformed, &inner),
+                    "accepted malformed or nonmatching command: {malformed}"
+                );
+            }
+        }
     }
 
     #[test]

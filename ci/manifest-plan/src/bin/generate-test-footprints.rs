@@ -4,9 +4,9 @@
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Generate `ci/test-footprints.json` from Cargo metadata and the portable DAG.
+//! Generate `ci/test-footprints.json` from Cargo metadata and the hosted-portable DAG.
 //!
-//! Cargo owns package paths and dependency edges. The portable DAG owns test
+//! Cargo owns package paths and dependency edges. The hosted-portable DAG owns test
 //! nodes and commands. `ci/test-footprints-policy.json` contains only the
 //! fail-safe path policy and semantic edges for non-Cargo harnesses.
 
@@ -25,8 +25,20 @@ use serde_json::json;
 
 const POLICY: &str = "ci/test-footprints-policy.json";
 const OUTPUT: &str = "ci/test-footprints.json";
-const DAG: &str = "ci/dag/portable.json";
+const DAG: &str = "ci/dag/validate.json";
 const REGENERATE: &str = "cargo run -p hermit-manifest-plan --bin generate-test-footprints";
+const STRICT_COMPAT_SELECTION_ALIAS: &str = "test.strict_compat";
+
+fn known_selection_node(nodes: &BTreeSet<String>, node: &str) -> bool {
+    nodes.contains(node)
+        // Policy uses the public selectors shared with local validation. The
+        // hosted driver resolves only an exact, present `_on_host` counterpart.
+        || nodes.contains(&format!("{node}_on_host"))
+        || (node == STRICT_COMPAT_SELECTION_ALIAS
+            && nodes
+                .iter()
+                .any(|candidate| candidate.starts_with("compat.")))
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct Args {
@@ -250,7 +262,12 @@ fn cargo_command_packages(
     let mut command_index = 0;
     while command_index < tokens.len() {
         let counted_nextest = tokens[command_index].ends_with("/ci/run-nextest-counted.sh");
-        if tokens[command_index] != "cargo" && !counted_nextest {
+        let prepared_nextest = tokens[command_index].ends_with("/ci/nextest-binaries.rs")
+            && matches!(
+                tokens.get(command_index + 1).map(String::as_str),
+                Some("run" | "list")
+            );
+        if tokens[command_index] != "cargo" && !counted_nextest && !prepared_nextest {
             command_index += 1;
             continue;
         }
@@ -259,9 +276,13 @@ fn cargo_command_packages(
             .map(String::as_str)
             .unwrap_or_default();
         let recognized = counted_nextest
+            || prepared_nextest
             || matches!(subcommand, "build" | "test" | "clippy" | "fmt" | "doc")
             || (subcommand == "nextest"
-                && tokens.get(command_index + 2).map(String::as_str) == Some("run"));
+                && matches!(
+                    tokens.get(command_index + 2).map(String::as_str),
+                    Some("run" | "list")
+                ));
         if !recognized {
             command_index += 1;
             continue;
@@ -320,18 +341,69 @@ fn cargo_command_packages(
     result
 }
 
+fn prepared_command_packages(
+    command: &str,
+    graph: &dagrun::model::DagConfig,
+    all: &BTreeSet<String>,
+    defaults: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, String> {
+    let tokens = shell_tokens(command);
+    let mut result = BTreeSet::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if !token.ends_with("/ci/nextest-binaries.rs")
+            || tokens.get(index + 1).map(String::as_str) != Some("prepare")
+        {
+            continue;
+        }
+        let profile = tokens
+            .get(index + 2)
+            .ok_or("prepared command has no profile")?;
+        let selections = hermit_manifest_plan::nextest_binaries::config_selections(graph, profile)?;
+        for args in selections.values() {
+            // These are validated Cargo build selectors from the graph. This
+            // string is only parsed for package names; it is never executed.
+            result.extend(cargo_command_packages(
+                &format!("cargo test {}", args.join(" ")),
+                all,
+                defaults,
+            ));
+            if args
+                .windows(2)
+                .any(|args| args == ["--test", "hermit_modes"])
+            {
+                let guests = "hermetic_infra_hermit_tests";
+                if !all.contains(guests) {
+                    return Err("prepared hermit_modes profile has no Cargo guest package".into());
+                }
+                result.insert(guests.into());
+            }
+        }
+    }
+    Ok(result)
+}
+
 fn load_dag_targets(
     dag: &Value,
     packages: &BTreeMap<String, Package>,
     defaults: &BTreeSet<String>,
 ) -> (BTreeSet<String>, BTreeMap<String, BTreeSet<String>>) {
     let all_packages: BTreeSet<String> = packages.keys().cloned().collect();
+    let graph = dagrun::io::dag_from_json(&dag.to_string())
+        .unwrap_or_else(|error| die(format!("{DAG}: {error}")));
     let steps = dag["steps"]
         .as_array()
         .unwrap_or_else(|| die(format!("{DAG}: `steps` must be an array")));
     let mut all_nodes = BTreeSet::new();
     let mut targets = BTreeMap::new();
     for step in steps {
+        if !step["labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|label| label.as_str() == Some("hosted-portable"))
+        {
+            continue;
+        }
         let group = step["group"]
             .as_str()
             .unwrap_or_else(|| die(format!("{DAG}: step is missing `group`")));
@@ -345,10 +417,12 @@ fn load_dag_targets(
         if !all_nodes.insert(node.clone()) {
             die(format!("{DAG}: duplicate node {node}"));
         }
-        targets.insert(
-            node,
-            cargo_command_packages(command, &all_packages, defaults),
+        let mut selected_packages = cargo_command_packages(command, &all_packages, defaults);
+        selected_packages.extend(
+            prepared_command_packages(command, &graph, &all_packages, defaults)
+                .unwrap_or_else(|error| die(format!("{DAG}: {node}: {error}"))),
         );
+        targets.insert(node, selected_packages);
     }
     (all_nodes, targets)
 }
@@ -368,7 +442,7 @@ fn load_rules(
         let location = format!("{POLICY}: package_rules[{index}]");
         let rule_nodes = strings(raw_rule, "nodes", &location);
         for node in &rule_nodes {
-            if !nodes.contains(node) {
+            if !known_selection_node(nodes, node) {
                 die(format!("{location}: unknown portable DAG node `{node}`"));
             }
         }
@@ -406,7 +480,7 @@ fn validate_path_footprints(policy: &Value, nodes: &BTreeSet<String>) {
         let location = format!("{POLICY}: path_footprints[{index}]");
         let _ = strings(footprint, "paths", &location);
         for node in strings(footprint, "nodes", &location) {
-            if !nodes.contains(&node) {
+            if !known_selection_node(nodes, &node) {
                 die(format!("{location}: unknown portable DAG node `{node}`"));
             }
         }
@@ -610,6 +684,81 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    fn committed_hosted_nodes() -> BTreeSet<String> {
+        let dag: Value = serde_json::from_str(include_str!("../../../dag/validate.json")).unwrap();
+        dag["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|step| {
+                step["labels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|label| label == "hosted-portable")
+            })
+            .map(|step| {
+                format!(
+                    "{}.{}",
+                    step["group"].as_str().unwrap(),
+                    step["job"].as_str().unwrap()
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn committed_policy_public_selectors_resolve_to_present_hosted_nodes() {
+        let nodes = committed_hosted_nodes();
+        let policy: Value =
+            serde_json::from_str(include_str!("../../../test-footprints-policy.json")).unwrap();
+        assert!(!nodes.contains("test.applications_e2e"));
+        assert!(nodes.contains("test.applications_e2e_on_host"));
+        for key in ["package_rules", "path_footprints"] {
+            for rule in policy[key].as_array().unwrap() {
+                for node in strings(rule, "nodes", key) {
+                    assert!(known_selection_node(&nodes, &node), "{key}: {node}");
+                }
+            }
+        }
+        let shared_runtime = policy["package_rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| {
+                strings(rule, "packages", "package_rules")
+                    .contains(&"hermit-test-workdir".to_string())
+            })
+            .expect("shared workdir must retain the shared-runtime coverage policy");
+        assert_eq!(shared_runtime["e2e_all"], true);
+        assert!(
+            strings(shared_runtime, "nodes", "package_rules")
+                .contains(&"test.applications_e2e".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_or_removed_hosted_policy_nodes_still_refuse() {
+        let mut nodes = committed_hosted_nodes();
+        assert!(known_selection_node(&nodes, "test.applications_e2e"));
+        assert!(nodes.remove("test.applications_e2e_on_host"));
+        assert!(!known_selection_node(&nodes, "test.applications_e2e"));
+        assert!(!known_selection_node(
+            &nodes,
+            "test.applications_e2e_on_host"
+        ));
+        assert!(!known_selection_node(&nodes, "test.applications_e2e_typo"));
+        assert!(nodes.insert("test.applications_e2e".into()));
+        assert!(known_selection_node(&nodes, "test.applications_e2e"));
+        assert!(!known_selection_node(
+            &nodes,
+            "test.applications_e2e_on_host"
+        ));
+        assert!(known_selection_node(&nodes, STRICT_COMPAT_SELECTION_ALIAS));
+        nodes.retain(|node| !node.starts_with("compat."));
+        assert!(!known_selection_node(&nodes, STRICT_COMPAT_SELECTION_ALIAS));
+    }
+
     #[test]
     fn no_arguments_still_select_artifact_write() {
         assert_eq!(parse_args(std::iter::empty()), Some(Args::default()));
@@ -665,7 +814,90 @@ mod tests {
             cargo_command_packages("/tmp/tree/ci/run-nextest-counted.sh -p b", &all, &defaults),
             BTreeSet::from(["b".into()])
         );
+        assert_eq!(
+            cargo_command_packages(
+                "cargo nextest list --workspace --exclude b && ./ci/nextest-binaries.rs list -p b",
+                &all,
+                &defaults
+            ),
+            BTreeSet::from(["a".into(), "b".into(), "c".into()])
+        );
         assert!(cargo_command_packages("cargo nextest show-config", &all, &defaults).is_empty());
+    }
+
+    #[test]
+    fn prepared_profiles_follow_graph_selections_and_include_cargo_guests() {
+        use hermit_manifest_plan::nextest_binaries::REQUIRED_ENV;
+        use hermit_manifest_plan::nextest_binaries::SELECTION_ENV;
+        let mut graph = dagrun::io::dag_from_json(&json!({"steps": [
+            {"group": "test", "job": "modes", "cmd": "true", "labels": ["portable"],
+             "env": {REQUIRED_ENV: "1", SELECTION_ENV: "[\"-p\",\"hermit\",\"--test\",\"hermit_modes\"]"}},
+            {"group": "test", "job": "unit", "cmd": "true", "labels": ["quick"],
+             "env": {REQUIRED_ENV: "1", SELECTION_ENV: "[\"-p\",\"hermit-detcore\",\"--lib\"]"}}
+        ]}).to_string()).unwrap();
+        let all = BTreeSet::from(
+            [
+                "hermit",
+                "hermit-detcore",
+                "hermetic_infra_hermit_tests",
+                "other",
+            ]
+            .map(String::from),
+        );
+        let defaults = BTreeSet::from(["other".into()]);
+        assert_eq!(
+            prepared_command_packages(
+                "./ci/nextest-binaries.rs prepare portable",
+                &graph,
+                &all,
+                &defaults
+            )
+            .unwrap(),
+            BTreeSet::from(["hermit".into(), "hermetic_infra_hermit_tests".into()])
+        );
+        assert_eq!(
+            prepared_command_packages(
+                "./ci/nextest-binaries.rs prepare quick",
+                &graph,
+                &all,
+                &defaults
+            )
+            .unwrap(),
+            BTreeSet::from(["hermit-detcore".into()])
+        );
+        assert!(
+            prepared_command_packages(
+                "./ci/nextest-binaries.rs prepare absent",
+                &graph,
+                &all,
+                &defaults
+            )
+            .is_err()
+        );
+        let mut no_guests = all.clone();
+        no_guests.remove("hermetic_infra_hermit_tests");
+        assert!(
+            prepared_command_packages(
+                "./ci/nextest-binaries.rs prepare portable",
+                &graph,
+                &no_guests,
+                &defaults
+            )
+            .is_err()
+        );
+        graph.steps[1]
+            .env
+            .insert(SELECTION_ENV.into(), "[\"-p\",\"other\",\"--lib\"]".into());
+        assert_eq!(
+            prepared_command_packages(
+                "./ci/nextest-binaries.rs prepare quick",
+                &graph,
+                &all,
+                &defaults
+            )
+            .unwrap(),
+            BTreeSet::from(["other".into()])
+        );
     }
 
     #[test]

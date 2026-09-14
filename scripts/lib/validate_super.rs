@@ -4,43 +4,11 @@
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! The `super` stress/diagnostic suite, as boxed DAG nodes.
+//! Generator and reporting support for the committed super population.
 //!
-//! # Where the gate table came from (provenance matters here too)
-//!
-//! `ci/super/gates.json` was NOT hand-transcribed from `validate.sh`. It was
-//! lifted MECHANICALLY by the same technique that produced the compatibility
-//! corpora: a COPY of `validate.sh` had `run_check` / `run_check_with_timeout`
-//! replaced by a recorder that dumped `(timeout, label, argv)` instead of
-//! executing, *after* the real bash had already evaluated every variable
-//! expansion, mode gate, and conditional; `run_super_suite` was then called. The
-//! dump reflects the code path, not a reading of it. 32 rows came out — 29 plain
-//! commands plus three bash FUNCTIONS (`run_portable_slow_strict_diagnostics`,
-//! `run_super_stress_suite`, `run_calibrated_analyze_tests`) which this module
-//! expands into their own boxed nodes.
-//!
-//! # Two deliberate, documented departures from the bash
-//!
-//! **1. The KVM and DBT stress probes were DEAD CODE in `validate.sh`.**
-//! `run_super_stress_suite` guards them with
-//! `if backend_selector_supported && kvm_backend_available`, and
-//! `backend_selector_supported` **is not defined anywhere in the repository**
-//! (`validate.sh` calls it at :2694 and :2701 and defines it nowhere). An
-//! undefined command exits 127, so the condition was ALWAYS false and both
-//! probes have always been skipped. The port implements the availability check
-//! the bash clearly intended, but expresses it as a DAG node the probe rows
-//! DEPEND on: when the backend is unavailable the availability node fails and
-//! its 20 dependents are *skipped*, which the runner reports as skipped rather
-//! than failed — structurally the same "SKIP" the bash printed. And because
-//! these rows have never been measured, [`stress_verdict`] classifies KVM/DBT
-//! stress failures as NONBLOCKING and says so: a first-ever measurement must
-//! arrive as data, not as an unratcheted gate that turns the suite red.
-//!
-//! **2. Concurrency is the scheduler's, not a hand-rolled batch loop.**
-//! `run_super_probe` forked `SUPER_JOBS` copies at a time; on this 316-core box
-//! `SUPER_JOBS` resolves to `(316*3+1)/2 = 474`, i.e. all 20 repetitions of a
-//! probe ran at once, unboxed. Here each `(probe, iteration)` is its own DAG
-//! node with its own wall/CPU/memory box, scheduled at the driver's `-j` width.
+//! Static super nodes are authored directly in `ci/dag/validate.json`. The
+//! maintenance generator calls this module only for the namespaced `superstress`
+//! partition; runtime validation selects the committed `super` label.
 
 use std::path::Path;
 
@@ -48,11 +16,10 @@ use dagrun::model::Step;
 use dagrun::model::StepOutcome;
 
 use crate::validate_plan::node;
-use crate::validate_plan::shell_join;
 use crate::validate_plan::shell_quote;
 
-/// `GATE_TIMEOUT_SECONDS` (validate.sh:400). A gates.json row with
-/// `"timeout": 0` used bare `run_check`, which inherits this default.
+/// `GATE_TIMEOUT_SECONDS` (validate.sh:400). A generated super node without
+/// an explicit override inherits this historical default before it is committed.
 pub const DEFAULT_GATE_TIMEOUT_S: i64 = 600;
 
 /// `SUPER_REPETITIONS` (validate.sh:682).
@@ -69,142 +36,99 @@ pub const SUPER_PROBE_TIMEOUT_S: i64 = 60;
 const SUPER_PROBE_CPU_TIMEOUT_S: i64 = 120;
 const SUPER_PROBE_MEM_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 
-/// Memory ceiling for a `cargo build` node in this suite.
-const BUILD_MEM_BYTES: i64 = 16 * 1024 * 1024 * 1024;
-/// Memory ceiling for a `cargo test` diagnostic node.
-const TEST_MEM_BYTES: i64 = 8 * 1024 * 1024 * 1024;
-
-/// One row of the mechanically extracted gate table.
+/// One row in the mechanically extracted super source table. These rows are a
+/// maintenance-time input and self-test oracle; runtime consumes only the
+/// committed validation DAG.
 #[derive(Clone, Debug)]
-pub struct SuperGate {
-    pub job: String,
-    pub label: String,
-    /// Wall seconds; `0` means "validate.sh's `run_check` default".
-    pub timeout: i64,
-    pub argv: Vec<String>,
-    /// Set when the row was a bash FUNCTION rather than a command.
-    pub synthetic: Option<String>,
+struct SuperGate {
+    job: String,
+    label: String,
+    timeout: i64,
+    argv: Vec<String>,
+    synthetic: Option<String>,
 }
 
-/// Translate the mechanically extracted libtest invocation to nextest while
-/// preserving Cargo target selection and libtest filters. The table remains a
-/// provenance artifact; this is the versioned execution-policy layer that adds
-/// per-individual-test termination.
 fn apply_innermost_timeout_runner(argv: &mut Vec<String>, root: &str) -> bool {
-    let Some(cargo) = argv.windows(2).position(|w| w == ["cargo", "test"]) else {
+    let Some(cargo) = argv.windows(2).position(|words| words == ["cargo", "test"]) else {
         return false;
     };
     argv[cargo] = format!("{root}/ci/run-nextest-counted.sh");
     argv.remove(cargo + 1);
-
     let mut jobs = None;
     let mut no_capture = false;
-    argv.retain(|arg| {
-        if let Some(value) = arg.strip_prefix("--test-threads=") {
+    argv.retain(|argument| {
+        if let Some(value) = argument.strip_prefix("--test-threads=") {
             jobs = Some(value.to_string());
             false
-        } else if arg == "--nocapture" {
+        } else if argument == "--nocapture" {
             no_capture = true;
             false
         } else {
             true
         }
     });
-    let split = argv.iter().position(|arg| arg == "--").unwrap_or(argv.len());
+    let split = argv.iter().position(|argument| argument == "--").unwrap_or(argv.len());
     if let Some(jobs) = jobs {
         argv.splice(split..split, ["-j".to_string(), jobs]);
     }
     if no_capture {
-        let split = argv.iter().position(|arg| arg == "--").unwrap_or(argv.len());
+        let split = argv.iter().position(|argument| argument == "--").unwrap_or(argv.len());
         argv.insert(split, "--no-capture".to_string());
     }
     true
 }
 
-impl SuperGate {
-    /// Resolved wall budget: the row's own, or the `run_check` default.
-    pub fn wall(&self) -> i64 {
-        if self.timeout > 0 { self.timeout } else { DEFAULT_GATE_TIMEOUT_S }
-    }
-}
-
-/// Load `ci/super/gates.json`.
-///
-/// Fails LOUDLY on an empty or malformed table for the same reason
-/// `validate_corpus::load` does: a silently-empty super suite would report
-/// "pass" having run nothing, which is the zero-executed-tests defect class.
-pub fn load_gates(root: &Path) -> Result<Vec<SuperGate>, String> {
-    let file = root.join("ci").join("super").join("gates.json");
+fn load_gates(root: &Path) -> Result<Vec<SuperGate>, String> {
+    let file = root.join("ci/super/gates.json");
     let text = std::fs::read_to_string(&file)
-        .map_err(|e| format!("cannot read super gate table {}: {e}", file.display()))?;
-    let doc: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("invalid JSON in {}: {e}", file.display()))?;
-    let rows = doc
+        .map_err(|error| format!("cannot read super gate table {}: {error}", file.display()))?;
+    let document: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("invalid JSON in {}: {error}", file.display()))?;
+    let rows = document
         .get("rows")
-        .and_then(|r| r.as_array())
+        .and_then(|rows| rows.as_array())
         .ok_or_else(|| format!("{} has no `rows` array", file.display()))?;
-    let root_s = root.to_string_lossy().to_string();
-    let mut out = Vec::with_capacity(rows.len());
-    for (i, row) in rows.iter().enumerate() {
-        let get_str = |k: &str| row.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
-        let job = get_str("job")
-            .ok_or_else(|| format!("{} row {i}: missing string `job`", file.display()))?;
-        let label = get_str("label")
-            .ok_or_else(|| format!("{} row {i}: missing string `label`", file.display()))?;
-        let timeout = row.get("timeout").and_then(|v| v.as_i64()).unwrap_or(0);
-        let argv_raw = row
+    let root = root.to_string_lossy();
+    let mut gates = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let string = |field: &str| {
+            row.get(field)
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        };
+        let job = string("job")
+            .ok_or_else(|| format!("{} row {index}: missing string `job`", file.display()))?;
+        let label = string("label")
+            .ok_or_else(|| format!("{} row {index}: missing string `label`", file.display()))?;
+        let timeout = row.get("timeout").and_then(|value| value.as_i64()).unwrap_or(0);
+        let raw = row
             .get("argv")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| format!("{} row {i} ({label}): missing array `argv`", file.display()))?;
-        let mut argv = Vec::with_capacity(argv_raw.len());
-        for a in argv_raw {
-            let s = a.as_str().ok_or_else(|| {
-                format!("{} row {i} ({label}): non-string argv element", file.display())
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| format!("{} row {index} ({label}): missing array `argv`", file.display()))?;
+        let mut argv = Vec::with_capacity(raw.len());
+        for argument in raw {
+            let argument = argument.as_str().ok_or_else(|| {
+                format!("{} row {index} ({label}): non-string argv element", file.display())
             })?;
-            argv.push(s.replace("{{ROOT_DIR}}", &root_s));
+            argv.push(argument.replace("{{ROOT_DIR}}", &root));
         }
-        apply_innermost_timeout_runner(&mut argv, &root_s);
-        let synthetic = get_str("synthetic");
+        apply_innermost_timeout_runner(&mut argv, &root);
+        let synthetic = string("synthetic");
         if synthetic.is_none() && argv.is_empty() {
-            return Err(format!("{} row {i} ({label}): empty argv", file.display()));
+            return Err(format!("{} row {index} ({label}): empty argv", file.display()));
         }
-        out.push(SuperGate { job, label, timeout, argv, synthetic });
+        gates.push(SuperGate {
+            job,
+            label,
+            timeout,
+            argv,
+            synthetic,
+        });
     }
-    if out.is_empty() {
+    if gates.is_empty() {
         return Err(format!("{} contained zero rows", file.display()));
     }
-    Ok(out)
-}
-
-/// Memory hint for a plain gate row, chosen from what the command actually is.
-fn mem_for(argv: &[String]) -> i64 {
-    let joined = argv.join(" ");
-    if joined.contains("cargo build") || joined.contains("prepare_leveldb") {
-        BUILD_MEM_BYTES
-    } else {
-        TEST_MEM_BYTES
-    }
-}
-
-/// Build a plain (non-synthetic) super gate node.
-pub fn gate_node(g: &SuperGate, deps: Vec<String>) -> Step {
-    // The slow-test override is 600 s plus 30 s termination grace. Keep the
-    // cgroup node comfortably outside it so nextest always prints the test name.
-    let wall = if g.argv.windows(3).any(|w| w == ["cargo", "nextest", "run"]) {
-        g.wall().max(720)
-    } else {
-        g.wall()
-    };
-    node(
-        "super",
-        &g.job,
-        &g.label,
-        shell_join(&g.argv),
-        deps,
-        wall,
-        (wall * 2).min(7200),
-        mem_for(&g.argv),
-    )
+    Ok(gates)
 }
 
 // --------------------------------------------------------------------- stress
@@ -442,203 +366,152 @@ pub fn stress_verdict(rates: &[ProbeRate], reps: i64, jobs: i64, host_cpus: usiz
     blocking
 }
 
-/// Tags of every stress node whose failure must not turn the suite red.
-pub fn nonblocking_tags(reps: i64) -> Vec<String> {
-    let mut out = vec!["superstress.kvm_available".to_string(), "superstress.dbt_available".to_string()];
-    for probe in STRESS_PROBES.iter().filter(|p| p.nonblocking()) {
-        let stem = probe.job_stem();
-        for i in 1..=reps {
-            out.push(format!("superstress.{stem}_{i:02}"));
-        }
-    }
-    out
-}
-
-// ------------------------------------------------------- calibrated analyze
-
-/// `run_calibrated_analyze_tests` (validate.sh:4526) as one boxed node.
-///
-/// Kept as a single node because the three steps are one measurement: build the
-/// skid probe, read its recommended RCB margin, then run the analyze test with
-/// that margin exported. Splitting them would require passing a value between
-/// nodes, and the runner has no such channel. Every knob the bash exposed as an
-/// environment override is preserved verbatim.
-pub fn calibrated_analyze_node(g: &SuperGate, deps: Vec<String>) -> Step {
-    // The extracted synthetic row carries libtest's thread flag after `--`.
-    // Nextest owns process concurrency with `-j 1`, so do not forward an
-    // emulation flag it deliberately does not support.
-    let test_args = shell_join(
-        g.argv
-            .iter()
-            .filter(|arg| !arg.starts_with("--test-threads="))
-            .cloned()
-            .collect::<Vec<_>>(),
-    );
-    let cmd = format!(
-        r#"set -u
-iters=${{ANALYZE_SKID_CALIBRATION_ITERATIONS:-64}}
-period=${{ANALYZE_SKID_CALIBRATION_PERIOD:-1000000}}
-floor=${{ANALYZE_SKID_MINIMUM_MARGIN:-20000}}
-cal_timeout=${{ANALYZE_SKID_CALIBRATION_TIMEOUT:-30}}
-for name in iters period floor cal_timeout; do
-    eval "v=\$$name"
-    case "$v" in
-        ''|*[!0-9]*|0*) echo "Analyze PMU calibration error: $name must be a positive integer, got $v" >&2; exit 2 ;;
-    esac
-done
-bin=$PWD/target/ci-pmu-skid
-mkdir -p "$(dirname "$bin")" || exit 1
-cc -O2 -Wall -Wextra -Werror -std=gnu11 tests/util/pmu_skid.c -o "$bin" || {{
-    echo "Analyze PMU calibration error: failed to build tests/util/pmu_skid.c" >&2; exit 1; }}
-out=$(timeout "$cal_timeout" "$bin" --iterations "$iters" --period "$period" 2>&1) || {{
-    status=$?; printf 'Analyze PMU calibration failed (exit %s):\n%s\n' "$status" "$out" >&2; exit "$status"; }}
-printf '%s\n' "$out"
-rec=$(printf '%s\n' "$out" | sed -n 's/^Recommended margin: \([0-9][0-9]*\) RCB.*/\1/p')
-case "$rec" in
-    ''|*[!0-9]*|0*) echo "Analyze PMU calibration error: output omitted a valid recommended margin" >&2; exit 1 ;;
-esac
-margin=$rec
-if [ "$margin" -lt "$floor" ]; then margin=$floor; fi
-printf 'Analyze PMU skid margin: calibrated=%s RCB, conservative floor=%s RCB, using=%s RCB\n' \
-    "$rec" "$floor" "$margin"
-HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test analyze -j 1 {test_args}"#
-    );
-    let wall = g.wall();
-    node("super", &g.job, &g.label, cmd, deps, wall, (wall * 2).min(7200), TEST_MEM_BYTES)
-}
-
 // ----------------------------------------------------------------- self-test
 
-/// Inert brackets for this module. Neither branch can run a gate: they only
-/// construct nodes and classify synthetic outcomes.
+/// Focused controls for the reporting policy that remains live after the
+/// committed DAG became the sole source of super-plan construction.
 pub fn self_test(root: &Path) -> Result<String, String> {
     let gates = load_gates(root)?;
-    // Positive: the qualifying table must be ACCEPTED with its three synthetic
-    // rows recognized, so a table that silently lost one cannot pass.
-    let synth: Vec<&str> =
-        gates.iter().filter_map(|g| g.synthetic.as_deref()).collect();
-    let want = ["portable_slow_strict_diagnostics", "super_stress_suite", "calibrated_analyze_tests"];
-    for w in want {
-        if !synth.contains(&w) {
-            return Err(format!("super gate table lost its `{w}` synthetic row"));
-        }
-    }
-    if gates.len() < 30 {
+    if gates.len() != 32 {
         return Err(format!(
-            "super gate table has only {} rows; the mechanical extraction produced 32",
+            "super source table has {} rows; the mechanical extraction requires exactly 32",
             gates.len()
+        ));
+    }
+    let synthetic = gates
+        .iter()
+        .filter_map(|gate| gate.synthetic.as_deref())
+        .collect::<Vec<_>>();
+    let expected_synthetic = [
+        "portable_slow_strict_diagnostics",
+        "super_stress_suite",
+        "calibrated_analyze_tests",
+    ];
+    if synthetic.len() != expected_synthetic.len()
+        || expected_synthetic
+            .iter()
+            .any(|name| !synthetic.contains(name))
+    {
+        return Err(format!(
+            "super source table synthetic rows changed: {synthetic:?}"
         ));
     }
     let nextest_rows = gates
         .iter()
-        .filter(|g| {
-            g.argv
+        .filter(|gate| {
+            gate.argv
                 .iter()
-                .any(|arg| arg.ends_with("/ci/run-nextest-counted.sh"))
+                .any(|argument| argument.ends_with("/ci/run-nextest-counted.sh"))
         })
         .count();
     if nextest_rows < 20
         || gates
             .iter()
-            .any(|g| g.argv.windows(2).any(|w| w == ["cargo", "test"]))
+            .any(|gate| gate.argv.windows(2).any(|words| words == ["cargo", "test"]))
     {
         return Err(format!(
-            "super innermost timeout conversion incomplete: {nextest_rows} nextest rows"
+            "super source table cargo-test conversion is incomplete: {nextest_rows} nextest rows"
         ));
     }
-    let analyze = gates
+    let calibrated = gates
         .iter()
-        .find(|g| g.synthetic.as_deref() == Some("calibrated_analyze_tests"))
-        .ok_or("super gate table lost calibrated_analyze_tests")?;
-    let analyze_cmd = calibrated_analyze_node(analyze, vec!["probe.dep".into()]).cmd;
-    if !analyze_cmd.contains("./ci/run-nextest-counted.sh")
-        || analyze_cmd.contains("--test-threads=")
+        .find(|gate| gate.synthetic.as_deref() == Some("calibrated_analyze_tests"))
+        .ok_or_else(|| "super source table lost calibrated_analyze_tests".to_string())?;
+    let normalized_calibrated = calibrated
+        .argv
+        .iter()
+        .filter(|argument| !argument.starts_with("--test-threads="))
+        .cloned()
+        .collect::<Vec<_>>();
+    if normalized_calibrated
+        .iter()
+        .any(|argument| argument.starts_with("--test-threads="))
+        || normalized_calibrated.len() + 1 != calibrated.argv.len()
+        || calibrated.job.is_empty()
+        || calibrated.label.is_empty()
+        || calibrated.timeout < 0
     {
         return Err(format!(
-            "calibrated analyze did not normalize libtest arguments: {analyze_cmd}"
+            "calibrated analyze source arguments were not normalized: {:?}",
+            calibrated.argv
         ));
     }
-    // Negative: a table whose rows are not an array, or whose row lacks argv,
-    // must be REFUSED rather than yielding an empty (silently green) suite.
-    let bad_dir = std::env::temp_dir().join(format!("validate-super-selftest-{}", std::process::id()));
-    let bad_file = bad_dir.join("ci").join("super").join("gates.json");
-    std::fs::create_dir_all(bad_file.parent().unwrap())
-        .map_err(|e| format!("self-test: cannot stage negative fixture: {e}"))?;
-    let mut refused = 0usize;
-    for (why, body) in [
+    let committed = std::fs::read_to_string(root.join("ci/dag/validate.json"))
+        .map_err(|error| format!("cannot read committed super graph: {error}"))?;
+    let committed = dagrun::io::dag_from_json(&committed)
+        .map_err(|error| format!("cannot parse committed super graph: {error}"))?;
+    let emitted = committed
+        .steps
+        .iter()
+        .find(|step| step.tag() == "super.pmu_analyze_hello_race_stress_calibrated_skid")
+        .ok_or_else(|| "committed graph lost calibrated analyze node".to_string())?;
+    if !emitted.cmd.contains("./ci/run-nextest-counted.sh")
+        || emitted.cmd.contains("--test-threads=")
+    {
+        return Err(format!(
+            "committed calibrated analyze command was not normalized: {}",
+            emitted.cmd
+        ));
+    }
+
+    let bad_root = std::env::temp_dir().join(format!(
+        "validate-super-source-self-test-{}",
+        std::process::id()
+    ));
+    let bad_file = bad_root.join("ci/super/gates.json");
+    std::fs::create_dir_all(bad_file.parent().expect("fixture has a parent"))
+        .map_err(|error| format!("cannot create super negative fixture: {error}"))?;
+    let mut refused = 0;
+    for (description, body) in [
         ("no rows array", r#"{"rows": {}}"#),
         ("empty rows", r#"{"rows": []}"#),
         ("row without argv", r#"{"rows":[{"job":"j","label":"l","timeout":0}]}"#),
-        ("row with non-string argv", r#"{"rows":[{"job":"j","label":"l","argv":[7]}]}"#),
+        ("non-string argv", r#"{"rows":[{"job":"j","label":"l","argv":[7]}]}"#),
     ] {
         std::fs::write(&bad_file, body)
-            .map_err(|e| format!("self-test: cannot write negative fixture: {e}"))?;
-        if load_gates(&bad_dir).is_ok() {
-            let _ = std::fs::remove_dir_all(&bad_dir);
-            return Err(format!("super gate loader ACCEPTED a malformed table ({why})"));
+            .map_err(|error| format!("cannot write super negative fixture: {error}"))?;
+        if load_gates(&bad_root).is_ok() {
+            let _ = std::fs::remove_dir_all(&bad_root);
+            return Err(format!("super source loader accepted {description}"));
         }
         refused += 1;
     }
-    let _ = std::fs::remove_dir_all(&bad_dir);
+    let _ = std::fs::remove_dir_all(&bad_root);
 
-    // Bracket the stress verdict on both sides with synthetic outcomes: a full
-    // ptrace sweep must be ACCEPTED (0 blocking) and a single ptrace miss must
-    // be REFUSED (1 blocking), while the same miss on KVM stays nonblocking.
-    let reps = 3i64;
-    let mk = |tag: &str, ok: bool| StepOutcome {
-        tag: tag.to_string(),
-        ok,
-        duration_s: 0.0,
-        summary: String::new(),
-        executed_tests: None,
-        filtered_tests: None,
-        test_results: None,
-        returncode: Some(if ok { 0 } else { 1 }),
-        oomed: false,
-        oom_kills: 0,
-        timed_out: false,
-        cpu_timed_out: false,
-        reason: String::new(),
-        aborted: false,
-    };
-    let mut all_pass = Vec::new();
-    for probe in STRESS_PROBES {
-        for i in 1..=reps {
-            all_pass.push(mk(&format!("superstress.{}_{i:02}", probe.slug().replace('-', "_")), true));
-        }
-    }
-    let rates = stress_rates(&all_pass, reps);
-    if count_blocking(&rates) != 0 {
-        return Err("stress verdict: an all-passing sweep must be accepted".into());
-    }
-    let mut one_ptrace_miss = all_pass.clone();
-    one_ptrace_miss[0] = mk("superstress.ptrace_strict_verify_01", false);
-    if count_blocking(&stress_rates(&one_ptrace_miss, reps)) != 1 {
-        return Err("stress verdict: a ptrace repetition failure must be blocking".into());
-    }
-    let mut one_kvm_miss = all_pass.clone();
-    let kvm_idx = all_pass
+    let reps = 2;
+    let all_green = STRESS_PROBES
         .iter()
-        .position(|o| o.tag.starts_with("superstress.kvm_verify_"))
-        .ok_or("stress verdict: kvm rows absent from the synthetic sweep")?;
-    one_kvm_miss[kvm_idx] = mk("superstress.kvm_verify_01", false);
-    if count_blocking(&stress_rates(&one_kvm_miss, reps)) != 0 {
-        return Err("stress verdict: a KVM repetition failure must stay NONBLOCKING".into());
+        .copied()
+        .map(|probe| ProbeRate {
+            probe,
+            passed: reps as usize,
+            ran: reps as usize,
+            planned: reps as usize,
+        })
+        .collect::<Vec<_>>();
+    if stress_verdict(&all_green, reps, 1, 1) != 0 {
+        return Err("super stress verdict: an all-passing population must be accepted".into());
     }
+
+    let mut ptrace_miss = all_green.clone();
+    ptrace_miss[0].passed -= 1;
+    if stress_verdict(&ptrace_miss, reps, 1, 1) != 1 {
+        return Err("super stress verdict: a ptrace miss must remain blocking".into());
+    }
+
+    let mut kvm_miss = all_green;
+    let kvm = kvm_miss
+        .iter_mut()
+        .find(|rate| rate.probe == StressProbe::KvmVerify)
+        .ok_or_else(|| "super stress verdict: KVM control is absent".to_string())?;
+    kvm.passed -= 1;
+    if stress_verdict(&kvm_miss, reps, 1, 1) != 0 {
+        return Err("super stress verdict: the first KVM measurement must remain nonblocking".into());
+    }
+
     Ok(format!(
-        "super: {} gate rows ({} synthetic, {nextest_rows} cargo-nextest + calibrated analyze), {refused} malformed tables refused, \
-         stress verdict bracketed 1 accept / 1 blocking-refusal / 1 nonblocking",
-        gates.len(),
-        synth.len()
+        "super source: 32 rows, 3 synthetic expansions, {nextest_rows} nextest rows, {refused} malformed tables refused; stress verdict bracketed"
     ))
-}
-
-/// Blocking count without printing (used by the inert brackets).
-fn count_blocking(rates: &[ProbeRate]) -> usize {
-    rates
-        .iter()
-        .filter(|r| r.ran > 0 && r.passed != r.planned && !r.probe.nonblocking())
-        .count()
 }
 
 /// Environment overrides this module honors, for the plan banner.

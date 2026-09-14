@@ -21,6 +21,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls;
+use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::MemoryAccess;
@@ -42,6 +43,7 @@ use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::signal::read_kernel_sigset;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
 use crate::types::DetTid;
@@ -447,6 +449,44 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(guest.inject(call).await?);
         }
 
+        // Linux copies pselect6's outer { sigmask, sigsetsize } wrapper before
+        // validating the timeout. Copy only the wrapper here; validation of the
+        // pointed-to signal mask remains below, after timeout validation.
+        let sigmask_argument = match call.sigmask() {
+            Some(argument) => {
+                // A split read can fall back to PTRACE_PEEKDATA for the final
+                // word, bypassing PROT_NONE or reporting EIO for an unmapped
+                // page. Have Linux validate both wrapper words first. It copies
+                // this wrapper before rejecting a malformed timeout, without
+                // reading the inner mask, changing it, waiting, or writing output.
+                let mut stack = guest.stack().await;
+                let validation_timeout = stack.reserve::<Timespec>();
+                let _guard = stack.commit()?;
+                guest.memory().write_value(
+                    validation_timeout,
+                    &Timespec {
+                        tv_sec: 0,
+                        tv_nsec: 1_000_000_000,
+                    },
+                )?;
+                let validation = syscalls::Pselect6::new()
+                    .with_nfds(0)
+                    .with_readfds(None)
+                    .with_writefds(None)
+                    .with_exceptfds(None)
+                    .with_timeout(Some(validation_timeout))
+                    .with_sigmask(Some(argument));
+                match guest.inject(validation).await {
+                    Err(Errno::EINVAL) => {}
+                    Err(errno) => return Err(errno.into()),
+                    // Success would mean the backend did not validate the probe.
+                    Ok(_) => return Err(Errno::EIO.into()),
+                }
+                let argument: Pselect6SigmaskArg = guest.memory().read_value(argument.cast())?;
+                Some(argument)
+            }
+            None => None,
+        };
         let raw_timeout = match call.timeout() {
             Some(timeout) => {
                 let timeout: Timespec = guest.memory().read_value(timeout)?;
@@ -454,7 +494,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             None => None,
         };
-        if matches!(raw_timeout, Some(timeout) if timeout.tv_sec == 0 && timeout.tv_nsec == 0) {
+        let timeout = raw_timeout.map(ppoll_timeout_duration).transpose()?;
+        if timeout == Some(Duration::ZERO) {
             return Ok(guest.inject(call).await?);
         }
 
@@ -477,14 +518,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `sigchld_deferred`/`sigchld_ready`), honor the mask on each deterministic poll
         // probe instead: a pending unblocked signal is observed at a scheduler-decided
         // probe point rather than at host signal-arrival time.
-        let sigmask = if let Some(argument) = call.sigmask() {
-            let argument: Pselect6SigmaskArg = guest.memory().read_value(argument.cast())?;
+        let sigmask = if let Some(argument) = sigmask_argument {
             if argument.sigmask != 0 {
                 if argument.sigsetsize != KERNEL_SIGSET_SIZE {
                     return Err(Errno::EINVAL.into());
                 }
-                let mask_addr = AddrMut::<u64>::from_raw(argument.sigmask).ok_or(Errno::EFAULT)?;
-                let mask: u64 = guest.memory().read_value(mask_addr.cast())?;
+                let mask_addr =
+                    Addr::<libc::sigset_t>::from_raw(argument.sigmask).ok_or(Errno::EFAULT)?;
+                let mask = read_kernel_sigset(guest, mask_addr).await?;
                 Some(sanitize_ppoll_signal_mask(mask))
             } else {
                 None
@@ -495,7 +536,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The inner mask was snapshotted above. Do not let later guest mutations of the
         // outer wrapper change the meaning of a retry probe.
         let call = call.with_sigmask(None);
-        let timeout = raw_timeout.map(ppoll_timeout_duration).transpose()?;
 
         self.handle_internal_pselect6(guest, call, timeout, sigmask)
             .await
@@ -869,16 +909,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else {
                 Ok(guest.inject_with_retry(probe).await?)
             };
-            if let Some(timeout_address) = timeout_address {
-                // Linux preserves the ppoll result when remaining-time copyout faults,
-                // so a failed writeback is logged and dropped rather than propagated.
-                let _ = guest
-                    .memory()
-                    .write_value(timeout_address, &timespec_from_duration(Duration::ZERO))
-                    .inspect_err(|error| {
-                        trace!(?error, "ignoring ppoll zero-timeout writeback failure");
-                    });
-            }
+            // Linux does not write back an initially zero timeout. Besides matching the
+            // kernel, omitting this write matters when the timeout aliases the pollfd array:
+            // the injected probe may have just stored revents in those same bytes.
             result
         } else if ppoll_uses_kernel_wait(
             self.cfg.sequentialize_threads,
@@ -895,7 +928,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if call.sigsetsize() != KERNEL_SIGSET_SIZE {
                     return Err(Errno::EINVAL.into());
                 }
-                let signal_mask: u64 = guest.memory().read_value(signal_mask.cast())?;
+                let signal_mask = read_kernel_sigset(guest, signal_mask).await?;
                 let mut stack = guest.stack().await;
                 let signal_mask = stack.push(sanitize_ppoll_signal_mask(signal_mask)).cast();
                 signal_mask_guard = Some(stack.commit()?);
@@ -925,7 +958,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if call.sigsetsize() != KERNEL_SIGSET_SIZE {
                     return Err(Errno::EINVAL.into());
                 }
-                let signal_mask: u64 = guest.memory().read_value(signal_mask.cast())?;
+                let signal_mask = read_kernel_sigset(guest, signal_mask).await?;
                 Some(sanitize_ppoll_signal_mask(signal_mask))
             }
             None => None,

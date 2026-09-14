@@ -63,6 +63,8 @@ use timeouts::MAX_TIMEOUT_SECONDS;
 use timeouts::MIN_TIMEOUT_SECONDS;
 use timeouts::resolve_timeout_seconds;
 
+const HERMIT_BACKENDS: [&str; 5] = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
+const NAKED_BACKENDS: [&str; 1] = ["native"];
 const RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=\"$cell/tmp\" E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_RUN_ENV: &str = "env LC_ALL=C TZ=UTC HOME=\"$cell/home\" XDG_CONFIG_HOME=\"$cell/xdg-config\" E2E_TMPDIR=/tmp/hermit-e2e E2E_FIXTURE_DIR=\"$cell/fixtures\"";
 const HERMIT_GUEST_ENV_ARGS: &str = "--env LC_ALL=C --env TZ=UTC --env HOME=\"$cell/home\" --env XDG_CONFIG_HOME=\"$cell/xdg-config\" --env E2E_TMPDIR=/tmp/hermit-e2e --env E2E_FIXTURE_DIR=\"$cell/fixtures\"";
@@ -82,6 +84,26 @@ fn repo_root() -> PathBuf {
 }
 
 fn shell_quote(value: &str) -> String {
+    if value.bytes().any(|byte| !(b' '..=b'~').contains(&byte)) {
+        let mut quoted = String::from("$'");
+        for byte in value.bytes() {
+            match byte {
+                b'\\' => quoted.push_str("\\\\"),
+                b'\'' => quoted.push_str("\\'"),
+                b'\n' => quoted.push_str("\\n"),
+                b'\r' => quoted.push_str("\\r"),
+                b'\t' => quoted.push_str("\\t"),
+                b' '..=b'~' => quoted.push(char::from(byte)),
+                _ => {
+                    quoted.push_str("\\x");
+                    quoted.push(char::from(b"0123456789abcdef"[(byte >> 4) as usize]));
+                    quoted.push(char::from(b"0123456789abcdef"[(byte & 0x0f) as usize]));
+                }
+            }
+        }
+        quoted.push('\'');
+        return quoted;
+    }
     if !value.is_empty()
         && value
             .bytes()
@@ -164,6 +186,105 @@ fn test_id(test: &Value, bucket: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_else(|| fail(format!("{bucket}: [[test]] is missing `id`")))
         .to_owned()
+}
+
+fn backend_vocabulary(mode: &str) -> &'static [&'static str] {
+    if mode == "naked" {
+        &NAKED_BACKENDS
+    } else {
+        &HERMIT_BACKENDS
+    }
+}
+
+fn configured_mode_backends(
+    spec: &Value,
+    mode: &str,
+    id: &str,
+) -> Result<BTreeSet<String>, String> {
+    let mut configured = BTreeSet::new();
+    if let Some(enabled) = spec.get("backends_enabled") {
+        let enabled = enabled
+            .as_array()
+            .ok_or_else(|| format!("{id}.modes.{mode}.backends_enabled must be an array"))?;
+        for backend in enabled {
+            configured.insert(
+                backend
+                    .as_str()
+                    .ok_or_else(|| {
+                        format!("{id}.modes.{mode}.backends_enabled entries must be strings")
+                    })?
+                    .to_owned(),
+            );
+        }
+    }
+    if let Some(disabled) = spec.get("backends_disabled") {
+        let disabled = disabled
+            .as_table()
+            .ok_or_else(|| format!("{id}.modes.{mode}.backends_disabled must be a table"))?;
+        configured.extend(disabled.keys().cloned());
+    }
+    Ok(configured)
+}
+
+fn validate_mode_guest_args(spec: &Value, mode: &str, id: &str) -> Result<(), String> {
+    let configured = configured_mode_backends(spec, mode, id)?;
+    let Some(value) = spec.get("guest_args") else {
+        return Ok(());
+    };
+    let by_backend = value
+        .as_table()
+        .ok_or_else(|| format!("{id}.modes.{mode}.guest_args must be a table"))?;
+    let vocabulary = backend_vocabulary(mode);
+    for (backend, args) in by_backend {
+        if !vocabulary.contains(&backend.as_str()) {
+            return Err(format!(
+                "{id}: modes.{mode}.guest_args.{backend} names an invalid backend for this mode; expected one of {vocabulary:?}"
+            ));
+        }
+        if !configured.contains(backend) {
+            return Err(format!(
+                "{id}: modes.{mode}.guest_args.{backend} names a backend outside backends_enabled/backends_disabled"
+            ));
+        }
+        let args = args
+            .as_array()
+            .ok_or_else(|| format!("{id}.modes.{mode}.guest_args.{backend} must be an array"))?;
+        if args.iter().any(|argument| argument.as_str().is_none()) {
+            return Err(format!(
+                "{id}.modes.{mode}.guest_args.{backend} entries must be strings"
+            ));
+        }
+        if args
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|argument| argument.contains('\0'))
+        {
+            return Err(format!(
+                "{id}: modes.{mode}.guest_args.{backend} contains a NUL byte, which Linux argv cannot represent"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_requested_backend(
+    spec: &Value,
+    mode: &str,
+    backend: &str,
+    id: &str,
+) -> Result<(), String> {
+    let vocabulary = backend_vocabulary(mode);
+    if !vocabulary.contains(&backend) {
+        return Err(format!(
+            "{id}: backend `{backend}` is invalid for mode `{mode}`; expected one of {vocabulary:?}"
+        ));
+    }
+    if !configured_mode_backends(spec, mode, id)?.contains(backend) {
+        return Err(format!(
+            "{id}: backend `{backend}` is outside modes.{mode}.backends_enabled/backends_disabled"
+        ));
+    }
+    Ok(())
 }
 
 /// Build the shell setup prefix (compile/prepare the guest) and return the
@@ -260,6 +381,41 @@ fn setup_prefix(test: &Value, id: &str) -> (String, String) {
     };
 
     (commands.join(" && "), guest)
+}
+
+/// Return only the arguments declared for this exact mode/backend pair.
+/// An absent entry deliberately means no arguments; it must not inherit a
+/// sibling backend's scenario.
+fn mode_guest_args(spec: &Value, mode: &str, backend: &str, id: &str) -> Vec<String> {
+    validate_mode_guest_args(spec, mode, id).unwrap_or_else(|error| fail(error));
+    let Some(by_backend) = spec.get("guest_args") else {
+        return Vec::new();
+    };
+    let by_backend = by_backend.as_table().unwrap();
+    string_array(
+        by_backend.get(backend),
+        &format!("{id}.modes.{mode}.guest_args.{backend}"),
+    )
+}
+
+/// Append guest arguments while preserving `sh -c`'s `$0` convention.
+fn guest_with_args(test: &Value, guest: &str, guest_args: &[String]) -> String {
+    if guest_args.is_empty() {
+        return guest.to_owned();
+    }
+    let argv0 = if matches!(test.get("direct"), Some(Value::String(_))) {
+        " --"
+    } else {
+        ""
+    };
+    format!(
+        "{guest}{argv0} {}",
+        guest_args
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
 }
 
 /// Assemble the Hermit invocation for one (mode, backend) cell. `log` overrides
@@ -437,7 +593,12 @@ fn load_manifests(root: &Path) -> Manifests {
             .and_then(Value::as_array)
             .unwrap_or_else(|| fail(format!("{}: missing [[test]] entries", path.display())));
         for test in entries {
-            tests.push((bucket.clone(), inherited_timeout_seconds, test.clone()));
+            let test = test.clone();
+            let id = test_id(&test, &bucket);
+            for (mode, spec) in modes_table(&test, &id) {
+                validate_mode_guest_args(spec, mode, &id).unwrap_or_else(|error| fail(error));
+            }
+            tests.push((bucket.clone(), inherited_timeout_seconds, test));
         }
     }
     Manifests { tests }
@@ -705,9 +866,7 @@ fn resolve_cell(
             ))
         }),
     };
-    if args.flag("backend").is_none() && mode != "naked" && !enabled.contains(&backend) {
-        // (unreachable given the first() default, but keep the invariant clear)
-    }
+    validate_requested_backend(spec, &mode, &backend, id).unwrap_or_else(|error| fail(error));
     let lane = args
         .flag("lane")
         .map(str::to_owned)
@@ -724,6 +883,8 @@ fn build_full_command(
 ) -> (String, String, String) {
     let (mode, backend, lane, timeout) = resolve_cell(test, id, inherited_timeout_seconds, args);
     let (setup, guest) = setup_prefix(test, id);
+    let guest_args = mode_guest_args(&modes_table(test, id)[&mode], &mode, &backend, id);
+    let guest = guest_with_args(test, &guest, &guest_args);
     let log = args
         .flag("log")
         .map(str::to_owned)
@@ -767,6 +928,80 @@ fn build_full_command(
     };
     let full = outer_cell_command(&setup, &bounded_invocation(&run, id), timeout);
     (full, mode, backend)
+}
+
+fn full_guest_argument_command_bracket() {
+    let direct: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+direct: 'printf "%s\0" "$0" "$@"'
+lane: portable
+modes:
+  naked:
+    ci: false
+    backends_enabled: [native]
+    guest_args:
+      native: []
+"#,
+    )
+    .unwrap();
+    let work = std::env::temp_dir().join(format!(
+        "hermit-manifest-cli-guest-args-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&work).unwrap();
+    let options = parse_args(&["--mode".into(), "naked".into()]);
+    for arguments in [
+        Vec::<String>::new(),
+        vec![String::new()],
+        vec!["first".into(), "second".into()],
+        vec![
+            String::new(),
+            "tab\tinside".into(),
+            "line\ninside\n".into(),
+            "carriage\rreturn".into(),
+            "é日本".into(),
+            "'\\$()`${UNEXPANDED}`".into(),
+        ],
+    ] {
+        let mut value = direct.clone();
+        value["modes"]["naked"]["guest_args"]["native"] = serde_yaml::to_value(&arguments).unwrap();
+        let fixture: Value = serde_yaml::to_string(&value).unwrap().parse().unwrap();
+        let (command, mode, backend) = build_full_command(&fixture, "fixture/argv", 15, &options);
+        assert_eq!((mode.as_str(), backend.as_str()), ("naked", "native"));
+        assert!(command.starts_with("timeout --kill-after=10s 15s bash -c "));
+        assert!(command.is_ascii());
+        assert!(!command.contains('\n'));
+        // Exercise the same complete command and outer shell as cmd_run. The
+        // explicit inner Bash owns ANSI-C quoting. Only native printf runs;
+        // the help-query placeholder cannot invoke a Hermit binary.
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .env("HERMIT_BIN", "/bin/false")
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut expected = if arguments.is_empty() {
+            b"sh\0".to_vec()
+        } else {
+            b"--\0".to_vec()
+        };
+        for argument in arguments {
+            expected.extend_from_slice(argument.as_bytes());
+            expected.push(0);
+        }
+        assert_eq!(output.stdout, expected);
+    }
+    fs::remove_dir_all(work).unwrap();
 }
 
 fn self_test() -> ExitCode {
@@ -876,6 +1111,190 @@ modes:
     );
     assert!(weak_verify.contains("--verify --verify-json \"$cell/captures/verify.json\""));
     assert!(weak_verify.contains("--strict $run_verify_strict --verify"));
+
+    let per_backend_guest_args: Value = r#"
+direct: [/bin/echo]
+lane: portable
+modes:
+  verify:
+    backends_enabled: [ptrace]
+    backends_disabled:
+      kvm: configured but not selected for ordinary validation
+    guest_args:
+      ptrace: [ptrace-scenario]
+      kvm: [kvm-scenario, value with spaces]
+"#
+    .parse()
+    .unwrap();
+    let kvm_args = parse_args(&[
+        "--mode".to_owned(),
+        "verify".to_owned(),
+        "--backend".to_owned(),
+        "kvm".to_owned(),
+    ]);
+    let (kvm_command, mode, backend) =
+        build_full_command(&per_backend_guest_args, "fixture", 15, &kvm_args);
+    assert_eq!((mode.as_str(), backend.as_str()), ("verify", "kvm"));
+    assert!(kvm_command.contains("kvm-scenario"));
+    assert!(kvm_command.contains("value with spaces"));
+    assert!(!kvm_command.contains("ptrace-scenario"));
+    assert_eq!(
+        guest_with_args(
+            &per_backend_guest_args,
+            "/bin/echo",
+            &["kvm-scenario".into(), "value with spaces".into()]
+        ),
+        "/bin/echo kvm-scenario 'value with spaces'"
+    );
+
+    let absent_kvm_guest_args: Value = r#"
+direct: [/bin/echo]
+lane: portable
+modes:
+  verify:
+    backends_enabled: [ptrace]
+    backends_disabled:
+      kvm: configured but not selected for ordinary validation
+    guest_args:
+      ptrace: [ptrace-scenario]
+"#
+    .parse()
+    .unwrap();
+    let (kvm_without_args, _, _) =
+        build_full_command(&absent_kvm_guest_args, "fixture", 15, &kvm_args);
+    assert!(kvm_without_args.contains("-- /bin/echo"));
+    assert!(!kvm_without_args.contains("ptrace-scenario"));
+
+    assert!(
+        validate_requested_backend(
+            &per_backend_guest_args["modes"]["verify"],
+            "verify",
+            "kvm",
+            "fixture"
+        )
+        .is_ok()
+    );
+    let outside_partition: Value = r#"
+backends_enabled: [ptrace]
+backends_disabled: {}
+"#
+    .parse()
+    .unwrap();
+    assert_eq!(
+        validate_requested_backend(&outside_partition, "verify", "kvm", "fixture").unwrap_err(),
+        "fixture: backend `kvm` is outside modes.verify.backends_enabled/backends_disabled"
+    );
+    assert_eq!(
+        validate_requested_backend(&outside_partition, "verify", "native", "fixture").unwrap_err(),
+        "fixture: backend `native` is invalid for mode `verify`; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
+    );
+    let naked_partition: Value = r#"
+backends_enabled: [native]
+backends_disabled: {}
+"#
+    .parse()
+    .unwrap();
+    assert_eq!(
+        validate_requested_backend(&naked_partition, "naked", "ptrace", "fixture").unwrap_err(),
+        "fixture: backend `ptrace` is invalid for mode `naked`; expected one of [\"native\"]"
+    );
+
+    let empty_guest_args: Value = r#"
+backends_enabled: [ptrace]
+backends_disabled:
+  kvm: configured but not selected for ordinary validation
+guest_args:
+  kvm: []
+"#
+    .parse()
+    .unwrap();
+    assert!(validate_mode_guest_args(&empty_guest_args, "verify", "fixture").is_ok());
+    let nul_guest_args: Value = r#"
+backends_enabled: [ptrace]
+guest_args:
+  ptrace: ["\0"]
+"#
+    .parse()
+    .unwrap();
+    assert_eq!(
+        validate_mode_guest_args(&nul_guest_args, "verify", "fixture").unwrap_err(),
+        "fixture: modes.verify.guest_args.ptrace contains a NUL byte, which Linux argv cannot represent"
+    );
+    let outside_guest_args: Value = r#"
+backends_enabled: [ptrace]
+backends_disabled: {}
+guest_args:
+  kvm: [kvm-scenario]
+"#
+    .parse()
+    .unwrap();
+    assert_eq!(
+        validate_mode_guest_args(&outside_guest_args, "verify", "fixture").unwrap_err(),
+        "fixture: modes.verify.guest_args.kvm names a backend outside backends_enabled/backends_disabled"
+    );
+    let unknown_guest_args: Value = r#"
+backends_enabled: [ptrace]
+backends_disabled:
+  ptrcae: misspelled backend
+guest_args:
+  ptrcae: [scenario]
+"#
+    .parse()
+    .unwrap();
+    assert_eq!(
+        validate_mode_guest_args(&unknown_guest_args, "verify", "fixture").unwrap_err(),
+        "fixture: modes.verify.guest_args.ptrcae names an invalid backend for this mode; expected one of [\"ptrace\", \"dbt\", \"kvm\", \"sabre\", \"liteinst\"]"
+    );
+    let wrong_naked_guest_args: Value = r#"
+backends_enabled: [native]
+backends_disabled:
+  ptrace: invalid in naked mode
+guest_args:
+  ptrace: [scenario]
+"#
+    .parse()
+    .unwrap();
+    assert_eq!(
+        validate_mode_guest_args(&wrong_naked_guest_args, "naked", "fixture").unwrap_err(),
+        "fixture: modes.naked.guest_args.ptrace names an invalid backend for this mode; expected one of [\"native\"]"
+    );
+
+    let direct_string: Value = r#"
+direct: 'printf "%s\0" "$0" "$@"'
+"#
+    .parse()
+    .unwrap();
+    let (_, direct_guest) = setup_prefix(&direct_string, "fixture");
+    let no_args = guest_with_args(&direct_string, &direct_guest, &[]);
+    assert_eq!(no_args, "sh -c 'printf \"%s\\0\" \"$0\" \"$@\"'");
+    assert_eq!(no_args.lines().count(), 1);
+    // A guest fragment runs inside the production wrapper's explicit Bash.
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(&no_args)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"sh\0");
+
+    let direct_guest = guest_with_args(
+        &direct_string,
+        &direct_guest,
+        &["".into(), "tab\tinside".into(), "line\ninside".into()],
+    );
+    assert_eq!(
+        direct_guest,
+        "sh -c 'printf \"%s\\0\" \"$0\" \"$@\"' -- '' $'tab\\tinside' $'line\\ninside'"
+    );
+    assert_eq!(direct_guest.lines().count(), 1);
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(&direct_guest)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"--\0\0tab\tinside\0line\ninside\0");
+    full_guest_argument_command_bracket();
     println!("manifest-cli self-test: PASS");
     ExitCode::SUCCESS
 }

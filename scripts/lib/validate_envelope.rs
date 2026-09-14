@@ -185,35 +185,32 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
     out
 }
 
-/// The workspace build node the measurement hangs off.
-pub fn build_node(gate_dep: &str) -> Step {
-    node(
-        "envelope",
-        "build",
-        "Build workspace for envelope measurement",
-        "cargo build --workspace --features third-party-backends".to_string(),
-        vec![gate_dep.to_string()],
-        3600,
-        7200,
-        16 * 1024 * 1024 * 1024,
-    )
-}
-
 /// Per-probe, per-level pass bits derived from typed outcomes.
 ///
 /// A node that never ran (skipped because its dependency failed) scores 0, which
 /// is exactly what the bash's `p4=0` default did when L2 failed.
 pub fn score(outcomes: &[StepOutcome], reps: i64, commit: &str) -> serde_json::Value {
-    let passed = |tag: &str| -> i64 {
-        outcomes.iter().find(|o| o.tag == tag).map(|o| i64::from(o.ok && !o.aborted)).unwrap_or(0)
-    };
+    score_with_passed(reps, commit, |tag| {
+        outcomes.iter().find(|outcome| outcome.tag == tag)
+            .map(|outcome| outcome.ok && !outcome.aborted).unwrap_or(false)
+    })
+}
+
+/// Score the same fixed population from the driver's authoritative node results.
+/// A missing or non-product result still scores zero; the run's separate
+/// completeness requirement prevents that measurement from qualifying a pass.
+pub fn score_with_passed(
+    reps: i64,
+    commit: &str,
+    passed: impl Fn(&str) -> bool,
+) -> serde_json::Value {
     let mut totals = [0i64; 5];
     let mut probes = Vec::new();
     for p in PROBES {
         let mut row = serde_json::Map::new();
         row.insert("probe".into(), serde_json::Value::String(p.label.to_string()));
         for (i, lvl) in LEVELS.iter().enumerate() {
-            let bit = passed(&format!("envelope.{}_{lvl}", p.label));
+            let bit = i64::from(passed(&format!("envelope.{}_{lvl}", p.label)));
             totals[i] += bit;
             row.insert((*lvl).to_string(), serde_json::Value::from(bit));
         }

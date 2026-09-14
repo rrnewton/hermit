@@ -9,11 +9,12 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
+use hermit::canonical_verdict::NoResultReason;
 use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
 
 const HELP: &str = "\
-Usage: verification-report <REQUIREMENT> <PATH>
+Usage: verification-report [--json] <REQUIREMENT> <PATH>
 
 Read a current Hermit --verify-json report through the producer-owned schema.
 
@@ -22,7 +23,11 @@ Requirements:
   canonical-match  Require a typed match under the canonical comparison policy
 
 Options:
-  -h, --help       Print this help";
+  --json          Print the parsed report, even when the requirement is unmet
+  -h, --help       Print this help
+
+Exit status: 0 when the requirement is met, 1 when unmet, 2 on a refusal.
+JSON output alone does not mean verification passed.";
 
 fn refuse(message: impl std::fmt::Display) -> ExitCode {
     eprintln!("verification-report: REFUSED: {message}");
@@ -32,10 +37,23 @@ fn refuse(message: impl std::fmt::Display) -> ExitCode {
 fn read_current_report(path: &Path) -> Result<VerificationReport, String> {
     let bytes =
         fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    let value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("{} is not valid JSON: {error}", path.display()))?;
-    VerificationReport::from_current_json_value(value)
+    VerificationReport::from_current_json_slice(&bytes)
         .map_err(|error| format!("{}: {error}", path.display()))
+}
+fn no_result_detail(report: &VerificationReport) -> String {
+    match report.no_result_reason.as_ref() {
+        Some(NoResultReason::NotRun) => "the invocation did not run".into(),
+        Some(NoResultReason::FirstRunRejected {
+            exit_code,
+            signal,
+            stdout_bytes,
+            stderr_bytes,
+        }) => format!(
+            "the first run was rejected: exit_code={exit_code:?} signal={signal:?} stdout_bytes={stdout_bytes} stderr_bytes={stderr_bytes}"
+        ),
+        Some(NoResultReason::ComparisonRefused { detail }) => detail.clone(),
+        None => "the producer recorded no specific no-result cause".into(),
+    }
 }
 
 fn require_match(report: &VerificationReport) -> Result<(), String> {
@@ -50,9 +68,10 @@ fn require_match(report: &VerificationReport) -> Result<(), String> {
         Verdict::Diverged => {
             Err("verdict is diverged but verified is true; the typed fields disagree".into())
         }
-        Verdict::NoResult if !report.verified => {
-            Err("verification verdict is no_result, not matched".into())
-        }
+        Verdict::NoResult if !report.verified => Err(format!(
+            "verification verdict is no_result, not matched: {}",
+            no_result_detail(report)
+        )),
         Verdict::NoResult => {
             Err("verdict is no_result but verified is true; the typed fields disagree".into())
         }
@@ -67,26 +86,38 @@ fn require_match(report: &VerificationReport) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let emit_json = if let Some(index) = arguments.iter().position(|arg| arg == "--json") {
+        arguments.remove(index);
+        true
+    } else {
+        false
+    };
     if matches!(arguments.as_slice(), [flag] if matches!(flag.as_str(), "-h" | "--help")) {
         println!("{HELP}");
         return ExitCode::SUCCESS;
     }
     let mut args = arguments.into_iter();
     let Some(requirement) = args.next() else {
-        return refuse("usage: verification-report matched|canonical-match PATH");
+        return refuse("usage: verification-report [--json] matched|canonical-match PATH");
     };
     let Some(path) = args.next() else {
-        return refuse("usage: verification-report matched|canonical-match PATH");
+        return refuse("usage: verification-report [--json] matched|canonical-match PATH");
     };
     if args.next().is_some() {
-        return refuse("usage: verification-report matched|canonical-match PATH");
+        return refuse("usage: verification-report [--json] matched|canonical-match PATH");
     }
 
     let report = match read_current_report(Path::new(&path)) {
         Ok(report) => report,
         Err(error) => return refuse(error),
     };
+    if emit_json {
+        match serde_json::to_string(&report) {
+            Ok(json) => println!("{json}"),
+            Err(error) => return refuse(format!("cannot encode parsed report: {error}")),
+        }
+    }
     if let Err(error) = require_match(&report) {
         eprintln!("verification-report: {error}");
         return ExitCode::FAILURE;

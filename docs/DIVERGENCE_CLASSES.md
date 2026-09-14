@@ -25,8 +25,8 @@ you see what actually differs there:
 ```bash
 hermit run --strict --verify --verify-strict --verify-json report.json -- <prog>
 # the report names the location; the run prints the two retained log paths
-diff <(sed 's/^[0-9T:.-]*Z*//' /tmp/run1_log_XXXXX) \
-     <(sed 's/^[0-9T:.-]*Z*//' /tmp/run2_log_YYYYY) > d.txt
+diff <(sed 's/^[0-9T:.-]*Z*//' PATH_PRINTED_FOR_RUN_1) \
+     <(sed 's/^[0-9T:.-]*Z*//' PATH_PRINTED_FOR_RUN_2) > d.txt
 grep -cE '^[<>]' d.txt                       # how many lines differ at all
 grep -E '^[<>]' d.txt | grep -c '\[syscall\]'   # control flow?
 grep -E '^[<>]' d.txt | grep -c 'iobuf'         # payload only?

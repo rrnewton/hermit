@@ -27,7 +27,7 @@ class RegistrationAuditTest(unittest.TestCase):
         )
         # Nested helpers are tracked source, but not top-level Cargo test targets.
         (self.root / "hermit-cli/tests/common/mod.rs").write_text("pub fn helper() {}\n")
-        (self.root / "ci/dag/portable.json").write_text(
+        (self.root / "ci/dag/validate.json").write_text(
             '{"steps":[{"group":"test","job":"registered",'
             '"cmd":"cargo test -p hermit --test registered",'
             '"integration_test_binaries":["registered"]}]}\n'
@@ -123,7 +123,7 @@ class RegistrationAuditTest(unittest.TestCase):
         }
         if declared is not None:
             probe_step["integration_test_binaries"] = declared
-        (self.root / "ci/dag/portable.json").write_text(
+        (self.root / "ci/dag/validate.json").write_text(
             json.dumps(
                 {
                     "steps": [
@@ -176,7 +176,7 @@ class RegistrationAuditTest(unittest.TestCase):
     def test_invocation_named_only_in_a_description_does_not_register(self) -> None:
         probe = self.root / "hermit-cli/tests/zz_probe.rs"
         probe.write_text("#[test]\nfn probe() {}\n")
-        (self.root / "ci/dag/portable.json").write_text(
+        (self.root / "ci/dag/validate.json").write_text(
             '{"steps":[{"group":"test","job":"registered",'
             '"cmd":"cargo test -p hermit --test registered",'
             '"integration_test_binaries":["registered"],'

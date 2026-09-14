@@ -28,7 +28,14 @@ set -uo pipefail
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d) || exit 1
-trap 'rm -rf "$work"' EXIT
+authority=""
+cleanup() {
+    rm -rf -- "$work"
+    if [ -n "$authority" ]; then
+        rm -rf -- "$authority"
+    fi
+}
+trap cleanup EXIT
 
 # A `gh` that serves the pinned authority on its FIRST call and returns HTTP 504
 # on every call after, counting each. This is the ordering the codex lane
@@ -52,15 +59,21 @@ exit 1
 STUB
 chmod +x "$work/bin/gh"
 
-# Obtain both authorities first, with the real environment.
-authority="$work/authority"
-mkdir -p "$authority"
-if ! "$ROOT_DIR/scripts/check_outcome_adapter.py" --materialize-authority "$authority" \
-        >/dev/null 2>&1 \
-   || ! "$ROOT_DIR/scripts/review_contract_adapter.py" --materialize-authority "$authority" \
-        >/dev/null 2>&1; then
+# Obtain both authorities first, with the real environment. Use the same helper
+# as the guarded checkers so only its reserved exit 3 means unavailable. A
+# reachable refusal, a digest mismatch, or an ordinary adapter error must stay
+# nonzero; otherwise this test itself would turn a real lint failure into the
+# no-result marker that check.lint_checks trusts.
+authority_rc=0
+authority=$("$ROOT_DIR/scripts/authority-available.sh" \
+    "$ROOT_DIR/scripts/check_outcome_adapter.py" \
+    "$ROOT_DIR/scripts/review_contract_adapter.py") || authority_rc=$?
+if [ "$authority_rc" -eq 3 ]; then
     echo "NO-RESULT-CASE: test-authority-obtained-once.sh: the pinned authorities could not be obtained, so the no-later-fetch property could not be tested"
     exit 0
+elif [ "$authority_rc" -ne 0 ]; then
+    echo "test-authority-obtained-once.sh: obtaining the pinned authorities failed with exit $authority_rc; that is not an outage and is not being skipped" >&2
+    exit "$authority_rc"
 fi
 
 failures=0

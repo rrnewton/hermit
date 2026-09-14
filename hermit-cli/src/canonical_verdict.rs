@@ -54,6 +54,8 @@ pub enum NoResultReason {
         stdout_bytes: u64,
         stderr_bytes: u64,
     },
+    /// The log comparator refused to claim either agreement or divergence.
+    ComparisonRefused { detail: String },
 }
 
 /// The understood infrastructure failure recorded by verification.
@@ -194,7 +196,7 @@ pub struct VerificationReport {
     pub verified: bool,
     pub bitwise_parity: bool,
     pub verdict: Verdict,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub no_result_reason: Option<NoResultReason>,
     #[serde(default)]
     pub infrastructure_error: Option<InfrastructureError>,
@@ -372,6 +374,18 @@ impl VerificationReport {
     }
 
     /// Parse a report written by the current producer and require every field
+    /// it promises to emit, preserving duplicate-field refusal from the original
+    /// bytes. Parsing only a Value would silently collapse duplicate object keys.
+    #[allow(dead_code)] // path-included readers use different parse forms
+    pub fn from_current_json_slice(bytes: &[u8]) -> Result<Self, String> {
+        let report = Self::from_json_slice(bytes)?;
+        let value = serde_json::from_slice(bytes)
+            .map_err(|error| format!("incomplete verification report: {error}"))?;
+        Self::from_current_json_value(value)?;
+        Ok(report)
+    }
+
+    /// Parse a report written by the current producer and require every field
     /// that producer promises to emit. Retained-report readers use
     /// [`Self::from_json_value`] instead so fields added after an old run remain
     /// honest absence rather than making the whole report unreadable.
@@ -386,6 +400,7 @@ impl VerificationReport {
             "verdict",
             "infrastructure_error",
             "comparison",
+            "no_result_reason",
             "compared_log_messages",
             "guest_exit_code",
             "guest_signal",
@@ -431,7 +446,21 @@ impl VerificationReport {
                 }
             }
         }
-        Self::from_json_value(value)
+        let report = Self::from_json_value(value)?;
+        match (&report.verdict, &report.no_result_reason) {
+            (Verdict::NoResult, Some(NoResultReason::ComparisonRefused { detail }))
+                if detail.trim().is_empty() =>
+            {
+                Err("incomplete verification report: comparison_refused omitted its detail".into())
+            }
+            (Verdict::NoResult, Some(_)) => Ok(report),
+            (Verdict::NoResult, None) => Ok(report),
+            (_, Some(_)) => Err(format!(
+                "inconsistent verification report: verdict={} carries no_result_reason",
+                report.verdict
+            )),
+            (_, None) => Ok(report),
+        }
     }
 
     /// Prove that the invocation actually compared the canonical INFO evidence.
@@ -801,17 +830,31 @@ mod tests {
             .expect("the typed not-run reason must round-trip");
         assert_eq!(parsed.no_result_reason, Some(NoResultReason::NotRun));
 
-        // A comparator refusal is also a current no-result outcome, but it is
-        // written without this pre-run/first-run reason. Preserve that distinct
-        // producer state rather than inventing a reason on its behalf.
-        let mut comparator_refusal = current.clone();
-        comparator_refusal
-            .as_object_mut()
-            .unwrap()
-            .remove("no_result_reason");
-        let parsed = VerificationReport::from_current_json_value(comparator_refusal)
-            .expect("a current comparator refusal may have no run reason");
+        let mut missing = current.clone();
+        missing.as_object_mut().unwrap().remove("no_result_reason");
+        let error = VerificationReport::from_current_json_value(missing)
+            .expect_err("a current no-result must state the nullable reason field");
+        assert!(error.contains("no_result_reason"), "{error}");
+
+        let mut absent = current.clone();
+        absent["no_result_reason"] = serde_json::Value::Null;
+        let parsed = VerificationReport::from_current_json_value(absent)
+            .expect("explicit null records that the producer has no exact cause");
         assert_eq!(parsed.no_result_reason, None);
+
+        let mut comparator_refusal = current.clone();
+        comparator_refusal["no_result_reason"] = serde_json::json!({
+            "kind": "comparison_refused",
+            "detail": "the first log was truncated"
+        });
+        let parsed = VerificationReport::from_current_json_value(comparator_refusal)
+            .expect("a comparator refusal carries the producer's exact cause");
+        assert_eq!(
+            parsed.no_result_reason,
+            Some(NoResultReason::ComparisonRefused {
+                detail: "the first log was truncated".into()
+            })
+        );
 
         let mut unknown = current;
         unknown["no_result_reason"] = serde_json::json!({"kind": "never_ran"});
@@ -829,6 +872,7 @@ mod tests {
             "verified": true,
             "bitwise_parity": true,
             "verdict": "matched",
+            "no_result_reason": null,
             "infrastructure_error": null,
             "comparison": {
                 "strictness": "canonical",
@@ -873,6 +917,102 @@ mod tests {
         assert!(
             error.contains("compare_io_buffers"),
             "refusal must name the missing comparison field: {error}"
+        );
+    }
+
+    #[test]
+    fn current_raw_reports_reject_duplicates_and_preserve_required_fields() {
+        let current = serde_json::json!({
+            "verified": true,
+            "bitwise_parity": true,
+            "verdict": "matched",
+            "no_result_reason": null,
+            "infrastructure_error": null,
+            "comparison": {
+                "strictness": "canonical",
+                "display_name": "BitwiseInfoV1",
+                "compare_logs": true,
+                "compare_io_buffers": true,
+                "log_scope": "info",
+                "record_envelope": "all_records_v1",
+                "virtualize_time": true,
+                "strip_lines": false,
+                "canonicalize_addresses": true,
+                "full_trace": true,
+                "exact_remainder": true,
+                "stripped_prefixes": ["real-wall-clock-prefix/v1"],
+                "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
+                "ignore_lines": false,
+                "skip_commit": false,
+                "skip_detlog": false
+            },
+            "compared_log_messages": {"left": 1, "right": 1},
+            "guest_exit_code": 0,
+            "guest_signal": null,
+            "first_divergent_scheduler_turn": null,
+            "first_divergent_virtual_nanoseconds": null,
+            "first_divergent_record": null,
+            "first_divergent_syscall": null,
+            "first_divergent_left_message": null,
+            "first_divergent_right_message": null
+        });
+        let raw = serde_json::to_string(&current).unwrap();
+        VerificationReport::from_current_json_slice(raw.as_bytes())
+            .unwrap()
+            .require_canonical_match()
+            .unwrap();
+        for (needle, replacement) in [
+            (r#""verified":true"#, r#""verified":false,"verified":true"#),
+            (r#""verified":true"#, r#""verified":true,"verified":true"#),
+            (
+                r#""no_result_reason":null"#,
+                r#""no_result_reason":{"kind":"not_run"},"no_result_reason":null"#,
+            ),
+            (
+                r#""no_result_reason":null"#,
+                r#""no_result_reason":null,"no_result_reason":null"#,
+            ),
+            (r#""left":1"#, r#""left":0,"left":1"#),
+            (r#""left":1"#, r#""left":1,"left":1"#),
+        ] {
+            assert_eq!(raw.matches(needle).count(), 1);
+            let duplicated = raw.replacen(needle, replacement, 1);
+            let collapsed: serde_json::Value = serde_json::from_str(&duplicated).unwrap();
+            assert_eq!(
+                collapsed, current,
+                "the last-value map loses this contradiction"
+            );
+            let error =
+                VerificationReport::from_current_json_slice(duplicated.as_bytes()).unwrap_err();
+            assert!(error.contains("duplicate field"), "{replacement}: {error}");
+        }
+        for field in ["no_result_reason", "guest_signal"] {
+            let mut missing = current.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            let error =
+                VerificationReport::from_current_json_slice(&serde_json::to_vec(&missing).unwrap())
+                    .unwrap_err();
+            assert!(error.contains(field), "{error}");
+        }
+        let mut missing = current;
+        missing["comparison"]
+            .as_object_mut()
+            .unwrap()
+            .remove("compare_io_buffers");
+        assert!(
+            VerificationReport::from_current_json_slice(&serde_json::to_vec(&missing).unwrap())
+                .unwrap_err()
+                .contains("compare_io_buffers")
+        );
+        let mut refused = serde_json::to_value(VerificationReport::no_result()).unwrap();
+        refused["no_result_reason"] = serde_json::json!({"kind":"comparison_refused","detail":"the second log was truncated"});
+        VerificationReport::from_current_json_slice(&serde_json::to_vec(&refused).unwrap())
+            .unwrap();
+        refused["no_result_reason"]["detail"] = serde_json::json!("");
+        assert!(
+            VerificationReport::from_current_json_slice(&serde_json::to_vec(&refused).unwrap())
+                .unwrap_err()
+                .contains("detail")
         );
     }
 

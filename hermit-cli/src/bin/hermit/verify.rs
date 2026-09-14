@@ -7,7 +7,13 @@
  */
 
 use std::collections::BTreeSet;
+use std::fs;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -41,6 +47,41 @@ use tracing::metadata::LevelFilter;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::record_envelope::RecordEnvelopePolicy;
+
+const FAILED_VERIFY_LOG_DIR_PREFIX: &str = "comparison-";
+const FAILED_VERIFY_LOG_PENDING_PREFIX: &str = ".pending-comparison-";
+const FAILED_VERIFY_LOG_RETIRING_PREFIX: &str = ".retiring-comparison-";
+const FAILED_VERIFY_LOG_LOCK: &str = ".retention.lock";
+const FAILED_VERIFY_LOG_ROOT_LOCK: &str = ".retirement.lock";
+// Cell-aware validation stores its logs in per-attempt artifact directories.
+// This population exists for recent ad-hoc failures whose caller supplied no
+// durable destination and, consequently, no cell identity. Sixty-four complete
+// comparisons preserve a useful recent debugging window without pretending a
+// per-cell policy can be recovered from identity-free files.
+const FAILED_VERIFY_LOG_COMPARISONS_TO_KEEP: usize = 64;
+
+#[derive(Clone, Debug)]
+pub(crate) struct FailedVerifyLogRetention {
+    root: PathBuf,
+    keep: usize,
+}
+
+impl FailedVerifyLogRetention {
+    #[cfg(test)]
+    fn new(root: PathBuf, keep: usize) -> Self {
+        Self { root, keep }
+    }
+}
+
+pub(crate) fn default_failed_verify_log_retention() -> FailedVerifyLogRetention {
+    let root = dirs::state_dir()
+        .map(|path| path.join("hermit").join("verify-failures"))
+        .unwrap_or_else(|| std::env::temp_dir().join("hermit-verify-failures"));
+    FailedVerifyLogRetention {
+        root,
+        keep: FAILED_VERIFY_LOG_COMPARISONS_TO_KEEP,
+    }
+}
 
 pub(crate) struct ComparedRun<'a> {
     pub output: &'a Output,
@@ -79,6 +120,10 @@ pub(crate) struct ComparisonOptions {
     /// Keep both captured logs at their selected paths after comparison,
     /// whether the runs match or diverge.
     pub keep_logs: bool,
+    /// Where an implicitly retained failed comparison is stored and bounded.
+    /// This is absent when the caller explicitly requested `--keep-logs`; an
+    /// explicit evidence directory remains entirely caller-owned.
+    pub failed_log_retention: Option<FailedVerifyLogRetention>,
     /// Typed, versioned record envelope applied before selecting messages.
     /// Its policy identity is serialized beside the verdict.
     pub record_envelope: RecordEnvelope,
@@ -449,6 +494,9 @@ pub(crate) fn verification_runtime_from_summaries(
 #[derive(Debug, Clone)]
 pub struct VerificationOutcome {
     pub verdict: Verdict,
+    /// Why verification did not reach a verdict. None for a completed match or
+    /// divergence; current no-result producers must provide a typed reason.
+    pub no_result_reason: Option<NoResultReason>,
     /// Exit status of the second (replay / repeat) run, propagated verbatim.
     pub guest_status: ExitStatus,
     /// The exact common output/log comparison used for [`Self::verdict`],
@@ -515,13 +563,18 @@ impl VerificationOutcome {
         match self.verdict {
             Verdict::Matched => Ok(self.guest_status),
             Verdict::Diverged => Ok(ExitStatus::Exited(HERMIT_VERIFICATION_DIVERGENCE_EXIT)),
-            // Reached when the comparator refused (a truncated log) and nothing
-            // else was observed to differ. Still an error, so the historical
-            // nonzero process exit is unchanged -- but it must not be reported
-            // as a mismatch, because no comparison established one.
-            Verdict::NoResult => Err(Error::msg(
-                "Verification did not reach a verdict (no comparison was performed).",
-            )),
+            // Still an error, so the historical nonzero process exit is
+            // unchanged -- but carry the reason instead of replacing it with a
+            // generic message.
+            Verdict::NoResult => match self.no_result_reason {
+                Some(NoResultReason::ComparisonRefused { detail }) => Err(Error::msg(format!(
+                    "Verification did not reach a verdict: {detail}"
+                ))),
+                Some(reason) => Err(Error::msg(format!(
+                    "Verification did not reach a verdict: {reason:?}"
+                ))),
+                None => Err(Error::msg("Verification did not reach a verdict.")),
+            },
             Verdict::InfrastructureError => {
                 Err(Error::msg("Verification recorded an infrastructure error."))
             }
@@ -587,18 +640,20 @@ pub(crate) fn verification_report(outcome: &VerificationOutcome) -> Verification
                 .compared_log_messages
                 .is_some_and(|counts| counts.is_nonzero()),
         verdict: outcome.verdict,
-        // A verdict reached through the outcome path has no refusal to
-        // explain. The rejected-first-run path never builds an outcome, so
-        // it writes its own reason at the site where the status is in hand.
-        no_result_reason: None,
+        no_result_reason: outcome.no_result_reason.clone(),
         infrastructure_error: None,
-        comparison: Some(comparison_report(&outcome.comparison)),
-        compared_log_messages: outcome
-            .compared_log_messages
-            .map(|counts| ComparedLogMessages {
-                left: u64::try_from(counts.left).expect("compared log count fits u64"),
-                right: u64::try_from(counts.right).expect("compared log count fits u64"),
-            }),
+        comparison: (outcome.verdict != Verdict::NoResult)
+            .then(|| comparison_report(&outcome.comparison)),
+        compared_log_messages: if outcome.verdict == Verdict::NoResult {
+            None
+        } else {
+            outcome
+                .compared_log_messages
+                .map(|counts| ComparedLogMessages {
+                    left: u64::try_from(counts.left).expect("compared log count fits u64"),
+                    right: u64::try_from(counts.right).expect("compared log count fits u64"),
+                })
+        },
         dbt_counted_branches: if outcome.verdict == Verdict::NoResult {
             None
         } else {
@@ -643,6 +698,7 @@ pub fn write_skid_overshoot_verification_json(
     report.verified = false;
     report.bitwise_parity = false;
     report.verdict = Verdict::InfrastructureError;
+    report.no_result_reason = None;
     report.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count });
     report.dbt_counted_branches = None;
     write_report_json(path, &report)
@@ -845,6 +901,231 @@ pub(crate) fn retain_verification_logs<const N: usize>(
     Ok(retained)
 }
 
+fn flock(file: &File, operation: i32) -> io::Result<()> {
+    // SAFETY: flock only reads the supplied descriptor and operation. `file`
+    // keeps the descriptor open for at least the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn open_retention_lock(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+}
+
+fn persist_log(log: TempPath, destination: &Path) -> io::Result<()> {
+    match log.persist_noclobber(destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.error.raw_os_error() == Some(libc::EXDEV) => {
+            fs::copy(&*error.path, destination)?;
+            drop(error.path);
+            Ok(())
+        }
+        Err(error) => Err(error.error),
+    }
+}
+
+fn retained_comparison_dirs(root: &Path) -> io::Result<Vec<(PathBuf, std::time::SystemTime)>> {
+    let mut directories = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(FAILED_VERIFY_LOG_DIR_PREFIX) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            continue;
+        }
+        directories.push((entry.path(), metadata.modified()?));
+    }
+    directories.sort_by(|(left_path, left_time), (right_path, right_time)| {
+        right_time
+            .cmp(left_time)
+            .then_with(|| right_path.cmp(left_path))
+    });
+    Ok(directories)
+}
+
+fn finish_interrupted_retirements(root: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(FAILED_VERIFY_LOG_RETIRING_PREFIX)
+            && !name.starts_with(FAILED_VERIFY_LOG_PENDING_PREFIX)
+        {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_dir() && metadata.uid() == unsafe { libc::geteuid() } {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn retire_failed_verification_logs(root: &Path, current: &Path, keep: usize) -> io::Result<usize> {
+    let directories = retained_comparison_dirs(root)?;
+    let mut kept = BTreeSet::from([current.to_path_buf()]);
+    for (path, _) in &directories {
+        if kept.len() >= keep.max(1) {
+            break;
+        }
+        kept.insert(path.clone());
+    }
+
+    let mut retired = 0;
+    for (path, _) in directories {
+        if kept.contains(&path) {
+            continue;
+        }
+        let lock = match open_retention_lock(&path.join(FAILED_VERIFY_LOG_LOCK)) {
+            Ok(lock) => lock,
+            Err(error) => {
+                eprintln!(
+                    "WARNING: could not inspect retained verification logs {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        match flock(&lock, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) => {
+                eprintln!(
+                    "WARNING: could not lock retained verification logs {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| io::Error::other("retained verification directory has no name"))?;
+        let retiring = tempfile::Builder::new()
+            .prefix(&format!("{FAILED_VERIFY_LOG_RETIRING_PREFIX}{name}-"))
+            .rand_bytes(12)
+            .tempdir_in(root)?
+            .keep();
+        fs::remove_dir(&retiring)?;
+        fs::rename(&path, &retiring)?;
+        fs::remove_dir_all(&retiring)?;
+        retired += 1;
+    }
+    Ok(retired)
+}
+
+fn retain_failed_verification_logs(
+    logs: [(&str, TempPath); 2],
+    retention: &FailedVerifyLogRetention,
+) -> Result<Vec<PathBuf>, Error> {
+    fs::create_dir_all(&retention.root).with_context(|| {
+        format!(
+            "could not create failed verification log directory {}",
+            retention.root.display()
+        )
+    })?;
+    let root = fs::canonicalize(&retention.root).with_context(|| {
+        format!(
+            "could not resolve failed verification log directory {}",
+            retention.root.display()
+        )
+    })?;
+    let root_lock = open_retention_lock(&root.join(FAILED_VERIFY_LOG_ROOT_LOCK))?;
+    flock(&root_lock, libc::LOCK_EX)?;
+    finish_interrupted_retirements(&root)?;
+
+    let pending = tempfile::Builder::new()
+        .prefix(FAILED_VERIFY_LOG_PENDING_PREFIX)
+        .rand_bytes(12)
+        .tempdir_in(&root)?
+        .keep();
+    let pending_name = pending
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("failed verification directory has no name"))?;
+    let final_name = pending_name
+        .strip_prefix(FAILED_VERIFY_LOG_PENDING_PREFIX)
+        .ok_or_else(|| io::Error::other("failed verification directory has an invalid name"))?;
+    let completed = root.join(format!("{FAILED_VERIFY_LOG_DIR_PREFIX}{final_name}"));
+    let pair_lock = open_retention_lock(&pending.join(FAILED_VERIFY_LOG_LOCK))?;
+    flock(&pair_lock, libc::LOCK_EX)?;
+
+    let mut retained = Vec::with_capacity(logs.len());
+    for (index, (label, log)) in logs.into_iter().enumerate() {
+        let original_name = log
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(if index == 0 { "run1.log" } else { "run2.log" });
+        let destination = pending.join(original_name);
+        persist_log(log, &destination)?;
+        retained.push((label, destination));
+    }
+    fs::rename(&pending, &completed)?;
+    for (label, path) in &mut retained {
+        *path = completed.join(path.file_name().expect("retained log has a name"));
+        eprintln!("::   {label}: {}", path.display());
+    }
+    drop(pair_lock);
+
+    let retired = retire_failed_verification_logs(&root, &completed, retention.keep)?;
+    if retired > 0 {
+        eprintln!(
+            ":: Retired {retired} older failed verification comparison(s); keeping the newest {} plus comparisons with active readers",
+            retention.keep.max(1)
+        );
+    }
+    Ok(retained.into_iter().map(|(_, path)| path).collect())
+}
+
+pub(crate) fn lock_failed_verification_logs_for_read(
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> io::Result<Vec<File>> {
+    let mut directories = BTreeSet::new();
+    for path in paths {
+        let path = match fs::canonicalize(path) {
+            Ok(path) => path,
+            // Follow mode also accepts logs their writers have not created yet.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(directory) = path.parent() else {
+            continue;
+        };
+        let Some(name) = directory.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with(FAILED_VERIFY_LOG_DIR_PREFIX)
+            && directory.join(FAILED_VERIFY_LOG_LOCK).is_file()
+        {
+            directories.insert(directory.to_path_buf());
+        }
+    }
+    let mut locks = Vec::with_capacity(directories.len());
+    for directory in directories {
+        let lock = open_retention_lock(&directory.join(FAILED_VERIFY_LOG_LOCK))?;
+        flock(&lock, libc::LOCK_SH)?;
+        locks.push(lock);
+    }
+    Ok(locks)
+}
+
 pub fn compare_two_runs(
     first: ComparedRun<'_>,
     second: ComparedRun<'_>,
@@ -875,8 +1156,8 @@ fn compare_two_runs_with_unsupported_scan(
     // was refused. Only an observed difference can justify a `Diverged`
     // verdict; see the verdict selection at the end of this function.
     let mut observed_divergence = false;
-    // The log comparator declined to produce a verdict (a truncated input).
-    let mut comparison_refused = false;
+    // The log comparator's exact reason for declining to produce a verdict.
+    let mut comparison_refusal_reason = None;
     // None until the log comparison actually runs; stays None on the
     // output-only fallback so the report can distinguish
     // "compared nothing" from "compared and matched".
@@ -1000,8 +1281,8 @@ fn compare_two_runs_with_unsupported_scan(
             });
             if summary.diff_found {
                 failed = true;
-                if summary.refused {
-                    comparison_refused = true;
+                if let Some(refusal_reason) = summary.refusal_reason.clone() {
+                    comparison_refusal_reason = Some(refusal_reason);
                 } else {
                     observed_divergence = true;
                 }
@@ -1027,7 +1308,7 @@ fn compare_two_runs_with_unsupported_scan(
                 first_divergent_syscall = summary.first_divergent_syscall;
                 first_divergent_left_message = summary.first_divergent_left_message.clone();
                 first_divergent_right_message = summary.first_divergent_right_message.clone();
-                if !summary.refused {
+                if summary.refusal_reason.is_none() {
                     eprintln!(
                         ":: {}",
                         format!("Log differences found between {label1} and {label2}.")
@@ -1063,7 +1344,12 @@ fn compare_two_runs_with_unsupported_scan(
 
     if let Err(error) = log_processing_result {
         if options.keep_logs || failed {
-            retain_verification_logs([(label1, log1), (label2, log2)])?;
+            if let Some(retention) = &options.failed_log_retention {
+                eprintln!(":: Verification logs retained:");
+                retain_failed_verification_logs([(label1, log1), (label2, log2)], retention)?;
+            } else {
+                retain_verification_logs([(label1, log1), (label2, log2)])?;
+            }
         }
         return Err(error);
     }
@@ -1072,23 +1358,35 @@ fn compare_two_runs_with_unsupported_scan(
     // that behavior to successful comparisons instead of changing the failure
     // path.
     if options.keep_logs || failed {
-        retain_verification_logs([(label1, log1), (label2, log2)])?;
+        if let Some(retention) = &options.failed_log_retention {
+            eprintln!(":: Verification logs retained:");
+            retain_failed_verification_logs([(label1, log1), (label2, log2)], retention)?;
+        } else {
+            retain_verification_logs([(label1, log1), (label2, log2)])?;
+        }
     }
 
     if failed {
         // A refused comparison is a NO-RESULT, not a divergence. A real
         // stdout/stderr/exit-status mismatch still outranks the refusal.
-        let verdict = if comparison_refused && !observed_divergence {
+        let verdict = if comparison_refusal_reason.is_some() && !observed_divergence {
             Verdict::NoResult
         } else {
             Verdict::Diverged
         };
+        let no_result_reason =
+            (verdict == Verdict::NoResult).then(|| NoResultReason::ComparisonRefused {
+                detail: comparison_refusal_reason
+                    .expect("a refused comparison retains its producer reason"),
+            });
+
         // Divergence is a verification *verdict*, not an I/O error: return it as
         // a value carrying the guest exit status. Callers that want the
         // historical "divergence -> nonzero process exit" behavior use
         // `VerificationOutcome::into_exit_status`.
         Ok(VerificationOutcome {
             verdict,
+            no_result_reason,
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
@@ -1104,6 +1402,7 @@ fn compare_two_runs_with_unsupported_scan(
     } else {
         Ok(VerificationOutcome {
             verdict: Verdict::Matched,
+            no_result_reason: None,
             guest_status: out2.status,
             comparison: spec,
             compared_log_messages,
@@ -1274,6 +1573,8 @@ mod tests {
             log,
             log_file: None,
             log_file_handle: None,
+            run_evidence_log_handle: None,
+            run_evidence_write_error: None,
             backend: None,
         }
     }
@@ -1392,6 +1693,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: true,
                 keep_logs: false,
+                failed_log_retention: None,
                 record_envelope,
                 virtualize_time: true,
             },
@@ -1486,6 +1788,16 @@ mod tests {
         let report = verification_report(&outcome);
         assert!(!report.verified);
         assert!(!report.bitwise_parity);
+        assert!(
+            matches!(
+                report.no_result_reason.as_ref(),
+                Some(NoResultReason::ComparisonRefused { detail })
+                    if detail.contains("truncated at the configured size bound")
+            ),
+            "the typed report must retain the exact comparator refusal: {report:?}"
+        );
+        assert_eq!(report.comparison, None);
+        assert_eq!(report.compared_log_messages, None);
         assert!(
             outcome.into_exit_status().is_err(),
             "a no-result must still exit nonzero; it is not a pass"
@@ -1646,6 +1958,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: false,
+                failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
             },
@@ -1859,6 +2172,7 @@ mod tests {
                 diagnostic_full_trace: true,
                 compare_io_buffers: false,
                 keep_logs: false,
+                failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
             },
@@ -1959,6 +2273,7 @@ mod tests {
                     diagnostic_full_trace: false,
                     compare_io_buffers: false,
                     keep_logs,
+                    failed_log_retention: None,
                     record_envelope: RecordEnvelope::all_records_v1(),
                     virtualize_time: true,
                 },
@@ -1971,6 +2286,141 @@ mod tests {
                 fs::remove_file(left_path).unwrap();
                 fs::remove_file(right_path).unwrap();
             }
+        }
+    }
+
+    fn run_failed_comparison(source: &Path, retention: FailedVerifyLogRetention, value: u64) {
+        let output = output(0, b"same output\n", b"");
+        let (left, right) = temp_log_files_in("run1", "run2", Some(source)).unwrap();
+        fs::write(left.path(), detlog_with_value(value)).unwrap();
+        fs::write(right.path(), detlog_with_value(value + 1)).unwrap();
+        let outcome = compare_two_runs(
+            ComparedRun {
+                output: &output,
+                log: left.into_temp_path(),
+                label: "run 1",
+            },
+            ComparedRun {
+                output: &output,
+                log: right.into_temp_path(),
+                label: "run 2",
+            },
+            ComparisonOptions {
+                verbose: false,
+                strictness: LogCompareStrictness::Canonical,
+                compare_logs: true,
+                diagnostic_full_trace: false,
+                compare_io_buffers: true,
+                keep_logs: false,
+                failed_log_retention: Some(retention),
+                record_envelope: RecordEnvelope::all_records_v1(),
+                virtualize_time: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.verdict, Verdict::Diverged);
+    }
+
+    #[test]
+    fn failed_comparison_materialization_holds_the_retained_count_at_the_bound() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let root = temporary.path().join("verify-failures");
+        fs::create_dir(&source).unwrap();
+        let retention = FailedVerifyLogRetention::new(root.clone(), 2);
+
+        for value in 0..3 {
+            run_failed_comparison(&source, retention.clone(), value);
+        }
+
+        let directories = retained_comparison_dirs(&root).unwrap();
+        assert_eq!(
+            directories.len(),
+            2,
+            "the third failure must retire the oldest"
+        );
+        for (directory, _) in directories {
+            let logs = fs::read_dir(directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name() != FAILED_VERIFY_LOG_LOCK)
+                .collect::<Vec<_>>();
+            assert_eq!(logs.len(), 2, "each retained failure keeps both logs");
+        }
+    }
+
+    #[test]
+    fn failed_comparison_retirement_refuses_a_log_diff_reader() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let root = temporary.path().join("verify-failures");
+        fs::create_dir(&source).unwrap();
+        let retention = FailedVerifyLogRetention::new(root.clone(), 2);
+        run_failed_comparison(&source, retention.clone(), 0);
+        run_failed_comparison(&source, retention.clone(), 2);
+
+        let oldest = retained_comparison_dirs(&root).unwrap().pop().unwrap().0;
+        let protected_log = fs::read_dir(&oldest)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name() != FAILED_VERIFY_LOG_LOCK)
+            .unwrap()
+            .path();
+        let read_locks = lock_failed_verification_logs_for_read([protected_log]).unwrap();
+        run_failed_comparison(&source, retention.clone(), 4);
+        assert!(oldest.is_dir(), "an active reader must prevent retirement");
+        assert_eq!(retained_comparison_dirs(&root).unwrap().len(), 3);
+
+        drop(read_locks);
+        run_failed_comparison(&source, retention, 6);
+        assert!(
+            !oldest.exists(),
+            "the unlocked old evidence is retired later"
+        );
+        assert_eq!(retained_comparison_dirs(&root).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn failed_comparison_retirement_protects_symlinked_readers() {
+        for file_alias in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            let root = temporary.path().join("verify-failures");
+            fs::create_dir(&source).unwrap();
+            let retention = FailedVerifyLogRetention::new(root.clone(), 2);
+            run_failed_comparison(&source, retention.clone(), 0);
+            run_failed_comparison(&source, retention.clone(), 2);
+
+            let oldest = retained_comparison_dirs(&root).unwrap().pop().unwrap().0;
+            let protected_log = fs::read_dir(&oldest)
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| entry.file_name() != FAILED_VERIFY_LOG_LOCK)
+                .unwrap()
+                .path();
+            let alias = temporary.path().join("reader-path");
+            let input = if file_alias {
+                std::os::unix::fs::symlink(&protected_log, &alias).unwrap();
+                alias
+            } else {
+                std::os::unix::fs::symlink(&oldest, &alias).unwrap();
+                alias.join(protected_log.file_name().unwrap())
+            };
+            let read_locks = lock_failed_verification_logs_for_read([input]).unwrap();
+            run_failed_comparison(&source, retention.clone(), 4);
+            assert!(
+                oldest.is_dir(),
+                "a reader through a symlink must prevent retirement (file_alias={file_alias})"
+            );
+            assert_eq!(retained_comparison_dirs(&root).unwrap().len(), 3);
+
+            drop(read_locks);
+            run_failed_comparison(&source, retention, 6);
+            assert!(
+                !oldest.exists(),
+                "the aliased evidence must be retired after its reader releases the lock"
+            );
+            assert_eq!(retained_comparison_dirs(&root).unwrap().len(), 2);
         }
     }
 
@@ -2002,6 +2452,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: true,
+                failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
             },
@@ -2064,6 +2515,7 @@ mod tests {
                 diagnostic_full_trace: false,
                 compare_io_buffers: false,
                 keep_logs: true,
+                failed_log_retention: None,
                 record_envelope: RecordEnvelope::all_records_v1(),
                 virtualize_time: true,
             },
@@ -2691,6 +3143,7 @@ mod tests {
         // report's boolean is the conjunction of the verdict and the contract.
         let diverged = VerificationOutcome {
             verdict: Verdict::Diverged,
+            no_result_reason: None,
             guest_status: ExitStatus::Exited(0),
             comparison: full,
             compared_log_messages: Some(ComparedLogCounts { left: 9, right: 9 }),

@@ -41,7 +41,7 @@
 # CI already runs it as separate jobs: build jobs publish a prebuilt tree, then
 # test, E2E, and final-result jobs consume it. This script reads THE SAME KEYS
 # with THE SAME jq expressions as .github/workflows/ci-portable.yml. Completeness
-# is checked against validate's constructed portable-only plan, never a raw lane
+# is checked against the committed hosted-portable selection, never a generated lane
 # file, so plan-construction changes cannot silently fall out of this path.
 #
 # THE PARTITION IS THE SHARD MAP, NOT THE `group` FIELD. A naive implementation
@@ -200,7 +200,7 @@ test_node_count=$(tr ',' '\n' <<<"$test_nodes" | wc -l)
 total_node_count=$((build_node_count + test_node_count))
 if [[ -z "$shards" ]]; then
     plan_out=$(mktemp)
-    ./scripts/validate.rs portable-only --show-plan-json \
+    ./scripts/validate.rs --hosted-portable-only --show-plan-json \
         --skip-inner-dirty-working-tree-and-rebase-freshness-checks >"$plan_out"
     plan_json=$(sed -n '1p' "$plan_out")
     rm -f "$plan_out"
@@ -212,7 +212,7 @@ if [[ -z "$shards" ]]; then
     }
     compat_expansion=$(jq -r '
         .dags[].steps[].tag
-        | select(. == "compatprep.fixtures" or startswith("compat."))
+        | select(. == "compatprep.fixtures" or . == "compatprep.fixtures_on_host" or startswith("compat."))
     ' <<<"$plan_json")
     [[ -n "$compat_expansion" ]] || {
         echo "run-split-validate: constructed plan has no direct strict compatibility nodes." >&2
@@ -223,20 +223,27 @@ if [[ -z "$shards" ]]; then
     # here too before comparing the partition with the constructed graph.
     selected_list=$(
         {
-            tr ',' '\n' <<<"$build_nodes,$test_nodes" | grep -Fvx 'test.strict_compat'
+            # Match validate's exact-name-first hosted selector resolution.
+            # Preserve unknown names and duplicates for the checks below.
+            tr ',' '\n' <<<"$build_nodes,$test_nodes" | grep -Fvx 'test.strict_compat' |
+                jq -Rr --argjson available "$(jq '[.dags[].steps[].tag]' <<<"$plan_json")" '
+                    . as $tag | ($tag + "_on_host") as $hosted
+                    | if ($available | index($tag)) == null and ($available | index($hosted)) != null
+                      then $hosted else $tag end
+                '
             printf '%s\n' "$compat_expansion"
         } | LC_ALL=C sort
     )
-    duplicate_nodes=$(uniq -d <<<"$selected_list" || true)
+    duplicate_nodes=$(LC_ALL=C uniq -d <<<"$selected_list" || true)
     strict_compat_node_count=$(wc -l <<<"$compat_expansion")
     test_node_count=$((test_node_count - 1 + strict_compat_node_count))
     total_node_count=$((build_node_count + test_node_count))
     expected_list=$(jq -r '.dags[].steps[].tag' <<<"$plan_json" | LC_ALL=C sort)
-    duplicate_dag_nodes=$(uniq -d <<<"$expected_list" || true)
-    selected_unique=$(uniq <<<"$selected_list")
-    expected_unique=$(uniq <<<"$expected_list")
-    missing_nodes=$(comm -23 <(printf '%s\n' "$expected_unique") <(printf '%s\n' "$selected_unique") || true)
-    extra_nodes=$(comm -13 <(printf '%s\n' "$expected_unique") <(printf '%s\n' "$selected_unique") || true)
+    duplicate_dag_nodes=$(LC_ALL=C uniq -d <<<"$expected_list" || true)
+    selected_unique=$(LC_ALL=C uniq <<<"$selected_list")
+    expected_unique=$(LC_ALL=C uniq <<<"$expected_list")
+    missing_nodes=$(LC_ALL=C comm -23 <(printf '%s\n' "$expected_unique") <(printf '%s\n' "$selected_unique") || true)
+    extra_nodes=$(LC_ALL=C comm -13 <(printf '%s\n' "$expected_unique") <(printf '%s\n' "$selected_unique") || true)
     if [[ -n "$duplicate_nodes" || -n "$duplicate_dag_nodes" || -n "$missing_nodes" || -n "$extra_nodes" ]]; then
         echo "run-split-validate: full portable step selection does not exactly match validate's constructed plan." >&2
         [[ -z "$duplicate_nodes" ]] || printf '  duplicate selection: %s\n' $duplicate_nodes >&2
@@ -342,8 +349,14 @@ if [[ $do_offline -eq 1 ]]; then
     # The assertion runs INSIDE the container as its first act, and a reachable
     # network aborts the phase before anything is built or tested. Checking from
     # out here would prove nothing about in there.
+    # Keep the two machine timeout settings independent across this boundary.
+    # run-in-pinned-root omits an unset name and otherwise preserves its value;
+    # the manifest runner remains the single parser and policy authority, so a
+    # malformed setting is refused there rather than reinterpreted in shell.
     exec "$HERE/run-in-pinned-root.sh" \
         --src "$ROOT" --out "$out" --src-rw --cargo-home "$cargo_home" \
+        --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER \
+        --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER \
         -- bash -c '
             set -euo pipefail
             /src/ci/hermetic/assert-no-network.sh
@@ -375,12 +388,28 @@ if [[ $do_offline -eq 1 ]]; then
             done
             for path in /usr/bin/bash /usr/bin/date /usr/bin/df /usr/bin/du \
                         /usr/bin/find /usr/bin/git /usr/bin/node /usr/bin/nodejs \
-                        /usr/bin/python3 /usr/bin/sort /usr/bin/tr; do
+                        /usr/bin/nproc /usr/bin/python3 /usr/bin/sort \
+                        /usr/bin/stat /usr/bin/tr; do
                 [[ -x "$path" ]] || {
                     echo "run-split-validate: pinned root is missing required FHS path: $path" >&2
                     exit 2
                 }
             done
+
+            # These CLI test drivers are distinct from the guest-tool list.
+            command -v gdb >/dev/null || {
+                echo "run-split-validate: pinned root is missing required CLI test driver: gdb" >&2
+                exit 2
+            }
+            gdb_python=$(timeout 10s gdb --batch --nx \
+                -ex "python import sys; print(2694001)") || {
+                echo "run-split-validate: pinned gdb cannot run the required Python fixture" >&2
+                exit 2
+            }
+            [[ "$gdb_python" == "2694001" ]] || {
+                echo "run-split-validate: pinned gdb Python fixture marker was not exact" >&2
+                exit 2
+            }
 
             echo ":: build-side nodes"
             /src/ci/run-node.sh '"$lane"' '"$build_nodes"'

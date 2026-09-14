@@ -1836,6 +1836,12 @@ drift from what CI actually passes. A hardcoded long string would have been a
 third shape invented by the test author; the shard file is the shape production
 uses.
 
+The later one-DAG cutover removed this scratch-DAG command-replacement path
+entirely. `ci/run-node.sh` now selects exact committed nodes only, refuses every
+trailing replacement argument, and invokes `scripts/validate.rs`; its long-input
+control still reads the real shard selection, but no longer creates or mutates a
+second DAG.
+
 ⚠️ **The sibling failure is a guard whose cases all assert the same DIRECTION.**
 A file where every case says "this must be refused" passes just as well against
 an implementation that refuses *everything*. On

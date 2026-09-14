@@ -7,40 +7,48 @@ with explicit dependencies and resource limits, so the scheduler can run
 independent gates concurrently. On hosts with delegated cgroup v2 support, it
 can also box each node for memory limits and full process-subtree teardown.
 
-- [`portable.json`](portable.json) — contributes committed data to the plan
-  constructed for `scripts/validate.rs`'s **`--portable-only`** lane and the
-  manually dispatched GitHub-managed portable `regular` diagnostic in
-  [`.github/workflows/ci-portable.yml`](../../.github/workflows/ci-portable.yml).
-  No PMU / CPUID interception required.
-- [`privileged.json`](privileged.json) — contributes the focused capability
-  contract selected by the manually dispatched privileged diagnostic in
-  [`.github/workflows/ci-privileged.yml`](../../.github/workflows/ci-privileged.yml).
-  Requires PMU + `/dev/kvm`.
+- [`validate.json`](validate.json) — the one committed superset. Steps declare
+  `quick`, `portable`, `hosted-portable`, `full`, `super`, `privileged`, and
+  `hosted-privileged` labels; dagrun selects the requested label and its
+  dependency ancestry without rewriting the graph.
 
 Run a lane with the wrapper:
 
 ```sh
 ci/run-dag.sh portable   --max-mem 32G          # memory-aware -j
 ci/run-dag.sh privileged -j 2                    # PMU lane, one gate at a time
-ci/run-dag.sh portable   ascii                   # visualize instead of run
+agent-utils/py/bin/dagrun ascii --dag ci/dag/validate.json  # inspect the superset
 ```
 
 ## Status: active local lanes and manual hosted diagnostics
 
-`scripts/validate.rs` constructs the plan from the committed validation data.
-The hosted workflows pass selected step tags back to that plan builder; they do
-not read a lane file as an executable plan or restate a step command. The
-constructed plan is therefore the source of truth for individual gate commands,
-dependencies, and resource declarations even when the hosted workflow groups
-those steps across separate jobs.
+`scripts/validate.rs` reads `validate.json` and selects local labels.
+`ci/run-dag.sh portable` and `ci/run-dag.sh privileged` map to the explicit
+`hosted-portable` and `hosted-privileged` labels in that same file. The hosted
+nodes retain host commands and typed host dependencies; local labels select
+their pinned-root counterparts. Standard profile execution does not merge lane
+files, regenerate nodes, or rewrite commands and resource caps.
 
-The privileged DAG is limited to the focused build, CPUID faulting, PMU skid,
-manifest validation, and KVM E2E cells so the manual self-hosted smoke stays
-within its 270-second workflow bound. Each sequential build/KVM segment is
-capped at 120 seconds, yielding a 240-second maximum DAG timeout path; the
-manifest audit recomputes and enforces that bound. The 139-program
-record/replay ratchet is preserved as a separate step in the manually dispatched
-full validation job.
+`generate-validation-dag --check` is a maintenance check, not part of runtime
+plan construction. Static step definitions live as private typed generator
+input in `ci/manifest-plan/src/validation_dag_static.rs`; generated manifest,
+compatibility, stress, local pinned-root, and hosted variants are composed with
+them to emit the entire file deterministically. `--check` regenerates from that
+independent source and refuses any command, dependency, or cap drift in the
+committed artifact. `--write` updates this same file; there is no secondary
+runnable DAG.
+
+The local privileged selection contains 19 nodes with the pre-cutover wrapped 3900-second critical
+path. The separately labelled hosted privileged smoke preserves its historical
+12-node population and 1500-second critical path, so the manual workflow keeps
+its audited 1560-second launcher bound. The stale hosted file omitted CPU
+budgets and therefore inherited dagrun's 10-second fallback; every hosted node
+now carries the corresponding current-plan CPU budget explicitly. This is a
+correctness repair, not a claim that the obsolete fallback was equivalent.
+Commands, dependencies, wall bounds, and the absence of hosted resource demands
+remain checked against the hosted selection. The 139-program record/replay
+ratchet remains a separate step in the manually dispatched full validation
+job.
 
 The `mem_race` family and three nonblocking post-DAG diagnostics run in the
 manually dispatched `super` tier so a known host-sensitive hang cannot consume
@@ -48,8 +56,50 @@ the serialized capability lane unexpectedly.
 
 The `Validation Levels` workflow does not launch for pull requests, `main`, or a
 schedule. Its quick, privileged, and super levels remain available by manual
-dispatch. The manual [`ci-dag.yml`](../../.github/workflows/ci-dag.yml) workflow
-runs either DAG on demand.
+dispatch. The manual [`ci-dag.yml`](../../.github/workflows/ci-dag.yml)
+workflow selects either the `hosted-portable` or `hosted-privileged` label from
+the same committed superset on demand.
+
+### Prepared Nextest executables
+
+The workspace producers prepare each distinct Cargo test selection before its
+Nextest consumers run. The committed graph records the exact Cargo selectors
+for every counted runner, the embedded KVM inventory commands, and the direct
+CPUID `tests_misc` lookup. The generator
+checks those declarations against the command arguments and requires a producer
+in each consumer's dependency ancestry. The full privileged barrier verifies
+its three selections without rebuilding shared test executables.
+
+`ci/nextest-binaries.rs prepare PROFILE` writes one atomic record for all of that
+profile's selections. The record binds source trees, compiler identity, Cargo
+configuration and build settings, actual Cargo target/package identities,
+metadata, and the contents of test executables and recorded runtime files.
+The `hermit_modes` preparation also builds all 21 Cargo guest fixtures together
+and supplies their verified Cargo-reported paths to the test process. Missing,
+stale, ambiguous, or wrong-target artifacts cause refusal; a consumer never
+falls back to compiling them. The actual Cargo target directory is retained,
+including a configured `CARGO_TARGET_DIR`; no guessed target remap is applied.
+
+For an explicit local prepared run, first prepare a graph profile, then invoke
+`ci/nextest-binaries.rs run` or `list` with the same Cargo selectors and desired
+Nextest filters. `--profile ci` remains a Nextest runtime setting. Unsupported
+build settings such as `--cargo-profile` and `--release` are refused rather than
+silently interpreted as runtime options. Official counted runs retain their
+versioned test results, exact selected counts, retries and failure status.
+The prebuilt Rust-script producer prepares the helper itself before official
+consumers; ordinary standalone Rust-script invocations can still compile the
+helper during command lookup.
+
+The quick build now depends on Nextest setup because preparation needs it.
+This adds the existing 600-second setup timeout to its worst-case dependency
+path (8580 to 9180 seconds); individual node timeouts and CPU caps are unchanged.
+These sums are scheduling bounds, not measured preparation or execution times.
+The pressure runner's batch preparation similarly retains the Nextest setup
+prerequisite: ten nodes including LiteInst, or nine without it. This adds 600
+seconds to those declared preparation paths (6000 and 5100 seconds), while
+preserving the existing 7200-second whole-run bound and the smaller exact-cell
+preparation sets. The pinned image already includes Nextest 0.9.100; its
+separate mounted Cargo target keeps image metadata distinct from host metadata.
 
 ### Runner dependency
 
@@ -160,17 +210,10 @@ runtime output.
 
 ### Command fidelity
 
-Node `cmd`s are the **verbatim** commands `scripts/validate.rs` runs, with three
-deliberate exceptions, chosen to avoid duplicating script logic that has many
-moving parts:
-
-- **Portable strict compatibility is a generated expansion.** The committed
-  `test.strict_compat` row is a fail-closed marker; `scripts/validate.rs`
-  replaces it with one run-unique fixture-preparation node and the corpus-derived
-  `compat.*` nodes before invoking dagrun. This keeps the corpus JSON as the one
-  source of argv while exposing every probe and its resource demand to the one
-  outer scheduler. The privileged `rr.compat_baseline` composite still reuses
-  `./scripts/validate.rs --rr-compat-only`.
+Node `cmd`s are the **verbatim** commands `scripts/validate.rs` runs. Portable
+strict compatibility is committed as one fixture producer plus direct
+`compat.*` steps. The stable `test.strict_compat` shard/selection alias expands
+only to those already-committed steps; it never constructs or rewrites them.
 - **The DBT stderr-isolation CLI case is a separate 120-second node** so a
   backend hang fails quickly without consuming the aggregate CLI budget. The
   aggregate node skips that case, so the test set remains unchanged.
@@ -289,7 +332,7 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
 
 **Outer** — how many gates may co-run:
 
-- `resource_caps` gates *scarce* resources. `portable.json` keeps only
+- `resource_caps` gates *scarce* resources. The `portable` label keeps only
   `{"manifest_guest": 8}`. Ordinary manifest buckets use disjoint cell trees
   and request one slot after the shared build barrier. The two high-width
   buckets, `backend-parity-c` and `c-programs`, request all eight slots and pass
@@ -297,7 +340,7 @@ The task's "outer + inner resource limits" map onto the runner's two knobs:
   the measured worker width. Legacy Hermit guest gates and direct strict
   compatibility probes have no shared scarce-resource demand; they may overlap
   when dependencies, the outer scheduler width, and memory allow.
-  `privileged.json` declares no resource cap: `/dev/kvm` supports concurrent
+  The `privileged` label declares no resource cap: `/dev/kvm` supports concurrent
   guests, so its three consumers may overlap. The PMU is
   **not** a scarce resource and carries no cap: reverie
   measures retired conditional branches with per-task (`cpu = -1`) counters that

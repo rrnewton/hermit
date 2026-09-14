@@ -69,9 +69,159 @@
 
 # c-programs
 
+## c-programs/writev-determinism
+
+### 2026-09-02 — historical CPU variation followed changing test work
+
+- Scope: the reported solo cohort contained 27 `PASS` observations from full
+  validates on one recorded host, at outer DAG width 16 and inner manifest
+  width 8.
+  Its unpartitioned CPU result was mean 0.545198 seconds, sample standard
+  deviation 0.480885 seconds, and CV 0.882. Every observation had exactly one
+  attempt, so retries did not contribute.
+- Distribution: partitioning those same observations by the result row's
+  `test_sha256` changes the result materially:
+
+  | `test_sha256` prefix | n | CPU mean | sample SD | CV | scheduler turns | syscalls |
+  |---|---:|---:|---:|---:|---:|---:|
+  | `3c0b82fdee9b` | 18 | 0.247418s | 0.022896s | 0.093 | 204 | 147 |
+  | `45d3c45959c4` | 2 | 0.483777s | 0.095295s | 0.197 | 613 | 299 |
+  | `8c60c1f11b33` | 5 | 1.313803s | 0.151321s | 0.115 | 4062 | 308 |
+  | `3cdfef2f2edd` | 2 | 1.365126s | 0.030647s | 0.022 | 4474 | 458 |
+
+  Differences between those four source-group means account for 98.16% of
+  the cohort's total squared CPU deviation; 1.84% remains within the groups.
+  Within each hash, the observation SHA-256 and stdout were identical. The
+  first group emitted only `writev-stdout` and `writev-determinism-ok`; the
+  later groups added the two-blocked-writer check, six signal/partial-write
+  checks, or both. Commit `d04efc883640ff111781c6f324e3ed10c60f52ad`
+  adds the signal/partial-write cases to the default path, and
+  `c4bdf4d4d366931f9f1778a6f7325aaffd3dd95d` adds the two-blocked-writer
+  check. Their larger stable scheduler-turn and syscall counts are direct
+  evidence that the later fixture versions intentionally execute more work.
+- Build and accounting: full validate invokes this bucket with `--prebuilt`.
+  On that path `prepare_test_until` copies the prepared C fixture and does not
+  invoke `cc`; the row's CPU value equalled its sole attempt's CPU value in all
+  27 observations. The measurement is the specific launched child's
+  `wait4(2)` user plus system CPU, including descendants it reaped; it is not
+  the enclosing DAG cgroup counter. Cached compilation, cgroup contamination,
+  and retries therefore do not explain this distribution.
+- Interpretation: the cross-version CV compares different work and is not
+  evidence that one version performs a non-conserved amount of work. The
+  corresponding within-version CPU CVs are 0.022–0.197; the largest value has
+  only two observations. The other nine cells in the original CPU top ten each
+  had one `test_sha256`, so source-version mixing did not explain their ranks.
+  As a same-SHA check outside the ranked solo cohort, two observations at
+  `b779f99f2add10d9fa198466efd2dbce0edbf689` with the same Hermit binary and
+  test hash used 0.210147 and 0.215621 CPU seconds.
+- Debugging rule: before interpreting cell runtime variance, partition rows by
+  `test_sha256` and `binary_sha256`, then hold host, outer/inner concurrency,
+  and attempt count constant. Compare scheduler turns, syscalls, virtual time,
+  observation hash, and stdout. A change in those work counters or outputs is
+  a changed workload to explain before investigating contention or caches.
+
+The raw fields can be inspected without rerunning the cell:
+
+```bash
+artifact_root=${DEV_HERMIT_ROOT:?set DEV_HERMIT_ROOT}/ignored/validate/artifacts
+rg -l 'writev-determinism' \
+  "$artifact_root" \
+  -g results.jsonl |
+while IFS= read -r result; do
+  jq -r 'select(.test == "c-programs/writev-determinism" and
+                .mode == "verify" and .backend == "ptrace" and
+                .outcome == "PASS" and (.cpu_usage_usec | type) == "number") |
+         [.run_id, .hermit_sha, .test_sha256, .binary_sha256,
+          .cpu_usage_usec, .duration_ms, (.attempts | length),
+          .runtime.run1.scheduler_turns, .runtime.run1.syscalls,
+          .attempts[0].observation_sha256] | @tsv' "$result"
+done
+```
+
+The producer implementation is
+`ci/manifest-plan/src/runner.rs`: `prepare_test_until` chooses prebuilt-copy
+versus compilation, `rusage_cpu_usage_usec` reads `wait4` user and system CPU,
+`run_cell` sums preparation and attempt CPU, and `test_digest` hashes the guest
+source bytes.
+
 # chaos-c
 
 # data-handling
+
+## data-handling/dd-partial-transfers
+
+### 2026-09-02 — portable / verify / ptrace — fixed work stopped by the wall deadline
+
+- Classification: this is a fixed-work cell with an undersized wall bound, not
+  a cell that conditionally builds or selects a variable workload. Its
+  `--prepare` action is a no-op. Each guest execution generates exactly 4096
+  bytes, copies 4096 bytes through `dd bs=1` over a pipe, copies the same 4096
+  bytes through file-backed `dd bs=1`, and transfers one final 89-byte input in
+  13 seven-byte blocks. A healthy strict verification performs that guest work
+  twice.
+- Controlled command: the following is the direct form used for two independent
+  measurements. It requires a built Hermit and the parent repository's
+  `bin/safehermit`; replace the two path variables for another checkout. The
+  measured binary reported `hermit 0.2.0 (2026-09-02, g5910bc208d13)`, had
+  SHA-256 `68b548ee25b7f6b16244ec5e7a9a4d9cf300936c4c38ee9c8225a7cc8582251f`,
+  and ran a guest script with SHA-256
+  `30b56fd75af20124a68e28d744e54bd82b0161e5b91304a3fb047a23d66fd6b2`.
+  The backend was ptrace, the log level was info, and there were no
+  determinism relaxations.
+
+  ```bash
+  dev_hermit=${DEV_HERMIT_ROOT:?set DEV_HERMIT_ROOT}
+  hermit_bin=${HERMIT_BIN:?set HERMIT_BIN to the measured Hermit binary}
+  run=$(mktemp -d)
+  mkdir -p "$run/home" "$run/xdg-config" "$run/fixtures"
+  env E2E_FIXTURE_DIR="$run/fixtures" E2E_TMPDIR=/tmp/hermit-e2e \
+    HERMIT_E2E_SCHEDULED_JOBS=1 HOME="$run/home" LC_ALL=C TZ=UTC \
+    XDG_CONFIG_HOME="$run/xdg-config" \
+    "$dev_hermit/bin/safehermit" --sh-deadline 120 \
+    --sh-report "$run/safehermit.report" \
+    "$hermit_bin" --log info run --base-env=minimal --backend ptrace \
+    --strict --verify-strict --verify --verify-json "$run/verify.json" \
+    --mount=type=tmpfs,target=/test --workdir /test --env LC_ALL=C \
+    --env TZ=UTC --env HOME="$run/home" \
+    --env XDG_CONFIG_HOME="$run/xdg-config" --env E2E_TMPDIR=/test \
+    --env E2E_FIXTURE_DIR="$run/fixtures" \
+    --env HERMIT_E2E_SCHEDULED_JOBS=1 -- \
+    "$PWD/tests/e2e/data-handling/dd-partial-transfers.sh" --run
+  jq '{verdict, bitwise_parity, compared_log_messages, runtime}' \
+    "$run/verify.json"
+  ```
+
+- Real output: two fresh-home invocations on a 316-CPU host each completed in
+  10 seconds and produced byte-identical reports. Both internal executions in
+  both invocations recorded exactly 18,616 syscalls, 8,832 scheduler turns,
+  4,777,481,955 virtual nanoseconds, and 63,224 canonical INFO messages:
+
+  ```json
+  {"verdict":"matched","bitwise_parity":true,"compared_log_messages":{"left":63224,"right":63224},"runtime":{"run1":{"scheduler_turns":8832,"virtual_nanoseconds":4777481955,"syscalls":18616},"run2":{"scheduler_turns":8832,"virtual_nanoseconds":4777481955,"syscalls":18616}}}
+  ```
+
+- Independent control: three fresh-home invocations of exact Hermit
+  `a6b0c37648df774d5859aad23a535caf03a6d392` on
+  `devbig030.atn3.facebook.com` each completed in 9 seconds with matched L2
+  reports and exactly 63,224 INFO messages on both sides. Other retained SHAs
+  record a different but internally equal count; compare work counters only
+  within one exact binary and source revision.
+- Failure evidence: hosted CI at `6fab069e01096d174a196f9a658b7d5468d494d5`
+  completed Run1 twice, entered Run2, and then received SIGTERM after 14.657
+  and 14.664 seconds. A concurrent local run completed one attempt in 14.019
+  seconds, while its peer was killed at 15.042 and 15.036 seconds after using
+  14.298 and 6.466 process CPU-seconds. The smaller CPU total belongs to an
+  incomplete execution; it is not evidence that the cell selected less work.
+- Follow-up checked on 2026-09-12: the manifest now configures a 58-second wall
+  bound and a 22-second CPU bound. Its 60 retained typed passing rows had a
+  nearest-rank p90 of 14.275 wall seconds and 12.732855 CPU seconds; the
+  calibration requires `ceil(4 * wall) = 58` and `ceil(1.5 * CPU) = 20`,
+  covered by the configured 22-second CPU default. The historical 15-second
+  failures above do not describe the current bound. The guest source hash and
+  full transfer population remain unchanged. See
+  `tests/e2e/manifests/data-handling.yaml` and
+  `ci/manifest-plan/src/timeouts.rs` for the measured policy. Preserve that
+  fixed workload when investigating future runtime variation.
 
 # debugger-c
 
