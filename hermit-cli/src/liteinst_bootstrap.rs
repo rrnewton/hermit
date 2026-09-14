@@ -4,7 +4,9 @@
 // LICENSE file in the root directory of this source tree.
 
 //! Tool identity, configuration schema and effective logging directives carried
-//! by the sealed LiteInst bootstrap. The host resolves the environment once;
+//! by the LiteInst bootstrap. The payload is schema-validated and its config
+//! fingerprint is compared; it is not cryptographically authenticated.
+//! The host resolves the environment once;
 //! the guest consumes the same accepted directives without reading its own
 //! environment or reformatting field matchers.
 
@@ -24,6 +26,14 @@ pub struct EffectiveFilter {
 }
 
 impl EffectiveFilter {
+    /// Resolve `RUST_LOG` once, using the same missing/non-Unicode fallback as
+    /// `EnvFilter::from_default_env`. All CLI file and stderr subscribers use
+    /// this constructor so their policy also defines the bootstrap directives.
+    pub fn from_default_env(level: LevelFilter) -> Self {
+        let raw = std::env::var(EnvFilter::DEFAULT_ENV).unwrap_or_default();
+        Self::from_directives_lossy(&raw, level)
+    }
+
     /// Resolve directives using the CLI's existing lossy environment policy and
     /// its final Tokio and level overrides. Preserve the accepted source text:
     /// formatting an EnvFilter is not a lossless encoding of field matchers.
@@ -137,50 +147,50 @@ mod tests {
         assert_eq!(encode(FINGERPRINT, &decoded).unwrap(), encoded);
     }
 
+    use std::io;
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct Records(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Records {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture(filter: EnvFilter) -> Vec<u8> {
+        let records = Records(Arc::new(Mutex::new(Vec::new())));
+        let writer = records.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "bootstrap_fixture", "outside info");
+            tracing::debug!(target: "tokio", "Tokio override");
+            for task in [1.0_f64, -1.0, 2.0] {
+                let span = tracing::info_span!(target: "bootstrap_fixture", "work", task);
+                let _entered = span.enter();
+                tracing::debug!(target: "bootstrap_fixture", "inside debug");
+                tracing::trace!(target: "bootstrap_fixture", "inside trace");
+            }
+            tracing::warn!(target: "bootstrap_fixture", "warning");
+        });
+        records.0.lock().unwrap().clone()
+    }
+
     #[test]
     fn decoded_filter_selects_the_same_events_and_span_fields_as_the_host() {
-        use std::io;
-        use std::io::Write;
-        use std::sync::Arc;
-        use std::sync::Mutex;
-
-        #[derive(Clone)]
-        struct Records(Arc<Mutex<Vec<u8>>>);
-
-        impl Write for Records {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        fn capture(filter: EnvFilter) -> Vec<u8> {
-            let records = Records(Arc::new(Mutex::new(Vec::new())));
-            let writer = records.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .without_time()
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish();
-            tracing::subscriber::with_default(subscriber, || {
-                tracing::info!(target: "bootstrap_fixture", "outside info");
-                tracing::debug!(target: "tokio", "Tokio override");
-                for task in [1.0_f64, -1.0, 2.0] {
-                    let span = tracing::info_span!(target: "bootstrap_fixture", "work", task);
-                    let _entered = span.enter();
-                    tracing::debug!(target: "bootstrap_fixture", "inside debug");
-                    tracing::trace!(target: "bootstrap_fixture", "inside trace");
-                }
-                tracing::warn!(target: "bootstrap_fixture", "warning");
-            });
-            records.0.lock().unwrap().clone()
-        }
-
         for raw in [
             "",
             "off,tokio=off",
@@ -192,7 +202,12 @@ mod tests {
             let host = EffectiveFilter::from_directives_lossy(raw, LevelFilter::WARN);
             let payload = encode(FINGERPRINT, &host).unwrap();
             let guest = decode(&payload, FINGERPRINT).unwrap();
-            let expected = capture(host.into_filter());
+            // Keep the original CLI construction as an independent oracle.
+            let original = EnvFilter::new(raw)
+                .add_directive("tokio=debug".parse().unwrap())
+                .add_directive(LevelFilter::WARN.into());
+            let expected = capture(original);
+            assert_eq!(capture(host.into_filter()), expected, "host: {raw}");
             assert!(
                 expected
                     .windows(b"Tokio override".len())
@@ -214,6 +229,68 @@ mod tests {
                 );
             }
             assert_eq!(capture(guest.into_filter()), expected, "{raw}");
+        }
+    }
+
+    // Run environment controls in child processes so these tests do not mutate
+    // the process-global environment while other libtest threads are active.
+    #[test]
+    fn default_environment_filter_subprocess() {
+        if std::env::var_os("HERMIT_BOOTSTRAP_FILTER_CHILD").is_none() {
+            return;
+        }
+        let host = EffectiveFilter::from_default_env(LevelFilter::WARN);
+        let encoded = encode(FINGERPRINT, &host).unwrap();
+        let original = EnvFilter::from_default_env()
+            .add_directive("tokio=debug".parse().unwrap())
+            .add_directive(LevelFilter::WARN.into());
+        let expected = capture(original);
+        assert!(
+            expected
+                .windows(b"Tokio override".len())
+                .any(|part| part == b"Tokio override")
+        );
+        assert_eq!(capture(host.into_filter()), expected);
+        assert_eq!(
+            capture(decode(&encoded, FINGERPRINT).unwrap().into_filter()),
+            expected
+        );
+    }
+
+    #[test]
+    fn environment_policy_matches_original_cli_for_missing_invalid_and_valid_values() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::process::Command;
+
+        for value in [
+            None,
+            Some(OsString::new()),
+            Some(OsString::from_vec(vec![0xff])),
+            Some(OsString::from(
+                "broken=bogus,bootstrap_fixture=trace,tokio=off",
+            )),
+            Some(OsString::from(
+                "off,bootstrap_fixture[work{task=1.0}]=trace",
+            )),
+        ] {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "--exact",
+                "liteinst_bootstrap::tests::default_environment_filter_subprocess",
+                "--nocapture",
+            ]);
+            child.env("HERMIT_BOOTSTRAP_FILTER_CHILD", "1");
+            child.env_remove(EnvFilter::DEFAULT_ENV);
+            if let Some(value) = &value {
+                child.env(EnvFilter::DEFAULT_ENV, value);
+            }
+            let output = child.output().unwrap();
+            assert!(output.status.success(), "{value:?}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "{value:?}: {output:?}"
+            );
         }
     }
 

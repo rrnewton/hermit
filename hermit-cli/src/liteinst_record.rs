@@ -44,11 +44,22 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 
+/// Provisional per-event payload budget, not derived from measured workloads.
+/// Measure complete INFO record sizes before selecting production limits or
+/// wiring this preparation into backend verification.
 pub const EVENT_BYTES: usize = 1024 * 1024;
+/// Provisional per-span payload budget, not derived from measured workloads.
+/// Each successfully formatted span retains the full reserved capacity until
+/// its cache is replaced or the span closes, even when its fields are short.
+/// Measure field sizes and live-span memory costs before production wiring.
 pub const SPAN_BYTES: usize = 64 * 1024;
 
 /// Formatter payload budgets, not a bound on callback allocations, registry or
 /// filter bookkeeping, allocator overhead, live spans or concurrent emitters.
+/// Each formatting call reserves its full event or span budget fallibly. Span
+/// caches retain that allocation, including unused capacity; an update briefly
+/// holds both the old cache and its replacement. An allocator may reserve more
+/// than requested, but only the configured payload limit may be written.
 #[derive(Clone, Copy, Debug)]
 pub struct FormatterLimits {
     event_bytes: usize,
@@ -124,6 +135,9 @@ impl std::error::Error for RecordFailure {
 /// lifecycle completeness. In particular, losing Registry's current-span TLS
 /// can omit context without setting this status. `None` cannot certify a
 /// complete log; the caller must establish those dependency lifetimes too.
+/// Sink calls already in flight may finish after another emitter fails. This
+/// status is not a publication barrier: quiesce all emitters before checking
+/// the final result, and refuse comparison if any failure was recorded.
 #[derive(Clone, Default)]
 pub struct RecordStatus(
     Arc<Mutex<Option<Arc<RecordFailure>>>>,
@@ -153,29 +167,39 @@ impl RecordStatus {
     }
 
     fn formatting(&self, action: impl FnOnce() -> fmt::Result) -> fmt::Result {
-        let attempt = Attempt(self);
+        let attempt = Attempt(Some(self));
         let result = action();
+        attempt.complete();
         if result.is_err() {
             self.fail(RecordFailure::Formatting);
         }
-        drop(attempt);
         result
     }
 }
 
-struct Attempt<'status>(&'status RecordStatus);
+struct Attempt<'status>(Option<&'status RecordStatus>);
+
+impl Attempt<'_> {
+    fn complete(mut self) {
+        // A successful callback may run from Drop during an unrelated panic.
+        // Only unwinding out of this callback is a formatter or sink failure.
+        self.0 = None;
+    }
+}
 
 impl Drop for Attempt<'_> {
     fn drop(&mut self) {
-        if std::thread::panicking() {
-            self.0.fail(RecordFailure::Unwinding);
+        if let Some(status) = self.0
+            && std::thread::panicking()
+        {
+            status.fail(RecordFailure::Unwinding);
         }
     }
 }
 
 struct BoundedBuffer<'status> {
-    bytes: Box<[u8]>,
-    used: usize,
+    bytes: Vec<u8>,
+    limit: usize,
     failed: bool,
     kind: BufferKind,
     status: &'status RecordStatus,
@@ -201,10 +225,9 @@ impl<'status> BoundedBuffer<'status> {
             status.fail(RecordFailure::Allocation);
             return Err(fmt::Error);
         }
-        bytes.resize(limit, 0);
         Ok(Self {
-            bytes: bytes.into_boxed_slice(),
-            used: 0,
+            bytes,
+            limit,
             failed: false,
             kind,
             status,
@@ -212,14 +235,11 @@ impl<'status> BoundedBuffer<'status> {
     }
 
     fn text(&self) -> &str {
-        std::str::from_utf8(&self.bytes[..self.used])
-            .expect("only complete UTF-8 strings were copied")
+        std::str::from_utf8(&self.bytes).expect("only complete UTF-8 strings were copied")
     }
 
     fn into_string(self) -> String {
-        let mut bytes = self.bytes.into_vec();
-        bytes.truncate(self.used);
-        String::from_utf8(bytes).expect("only complete UTF-8 strings were copied")
+        String::from_utf8(self.bytes).expect("only complete UTF-8 strings were copied")
     }
 }
 
@@ -228,17 +248,22 @@ impl fmt::Write for BoundedBuffer<'_> {
         if self.failed {
             return Err(fmt::Error);
         }
-        let end = self.used.checked_add(text.len());
-        let Some(end) = end.filter(|&end| end <= self.bytes.len()) else {
+        if self
+            .bytes
+            .len()
+            .checked_add(text.len())
+            .is_none_or(|end| end > self.limit)
+        {
             self.failed = true;
             self.status.fail(RecordFailure::Size {
                 buffer: self.kind,
-                limit: self.bytes.len(),
+                limit: self.limit,
             });
             return Err(fmt::Error);
-        };
-        self.bytes[self.used..end].copy_from_slice(text.as_bytes());
-        self.used = end;
+        }
+        // The full payload budget was reserved fallibly before formatting;
+        // appending within that limit cannot allocate or touch unused bytes.
+        self.bytes.extend_from_slice(text.as_bytes());
         Ok(())
     }
 }
@@ -427,8 +452,10 @@ impl<Sink: Fn(&[u8]) -> io::Result<()>> Write for RecordWriter<'_, Sink> {
 
     fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
         with_active(self.status, || {
-            let _attempt = Attempt(self.status);
-            match (self.sink)(bytes) {
+            let attempt = Attempt(Some(self.status));
+            let result = (self.sink)(bytes);
+            attempt.complete();
+            match result {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     self.status.fail(RecordFailure::Sink(error));
@@ -481,10 +508,19 @@ impl<'sink, Sink: Fn(&[u8]) -> io::Result<()> + 'sink> MakeWriter<'sink>
 /// Prepare without installing a subscriber or opening a destination.
 ///
 /// `filter` must already be resolved by the caller. Records use the standard
-/// Full format with timestamps, ANSI disabled, and normal ANSI sanitization.
+/// Full format with timestamps and generated ANSI disabled. Stock sanitizes
+/// the `message` field and error values; arbitrary named Debug fields preserve
+/// their original bytes, including escape sequences.
 /// Inspect the retained status after emitter quiescence, including teardown;
 /// absence of a local failure alone is not a complete-log or parity verdict.
 /// The callback is invoked once on the first local failure, after storing it.
+///
+/// The emitted byte stream is not self-describing on failure: it can be an
+/// incomplete prefix with no marker. A consumer feeding it to `detcore::logdiff`
+/// must ensure any failure refuses comparison, either through retained failure
+/// state or an in-band marker recognized by the comparator as truncation. The
+/// bytes alone cannot qualify a comparison. Transport wiring must enforce this
+/// before this preparation can be used for backend verification.
 pub fn record_subscriber_with_failure<Sink>(
     filter: EnvFilter,
     limits: FormatterLimits,

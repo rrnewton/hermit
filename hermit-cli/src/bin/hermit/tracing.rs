@@ -11,9 +11,9 @@ use std::io::IsTerminal;
 use std::io::Write;
 use std::io::stderr;
 
+use hermit::liteinst_bootstrap::EffectiveFilter;
 use tracing::Subscriber;
 use tracing::metadata::LevelFilter;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::util::SubscriberInitExt;
 
 const DEFAULT_TRACE_LEVEL: LevelFilter = LevelFilter::WARN;
@@ -155,9 +155,7 @@ fn file_subscriber<W: Write + Send + 'static>(
     level: LevelFilter,
     f: W,
 ) -> (impl Subscriber, impl Drop) {
-    let filter = EnvFilter::from_default_env()
-        .add_directive("tokio=debug".parse().expect("correct directive"))
-        .add_directive(level.into());
+    let filter = EffectiveFilter::from_default_env(level).into_filter();
 
     let (writer, guard) = tracing_appender::non_blocking(f);
 
@@ -195,9 +193,7 @@ fn sync_file_subscriber<W: Write + Send + 'static>(
     level: LevelFilter,
     f: W,
 ) -> (impl Subscriber, impl Drop) {
-    let filter = EnvFilter::from_default_env()
-        .add_directive("tokio=debug".parse().expect("correct directive"))
-        .add_directive(level.into());
+    let filter = EffectiveFilter::from_default_env(level).into_filter();
 
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -250,9 +246,7 @@ pub fn init_file_tracing<W: Write + Send + 'static>(level: Option<LevelFilter>, 
 pub fn stderr_subscriber(level: Option<LevelFilter>) -> impl Subscriber {
     let level = level.unwrap_or(DEFAULT_TRACE_LEVEL);
 
-    let filter = EnvFilter::from_default_env()
-        .add_directive("tokio=debug".parse().expect("correct directive"))
-        .add_directive(level.into());
+    let filter = EffectiveFilter::from_default_env(level).into_filter();
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         // NOT `io::stderr`: a guest can set O_NONBLOCK on the inherited fd 2,

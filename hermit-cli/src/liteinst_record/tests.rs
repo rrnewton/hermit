@@ -512,14 +512,18 @@ fn fixed_storage_rejects_before_copy_and_stays_poisoned() {
 
     let status = RecordStatus::default();
     let mut buffer = BoundedBuffer::new(3, BufferKind::Event, &status).unwrap();
-    assert_eq!(buffer.bytes.len(), 3);
+    assert_eq!(buffer.bytes.len(), 0);
+    assert_eq!(buffer.bytes.capacity(), 3);
+    let pointer = buffer.bytes.as_ptr();
     buffer.write_str("é").unwrap();
     assert_eq!(buffer.text(), "é");
     assert!(buffer.write_str("é").is_err());
     assert_eq!(buffer.text(), "é");
-    assert_eq!(buffer.bytes.len(), 3);
+    assert_eq!(buffer.bytes.len(), 2);
     assert!(buffer.write_str("x").is_err());
-    assert_eq!(buffer.bytes[2], 0);
+    assert_eq!(buffer.bytes, "é".as_bytes());
+    assert_eq!(buffer.bytes.capacity(), 3);
+    assert_eq!(buffer.bytes.as_ptr(), pointer);
     assert!(matches!(
         status.failure().as_deref(),
         Some(RecordFailure::Size {
@@ -1122,6 +1126,42 @@ fn compare_with_stock(filter_text: &str, emit: impl Fn()) -> Vec<Vec<u8>> {
 }
 
 #[test]
+fn complete_records_during_unrelated_outer_unwind_match_stock() {
+    struct EmitOnDrop;
+
+    impl Drop for EmitOnDrop {
+        fn drop(&mut self) {
+            tracing::info!(target: "host_record", "outer panic event");
+            let span = tracing::info_span!(target: "host_record", "during_drop", value = 1);
+            let _entered = span.enter();
+            span.record("value", 2);
+            tracing::info!(target: "host_record", "updated span event");
+        }
+    }
+
+    let records = compare_with_stock("info", || {
+        let panic = std::panic::catch_unwind(|| {
+            let _emit = EmitOnDrop;
+            panic!("unrelated outer panic");
+        });
+        assert_eq!(
+            panic.unwrap_err().downcast_ref::<&str>(),
+            Some(&"unrelated outer panic")
+        );
+        tracing::info!(target: "host_record", "after catch_unwind");
+    });
+    assert_eq!(
+        records,
+        [
+            b"unchanged-time  INFO host_record: outer panic event\n".to_vec(),
+            b"unchanged-time  INFO during_drop{value=1 value=2}: host_record: updated span event\n"
+                .to_vec(),
+            b"unchanged-time  INFO host_record: after catch_unwind\n".to_vec(),
+        ]
+    );
+}
+
+#[test]
 fn complete_bytes_match_stock_fields_spans_filter_and_sanitization() {
     let records = compare_with_stock("off,host_record=info", structured_events);
     assert_eq!(records.len(), 2);
@@ -1479,4 +1519,53 @@ fn teardown_control_reproduces_stock_formatter_tls_failure() {
             "{case}: only the original warmup record survives"
         );
     }
+}
+
+// These controls characterize unresolved dependency defects, not supported
+// logging cases. When the lifetime defects are fixed, require the complete
+// records here too; never relax the positive 142-byte teardown comparison.
+#[test]
+fn known_teardown_defects_abort_on_new_span_and_dynamic_filter() {
+    use std::os::unix::process::ExitStatusExt;
+
+    for (case, diagnostic) in [
+        (
+            "new-span",
+            "Thread count overflowed the configured max count.",
+        ),
+        (
+            "dynamic-filter",
+            "cannot access a Thread Local Storage value during or after destruction: AccessError",
+        ),
+    ] {
+        let (result, bytes) = teardown_subprocess(case);
+        assert_eq!(
+            result.status.signal(),
+            Some(libc::SIGABRT),
+            "{case}: expected the known dependency abort, not complete logging"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains(diagnostic), "{case}: {stderr}");
+        assert!(
+            stderr.contains("thread local panicked on drop, aborting"),
+            "{case}: {stderr}"
+        );
+        assert_eq!(
+            bytes, TEARDOWN_RECORD,
+            "{case}: the known defect preserves only the 71-byte warmup"
+        );
+    }
+}
+
+#[test]
+fn known_teardown_defect_loses_context_without_reporting_a_local_failure() {
+    let (result, bytes) = teardown_subprocess("contextual");
+    // The child also requires RecordStatus to remain clear. Exit success and
+    // a clear local status are insufficient: the entered context was lost.
+    assert!(result.status.success(), "{:?}", result.stderr);
+    assert!(result.stderr.is_empty(), "{:?}", result.stderr);
+    let missing_context = b" INFO host_record: retained value=11 answer=\"stable\"\n";
+    assert_eq!(bytes, [TEARDOWN_RECORD, missing_context].concat());
+    assert_eq!(bytes.len(), 124);
+    assert_ne!(bytes, TEARDOWN_RECORD.repeat(2));
 }
