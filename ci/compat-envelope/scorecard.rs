@@ -2661,12 +2661,30 @@ fn selected_partition(
 }
 
 fn tracked_current_summary(derived: &Derived) -> String {
+    let backend_population = derived
+        .population
+        .iter()
+        .filter(|id| !is_naked_native(id))
+        .count();
+    let backend_green = derived
+        .green
+        .iter()
+        .filter(|id| !is_naked_native(id))
+        .count();
+    let native_controls = derived
+        .population
+        .iter()
+        .filter(|id| is_naked_native(id))
+        .count();
+    let selected_native_controls = derived
+        .selected
+        .iter()
+        .filter(|id| is_naked_native(id))
+        .count();
     format!(
-        "compatibility scorecard: tracked table and {} comparable cells are current; selected regression denominator {} = {} comparable + {} custom",
-        derived.population.len(),
-        derived.selected.len(),
-        derived.green.len(),
-        derived.selected_custom.len()
+        "compatibility scorecard: tracked table and {backend_population} Hermit-backend comparable cells are current; selected Hermit-backend regression denominator {} = {backend_green} comparable + {} custom; {native_controls} native control rows tracked separately ({selected_native_controls} selected)",
+        backend_green + derived.selected_custom.len(),
+        derived.selected_custom.len(),
     )
 }
 
@@ -2676,12 +2694,18 @@ fn read_json<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T, String> {
 }
 
 fn render_scorecard(derived: &Derived) -> String {
+    let native_controls = derived
+        .population
+        .iter()
+        .filter(|id| is_naked_native(id))
+        .collect::<Vec<_>>();
     let mut backends: BTreeSet<&str> = derived
         .population
         .iter()
+        .filter(|id| !is_naked_native(id))
         .map(|id| id.backend.as_str())
         .collect();
-    let preferred = ["ptrace", "dbt", "kvm", "sabre", "liteinst", "native"];
+    let preferred = ["ptrace", "dbt", "kvm", "sabre", "liteinst"];
     let mut ordered = Vec::new();
     for backend in preferred {
         if backends.remove(backend) {
@@ -2697,10 +2721,18 @@ fn render_scorecard(derived: &Derived) -> String {
     let na_total = derived
         .population
         .iter()
-        .filter(|id| !derived.enabled.contains(*id))
+        .filter(|id| !is_naked_native(id) && !derived.enabled.contains(*id))
         .count();
-    let status_green_total = derived.green.len();
-    let status_red_total = derived.enabled.difference(&derived.green).count();
+    let status_green_total = derived
+        .green
+        .iter()
+        .filter(|id| !is_naked_native(id))
+        .count();
+    let status_red_total = derived
+        .enabled
+        .difference(&derived.green)
+        .filter(|id| !is_naked_native(id))
+        .count();
 
     let mut out = format!(
         "# Compatibility scorecard\n\n\
@@ -2729,12 +2761,12 @@ this regression plan. These same-backend results do not establish cross-backend 
         let backend_total = derived
             .population
             .iter()
-            .filter(|id| id.backend == *backend)
+            .filter(|id| !is_naked_native(id) && id.backend == *backend)
             .count();
         let backend_green = derived
             .green
             .iter()
-            .filter(|id| id.backend == *backend)
+            .filter(|id| !is_naked_native(id) && id.backend == *backend)
             .count();
         // NOT APPLICABLE IS SUBTRACTED FROM RED, NOT ADDED TO THE TOTAL. The
         // population is unchanged; what changes is that a cell whose backend is
@@ -2742,7 +2774,11 @@ this regression plan. These same-backend results do not establish cross-backend 
         let backend_na = derived
             .population
             .iter()
-            .filter(|id| id.backend == *backend && !derived.enabled.contains(*id))
+            .filter(|id| {
+                !is_naked_native(id)
+                    && id.backend == *backend
+                    && !derived.enabled.contains(*id)
+            })
             .count();
         green_total += backend_green;
         total += backend_total;
@@ -2779,6 +2815,7 @@ this regression plan. These same-backend results do not establish cross-backend 
     let modes: BTreeSet<&str> = derived
         .population
         .iter()
+        .filter(|id| !is_naked_native(id))
         .map(|id| id.mode.as_str())
         .collect();
     out.push_str(&format!(
@@ -2831,24 +2868,32 @@ statuses as the table above.\n\n| Mode",
         out.push_str(" | ---:");
     }
     out.push_str(" | ---: | ---: | ---: | ---: |\n");
-    for mode in ["verify", "replay", "chaos", "naked"] {
+    for mode in ["verify", "replay", "chaos"] {
         let mode_total = derived
             .population
             .iter()
-            .filter(|id| id.mode == mode)
+            .filter(|id| !is_naked_native(id) && id.mode == mode)
             .count();
-        let mode_green = derived.green.iter().filter(|id| id.mode == mode).count();
+        let mode_green = derived
+            .green
+            .iter()
+            .filter(|id| !is_naked_native(id) && id.mode == mode)
+            .count();
         let mode_na = derived
             .population
             .iter()
-            .filter(|id| id.mode == mode && !derived.enabled.contains(*id))
+            .filter(|id| {
+                !is_naked_native(id) && id.mode == mode && !derived.enabled.contains(*id)
+            })
             .count();
         out.push_str(&format!("| `{mode}`"));
         for backend in &ordered {
             let cell_total = derived
                 .population
                 .iter()
-                .filter(|id| id.mode == mode && id.backend == *backend)
+                .filter(|id| {
+                    !is_naked_native(id) && id.mode == mode && id.backend == *backend
+                })
                 .count();
             if cell_total == 0 {
                 out.push_str(" | —");
@@ -2856,7 +2901,9 @@ statuses as the table above.\n\n| Mode",
                 let cell_green = derived
                     .green
                     .iter()
-                    .filter(|id| id.mode == mode && id.backend == *backend)
+                    .filter(|id| {
+                        !is_naked_native(id) && id.mode == mode && id.backend == *backend
+                    })
                     .count();
                 out.push_str(&format!(" | {cell_green} / {cell_total}"));
             }
@@ -2866,10 +2913,45 @@ statuses as the table above.\n\n| Mode",
             mode_total - mode_green - mode_na
         ));
     }
+    out.push_str("| **Total**");
+    for _ in &ordered {
+        out.push_str(" |");
+    }
     out.push_str(&format!(
-        "| **Total** | | | | | | | **{green_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
+        " | **{green_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
         total - green_total - na_total
     ));
+    out.push_str(
+        "## Native controls\n\n\
+Native naked execution is retained as a separate control and is not a Hermit backend. Every \
+control remains visible below, but none contributes to the backend denominator, Green/Red/Not \
+applicable totals, mode totals, or the Status and measurement cross-tab. Canonical \
+`stress-series/v4` retains its ordered attempt and diversity evidence.\n\n\
+| Lane | Category | Test | Mode | Backend | Status |\n\
+| --- | --- | --- | --- | --- | --- |\n",
+    );
+    for id in native_controls.iter().copied() {
+        let status = if !derived.enabled.contains(id) {
+            CellStatus::NotApplicable
+        } else if derived.green.contains(id) {
+            CellStatus::Green
+        } else {
+            CellStatus::Red
+        };
+        out.push_str(&format!(
+            "| `{}` | `{}` | `{}` | `{}` | `{}` | `{}` |\n",
+            id.lane,
+            id.category,
+            id.test,
+            id.mode,
+            id.backend,
+            status.as_str()
+        ));
+    }
+    if native_controls.is_empty() {
+        out.push_str("| _none_ | — | — | — | — | — |\n");
+    }
+    out.push('\n');
     out.push_str(
         "## Cross-backend parity\n\n\
 The manifest-backed scorecard does not yet contain cross-backend parity cells. In particular, \
@@ -2918,15 +3000,20 @@ denominator.\n\n\
     let chaos = derived
         .selected
         .iter()
-        .filter(|id| id.mode == "chaos")
+        .filter(|id| !is_naked_native(id) && id.mode == "chaos")
         .count();
     let custom = derived.selected_custom.len();
+    let native_selected = derived
+        .selected
+        .iter()
+        .filter(|id| is_naked_native(id))
+        .count();
     out.push_str(&format!(
-        "Ordinary full validation executes {} selected regression cells: the {green_total} green \
-compatibility cells above (including {chaos} chaos-mode race-exposure checks), and {custom} \
-explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for \
-all of them; a failing green cell is a regression, not permission to move it to red.\n",
-        derived.selected.len()
+        "Ordinary full validation executes {green_total} selected Hermit-backend regression cells \
+(including {chaos} chaos-mode race-exposure checks), {native_selected} selected native controls, \
+and {custom} explicit custom commands outside the comparable denominator. A passing validate must \
+produce a fresh result for all of them; a failing green cell is a regression, not permission to \
+move it to red.\n"
     ));
     if !derived.selected_custom.is_empty() {
         out.push_str(
@@ -2965,9 +3052,18 @@ fn render_measurement_section(tracked: &TrackedCells) -> String {
         tracked
             .cells
             .iter()
-            .filter(|cell| cell.status == status && cell.measurement == measurement)
+            .filter(|cell| {
+                !is_naked_native(&cell.id)
+                    && cell.status == status
+                    && cell.measurement == measurement
+            })
             .count()
     };
+    let backend_cell_count = tracked
+        .cells
+        .iter()
+        .filter(|cell| !is_naked_native(&cell.id))
+        .count();
     // These current-state claims used to be fixed prose above the generated
     // table. An import changed one count to zero while leaving the prose saying
     // both combinations were present. Derive the claims through the table's
@@ -2998,10 +3094,10 @@ establish that it describes current code; `show` reports whether the recorded la
 matches `HEAD:detcore`.\n\n",
     );
     out.push_str(&format!(
-        "The cross-tab includes all **{}** tracked cells; no row is omitted. The current generated \
-data contains **{red_measured_and_passed_claim}**. These claims \
+        "The cross-tab includes all **{backend_cell_count}** tracked Hermit-backend cells; native \
+controls remain visible in their separate table above. The current generated data contains \
+**{red_measured_and_passed_claim}**. These claims \
 use the same counts printed in the table below.\n\n",
-        tracked.cells.len(),
     ));
     out.push_str(
         "| Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |\n\
@@ -3015,7 +3111,7 @@ use the same counts printed in the table below.\n\n",
         let status_total = tracked
             .cells
             .iter()
-            .filter(|cell| cell.status == status)
+            .filter(|cell| !is_naked_native(&cell.id) && cell.status == status)
             .count();
         out.push_str(&format!(" | {status_total} |\n"));
     }
@@ -3024,11 +3120,13 @@ use the same counts printed in the table below.\n\n",
         let measurement_total = tracked
             .cells
             .iter()
-            .filter(|cell| cell.measurement == measurement)
+            .filter(|cell| {
+                !is_naked_native(&cell.id) && cell.measurement == measurement
+            })
             .count();
         out.push_str(&format!(" | **{measurement_total}**"));
     }
-    out.push_str(&format!(" | **{}** |\n\n", tracked.cells.len()));
+    out.push_str(&format!(" | **{backend_cell_count}** |\n\n"));
 
     out.push_str(
         "Cells whose stored `measurement` is not `never-measured` are shown individually so status \
@@ -3587,22 +3685,26 @@ fn update_tracked(
     let not_applicable = derived
         .population
         .iter()
-        .filter(|id| !derived.enabled.contains(*id))
+        .filter(|id| !is_naked_native(id) && !derived.enabled.contains(*id))
         .count();
+    let backend_cells = cells
+        .cells
+        .iter()
+        .filter(|cell| !is_naked_native(&cell.id))
+        .collect::<Vec<_>>();
     println!(
-        "compatibility scorecard: wrote {} green / {} red / {} not-applicable / {} total",
-        cells
-            .cells
+        "compatibility scorecard: wrote {} Hermit-backend green / {} red / {} not-applicable / {} total; {} native controls tracked separately",
+        backend_cells
             .iter()
             .filter(|cell| cell.status == CellStatus::Green)
             .count(),
-        cells
-            .cells
+        backend_cells
             .iter()
             .filter(|cell| cell.status == CellStatus::Red)
             .count(),
         not_applicable,
-        derived.population.len()
+        backend_cells.len(),
+        cells.cells.len() - backend_cells.len()
     );
     Ok(())
 }
@@ -3707,6 +3809,7 @@ fn observation_tree_counts(tracked: &TrackedCells, head_tree: &str) -> (usize, u
     tracked
         .cells
         .iter()
+        .filter(|cell| !is_naked_native(&cell.id))
         .flat_map(|cell| cell.observations.iter())
         .fold(
             (0, 0),
@@ -3723,14 +3826,22 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
         return Ok(String::new());
     };
     let head_tree = git_rev_parse(root, "HEAD:detcore").ok();
-    let total = tracked.cells.len();
+    let total = tracked
+        .cells
+        .iter()
+        .filter(|cell| !is_naked_native(&cell.id))
+        .count();
     let stamped = tracked
         .cells
         .iter()
-        .filter(|cell| cell.last_tested.is_some())
+        .filter(|cell| !is_naked_native(&cell.id) && cell.last_tested.is_some())
         .count();
     let (mut current, mut stale) = (0usize, 0usize);
-    for cell in &tracked.cells {
+    for cell in tracked
+        .cells
+        .iter()
+        .filter(|cell| !is_naked_native(&cell.id))
+    {
         let Some(last) = &cell.last_tested else {
             continue;
         };
@@ -3743,7 +3854,7 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
     let observed = tracked
         .cells
         .iter()
-        .filter(|cell| !cell.observations.is_empty())
+        .filter(|cell| !is_naked_native(&cell.id) && !cell.observations.is_empty())
         .count();
     let (different_observations, unknown_observations) = head_tree
         .as_deref()
@@ -3751,7 +3862,7 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
         .unwrap_or_default();
 
     let mut out = String::new();
-    out.push_str("\nRecorded evidence (not part of the green/red verdict)\n");
+    out.push_str("\nRecorded Hermit-backend evidence (not part of the green/red verdict)\n");
     out.push_str(&format!(
         "  cells with a recorded last test : {stamped} of {total}\n"
     ));
@@ -3786,7 +3897,11 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
     // "pressure says determinism-failure" means something different at N=1 and
     // at N=40.
     let mut conflicts = Vec::new();
-    for cell in &tracked.cells {
+    for cell in tracked
+        .cells
+        .iter()
+        .filter(|cell| !is_naked_native(&cell.id))
+    {
         let identities = cell
             .observations
             .iter()
@@ -4846,7 +4961,11 @@ fn import_results(
 
     let measurement_counts = |cells: &TrackedCells| {
         let mut counts = BTreeMap::new();
-        for cell in &cells.cells {
+        for cell in cells
+            .cells
+            .iter()
+            .filter(|cell| !is_naked_native(&cell.id))
+        {
             *counts.entry(cell.measurement.as_str()).or_insert(0usize) += 1;
         }
         counts
@@ -4856,6 +4975,7 @@ fn import_results(
     let changed = before
         .cells
         .iter()
+        .filter(|old| !is_naked_native(&old.id))
         .filter_map(|old| {
             let new = tracked.cells.iter().find(|cell| cell.id == old.id)?;
             (old.measurement != new.measurement).then_some((old, new))
@@ -4929,13 +5049,21 @@ fn import_results(
         );
     }
     println!(
-        "  population before: {} cells; measurement {:?}",
-        before.cells.len(),
+        "  Hermit-backend population before: {} cells; measurement {:?}",
+        before
+            .cells
+            .iter()
+            .filter(|cell| !is_naked_native(&cell.id))
+            .count(),
         before_counts
     );
     println!(
-        "  population after : {} cells; measurement {:?}",
-        tracked.cells.len(),
+        "  Hermit-backend population after : {} cells; measurement {:?}",
+        tracked
+            .cells
+            .iter()
+            .filter(|cell| !is_naked_native(&cell.id))
+            .count(),
         after_counts
     );
     for (old, new) in changed {
@@ -7512,17 +7640,24 @@ fn verify_results(root: &Path, result_root: &Path, lanes: &BTreeSet<String>) -> 
     }
     let green_checked = expected
         .iter()
-        .filter(|id| derived.green.contains(*id))
+        .filter(|id| !is_naked_native(id) && derived.green.contains(*id))
         .count();
-    let chaos_checked = expected.iter().filter(|id| id.mode == "chaos").count();
+    let chaos_checked = expected
+        .iter()
+        .filter(|id| !is_naked_native(id) && id.mode == "chaos")
+        .count();
     let custom_checked = expected.iter().filter(|id| id.mode == "custom").count();
+    let native_checked = expected
+        .iter()
+        .filter(|id| is_naked_native(id))
+        .count();
     println!();
     println!(
         "{}",
         fresh_result_summary(
-            expected.len(),
-            &head,
             green_checked,
+            native_checked,
+            &head,
             chaos_checked,
             custom_checked,
         )
@@ -7532,15 +7667,16 @@ fn verify_results(root: &Path, result_root: &Path, lanes: &BTreeSet<String>) -> 
 }
 
 fn fresh_result_summary(
-    selected: usize,
+    backend: usize,
+    native: usize,
     head: &str,
-    green: usize,
     chaos: usize,
     custom: usize,
 ) -> String {
     format!(
-        "Fresh result check: {selected}/{selected} selected cells passed at {head} \
-({green} compatibility green, including {chaos} chaos; {custom} custom outside the comparable denominator)."
+        "Fresh result check: {backend}/{backend} selected Hermit-backend cells, \
+{native}/{native} native controls, and {custom}/{custom} custom commands passed at {head} \
+({backend} compatibility green, including {chaos} chaos)."
     )
 }
 
@@ -8902,9 +9038,10 @@ fn self_test() -> Result<(), String> {
             ));
         }
     }
-    let summary = fresh_result_summary(172, "fixture-sha", 170, 2, 2);
-    let expected_summary = "Fresh result check: 172/172 selected cells passed at fixture-sha \
-(170 compatibility green, including 2 chaos; 2 custom outside the comparable denominator).";
+    let summary = fresh_result_summary(170, 1, "fixture-sha", 2, 2);
+    let expected_summary = "Fresh result check: 170/170 selected Hermit-backend cells, \
+1/1 native controls, and 2/2 custom commands passed at fixture-sha \
+(170 compatibility green, including 2 chaos).";
     if summary != expected_summary {
         return Err(format!(
             "fresh-result summary obscures overlapping compatibility/chaos counts: {summary}"
@@ -9377,9 +9514,58 @@ fn self_test() -> Result<(), String> {
         }
     }
     if tracked_current_summary(&selected_fixture)
-        != "compatibility scorecard: tracked table and 1 comparable cells are current; selected regression denominator 4 = 1 comparable + 3 custom"
+        != "compatibility scorecard: tracked table and 1 Hermit-backend comparable cells are current; selected Hermit-backend regression denominator 4 = 1 comparable + 3 custom; 0 native control rows tracked separately (0 selected)"
     {
         return Err("check summary did not expose the exact selected denominator".into());
+    }
+    let native_control = CellId {
+        lane: "portable".into(),
+        category: "fixture".into(),
+        test: "fixture/native-control".into(),
+        mode: "naked".into(),
+        backend: "native".into(),
+    };
+    let mut mixed_population = selected_fixture.population.clone();
+    mixed_population.insert(native_control.clone());
+    let mut mixed_enabled = selected_fixture.enabled.clone();
+    mixed_enabled.insert(native_control.clone());
+    let mut mixed_selected = selected_fixture.selected.clone();
+    mixed_selected.insert(native_control.clone());
+    let mut mixed_green = selected_fixture.green.clone();
+    mixed_green.insert(native_control.clone());
+    let mut mixed_fixture = Derived {
+        population: mixed_population,
+        enabled: mixed_enabled,
+        ci_disabled_reasons: BTreeMap::new(),
+        not_applicable_reasons: BTreeMap::new(),
+        selected: mixed_selected,
+        green: mixed_green,
+        selected_custom: selected_fixture.selected_custom.clone(),
+    };
+    let mixed_rendered = render_scorecard(&mixed_fixture);
+    let backend_section = rendered.split("## Native controls").next();
+    let mixed_backend_section = mixed_rendered.split("## Native controls").next();
+    if backend_section != mixed_backend_section
+        || mixed_backend_section.is_some_and(|section| section.contains("| `native` |"))
+        || !mixed_rendered.contains(
+            "| `portable` | `fixture` | `fixture/native-control` | `naked` | `native` | `green` |",
+        )
+        || tracked_current_summary(&mixed_fixture)
+            != "compatibility scorecard: tracked table and 1 Hermit-backend comparable cells are current; selected Hermit-backend regression denominator 4 = 1 comparable + 3 custom; 1 native control rows tracked separately (1 selected)"
+    {
+        return Err(
+            "native control changed a Hermit-backend aggregate or was not visible separately"
+                .into(),
+        );
+    }
+    mixed_fixture.green.remove(&native_control);
+    let mixed_red_rendered = render_scorecard(&mixed_fixture);
+    if mixed_red_rendered.split("## Native controls").next() != backend_section
+        || !mixed_red_rendered.contains(
+            "| `portable` | `fixture` | `fixture/native-control` | `naked` | `native` | `red` |",
+        )
+    {
+        return Err("native control status leaked into Hermit-backend status totals".into());
     }
     if selected_green(&BTreeSet::new(), &population).contains(&chaos_id) {
         return Err("an unselected chaos cell was accepted as green".into());
@@ -9437,8 +9623,26 @@ red/`measured-and-passed` count is **1**.";
     {
         return Err(
             "measurement prose did not use the same green/never-measured and red/measured-and-passed counts as its table"
-                .into(),
+            .into(),
         );
+    }
+    let mut native_measured = measured_red.cells[0].clone();
+    native_measured.id = native_control.clone();
+    native_measured.status = CellStatus::Green;
+    native_measured.measurement = MeasurementState::Diverged;
+    let mixed_measurement_section = render_measurement_section(&TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: vec![measured_red.cells[0].clone(), native_measured],
+    });
+    if mixed_measurement_section
+        .split("Cells whose stored `measurement`")
+        .next()
+        != measured_section
+            .split("Cells whose stored `measurement`")
+            .next()
+    {
+        return Err("native control changed the Hermit-backend status/measurement rollup".into());
     }
     let measured_row = format!(
         "| `{}` | `{}` | `{}` | `red` | `measured-and-passed` |",

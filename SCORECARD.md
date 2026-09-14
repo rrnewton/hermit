@@ -2,7 +2,7 @@
 
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. `./ci/compat-envelope/scorecard.rs check` verifies it.
 
-**Green** means this manifest cell is selected by full in `ci/expected-e2e-plan.json`; ordinary validation therefore requires it to pass. **Red** means the cell is in the manifest but is not selected by full. **Red does not mean failed:** a red cell may have passed, failed, produced no verdict, or never run. Manifest-disabled combinations are **Not applicable**; they are neither red nor omitted. The current generated data counts Green as **730** and Red as **177**. The generator classifies the current **4853** manifest-disabled combinations as **Not applicable**.
+**Green** means this manifest cell is selected by full in `ci/expected-e2e-plan.json`; ordinary validation therefore requires it to pass. **Red** means the cell is in the manifest but is not selected by full. **Red does not mean failed:** a red cell may have passed, failed, produced no verdict, or never run. Manifest-disabled combinations are **Not applicable**; they are neither red nor omitted. The current generated data counts Green as **730** and Red as **144**. The generator classifies the current **4526** manifest-disabled combinations as **Not applicable**.
 
 Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and accepts a result only when the typed report says `verified=true`, `verdict=matched`, `bitwise_parity=true`, `strictness=canonical`, `compare_logs=true`, a named canonical `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped comparison when invoked directly and does not satisfy this regression plan. These same-backend results do not establish cross-backend parity.
 
@@ -13,17 +13,16 @@ Every selected `verify` cell, and every seed in a selected `chaos` cell, runs th
 | `kvm` | 243 | 8 | 829 | 1080 |
 | `sabre` | 112 | 32 | 936 | 1080 |
 | `liteinst` | 28 | 25 | 1027 | 1080 |
-| `native` | 0 | 33 | 327 | 360 |
-| **Total** | **730** | **177** | **4853** | **5760** |
+| **Total** | **730** | **144** | **4526** | **5400** |
 
 ## Denominator, and why the percentage is not comparable across changes to it
 
-Green is **730 of 5760**, which is **12.67%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
+Green is **730 of 5400**, which is **13.52%** — over THIS population and no other. The population is every combination the manifest declares, and it is composed of:
 
-- backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`, `native`
-- modes: `chaos`, `naked`, `replay`, `verify`
+- backends: `ptrace`, `dbt`, `kvm`, `sabre`, `liteinst`
+- modes: `chaos`, `replay`, `verify`
 
-⚠️ **4853 of those 5760 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 907 cells that CAN run, green is **80.49%**.
+⚠️ **4526 of those 5400 cells are NOT APPLICABLE** — their backend is not enabled for their mode, so they were never asked to run and cannot pass or fail. Over the 874 cells that CAN run, green is **83.52%**.
 
 ⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same 730 green cells measured against a smaller denominator. Nothing was fixed to produce it; it is what the first figure always meant once the cells that cannot run are excluded. Quote both or neither, and never compare one against the other as though something moved.
 
@@ -31,13 +30,379 @@ Green is **730 of 5760**, which is **12.67%** — over THIS population and no ot
 
 The mode view makes the current order of work explicit: expand `verify` first, then `replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does not exist for that backend. The summary columns use the same Green, Red, and Not applicable statuses as the table above.
 
-| Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | `native` | Green | Red | Not applicable | Total |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `verify` | 341 / 360 | 0 / 360 | 243 / 360 | 112 / 360 | 28 / 360 | — | 724 | 142 | 934 | 1800 |
-| `replay` | 1 / 360 | 0 / 360 | 0 / 360 | 0 / 360 | 0 / 360 | — | 1 | 0 | 1799 | 1800 |
-| `chaos` | 5 / 360 | 0 / 360 | 0 / 360 | 0 / 360 | 0 / 360 | — | 5 | 2 | 1793 | 1800 |
-| `naked` | — | — | — | — | — | 0 / 360 | 0 | 33 | 327 | 360 |
-| **Total** | | | | | | | **730** | **177** | **4853** | **5760** |
+| Mode | `ptrace` | `dbt` | `kvm` | `sabre` | `liteinst` | Green | Red | Not applicable | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `verify` | 341 / 360 | 0 / 360 | 243 / 360 | 112 / 360 | 28 / 360 | 724 | 142 | 934 | 1800 |
+| `replay` | 1 / 360 | 0 / 360 | 0 / 360 | 0 / 360 | 0 / 360 | 1 | 0 | 1799 | 1800 |
+| `chaos` | 5 / 360 | 0 / 360 | 0 / 360 | 0 / 360 | 0 / 360 | 5 | 2 | 1793 | 1800 |
+| **Total** | | | | | | **730** | **144** | **4526** | **5400** |
+
+## Native controls
+
+Native naked execution is retained as a separate control and is not a Hermit backend. Every control remains visible below, but none contributes to the backend denominator, Green/Red/Not applicable totals, mode totals, or the Status and measurement cross-tab. Canonical `stress-series/v4` retains its ordered attempt and diversity evidence.
+
+| Lane | Category | Test | Mode | Backend | Status |
+| --- | --- | --- | --- | --- | --- |
+| `portable` | `applications` | `applications/c-toolchain-workflow` | `naked` | `native` | `not-applicable` |
+| `portable` | `applications` | `applications/example-timed-progress-bar` | `naked` | `native` | `not-applicable` |
+| `portable` | `applications` | `applications/git-repository-workflow` | `naked` | `native` | `not-applicable` |
+| `portable` | `applications` | `applications/timed-progress-bar` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/aio-refusal` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/append-pwrite` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/bind-getsockname` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/cachestat-refusal` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/child-subreaper-refusal` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/close-range-fds` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/copy-file-range-refusal` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/cpu-virtualization` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/cwd-roundtrip` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/dup-shared-offset` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/environment-and-workdir` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/epoll-pwait2` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/epoll-readiness` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/event-delivery-ordering` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/eventfd-semantics` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/faccessat2-flags` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/fadvise-hints` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/fallocate-extents` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/fchmod-bits` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/fchmodat2-flags` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/fcntl-owner` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/fd-duplication` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/file-backed-mmap` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/file-io-roundtrip` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/flock-lifecycle` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/fork-exec-pipeline` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/fsync-durability` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/ftruncate-sparse` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/getcpu-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/getpriority-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/getrusage-self-accounting` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/hardware-trap-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/host-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/inline-syscall-sites` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/inotify-watch` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/ioctl-fionread` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/kcmp-refusal` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/linkat-flags` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/lseek-positioning` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/mce-kill-refusal` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/membarrier-query` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/memfd-create` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/mempolicy-default` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/mincore-residency` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/mixed-inline-and-libc-syscalls` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/mkdir-rmdir` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/mknod-special` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/mmap-layout-pointer-order` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/msync-writeback` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/name-to-handle-refusal` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/no-new-privs-refusal` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/numa-node-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/o-tmpfile-anon` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/openat-flags` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/openat2-refusal` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/path-file-ops` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/personality-domain` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/pid-probe` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/pidfd-open-self` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/pipe-capacity` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/pipe-capacity-pin` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/pipe-ipc` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/pipe-multiwriter-ordering` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/pipe2-flags` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/poll-readiness` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/prctl-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/prctl-pdeathsig` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/preadv2-flags` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/pthread-lifecycle` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/readdir-entries` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/readdir-order-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/record-lock` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/rename-ops` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/renameat2-flags` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/rlimit-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/robust-list` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/sched-getaffinity-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/seccomp-refusal` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/sendfile-copy` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/set-tid-address` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/short-io-split-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/shutdown-socketpair` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/signal-delivery-sequence` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/signal-waitstatus-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/signalfd-create` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/socket-epoll-ordering` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/socket-options` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/socketpair-flags` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/sockname-unnamed` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/stat-metadata-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/statfs-free-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/static-nolibc-syscall-sites` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/statx-metadata` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/symlink-ops` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/sync-file-range` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/sysv-ipc-refusal` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/thp-disable` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/timer-family-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/umask-mode` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/uname-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/utimensat-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/vectored-file-io` | `naked` | `native` | `not-applicable` |
+| `portable` | `backend-parity-c` | `backend-parity-c/vectored-io` | `naked` | `native` | `not-applicable` |
+| `portable` | `bin-c` | `bin-c/posix-timer-test` | `naked` | `native` | `not-applicable` |
+| `portable` | `bin-c` | `bin-c/robust-futex-test` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/acct-refusal-probe` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/add-key-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/adjtimex-deterministic` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/arch-prctl-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/bpf-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/cachestat-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/clock-adjtime-deterministic` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/clone` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/copy-file-range-refusal-probe` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/dbt-copied-tiocgpgrp` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/dbt-exec-failure` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/dbt-execveat-unsupported` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/dbt-mmap-exec` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/dbt-pid-virtualization` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/dbt-prlimit-self` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/dbt-self-sigqueue` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/dbt-unsupported-syscall` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/dbt-wait-lifecycle` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/epoll-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/fp-reduction-nondeterminism` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/futex-requeue-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/futex-waitv-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/futex-wake-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/get-robust-list-child` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/get-robust-list-self` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/get-robust-list-thread` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/getcpu` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/getitimer-determinism-probe` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/getsockopt-null` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/hello-alarm` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/hello-nostdlib` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/hello-signals` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/io-uring-fallback` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/io-uring-ring-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/ioctl-fioclex` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/ioctl-siocethtool` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/ipc-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/just-spin` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/kcmp-eperm` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/keyctl-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/keyctl-passthrough` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/listmount-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/liteinst-advanced` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/lsm-get-self-attr-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/lsm-list-modules-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/lsm-set-self-attr-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/madvise-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/map-shadow-stack-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/memfd-secret-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/meminfo-available-deterministic` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/meminfo-cached-deterministic` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/meminfo-free-deterministic` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/memorypress` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/mmap-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/mmap-stress-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/name-to-handle-at-eopnotsupp` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/name-to-handle-directory-eopnotsupp` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/name-to-handle-empty-path-eopnotsupp` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/name-to-handle-regular-eopnotsupp` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/nanosleep-par` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/nanosleep-threads-nocrash` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/nanosleep-threads-simple` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/netlink-autobind-generic` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/netlink-autobind-route` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/netlink-autobind-usersock` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/netns-cookie-tcp4` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/netns-cookie-tcp6` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/netns-cookie-udp4` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/pause-alarm-interrupt` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/perf-event-hardware-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/perf-event-open-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/perf-event-software-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/perf-event-watchpoint-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/periodic-setitimer-delivery` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/pidfd-open-self` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/pidfd-poll-self` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/pidfd-waitid-child` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/pipe2-errno-precedence` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/ppoll-readv` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/ppoll-simulation` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/prctl-dumpable` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/prctl-option-policy` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/pread64-nostdlib` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/print-memaddrs` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/printf-with-threads` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/proc-fd-link-aliases` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/proc-fdinfo` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/proc-locks` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/process-mrelease-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/process-vm-readv-refusal-probe` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/process-vm-writev-refusal-probe` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/procfs-identity-agreement` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/procfs-positioned-probe` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/prodcons-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/pselect6-simulation` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/ptrace-attach-eperm` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/ptrace-eperm` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/ptrace-seize-eperm` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/ptrace-traceme-eperm` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/pty-nr-count` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/racewrite-nostdlib` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/random-sources` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/rcx-canonicalization` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/record-replay-fd-close` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/record-replay-file-state` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/record-replay-file-state-regular-sink` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/record-replay-lseek-seek-cur` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/record-replay-setsockopt` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/recvmsg-scm-rights-mmap` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/remap-file-pages-anonymous-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/remap-file-pages-memfd-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/remap-file-pages-tmpfile-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/request-key-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/resource-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/sched-setattr-batch` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/sched-setattr-idle` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/sched-setattr-other` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/sched-yield-progress` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/scheduler-policy-queries` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/session-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/setitimer-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/sigmask-preemption` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/signal-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/sigpipe-siginfo` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/sigtimedwait-no-timeout` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/sigtimedwait-timeout-0s` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/sigtimedwait-timeout-1s` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/so-incoming-cpu-tcp4` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/so-incoming-cpu-tcp6` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/so-incoming-cpu-udp4` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/socket-cookie-tcp` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/socket-cookie-udp` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/socket-cookie-unix` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/socket-ioctl-timestamp` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/socket-timestamp-edge-cases` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/socket-timestamp-timespec` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/socket-timestamp-timeval` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/splice-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/statmount-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/syscall-file-io` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/syscall-file-metadata` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/syscall-quick-wins` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/sysfs-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/sysinfo` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/sysinfo-uptime` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/syslog-deterministic` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/sysv-sem-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/sysv-shm-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/tcp-info-accept4` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/tcp-info-accept6` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/tcp-info-client4` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/tee-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/thread-self-procfs-handoff` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/thread-sync-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/threadexhaustion` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/timer-create-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/uname` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/unix-autobind-dgram` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/unix-autobind-seqpacket` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/unix-autobind-stream` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/ustat-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/vforkexec` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/vmsplice-enosys` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/wait-on-child` | `naked` | `native` | `not-applicable` |
+| `portable` | `c-programs` | `c-programs/writev-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `chaos-c` | `chaos-c/lock-granularity` | `naked` | `native` | `not-applicable` |
+| `portable` | `data-handling` | `data-handling/archive-roundtrip` | `naked` | `native` | `not-applicable` |
+| `portable` | `data-handling` | `data-handling/dd-partial-transfers` | `naked` | `native` | `not-applicable` |
+| `portable` | `data-handling` | `data-handling/jq-json-transform` | `naked` | `native` | `red` |
+| `portable` | `data-handling` | `data-handling/shell-pipeline` | `naked` | `native` | `not-applicable` |
+| `portable` | `data-handling` | `data-handling/sqlite-query-determinism` | `naked` | `native` | `red` |
+| `portable` | `data-handling` | `data-handling/zstd-multithread` | `naked` | `native` | `not-applicable` |
+| `portable` | `debugger-c` | `debugger-c/debuggee` | `naked` | `native` | `not-applicable` |
+| `portable` | `determinism-stress` | `determinism-stress/example-race` | `naked` | `native` | `not-applicable` |
+| `portable` | `determinism-stress` | `determinism-stress/order-violation` | `naked` | `native` | `not-applicable` |
+| `portable` | `determinism-stress` | `determinism-stress/process-chains` | `naked` | `native` | `not-applicable` |
+| `portable` | `determinism-stress` | `determinism-stress/thread-contention` | `naked` | `native` | `red` |
+| `portable` | `determinism-stress` | `determinism-stress/thread-interleaving` | `naked` | `native` | `not-applicable` |
+| `portable` | `determinism-stress` | `determinism-stress/thread-output` | `naked` | `native` | `not-applicable` |
+| `portable` | `determinism-stress-c` | `determinism-stress-c/fork-tree` | `naked` | `native` | `not-applicable` |
+| `portable` | `determinism-stress-c` | `determinism-stress-c/lock-free` | `naked` | `native` | `not-applicable` |
+| `portable` | `determinism-stress-c` | `determinism-stress-c/mmap-fork-shared` | `naked` | `native` | `not-applicable` |
+| `portable` | `determinism-stress-c` | `determinism-stress-c/pid-tid` | `naked` | `native` | `not-applicable` |
+| `portable` | `determinism-stress-c` | `determinism-stress-c/pid-tid-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `determinism-stress-c` | `determinism-stress-c/pipe-chain` | `naked` | `native` | `not-applicable` |
+| `portable` | `determinism-stress-c` | `determinism-stress-c/pipe-prefill` | `naked` | `native` | `not-applicable` |
+| `portable` | `determinism-stress-c` | `determinism-stress-c/producer-consumer` | `naked` | `native` | `red` |
+| `portable` | `determinism-stress-c` | `determinism-stress-c/signal-order` | `naked` | `native` | `not-applicable` |
+| `portable` | `determinism-stress-c` | `determinism-stress-c/thread-contention` | `naked` | `native` | `not-applicable` |
+| `portable` | `determinism-stress-c` | `determinism-stress-c/thread-stress` | `naked` | `native` | `not-applicable` |
+| `portable` | `language-runtimes` | `language-runtimes/bash-loop-pipe-time` | `naked` | `native` | `not-applicable` |
+| `portable` | `language-runtimes` | `language-runtimes/bash-random` | `naked` | `native` | `red` |
+| `portable` | `language-runtimes` | `language-runtimes/cpp-stl-determinism` | `naked` | `native` | `red` |
+| `portable` | `language-runtimes` | `language-runtimes/example-python-random` | `naked` | `native` | `not-applicable` |
+| `portable` | `language-runtimes` | `language-runtimes/gawk-random` | `naked` | `native` | `red` |
+| `portable` | `language-runtimes` | `language-runtimes/lua-random` | `naked` | `native` | `red` |
+| `portable` | `language-runtimes` | `language-runtimes/m4-macro-mkstemp` | `naked` | `native` | `red` |
+| `portable` | `language-runtimes` | `language-runtimes/node-v8-jit` | `naked` | `native` | `red` |
+| `portable` | `language-runtimes` | `language-runtimes/perl-hash-order` | `naked` | `native` | `red` |
+| `portable` | `language-runtimes` | `language-runtimes/perl-io-subprocess-time` | `naked` | `native` | `not-applicable` |
+| `portable` | `language-runtimes` | `language-runtimes/perl-random` | `naked` | `native` | `red` |
+| `portable` | `language-runtimes` | `language-runtimes/python-dict-hash-iteration` | `naked` | `native` | `not-applicable` |
+| `portable` | `language-runtimes` | `language-runtimes/python-hash-determinism` | `naked` | `native` | `red` |
+| `portable` | `language-runtimes` | `language-runtimes/python-hashseed` | `naked` | `native` | `red` |
+| `portable` | `language-runtimes` | `language-runtimes/python-io-subprocess-time` | `naked` | `native` | `not-applicable` |
+| `portable` | `language-runtimes` | `language-runtimes/python-random` | `naked` | `native` | `red` |
+| `portable` | `language-runtimes` | `language-runtimes/ruby-random` | `naked` | `native` | `red` |
+| `portable` | `language-runtimes` | `language-runtimes/rust-hashmap-iteration` | `naked` | `native` | `red` |
+| `portable` | `language-runtimes` | `language-runtimes/tcl-rand-clock` | `naked` | `native` | `red` |
+| `portable` | `shared-futex-c` | `shared-futex-c/qemu-exec-init` | `naked` | `native` | `not-applicable` |
+| `portable` | `shared-futex-c` | `shared-futex-c/qemu-hello` | `naked` | `native` | `not-applicable` |
+| `portable` | `shared-futex-c` | `shared-futex-c/qemu-init` | `naked` | `native` | `not-applicable` |
+| `portable` | `shared-futex-c` | `shared-futex-c/qemu-net-init` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/auxv-loader-dump` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/clock-determinism` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/clock-exec-continuity` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/date-nanoseconds` | `naked` | `native` | `red` |
+| `portable` | `system-utils` | `system-utils/du-tree-summary` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/errno-path-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/example-date` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/example-devrand` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/file-timestamp-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/find-tree-metadata` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/harness-width-contract` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/mcookie-random` | `naked` | `native` | `red` |
+| `portable` | `system-utils` | `system-utils/mktemp-name` | `naked` | `native` | `red` |
+| `portable` | `system-utils` | `system-utils/nscd-neutralised` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/openssl-enc` | `naked` | `native` | `red` |
+| `portable` | `system-utils` | `system-utils/openssl-genpkey` | `naked` | `native` | `red` |
+| `portable` | `system-utils` | `system-utils/openssl-passwd` | `naked` | `native` | `red` |
+| `portable` | `system-utils` | `system-utils/openssl-rand` | `naked` | `native` | `red` |
+| `portable` | `system-utils` | `system-utils/openssl-x509` | `naked` | `native` | `red` |
+| `portable` | `system-utils` | `system-utils/overflow-gid-resolves` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/proc-random-uuid` | `naked` | `native` | `red` |
+| `portable` | `system-utils` | `system-utils/proc-uptime` | `naked` | `native` | `red` |
+| `portable` | `system-utils` | `system-utils/procfs-sanitized-paths` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/ps-proc-table` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/random-device` | `naked` | `native` | `red` |
+| `portable` | `system-utils` | `system-utils/record-getpid` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/shm-coherency-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/shuf-permutation` | `naked` | `native` | `red` |
+| `portable` | `system-utils` | `system-utils/sort-random` | `naked` | `native` | `red` |
+| `portable` | `system-utils` | `system-utils/ssh-keygen-ed25519` | `naked` | `native` | `red` |
+| `portable` | `system-utils` | `system-utils/startup-surface-identity` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/startup-tls-guards` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/sysfs-sanitized-prefixes` | `naked` | `native` | `not-applicable` |
+| `portable` | `system-utils` | `system-utils/uuidgen-random` | `naked` | `native` | `red` |
+| `portable` | `util-c` | `util-c/pmu-skid` | `naked` | `native` | `not-applicable` |
+| `privileged` | `applications` | `applications/kvm-python-examples` | `naked` | `native` | `not-applicable` |
+| `privileged` | `applications` | `applications/kvm-shell-environment` | `naked` | `native` | `not-applicable` |
+| `privileged` | `backend-parity-c` | `backend-parity-c/cpuid-probe` | `naked` | `native` | `not-applicable` |
 
 ## Cross-backend parity
 
@@ -63,7 +428,7 @@ This view uses the same Basic Sanity Milestone 1 contracts as the tables above, 
 | `system-utils` | 33 / 34 | 1 / 34 | 0 / 34 | 34 | 102 |
 | `util-c` | 0 / 1 | 0 / 1 | 0 / 1 | 0 | 3 |
 
-Ordinary full validation executes 733 selected regression cells: the 730 green compatibility cells above (including 5 chaos-mode race-exposure checks), and 3 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
+Ordinary full validation executes 730 selected Hermit-backend regression cells (including 5 chaos-mode race-exposure checks), 0 selected native controls, and 3 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for all of them; a failing green cell is a regression, not permission to move it to red.
 
 ### Selected custom commands outside the comparable denominator
 
@@ -83,14 +448,14 @@ The current green/`never-measured` count is **15**, and the current red/`measure
 
 Retained history that has not been imported is not counted here. A stored measurement does not establish that it describes current code; `show` reports whether the recorded last test still matches `HEAD:detcore`.
 
-The cross-tab includes all **5760** tracked cells; no row is omitted. The current generated data contains **93 Red cells that are `measured-and-passed`**. These claims use the same counts printed in the table below.
+The cross-tab includes all **5400** tracked Hermit-backend cells; native controls remain visible in their separate table above. The current generated data contains **93 Red cells that are `measured-and-passed`**. These claims use the same counts printed in the table below.
 
 | Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `green` | 15 | 695 | 0 | 6 | 14 | 730 |
-| `red` | 48 | 93 | 8 | 0 | 28 | 177 |
-| `not-applicable` | 4852 | 0 | 0 | 0 | 1 | 4853 |
-| **Total** | **4915** | **788** | **8** | **6** | **43** | **5760** |
+| `red` | 15 | 93 | 8 | 0 | 28 | 144 |
+| `not-applicable` | 4525 | 0 | 0 | 0 | 1 | 4526 |
+| **Total** | **4555** | **788** | **8** | **6** | **43** | **5400** |
 
 Cells whose stored `measurement` is not `never-measured` are shown individually so status and measurement remain visible together.
 

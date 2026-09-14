@@ -11,16 +11,15 @@ data are not versioned; each validate run retains those under `ignored/`.
 
 The denominator is the complete comparable manifest matrix, not just the
 combinations that happen to be enabled today. For `N` manifest tests, verify,
-replay, and chaos span five Hermit backends, while native contributes one
-naked-execution control: `N × (5 × 3 + 1)` cells. Native is shown as a sixth
-backend in the table, but it does not have replay or chaos cells, so the formula
-is not `N × 6 × 3`. Explicit `custom` commands still run when selected by
-ordinary validation, but they are not multiplied across every test/backend
-pair: unlike the three common modes, they do not define a uniform product-wide
-denominator.
+replay, and chaos span five Hermit backends: `N × 5 × 3` cells. Native naked
+execution remains visible as a separate control, but is not a Hermit backend
+and does not enter any backend denominator, count, status rollup, or backend
+table. Explicit `custom` commands still run when selected by ordinary
+validation, but they are not multiplied across every test/backend pair: unlike
+the three common modes, they do not define a uniform product-wide denominator.
 
 For one dated example only: on 2026-08-13, `N = 336`, so the comparable matrix
-has `336 × (5 × 3 + 1) = 5,376` cells. The checked-in table is generated from
+has `336 × 5 × 3 = 5,040` cells. The checked-in table is generated from
 the live manifest and changes automatically when a manifest test is added.
 
 `hermit-manifest-plan --format
