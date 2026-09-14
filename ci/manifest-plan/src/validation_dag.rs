@@ -1730,13 +1730,20 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
             || producers.iter().any(|step| {
                 step.cpu_timeout != expected_cpu
                     || step.group.starts_with("quick-super-") != quick_super
+                    || step.hint.preferred_inner_jobs != Some(2)
+                    || step.jobs_env.as_deref() != Some("CARGO_BUILD_JOBS")
             })
         {
             return Err(format!(
-                "{profile} Rust-script producers must retain {expected_count} distinct producers with CPU budget {expected_cpu}: {:?}",
+                "{profile} Rust-script producers must retain {expected_count} distinct producers with CPU budget {expected_cpu}, two inner Cargo jobs, and the CARGO_BUILD_JOBS width channel: {:?}",
                 producers
                     .iter()
-                    .map(|step| (step.tag(), step.cpu_timeout))
+                    .map(|step| (
+                        step.tag(),
+                        step.cpu_timeout,
+                        step.hint.preferred_inner_jobs,
+                        step.jobs_env.as_deref()
+                    ))
                     .collect::<Vec<_>>()
             ));
         }
@@ -2452,6 +2459,37 @@ sys.exit(37)
                 .cpu_timeout = wrong_cpu;
             let error = assert_invariants(&changed, &cells).unwrap_err();
             assert!(error.contains("CPU budget"), "{tag}: {error}");
+        }
+    }
+
+    #[test]
+    fn rust_script_producers_retain_measured_two_job_width() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let producers = committed
+            .steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step.job.as_str(),
+                    "rust_scripts" | "rust_scripts_in_pinned_root" | "rust_scripts_on_host"
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(producers.len(), 5);
+        for step in producers {
+            assert_eq!(step.hint.preferred_inner_jobs, Some(2), "{}", step.tag());
+            assert_eq!(
+                step.jobs_env.as_deref(),
+                Some("CARGO_BUILD_JOBS"),
+                "{}",
+                step.tag()
+            );
+            assert_eq!(
+                step.hint.hard_mem_max_bytes,
+                Some(2 * 1024 * 1024 * 1024),
+                "{}",
+                step.tag()
+            );
         }
     }
 

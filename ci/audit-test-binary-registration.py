@@ -25,6 +25,7 @@ missing evidence into a zero or a success.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
@@ -51,6 +52,15 @@ _HERMIT_INVOCATION_RE = re.compile(
 )
 _TEST_FLAG_RE = re.compile(r"--test(?:=|\s+)([A-Za-z0-9_]+)")
 _TOP_LEVEL_TEST_RE = re.compile(r"^hermit-cli/tests/([^/]+)\.rs$")
+# Exact SHA-256 of the committed `test.isolated_dbt_workdir` command. Its nested
+# Bash payload runs the `cli` binary behind prlimit. This step never falls back
+# to the ordinary parser: any command mutation returns no executed target.
+_EXACT_STEP_COMMAND_TARGETS = {
+    "test.isolated_dbt_workdir": (
+        "fb6d598b884b84b51b0190de783d924a15bd9527424c959bc2cbbc386767c931",
+        {"cli"},
+    )
+}
 
 # REGISTRATION MEANS "CI EXECUTES IT", NOT "THE TEXT APPEARS SOMEWHERE".
 #
@@ -69,7 +79,9 @@ _TOP_LEVEL_TEST_RE = re.compile(r"^hermit-cli/tests/([^/]+)\.rs$")
 # the allowlist and are refused.
 _SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||[;|\n]")
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_KNOWN_RUNNERS = frozenset({"timeout", "env", "nice", "nohup", "xargs", "exec", "command"})
+_KNOWN_RUNNERS = frozenset(
+    {"timeout", "env", "nice", "nohup", "xargs", "exec", "command"}
+)
 _DURATION_RE = re.compile(r"^\d+[smhd]?$")
 # `--no-run` compiles the binary and never executes it, so it is not coverage.
 _NO_RUN_RE = re.compile(r"(?<![\w-])--no-run(?![\w-])")
@@ -102,6 +114,17 @@ def executed_test_targets(command: str) -> set[str]:
             continue
         found.update(_TEST_FLAG_RE.findall(invocation))
     return found
+
+
+def executed_test_targets_for_step(tag: str, command: str) -> set[str]:
+    """Return executed targets, enforcing exact commands for named exceptions."""
+    exact = _EXACT_STEP_COMMAND_TARGETS.get(tag)
+    if exact is None:
+        return executed_test_targets(command)
+    expected_digest, targets = exact
+    if hashlib.sha256(command.encode()).hexdigest() != expected_digest:
+        return set()
+    return set(targets)
 
 
 @dataclass(frozen=True)
@@ -148,7 +171,7 @@ def registered_targets(root: Path) -> set[str]:
         except (OSError, DagJsonError) as error:
             raise ValueError(f"cannot parse {path.relative_to(root)}: {error}") from error
         for step in config.steps:
-            executed = executed_test_targets(step.cmd)
+            executed = executed_test_targets_for_step(step.tag, step.cmd)
             declared = step.integration_test_binaries
             if declared is None:
                 if executed:

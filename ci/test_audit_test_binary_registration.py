@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
+import json
+import runpy
 import subprocess
 import tempfile
 import unittest
-import json
 from pathlib import Path
 
 
@@ -198,6 +199,88 @@ class RegistrationAuditTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ci-registered=2", result.stdout)
+
+    def test_exact_prlimit_command_registers_and_any_mutation_refuses(self) -> None:
+        dag = json.loads((SCRIPT.parent / "dag/validate.json").read_text())
+        command = next(
+            step["cmd"]
+            for step in dag["steps"]
+            if f"{step['group']}.{step['job']}" == "test.isolated_dbt_workdir"
+        )
+        executed_test_targets_for_step = runpy.run_path(str(SCRIPT))[
+            "executed_test_targets_for_step"
+        ]
+
+        self.assertEqual(
+            executed_test_targets_for_step("test.isolated_dbt_workdir", command),
+            {"cli"},
+        )
+        for mutated in (
+            command.replace("${CI:+--profile ci}", "${CI:+--profile ci}--help"),
+            command.replace("${CI:+--profile ci}", "{--help,--color}"),
+            command.replace("--test cli", "--help --test cli"),
+            command.replace("prlimit ", "prlimit --help ", 1),
+            command.replace("prlimit --fsize=67108864:67108864", "timeout --help"),
+            command.replace("prlimit --fsize=67108864:67108864", "/bin/echo"),
+            command.replace("prlimit ", "", 1),
+        ):
+            with self.subTest(mutated=mutated):
+                self.assertEqual(
+                    executed_test_targets_for_step(
+                        "test.isolated_dbt_workdir", mutated
+                    ),
+                    set(),
+                )
+
+    def test_nonexecuting_prlimit_forms_do_not_register(self) -> None:
+        for prefix in (
+            "prlimit --help",
+            "prlimit --version",
+            "prlimit --pid=123 --",
+            "prlimit --fsize=67108864:67108864",
+            "prlimit --fsize=67108864:67108864 -- --help",
+            "prlimit --fsize=67108864:67108864 -- CARGO_BUILD_JOBS=2",
+            "prlimit --fsize=67108864:67108864 -- /bin/echo",
+            "prlimit --fsize=67108864:67108864 -- /definitely/missing",
+            "prlimit --fsize=67108864:67108864 -- "
+            "./ci/run-with-reverie-dbt-budget.sh --help",
+            "prlimit --fsize=67108864:67108864 -- "
+            "./ci/run-with-reverie-dbt-budget.sh CARGO_BUILD_JOBS=2",
+            "prlimit --fsize=67108864:67108864 -- "
+            "./ci/run-with-reverie-dbt-budget.sh /bin/echo",
+            "prlimit --fsize=67108864:67108864 -- "
+            "./ci/run-with-reverie-dbt-budget.sh /definitely/missing",
+            "prlimit --fsize=67108864:67108864 -- "
+            "./ci/run-with-reverie-dbt-budget.shcargo",
+            "prlimit --fsize=67108864:67108864 -- "
+            "./ci/run-with-reverie-dbt-budget.sh./ci/run-nextest-counted.sh",
+            "timeout --help prlimit --fsize=67108864:67108864 -- "
+            "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh",
+            "env --help prlimit --fsize=67108864:67108864 -- "
+            "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh",
+            "/bin/echo prlimit --fsize=67108864:67108864 -- "
+            "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh",
+        ):
+            with self.subTest(prefix=prefix):
+                result = self._plant_probe_with_dag_command(
+                    f"{prefix} cargo test -p hermit --test zz_probe",
+                    declared=["zz_probe"],
+                )
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("integration_test_binaries", result.stderr)
+
+    def test_non_shell_separators_before_invocation_do_not_register(self) -> None:
+        for separator in ("\r", "\v", "\f", "\N{NO-BREAK SPACE}"):
+            with self.subTest(separator=repr(separator)):
+                result = self._plant_probe_with_dag_command(
+                    "prlimit --fsize=67108864:67108864 -- "
+                    "./ci/run-with-reverie-dbt-budget.sh"
+                    f"{separator}./ci/run-nextest-counted.sh "
+                    "-p hermit --test zz_probe -j 1",
+                    declared=["zz_probe"],
+                )
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("integration_test_binaries", result.stderr)
 
     def test_executed_target_without_typed_declaration_is_refused_by_name(self) -> None:
         result = self._plant_probe_with_dag_command(

@@ -178,7 +178,7 @@
         "rss_baseline_bytes": 1073741824,
         "hard_mem_max_bytes": 2147483648,
         "classification": "cpu-bound",
-        "preferred_inner_jobs": 8,
+        "preferred_inner_jobs": 2,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
@@ -12212,6 +12212,9 @@
           "owner": "super.pmu_analyze_hello_race_stress_calibrated_skid"
         }
       ],
+      "integration_test_binaries": [
+        "analyze"
+      ],
       "deps": [
         "pre.reverie_pin",
         "quick-super-gate.manifest",
@@ -12860,6 +12863,9 @@
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
           "owner": "liteinst.strict"
         }
+      ],
+      "integration_test_binaries": [
+        "liteinst_advanced"
       ],
       "deps": [
         "build.rust_scripts_in_pinned_root",
@@ -19314,7 +19320,7 @@
         "rss_baseline_bytes": 1073741824,
         "hard_mem_max_bytes": 2147483648,
         "classification": "cpu-bound",
-        "preferred_inner_jobs": 8,
+        "preferred_inner_jobs": 2,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
@@ -67440,7 +67446,7 @@
         "rss_baseline_bytes": 1073741824,
         "hard_mem_max_bytes": 2147483648,
         "classification": "cpu-bound",
-        "preferred_inner_jobs": 8,
+        "preferred_inner_jobs": 2,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
@@ -67838,7 +67844,7 @@
         "rss_baseline_bytes": 2147483648,
         "hard_mem_max_bytes": 2147483648,
         "classification": "cpu-bound",
-        "preferred_inner_jobs": 8,
+        "preferred_inner_jobs": 2,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
@@ -67946,7 +67952,7 @@
         "rss_baseline_bytes": 2147483648,
         "hard_mem_max_bytes": 2147483648,
         "classification": "cpu-bound",
-        "preferred_inner_jobs": 8,
+        "preferred_inner_jobs": 2,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
