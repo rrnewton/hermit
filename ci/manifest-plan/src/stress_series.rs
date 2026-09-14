@@ -718,6 +718,9 @@ impl SeriesRow {
         if let Some(evidence) = &self.series.no_verdict_evidence {
             self.validate_no_verdict_evidence(evidence)?;
         }
+        if self.series.pressure_evidence.is_some() && self.series.native_evidence.is_some() {
+            return Err("pressure_evidence and native_evidence are mutually exclusive".into());
+        }
         if let Some(evidence) = &self.series.pressure_evidence {
             self.validate_pressure_evidence(evidence)?;
         }
@@ -840,6 +843,11 @@ impl SeriesRow {
         {
             return Err("native_evidence requires exactly one outer logical-execution row".into());
         }
+        if self.producer == SeriesProducer::Validate
+            && self.series.attempt != Some(self.series.run_index)
+        {
+            return Err("validate native_evidence outer attempt must equal run_index".into());
+        }
         let diversity = evidence.diversity;
         if !(3..=5).contains(&diversity.runs) {
             return Err("native_evidence diversity.runs must be between 3 and 5".into());
@@ -914,6 +922,24 @@ impl SeriesRow {
                 "native_evidence diversity.distinct={} disagrees with {} distinct observation hashes",
                 diversity.distinct, observed
             ));
+        }
+        let outer = (
+            self.series.outcome,
+            self.series.result,
+            self.series.failure_class,
+        );
+        if outer
+            == (
+                SeriesOutcome::Errored,
+                None,
+                Some(FailureClass::UnderstoodInfrastructureFailure),
+            )
+        {
+            // An integrity check after the child attempts, such as detecting a
+            // changed Hermit binary, supersedes any otherwise complete child
+            // outcome. The inner attempts remain truthful evidence rather than
+            // being rewritten to manufacture an ERROR disposition.
+            return Ok(());
         }
         let all_passed = evidence
             .attempts
@@ -1525,6 +1551,32 @@ mod tests {
         assert_eq!(evidence.diversity.distinct, 1);
         assert_eq!(evidence.diversity.min_distinct, 2);
         assert_eq!(evidence.attempts.len(), 3);
+
+        let mut infrastructure_override = fixture;
+        infrastructure_override.series.outcome = SeriesOutcome::Errored;
+        infrastructure_override.series.result = None;
+        infrastructure_override.series.failure_class =
+            Some(FailureClass::UnderstoodInfrastructureFailure);
+        infrastructure_override.validate_for_write().unwrap();
+
+        let failed_attempt = &mut infrastructure_override
+            .series
+            .native_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0];
+        failed_attempt.outcome = SeriesNativeAttemptOutcome::Fail;
+        failed_attempt.status = Some(7);
+        infrastructure_override.validate_for_write().unwrap();
+
+        let mut neighboring_tuple = infrastructure_override;
+        neighboring_tuple.series.result = Some(ObservedResult::InfrastructureError);
+        assert!(
+            neighboring_tuple
+                .validate_for_write()
+                .unwrap_err()
+                .contains("contradict the outer")
+        );
     }
 
     #[test]
@@ -1682,6 +1734,26 @@ mod tests {
                 "missing {field} was not refused: {error}"
             );
         }
+
+        let mut mixed_evidence = native_row(3, &['a', 'b', 'a']);
+        mixed_evidence.series.pressure_evidence = pressure_row().series.pressure_evidence;
+        assert!(
+            mixed_evidence
+                .validate_for_write()
+                .unwrap_err()
+                .contains("mutually exclusive")
+        );
+
+        let mut mismatched_outer_attempt = native_row(3, &['a', 'b', 'a']);
+        mismatched_outer_attempt.series.run_index = 2;
+        assert!(
+            mismatched_outer_attempt
+                .validate_for_write()
+                .unwrap_err()
+                .contains("outer attempt must equal run_index")
+        );
+        mismatched_outer_attempt.producer = SeriesProducer::HermitRepeat;
+        mismatched_outer_attempt.validate_for_write().unwrap();
     }
 
     #[test]

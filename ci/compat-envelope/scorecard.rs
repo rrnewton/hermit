@@ -6976,6 +6976,7 @@ fn validate_scorecard_snapshot(
         "failure_class",
         "no_verdict_evidence",
         "pressure_evidence",
+        "native_evidence",
         "run_index",
         "attempt",
         "num_runs",
@@ -11244,6 +11245,52 @@ red/`measured-and-passed` count is **0**.",
         write_scorecard_snapshot_fixture(&row_snapshot_path, &row_snapshot_value)?;
     HeldScorecardSeriesSnapshot::open(&row_snapshot_path, &row_snapshot_sha)
         .map_err(|error| format!("valid row-bearing combined snapshot was refused: {error}"))?;
+
+    let mut native_snapshot_row = series_row.clone();
+    native_snapshot_row.schema = SeriesSchema::V4;
+    native_snapshot_row.event_id = "fixture-combined-native-v4".into();
+    native_snapshot_row.series.cell = "system-utils/record-getpid/naked/native".into();
+    native_snapshot_row.series.native_evidence = Some(SeriesNativeEvidence {
+        attempts: ['a', 'b', 'a']
+            .into_iter()
+            .enumerate()
+            .map(|(offset, hash)| SeriesNativeAttempt {
+                index: offset as u64 + 1,
+                outcome: SeriesNativeAttemptOutcome::Pass,
+                status: Some(0),
+                signal: None,
+                timed_out: false,
+                observation_sha256: hash.to_string().repeat(64),
+            })
+            .collect(),
+        diversity: SeriesNativeDiversity {
+            runs: 3,
+            min_distinct: 2,
+            distinct: 2,
+        },
+    });
+    native_snapshot_row.validate_for_write()?;
+    let native_snapshot_value = scorecard_snapshot_fixture_value(
+        &source_commit,
+        &source_tree,
+        std::slice::from_ref(&native_snapshot_row),
+    )?;
+    let native_snapshot_path = snapshot_root.join("native-v4.json");
+    let native_snapshot_sha =
+        write_scorecard_snapshot_fixture(&native_snapshot_path, &native_snapshot_value)?;
+    let held_native = HeldScorecardSeriesSnapshot::open(
+        &native_snapshot_path,
+        &native_snapshot_sha,
+    )
+    .map_err(|error| format!("valid native-v4 combined snapshot was refused: {error}"))?;
+    if held_native.rows.len() != 1
+        || held_native.rows[0].schema != SeriesSchema::V4
+        || held_native.rows[0].event_id != native_snapshot_row.event_id
+        || held_native.rows[0].series.native_evidence
+            != native_snapshot_row.series.native_evidence
+    {
+        return Err("native-v4 combined snapshot did not round-trip its typed evidence".into());
+    }
 
     // Both digests must match the ambiguous original bytes, so rejection tests
     // duplicate-field validation rather than an unrelated checksum mismatch.

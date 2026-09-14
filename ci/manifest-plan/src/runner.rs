@@ -8249,6 +8249,53 @@ backends_disabled:
             }))
         );
         result.require_current_classification().unwrap();
+
+        let native_attempts = result
+            .attempts
+            .iter()
+            .map(|attempt| {
+                serde_json::json!({
+                    "index": attempt.index.parse::<u64>().unwrap(),
+                    "outcome": attempt.outcome,
+                    "status": attempt.status,
+                    "signal": attempt.signal,
+                    "timed_out": attempt.timed_out,
+                    "observation_sha256": attempt.observation_sha256,
+                })
+            })
+            .collect::<Vec<_>>();
+        let series_row: crate::stress_series::SeriesRow =
+            serde_json::from_value(serde_json::json!({
+                "schema": "stress-series/v4",
+                "event_id": "native-binary-change",
+                "event_type": "series.observation",
+                "emitted_at": "2026-09-14T00:00:00Z",
+                "team": "hermit",
+                "host": result.machine_shortname,
+                "producer": "validate",
+                "run_id": result.run_id,
+                "series": {
+                    "cell": "fixture/native-binary-change/naked/native",
+                    "tree": result.hermit_sha,
+                    "outcome": "errored",
+                    "result": result.result,
+                    "failure_class": result.failure_class,
+                    "native_evidence": {
+                        "attempts": native_attempts,
+                        "diversity": result.diversity,
+                    },
+                    "run_index": 1,
+                    "attempt": 1,
+                    "num_runs": 1,
+                    "main_ancestry": true,
+                    "source_tree_dirty": false,
+                    "machine_shortname": result.machine_shortname,
+                    "kernel_version": result.kernel_version,
+                    "host_capabilities": result.host_capabilities,
+                },
+            }))
+            .unwrap();
+        series_row.validate_for_write().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
