@@ -292,5 +292,116 @@ run_range "$r" 1
 check "successful banner after a deliberate failure passes" 0 "$RC" "$OUT"
 rm -rf "$r"
 
+# Exercise each new result-ordering control through both real consumers: the
+# staged commit-message path and the range path used by the workflow/lander.
+check_staged_and_range() {  # description, expected exit, path, body, trailers, diagnostic
+    local description="$1" expected="$2" path="$3" body="$4" trailers="$5" diagnostic="$6"
+    local repo message mode
+    repo=$(new_repo)
+    message="$repo/message.txt"
+    mkdir -p "$(dirname -- "$repo/$path")"
+    printf 'fixture\n' >"$repo/$path"
+    git -C "$repo" add -- "$path" || { rm -rf "$repo"; return 1; }
+    printf '[hermit2, implementer, unresolved, host, role=impl] checker fixture\n\n%s\n\n%s\n' \
+        "$body" "$trailers" >"$message"
+    for mode in staged range; do
+        if [ "$mode" = staged ]; then
+            OUT=$(cd "$repo" && "$GATE" --staged --message-file "$message" 2>&1)
+            RC=$?
+        else
+            git -C "$repo" commit -q -F "$message" || { rm -rf "$repo"; return 1; }
+            run_range "$repo" 1
+        fi
+        check "$description (--$mode)" "$expected" "$RC" "$OUT"
+        if [[ "$OUT" != *"$diagnostic"* ]]; then
+            printf 'FAIL %s (--%s): missing diagnostic %s\n%s\n' \
+                "$description" "$mode" "$diagnostic" "$OUT"
+            fail=$((fail + 1))
+        fi
+    done
+    rm -rf "$repo"
+}
+
+TRAILER_THREE='Demo-Green-Review: reviewer=other demo=demos/03-chaos-concurrency.sh result=GREEN evidence=log.txt'
+TRAILER_EIGHT='Demo-Green-Review: reviewer=other demo=demos/08-h.sh result=GREEN evidence=log.txt'
+CONTRADICTS="result=GREEN contradicts the body's reported result"
+COVERED='attestation covers every touched demo'
+
+# These are the actual title and format from Demo 3's DEMO_LABEL and common.sh.
+check_staged_and_range "titled emitted failure refuses" 1 demos/03-chaos-concurrency.sh \
+    '=== Demo 3: Chaos Concurrency Testing: FAILURE (exit 1) — see errors above ===' \
+    "$TRAILER_THREE" "$CONTRADICTS" || exit 1
+check_staged_and_range "titled zero-padded success passes" 0 demos/03-chaos-concurrency.sh \
+    '=== Demo 03: Chaos Concurrency Testing: SUCCESS ===' \
+    "$TRAILER_THREE" "$COVERED" || exit 1
+check_staged_and_range "failure before a diagnostic colon refuses" 1 demos/03-chaos-concurrency.sh \
+    '=== Demo 03: Chaos Concurrency Testing: FAILURE: guest exited 125 ===' \
+    "$TRAILER_THREE" "$CONTRADICTS" || exit 1
+
+# run-all.sh emits all three aggregate result forms. A suite result names no
+# individual failing demo, so it contradicts all but not a scoped good demo.
+check_staged_and_range "emitted suite failure refuses all" 1 demos/03-chaos-concurrency.sh \
+    '=== Demo suite: FAILURE — 1 demo(s) failed, 7 passed, 0 skipped ===' \
+    "$TRAILER_ALL" "$CONTRADICTS" || exit 1
+check_staged_and_range "emitted incomplete suite refuses all" 1 demos/03-chaos-concurrency.sh \
+    '=== Demo suite: INCOMPLETE — 7 of 8 requested demos passed, 1 skipped and unmeasured ===' \
+    "$TRAILER_ALL" "$CONTRADICTS" || exit 1
+check_staged_and_range "emitted suite success passes all" 0 demos/03-chaos-concurrency.sh \
+    '=== Demo suite: SUCCESS — all 8 requested demos passed ===' \
+    "$TRAILER_ALL" "$COVERED" || exit 1
+check_staged_and_range "suite failure preserves scoped good evidence" 0 demos/03-chaos-concurrency.sh \
+    '=== Demo 03: SUCCESS ===
+=== Demo suite: FAILURE — 1 demo(s) failed, 7 passed, 0 skipped ===' \
+    "$TRAILER_THREE" "$COVERED" || exit 1
+
+# The latest actual result for the same demo must be green. Earlier successful
+# controls and later results for a different demo cannot excuse a real failure.
+check_staged_and_range "success before titled failure refuses" 1 demos/03-chaos-concurrency.sh \
+    '=== Demo 03: SUCCESS ===
+=== Demo 03: Chaos Concurrency Testing: FAILURE ===' \
+    "$TRAILER_THREE" "$CONTRADICTS" || exit 1
+check_staged_and_range "success before plain failure refuses" 1 demos/08-h.sh \
+    '=== Demo 08: GREEN ===
+=== Demo 08: FAILURE (the real run, after the control) ===' \
+    "$TRAILER_EIGHT" "$CONTRADICTS" || exit 1
+check_staged_and_range "titled failure before later success passes" 0 demos/03-chaos-concurrency.sh \
+    '=== Demo 03: Chaos Concurrency Testing: FAILURE ===
+=== Demo 03: Chaos Concurrency Testing: SUCCESS ===' \
+    "$TRAILER_THREE" "$COVERED" || exit 1
+check_staged_and_range "another demo success cannot cancel failure" 1 demos/03-chaos-concurrency.sh \
+    '=== Demo 03: SUCCESS ===
+=== Demo 03: FAILURE ===
+=== Demo 08: SUCCESS ===' \
+    "$TRAILER_THREE" "$CONTRADICTS" || exit 1
+check_staged_and_range "another demo failure preserves scope" 0 demos/08-h.sh \
+    '=== Demo 03: Chaos Concurrency Testing: FAILURE ===' \
+    "$TRAILER_EIGHT" "$COVERED" || exit 1
+check_staged_and_range "unrecognized word cannot replace failure" 1 demos/03-chaos-concurrency.sh \
+    '=== Demo 03: FAILURE ===
+=== Demo 03: SUCCESSOR ===' \
+    "$TRAILER_THREE" "$CONTRADICTS" || exit 1
+check_staged_and_range "suite success before failure refuses" 1 demos/03-chaos-concurrency.sh \
+    '=== Demo suite: SUCCESS — all 8 requested demos passed ===
+=== Demo suite: FAILURE — 1 demo(s) failed, 7 passed, 0 skipped ===' \
+    "$TRAILER_ALL" "$CONTRADICTS" || exit 1
+check_staged_and_range "suite failure before later success passes" 0 demos/03-chaos-concurrency.sh \
+    '=== Demo suite: FAILURE — 1 demo(s) failed, 7 passed, 0 skipped ===
+=== Demo suite: SUCCESS — all 8 requested demos passed ===' \
+    "$TRAILER_ALL" "$COVERED" || exit 1
+
+# Retain the prior refusal and recovery cases through the hook path as well.
+check_staged_and_range "duplicate reviewer cannot hide implementer" 1 demos/03-chaos-concurrency.sh \
+    '=== Demo 03: SUCCESS ===' \
+    'Demo-Green-Review: reviewer=other reviewer=implementer demo=all result=GREEN evidence=log.txt' \
+    'reviewer= must occur exactly once' || exit 1
+check_staged_and_range "implementer cannot approve itself" 1 demos/03-chaos-concurrency.sh \
+    '=== Demo 03: SUCCESS ===' \
+    'Demo-Green-Review: reviewer=implementer demo=all result=GREEN evidence=log.txt' \
+    'reviewer=implementer is also the role=impl identity' || exit 1
+check_staged_and_range "malformed trailer preserves later valid evidence" 0 demos/03-chaos-concurrency.sh \
+    '=== Demo 03: SUCCESS ===' \
+    "Demo-Green-Review: reviewer=other reviewer=implementer demo=all result=GREEN evidence=bad.log
+$TRAILER_THREE" "$COVERED" || exit 1
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

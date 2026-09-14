@@ -97,27 +97,37 @@ claim_covers_demo_number() {  # $1 = comma-separated demo= value, $2 = number
 }
 
 # A body's mechanical result lines may include deliberate negative controls as
-# well as the real run. A claim is contradicted when it covers a numbered demo
-# for which the body reports a non-green result and no green result. This makes
-# a forced-failure check followed by a successful real run valid, while a body
-# that reports only PARTIAL or FAILURE cannot claim GREEN.
+# well as the real run. Only a later successful result for the same demo can
+# supersede a non-green result. Suite results also contradict demo=all, but do
+# not identify which individual demo failed.
 claim_contradicts_body() {  # $1 = commit message, $2 = demo= value
-    local text="$1" claims="$2" line number result
-    declare -A green=() nongreen=()
+    local text="$1" claims="$2" line number detail
+    local result_pattern='(^|:)[[:space:]]*(first[[:space:]]+run[[:space:]]+saved,[[:space:]]*)?(green|pass|success|partial|fail|failure|failed|red|skip|skipped|incomplete|no_result|no-result|error)([^[:alnum:]_-]|$)'
+    declare -A last_result=()
     while IFS= read -r line; do
-        if [[ "${line,,}" =~ ^[[:space:]]*(=+[[:space:]]*)?demo[[:space:]]*0*([0-9]+)[^:]*:[[:space:]]*(first[[:space:]]+run[[:space:]]+saved,[[:space:]]*)?([a-z_-]+) ]]; then
-            number="${BASH_REMATCH[2]}"
-            result="${BASH_REMATCH[4]}"
-            case "$result" in
-                green|pass|success) green[$((10#$number))]=1 ;;
-                partial|fail|failure|failed|red|skip|skipped|incomplete|no_result|no-result|error)
-                    nongreen[$((10#$number))]=1 ;;
-            esac
+        line="${line,,}"
+        if [[ "$line" =~ ^[[:space:]]*(=+[[:space:]]*)?demo[[:space:]]*0*([0-9]+)[^:]*:(.*)$ ]]; then
+            number="$((10#${BASH_REMATCH[2]}))"
+            detail="${BASH_REMATCH[3]}"
+        elif [[ "$line" =~ ^[[:space:]]*(=+[[:space:]]*)?demo[[:space:]]+suite[[:space:]]*:(.*)$ ]]; then
+            number=suite
+            detail="${BASH_REMATCH[2]}"
+        else
+            continue
+        fi
+        # Demo titles can contain colons. Find the first actual result after a
+        # colon, without mistaking a later diagnostic colon for the result.
+        if [[ "$detail" =~ $result_pattern ]]; then
+            last_result[$number]="${BASH_REMATCH[3]}"
         fi
     done <<<"$text"
-    for number in "${!nongreen[@]}"; do
-        [ "${green[$number]:-0}" = 1 ] && continue
-        claim_covers_demo_number "$claims" "$number" && return 0
+    for number in "${!last_result[@]}"; do
+        case "${last_result[$number]}" in green|pass|success) continue ;; esac
+        if [ "$number" = suite ]; then
+            [[ ",$claims," = *,all,* ]] && return 0
+        else
+            claim_covers_demo_number "$claims" "$number" && return 0
+        fi
     done
     return 1
 }
