@@ -64,7 +64,7 @@ const CELLS: &str = "ci/compat-envelope/cells.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SCHEMA: u64 = 7;
 const PRESSURE_SUMMARY_SCHEMA: u64 = 5;
-const CELL_RESULT_SCHEMA: u64 = 4;
+const CELL_RESULT_SCHEMA: u64 = 5;
 const SCORECARD_SERIES_SNAPSHOT_SCHEMA: &str = "scorecard-series-snapshot/v1";
 const SCORECARD_SERIES_SNAPSHOT_SOURCE: &str = "series";
 
@@ -466,6 +466,7 @@ fn derive_measurement(cell: &TrackedCell) -> MeasurementState {
                 ObservedResult::CrashError
                 | ObservedResult::Timeout
                 | ObservedResult::Oom
+                | ObservedResult::InsufficientDiversity
                 | ObservedResult::SandboxDenied
                 | ObservedResult::InfrastructureError => {}
             }
@@ -6095,7 +6096,7 @@ fn series_evidence(row: &SeriesRow, id: &CellId) -> Option<SeriesEvidence> {
             no_verdict: true,
         });
     }
-    if row.schema == SeriesSchema::V3 {
+    if matches!(row.schema, SeriesSchema::V3 | SeriesSchema::V4) {
         return match row.series.result {
             Some(
                 result @ (ObservedResult::Pass
@@ -6110,6 +6111,7 @@ fn series_evidence(row: &SeriesRow, id: &CellId) -> Option<SeriesEvidence> {
                 ObservedResult::CrashError
                 | ObservedResult::Timeout
                 | ObservedResult::Oom
+                | ObservedResult::InsufficientDiversity
                 | ObservedResult::SandboxDenied
                 | ObservedResult::InfrastructureError,
             )
@@ -11179,6 +11181,7 @@ red/`measured-and-passed` count is **0**.",
             failure_class: None,
             no_verdict_evidence: None,
             pressure_evidence: None,
+            native_evidence: None,
             run_index: 1,
             attempt: Some(1),
             num_runs: 1,
@@ -12057,7 +12060,7 @@ red/`measured-and-passed` count is **0**.",
     )?;
 
     let mut invalid_row_schema = row_snapshot_value.clone();
-    invalid_row_schema["rows"][0]["schema"] = serde_json::json!("stress-series/v4");
+    invalid_row_schema["rows"][0]["schema"] = serde_json::json!("stress-series/v5");
     recompute_snapshot_rows(&mut invalid_row_schema)?;
     assert_snapshot_refused_unchanged(
         "invalid-row-schema",
@@ -14565,6 +14568,7 @@ red/`measured-and-passed` count is **0**.",
                 failure_class,
                 no_verdict_evidence: None,
                 pressure_evidence: None,
+                native_evidence: None,
                 run_index: 1,
                 attempt: None,
                 num_runs,

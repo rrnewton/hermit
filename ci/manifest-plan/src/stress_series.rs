@@ -20,6 +20,7 @@ use crate::runner::ObservedResult;
 pub const STRESS_SERIES_SCHEMA_V1: &str = "stress-series/v1";
 pub const STRESS_SERIES_SCHEMA_V2: &str = "stress-series/v2";
 pub const STRESS_SERIES_SCHEMA_V3: &str = "stress-series/v3";
+pub const STRESS_SERIES_SCHEMA_V4: &str = "stress-series/v4";
 // Frozen when introduced in v2 and retained by v3: extending the machine
 // vocabulary must not retroactively make already-written rows unreadable. A
 // new capability therefore requires a new stress-series schema before
@@ -35,6 +36,8 @@ pub enum SeriesSchema {
     V2,
     #[serde(rename = "stress-series/v3")]
     V3,
+    #[serde(rename = "stress-series/v4")]
+    V4,
 }
 
 impl SeriesSchema {
@@ -43,6 +46,7 @@ impl SeriesSchema {
             Self::V1 => STRESS_SERIES_SCHEMA_V1,
             Self::V2 => STRESS_SERIES_SCHEMA_V2,
             Self::V3 => STRESS_SERIES_SCHEMA_V3,
+            Self::V4 => STRESS_SERIES_SCHEMA_V4,
         }
     }
 }
@@ -238,6 +242,54 @@ pub struct SeriesPressureComparison {
     pub no_result_kind: Option<SeriesNoVerdictKind>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum SeriesNativeAttemptOutcome {
+    #[serde(rename = "PASS")]
+    Pass,
+    #[serde(rename = "FAIL")]
+    Fail,
+    #[serde(rename = "ERROR")]
+    Error,
+}
+
+/// Lossless process and observation evidence for one native inner attempt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesNativeAttempt {
+    pub index: u64,
+    pub outcome: SeriesNativeAttemptOutcome,
+    #[serde(deserialize_with = "deserialize_nullable_i32")]
+    pub status: Option<i32>,
+    #[serde(deserialize_with = "deserialize_nullable_i32")]
+    pub signal: Option<i32>,
+    pub timed_out: bool,
+    pub observation_sha256: String,
+}
+
+fn deserialize_nullable_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i32>::deserialize(deserializer)
+}
+
+/// Producer-owned native diversity requirement and observed result.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesNativeDiversity {
+    pub runs: u64,
+    pub min_distinct: u64,
+    pub distinct: u64,
+}
+
+/// One naked/native logical execution, retained inside one outer series row.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesNativeEvidence {
+    pub attempts: Vec<SeriesNativeAttempt>,
+    pub diversity: SeriesNativeDiversity,
+}
+
 impl SeriesPressureAttempt {
     /// Validate one retained invocation without changing its framework outcome.
     /// Callers that have original report bytes must additionally validate their
@@ -412,6 +464,10 @@ pub struct SeriesPayload {
     /// cannot establish a clean first attempt for sample promotion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pressure_evidence: Option<SeriesPressureEvidence>,
+    /// Required on every stress-series/v4 naked/native row and forbidden on
+    /// every other row. Earlier schemas cannot prove native diversity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_evidence: Option<SeriesNativeEvidence>,
     pub run_index: u64,
     #[serde(default)]
     pub attempt: Option<u64>,
@@ -480,19 +536,23 @@ impl SeriesRow {
         )
     }
 
-    /// Validate a newly written row. Historical v1/v2 rows remain
+    /// Validate a newly written row. Historical v1-v3 rows remain
     /// deserializable, but no new row may omit the framework's exact result and
     /// attribution.
     pub fn validate_for_write(&self) -> Result<(), String> {
-        if self.schema != SeriesSchema::V3 {
+        if !matches!(self.schema, SeriesSchema::V3 | SeriesSchema::V4) {
             return Err(format!(
-                "new rows must use {STRESS_SERIES_SCHEMA_V3}, got {}",
+                "new rows must use {STRESS_SERIES_SCHEMA_V3} or {STRESS_SERIES_SCHEMA_V4}, got {}",
                 self.schema.as_str()
             ));
+        }
+        if self.series.cell.ends_with("/naked/native") && self.schema != SeriesSchema::V4 {
+            return Err("new naked/native rows must use stress-series/v4".into());
         }
         self.validate_common()?;
         self.validate_host_facts()?;
         self.validate_classification()?;
+        self.validate_native_contract()?;
         self.require_current_no_verdict_evidence()
     }
 
@@ -503,12 +563,16 @@ impl SeriesRow {
     /// carry the exact result classification.
     pub fn validate_for_read(&self) -> Result<(), String> {
         self.validate_common()?;
-        if matches!(self.schema, SeriesSchema::V2 | SeriesSchema::V3) {
+        if matches!(
+            self.schema,
+            SeriesSchema::V2 | SeriesSchema::V3 | SeriesSchema::V4
+        ) {
             self.validate_host_facts()?;
         }
-        if self.schema == SeriesSchema::V3 {
+        if matches!(self.schema, SeriesSchema::V3 | SeriesSchema::V4) {
             self.validate_classification()?;
         }
+        self.validate_native_contract()?;
         Ok(())
     }
 
@@ -525,9 +589,10 @@ impl SeriesRow {
             ));
         }
         self.validate_host_facts()?;
-        if self.schema == SeriesSchema::V3 {
+        if matches!(self.schema, SeriesSchema::V3 | SeriesSchema::V4) {
             self.validate_classification()?;
         }
+        self.validate_native_contract()?;
         if self.series.source_tree_dirty {
             return Err(
                 "source_tree_dirty is true; dirty source is not checked-in evidence".into(),
@@ -655,8 +720,12 @@ impl SeriesRow {
     }
 
     fn validate_pressure_evidence(&self, evidence: &SeriesPressureEvidence) -> Result<(), String> {
-        if self.schema != SeriesSchema::V3 || self.producer != SeriesProducer::PressureTest {
-            return Err("pressure_evidence requires a pressure-test stress-series/v3 row".into());
+        if !matches!(self.schema, SeriesSchema::V3 | SeriesSchema::V4)
+            || self.producer != SeriesProducer::PressureTest
+        {
+            return Err(
+                "pressure_evidence requires a pressure-test stress-series/v3 or v4 row".into(),
+            );
         }
         if self.series.attempt.is_none_or(|attempt| attempt == 0)
             || self.series.num_runs != 1
@@ -738,6 +807,121 @@ impl SeriesRow {
         Ok(())
     }
 
+    fn validate_native_contract(&self) -> Result<(), String> {
+        let native = self.series.cell.ends_with("/naked/native");
+        if !native {
+            if self.series.native_evidence.is_some() {
+                return Err("native_evidence is valid only for a naked/native cell".into());
+            }
+            if self.series.result == Some(ObservedResult::InsufficientDiversity) {
+                return Err("insufficient-diversity is valid only for a naked/native cell".into());
+            }
+            return Ok(());
+        }
+        if self.schema != SeriesSchema::V4 {
+            if self.series.native_evidence.is_some() {
+                return Err("native_evidence requires stress-series/v4".into());
+            }
+            return Ok(());
+        }
+        let evidence = self
+            .series
+            .native_evidence
+            .as_ref()
+            .ok_or("stress-series/v4 naked/native row omitted native_evidence")?;
+        if self.series.attempt.is_none_or(|attempt| attempt == 0)
+            || self.series.num_runs != 1
+            || self.series.last_run_index.is_some()
+        {
+            return Err("native_evidence requires exactly one outer logical-execution row".into());
+        }
+        let diversity = evidence.diversity;
+        if !(3..=5).contains(&diversity.runs) {
+            return Err("native_evidence diversity.runs must be between 3 and 5".into());
+        }
+        if !(2..=diversity.runs).contains(&diversity.min_distinct) {
+            return Err("native_evidence diversity.min_distinct must be between 2 and runs".into());
+        }
+        if evidence.attempts.len() as u64 != diversity.runs {
+            return Err(
+                "native_evidence attempts must contain exactly diversity.runs entries".into(),
+            );
+        }
+        let mut hashes = std::collections::BTreeSet::new();
+        for (offset, attempt) in evidence.attempts.iter().enumerate() {
+            let expected = offset as u64 + 1;
+            if attempt.index != expected {
+                return Err(format!(
+                    "native_evidence attempt index must preserve order 1..runs; expected {expected}, got {}",
+                    attempt.index
+                ));
+            }
+            if attempt.status.is_some_and(|status| status < 0)
+                || attempt.signal.is_some_and(|signal| signal <= 0)
+                || (attempt.status.is_some() && attempt.signal.is_some())
+            {
+                return Err("native_evidence attempt has an invalid process disposition".into());
+            }
+            if attempt.outcome == SeriesNativeAttemptOutcome::Pass
+                && (attempt.status != Some(0) || attempt.signal.is_some() || attempt.timed_out)
+            {
+                return Err(
+                    "native_evidence passing attempt lacks a completed zero-exit disposition"
+                        .into(),
+                );
+            }
+            if !is_sha256(&attempt.observation_sha256) {
+                return Err(
+                    "native_evidence attempt observation_sha256 must be lowercase 64-hex".into(),
+                );
+            }
+            hashes.insert(&attempt.observation_sha256);
+        }
+        let observed = hashes.len() as u64;
+        if diversity.distinct != observed {
+            return Err(format!(
+                "native_evidence diversity.distinct={} disagrees with {} distinct observation hashes",
+                diversity.distinct, observed
+            ));
+        }
+        let all_passed = evidence
+            .attempts
+            .iter()
+            .all(|attempt| attempt.outcome == SeriesNativeAttemptOutcome::Pass);
+        let sufficient = observed >= diversity.min_distinct;
+        let expected = if all_passed && sufficient {
+            (SeriesOutcome::Passed, Some(ObservedResult::Pass), None)
+        } else if all_passed {
+            (
+                SeriesOutcome::NoResult,
+                Some(ObservedResult::InsufficientDiversity),
+                Some(FailureClass::NoResult),
+            )
+        } else {
+            if self.series.result == Some(ObservedResult::Pass)
+                || self.series.result == Some(ObservedResult::InsufficientDiversity)
+            {
+                return Err(
+                    "native_evidence non-passing attempt contradicts the outer native result"
+                        .into(),
+                );
+            }
+            return Ok(());
+        };
+        if (
+            self.series.outcome,
+            self.series.result,
+            self.series.failure_class,
+        ) != expected
+        {
+            return Err(
+                "native_evidence attempts and diversity contradict the outer result classification"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     fn validate_no_verdict_evidence(
         &self,
         evidence: &SeriesNoVerdictEvidence,
@@ -748,8 +932,8 @@ impl SeriesRow {
                 evidence.evidence_sha256
             ));
         }
-        if self.schema != SeriesSchema::V3 {
-            return Err("no_verdict_evidence is supported only by stress-series/v3".into());
+        if !matches!(self.schema, SeriesSchema::V3 | SeriesSchema::V4) {
+            return Err("no_verdict_evidence is supported only by stress-series/v3 or v4".into());
         }
         let attempt = self
             .series
@@ -1083,6 +1267,11 @@ impl SeriesRow {
                     Some(FailureClass::NoResult)
                 )
                 | (
+                    SeriesOutcome::NoResult,
+                    Some(ObservedResult::InsufficientDiversity),
+                    Some(FailureClass::NoResult)
+                )
+                | (
                     SeriesOutcome::Errored,
                     Some(ObservedResult::SandboxDenied | ObservedResult::InfrastructureError)
                         | None,
@@ -1099,7 +1288,8 @@ impl SeriesRow {
             Ok(())
         } else {
             Err(format!(
-                "stress-series/v3 classification mismatch: outcome={} result={:?} failure_class={:?}",
+                "{} classification mismatch: outcome={} result={:?} failure_class={:?}",
+                self.schema.as_str(),
                 self.series.outcome.as_str(),
                 self.series.result,
                 self.series.failure_class
@@ -1159,6 +1349,7 @@ mod tests {
                 failure_class: None,
                 no_verdict_evidence: None,
                 pressure_evidence: None,
+                native_evidence: None,
                 run_index: 1,
                 attempt: None,
                 num_runs: 1,
@@ -1213,6 +1404,181 @@ mod tests {
             }],
         });
         fixture
+    }
+
+    fn native_row(runs: u64, hashes: &[char]) -> SeriesRow {
+        assert_eq!(runs as usize, hashes.len());
+        let mut fixture = row(SeriesSchema::V4);
+        fixture.series.cell = "fixture/test/naked/native".into();
+        fixture.series.attempt = Some(1);
+        fixture.series.native_evidence = Some(SeriesNativeEvidence {
+            attempts: hashes
+                .iter()
+                .enumerate()
+                .map(|(offset, hash)| SeriesNativeAttempt {
+                    index: offset as u64 + 1,
+                    outcome: SeriesNativeAttemptOutcome::Pass,
+                    status: Some(0),
+                    signal: None,
+                    timed_out: false,
+                    observation_sha256: hash.to_string().repeat(64),
+                })
+                .collect(),
+            diversity: SeriesNativeDiversity {
+                runs,
+                min_distinct: 2,
+                distinct: hashes
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len() as u64,
+            },
+        });
+        fixture
+    }
+
+    #[test]
+    fn v4_native_round_trips_three_and_five_ordered_attempts() {
+        for fixture in [
+            native_row(3, &['a', 'b', 'a']),
+            native_row(5, &['a', 'b', 'c', 'b', 'a']),
+        ] {
+            fixture.validate_for_write().unwrap();
+            let encoded = serde_json::to_string(&fixture).unwrap();
+            let decoded: SeriesRow = serde_json::from_str(&encoded).unwrap();
+            decoded.validate_for_read().unwrap();
+            decoded.validate_for_projection().unwrap();
+            assert_eq!(decoded, fixture);
+        }
+    }
+
+    #[test]
+    fn v4_native_identical_successes_remain_an_auditable_failure() {
+        let mut fixture = native_row(3, &['a', 'a', 'a']);
+        fixture.series.outcome = SeriesOutcome::NoResult;
+        fixture.series.result = Some(ObservedResult::InsufficientDiversity);
+        fixture.series.failure_class = Some(FailureClass::NoResult);
+        fixture.validate_for_write().unwrap();
+        let evidence = fixture.series.native_evidence.as_ref().unwrap();
+        assert_eq!(evidence.diversity.distinct, 1);
+        assert_eq!(evidence.diversity.min_distinct, 2);
+        assert_eq!(evidence.attempts.len(), 3);
+    }
+
+    #[test]
+    fn v4_native_refuses_missing_partial_reordered_and_contradictory_evidence() {
+        let mut missing = native_row(3, &['a', 'b', 'a']);
+        missing.series.native_evidence = None;
+        assert!(
+            missing
+                .validate_for_write()
+                .unwrap_err()
+                .contains("omitted native_evidence")
+        );
+
+        let mut partial = native_row(3, &['a', 'b', 'a']);
+        partial
+            .series
+            .native_evidence
+            .as_mut()
+            .unwrap()
+            .attempts
+            .pop();
+        assert!(
+            partial
+                .validate_for_write()
+                .unwrap_err()
+                .contains("exactly diversity.runs")
+        );
+
+        let mut reordered = native_row(3, &['a', 'b', 'a']);
+        reordered
+            .series
+            .native_evidence
+            .as_mut()
+            .unwrap()
+            .attempts
+            .swap(0, 1);
+        assert!(
+            reordered
+                .validate_for_write()
+                .unwrap_err()
+                .contains("preserve order")
+        );
+
+        let mut understated = native_row(3, &['a', 'b', 'a']);
+        understated
+            .series
+            .native_evidence
+            .as_mut()
+            .unwrap()
+            .diversity
+            .distinct = 1;
+        assert!(
+            understated
+                .validate_for_write()
+                .unwrap_err()
+                .contains("distinct observation hashes")
+        );
+
+        let false_pass = native_row(3, &['a', 'a', 'a']);
+        assert!(
+            false_pass
+                .validate_for_write()
+                .unwrap_err()
+                .contains("contradict the outer")
+        );
+
+        let encoded = serde_json::to_value(native_row(3, &['a', 'b', 'a'])).unwrap();
+        for field in ["status", "signal"] {
+            let mut missing_required_null = encoded.clone();
+            missing_required_null["series"]["native_evidence"]["attempts"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            let error = serde_json::from_value::<SeriesRow>(missing_required_null).unwrap_err();
+            assert!(
+                error.to_string().contains("missing field"),
+                "missing {field} was not refused: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn v4_non_native_forbids_native_evidence_and_legacy_native_is_read_only() {
+        let mut non_native = native_row(3, &['a', 'b', 'a']);
+        non_native.series.cell = "fixture/test/verify/ptrace".into();
+        assert!(
+            non_native
+                .validate_for_write()
+                .unwrap_err()
+                .contains("only for a naked/native")
+        );
+
+        let mut non_native_diversity = native_row(3, &['a', 'a', 'a']);
+        non_native_diversity.series.cell = "fixture/test/verify/ptrace".into();
+        non_native_diversity.series.native_evidence = None;
+        non_native_diversity.series.outcome = SeriesOutcome::NoResult;
+        non_native_diversity.series.result = Some(ObservedResult::InsufficientDiversity);
+        non_native_diversity.series.failure_class = Some(FailureClass::NoResult);
+        assert!(
+            non_native_diversity
+                .validate_for_write()
+                .unwrap_err()
+                .contains("only for a naked/native")
+        );
+
+        let mut legacy = native_row(3, &['a', 'b', 'a']);
+        legacy.schema = SeriesSchema::V3;
+        legacy.series.native_evidence = None;
+        legacy.validate_for_read().unwrap();
+        legacy.validate_for_projection().unwrap();
+        assert!(
+            legacy
+                .validate_for_write()
+                .unwrap_err()
+                .contains("must use stress-series/v4")
+        );
     }
 
     #[test]
@@ -1382,7 +1748,7 @@ mod tests {
         retained_v2.validate_for_projection().unwrap();
         assert_eq!(
             retained_v2.validate_for_write().unwrap_err(),
-            "new rows must use stress-series/v3, got stress-series/v2"
+            "new rows must use stress-series/v3 or stress-series/v4, got stress-series/v2"
         );
     }
 
