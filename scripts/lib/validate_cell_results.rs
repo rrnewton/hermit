@@ -21,6 +21,7 @@ use hermit_manifest_plan::ledger::ComparisonSpec;
 use hermit_manifest_plan::ledger::ComparisonTier;
 use hermit_manifest_plan::ledger::RequiredNullable;
 use hermit_manifest_plan::runner::outcome_after_retries;
+use hermit_manifest_plan::runner::CELL_RESULT_SCHEMA;
 use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
@@ -624,13 +625,13 @@ pub fn retain(
     let mut observations = BTreeSet::new();
     let mut attempt_rows: BTreeMap<CellIdentity, Vec<(u64, Value)>> = BTreeMap::new();
     for (file, line_number, row) in read_result_rows(result_root)? {
-            if row.get("schema").and_then(Value::as_u64) != Some(4)
+            if row.get("schema").and_then(Value::as_u64) != Some(CELL_RESULT_SCHEMA)
                 || string(&row, "hermit_sha")? != commit
                 || row.get("source_tree_dirty").and_then(Value::as_bool) != Some(false)
             {
                 return Err(format!(
-                    "{}:{line_number} is not an exact clean schema-4 cell result for {commit}",
-                    file.display()
+                    "{}:{line_number} is not an exact clean schema-{CELL_RESULT_SCHEMA} cell result for {commit}",
+                    file.display(),
                 ));
             }
             require_current_timeout_policy(&row)
@@ -855,7 +856,7 @@ mod tests {
     fn result_row(run_id: &str, commit: &str) -> Value {
         let matched = report("matched", "info");
         serde_json::json!({
-            "schema": 4,
+            "schema": CELL_RESULT_SCHEMA,
             "run_id": run_id,
             "hermit_sha": commit,
             "source_tree_dirty": false,
