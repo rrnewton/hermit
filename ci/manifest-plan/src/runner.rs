@@ -3387,9 +3387,10 @@ pub fn run_cell(context: &RunContext, cell: &SelectedCell) -> Result<CellResult,
         error_kind = Some("infrastructure".into());
         reason = Some("Hermit binary changed while the cell was executing".into());
     }
-    let result = if naked_minimum.is_some_and(|minimum| {
-        attempts.iter().all(|attempt| attempt.outcome == "PASS") && distinct < minimum
-    }) {
+    let result = if outcome == "FAIL"
+        && naked_minimum.is_some_and(|minimum| {
+            attempts.iter().all(|attempt| attempt.outcome == "PASS") && distinct < minimum
+        }) {
         Some(ObservedResult::InsufficientDiversity)
     } else {
         observed_result(&cell.id.mode, &outcome, &attempts, error_kind.as_deref())
@@ -8175,6 +8176,79 @@ backends_disabled:
                 "distinct": 1,
             }))
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn naked_binary_change_overrides_insufficient_diversity() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-native-binary-change-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let hermit_bin = root.join("hermit");
+        fs::write(&hermit_bin, b"before").unwrap();
+        let program = root.join("fixture.sh");
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  --prepare) : ;;\n  --run) printf changed >> {:?}; printf 'same\\n' ;;\n  *) exit 64 ;;\nesac\n",
+                hermit_bin
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).unwrap();
+
+        let mut test = recipe(true);
+        test.id = "fixture/native-binary-change".into();
+        test.program = Some("fixture.sh".into());
+        test.direct = None;
+        let mut mode = test.modes.remove("verify").unwrap();
+        mode.runs = Some(3);
+        mode.assert = Some(Assertions {
+            min_distinct: Some(2),
+            ..Assertions::default()
+        });
+        test.modes.insert("naked".into(), mode);
+        let cell = SelectedCell {
+            category: "fixture".into(),
+            id: CellId {
+                test: test.id.clone(),
+                mode: "naked".into(),
+                backend: None,
+            },
+            test,
+            enabled: true,
+            timeout_seconds: 2,
+            cpu_timeout_seconds: 1,
+        };
+        let result = run_cell(&run_context(&root), &cell).unwrap();
+        assert_eq!(result.outcome, "ERROR");
+        assert_eq!(result.result, None);
+        assert_eq!(
+            result.failure_class,
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+        assert_eq!(result.error_kind.as_deref(), Some("infrastructure"));
+        assert_eq!(result.attempts.len(), 3);
+        assert!(
+            result
+                .attempts
+                .iter()
+                .all(|attempt| attempt.outcome == "PASS")
+        );
+        assert_eq!(
+            result.diversity,
+            Some(serde_json::json!({
+                "runs": 3,
+                "min_distinct": 2,
+                "distinct": 1,
+            }))
+        );
+        result.require_current_classification().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

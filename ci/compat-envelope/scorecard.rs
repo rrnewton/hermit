@@ -68,6 +68,7 @@ const CELLS: &str = "ci/compat-envelope/cells.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SCHEMA: u64 = 7;
 const PRESSURE_SUMMARY_SCHEMA: u64 = 5;
+const LEGACY_CELL_RESULT_SCHEMA: u64 = 4;
 const CELL_RESULT_SCHEMA: u64 = 5;
 const SCORECARD_SERIES_SNAPSHOT_SCHEMA: &str = "scorecard-series-snapshot/v1";
 const SCORECARD_SERIES_SNAPSHOT_SOURCE: &str = "series";
@@ -2055,7 +2056,12 @@ struct Derived {
 }
 
 fn retained_import_cells(derived: &Derived) -> BTreeSet<CellId> {
-    derived.enabled.clone()
+    derived
+        .enabled
+        .iter()
+        .filter(|id| !is_naked_native(id))
+        .cloned()
+        .collect()
 }
 
 #[derive(Clone)]
@@ -7703,15 +7709,18 @@ fn read_retained_results(
             rows_scanned += 1;
             let raw: JsonValue = serde_json::from_str(line)
                 .map_err(|e| format!("invalid JSON at {}:{}: {e}", path.display(), index + 1))?;
-            // Retained history includes older result schemas. They cannot carry
-            // the complete invocation and comparison receipt required here, so
-            // they are outside this import rather than malformed current rows.
-            if raw.get("schema").and_then(JsonValue::as_u64) != Some(CELL_RESULT_SCHEMA) {
+            // Schema 4 remains complete comparison evidence for non-native
+            // rows. Schema 5 adds native diversity, but that does not invalidate
+            // the historical Hermit-backend observations imported here.
+            let Some(schema) = raw.get("schema").and_then(JsonValue::as_u64) else {
+                continue;
+            };
+            if !matches!(schema, LEGACY_CELL_RESULT_SCHEMA | CELL_RESULT_SCHEMA) {
                 continue;
             }
             let mut row: ResultRow = serde_json::from_value(raw).map_err(|e| {
                 format!(
-                    "invalid schema-{CELL_RESULT_SCHEMA} row at {}:{}: {e}",
+                    "invalid schema-{schema} row at {}:{}: {e}",
                     path.display(),
                     index + 1
                 )
@@ -10655,9 +10664,14 @@ red/`measured-and-passed` count is **0**.",
         return Err("an empty current pressure summary was accepted".into());
     }
 
+    let native_import_id = CellId {
+        mode: "naked".into(),
+        backend: "native".into(),
+        ..validate_id.clone()
+    };
     let red_import_fixture = Derived {
-        population: BTreeSet::from([validate_id.clone()]),
-        enabled: BTreeSet::from([validate_id.clone()]),
+        population: BTreeSet::from([validate_id.clone(), native_import_id.clone()]),
+        enabled: BTreeSet::from([validate_id.clone(), native_import_id]),
         ci_disabled_reasons: BTreeMap::new(),
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
@@ -10665,7 +10679,10 @@ red/`measured-and-passed` count is **0**.",
         selected_custom: BTreeSet::new(),
     };
     if retained_import_cells(&red_import_fixture) != BTreeSet::from([validate_id.clone()]) {
-        return Err("an enabled red cell was excluded from retained import".into());
+        return Err(
+            "retained import did not preserve the enabled Hermit cell while excluding native"
+                .into(),
+        );
     }
 
     let rows = BTreeMap::from([(
@@ -12293,6 +12310,21 @@ red/`measured-and-passed` count is **0**.",
         return Err(format!(
             "import-results did not admit canonical replay evidence with real time: {:?}",
             String::from_utf8_lossy(&imported.stderr)
+        ));
+    }
+    restore_generated()?;
+
+    let mut historical_replay_row = replay_row.clone();
+    historical_replay_row.schema = LEGACY_CELL_RESULT_SCHEMA;
+    historical_replay_row.run_id = "result-command-schema-4-replay".into();
+    write_result_row(&historical_replay_row)?;
+    let imported_historical = run_result_command("import-results", Some(&current_summary))?;
+    if !imported_historical.status.success()
+        || !has_current_replay(&read_json(&result_command_root.join(CELLS))?)
+    {
+        return Err(format!(
+            "import-results discarded historical schema-4 non-native evidence: {:?}",
+            String::from_utf8_lossy(&imported_historical.stderr)
         ));
     }
     restore_generated()?;

@@ -228,11 +228,11 @@ nonzero; neither path commits the generated files.
 An off-the-record local validate still adds any clean exact-HEAD per-cell
 observations. Those observations cannot qualify a receipt, and the scorecard
 writer cannot change which cells are selected or move their green/red state.
-`import-results` walks retained history without executing a guest, keeps only
-clean schema-4 `BitwiseInfoV1` terminal comparisons from commits on `HEAD`'s
-history, and selects the newest such commit independently for every enabled
-cell. If several retained runs at that commit disagree, it imports every result
-instead of resolving the conflict by file order.
+`import-results` walks retained history without executing a guest, keeps clean
+schema-4 and schema-5 non-native `BitwiseInfoV1` terminal comparisons from
+commits on `HEAD`'s history, and selects the newest such commit independently
+for every enabled cell. If several retained runs at that commit disagree, it
+imports every result instead of resolving the conflict by file order.
 
 A retained comparison without a divergence position is imported as historical
 evidence with its own SHA. A retained position is handled only after a current
