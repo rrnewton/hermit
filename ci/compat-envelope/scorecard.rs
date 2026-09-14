@@ -45,6 +45,10 @@ use hermit_manifest_plan::stress_series::SeriesAttemptDisposition;
 use hermit_manifest_plan::stress_series::SeriesCoordinates;
 use hermit_manifest_plan::stress_series::SeriesNoVerdictEvidence;
 use hermit_manifest_plan::stress_series::SeriesNoVerdictKind;
+use hermit_manifest_plan::stress_series::SeriesNativeAttempt;
+use hermit_manifest_plan::stress_series::SeriesNativeAttemptOutcome;
+use hermit_manifest_plan::stress_series::SeriesNativeDiversity;
+use hermit_manifest_plan::stress_series::SeriesNativeEvidence;
 use hermit_manifest_plan::stress_series::SeriesOutcome;
 use hermit_manifest_plan::stress_series::SeriesPayload;
 use hermit_manifest_plan::stress_series::SeriesProducer;
@@ -14611,10 +14615,11 @@ red/`measured-and-passed` count is **0**.",
     };
 
     // Native attempt/diversity evidence belongs to the canonical series; the
-    // legacy cells.json observation shape cannot represent it. Exclude every
-    // schema and outcome uniformly. In particular, admitting only PASS while
-    // dropping a diversity failure, timeout, or no-result row would make the
-    // legacy projection less honest than the canonical series.
+    // legacy cells.json observation shape cannot represent it. Exclude both
+    // current v4 evidence and historical rows that cannot prove diversity. In
+    // particular, admitting only PASS while dropping a diversity failure,
+    // timeout, or no-result row would make the legacy projection less honest
+    // than the canonical series.
     let mut native_cell = boundary_cell(Vec::new(), CellStatus::Red);
     native_cell.id.mode = "naked".into();
     native_cell.id.backend = "native".into();
@@ -14623,7 +14628,7 @@ red/`measured-and-passed` count is **0**.",
         projection: None,
         cells: vec![boundary_cell(Vec::new(), CellStatus::Green), native_cell],
     };
-    let native_pass = series_row(
+    let mut native_pass = series_row(
         "fixture/boundary/naked/native",
         SeriesOutcome::Passed,
         SeriesProducer::Validate,
@@ -14631,17 +14636,56 @@ red/`measured-and-passed` count is **0**.",
         None,
         None,
     );
-    // Until the next schema carries the inner hashes, the producer's failed
-    // outer result is the only retained statement that successful attempts did
-    // not meet the declared diversity requirement.
-    let native_failed_diversity = series_row(
+    native_pass.schema = SeriesSchema::V4;
+    native_pass.series.attempt = Some(1);
+    native_pass.series.native_evidence = Some(SeriesNativeEvidence {
+        attempts: ['a', 'b', 'a']
+            .into_iter()
+            .enumerate()
+            .map(|(offset, hash)| SeriesNativeAttempt {
+                index: offset as u64 + 1,
+                outcome: SeriesNativeAttemptOutcome::Pass,
+                status: Some(0),
+                signal: None,
+                timed_out: false,
+                observation_sha256: hash.to_string().repeat(64),
+            })
+            .collect(),
+        diversity: SeriesNativeDiversity {
+            runs: 3,
+            min_distinct: 2,
+            distinct: 2,
+        },
+    });
+    let mut native_failed_diversity = series_row(
         "fixture/boundary/naked/native",
-        SeriesOutcome::Errored,
+        SeriesOutcome::NoResult,
         SeriesProducer::Validate,
         1,
         None,
         None,
     );
+    native_failed_diversity.schema = SeriesSchema::V4;
+    native_failed_diversity.series.result = Some(ObservedResult::InsufficientDiversity);
+    native_failed_diversity.series.failure_class = Some(FailureClass::NoResult);
+    native_failed_diversity.series.attempt = Some(1);
+    native_failed_diversity.series.native_evidence = Some(SeriesNativeEvidence {
+        attempts: (1..=3)
+            .map(|index| SeriesNativeAttempt {
+                index,
+                outcome: SeriesNativeAttemptOutcome::Pass,
+                status: Some(0),
+                signal: None,
+                timed_out: false,
+                observation_sha256: "a".repeat(64),
+            })
+            .collect(),
+        diversity: SeriesNativeDiversity {
+            runs: 3,
+            min_distinct: 2,
+            distinct: 1,
+        },
+    });
     let native_timeout = series_row(
         "fixture/boundary/naked/native",
         SeriesOutcome::Timeout,
@@ -14702,11 +14746,18 @@ red/`measured-and-passed` count is **0**.",
         || native_outcome.runs != 1
         || native_projection.cells.len() != 2
         || native_outcome.skipped.len() != 6
-        || !native_outcome.skipped.iter().all(|line| {
-            line.contains(
-                "naked/native evidence is canonical-series-only and is not projected into legacy cells.json observations",
-            )
-        })
+        || native_outcome
+            .skipped
+            .iter()
+            .filter(|line| line.contains("canonical-series-only"))
+            .count()
+            != 2
+        || native_outcome
+            .skipped
+            .iter()
+            .filter(|line| line.contains("does not retain ordered attempts and diversity"))
+            .count()
+            != 4
         || !native_projection.cells[1].observations.is_empty()
         || native_projection.cells[1].last_tested.is_some()
         || native_projection.cells[1].measurement != MeasurementState::NeverMeasured
@@ -14747,7 +14798,7 @@ red/`measured-and-passed` count is **0**.",
         .map_err(|error| format!("cannot re-encode native-only atomicity fixture: {error}"))?;
     if !native_only_error.contains("every one of the 1 readable series row(s) determined nothing")
         || !native_only_error.contains(
-            "naked/native evidence is canonical-series-only and is not projected into legacy cells.json observations",
+            "historical naked/native row does not retain ordered attempts and diversity",
         )
         || native_only_after != native_only_before
     {
