@@ -3,7 +3,8 @@
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
 
-//! Tool identity, configuration schema and effective logging directives carried
+//! The shared CLI logging filter policy and the tool identity, configuration
+//! schema and effective logging directives carried
 //! by the LiteInst bootstrap. The payload is schema-validated and its config
 //! fingerprint is compared; it is not cryptographically authenticated.
 //! The host resolves the environment once;
@@ -262,6 +263,9 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
         use std::process::Command;
+        use std::process::Stdio;
+        use std::time::Duration;
+        use std::time::Instant;
 
         for value in [
             None,
@@ -285,7 +289,18 @@ mod tests {
             if let Some(value) = &value {
                 child.env(EnvFilter::DEFAULT_ENV, value);
             }
-            let output = child.output().unwrap();
+            child.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let mut child = child.spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let output = child.wait_with_output().unwrap();
+                    panic!("filter child exceeded ten seconds: {value:?}: {output:?}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
             assert!(output.status.success(), "{value:?}: {output:?}");
             assert!(
                 String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),

@@ -1531,6 +1531,8 @@ fn known_teardown_defects_abort_on_new_span_and_dynamic_filter() {
     for (case, diagnostic) in [
         (
             "new-span",
+            // sharded-slab 0.1.7, shard.rs:295. Reassess this known defect
+            // after a dependency update; complete records remain the goal.
             "Thread count overflowed the configured max count.",
         ),
         (
