@@ -47,6 +47,9 @@ use hermit_manifest_plan::stress_series::SeriesNoVerdictEvidence;
 use hermit_manifest_plan::stress_series::SeriesNoVerdictKind;
 use hermit_manifest_plan::stress_series::SeriesOutcome;
 use hermit_manifest_plan::stress_series::SeriesPayload;
+use hermit_manifest_plan::stress_series::SeriesPressureAttempt;
+use hermit_manifest_plan::stress_series::SeriesPressureComparison;
+use hermit_manifest_plan::stress_series::SeriesPressureEvidence;
 use hermit_manifest_plan::stress_series::SeriesProducer;
 use hermit_manifest_plan::stress_series::SeriesRow;
 use hermit_manifest_plan::stress_series::SeriesSchema;
@@ -5269,7 +5272,8 @@ where
     // its stored representation. Exactly represented events are suppressed in
     // favour of the richer direct invocation; zero matches remain explicit
     // pre-series evidence, while conflicting or multiple matches refuse.
-    let representation = direct_representation(&tracked, &snapshot.rows)?;
+    let current_invocations = current_result_explicit_invocations(&result_rows, &detcore_tree)?;
+    let representation = direct_representation(&tracked, &snapshot.rows, &current_invocations)?;
     remove_replaceable_projected_observations(
         &mut tracked,
         &snapshot.rows,
@@ -5539,16 +5543,41 @@ struct DirectEvidenceKey {
     kind: DirectEvidenceKind,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ExplicitInvocationIdentity {
+    base: DirectEvidenceBase,
+    attempt: u64,
+    evidence_sha256: String,
+}
+
+type ExplicitInvocationResults =
+    BTreeMap<ExplicitInvocationIdentity, BTreeMap<Option<ObservedResult>, usize>>;
+
+#[derive(Debug)]
+struct DirectEvidenceIndex {
+    keys: BTreeMap<DirectEvidenceKey, usize>,
+    explicit_invocations: ExplicitInvocationResults,
+    opaque: bool,
+}
+
+#[derive(Debug)]
+struct SourceDirectEvidence {
+    base: DirectEvidenceBase,
+    key: Option<DirectEvidenceKey>,
+    explicit_invocation: Option<ExplicitInvocationIdentity>,
+    result: Option<ObservedResult>,
+    event_id: String,
+}
+
 #[derive(Debug)]
 struct DirectRepresentation {
     represented_event_ids: BTreeSet<String>,
     has_unrepresented_direct_evidence: bool,
 }
 
-fn direct_evidence_keys(
-    tracked: &TrackedCells,
-) -> Result<(BTreeMap<DirectEvidenceKey, usize>, bool), String> {
+fn direct_evidence_index(tracked: &TrackedCells) -> Result<DirectEvidenceIndex, String> {
     let mut counts = BTreeMap::<DirectEvidenceKey, usize>::new();
+    let mut explicit_invocations = ExplicitInvocationResults::new();
     let mut opaque = false;
     for cell in &tracked.cells {
         let cell_name = series_cell_key(&cell.id);
@@ -5560,14 +5589,15 @@ fn direct_evidence_keys(
             let mut represented_results = BTreeSet::new();
             let mut units = 0usize;
             for comparison in &observation.canonical_comparisons {
+                let base = DirectEvidenceBase {
+                    cell: cell_name.clone(),
+                    identity: identity.clone(),
+                    provenance: observation.provenance,
+                    hermit_sha: comparison.hermit_sha.clone(),
+                    run_id: comparison.run_id.clone(),
+                };
                 let key = DirectEvidenceKey {
-                    base: DirectEvidenceBase {
-                        cell: cell_name.clone(),
-                        identity: identity.clone(),
-                        provenance: observation.provenance,
-                        hermit_sha: comparison.hermit_sha.clone(),
-                        run_id: comparison.run_id.clone(),
-                    },
+                    base,
                     kind: DirectEvidenceKind::Result(comparison.result),
                 };
                 *counts.entry(key).or_default() += 1;
@@ -5586,11 +5616,22 @@ fn direct_evidence_keys(
                     run_id: invocation.run_id.clone(),
                 };
                 let kind = match (invocation.attempt, invocation.evidence_sha256.as_ref()) {
-                    (Some(attempt), Some(evidence_sha256)) => DirectEvidenceKind::ExactInvocation {
-                        attempt,
-                        evidence_sha256: evidence_sha256.clone(),
-                        result: invocation.result,
-                    },
+                    (Some(attempt), Some(evidence_sha256)) => {
+                        *explicit_invocations
+                            .entry(ExplicitInvocationIdentity {
+                                base: base.clone(),
+                                attempt,
+                                evidence_sha256: evidence_sha256.clone(),
+                            })
+                            .or_default()
+                            .entry(invocation.result)
+                            .or_default() += 1;
+                        DirectEvidenceKind::ExactInvocation {
+                            attempt,
+                            evidence_sha256: evidence_sha256.clone(),
+                            result: invocation.result,
+                        }
+                    }
                     (None, None) => {
                         let Some(result) = invocation.result else {
                             opaque = true;
@@ -5622,13 +5663,62 @@ fn direct_evidence_keys(
     // observation. Keep that multiplicity so the caller can refuse only when
     // a snapshot event actually claims the ambiguous base; unrelated history
     // remains opaque evidence rather than disabling every combined write.
-    Ok((counts, opaque))
+    Ok(DirectEvidenceIndex {
+        keys: counts,
+        explicit_invocations,
+        opaque,
+    })
 }
 
-fn source_direct_evidence_key(
+fn current_result_explicit_invocations(
+    rows: &BTreeMap<CellId, Vec<ResultCandidate>>,
+    detcore_tree: &str,
+) -> Result<ExplicitInvocationResults, String> {
+    let mut invocations = ExplicitInvocationResults::new();
+    for (id, candidates) in rows {
+        for candidate in candidates {
+            let evidence = candidate
+                .row
+                .comparison_evidence()
+                .map_err(|error| format!("{} {error}", display_id(id)))?;
+            let result = match &evidence {
+                ValidateRowEvidence::Matched { .. } => Some(ObservedResult::Pass),
+                ValidateRowEvidence::Diverged { .. } => Some(if candidate.row.mode == "replay" {
+                    ObservedResult::ReplayFailure
+                } else {
+                    ObservedResult::DeterminismFailure
+                }),
+                ValidateRowEvidence::NotRun { result, .. }
+                | ValidateRowEvidence::Unavailable { result, .. } => *result,
+            };
+            let identity = ExplicitInvocationIdentity {
+                base: DirectEvidenceBase {
+                    cell: series_cell_key(id),
+                    identity: SeriesObservationIdentity::DetcoreTree(detcore_tree.to_string()),
+                    provenance: ObservationProvenance::Validate,
+                    hermit_sha: candidate.row.hermit_sha.clone(),
+                    run_id: candidate.row.run_id.clone(),
+                },
+                attempt: candidate.row.attempt,
+                evidence_sha256: candidate.evidence_identity.clone(),
+            };
+            // Byte-identical repeated rows describe one immutable invocation.
+            // Conflicting classifications retain distinct map keys and are
+            // refused by reconciliation (or earlier by the result fold).
+            invocations
+                .entry(identity)
+                .or_default()
+                .entry(result)
+                .or_insert(1);
+        }
+    }
+    Ok(invocations)
+}
+
+fn source_direct_evidence(
     row: &SeriesRow,
     tracked: &TrackedCells,
-) -> Result<Option<(DirectEvidenceBase, Option<DirectEvidenceKey>)>, String> {
+) -> Result<Option<SourceDirectEvidence>, String> {
     if row.validate_for_projection().is_err() {
         return Ok(None);
     }
@@ -5669,36 +5759,151 @@ fn source_direct_evidence_key(
     } else {
         None
     };
-    Ok(Some((
-        base.clone(),
-        kind.map(|kind| DirectEvidenceKey { base, kind }),
-    )))
+    let evidence_sha256 = row
+        .series
+        .no_verdict_evidence
+        .as_ref()
+        .map(|evidence| evidence.evidence_sha256.as_str())
+        .or_else(|| {
+            row.series
+                .pressure_evidence
+                .as_ref()
+                .map(|evidence| evidence.evidence_sha256.as_str())
+        });
+    let explicit_invocation =
+        row.series
+            .attempt
+            .zip(evidence_sha256)
+            .map(|(attempt, evidence_sha256)| ExplicitInvocationIdentity {
+                base: base.clone(),
+                attempt,
+                evidence_sha256: evidence_sha256.to_string(),
+            });
+    Ok(Some(SourceDirectEvidence {
+        base: base.clone(),
+        key: kind.map(|kind| DirectEvidenceKey { base, kind }),
+        explicit_invocation,
+        result: evidence.result,
+        event_id: row.event_id.clone(),
+    }))
 }
 
 fn direct_representation(
     tracked: &TrackedCells,
     rows: &[SeriesRow],
+    current_invocations: &ExplicitInvocationResults,
 ) -> Result<DirectRepresentation, String> {
-    let (direct, opaque) = direct_evidence_keys(tracked)?;
-    let mut source =
-        BTreeMap::<DirectEvidenceBase, Vec<(Option<DirectEvidenceKey>, String)>>::new();
+    let mut direct = direct_evidence_index(tracked)?;
+    for (identity, results) in current_invocations {
+        let retained = direct
+            .explicit_invocations
+            .entry(identity.clone())
+            .or_default();
+        for (result, count) in results {
+            // The direct fold retains exact no-verdict invocations itself.
+            // Merge the same current result identity without counting that
+            // second storage view as a second invocation.
+            retained.entry(*result).or_insert(*count);
+        }
+    }
+    let mut source = BTreeMap::<DirectEvidenceBase, Vec<SourceDirectEvidence>>::new();
     for row in rows {
-        let Some((base, key)) = source_direct_evidence_key(row, tracked)? else {
+        let Some(claim) = source_direct_evidence(row, tracked)? else {
             continue;
         };
-        source
-            .entry(base)
-            .or_default()
-            .push((key, row.event_id.clone()));
+        source.entry(claim.base.clone()).or_default().push(claim);
+    }
+
+    let mut source_explicit =
+        BTreeMap::<ExplicitInvocationIdentity, Vec<&SourceDirectEvidence>>::new();
+    for claim in source.values().flatten() {
+        if let Some(identity) = &claim.explicit_invocation {
+            source_explicit
+                .entry(identity.clone())
+                .or_default()
+                .push(claim);
+        }
+    }
+    let mut explicitly_matched_event_ids = BTreeSet::new();
+    for (identity, claims) in source_explicit {
+        if claims.len() != 1 {
+            return Err(format!(
+                "{} series events claim one explicit invocation identity for run {} attempt {} at {}",
+                claims.len(),
+                identity.base.run_id,
+                identity.attempt,
+                identity.base.hermit_sha
+            ));
+        }
+        let Some(direct_results) = direct.explicit_invocations.get(&identity) else {
+            continue;
+        };
+        let direct_count = direct_results.values().sum::<usize>();
+        if direct_count != 1 || direct_results.len() != 1 {
+            return Err(format!(
+                "series event {} claims an explicit invocation identity with {direct_count} retained direct records for run {} attempt {} at {}",
+                claims[0].event_id,
+                identity.base.run_id,
+                identity.attempt,
+                identity.base.hermit_sha
+            ));
+        }
+        let direct_result = *direct_results
+            .keys()
+            .next()
+            .expect("one direct invocation result exists");
+        if claims[0].result != direct_result {
+            return Err(format!(
+                "series event {} and retained direct evidence disagree for explicit invocation run {} attempt {} at {}: series={:?}, direct={direct_result:?}",
+                claims[0].event_id,
+                identity.base.run_id,
+                identity.attempt,
+                identity.base.hermit_sha,
+                claims[0].result
+            ));
+        }
+        explicitly_matched_event_ids.insert(claims[0].event_id.clone());
     }
 
     let mut represented_event_ids = BTreeSet::new();
     let mut represented_direct = BTreeSet::new();
-    for (direct_key, direct_count) in &direct {
+    for (direct_key, direct_count) in &direct.keys {
         let candidates = source
             .get(&direct_key.base)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        let candidates = candidates
+            .iter()
+            .filter(|candidate| match &direct_key.kind {
+                DirectEvidenceKind::Result(result) => {
+                    candidate.explicit_invocation.is_none()
+                        // Pressure rows add an exact source digest, but legacy
+                        // pressure observations retain only their compact
+                        // run/result key. Keep that compact match (and its
+                        // duplicate-count refusal) instead of treating the
+                        // additive digest as proof that no legacy key applies.
+                        || matches!(
+                            candidate.key.as_ref(),
+                            Some(DirectEvidenceKey {
+                                kind: DirectEvidenceKind::Result(_),
+                                ..
+                            })
+                        )
+                        || (explicitly_matched_event_ids.contains(&candidate.event_id)
+                            && candidate.result == Some(*result))
+                }
+                DirectEvidenceKind::ExactInvocation {
+                    attempt,
+                    evidence_sha256,
+                    ..
+                } => candidate
+                    .explicit_invocation
+                    .as_ref()
+                    .is_some_and(|identity| {
+                        identity.attempt == *attempt && identity.evidence_sha256 == *evidence_sha256
+                    }),
+            })
+            .collect::<Vec<_>>();
         if !candidates.is_empty() && *direct_count != 1 {
             return Err(format!(
                 "series evidence claims direct run {} at {}, but the retained scorecard has {direct_count} records for that exact identity",
@@ -5707,7 +5912,7 @@ fn direct_representation(
         }
         let exact = candidates
             .iter()
-            .filter(|(candidate, _)| candidate.as_ref() == Some(direct_key))
+            .filter(|candidate| candidate.key.as_ref() == Some(direct_key))
             .collect::<Vec<_>>();
         match exact.as_slice() {
             [] if candidates.is_empty() => {}
@@ -5717,10 +5922,11 @@ fn direct_representation(
                     direct_key.base.run_id, direct_key.base.hermit_sha
                 ));
             }
-            [(_, event_id)] => {
-                if !represented_event_ids.insert(event_id.clone()) {
+            [claim] => {
+                if !represented_event_ids.insert(claim.event_id.clone()) {
                     return Err(format!(
-                        "series event {event_id} maps to more than one exact direct result"
+                        "series event {} maps to more than one exact direct result",
+                        claim.event_id
                     ));
                 }
                 represented_direct.insert(direct_key.clone());
@@ -5737,7 +5943,8 @@ fn direct_representation(
     }
     Ok(DirectRepresentation {
         represented_event_ids,
-        has_unrepresented_direct_evidence: opaque || represented_direct.len() != direct.len(),
+        has_unrepresented_direct_evidence: direct.opaque
+            || represented_direct.len() != direct.keys.len(),
     })
 }
 
@@ -6778,6 +6985,7 @@ impl HeldScorecardSeriesSnapshot {
         }
         let parent = path
             .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
         let parent_file = OpenOptions::new()
@@ -6802,7 +7010,11 @@ impl HeldScorecardSeriesSnapshot {
         }
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            // Opening a FIFO read-only blocks until a writer arrives. This
+            // runs while holding the repository scorecard lock, so make the
+            // descriptor acquisition itself nonblocking and reject every
+            // non-regular type immediately from descriptor metadata below.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(|error| {
                 format!(
@@ -10655,6 +10867,55 @@ red/`measured-and-passed` count is **0**.",
         }
         child.output().map_err(|e| e.to_string())
     };
+    let run_bounded_combined_command = |snapshot: &Path,
+                                        snapshot_sha256: &str|
+     -> Result<(std::process::Output, Duration), String> {
+        let started = Instant::now();
+        let mut child = Command::new(&executable)
+            .arg("project-and-observe-results")
+            .arg("--snapshot")
+            .arg(snapshot)
+            .arg("--snapshot-sha256")
+            .arg(snapshot_sha256)
+            .arg("--results")
+            .arg(&result_root)
+            .arg("--expected-head")
+            .arg(&fixture_head)
+            .arg("--refreshed-at")
+            .arg("fixture-refresh")
+            .current_dir(&result_command_root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("cannot start bounded combined writer: {error}"))?;
+        loop {
+            if child
+                .try_wait()
+                .map_err(|error| format!("cannot inspect bounded combined writer: {error}"))?
+                .is_some()
+            {
+                let elapsed = started.elapsed();
+                let output = child
+                    .wait_with_output()
+                    .map_err(|error| format!("cannot collect bounded combined writer: {error}"))?;
+                return Ok((output, elapsed));
+            }
+            if started.elapsed() >= Duration::from_secs(5) {
+                child.kill().map_err(|error| {
+                    format!("cannot stop hung combined writer after 5s: {error}")
+                })?;
+                let output = child.wait_with_output().map_err(|error| {
+                    format!("cannot collect hung combined writer after 5s: {error}")
+                })?;
+                return Err(format!(
+                    "combined writer exceeded its external 5s bound: status={} stderr={:?}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
     let has_current_replay = |cells: &TrackedCells| {
         cells.cells.iter().any(|cell| {
             cell.id == replay_id
@@ -10940,6 +11201,56 @@ red/`measured-and-passed` count is **0**.",
         );
     }
 
+    // Snapshot acquisition happens under the scorecard write lock. A FIFO
+    // must therefore refuse without waiting for a peer, release the lock, and
+    // leave both generated outputs intact. The immediately following regular
+    // file invocation is deliberately an actual CLI call with a bare relative
+    // filename: it proves both that the lock was released and that `parent()`'s
+    // empty component is normalized to the current directory.
+    let before_snapshot_kind_checks = read_generated_files(&result_command_root)?;
+    let fifo_snapshot_path = snapshot_root.join("blocked-snapshot.fifo");
+    let mkfifo = Command::new("mkfifo")
+        .arg(&fifo_snapshot_path)
+        .status()
+        .map_err(|error| format!("cannot start mkfifo for combined snapshot fixture: {error}"))?;
+    if !mkfifo.success() {
+        return Err(format!(
+            "cannot create combined snapshot FIFO fixture: {mkfifo}"
+        ));
+    }
+    let (fifo_output, fifo_elapsed) =
+        run_bounded_combined_command(&fifo_snapshot_path, &wrong_digest)?;
+    if fifo_output.status.success()
+        || fifo_elapsed >= Duration::from_secs(2)
+        || !String::from_utf8_lossy(&fifo_output.stderr).contains("not a regular file")
+        || read_generated_files(&result_command_root)? != before_snapshot_kind_checks
+    {
+        return Err(format!(
+            "combined FIFO snapshot did not refuse promptly and leave its generated pair unchanged: elapsed={fifo_elapsed:?} status={} stderr={:?}",
+            fifo_output.status,
+            String::from_utf8_lossy(&fifo_output.stderr)
+        ));
+    }
+
+    let bare_snapshot_name = Path::new("bare-scorecard-snapshot.json");
+    let bare_snapshot_path = result_command_root.join(bare_snapshot_name);
+    let bare_snapshot_sha =
+        write_scorecard_snapshot_fixture(&bare_snapshot_path, &empty_snapshot_value)?;
+    let (bare_output, _) = run_bounded_combined_command(bare_snapshot_name, &bare_snapshot_sha)?;
+    if !bare_output.status.success()
+        || !String::from_utf8_lossy(&bare_output.stdout)
+            .contains("compatibility scorecard: generated files unchanged")
+        || read_generated_files(&result_command_root)? != before_snapshot_kind_checks
+    {
+        return Err(format!(
+            "combined CLI refused a valid bare relative regular snapshot or changed its generated pair: status={} stderr={:?}",
+            bare_output.status,
+            String::from_utf8_lossy(&bare_output.stderr)
+        ));
+    }
+    fs::remove_file(&bare_snapshot_path)
+        .map_err(|error| format!("cannot remove bare combined snapshot fixture: {error}"))?;
+
     project_and_observe_results(
         &result_command_root,
         &row_snapshot_path,
@@ -11194,6 +11505,141 @@ red/`measured-and-passed` count is **0**.",
                 "combined transaction did not reconcile {label} direct and series evidence exactly once"
             ));
         }
+    }
+
+    // A no-verdict row is not harmless merely because it lacks a product
+    // result. When it names the same outer attempt and immutable result-row
+    // digest as the current PASS, the two are contradictory claims about one
+    // invocation. Exercise this from the clean first-write baseline so no
+    // prior projection can make the refusal pass accidentally.
+    let replay_evidence_identity = replay_row.evidence_identity()?;
+    let mut same_invocation_no_result = no_result_series.clone();
+    same_invocation_no_result.event_id = "fixture-combined-pass-no-result-conflict".into();
+    same_invocation_no_result.emitted_at = "2026-09-13T18:30:01Z".into();
+    same_invocation_no_result.run_id = replay_row.run_id.clone();
+    same_invocation_no_result
+        .series
+        .no_verdict_evidence
+        .as_mut()
+        .expect("no-result fixture carries typed evidence")
+        .evidence_sha256 = replay_evidence_identity.clone();
+    same_invocation_no_result.validate_for_read()?;
+    let contradictory_snapshot = scorecard_snapshot_fixture_value(
+        &source_commit,
+        &source_tree,
+        &[series_row.clone(), same_invocation_no_result.clone()],
+    )?;
+    let contradictory_snapshot_path = snapshot_root.join("pass-no-result-conflict.json");
+    let contradictory_snapshot_sha =
+        write_scorecard_snapshot_fixture(&contradictory_snapshot_path, &contradictory_snapshot)?;
+    restore_combined_baseline()?;
+    write_result_row(&replay_row)?;
+    let before_contradictory_first_write = read_generated_files(&result_command_root)?;
+    let contradictory_error = project_and_observe_results(
+        &result_command_root,
+        &contradictory_snapshot_path,
+        &contradictory_snapshot_sha,
+        &result_root,
+        &fixture_head,
+        "fixture-refresh",
+    )
+    .expect_err("combined first write accepted PASS plus same-invocation no_result");
+    if !contradictory_error.contains("disagree for explicit invocation")
+        || read_generated_files(&result_command_root)? != before_contradictory_first_write
+    {
+        return Err(format!(
+            "same-invocation PASS/no_result refusal changed the generated pair or lost its cause: {contradictory_error}"
+        ));
+    }
+
+    // Canonical comparisons do not retain their outer attempt. The current
+    // result candidate does, so explicitly prove that the same contradiction
+    // is recognized at an attempt other than the legacy implicit attempt 1.
+    let mut attempt_two_pass_row = replay_row.clone();
+    attempt_two_pass_row.attempt = 2;
+    let mut attempt_two_no_result = same_invocation_no_result.clone();
+    attempt_two_no_result.event_id = "fixture-combined-attempt-two-conflict".into();
+    attempt_two_no_result.emitted_at = "2026-09-13T18:30:02Z".into();
+    attempt_two_no_result.series.attempt = Some(2);
+    attempt_two_no_result.series.run_index = 2;
+    attempt_two_no_result
+        .series
+        .no_verdict_evidence
+        .as_mut()
+        .expect("no-result fixture carries typed evidence")
+        .evidence_sha256 = attempt_two_pass_row.evidence_identity()?;
+    attempt_two_no_result.validate_for_read()?;
+    let attempt_two_snapshot = scorecard_snapshot_fixture_value(
+        &source_commit,
+        &source_tree,
+        std::slice::from_ref(&attempt_two_no_result),
+    )?;
+    let attempt_two_path = snapshot_root.join("attempt-two-pass-no-result-conflict.json");
+    let attempt_two_sha =
+        write_scorecard_snapshot_fixture(&attempt_two_path, &attempt_two_snapshot)?;
+    restore_combined_baseline()?;
+    write_result_row(&attempt_two_pass_row)?;
+    let before_attempt_two_first_write = read_generated_files(&result_command_root)?;
+    let attempt_two_error = project_and_observe_results(
+        &result_command_root,
+        &attempt_two_path,
+        &attempt_two_sha,
+        &result_root,
+        &fixture_head,
+        "fixture-refresh",
+    )
+    .expect_err("combined first write accepted attempt-2 PASS plus same-invocation no_result");
+    if !attempt_two_error.contains("disagree for explicit invocation")
+        || read_generated_files(&result_command_root)? != before_attempt_two_first_write
+    {
+        return Err(format!(
+            "attempt-2 same-invocation PASS/no_result refusal changed the generated pair or lost its cause: {attempt_two_error}"
+        ));
+    }
+
+    // The identity includes the explicit outer attempt. The same typed
+    // no-verdict evidence at attempt 3 is a distinct measurement and must
+    // remain projectable beside the current attempt-2 PASS.
+    let mut different_attempt_no_result = attempt_two_no_result;
+    different_attempt_no_result.event_id = "fixture-combined-different-attempt-no-result".into();
+    different_attempt_no_result.emitted_at = "2026-09-13T18:30:02Z".into();
+    different_attempt_no_result.series.attempt = Some(3);
+    different_attempt_no_result.series.run_index = 3;
+    different_attempt_no_result.validate_for_read()?;
+    let different_attempt_snapshot = scorecard_snapshot_fixture_value(
+        &source_commit,
+        &source_tree,
+        std::slice::from_ref(&different_attempt_no_result),
+    )?;
+    let different_attempt_path = snapshot_root.join("different-attempt-no-result.json");
+    let different_attempt_sha =
+        write_scorecard_snapshot_fixture(&different_attempt_path, &different_attempt_snapshot)?;
+    restore_combined_baseline()?;
+    write_result_row(&attempt_two_pass_row)?;
+    project_and_observe_results(
+        &result_command_root,
+        &different_attempt_path,
+        &different_attempt_sha,
+        &result_root,
+        &fixture_head,
+        "fixture-refresh",
+    )?;
+    let different_attempt_written: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    if count_run_representations(
+        &different_attempt_written,
+        &replay_id,
+        &replay_row.run_id,
+        &different_attempt_no_result.event_id,
+    ) != 2
+        || different_attempt_written
+            .projection
+            .as_ref()
+            .is_none_or(|projection| !projection.pre_series_corpus)
+    {
+        return Err(
+            "combined transaction collapsed or lost a distinct-attempt no-result measurement"
+                .into(),
+        );
     }
     restore_combined_baseline()?;
     write_result_row(&replay_row)?;
@@ -14233,10 +14679,11 @@ red/`measured-and-passed` count is **0**.",
         cells: vec![boundary_cell(vec![legacy_observation], CellStatus::Green)],
     };
     validate_observation_identity_namespace(&duplicate_history)?;
-    let (legacy_keys, _) = direct_evidence_keys(&duplicate_history)?;
-    if legacy_keys.len() != 1 || legacy_keys.values().next() != Some(&2) {
+    let legacy_index = direct_evidence_index(&duplicate_history)?;
+    if legacy_index.keys.len() != 1 || legacy_index.keys.values().next() != Some(&2) {
         return Err(format!(
-            "legacy invocation fixture did not exercise one duplicate compact key: {legacy_keys:?}"
+            "legacy invocation fixture did not exercise one duplicate compact key: {:?}",
+            legacy_index.keys
         ));
     }
 
@@ -14245,11 +14692,33 @@ red/`measured-and-passed` count is **0**.",
     claimed_source_row.producer = SeriesProducer::PressureTest;
     claimed_source_row.run_id = legacy_run_id.into();
     claimed_source_row.event_id = "fixture-claimed-legacy-duplicate".into();
+    claimed_source_row.series.attempt = Some(1);
+    claimed_source_row.series.pressure_evidence = Some(SeriesPressureEvidence {
+        evidence_sha256: "c".repeat(64),
+        attempts: vec![SeriesPressureAttempt {
+            index: "1".into(),
+            outcome: "PASS".into(),
+            error_kind: None,
+            status: Some(0),
+            signal: None,
+            timed_out: false,
+            comparison: Some(SeriesPressureComparison {
+                verdict: canonical_verdict::Verdict::Matched,
+                canonical: true,
+                report_sha256: "d".repeat(64),
+                no_result_kind: None,
+            }),
+        }],
+    });
+    claimed_source_row.validate_for_read()?;
     let mut unrelated_source_row = claimed_source_row.clone();
     unrelated_source_row.run_id = "fixture-unrelated-source-run".into();
     unrelated_source_row.event_id = "fixture-unrelated-source-event".into();
-    let unrelated_representation =
-        direct_representation(&duplicate_history, &[unrelated_source_row])?;
+    let unrelated_representation = direct_representation(
+        &duplicate_history,
+        &[unrelated_source_row],
+        &ExplicitInvocationResults::new(),
+    )?;
     if !unrelated_representation.represented_event_ids.is_empty()
         || !unrelated_representation.has_unrepresented_direct_evidence
         || read_generated_files(&result_command_root)? != generated_before_legacy_mapping
@@ -14259,8 +14728,34 @@ red/`measured-and-passed` count is **0**.",
                 .into(),
         );
     }
-    let claimed_duplicate_error = direct_representation(&duplicate_history, &[claimed_source_row])
-        .expect_err("a source event claimed duplicate retained direct evidence");
+
+    let mut single_history = duplicate_history.clone();
+    let one_invocation = single_history.cells[0].observations[0]
+        .invocations
+        .iter()
+        .next()
+        .cloned()
+        .ok_or("legacy duplicate fixture unexpectedly has no invocation")?;
+    single_history.cells[0].observations[0].invocations = BTreeSet::from([one_invocation]);
+    let compact_pressure_match = direct_representation(
+        &single_history,
+        std::slice::from_ref(&claimed_source_row),
+        &ExplicitInvocationResults::new(),
+    )?;
+    if compact_pressure_match.represented_event_ids
+        != BTreeSet::from([claimed_source_row.event_id.clone()])
+        || compact_pressure_match.has_unrepresented_direct_evidence
+    {
+        return Err(
+            "explicit pressure evidence did not retain its valid legacy compact-key mapping".into(),
+        );
+    }
+    let claimed_duplicate_error = direct_representation(
+        &duplicate_history,
+        &[claimed_source_row],
+        &ExplicitInvocationResults::new(),
+    )
+    .expect_err("a source event claimed duplicate retained direct evidence");
     if !claimed_duplicate_error.contains("2 records for that exact identity")
         || read_generated_files(&result_command_root)? != generated_before_legacy_mapping
     {
