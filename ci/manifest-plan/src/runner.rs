@@ -2406,7 +2406,8 @@ fn execute_spec_until(
     // A producer class that cannot satisfy the requested backend or execution
     // shape is unavailable evidence, not a product crash. In particular, the
     // human error line must never override a mismatched class into FAIL.
-    let invalid_backend_evidence = output.timeout.is_none()
+    let invalid_backend_evidence = spec.id.mode != "naked"
+        && output.timeout.is_none()
         && !output.status.success()
         && !backend_unavailable
         && failure_class_line
@@ -2421,7 +2422,8 @@ fn execute_spec_until(
     // The producer did write a class, but it did not establish a more specific
     // result. Keep that absence as no-result instead of letting the following
     // English line manufacture a product failure.
-    let unclassified_internal_failure = output.timeout.is_none()
+    let unclassified_internal_failure = spec.id.mode != "naked"
+        && output.timeout.is_none()
         && !output.status.success()
         && !launch_refusal
         && !backend_unavailable
@@ -7305,6 +7307,15 @@ backends_disabled:
     /// Build one attempt from a real subprocess, so this exercises the same
     /// classification path used by an actual manifest sweep.
     fn attempt_from_script(backend: &str, script: &str, report: Option<&str>) -> AttemptResult {
+        attempt_from_script_in_mode("verify", Some(backend), script, report)
+    }
+
+    fn attempt_from_script_in_mode(
+        mode: &str,
+        backend: Option<&str>,
+        script: &str,
+        report: Option<&str>,
+    ) -> AttemptResult {
         let dir = std::env::temp_dir().join(format!(
             "hermit-runner-backend-availability-{}-{:?}",
             std::process::id(),
@@ -7324,8 +7335,8 @@ backends_disabled:
         let spec = CellRunSpec {
             id: CellId {
                 test: "fixture/backend-availability".into(),
-                mode: "verify".into(),
-                backend: Some(backend.into()),
+                mode: mode.into(),
+                backend: backend.map(str::to_owned),
             },
             lane: "portable".into(),
             category: "fixture".into(),
@@ -7334,7 +7345,7 @@ backends_disabled:
             argv,
             guest_argv: vec!["fixture".into()],
             timeout_seconds: 10,
-            verdict_path: Some(verdict),
+            verdict_path: (mode != "naked").then_some(verdict),
             verification_log_dir: None,
             sabre_path_evidence: None,
             cell_dir: dir.clone(),
@@ -7344,6 +7355,33 @@ backends_disabled:
         let result = execute_spec(&spec).unwrap();
         fs::remove_dir_all(dir).unwrap();
         result
+    }
+
+    #[test]
+    fn naked_guest_stderr_cannot_claim_hermit_internal_failure_classes() {
+        for first_line in [
+            "HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=ptrace",
+            "HERMIT_INTERNAL_FAILURE class=cli-error",
+        ] {
+            let script = format!("printf '%s\\n' '{first_line}' >&2; exit 7");
+            let result = attempt_from_script_in_mode("naked", None, &script, None);
+            assert_eq!(result.outcome, "FAIL", "reserved guest text was trusted");
+            assert_eq!(result.error_kind, None, "reserved guest text was trusted");
+            assert_eq!(result.status, Some(7));
+            assert_eq!(result.signal, None);
+            assert!(!result.timed_out);
+            let observed = observed_result(
+                "naked",
+                &result.outcome,
+                std::slice::from_ref(&result),
+                result.error_kind.as_deref(),
+            );
+            assert_eq!(observed, Some(ObservedResult::CrashError));
+            assert_eq!(
+                failure_class(&result.outcome, observed, result.error_kind.as_deref()),
+                Some(FailureClass::ProductFailure)
+            );
+        }
     }
 
     #[test]

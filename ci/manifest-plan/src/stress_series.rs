@@ -592,6 +592,11 @@ impl SeriesRow {
         if matches!(self.schema, SeriesSchema::V3 | SeriesSchema::V4) {
             self.validate_classification()?;
         }
+        if self.series.cell.ends_with("/naked/native") && self.schema != SeriesSchema::V4 {
+            return Err(
+                "historical naked/native row does not retain ordered attempts and diversity".into(),
+            );
+        }
         self.validate_native_contract()?;
         if self.series.source_tree_dirty {
             return Err(
@@ -859,16 +864,42 @@ impl SeriesRow {
             if attempt.status.is_some_and(|status| status < 0)
                 || attempt.signal.is_some_and(|signal| signal <= 0)
                 || (attempt.status.is_some() && attempt.signal.is_some())
+                || (attempt.timed_out && attempt.status == Some(0))
             {
                 return Err("native_evidence attempt has an invalid process disposition".into());
             }
-            if attempt.outcome == SeriesNativeAttemptOutcome::Pass
-                && (attempt.status != Some(0) || attempt.signal.is_some() || attempt.timed_out)
-            {
-                return Err(
-                    "native_evidence passing attempt lacks a completed zero-exit disposition"
-                        .into(),
-                );
+            match attempt.outcome {
+                SeriesNativeAttemptOutcome::Pass
+                    if attempt.status != Some(0)
+                        || attempt.signal.is_some()
+                        || attempt.timed_out =>
+                {
+                    return Err(
+                        "native_evidence passing attempt lacks a completed zero-exit disposition"
+                            .into(),
+                    );
+                }
+                SeriesNativeAttemptOutcome::Fail
+                    if !attempt.timed_out
+                        && !matches!(attempt.status, Some(status) if status > 0)
+                        && attempt.signal.is_none() =>
+                {
+                    return Err(
+                        "native_evidence failing attempt lacks a nonzero exit, signal, or timeout"
+                            .into(),
+                    );
+                }
+                SeriesNativeAttemptOutcome::Error
+                    if attempt.timed_out
+                        || (!matches!(attempt.status, Some(status) if status > 0)
+                            && attempt.signal.is_none()) =>
+                {
+                    return Err(
+                        "native_evidence error attempt lacks a nonzero exit or signal disposition"
+                            .into(),
+                    );
+                }
+                _ => {}
             }
             if !is_sha256(&attempt.observation_sha256) {
                 return Err(
@@ -889,6 +920,11 @@ impl SeriesRow {
             .iter()
             .all(|attempt| attempt.outcome == SeriesNativeAttemptOutcome::Pass);
         let sufficient = observed >= diversity.min_distinct;
+        let saw_error = evidence
+            .attempts
+            .iter()
+            .any(|attempt| attempt.outcome == SeriesNativeAttemptOutcome::Error);
+        let saw_timeout = evidence.attempts.iter().any(|attempt| attempt.timed_out);
         let expected = if all_passed && sufficient {
             (SeriesOutcome::Passed, Some(ObservedResult::Pass), None)
         } else if all_passed {
@@ -897,16 +933,42 @@ impl SeriesRow {
                 Some(ObservedResult::InsufficientDiversity),
                 Some(FailureClass::NoResult),
             )
-        } else {
-            if self.series.result == Some(ObservedResult::Pass)
-                || self.series.result == Some(ObservedResult::InsufficientDiversity)
-            {
-                return Err(
-                    "native_evidence non-passing attempt contradicts the outer native result"
-                        .into(),
-                );
+        } else if saw_error {
+            match (
+                self.series.outcome,
+                self.series.result,
+                self.series.failure_class,
+            ) {
+                (
+                    SeriesOutcome::Errored,
+                    None,
+                    Some(FailureClass::UnderstoodInfrastructureFailure),
+                )
+                | (
+                    SeriesOutcome::Skipped,
+                    None,
+                    Some(FailureClass::UnderstoodPrerequisiteFailure),
+                )
+                | (SeriesOutcome::NoResult, None, Some(FailureClass::NoResult)) => return Ok(()),
+                _ => {
+                    return Err(
+                        "native_evidence error attempt contradicts the outer result classification"
+                            .into(),
+                    );
+                }
             }
-            return Ok(());
+        } else if saw_timeout {
+            (
+                SeriesOutcome::Timeout,
+                Some(ObservedResult::Timeout),
+                Some(FailureClass::NoResult),
+            )
+        } else {
+            (
+                SeriesOutcome::Errored,
+                Some(ObservedResult::CrashError),
+                Some(FailureClass::ProductFailure),
+            )
         };
         if (
             self.series.outcome,
@@ -1529,6 +1591,84 @@ mod tests {
                 .contains("contradict the outer")
         );
 
+        let mut invalid_failure = native_row(3, &['a', 'b', 'a']);
+        let first = &mut invalid_failure
+            .series
+            .native_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0];
+        first.outcome = SeriesNativeAttemptOutcome::Fail;
+        invalid_failure.series.outcome = SeriesOutcome::Errored;
+        invalid_failure.series.result = Some(ObservedResult::CrashError);
+        invalid_failure.series.failure_class = Some(FailureClass::ProductFailure);
+        assert!(
+            invalid_failure
+                .validate_for_write()
+                .unwrap_err()
+                .contains("failing attempt lacks")
+        );
+
+        let mut crash = invalid_failure.clone();
+        crash.series.native_evidence.as_mut().unwrap().attempts[0].status = Some(7);
+        crash.validate_for_write().unwrap();
+        let mut false_timeout = crash.clone();
+        false_timeout.series.outcome = SeriesOutcome::Timeout;
+        false_timeout.series.result = Some(ObservedResult::Timeout);
+        false_timeout.series.failure_class = Some(FailureClass::NoResult);
+        assert!(
+            false_timeout
+                .validate_for_write()
+                .unwrap_err()
+                .contains("contradict the outer")
+        );
+        let mut false_divergence = crash;
+        false_divergence.series.outcome = SeriesOutcome::Diverged;
+        false_divergence.series.result = Some(ObservedResult::DeterminismFailure);
+        false_divergence.series.failure_class = Some(FailureClass::ProductFailure);
+        assert!(
+            false_divergence
+                .validate_for_write()
+                .unwrap_err()
+                .contains("contradict the outer")
+        );
+
+        let mut timeout = native_row(3, &['a', 'b', 'a']);
+        let final_attempt = &mut timeout.series.native_evidence.as_mut().unwrap().attempts[2];
+        final_attempt.outcome = SeriesNativeAttemptOutcome::Fail;
+        final_attempt.status = None;
+        final_attempt.timed_out = true;
+        timeout.series.outcome = SeriesOutcome::Timeout;
+        timeout.series.result = Some(ObservedResult::Timeout);
+        timeout.series.failure_class = Some(FailureClass::NoResult);
+        timeout.validate_for_write().unwrap();
+        let mut false_crash = timeout;
+        false_crash.series.outcome = SeriesOutcome::Errored;
+        false_crash.series.result = Some(ObservedResult::CrashError);
+        false_crash.series.failure_class = Some(FailureClass::ProductFailure);
+        assert!(
+            false_crash
+                .validate_for_write()
+                .unwrap_err()
+                .contains("contradict the outer")
+        );
+
+        let mut error = native_row(3, &['a', 'b', 'a']);
+        let first = &mut error.series.native_evidence.as_mut().unwrap().attempts[0];
+        first.outcome = SeriesNativeAttemptOutcome::Error;
+        first.status = None;
+        error.series.outcome = SeriesOutcome::NoResult;
+        error.series.result = None;
+        error.series.failure_class = Some(FailureClass::NoResult);
+        assert!(
+            error
+                .validate_for_write()
+                .unwrap_err()
+                .contains("error attempt lacks")
+        );
+        error.series.native_evidence.as_mut().unwrap().attempts[0].status = Some(125);
+        error.validate_for_write().unwrap();
+
         let encoded = serde_json::to_value(native_row(3, &['a', 'b', 'a'])).unwrap();
         for field in ["status", "signal"] {
             let mut missing_required_null = encoded.clone();
@@ -1572,7 +1712,12 @@ mod tests {
         legacy.schema = SeriesSchema::V3;
         legacy.series.native_evidence = None;
         legacy.validate_for_read().unwrap();
-        legacy.validate_for_projection().unwrap();
+        assert!(
+            legacy
+                .validate_for_projection()
+                .unwrap_err()
+                .contains("does not retain ordered attempts and diversity")
+        );
         assert!(
             legacy
                 .validate_for_write()
