@@ -2720,9 +2720,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     _ => self.passthrough(guest, call).await,
                 }
             }
-            // faccessat2 and fchmodat2 are untyped in the pinned Reverie revision; the
-            // reviewed classification table routes them, and every other reviewed
-            // PassThrough syscall, through the blanket arm below.
+            // faccessat2 is untyped in the pinned Reverie revision; the reviewed
+            // classification table routes it, and every other reviewed PassThrough
+            // syscall, through the blanket arm below.
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-644): Keep dispatch aligned with the reviewed classification.
             SyscallClassification::PassThrough => self.passthrough(guest, call).await,
