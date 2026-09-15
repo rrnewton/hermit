@@ -75,6 +75,7 @@ _DURATION_RE = re.compile(r"^\d+[smhd]?$")
 # Do not accept prlimit's query/help/PID forms, or infer execution without its
 # explicit command delimiter. Other option shapes remain unrecognized.
 _PRLIMIT_FSIZE_RE = re.compile(r"--fsize=[0-9]{1,20}:[0-9]{1,20}")
+_PRLIMIT_SCRIPT_WRAPPERS = frozenset({"./ci/run-with-reverie-dbt-budget.sh"})
 # `--no-run` compiles the binary and never executes it, so it is not coverage.
 _NO_RUN_RE = re.compile(r"(?<![\w-])--no-run(?![\w-])")
 
@@ -103,13 +104,13 @@ def _prefix_still_runs_cargo(prefix: str) -> bool:
                 position += 1
                 while position < len(tokens) and _ENV_ASSIGNMENT_RE.match(tokens[position]):
                     position += 1
-            if position < len(tokens) and (
-                tokens[position].startswith("-")
-                or _ENV_ASSIGNMENT_RE.match(tokens[position])
-                or _DURATION_RE.match(tokens[position])
-            ):
-                return False
-            continue
+            # Only the actual script wrapper used by these nodes is supported
+            # between prlimit (or env) and the recognized test invocation.
+            # Reusing the shell-prefix grammar here would falsely interpret
+            # `exec`, or assignments after timeout/nice, as shell syntax even
+            # though those programs use execvp. Refuse other wrapper forms until
+            # their operand semantics are handled explicitly.
+            return all(token in _PRLIMIT_SCRIPT_WRAPPERS for token in tokens[position:])
         if _ENV_ASSIGNMENT_RE.match(token):
             continue
         if "/" in token or token.endswith(".sh"):
