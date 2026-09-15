@@ -381,11 +381,29 @@ Typical flow for a change:
   rebase when needed, rerun validation at the new exact head, and verify the
   landed commit on freshly fetched `main`.
 
-When this repository is coordinated through the `dev-hermit` parent, landing
-authorization is the parent's exact-head local receipt queried through
-`ci-hub validate-status`. A label or copied status is only a cache, and delayed
-GitHub workflows are useful supplemental evidence rather than the admission
-gate. Never reuse a receipt from an earlier SHA.
+When this repository is coordinated through the `dev-hermit` parent, local
+validation evidence queried through `ci-hub validate-status` is the authority; a
+label or copied status is only a cache, and delayed GitHub workflows are useful
+supplemental evidence rather than the admission gate.
+
+**An exact-head receipt is NOT a hard prerequisite for landing, and work must not
+serialise behind one.** Do not restate that rule here in your own words — it is
+stated once, with its reasoning, in the OWNER-APPROVED RULE block at
+`scripts/check-reverie-pin.rs:10-17`, which replaced equality-to-the-tip on
+2026-08-08. Read it there. Its first clause is the one that governs landing:
+tip equality is allowed but not required, because "a lagging ancestor is
+legitimate; requiring the tip made the verdict a property of WHEN you looked
+rather than of the tree." That reasoning is about a Reverie pin, but the property
+it names is general, and it is why a soft-green landing on an ancestor is
+permitted rather than a shortcut.
+
+Two things this does not say. Validation ADMISSION is a separate question with
+the opposite answer: `scripts/validate.rs` refuses to start a run whose head is
+behind `origin/main`, because a run must measure a commit that includes
+everything available when it starts. And a REVIEW attestation does bind an exact
+sha — a head move makes an approval stale even for a patch-identical rebase.
+Neither of those makes an earlier commit's validation evidence unusable at the
+landing boundary.
 
 Follow `CONTRIBUTING.md`, update documentation for user-visible changes, and
 never publish security vulnerabilities as ordinary issues.
