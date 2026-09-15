@@ -71,13 +71,35 @@ _SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||[;|\n]")
 _ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _KNOWN_RUNNERS = frozenset({"timeout", "env", "nice", "nohup", "xargs", "exec", "command"})
 _DURATION_RE = re.compile(r"^\d+[smhd]?$")
+# The isolated-workdir nodes execute through this command form of prlimit.
+# Do not accept prlimit's query/help/PID forms, or infer execution without its
+# explicit command delimiter. Other option shapes remain unrecognized.
+_PRLIMIT_FSIZE_RE = re.compile(r"--fsize=[0-9]{1,20}:[0-9]{1,20}")
 # `--no-run` compiles the binary and never executes it, so it is not coverage.
 _NO_RUN_RE = re.compile(r"(?<![\w-])--no-run(?![\w-])")
 
 
 def _prefix_still_runs_cargo(prefix: str) -> bool:
     """Do the tokens before `cargo` leave cargo actually being executed?"""
-    for token in prefix.split():
+    tokens = prefix.split()
+    position = 0
+    while position < len(tokens):
+        token = tokens[position]
+        position += 1
+        if token == "prlimit":
+            if (
+                position + 1 >= len(tokens)
+                or _PRLIMIT_FSIZE_RE.fullmatch(tokens[position]) is None
+                or tokens[position + 1] != "--"
+            ):
+                return False
+            limits = tokens[position].removeprefix("--fsize=").split(":")
+            if not 0 <= int(limits[0]) <= int(limits[1]) <= 2**64 - 1:
+                return False
+            position += 2
+            if position < len(tokens) and tokens[position].startswith("-"):
+                return False
+            continue
         if _ENV_ASSIGNMENT_RE.match(token):
             continue
         if "/" in token or token.endswith(".sh"):
