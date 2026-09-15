@@ -97,7 +97,17 @@ def _prefix_still_runs_cargo(prefix: str) -> bool:
             if not 0 <= int(limits[0]) <= int(limits[1]) <= 2**64 - 1:
                 return False
             position += 2
-            if position < len(tokens) and tokens[position].startswith("-"):
+            # After --, prlimit uses execvp: an assignment is a program name,
+            # not shell syntax. Only an explicit env command can consume it.
+            if position < len(tokens) and tokens[position] == "env":
+                position += 1
+                while position < len(tokens) and _ENV_ASSIGNMENT_RE.match(tokens[position]):
+                    position += 1
+            if position < len(tokens) and (
+                tokens[position].startswith("-")
+                or _ENV_ASSIGNMENT_RE.match(tokens[position])
+                or _DURATION_RE.match(tokens[position])
+            ):
                 return False
             continue
         if _ENV_ASSIGNMENT_RE.match(token):
