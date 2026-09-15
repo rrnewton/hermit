@@ -6,17 +6,21 @@
 //! harness-managed execution; the producer and result-schema integration must
 //! provide that authority separately.
 
+use std::ffi::CString;
+use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
-use std::fs::OpenOptions;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -103,6 +107,20 @@ struct InspectedGzip {
 struct OpenedGzipEvidence {
     file: File,
     inspection: InspectedGzip,
+    parents: HeldParentChain,
+}
+
+struct HeldDirectory {
+    file: File,
+    identity: FileIdentity,
+    path: PathBuf,
+}
+
+/// Hold every directory from the caller's artifact root through the leaf's
+/// parent. Opening and checking each child relative to its held parent avoids
+/// following a substituted ancestor even when the leaf inode stays unchanged.
+struct HeldParentChain {
+    directories: Vec<HeldDirectory>,
 }
 
 fn checked_relative_path<'a>(
@@ -131,72 +149,177 @@ fn checked_relative_path<'a>(
     Ok(relative)
 }
 
-fn require_path_identity(
-    path: &Path,
+fn open_at(
+    parent_fd: RawFd,
+    name: &OsStr,
+    flags: libc::c_int,
+    display_path: &Path,
+    description: &str,
+) -> Result<File, String> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| format!("{description} {} contains NUL", display_path.display()))?;
+    // SAFETY: name is terminated and flags never include O_CREAT/O_TMPFILE, so
+    // openat takes no mode argument. Callers retain the parent descriptor.
+    let fd = unsafe {
+        libc::openat(
+            parent_fd,
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "cannot open {description} {}: {}",
+            display_path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: a successful openat returned a new descriptor owned by this File.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn require_entry_identity(
+    parent_fd: RawFd,
+    name: &OsStr,
     expected: FileIdentity,
-    description: &str,
-) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot recheck {description} {}: {error}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!(
-            "{description} {} is no longer a regular non-symlink file",
-            path.display()
-        ));
-    }
-    let actual = FileIdentity::from_metadata(&metadata);
-    if actual != expected {
-        return Err(format!(
-            "{description} {} changed identity before publication",
-            path.display()
-        ));
-    }
-    Ok(())
-}
-
-pub(super) fn require_plain_directory(path: &Path, description: &str) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect {description} {}: {error}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(format!(
-            "{description} {} is not a non-symlink directory",
-            path.display()
-        ));
-    }
-    Ok(())
-}
-
-fn require_plain_parent_chain(
-    artifact_dir: &Path,
+    expected_type: libc::mode_t,
     path: &Path,
     description: &str,
 ) -> Result<(), String> {
-    let relative = checked_relative_path(artifact_dir, path, description)?;
-    require_plain_directory(artifact_dir, "cell artifact directory")?;
-    let mut current = artifact_dir.to_owned();
-    if let Some(parent) = relative.parent() {
-        for component in parent.components() {
-            let Component::Normal(component) = component else {
-                unreachable!("checked_relative_path accepted only normal components")
-            };
-            current.push(component);
-            require_plain_directory(&current, description)?;
-        }
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| format!("{description} {} contains NUL", path.display()))?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: name is terminated, metadata points to writable storage, and the
+    // parent descriptor remains held. Do not follow even the last component.
+    if unsafe {
+        libc::fstatat(
+            parent_fd,
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "cannot recheck {description} {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: successful fstatat initialized metadata.
+    let metadata = unsafe { metadata.assume_init() };
+    let actual = FileIdentity {
+        device: metadata.st_dev,
+        inode: metadata.st_ino,
+    };
+    if metadata.st_mode & libc::S_IFMT != expected_type || actual != expected {
+        return Err(format!(
+            "{description} {} changed identity or type before publication",
+            path.display()
+        ));
     }
     Ok(())
+}
+
+impl HeldParentChain {
+    fn open(artifact_dir: &Path, path: &Path, description: &str) -> Result<Self, String> {
+        let relative = checked_relative_path(artifact_dir, path, description)?;
+        let mut directories = Vec::<HeldDirectory>::new();
+        let mut current = artifact_dir.to_owned();
+        // The artifact directory is the caller-supplied boundary. All names
+        // below it are single normal components checked above.
+        let names = std::iter::once(artifact_dir.as_os_str()).chain(
+            relative
+                .parent()
+                .expect("checked relative path has a parent")
+                .components()
+                .map(|component| component.as_os_str()),
+        );
+        for name in names {
+            let parent_fd = match directories.last() {
+                Some(parent) => {
+                    current.push(name);
+                    parent.file.as_raw_fd()
+                }
+                None => libc::AT_FDCWD,
+            };
+            // O_PATH needs search permission, preserving support for directory
+            // trees that can be traversed but cannot be listed.
+            let file = open_at(
+                parent_fd,
+                name,
+                libc::O_PATH | libc::O_DIRECTORY,
+                &current,
+                "non-symlink directory",
+            )?;
+            let identity = FileIdentity::from_metadata(&file.metadata().map_err(|error| {
+                format!("cannot inspect directory {}: {error}", current.display())
+            })?);
+            directories.push(HeldDirectory {
+                file,
+                identity,
+                path: current.clone(),
+            });
+        }
+        Ok(Self { directories })
+    }
+
+    fn leaf_parent_fd(&self) -> RawFd {
+        self.directories
+            .last()
+            .expect("the artifact directory is always held")
+            .file
+            .as_raw_fd()
+    }
+
+    fn require_path_identity(
+        &self,
+        path: &Path,
+        expected: FileIdentity,
+        description: &str,
+    ) -> Result<(), String> {
+        for (index, directory) in self.directories.iter().enumerate() {
+            let (parent_fd, name) = if index == 0 {
+                (libc::AT_FDCWD, directory.path.as_os_str())
+            } else {
+                (
+                    self.directories[index - 1].file.as_raw_fd(),
+                    directory.path.file_name().expect("normal directory name"),
+                )
+            };
+            require_entry_identity(
+                parent_fd,
+                name,
+                directory.identity,
+                libc::S_IFDIR,
+                &directory.path,
+                "retained verify-log directory",
+            )?;
+        }
+        require_entry_identity(
+            self.leaf_parent_fd(),
+            path.file_name().expect("normal retained file name"),
+            expected,
+            libc::S_IFREG,
+            path,
+            description,
+        )
+    }
 }
 
 fn open_plain_file_below(
     artifact_dir: &Path,
     path: &Path,
     description: &str,
-) -> Result<File, String> {
-    require_plain_parent_chain(artifact_dir, path, description)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| format!("cannot open {description} {}: {error}", path.display()))?;
+) -> Result<(File, HeldParentChain), String> {
+    let parents = HeldParentChain::open(artifact_dir, path, description)?;
+    let file = open_at(
+        parents.leaf_parent_fd(),
+        path.file_name().expect("checked relative file name"),
+        libc::O_RDONLY | libc::O_NONBLOCK,
+        path,
+        description,
+    )?;
     let metadata = file
         .metadata()
         .map_err(|error| format!("cannot inspect {description} {}: {error}", path.display()))?;
@@ -206,7 +329,7 @@ fn open_plain_file_below(
             path.display()
         ));
     }
-    Ok(file)
+    Ok((file, parents))
 }
 
 fn copy_and_hash_bounded(
@@ -291,7 +414,7 @@ fn open_and_inspect_gzip_file(
     maximum_uncompressed_bytes: u64,
     description: &str,
 ) -> Result<OpenedGzipEvidence, String> {
-    let mut file = open_plain_file_below(root, path, description)?;
+    let (mut file, parents) = open_plain_file_below(root, path, description)?;
     let inspection = inspect_open_gzip_file(
         &mut file,
         path,
@@ -299,7 +422,11 @@ fn open_and_inspect_gzip_file(
         maximum_uncompressed_bytes,
         description,
     )?;
-    Ok(OpenedGzipEvidence { file, inspection })
+    Ok(OpenedGzipEvidence {
+        file,
+        inspection,
+        parents,
+    })
 }
 
 fn inspect_open_gzip_file(
@@ -393,7 +520,7 @@ fn open_verified_retained_verify_log_with_limits(
     )?;
     require_single_link(&opened.file, &path, "retained compressed verify log")?;
     validate_retained_verify_log_inspection(retained, &opened.inspection)?;
-    require_path_identity(
+    opened.parents.require_path_identity(
         &path,
         opened.inspection.identity,
         "retained compressed verify log",
@@ -466,9 +593,11 @@ pub fn verify_retained_verify_log(
 
 /// Read the exact uncompressed bytes named by a retained-log descriptor.
 ///
-/// Descriptor validation, gzip decoding, and path-identity checks all use one
-/// held `O_NOFOLLOW` file descriptor. This is the scoring/read path; callers
-/// retaining the gzip itself should use [`copy_verified_retained_verify_log`].
+/// Descriptor validation and gzip decoding use one held `O_NOFOLLOW` file
+/// descriptor. Held directory descriptors authenticate the path from the
+/// artifact root through the leaf before success. This is the scoring/read
+/// path; callers retaining the gzip itself should use
+/// [`copy_verified_retained_verify_log`].
 pub fn read_verified_retained_verify_log(
     artifact_dir: &Path,
     retained: &RetainedVerifyLog,
@@ -499,7 +628,7 @@ pub fn read_verified_retained_verify_log(
     }
     let path = artifact_dir.join(retained_verify_log_relative_path(expected_attempt)?);
     require_single_link(&opened.file, &path, "retained compressed verify log")?;
-    require_path_identity(
+    opened.parents.require_path_identity(
         &path,
         opened.inspection.identity,
         "retained compressed verify log",
@@ -545,7 +674,7 @@ pub fn copy_verified_retained_verify_log(
     }
     let path = artifact_dir.join(retained_verify_log_relative_path(expected_attempt)?);
     require_single_link(&opened.file, &path, "retained compressed verify log")?;
-    require_path_identity(
+    opened.parents.require_path_identity(
         &path,
         opened.inspection.identity,
         "retained compressed verify log",
@@ -900,6 +1029,119 @@ mod tests {
         // The held descriptor returns the authenticated bytes, but the changed
         // path still prevents the caller from treating this copy as published.
         assert_eq!(destination.copied, fixture.compressed);
+    }
+
+    #[test]
+    fn copying_from_held_descriptor_refuses_ancestor_substitution() {
+        struct ReplacingAncestor {
+            ancestor: PathBuf,
+            alias: PathBuf,
+            copied: Vec<u8>,
+            replaced: bool,
+        }
+        impl Write for ReplacingAncestor {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.replaced {
+                    fs::rename(&self.ancestor, &self.alias)?;
+                    symlink(&self.alias, &self.ancestor)?;
+                    self.replaced = true;
+                }
+                self.copied.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let fixture = Fixture::new();
+        let identity = FileIdentity::from_metadata(&fs::metadata(fixture.path()).unwrap());
+        let mut destination = ReplacingAncestor {
+            ancestor: fixture.directory.path().join("retained"),
+            alias: fixture.directory.path().join("renamed-retained"),
+            copied: Vec::new(),
+            replaced: false,
+        };
+        let copied = copy_verified_retained_verify_log(
+            fixture.directory.path(),
+            &fixture.descriptor,
+            &fixture.descriptor.cell_id,
+            2,
+            &mut destination,
+            fixture.descriptor.compressed_bytes,
+        );
+        assert!(destination.replaced);
+        assert_eq!(destination.copied, fixture.compressed);
+        let after = fs::metadata(fixture.path()).unwrap();
+        assert_eq!(FileIdentity::from_metadata(&after), identity);
+        assert_eq!(
+            after.nlink(),
+            1,
+            "the leaf identity and link count cannot catch this substitution"
+        );
+        let error =
+            copied.expect_err("a substituted symlink ancestor must prevent successful copying");
+        assert!(
+            error.contains("directory") || error.contains("ancestor"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn copying_refuses_plain_directory_replacement_even_with_the_same_leaf() {
+        struct ReplacingDirectory {
+            directory: PathBuf,
+            saved: PathBuf,
+            copied: Vec<u8>,
+            replaced: bool,
+        }
+        impl Write for ReplacingDirectory {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.replaced {
+                    fs::rename(&self.directory, &self.saved)?;
+                    fs::create_dir(&self.directory)?;
+                    fs::rename(self.saved.join("verify"), self.directory.join("verify"))?;
+                    self.replaced = true;
+                }
+                self.copied.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let fixture = Fixture::new();
+        let identity = FileIdentity::from_metadata(&fs::metadata(fixture.path()).unwrap());
+        let mut destination = ReplacingDirectory {
+            directory: fixture.directory.path().join("retained"),
+            saved: fixture.directory.path().join("renamed-retained"),
+            copied: Vec::new(),
+            replaced: false,
+        };
+        let copied = copy_verified_retained_verify_log(
+            fixture.directory.path(),
+            &fixture.descriptor,
+            &fixture.descriptor.cell_id,
+            2,
+            &mut destination,
+            fixture.descriptor.compressed_bytes,
+        );
+        assert!(destination.replaced);
+        assert_eq!(destination.copied, fixture.compressed);
+        let after = fs::metadata(fixture.path()).unwrap();
+        assert_eq!(FileIdentity::from_metadata(&after), identity);
+        assert_eq!(after.nlink(), 1);
+        assert!(
+            fs::symlink_metadata(&destination.directory)
+                .unwrap()
+                .is_dir()
+        );
+        let error = copied.expect_err("a different plain ancestor directory must also be refused");
+        assert!(
+            error.contains("directory") && error.contains("changed identity"),
+            "{error}"
+        );
     }
 
     #[test]
