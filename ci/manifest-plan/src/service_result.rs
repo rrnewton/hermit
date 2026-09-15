@@ -10,7 +10,8 @@ pub const HISTORICAL_SCHEMA_VERSION: u64 = 1;
 pub const WRITEBACK_SCHEMA_VERSION: u64 = 2;
 pub const SELECTION_SCHEMA_VERSION: u64 = 3;
 pub const TEST_COUNTS_SCHEMA_VERSION: u64 = 4;
-pub const SCHEMA_VERSION: u64 = 5;
+pub const DETAIL_SCHEMA_VERSION: u64 = 5;
+pub const SCHEMA_VERSION: u64 = 6;
 pub const HISTORICAL_FIELD_NAMES: [&str; 7] = [
     "schema_version",
     "commit",
@@ -53,12 +54,26 @@ pub const TEST_COUNTS_FIELD_NAMES: [&str; 10] = [
     "passed_tests",
     "scorecard_writeback",
 ];
-pub const FIELD_NAMES: [&str; 11] = [
+pub const DETAIL_FIELD_NAMES: [&str; 11] = [
     "schema_version",
     "commit",
     "profile",
     "selection_mode",
     "final_validate_status",
+    "detail",
+    "exit_code",
+    "executed_nodes",
+    "executed_tests",
+    "passed_tests",
+    "scorecard_writeback",
+];
+pub const FIELD_NAMES: [&str; 12] = [
+    "schema_version",
+    "commit",
+    "profile",
+    "selection_mode",
+    "final_validate_status",
+    "could_not_run_kind",
     "detail",
     "exit_code",
     "executed_nodes",
@@ -107,6 +122,26 @@ impl FinalValidateStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CouldNotRunKind {
+    NoResult,
+    Refused,
+    Interrupted,
+}
+
+impl CouldNotRunKind {
+    pub const ALL: [Self; 3] = [Self::NoResult, Self::Refused, Self::Interrupted];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoResult => "no_result",
+            Self::Refused => "refused",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
 /// Outcome of publishing already-final validation evidence into the scorecard.
 /// This is bookkeeping about a completed validation, not the validation verdict.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -140,6 +175,11 @@ pub struct ValidationServiceResult {
     #[serde(default)]
     pub selection_mode: Option<String>,
     pub final_validate_status: FinalValidateStatus,
+    /// The producer path that reached a current COULD_NOT_RUN verdict. Schema 6
+    /// makes this required for that status so readers never infer the cause
+    /// from prose. Older schemas decode it as absent.
+    #[serde(default)]
+    pub could_not_run_kind: Option<CouldNotRunKind>,
     /// Ordered terminal detail rendered by validation. A current producer
     /// writes the field even when no cause exists, so null is honest absence
     /// rather than a missing field.
@@ -184,10 +224,11 @@ impl ValidationServiceResult {
             WRITEBACK_SCHEMA_VERSION => WRITEBACK_FIELD_NAMES.into_iter().collect(),
             SELECTION_SCHEMA_VERSION => SELECTION_FIELD_NAMES.into_iter().collect(),
             TEST_COUNTS_SCHEMA_VERSION => TEST_COUNTS_FIELD_NAMES.into_iter().collect(),
+            DETAIL_SCHEMA_VERSION => DETAIL_FIELD_NAMES.into_iter().collect(),
             SCHEMA_VERSION => FIELD_NAMES.into_iter().collect(),
             other => {
                 return Err(format!(
-                    "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {other}"
+                    "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, {DETAIL_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {other}"
                 ));
             }
         };
@@ -197,8 +238,15 @@ impl ValidationServiceResult {
                 "validation-service-result-fields: schema {schema_version} expected {expected_fields:?}, got {actual_fields:?}"
             ));
         }
-        let result: Self = serde_json::from_value(value)
-            .map_err(|error| format!("validation-service-result-shape: {error}"))?;
+        let result: Self = if schema_version == SCHEMA_VERSION {
+            // A Value has already collapsed duplicate fields. Parse current
+            // evidence from the original bytes so causes cannot be relabelled
+            // by a later occurrence, while keeping historical readers intact.
+            serde_json::from_slice(bytes)
+        } else {
+            serde_json::from_value(value)
+        }
+        .map_err(|error| format!("validation-service-result-shape: {error}"))?;
         result.validate()?;
         Ok(result)
     }
@@ -209,12 +257,13 @@ impl ValidationServiceResult {
             WRITEBACK_SCHEMA_VERSION,
             SELECTION_SCHEMA_VERSION,
             TEST_COUNTS_SCHEMA_VERSION,
+            DETAIL_SCHEMA_VERSION,
             SCHEMA_VERSION,
         ]
         .contains(&self.schema_version)
         {
             return Err(format!(
-                "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {}",
+                "validation-service-result-schema_version: expected {HISTORICAL_SCHEMA_VERSION}, {WRITEBACK_SCHEMA_VERSION}, {SELECTION_SCHEMA_VERSION}, {TEST_COUNTS_SCHEMA_VERSION}, {DETAIL_SCHEMA_VERSION}, or {SCHEMA_VERSION}, got {}",
                 self.schema_version
             ));
         }
@@ -248,7 +297,7 @@ impl ValidationServiceResult {
                 );
             }
         }
-        if self.schema_version != SCHEMA_VERSION && self.detail.is_some() {
+        if self.schema_version < DETAIL_SCHEMA_VERSION && self.detail.is_some() {
             return Err(format!(
                 "validation-service-result-historical-fields: schema {} cannot carry detail",
                 self.schema_version
@@ -259,6 +308,38 @@ impl ValidationServiceResult {
                 "validation-service-result-detail: {} must carry null",
                 self.final_validate_status.as_str()
             ));
+        }
+        if self.schema_version < SCHEMA_VERSION && self.could_not_run_kind.is_some() {
+            return Err(format!(
+                "validation-service-result-historical-fields: schema {} cannot carry could_not_run_kind",
+                self.schema_version
+            ));
+        }
+        if self.schema_version == SCHEMA_VERSION {
+            match self.final_validate_status {
+                FinalValidateStatus::CouldNotRun => {
+                    if self.could_not_run_kind.is_none() {
+                        return Err(
+                            "validation-service-result-could_not_run_kind: COULD_NOT_RUN requires no_result, refused, or interrupted"
+                                .to_string(),
+                        );
+                    }
+                    if self.detail.is_none() {
+                        return Err(
+                            "validation-service-result-detail: schema 6 COULD_NOT_RUN requires a concrete reason"
+                                .to_string(),
+                        );
+                    }
+                }
+                FinalValidateStatus::Passed | FinalValidateStatus::Failed => {
+                    if self.could_not_run_kind.is_some() {
+                        return Err(format!(
+                            "validation-service-result-could_not_run_kind: {} must carry null",
+                            self.final_validate_status.as_str()
+                        ));
+                    }
+                }
+            }
         }
         let validation_exit = self.final_validate_status.exit_code();
         if self.schema_version == HISTORICAL_SCHEMA_VERSION {
@@ -374,6 +455,7 @@ mod tests {
             profile: "full".into(),
             selection_mode: Some("full".into()),
             final_validate_status: FinalValidateStatus::Passed,
+            could_not_run_kind: None,
             detail: None,
             exit_code: 0,
             executed_nodes: 76,
@@ -446,6 +528,7 @@ mod tests {
                 profile: "full".into(),
                 selection_mode: Some("full".into()),
                 final_validate_status: FinalValidateStatus::CouldNotRun,
+                could_not_run_kind: Some(CouldNotRunKind::Refused),
                 detail: Some(detail.clone()),
                 exit_code: 75,
                 executed_nodes: 0,
@@ -469,6 +552,7 @@ mod tests {
         let mut value = serde_json::to_value(valid()).unwrap();
         value["schema_version"] = Value::from(HISTORICAL_SCHEMA_VERSION);
         value.as_object_mut().unwrap().remove("selection_mode");
+        value.as_object_mut().unwrap().remove("could_not_run_kind");
         value.as_object_mut().unwrap().remove("detail");
         value.as_object_mut().unwrap().remove("passed_tests");
         value.as_object_mut().unwrap().remove("scorecard_writeback");
@@ -489,6 +573,7 @@ mod tests {
         let mut value = serde_json::to_value(valid()).unwrap();
         value["schema_version"] = Value::from(WRITEBACK_SCHEMA_VERSION);
         value.as_object_mut().unwrap().remove("selection_mode");
+        value.as_object_mut().unwrap().remove("could_not_run_kind");
         value.as_object_mut().unwrap().remove("detail");
         value.as_object_mut().unwrap().remove("passed_tests");
         let decoded =
@@ -499,6 +584,7 @@ mod tests {
 
         let mut value = serde_json::to_value(valid()).unwrap();
         value["schema_version"] = Value::from(SELECTION_SCHEMA_VERSION);
+        value.as_object_mut().unwrap().remove("could_not_run_kind");
         value.as_object_mut().unwrap().remove("detail");
         value.as_object_mut().unwrap().remove("passed_tests");
         let decoded =
@@ -508,11 +594,21 @@ mod tests {
 
         let mut value = serde_json::to_value(valid()).unwrap();
         value["schema_version"] = Value::from(TEST_COUNTS_SCHEMA_VERSION);
+        value.as_object_mut().unwrap().remove("could_not_run_kind");
         value.as_object_mut().unwrap().remove("detail");
         let decoded =
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert_eq!(decoded.schema_version, TEST_COUNTS_SCHEMA_VERSION);
         assert_eq!(decoded.passed_tests, Some(2129));
+        assert_eq!(decoded.detail, None);
+
+        let mut value = serde_json::to_value(valid()).unwrap();
+        value["schema_version"] = Value::from(DETAIL_SCHEMA_VERSION);
+        value.as_object_mut().unwrap().remove("could_not_run_kind");
+        let decoded =
+            ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(decoded.schema_version, DETAIL_SCHEMA_VERSION);
+        assert_eq!(decoded.could_not_run_kind, None);
         assert_eq!(decoded.detail, None);
     }
 
@@ -523,7 +619,7 @@ mod tests {
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
-                .contains("schema 5 expected")
+                .contains("schema 6 expected")
         );
     }
 
@@ -534,7 +630,7 @@ mod tests {
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
-                .contains("schema 5 expected")
+                .contains("schema 6 expected")
         );
     }
 
@@ -545,18 +641,28 @@ mod tests {
         assert!(
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&value).unwrap())
                 .unwrap_err()
-                .contains("schema 5 expected")
+                .contains("schema 6 expected")
         );
     }
 
     #[test]
-    fn current_detail_is_required_nullable_and_only_names_no_result() {
+    fn current_detail_and_could_not_run_kind_are_required_and_consistent() {
         let mut missing = serde_json::to_value(valid()).unwrap();
         missing.as_object_mut().unwrap().remove("detail");
         let error =
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&missing).unwrap())
                 .unwrap_err();
-        assert!(error.contains("schema 5 expected"), "{error}");
+        assert!(error.contains("schema 6 expected"), "{error}");
+
+        let mut missing_kind = serde_json::to_value(valid()).unwrap();
+        missing_kind
+            .as_object_mut()
+            .unwrap()
+            .remove("could_not_run_kind");
+        let error =
+            ValidationServiceResult::from_json_slice(&serde_json::to_vec(&missing_kind).unwrap())
+                .unwrap_err();
+        assert!(error.contains("schema 6 expected"), "{error}");
 
         for status in [FinalValidateStatus::Passed, FinalValidateStatus::Failed] {
             let mut result = valid();
@@ -575,8 +681,14 @@ mod tests {
         no_result.exit_code = 75;
         no_result.executed_tests = None;
         no_result.passed_tests = None;
+        no_result.could_not_run_kind = Some(CouldNotRunKind::NoResult);
         no_result.detail = None;
-        no_result.validate().expect("genuine absence stays null");
+        assert!(
+            no_result
+                .validate()
+                .unwrap_err()
+                .contains("concrete reason")
+        );
         no_result.detail = Some(vec![]);
         assert!(no_result.validate().unwrap_err().contains("nonempty list"));
         no_result.detail = Some(vec![" ".into()]);
@@ -588,6 +700,52 @@ mod tests {
             ValidationServiceResult::from_json_slice(&serde_json::to_vec(&malformed).unwrap())
                 .unwrap_err();
         assert!(error.contains("validation-service-result-shape"), "{error}");
+
+        no_result.detail = Some(vec!["exact reason".into()]);
+        for kind in CouldNotRunKind::ALL {
+            no_result.could_not_run_kind = Some(kind);
+            no_result.validate().unwrap();
+            let encoded = serde_json::to_value(&no_result).unwrap();
+            assert_eq!(encoded["could_not_run_kind"], kind.as_str());
+        }
+
+        let encoded = serde_json::to_string(&no_result).unwrap();
+        for duplicate in [
+            r#""could_not_run_kind":"refused""#,
+            r#""detail":["different reason"]"#,
+            r#""schema_version":6"#,
+        ] {
+            let repeated = format!("{},{duplicate}}}", encoded.strip_suffix('}').unwrap());
+            let error = ValidationServiceResult::from_json_slice(repeated.as_bytes()).unwrap_err();
+            assert!(error.contains("duplicate field"), "{error}");
+        }
+
+        no_result.could_not_run_kind = None;
+        assert!(
+            no_result
+                .validate()
+                .unwrap_err()
+                .contains("COULD_NOT_RUN requires")
+        );
+
+        let mut failed_with_kind = valid();
+        failed_with_kind.final_validate_status = FinalValidateStatus::Failed;
+        failed_with_kind.exit_code = 1;
+        failed_with_kind.could_not_run_kind = Some(CouldNotRunKind::Interrupted);
+        assert!(
+            failed_with_kind
+                .validate()
+                .unwrap_err()
+                .contains("must carry null")
+        );
+
+        let mut legacy_no_result = no_result.clone();
+        legacy_no_result.schema_version = DETAIL_SCHEMA_VERSION;
+        legacy_no_result.could_not_run_kind = None;
+        legacy_no_result.detail = None;
+        legacy_no_result
+            .validate()
+            .expect("schema 5 explicit null remains readable");
     }
 
     #[test]
@@ -651,6 +809,8 @@ mod tests {
         no_result.exit_code = 75;
         no_result.executed_tests = None;
         no_result.passed_tests = None;
+        no_result.could_not_run_kind = Some(CouldNotRunKind::NoResult);
+        no_result.detail = Some(vec!["test framework produced no result".into()]);
         no_result.validate().unwrap();
     }
 
@@ -693,5 +853,21 @@ mod tests {
                 .collect();
             assert_eq!(fields, ScorecardWriteback::field_names(status));
         }
+        let cause = schema["could_not_run_kind"].as_object().unwrap();
+        assert_eq!(cause["nullable"], true);
+        assert_eq!(cause["required_for"], "COULD_NOT_RUN");
+        let variants: Vec<&str> = cause["variants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            variants,
+            CouldNotRunKind::ALL
+                .iter()
+                .map(|kind| kind.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 }

@@ -144,11 +144,12 @@ use hermit_manifest_plan::runner::Population;
 use hermit_manifest_plan::runner::resolved_cell_timeouts;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::FailureClass;
+use hermit_manifest_plan::runner::VerificationReport;
 use hermit_manifest_plan::runner::E2E_KERNEL_VERSION_ENV;
 use hermit_manifest_plan::runner::E2E_MACHINE_SHORTNAME_ENV;
 use hermit_manifest_plan::service_result::FinalValidateStatus;
 use hermit_manifest_plan::service_result::ScorecardWriteback;
-use hermit_manifest_plan::service_result::ValidationServiceResult;
+use hermit_manifest_plan::service_result::{CouldNotRunKind, ValidationServiceResult};
 use hermit_manifest_plan::timeouts::DEFAULT_TEST_WALL_TIMEOUT_SECONDS;
 use hermit_manifest_plan::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV;
 use hermit_manifest_plan::timeouts::scale_timeout_seconds;
@@ -672,8 +673,8 @@ fn usage() -> &'static str {
      The line is validate's last output and reports the validation verdict. A\n\
      post-verdict scorecard write-back failure preserves that line and exits 75;\n\
      current readers distinguish the two through ValidationServiceResult. A\n\
-     COULD_NOT_RUN service result carries the ordered refusal detail when validate\n\
-     has one. No line means validate died before reporting.\n\
+     Current COULD_NOT_RUN service results name no_result, refused, or interrupted\n\
+     and carry ordered concrete detail. No line means validate died before reporting.\n\
      Help, --show-plan, --write-constructed-dag, --write-generated-plan, and\n\
      --probe-host-capability do\n\
      not attempt validation and therefore do not emit a final validate status.\n\
@@ -2243,6 +2244,7 @@ fn self_test() -> Result<(), String> {
             .map_err(|error| format!("summary: cannot read write-back result: {error}"))?,
     )?;
     if writeback_result.final_validate_status != FinalValidateStatus::Passed
+        || writeback_result.could_not_run_kind.is_some()
         || writeback_result.detail.is_some()
         || writeback_result.exit_code != i32::from(COULD_NOT_RUN_EXIT_CODE)
         || writeback_result.scorecard_writeback
@@ -2275,6 +2277,7 @@ fn self_test() -> Result<(), String> {
             .map_err(|error| format!("summary: cannot read could-not-run result: {error}"))?,
     )?;
     if could_not_run.final_validate_status != FinalValidateStatus::CouldNotRun
+        || could_not_run.could_not_run_kind != Some(CouldNotRunKind::NoResult)
         || could_not_run.exit_code != i32::from(COULD_NOT_RUN_EXIT_CODE)
         || could_not_run.detail.as_ref() != Some(&refusal_detail)
         || could_not_run.scorecard_writeback.is_some()
@@ -2300,6 +2303,7 @@ fn self_test() -> Result<(), String> {
             .map_err(|error| format!("summary: cannot read service result: {error}"))?,
     )?;
     if service_result.final_validate_status != FinalValidateStatus::Passed
+        || service_result.could_not_run_kind.is_some()
         || service_result.detail.is_some()
         || service_result.exit_code != 0
         || service_result.executed_nodes != 76
@@ -2328,6 +2332,7 @@ fn self_test() -> Result<(), String> {
             .map_err(|error| format!("summary: cannot read failed result: {error}"))?,
     )?;
     if failed_result.final_validate_status != FinalValidateStatus::Failed
+        || failed_result.could_not_run_kind.is_some()
         || failed_result.exit_code != 1
         || failed_result.detail.is_some()
     {
@@ -2375,8 +2380,10 @@ fn self_test() -> Result<(), String> {
             failed_summary.exit_code,
         ));
     }
-    if !usage().contains("COULD_NOT_RUN service result carries the ordered refusal detail") {
-        return Err("summary: CLI help omitted the schema-5 refusal-detail contract".into());
+    if !usage()
+        .contains("Current COULD_NOT_RUN service results name no_result, refused, or interrupted")
+    {
+        return Err("summary: CLI help omitted the typed no-result contract".into());
     }
 
     let cache_tree = "b".repeat(40);
@@ -18057,6 +18064,8 @@ enum Verdict {
 const FINAL_VALIDATE_STATUS_PREFIX: &str = "FINAL_VALIDATE_STATUS: ";
 const COULD_NOT_RUN_EXIT_CODE: u8 = NO_RESULT_EXIT_CODE as u8;
 const VALIDATE_SERVICE_RESULT_PATH_ENV: &str = "VALIDATE_SERVICE_RESULT_PATH";
+const SERVICE_RESULT_VARIANT_SELF_TEST_DIR_ENV: &str =
+    "HERMIT_VALIDATE_SERVICE_RESULT_VARIANT_SELF_TEST_DIR";
 
 fn final_validate_status(verdict: Verdict) -> Option<FinalValidateStatus> {
     match verdict {
@@ -18068,6 +18077,20 @@ fn final_validate_status(verdict: Verdict) -> Option<FinalValidateStatus> {
             Some(FinalValidateStatus::CouldNotRun)
         }
         Verdict::PlanOnly | Verdict::Help => None,
+    }
+}
+
+fn could_not_run_kind(verdict: Verdict) -> Option<CouldNotRunKind> {
+    match verdict {
+        Verdict::NoResult => Some(CouldNotRunKind::NoResult),
+        Verdict::Refused => Some(CouldNotRunKind::Refused),
+        Verdict::Interrupted => Some(CouldNotRunKind::Interrupted),
+        Verdict::Pass
+        | Verdict::Fail
+        | Verdict::PlanOnly
+        | Verdict::CacheHit
+        | Verdict::SelfTest
+        | Verdict::Help => None,
     }
 }
 
@@ -18842,6 +18865,7 @@ fn write_validation_service_result(path: &Path, summary: &RunSummary) -> Result<
         profile: summary.profile.clone(),
         selection_mode: summary.selection_mode.clone(),
         final_validate_status: status,
+        could_not_run_kind: could_not_run_kind(summary.verdict),
         detail: if status == FinalValidateStatus::CouldNotRun {
             let detail = summary
                 .detail
@@ -18915,6 +18939,48 @@ fn publish_validation_service_result_or_refuse(
             Err(error)
         }
     }
+}
+
+/// Emit each producer-owned COULD_NOT_RUN variant through the real writer.
+///
+/// This is reachable only from an explicit `--self-test` invocation carrying
+/// the private environment marker. Parent integration tests consume the exact
+/// bytes so the Rust producer and Python reader cannot drift independently.
+fn write_service_result_variant_self_test_fixtures(directory: &Path) -> Result<String, String> {
+    if !directory.is_dir() {
+        return Err(format!(
+            "service-result variant fixture directory does not exist: {}",
+            directory.display()
+        ));
+    }
+    for (name, verdict) in [
+        ("no_result", Verdict::NoResult),
+        ("refused", Verdict::Refused),
+        ("interrupted", Verdict::Interrupted),
+    ] {
+        let mut summary = RunSummary::new(
+            verdict,
+            COULD_NOT_RUN_EXIT_CODE,
+            "self-test",
+            vec![format!("exact {name} fixture reason")],
+        );
+        summary.commit = "0123456789abcdef0123456789abcdef01234567".into();
+        summary.selection_mode = Some("full".into());
+        write_validation_service_result(&directory.join(format!("{name}.json")), &summary)?;
+    }
+    let mut verification = VerificationReport::no_result();
+    verification.no_result_reason = None;
+    let verification_bytes = serde_json::to_vec(&verification)
+        .map_err(|error| format!("cannot encode explicit-null verification fixture: {error}"))?;
+    std::fs::write(
+        directory.join("verification_no_result_explicit_null.json"),
+        [verification_bytes.as_slice(), b"\n"].concat(),
+    )
+    .map_err(|error| format!("cannot write explicit-null verification fixture: {error}"))?;
+    Ok(format!(
+        "service-result variants: wrote no_result, refused, and interrupted plus explicit-null verification evidence to {}",
+        directory.display()
+    ))
 }
 
 /// `--probe-host-capability <name>`: report THIS machine's verdict for one
@@ -19423,6 +19489,25 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             "watch the holder's live log with:".into(),
             "  tail -F -- $'/tmp/holder run.log'".into(),
         ]);
+    }
+
+    if args.self_test {
+        if let Some(directory) = std::env::var_os(SERVICE_RESULT_VARIANT_SELF_TEST_DIR_ENV) {
+            return match write_service_result_variant_self_test_fixtures(Path::new(&directory)) {
+                Ok(detail) => RunSummary::new(
+                    Verdict::SelfTest,
+                    0,
+                    "service-result variant self-test",
+                    vec![detail],
+                ),
+                Err(error) => RunSummary::new(
+                    Verdict::Fail,
+                    2,
+                    "service-result variant self-test",
+                    vec![error],
+                ),
+            };
+        }
     }
 
     if nested_scope_probe_selected(args.self_test, nested_scope_probe_requested()) {
@@ -22223,7 +22308,7 @@ mod final_validate_status_tests {
     }
 
     #[test]
-    fn schema_five_publishes_detail_only_for_could_not_run() {
+    fn schema_six_publishes_typed_kind_and_detail_only_for_could_not_run() {
         let temp = tempfile::tempdir().unwrap();
         let refusals = verdict_refusals(None, 0, Some(0));
         let expected_detail = refusals
@@ -22247,10 +22332,17 @@ mod final_validate_status_tests {
             &std::fs::read(&refused_path).unwrap(),
         )
         .unwrap();
-        assert_eq!(refused_result.schema_version, 5);
+        assert_eq!(
+            refused_result.schema_version,
+            hermit_manifest_plan::service_result::SCHEMA_VERSION
+        );
         assert_eq!(
             refused_result.final_validate_status,
             FinalValidateStatus::CouldNotRun
+        );
+        assert_eq!(
+            refused_result.could_not_run_kind,
+            Some(CouldNotRunKind::NoResult)
         );
         assert_eq!(refused_result.exit_code, i32::from(COULD_NOT_RUN_EXIT_CODE));
         assert_eq!(refused_result.detail, Some(expected_detail));
@@ -22272,6 +22364,7 @@ mod final_validate_status_tests {
         )
         .unwrap();
         assert_eq!(failed_result.final_validate_status, FinalValidateStatus::Failed);
+        assert_eq!(failed_result.could_not_run_kind, None);
         assert_eq!(failed_result.exit_code, 1);
         assert_eq!(failed_result.detail, None);
 
@@ -22287,6 +22380,7 @@ mod final_validate_status_tests {
         )
         .unwrap();
         assert_eq!(passed_result.final_validate_status, FinalValidateStatus::Passed);
+        assert_eq!(passed_result.could_not_run_kind, None);
         assert_eq!(passed_result.exit_code, 0);
         assert_eq!(passed_result.detail, None);
 
@@ -22317,6 +22411,38 @@ mod final_validate_status_tests {
         assert!(failed_publish.contains("cannot create validation service result beside"));
         assert_eq!(failed.verdict, Verdict::Fail);
         assert_eq!(failed.exit_code, 1);
+    }
+
+    #[test]
+    fn service_result_fixture_seam_uses_the_real_writer_for_all_variants() {
+        let temp = tempfile::tempdir().unwrap();
+        let summary = write_service_result_variant_self_test_fixtures(temp.path()).unwrap();
+        assert!(summary.contains("no_result, refused, and interrupted"));
+        for (name, kind) in [
+            ("no_result", CouldNotRunKind::NoResult),
+            ("refused", CouldNotRunKind::Refused),
+            ("interrupted", CouldNotRunKind::Interrupted),
+        ] {
+            let result = ValidationServiceResult::from_json_slice(
+                &std::fs::read(temp.path().join(format!("{name}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(result.final_validate_status, FinalValidateStatus::CouldNotRun);
+            assert_eq!(result.could_not_run_kind, Some(kind));
+            assert_eq!(result.detail, Some(vec![format!("exact {name} fixture reason")]));
+        }
+        let verification_bytes = std::fs::read(
+            temp.path()
+                .join("verification_no_result_explicit_null.json"),
+        )
+        .unwrap();
+        assert!(
+            std::str::from_utf8(&verification_bytes)
+                .unwrap()
+                .contains(r#""no_result_reason":null"#)
+        );
+        let verification = VerificationReport::from_current_json_slice(&verification_bytes).unwrap();
+        assert_eq!(verification.no_result_reason, None);
     }
 }
 

@@ -1,11 +1,12 @@
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "fields": [
     "schema_version",
     "commit",
     "profile",
     "selection_mode",
     "final_validate_status",
+    "could_not_run_kind",
     "detail",
     "exit_code",
     "executed_nodes",
@@ -36,5 +37,10 @@
       "completed": ["status"],
       "failed": ["status", "error"]
     }
+  },
+  "could_not_run_kind": {
+    "nullable": true,
+    "required_for": "COULD_NOT_RUN",
+    "variants": ["no_result", "refused", "interrupted"]
   }
 }
