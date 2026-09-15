@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["CiDisabledReasonSpec","CiDisabledResult","CiSelectionSpec"],"struct":["BackendCiDisabledReason","CiDisabledReasonData","CiSelection"]};

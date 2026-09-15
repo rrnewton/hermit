@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["check_fn_with_config","det_test_all_configs","det_test_cmd","det_test_cmd_with_config","det_test_fn","det_test_fn_with_config","det_test_fn_with_config_repetitions","expect_success","test_fn_with_config"],"macro":[["basic_det_test",1],["make_det_test_variants",1]],"static":["BOTTOM_CFG","MIDDLE_CFG","TOP_CFG"]};
