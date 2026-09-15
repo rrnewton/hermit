@@ -10,7 +10,9 @@ use std::ffi::CString;
 use std::fs;
 use std::fs::File;
 use std::io;
+use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
+use std::os::fd::BorrowedFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -291,8 +293,8 @@ impl OwnedCpuCgroup {
     /// Descriptor for enrollment before exec. Keep this owner alive through
     /// the complete spawn; the child writes `0\n` using only async-signal-safe
     /// operations before running any guest code.
-    pub fn enrollment_fd(&self) -> i32 {
-        self.procs_write.as_raw_fd()
+    pub fn enrollment_fd(&self) -> BorrowedFd<'_> {
+        self.procs_write.as_fd()
     }
 
     pub fn cpu_usage_usec(&self) -> Result<u64, String> {

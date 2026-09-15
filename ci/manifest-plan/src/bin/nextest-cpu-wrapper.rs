@@ -921,7 +921,8 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
         let enrollment_fd = attempt_cgroup
             .as_ref()
             .expect("budgeted path created an attempt cgroup")
-            .enrollment_fd();
+            .enrollment_fd()
+            .as_raw_fd();
         unsafe {
             command.pre_exec(move || {
                 loop {

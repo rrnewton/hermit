@@ -9,6 +9,8 @@
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
@@ -19,7 +21,7 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
-use flate2::read::MultiGzDecoder;
+use flate2::bufread::GzDecoder;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
@@ -51,8 +53,12 @@ pub struct RetainedVerifyLog {
     pub uncompressed_bytes: u64,
     pub compressed_sha256: String,
     pub compressed_bytes: u64,
+    /// Producer claim about the discarded peer; the retained-file readers do
+    /// not authenticate it. Bind it to the authoritative comparison separately.
     pub peer_uncompressed_sha256: String,
+    /// Producer claim about the discarded peer, unchecked by these readers.
     pub peer_uncompressed_bytes: u64,
+    /// Producer claim about the comparison, unchecked by these readers.
     pub compared_info_messages: u64,
 }
 
@@ -238,6 +244,32 @@ fn copy_and_hash_bounded(
     })
 }
 
+fn decode_single_gzip_bounded(
+    file: &mut File,
+    destination: &mut impl Write,
+    maximum_bytes: u64,
+    description: &str,
+) -> Result<ContentDigest, String> {
+    // The bufread decoder leaves bytes after the first member in this buffer.
+    // Requiring EOF therefore rejects both concatenation and trailing garbage,
+    // rather than validating only one header in a multi-member stream.
+    let mut input = BufReader::new(file);
+    let digest = {
+        let mut decoder = GzDecoder::new(&mut input);
+        copy_and_hash_bounded(&mut decoder, destination, maximum_bytes, description)?
+    };
+    if !input
+        .fill_buf()
+        .map_err(|error| format!("cannot finish reading {description}: {error}"))?
+        .is_empty()
+    {
+        return Err(format!(
+            "{description} must contain exactly one gzip member with no trailing bytes"
+        ));
+    }
+    Ok(digest)
+}
+
 fn require_single_link(file: &File, path: &Path, description: &str) -> Result<(), String> {
     let links = file
         .metadata()
@@ -306,15 +338,12 @@ fn inspect_open_gzip_file(
     }
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("cannot seek {description} {}: {error}", path.display()))?;
-    let uncompressed = {
-        let mut decoder = MultiGzDecoder::new(file);
-        copy_and_hash_bounded(
-            &mut decoder,
-            &mut std::io::sink(),
-            maximum_uncompressed_bytes,
-            description,
-        )?
-    };
+    let uncompressed = decode_single_gzip_bounded(
+        file,
+        &mut std::io::sink(),
+        maximum_uncompressed_bytes,
+        description,
+    )?;
     Ok(InspectedGzip {
         identity,
         compressed,
@@ -459,19 +488,16 @@ pub fn read_verified_retained_verify_log(
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("cannot seek retained compressed verify log: {error}"))?;
     let mut bytes = Vec::new();
-    let digest = {
-        let mut decoder = MultiGzDecoder::new(&mut opened.file);
-        copy_and_hash_bounded(
-            &mut decoder,
-            &mut bytes,
-            VERIFY_LOG_MAX_UNCOMPRESSED_BYTES,
-            "retained uncompressed verify log",
-        )?
-    };
+    let digest = decode_single_gzip_bounded(
+        &mut opened.file,
+        &mut bytes,
+        VERIFY_LOG_MAX_UNCOMPRESSED_BYTES,
+        "retained uncompressed verify log",
+    )?;
     if digest != opened.inspection.uncompressed {
         return Err("retained verify log changed while reading its uncompressed bytes".into());
     }
-    let path = artifact_dir.join(&retained.relative_path);
+    let path = artifact_dir.join(retained_verify_log_relative_path(expected_attempt)?);
     require_single_link(&opened.file, &path, "retained compressed verify log")?;
     require_path_identity(
         &path,
@@ -483,6 +509,10 @@ pub fn read_verified_retained_verify_log(
 
 /// Copy the exact gzip bytes named by a retained-log descriptor from one held
 /// source descriptor into a caller-owned destination.
+///
+/// On error, the destination may already contain partial or complete gzip
+/// bytes. Publish it only after this function succeeds; the caller owns
+/// destination rollback and durable publication.
 pub fn copy_verified_retained_verify_log(
     artifact_dir: &Path,
     retained: &RetainedVerifyLog,
@@ -513,7 +543,7 @@ pub fn copy_verified_retained_verify_log(
     if copied != opened.inspection.compressed {
         return Err("retained verify log changed while copying its compressed bytes".into());
     }
-    let path = artifact_dir.join(&retained.relative_path);
+    let path = artifact_dir.join(retained_verify_log_relative_path(expected_attempt)?);
     require_single_link(&opened.file, &path, "retained compressed verify log")?;
     require_path_identity(
         &path,
@@ -732,6 +762,41 @@ mod tests {
                 assert!(error.contains("cannot read"), "{error}");
             }
         }
+    }
+
+    #[test]
+    fn refuses_concatenated_members_even_when_all_recorded_digests_match() {
+        for timestamp in [0, 1] {
+            let mut fixture = Fixture::new();
+            let mut encoder = GzBuilder::new()
+                .mtime(timestamp)
+                .write(Vec::new(), Compression::default());
+            encoder.write_all(LOG).unwrap();
+            fixture.compressed.extend(encoder.finish().unwrap());
+            let decoded = [LOG, LOG].concat();
+            fixture.descriptor.compressed_sha256 =
+                format!("{:x}", Sha256::digest(&fixture.compressed));
+            fixture.descriptor.compressed_bytes = fixture.compressed.len() as u64;
+            fixture.descriptor.uncompressed_sha256 = format!("{:x}", Sha256::digest(&decoded));
+            fixture.descriptor.uncompressed_bytes = decoded.len() as u64;
+            fs::write(fixture.path(), &fixture.compressed).unwrap();
+            let error = fixture.verify().unwrap_err();
+            assert!(
+                error.contains("exactly one gzip member"),
+                "timestamp={timestamp}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_trailing_bytes_even_when_the_compressed_digest_matches() {
+        let mut fixture = Fixture::new();
+        fixture.compressed.push(b'\n');
+        fixture.descriptor.compressed_sha256 = format!("{:x}", Sha256::digest(&fixture.compressed));
+        fixture.descriptor.compressed_bytes = fixture.compressed.len() as u64;
+        fs::write(fixture.path(), &fixture.compressed).unwrap();
+        let error = fixture.verify().unwrap_err();
+        assert!(error.contains("no trailing bytes"), "{error}");
     }
 
     #[test]
