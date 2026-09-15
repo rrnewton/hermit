@@ -1,5 +1,5 @@
 {
-  "latest_identity": "745594574eea79722c740773929048853608e9b4d5ceb2bf81569e8550b500d9",
+  "latest_identity": "e905062c030fca4a7b7a062957cf86dd1f0855275b309d8c70db9a1516114bcb",
   "release_repository": "rrnewton/hermit",
   "releases": [
     {
@@ -181,6 +181,36 @@
       "recursive_identity_sha256": "d8e604d8ba3cf846a5599ab4e64628fa18bb2b803980e306f4416a6f269bd912",
       "release_title": "Compatibility website snapshot e75fe49e3b55c6357b32e0110d65731575fe287413f3239a92d9d4522e15a4fb",
       "tag": "compatibility-website-e75fe49e3b55c6357b32e0110d65731575fe287413f3239a92d9d4522e15a4fb"
+    },
+    {
+      "archive_bytes": 45622317,
+      "archive_member_count": 163,
+      "archive_sha256": "42a6ae70b59c076e2d4a0db37428337786b7929b1c3ea81e921b76d39cabb34f",
+      "artifacts_sha256": "41f30b9df084d287962cf2f0a330261ec1d13bfe08acd28ebe45a3ff5aeeff2f",
+      "asset": "compatibility-website-e905062c030fca4a7b7a062957cf86dd1f0855275b309d8c70db9a1516114bcb.tar.gz",
+      "build_sha256": "435674731de2ddddadea66b72366e111d930ca5c95b30295b413d35c9ab0410e",
+      "content_tree_sha256": "ec3d97c32122079eb303d3638aaa142566297896e167db36a83bdf80639cfb5f",
+      "counts": {
+        "current_validation_run_row_count": 111,
+        "green_cell_count": 805,
+        "in_manifest_cell_count": 5744,
+        "never_measured_cell_count": 4895,
+        "physical_row_count": 44779,
+        "red_cell_count": 30,
+        "represented_run_count": 51403,
+        "selected_by_full_custom_command_count": 3,
+        "test_count": 359,
+        "validation_history_row_count": 124
+      },
+      "directories": ["assets", "cells", "data", "runs", "tests"],
+      "file_bytes": 81055783,
+      "file_count": 157,
+      "identity": "e905062c030fca4a7b7a062957cf86dd1f0855275b309d8c70db9a1516114bcb",
+      "manifest_tree_sha256": "4b5ce07d7ad65d52ce7bdc871fcabd4d9d5305dc51a089fb399d6c77fb1d3f3b",
+      "mode_sha256": "d4eac0e1815277bda1a57e8eadc11c539814561d4777e673b7eca2ab245f6916",
+      "recursive_identity_sha256": "cd01281b4193cc8b6c99c6680a5b2a8dfc024c7263673d6e3d1309d9a84f2e58",
+      "release_title": "Compatibility website snapshot e905062c030fca4a7b7a062957cf86dd1f0855275b309d8c70db9a1516114bcb",
+      "tag": "compatibility-website-e905062c030fca4a7b7a062957cf86dd1f0855275b309d8c70db9a1516114bcb"
     }
   ],
   "schema_version": 1
