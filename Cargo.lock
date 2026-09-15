@@ -1048,12 +1048,14 @@ version = "0.2.0"
 dependencies = [
  "dagrun",
  "detcore-model",
+ "flate2",
  "libc",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
  "shell-words",
+ "tempfile",
  "toml",
 ]
 

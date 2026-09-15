@@ -77,6 +77,14 @@ const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 const CELL_CPU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CELL_CPU_ACCOUNTING_GRACE: Duration = Duration::from_secs(1);
 pub const CELL_RESULT_SCHEMA: u64 = 4;
+
+mod retained_verify_log;
+pub use retained_verify_log::RetainedVerifyLog;
+pub use retained_verify_log::RetainedVerifyLogRole;
+pub use retained_verify_log::VerifiedRetainedLogCopy;
+pub use retained_verify_log::copy_verified_retained_verify_log;
+pub use retained_verify_log::read_verified_retained_verify_log;
+pub use retained_verify_log::verify_retained_verify_log;
 pub const E2E_MACHINE_SHORTNAME_ENV: &str = "E2E_MACHINE_SHORTNAME";
 pub const E2E_KERNEL_VERSION_ENV: &str = "E2E_KERNEL_VERSION";
 pub const E2E_RUN_INDEX_ENV: &str = "E2E_RUN_INDEX";
@@ -255,7 +263,8 @@ pub struct ManifestSet {
     tests: BTreeMap<String, (String, u64, u64, TestRecipe)>,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CellId {
     pub test: String,
     pub mode: String,
