@@ -219,6 +219,16 @@ impl ValidationServiceResult {
             .ok_or_else(|| {
                 "validation-service-result-schema_version: must be an unsigned integer".to_string()
             })?;
+        // Value decoding keeps the last duplicate key. Check the discriminator
+        // from the original bytes before selecting even a historical reader.
+        // Other historical field semantics remain unchanged.
+        #[derive(Deserialize)]
+        struct SchemaDiscriminator {
+            #[serde(rename = "schema_version")]
+            _schema_version: serde::de::IgnoredAny,
+        }
+        serde_json::from_slice::<SchemaDiscriminator>(bytes)
+            .map_err(|error| format!("validation-service-result-shape: {error}"))?;
         let expected_fields: BTreeSet<&str> = match schema_version {
             HISTORICAL_SCHEMA_VERSION => HISTORICAL_FIELD_NAMES.into_iter().collect(),
             WRITEBACK_SCHEMA_VERSION => WRITEBACK_FIELD_NAMES.into_iter().collect(),
@@ -869,5 +879,40 @@ mod tests {
                 .map(|kind| kind.as_str())
                 .collect::<Vec<_>>()
         );
+    }
+    #[test]
+    fn schema_discriminator_cannot_downgrade_current_bytes() {
+        for schema in [5, 6, 1, 2, 3, 4] {
+            let fields: &[&str] = match schema {
+                1 => &HISTORICAL_FIELD_NAMES,
+                2 => &WRITEBACK_FIELD_NAMES,
+                3 => &SELECTION_FIELD_NAMES,
+                4 => &TEST_COUNTS_FIELD_NAMES,
+                5 => &DETAIL_FIELD_NAMES,
+                6 => &FIELD_NAMES,
+                _ => unreachable!(),
+            };
+            let mut value = serde_json::to_value(valid()).unwrap();
+            value["schema_version"] = schema.into();
+            value
+                .as_object_mut()
+                .unwrap()
+                .retain(|key, _| fields.contains(&key.as_str()));
+            let encoded = serde_json::to_string(&value).unwrap();
+            let parsed = ValidationServiceResult::from_json_slice(encoded.as_bytes()).unwrap();
+            assert_eq!(parsed.schema_version, schema);
+            for first in [6, 5, 1, 2, 3, 4] {
+                let repeated = format!(
+                    "{{\"schema_version\":{first},{}",
+                    encoded.strip_prefix('{').unwrap()
+                );
+                let error = ValidationServiceResult::from_json_slice(repeated.as_bytes())
+                    .expect_err("a repeated discriminator cannot select a permissive reader");
+                assert!(
+                    error.contains("duplicate field"),
+                    "schema {first}->{schema}: {error}"
+                );
+            }
+        }
     }
 }
