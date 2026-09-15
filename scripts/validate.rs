@@ -5228,7 +5228,7 @@ fn fallback_e2e_result_root(log_path: &Path, run: &std::ffi::OsStr) -> Result<Pa
 
 /// Give every real validate invocation its own durable E2E result directory.
 ///
-/// `target/debug/test-harness` already emits one schema-4 row per cell, but its local
+/// `target/debug/test-harness` already emits one schema-5 row per cell, but its local
 /// default is under the checkout. A canonical validate may run in a disposable
 /// scratch tree, so those rows disappeared at cleanup. Deriving the fallback
 /// from the durable log puts both artifacts under the same surviving root. A
@@ -17333,7 +17333,7 @@ print("fixture append accepted")
     .map_err(|error| format!("validate series writer: cannot write fixture script: {error}"))?;
     let row = |attempt| {
         serde_json::json!({
-            "schema": 4,
+            "schema": 5,
             "attempt": attempt,
             "hermit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "source_tree_dirty": false,

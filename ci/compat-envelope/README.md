@@ -11,16 +11,15 @@ data are not versioned; each validate run retains those under `ignored/`.
 
 The denominator is the complete comparable manifest matrix, not just the
 combinations that happen to be enabled today. For `N` manifest tests, verify,
-replay, and chaos span five Hermit backends, while native contributes one
-naked-execution control: `N × (5 × 3 + 1)` cells. Native is shown as a sixth
-backend in the table, but it does not have replay or chaos cells, so the formula
-is not `N × 6 × 3`. Explicit `custom` commands still run when selected by
-ordinary validation, but they are not multiplied across every test/backend
-pair: unlike the three common modes, they do not define a uniform product-wide
-denominator.
+replay, and chaos span five Hermit backends: `N × 5 × 3` cells. Native naked
+execution remains visible as a separate control, but is not a Hermit backend
+and does not enter any backend denominator, count, status rollup, or backend
+table. Explicit `custom` commands still run when selected by ordinary
+validation, but they are not multiplied across every test/backend pair: unlike
+the three common modes, they do not define a uniform product-wide denominator.
 
 For one dated example only: on 2026-08-13, `N = 336`, so the comparable matrix
-has `336 × (5 × 3 + 1) = 5,376` cells. The checked-in table is generated from
+has `336 × 5 × 3 = 5,040` cells. The checked-in table is generated from
 the live manifest and changes automatically when a manifest test is added.
 
 `hermit-manifest-plan --format
@@ -46,7 +45,7 @@ The path is deliberately direct:
 1. `hermit-manifest-plan` validates the complete matrix and emits the enabled
    execution plan.
 2. `ci/expected-e2e-plan.json` identifies the cells ordinary validation runs.
-3. Each manifest bucket appends schema-4 `results.jsonl` rows to a unique
+3. Each manifest bucket appends schema-5 `results.jsonl` rows to a unique
    durable result directory. Every row includes the validate attempt number,
    cell `duration_ms`, the `timeout_seconds` used for that attempt, literal
    argv, explicit environment, working directory, and pasteable shell command.
@@ -228,11 +227,11 @@ nonzero; neither path commits the generated files.
 An off-the-record local validate still adds any clean exact-HEAD per-cell
 observations. Those observations cannot qualify a receipt, and the scorecard
 writer cannot change which cells are selected or move their green/red state.
-`import-results` walks retained history without executing a guest, keeps only
-clean schema-4 `BitwiseInfoV1` terminal comparisons from commits on `HEAD`'s
-history, and selects the newest such commit independently for every enabled
-cell. If several retained runs at that commit disagree, it imports every result
-instead of resolving the conflict by file order.
+`import-results` walks retained history without executing a guest, keeps clean
+schema-4 and schema-5 non-native `BitwiseInfoV1` terminal comparisons from
+commits on `HEAD`'s history, and selects the newest such commit independently
+for every enabled cell. If several retained runs at that commit disagree, it
+imports every result instead of resolving the conflict by file order.
 
 A retained comparison without a divergence position is imported as historical
 evidence with its own SHA. A retained position is handled only after a current
