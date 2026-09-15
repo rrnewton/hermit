@@ -29,11 +29,24 @@ Demo-Green-Review: reviewer=<agent-id> demo=<demos/path[,demos/path...]|all> res
   serial shell and exits rc=0). Anything other than GREEN does not satisfy the gate.
 - `evidence=` — a link/path/SHA to the run log or artifact.
 
-A `result=GREEN` trailer is invalid when the same commit body reports only a
-non-green mechanical result such as `PARTIAL` or `FAILURE` for a demo covered by
-that trailer. Deliberate failing checks remain compatible with a later reported
+A `result=GREEN` trailer is invalid when the same commit body reports a non-green
+mechanical result such as `PARTIAL` or `FAILURE` for a demo covered by that
+trailer. Deliberate failing checks remain compatible with a later reported
 successful real run; the checker does not treat the presence of a negative
-control as a failed review.
+control as a failed review. "Later" is read literally: the **last** result the
+body reports for a demo is the one that counts, so a green followed by a real
+failure is still a contradiction.
+
+A banner is classified by the result word it carries anywhere on the line, so a
+second colon — `=== Demo 03: Chaos Concurrency: FAILURE ===` — does not hide the
+result. A line carrying any non-green word is non-green even if a green word also
+appears on it.
+
+The suite-level aggregate `demos/run-all.sh` emits, such as
+`=== Demo suite: FAILURE — 1 demo(s) failed, ... ===`, contradicts a `demo=all`
+trailer. It is deliberately not attributed to any individual demo: the aggregate
+reports that something failed without reporting which, so a trailer naming one
+exact path is not contradicted by it.
 
 ## Enforcement (mechanical)
 

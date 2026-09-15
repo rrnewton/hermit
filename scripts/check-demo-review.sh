@@ -96,29 +96,76 @@ claim_covers_demo_number() {  # $1 = comma-separated demo= value, $2 = number
     return 1
 }
 
+# Does a demo= claim cover everything? Only the documented `all` value does.
+# The suite-level aggregate below is contradicted by nothing narrower, because
+# it reports that SOMETHING failed without saying which demo it was.
+claim_covers_everything() {  # $1 = comma-separated demo= value
+    local claims="$1" value
+    while IFS= read -r value; do
+        [ "$value" = all ] && return 0
+    done < <(printf '%s\n' "$claims" | tr ',' '\n')
+    return 1
+}
+
+# The mechanical result vocabulary, as two whole-word alternations.
+DEMO_RESULT_GREEN='green|pass|success'
+DEMO_RESULT_NONGREEN='partial|fail|failure|failed|red|skip|skipped|incomplete|no_result|no-result|error'
+
+# Classify one banner line by the result word it carries ANYWHERE on the line,
+# not by the text between the demo number and the first colon.
+#
+# Reading only up to the first colon is wrong for a banner that carries a
+# second one. `demos/03-chaos-concurrency.sh` emits
+# `=== Demo 03: Chaos Concurrency: FAILURE ===`, and the first-colon reading
+# classified that as the word "chaos" — so the repository's own failure banner
+# was invisible and a GREEN claim covering demo 3 passed against a body saying
+# it failed.
+#
+# A line carrying ANY non-green word is non-green even when a green word also
+# appears. That is the conservative direction: it can only refuse claims the
+# previous parser accepted, never accept one it refused.
+line_result() {  # $1 = line -> prints "green", "nongreen", or nothing
+    local line="${1,,}"
+    if [[ "$line" =~ (^|[^a-z_-])(${DEMO_RESULT_NONGREEN})([^a-z_-]|$) ]]; then
+        printf 'nongreen\n'
+    elif [[ "$line" =~ (^|[^a-z_-])(${DEMO_RESULT_GREEN})([^a-z_-]|$) ]]; then
+        printf 'green\n'
+    fi
+}
+
 # A body's mechanical result lines may include deliberate negative controls as
 # well as the real run. A claim is contradicted when it covers a numbered demo
-# for which the body reports a non-green result and no green result. This makes
-# a forced-failure check followed by a successful real run valid, while a body
-# that reports only PARTIAL or FAILURE cannot claim GREEN.
+# whose LAST reported result in the body is non-green, or when it covers
+# everything and the last suite-level aggregate is non-green.
+#
+# The LAST result per demo decides, in body order. `ADVERSARIAL-REVIEW-POLICY.md`
+# says a deliberate failing check stays compatible with a *later* successful real
+# run; a set-membership test has no notion of later, so it also accepted a real
+# run that failed AFTER an earlier green. Taking the last result implements the
+# sentence the policy actually states, in both directions.
 claim_contradicts_body() {  # $1 = commit message, $2 = demo= value
-    local text="$1" claims="$2" line number result
-    declare -A green=() nongreen=()
+    local text="$1" claims="$2" line number result suite=
+    declare -A last=()
     while IFS= read -r line; do
-        if [[ "${line,,}" =~ ^[[:space:]]*(=+[[:space:]]*)?demo[[:space:]]*0*([0-9]+)[^:]*:[[:space:]]*(first[[:space:]]+run[[:space:]]+saved,[[:space:]]*)?([a-z_-]+) ]]; then
+        if [[ "${line,,}" =~ ^[[:space:]]*(=+[[:space:]]*)?demo[[:space:]]*0*([0-9]+)[^:]*: ]]; then
             number="${BASH_REMATCH[2]}"
-            result="${BASH_REMATCH[4]}"
-            case "$result" in
-                green|pass|success) green[$((10#$number))]=1 ;;
-                partial|fail|failure|failed|red|skip|skipped|incomplete|no_result|no-result|error)
-                    nongreen[$((10#$number))]=1 ;;
-            esac
+            result=$(line_result "$line")
+            [ -n "$result" ] && last[$((10#$number))]="$result"
+        elif [[ "${line,,}" =~ ^[[:space:]]*(=+[[:space:]]*)?demo[[:space:]]+suite[^:]*: ]]; then
+            # `demos/run-all.sh` emits
+            # `=== Demo suite: FAILURE — N demo(s) failed, ... ===`. "suite"
+            # carries no digits, so the numbered scan above cannot see it at
+            # all and a `demo=all result=GREEN` trailer passed against a body
+            # whose own aggregate said the suite failed.
+            result=$(line_result "$line")
+            [ -n "$result" ] && suite="$result"
         fi
     done <<<"$text"
-    for number in "${!nongreen[@]}"; do
-        [ "${green[$number]:-0}" = 1 ] && continue
+    for number in "${!last[@]}"; do
+        [ "${last[$number]}" = nongreen ] || continue
         claim_covers_demo_number "$claims" "$number" && return 0
     done
+    [ "$suite" = nongreen ] && claim_covers_everything "$claims" && return 0
     return 1
 }
 

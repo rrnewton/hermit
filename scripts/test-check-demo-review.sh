@@ -292,5 +292,80 @@ run_range "$r" 1
 check "successful banner after a deliberate failure passes" 0 "$RC" "$OUT"
 rm -rf "$r"
 
+# 25. A SECOND COLON BEFORE THE RESULT WORD must not hide the failure.
+# `demos/03-chaos-concurrency.sh` emits this exact shape. Reading only as far
+# as the first colon captured "Chaos Concurrency" as the result, so the banner
+# classified as neither green nor non-green and the GREEN claim stood.
+r=$(new_repo)
+commit_demo "$r" demos/03-chaos-concurrency.sh v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 3
+
+=== Demo 03: Chaos Concurrency: FAILURE ===
+
+Demo-Green-Review: reviewer=other demo=demos/03-chaos-concurrency.sh result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "two-colon failure banner still contradicts GREEN" 1 "$RC" "$OUT"
+rm -rf "$r"
+
+# 26. Control for 25: the same two-colon shape reporting SUCCESS must still
+# accept, so the fix refuses the failure rather than refusing the shape.
+r=$(new_repo)
+commit_demo "$r" demos/03-chaos-concurrency.sh v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 3
+
+=== Demo 03: Chaos Concurrency: SUCCESS ===
+
+Demo-Green-Review: reviewer=other demo=demos/03-chaos-concurrency.sh result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "two-colon success banner still accepts GREEN" 0 "$RC" "$OUT"
+rm -rf "$r"
+
+# 27. THE SUITE-LEVEL AGGREGATE carries no demo number, so the numbered scan
+# never saw it. `demos/run-all.sh` emits this line verbatim.
+r=$(new_repo)
+commit_demo "$r" demos/08-h.sh v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 8
+
+=== Demo suite: FAILURE — 1 demo(s) failed, 7 passed, 0 skipped ===
+
+Demo-Green-Review: reviewer=other demo=all result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "suite aggregate FAILURE contradicts a demo=all GREEN claim" 1 "$RC" "$OUT"
+rm -rf "$r"
+
+# 28. Control for 27: the suite's own success line must still accept `all`.
+r=$(new_repo)
+commit_demo "$r" demos/08-h.sh v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 8
+
+=== Demo suite: SUCCESS — all 8 requested demos passed ===
+
+Demo-Green-Review: reviewer=other demo=all result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "suite aggregate SUCCESS still accepts a demo=all GREEN claim" 0 "$RC" "$OUT"
+rm -rf "$r"
+
+# 29. Negative control for 27: the aggregate says SOMETHING failed but not
+# which demo, so it must not be attributed to a narrower claim.
+r=$(new_repo)
+commit_demo "$r" demos/08-h.sh v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 8
+
+=== Demo suite: FAILURE — 1 demo(s) failed, 7 passed, 0 skipped ===
+
+Demo-Green-Review: reviewer=other demo=demos/08-h.sh result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "suite aggregate FAILURE is not attributed to one named demo" 0 "$RC" "$OUT"
+rm -rf "$r"
+
+# 30. A REAL RUN THAT FAILED AFTER an earlier green must refuse. The policy
+# sentence is that a deliberate failing check stays compatible with a LATER
+# successful run; membership alone had no notion of later and accepted this.
+r=$(new_repo)
+commit_demo "$r" demos/08-h.sh v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 8
+
+=== Demo 08: GREEN ===
+=== Demo 08: FAILURE (the real run, after the control) ===
+
+Demo-Green-Review: reviewer=other demo=demos/08-h.sh result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "a failure reported after a green still contradicts GREEN" 1 "$RC" "$OUT"
+rm -rf "$r"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
