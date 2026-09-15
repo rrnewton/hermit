@@ -29,11 +29,33 @@ Demo-Green-Review: reviewer=<agent-id> demo=<demos/path[,demos/path...]|all> res
   serial shell and exits rc=0). Anything other than GREEN does not satisfy the gate.
 - `evidence=` — a link/path/SHA to the run log or artifact.
 
-A `result=GREEN` trailer is invalid when the same commit body reports only a
-non-green mechanical result such as `PARTIAL` or `FAILURE` for a demo covered by
-that trailer. Deliberate failing checks remain compatible with a later reported
+A `result=GREEN` trailer is invalid when the same commit body reports a non-green
+mechanical result such as `PARTIAL` or `FAILURE` for a demo covered by that
+trailer. Deliberate failing checks remain compatible with a later reported
 successful real run; the checker does not treat the presence of a negative
-control as a failed review.
+control as a failed review. "Later" is read literally: the **last** result the
+body reports for a demo is the one that counts, so a green followed by a real
+failure is still a contradiction.
+
+Only a line that begins `Demo <number>` (optionally behind `===`) and contains a
+colon is examined at all, and on such a line only a **result field** can be a
+result: the first token after a `:` or a `,`, or the last token of the label
+before the first colon. So a second colon does not hide the result —
+`=== Demo 3: Chaos Concurrency Testing: FAILURE (exit 1) ===` is a failure, and
+`Demo 07 failed: <detail>` is a failure — while ordinary prose on such a line is
+not a result. That second half matters as much as the first: this repository's
+own `demo08: <subject>` commit-subject convention must not read as a demo-8
+failure, and a sentence like `Demo 08: the calibration pass is unchanged` must
+not read as a green that cancels a real failure banner above it.
+
+Within one line, a non-green field beats a green field, so
+`FAILURE — 1 demo(s) failed, 7 passed` is a failure.
+
+The suite-level aggregate `demos/run-all.sh` emits, such as
+`=== Demo suite: FAILURE — 1 demo(s) failed, ... ===`, contradicts a `demo=all`
+trailer. It is deliberately not attributed to any individual demo: the aggregate
+reports that something failed without reporting which, so a trailer naming one
+exact path is not contradicted by it.
 
 ## Enforcement (mechanical)
 

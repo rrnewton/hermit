@@ -292,5 +292,156 @@ run_range "$r" 1
 check "successful banner after a deliberate failure passes" 0 "$RC" "$OUT"
 rm -rf "$r"
 
+# 25. A SECOND COLON BEFORE THE RESULT WORD must not hide the failure.
+# `demos/03-chaos-concurrency.sh` emits this exact shape. Reading only as far
+# as the first colon captured "Chaos Concurrency" as the result, so the banner
+# classified as neither green nor non-green and the GREEN claim stood.
+r=$(new_repo)
+commit_demo "$r" demos/03-chaos-concurrency.sh v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 3
+
+=== Demo 03: Chaos Concurrency: FAILURE ===
+
+Demo-Green-Review: reviewer=other demo=demos/03-chaos-concurrency.sh result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "two-colon failure banner still contradicts GREEN" 1 "$RC" "$OUT"
+rm -rf "$r"
+
+# 26. Control for 25: the same two-colon shape reporting SUCCESS must still
+# accept, so the fix refuses the failure rather than refusing the shape.
+r=$(new_repo)
+commit_demo "$r" demos/03-chaos-concurrency.sh v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 3
+
+=== Demo 03: Chaos Concurrency: SUCCESS ===
+
+Demo-Green-Review: reviewer=other demo=demos/03-chaos-concurrency.sh result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "two-colon success banner still accepts GREEN" 0 "$RC" "$OUT"
+rm -rf "$r"
+
+# 27. THE SUITE-LEVEL AGGREGATE carries no demo number, so the numbered scan
+# never saw it. `demos/run-all.sh` emits this line verbatim.
+r=$(new_repo)
+commit_demo "$r" demos/08-h.sh v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 8
+
+=== Demo suite: FAILURE — 1 demo(s) failed, 7 passed, 0 skipped ===
+
+Demo-Green-Review: reviewer=other demo=all result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "suite aggregate FAILURE contradicts a demo=all GREEN claim" 1 "$RC" "$OUT"
+rm -rf "$r"
+
+# 28. Control for 27: the suite's own success line must still accept `all`.
+r=$(new_repo)
+commit_demo "$r" demos/08-h.sh v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 8
+
+=== Demo suite: SUCCESS — all 8 requested demos passed ===
+
+Demo-Green-Review: reviewer=other demo=all result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "suite aggregate SUCCESS still accepts a demo=all GREEN claim" 0 "$RC" "$OUT"
+rm -rf "$r"
+
+# 29. Negative control for 27: the aggregate says SOMETHING failed but not
+# which demo, so it must not be attributed to a narrower claim.
+r=$(new_repo)
+commit_demo "$r" demos/08-h.sh v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 8
+
+=== Demo suite: FAILURE — 1 demo(s) failed, 7 passed, 0 skipped ===
+
+Demo-Green-Review: reviewer=other demo=demos/08-h.sh result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "suite aggregate FAILURE is not attributed to one named demo" 0 "$RC" "$OUT"
+rm -rf "$r"
+
+# 30. A REAL RUN THAT FAILED AFTER an earlier green must refuse. The policy
+# sentence is that a deliberate failing check stays compatible with a LATER
+# successful run; membership alone had no notion of later and accepted this.
+r=$(new_repo)
+commit_demo "$r" demos/08-h.sh v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 8
+
+=== Demo 08: GREEN ===
+=== Demo 08: FAILURE (the real run, after the control) ===
+
+Demo-Green-Review: reviewer=other demo=demos/08-h.sh result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "a failure reported after a green still contradicts GREEN" 1 "$RC" "$OUT"
+rm -rf "$r"
+
+# Stage a demo path and run the commit-msg hook's own mode. Every case above
+# drives `--range`; `.githooks/commit-msg` drives `--staged --message-file`,
+# which is the path a local author actually hits, so it gets its own controls.
+run_staged() {  # $1 repo, $2 demo path, $3 message
+    mkdir -p "$(dirname -- "$1/$2")"
+    printf 'v1\n' >"$1/$2"
+    chmod +x "$1/$2"
+    git -C "$1" add -A
+    printf '%s\n' "$3" >"$1/.msg"
+    OUT=$(cd "$1" && "$GATE" --staged --message-file .msg 2>&1)
+    RC=$?
+}
+
+# 31. PROSE MUST NOT CANCEL A REAL FAILURE. Searching the whole line for a
+# result word made the ordinary sentence below read as GREEN and cancel the
+# banner above it, accepting a body the previous head correctly refused.
+r=$(new_repo)
+commit_demo "$r" demos/08-h.sh v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 8
+
+=== Demo 08: FAILURE — required asset is missing: /assets/btrfs-convert ===
+Demo 08: the calibration pass is unchanged by this commit
+
+Demo-Green-Review: reviewer=other demo=demos/08-h.sh result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "prose after a failure banner does not cancel it" 1 "$RC" "$OUT"
+rm -rf "$r"
+
+# 32. AND THE OTHER DIRECTION: this repository's own `demo08: <subject>`
+# convention is prose, not a result. Whole-line scanning read "fail" out of the
+# subject and refused a legitimate commit that carries a valid attestation.
+r=$(new_repo)
+commit_demo "$r" demos/08-h.sh v1 "demo08: make the engagement sweep runnable, and prove it can fail
+
+[hermit2, implementer, unresolved, host, role=impl]
+
+Demo-Green-Review: reviewer=other demo=demos/08-h.sh result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "a demo08: commit subject is not a mechanical result" 0 "$RC" "$OUT"
+rm -rf "$r"
+
+# 33. The same subject through the commit-msg hook's own mode, because that is
+# where a local author meets it first.
+r=$(new_repo)
+run_staged "$r" demos/08-h.sh "demo08: count path engagement per seed so zero engagement is NO-RESULT, not clean
+
+[hermit2, implementer, unresolved, host, role=impl]
+
+Demo-Green-Review: reviewer=other demo=demos/08-h.sh result=GREEN evidence=log.txt"
+check "staged: a demo08: commit subject is not a mechanical result" 0 "$RC" "$OUT"
+rm -rf "$r"
+
+# 34. Staged control in the refusing direction, so case 33 cannot pass merely
+# because the staged path stopped inspecting anything.
+r=$(new_repo)
+run_staged "$r" demos/08-h.sh "demo08: repair the sweep
+
+[hermit2, implementer, unresolved, host, role=impl]
+
+=== Demo 08: FAILURE (exit 1) ===
+
+Demo-Green-Review: reviewer=other demo=demos/08-h.sh result=GREEN evidence=log.txt"
+check "staged: a real failure banner still contradicts GREEN" 1 "$RC" "$OUT"
+rm -rf "$r"
+
+# 35. The label's last token is a result, so a demo that reports its failure
+# before the colon is still seen. demos/07-drgn-kernel.py emits this shape.
+r=$(new_repo)
+commit_demo "$r" demos/07-g.py v1 "[hermit2, implementer, unresolved, host, role=impl] touch demo 7
+
+Demo 07 failed: missing kernel debuginfo
+
+Demo-Green-Review: reviewer=other demo=demos/07-g.py result=GREEN evidence=log.txt"
+run_range "$r" 1
+check "a failure reported before the colon still contradicts GREEN" 1 "$RC" "$OUT"
+rm -rf "$r"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
