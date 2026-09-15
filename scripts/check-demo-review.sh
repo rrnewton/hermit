@@ -96,29 +96,113 @@ claim_covers_demo_number() {  # $1 = comma-separated demo= value, $2 = number
     return 1
 }
 
+# Does a demo= claim cover everything? Only the documented `all` value does.
+# The suite-level aggregate below is contradicted by nothing narrower, because
+# it reports that SOMETHING failed without saying which demo it was.
+claim_covers_everything() {  # $1 = comma-separated demo= value
+    local claims="$1" value
+    while IFS= read -r value; do
+        [ "$value" = all ] && return 0
+    done < <(printf '%s\n' "$claims" | tr ',' '\n')
+    return 1
+}
+
+# Classify ONE TOKEN against the mechanical result vocabulary. The vocabulary
+# is unchanged; only where it is looked for has changed. Leading punctuation is
+# stripped so `(exit` and `===` are examined rather than skipped.
+demo_result_class() {  # $1 = one token -> prints "green", "nongreen", or nothing
+    local token="${1,,}"
+    [[ "$token" =~ ^[^a-z0-9_-]*([a-z0-9_-]+) ]] || return 0
+    case "${BASH_REMATCH[1]}" in
+        green|pass|success) printf 'green\n' ;;
+        partial|fail|failure|failed|red|skip|skipped|incomplete|no_result|no-result|error)
+            printf 'nongreen\n' ;;
+    esac
+}
+
+# Classify one line by the result word sitting IN A RESULT FIELD.
+#
+# A banner is `<label>: <result>[: <result>][, <result>]`, so a field is what
+# follows a `:` or a `,`, and the result is that field's FIRST token. Reading
+# only as far as the first colon was wrong for a banner carrying a second one:
+# `demos/common.sh` gives every labelled demo the shape
+# `=== Demo 3: Chaos Concurrency Testing: FAILURE (exit 1) ===`, which the
+# first-colon reading classified as the word "chaos", so the repository's own
+# failure banner was invisible and a GREEN claim covering that demo passed
+# against a body saying it failed.
+#
+# Scanning the WHOLE line for a result word instead is not the fix, and is the
+# defect an independent review caught in the first attempt at this. It reads
+# prose as a result, in both directions:
+#   * `=== Demo 08: FAILURE ... ===` followed by the ordinary sentence
+#     `Demo 08: the calibration pass is unchanged by this commit` classified
+#     that sentence as GREEN and cancelled the real failure — accepting a body
+#     the previous parser correctly refused.
+#   * this repository's own `demo08: <subject>` commit-subject convention
+#     produced false non-green results, so a legitimate demo-8 commit carrying
+#     a valid independent attestation was refused, through `--range` and
+#     through the `.githooks/commit-msg` `--staged` path alike.
+# Both disappear once only a field's first token can be a result, because
+# `the`, `make` and `count` are not in any field-leading position.
+#
+# The label's LAST token is also examined, so `Demo 07 failed: {}` from
+# `demos/07-drgn-kernel.py` is a result while `demo08: <prose>` is not.
+#
+# Within a line, non-green dominates green: `FAILURE ... , 7 passed` is a
+# failure. Across lines, the LAST classified line wins; see below.
+line_result() {  # $1 = line -> prints "green", "nongreen", or nothing
+    local line="$1" label rest field token class seen=''
+    local -a label_tokens=()
+    label="${line%%:*}"
+    rest="${line#*:}"
+    [ "$rest" = "$line" ] && rest=
+    read -r -a label_tokens <<<"$label"
+    class=$(demo_result_class "${label_tokens[${#label_tokens[@]} - 1]:-}")
+    [ "$class" = nongreen ] && { printf 'nongreen\n'; return 0; }
+    [ -n "$class" ] && seen="$class"
+    while IFS= read -r field; do
+        read -r token <<<"$field"
+        class=$(demo_result_class "$token")
+        [ "$class" = nongreen ] && { printf 'nongreen\n'; return 0; }
+        [ -n "$class" ] && seen=green
+    done < <(printf '%s\n' "$rest" | tr ':,' '\n\n')
+    [ -n "$seen" ] && printf '%s\n' "$seen"
+    return 0
+}
+
 # A body's mechanical result lines may include deliberate negative controls as
 # well as the real run. A claim is contradicted when it covers a numbered demo
-# for which the body reports a non-green result and no green result. This makes
-# a forced-failure check followed by a successful real run valid, while a body
-# that reports only PARTIAL or FAILURE cannot claim GREEN.
+# whose LAST reported result in the body is non-green, or when it covers
+# everything and the last suite-level aggregate is non-green.
+#
+# The LAST result per demo decides, in body order. `ADVERSARIAL-REVIEW-POLICY.md`
+# says a deliberate failing check stays compatible with a *later* successful real
+# run; a set-membership test has no notion of later, so it also accepted a real
+# run that failed AFTER an earlier green. Taking the last result implements the
+# sentence the policy actually states, in both directions.
 claim_contradicts_body() {  # $1 = commit message, $2 = demo= value
-    local text="$1" claims="$2" line number result
-    declare -A green=() nongreen=()
+    local text="$1" claims="$2" line number result suite=
+    declare -A last=()
     while IFS= read -r line; do
-        if [[ "${line,,}" =~ ^[[:space:]]*(=+[[:space:]]*)?demo[[:space:]]*0*([0-9]+)[^:]*:[[:space:]]*(first[[:space:]]+run[[:space:]]+saved,[[:space:]]*)?([a-z_-]+) ]]; then
+        if [[ "${line,,}" =~ ^[[:space:]]*(=+[[:space:]]*)?demo[[:space:]]*0*([0-9]+)[^:]*: ]]; then
             number="${BASH_REMATCH[2]}"
-            result="${BASH_REMATCH[4]}"
-            case "$result" in
-                green|pass|success) green[$((10#$number))]=1 ;;
-                partial|fail|failure|failed|red|skip|skipped|incomplete|no_result|no-result|error)
-                    nongreen[$((10#$number))]=1 ;;
-            esac
+            result=$(line_result "$line")
+            [ -n "$result" ] && last[$((10#$number))]="$result"
+        elif [[ "${line,,}" =~ ^[[:space:]]*(=+[[:space:]]*)?demo[[:space:]]+suite[^:]*: ]]; then
+            # `demos/run-all.sh` emits
+            # `=== Demo suite: FAILURE — N demo(s) failed, ... ===`. "suite"
+            # carries no digits, so the numbered scan above cannot see it at
+            # all and a `demo=all result=GREEN` trailer passed against a body
+            # whose own aggregate said the suite failed.
+            result=$(line_result "$line")
+            [ -n "$result" ] && suite="$result"
         fi
     done <<<"$text"
-    for number in "${!nongreen[@]}"; do
-        [ "${green[$number]:-0}" = 1 ] && continue
+    for number in "${!last[@]}"; do
+        [ "${last[$number]}" = nongreen ] || continue
         claim_covers_demo_number "$claims" "$number" && return 0
     done
+    [ "$suite" = nongreen ] && claim_covers_everything "$claims" && return 0
     return 1
 }
 
