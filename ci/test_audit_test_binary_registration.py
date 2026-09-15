@@ -200,6 +200,9 @@ class RegistrationAuditTest(unittest.TestCase):
             f"prlimit --fsize=67108865:67108864 -- {invocation}",
             f"prlimit --fsize=18446744073709551616:18446744073709551616 -- {invocation}",
             f"prlimit --fsize=67108864:67108864 -- --help {invocation}",
+            f"prlimit --fsize=67108864:67108864 -- HERMIT_REVIEW_ASSIGNMENT=1 {invocation}",
+            f"prlimit --fsize=67108864:67108864 -- 30 {invocation}",
+            f"prlimit --fsize=67108864:67108864 -- env --help {invocation}",
         ):
             with self.subTest(command=command):
                 result = self._plant_probe_with_dag_command(
@@ -207,6 +210,19 @@ class RegistrationAuditTest(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 2, result.stdout)
                 self.assertIn("integration_test_binaries", result.stderr)
+
+    def test_prlimit_assignments_require_shell_position_or_explicit_env(self) -> None:
+        invocation = "./ci/run-nextest-counted.sh -p hermit --test zz_probe"
+        for command in (
+            f"CARGO_BUILD_JOBS=1 prlimit --fsize=67108864:67108864 -- {invocation}",
+            f"prlimit --fsize=67108864:67108864 -- env CARGO_BUILD_JOBS=1 {invocation}",
+        ):
+            with self.subTest(command=command):
+                result = self._plant_probe_with_dag_command(
+                    command, declared=["zz_probe"]
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("ci-registered=2", result.stdout)
 
     def test_invocation_named_only_in_a_description_does_not_register(self) -> None:
         probe = self.root / "hermit-cli/tests/zz_probe.rs"
