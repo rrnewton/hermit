@@ -22,6 +22,176 @@ fail() {
 }
 
 [[ -f $WORKFLOW ]] || fail "missing $WORKFLOW"
+
+# Scope core-review assertions to that job and remove YAML comments before
+# matching. A literal pasted into an unrelated job or a `#` comment is not
+# executable wiring and must not keep this policy check green.
+core_review_job=$(awk '
+    /^  core-review-protocol:[[:space:]]*$/ { in_job = 1 }
+    in_job && /^  [[:alnum:]_-]+:[[:space:]]*$/ \
+        && $0 !~ /^  core-review-protocol:[[:space:]]*$/ { exit }
+    in_job {
+        line = $0
+        if (line ~ /^[[:space:]]*#/) next
+        sub(/[[:space:]]+#.*$/, "", line)
+        print line
+    }
+' "$WORKFLOW")
+[[ -n $core_review_job ]] || fail "missing core-review-protocol job"
+core_job_has() {
+    grep -Fq -- "$1" <<<"$core_review_job"
+}
+
+# Recover the one logical shell command that invokes the review linter.  A
+# binding elsewhere in the job is not evidence that the linter receives it.
+core_linter_invocation=$(awk '
+    {
+        lines[NR] = $0
+        if ($0 ~ /(^|[[:space:]])bash scripts\/core-review-protocol-lint[.]sh/) {
+            invocation_line = NR
+            invocation_count++
+        }
+    }
+    END {
+        if (invocation_count != 1) exit 1
+        first = invocation_line
+        while (first > 1 && lines[first - 1] ~ /\\[[:space:]]*$/) first--
+        for (line = first; line <= invocation_line; line++) {
+            sub(/\\[[:space:]]*$/, "", lines[line])
+            printf "%s%s", (line == first ? "" : " "), lines[line]
+        }
+        print ""
+    }
+' <<<"$core_review_job") ||
+    fail "core-review protocol must contain exactly one linter invocation"
+
+validate_core_linter_invocation() {
+    local invocation=$1 bash_index=-1 binding_count index word
+    local -a invocation_words
+
+    # Match assignment words in the command prefix, not their text inside an
+    # unused variable or another executable command.
+    read -r -a invocation_words <<<"$invocation"
+    [[ ${invocation_words[0]-} == if ]] || {
+        echo "core-review linter invocation must be the command governed by its if statement" >&2
+        return 1
+    }
+    for index in "${!invocation_words[@]}"; do
+        [[ ${invocation_words[$index]} == bash ]] && bash_index=$index
+    done
+    if [[ $bash_index -lt 2 || ${invocation_words[$((bash_index + 1))]-} != 'scripts/core-review-protocol-lint.sh;' ||
+          ${invocation_words[$((bash_index + 2))]-} != 'then' ||
+          $((bash_index + 3)) -ne ${#invocation_words[@]} ]]; then
+        echo "core-review linter invocation must execute scripts/core-review-protocol-lint.sh directly" >&2
+        return 1
+    fi
+
+    binding_count=0
+    for ((index = 1; index < bash_index; index++)); do
+        word=${invocation_words[$index]}
+        if [[ $word == PR_HEAD_SHA=* ]]; then
+            ((binding_count += 1))
+            [[ $word == "PR_HEAD_SHA=\"\$pr_head\"" ]] || {
+                echo "core-review linter invocation has an incorrect PR_HEAD_SHA binding" >&2
+                return 1
+            }
+        fi
+    done
+    if [[ $binding_count -ne 1 ]]; then
+        echo "core-review linter invocation must bind PR_HEAD_SHA exactly once" >&2
+        return 1
+    fi
+
+    binding_count=0
+    for ((index = 1; index < bash_index; index++)); do
+        word=${invocation_words[$index]}
+        if [[ $word == PR_COMMENTS_FILE=* ]]; then
+            ((binding_count += 1))
+            [[ $word == "PR_COMMENTS_FILE=\"\$pr_comments_file\"" ]] || {
+                echo "core-review linter invocation has an incorrect PR_COMMENTS_FILE binding" >&2
+                return 1
+            }
+        fi
+    done
+    if [[ $binding_count -ne 1 ]]; then
+        echo "core-review linter invocation must bind PR_COMMENTS_FILE exactly once" >&2
+        return 1
+    fi
+
+    for ((index = 1; index < bash_index; index++)); do
+        word=${invocation_words[$index]}
+        [[ $word =~ ^[a-zA-Z_][a-zA-Z_0-9]*= ]] || {
+            echo "core-review linter invocation contains executable token before the linter: $word" >&2
+            return 1
+        }
+    done
+}
+
+invocation_error=$(validate_core_linter_invocation "$core_linter_invocation" 2>&1) ||
+    fail "$invocation_error"
+
+# Negative controls exercise the production invocation parser.  Both deleting
+# a binding and retaining its literal text as an argument to an executable
+# shell command must fail with the missing binding's name. A later assignment
+# must not override a required value while retaining the original token.
+expect_binding_mutation_rejected() {
+    local test_name=$1 expected_name=$2 mutation=$3 error
+    if error=$(validate_core_linter_invocation "$mutation" 2>&1); then
+        fail "$test_name mutation was accepted"
+    fi
+    [[ $error == *"$expected_name"* ]] ||
+        fail "$test_name mutation did not name $expected_name: $error"
+}
+
+head_binding=" PR_HEAD_SHA=\"\$pr_head\""
+head_deleted=${core_linter_invocation/"$head_binding"/}
+expect_binding_mutation_rejected "deleted head binding" PR_HEAD_SHA "$head_deleted"
+head_decoy_replacement=" printf '%s' 'PR_HEAD_SHA=\"\$pr_head\"' &&"
+head_decoy=${core_linter_invocation/"$head_binding"/$head_decoy_replacement}
+expect_binding_mutation_rejected "executable head decoy" PR_HEAD_SHA "$head_decoy"
+head_override_replacement="$head_binding PR_HEAD_SHA=\"\$old_head\""
+head_override=${core_linter_invocation/"$head_binding"/$head_override_replacement}
+expect_binding_mutation_rejected "overridden head binding" PR_HEAD_SHA "$head_override"
+comments_binding=" PR_COMMENTS_FILE=\"\$pr_comments_file\""
+comments_deleted=${core_linter_invocation/"$comments_binding"/}
+expect_binding_mutation_rejected "deleted comment binding" PR_COMMENTS_FILE "$comments_deleted"
+comments_decoy_replacement=" printf '%s' 'PR_COMMENTS_FILE=\"\$pr_comments_file\"' &&"
+comments_decoy=${core_linter_invocation/"$comments_binding"/$comments_decoy_replacement}
+expect_binding_mutation_rejected "executable comment decoy" PR_COMMENTS_FILE "$comments_decoy"
+comments_override_replacement="$comments_binding PR_COMMENTS_FILE=\"\$old_comments_file\""
+comments_override=${core_linter_invocation/"$comments_binding"/$comments_override_replacement}
+expect_binding_mutation_rejected "overridden comment binding" PR_COMMENTS_FILE "$comments_override"
+
+core_job_has 'pr_head="$(jq -r '\''.head.sha'\'' <<< "$pr_json")"' ||
+    fail "core-review protocol must read the exact pull-request head"
+core_job_has 'issues/${pr_number}/comments?per_page=100' ||
+    fail "core-review protocol must fetch the complete issue-comment history"
+core_job_has '--paginate --slurp | jq -c '\''add // []'\'' > "$pr_comments_file"' ||
+    fail "core-review comment fetch must preserve all pages in one JSON array"
+core_job_has 'grep -qiE '\''kvm'\'' <<< "$files" || files_kvm_status=$?' ||
+    fail "KVM changed-file grep status must be captured"
+core_job_has 'grep -Fixq kvm <<< "$labels" || labels_kvm_status=$?' ||
+    fail "KVM label grep status must be captured"
+core_job_has 'case "$files_kvm_status" in' ||
+    fail "KVM changed-file grep errors must be handled"
+core_job_has 'case "$labels_kvm_status" in' ||
+    fail "KVM label grep errors must be handled"
+core_job_has 'if [ "$files_kvm_status" -eq 0 ] || [ "$labels_kvm_status" -eq 0 ]; then' ||
+    fail "KVM classification must use only checked match statuses"
+files_kvm_case=$(awk '
+    /case "\$files_kvm_status" in/ { in_case = 1 }
+    in_case { print }
+    in_case && /esac/ { exit }
+' <<<"$core_review_job")
+labels_kvm_case=$(awk '
+    /case "\$labels_kvm_status" in/ { in_case = 1 }
+    in_case { print }
+    in_case && /esac/ { exit }
+' <<<"$core_review_job")
+[[ $files_kvm_case == *'0 | 1)'* && $files_kvm_case == *'exit 2'* ]] ||
+    fail "KVM changed-file grep must accept only status 0/1 and refuse every error"
+[[ $labels_kvm_case == *'0 | 1)'* && $labels_kvm_case == *'exit 2'* ]] ||
+    fail "KVM label grep must accept only status 0/1 and refuse every error"
 grep -Fq 'actions: write' "$WORKFLOW" || fail "NO_RESULT must be able to re-dispatch and cancel"
 grep -Fq 'ref=4b78d727f35bc8612ac460a6e270dda5f5df304c' "$WORKFLOW" ||
     fail "gate must pin the parent authority commit"
