@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
-use std::ffi::CString;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
@@ -9,8 +8,6 @@ use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
-use std::os::unix::fs::FileExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
@@ -44,6 +41,8 @@ use hermit_manifest_plan::nextest_cpu::read_attempt_records;
 use hermit_manifest_plan::nextest_cpu::read_binary_map;
 use hermit_manifest_plan::nextest_cpu::write_attempt_atomic;
 use hermit_manifest_plan::nextest_cpu::write_binary_map_atomic;
+use hermit_manifest_plan::owned_cgroup::OwnedCpuCgroup as OwnedAttemptCgroup;
+use hermit_manifest_plan::owned_cgroup::current_cgroup_directory;
 use hermit_manifest_plan::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV;
 
 const ATTEMPT_ENV: &str = "__NEXTEST_ATTEMPT";
@@ -376,336 +375,23 @@ fn parse_wrapper_invocation(args: Vec<OsString>) -> Result<WrapperInvocation, St
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
+fn attempt_cgroup_name(identity: &AttemptIdentity) -> String {
+    format!(
+        "hermit-nextest-attempt-{}-{}",
+        std::process::id(),
+        &identity.key()[..16]
+    )
 }
 
-fn file_identity(file: &File, label: &str) -> Result<FileIdentity, String> {
-    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } != 0 {
-        return Err(format!(
-            "cannot inspect {label} identity: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    Ok(FileIdentity {
-        device: stat.st_dev,
-        inode: stat.st_ino,
-    })
+fn create_attempt_cgroup(identity: &AttemptIdentity) -> Result<OwnedAttemptCgroup, String> {
+    OwnedAttemptCgroup::create(&attempt_cgroup_name(identity))
 }
 
-fn cgroup_text(file: &File, label: &str) -> Result<String, String> {
-    const LIMIT: usize = 8192;
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 1024];
-    loop {
-        let count = file
-            .read_at(&mut chunk, bytes.len() as u64)
-            .map_err(|error| format!("cannot read {label}: {error}"))?;
-        if count == 0 {
-            break;
-        }
-        if bytes.len() + count > LIMIT {
-            return Err(format!("{label} exceeds the {LIMIT}-byte accounting bound"));
-        }
-        bytes.extend_from_slice(&chunk[..count]);
-    }
-    std::str::from_utf8(&bytes)
-        .map(str::to_owned)
-        .map_err(|error| format!("{label} is not valid UTF-8: {error}"))
-}
-
-fn cgroup_field(file: &File, file_label: &str, field: &str) -> Result<u64, String> {
-    let text = cgroup_text(file, file_label)?;
-    let mut found = None;
-    for line in text.lines() {
-        let mut words = line.split_whitespace();
-        let Some(name) = words.next() else {
-            continue;
-        };
-        let value = words
-            .next()
-            .ok_or_else(|| format!("{file_label} has no value for {name:?}"))?;
-        if words.next().is_some() {
-            return Err(format!("{file_label} has extra fields on line {line:?}"));
-        }
-        if name == field {
-            if found.is_some() {
-                return Err(format!("{file_label} repeats field {field:?}"));
-            }
-            found = Some(
-                value
-                    .parse::<u64>()
-                    .map_err(|error| format!("{file_label} has invalid {field}: {error}"))?,
-            );
-        }
-    }
-    found.ok_or_else(|| format!("{file_label} is missing field {field:?}"))
-}
-
-fn openat_file(directory: &File, name: &str, flags: i32, label: &str) -> Result<File, String> {
-    let name = CString::new(name).expect("owned cgroup control names contain no NUL");
-    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, 0) };
-    if fd < 0 {
-        return Err(format!(
-            "cannot open {label}: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-fn current_cgroup_directory() -> Result<PathBuf, String> {
-    let raw = fs::read_to_string("/proc/self/cgroup")
-        .map_err(|error| format!("cannot read /proc/self/cgroup: {error}"))?;
-    let mut unified = raw.lines().filter_map(|line| line.strip_prefix("0::"));
-    let path = unified
-        .next()
-        .ok_or_else(|| "/proc/self/cgroup has no unified cgroup v2 entry".to_string())?;
-    if unified.next().is_some() {
-        return Err("/proc/self/cgroup has multiple unified cgroup v2 entries".into());
-    }
-    let relative = Path::new(path.trim_start_matches('/'));
-    if relative.components().any(|component| {
-        !matches!(
-            component,
-            std::path::Component::Normal(_) | std::path::Component::CurDir
-        )
-    }) {
-        return Err(format!(
-            "unified cgroup path {path:?} is not a relative kernel path"
-        ));
-    }
-    Ok(Path::new("/sys/fs/cgroup").join(relative))
-}
-
-struct OwnedAttemptCgroup {
-    parent: File,
-    child: File,
-    cpu_stat: File,
-    events: File,
-    procs_read: File,
-    procs_write: File,
-    kill: File,
-    name: CString,
-    identity: FileIdentity,
-    path: PathBuf,
-}
-
-impl OwnedAttemptCgroup {
-    fn create(identity: &AttemptIdentity) -> Result<Self, String> {
-        let parent_path = current_cgroup_directory()?;
-        Self::create_in(&parent_path, identity)
-    }
-
-    fn create_in(parent_path: &Path, identity: &AttemptIdentity) -> Result<Self, String> {
-        let parent = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(parent_path)
-            .map_err(|error| {
-                format!(
-                    "cannot open delegated cgroup {}: {error}",
-                    parent_path.display()
-                )
-            })?;
-        let mut filesystem = unsafe { std::mem::zeroed::<libc::statfs>() };
-        if unsafe { libc::fstatfs(parent.as_raw_fd(), &mut filesystem) } != 0 {
-            return Err(format!(
-                "cannot inspect delegated cgroup filesystem: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
-        if filesystem.f_type != CGROUP2_SUPER_MAGIC {
-            return Err(format!(
-                "delegated cgroup {} is not on cgroup v2",
-                parent_path.display()
-            ));
-        }
-        let name_text = format!(
-            "hermit-nextest-attempt-{}-{}",
-            std::process::id(),
-            &identity.key()[..16]
-        );
-        let name = CString::new(name_text.as_bytes())
-            .map_err(|_| "owned cgroup name contains a NUL byte".to_string())?;
-        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) } != 0 {
-            return Err(format!(
-                "cannot create fresh attempt cgroup {}: {}",
-                parent_path.join(&name_text).display(),
-                io::Error::last_os_error()
-            ));
-        }
-        let result = (|| {
-            let child = openat_file(
-                &parent,
-                &name_text,
-                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-                "owned attempt cgroup",
-            )?;
-            let identity = file_identity(&child, "owned attempt cgroup")?;
-            let open_control = |control: &str, flags: i32| -> Result<File, String> {
-                let file = openat_file(
-                    &child,
-                    control,
-                    flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                    &format!("owned attempt cgroup {control}"),
-                )?;
-                let control_identity = file_identity(&file, control)?;
-                if control_identity.device != identity.device {
-                    return Err(format!(
-                        "owned attempt cgroup {control} is on device {}, expected {}",
-                        control_identity.device, identity.device
-                    ));
-                }
-                Ok(file)
-            };
-            let cpu_stat = open_control("cpu.stat", libc::O_RDONLY)?;
-            let events = open_control("cgroup.events", libc::O_RDONLY)?;
-            let procs_read = open_control("cgroup.procs", libc::O_RDONLY)?;
-            let procs_write = open_control("cgroup.procs", libc::O_WRONLY)?;
-            let kill = open_control("cgroup.kill", libc::O_WRONLY)?;
-            let owned = Self {
-                parent: parent.try_clone().map_err(|error| {
-                    format!("cannot retain delegated cgroup descriptor: {error}")
-                })?,
-                child,
-                cpu_stat,
-                events,
-                procs_read,
-                procs_write,
-                kill,
-                name: name.clone(),
-                identity,
-                path: parent_path.join(&name_text),
-            };
-            owned.verify_identity()?;
-            if owned.cpu_usage_usec()? != 0 {
-                return Err("fresh attempt cgroup has nonzero cpu.stat usage_usec".into());
-            }
-            if owned.populated()? || !owned.procs_empty()? {
-                return Err("fresh attempt cgroup is not empty before enrollment".into());
-            }
-            Ok(owned)
-        })();
-        match result {
-            Ok(owned) => Ok(owned),
-            Err(error) => {
-                if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) }
-                    == 0
-                {
-                    Err(error)
-                } else {
-                    Err(format!(
-                        "{error}; partial owned-cgroup initialization cleanup also failed: {}",
-                        io::Error::last_os_error()
-                    ))
-                }
-            }
-        }
-    }
-
-    fn verify_identity(&self) -> Result<(), String> {
-        let held = file_identity(&self.child, "held attempt cgroup")?;
-        if held != self.identity {
-            return Err("held attempt cgroup identity changed".into());
-        }
-        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-        if unsafe {
-            libc::fstatat(
-                self.parent.as_raw_fd(),
-                self.name.as_ptr(),
-                &mut stat,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(format!(
-                "cannot authenticate owned attempt cgroup path: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        let named = FileIdentity {
-            device: stat.st_dev,
-            inode: stat.st_ino,
-        };
-        if named != self.identity || stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
-            return Err("owned attempt cgroup path was replaced".into());
-        }
-        Ok(())
-    }
-
-    fn enrollment_fd(&self) -> i32 {
-        self.procs_write.as_raw_fd()
-    }
-
-    fn cpu_usage_usec(&self) -> Result<u64, String> {
-        self.verify_identity()?;
-        cgroup_field(&self.cpu_stat, "owned attempt cpu.stat", "usage_usec")
-    }
-
-    fn populated(&self) -> Result<bool, String> {
-        self.verify_identity()?;
-        match cgroup_field(&self.events, "owned attempt cgroup.events", "populated")? {
-            0 => Ok(false),
-            1 => Ok(true),
-            value => Err(format!(
-                "owned attempt cgroup.events has invalid populated value {value}"
-            )),
-        }
-    }
-
-    fn procs_empty(&self) -> Result<bool, String> {
-        self.verify_identity()?;
-        Ok(cgroup_text(&self.procs_read, "owned attempt cgroup.procs")?
-            .trim()
-            .is_empty())
-    }
-
-    fn kill(&self) -> Result<(), String> {
-        self.verify_identity()?;
-        loop {
-            let written = unsafe { libc::write(self.kill.as_raw_fd(), b"1\n".as_ptr().cast(), 2) };
-            if written == 2 {
-                return Ok(());
-            }
-            if written < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(if written < 0 {
-                format!(
-                    "cannot kill owned attempt cgroup: {}",
-                    io::Error::last_os_error()
-                )
-            } else {
-                format!("short write to owned attempt cgroup.kill: {written} bytes")
-            });
-        }
-    }
-
-    fn remove_empty(&mut self) -> Result<(), String> {
-        self.verify_identity()?;
-        if self.populated()? || !self.procs_empty()? {
-            return Err("cannot remove populated owned attempt cgroup".into());
-        }
-        if unsafe {
-            libc::unlinkat(
-                self.parent.as_raw_fd(),
-                self.name.as_ptr(),
-                libc::AT_REMOVEDIR,
-            )
-        } != 0
-        {
-            return Err(format!(
-                "cannot remove owned empty attempt cgroup: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        Ok(())
-    }
+fn create_attempt_cgroup_in(
+    parent_path: &Path,
+    identity: &AttemptIdentity,
+) -> Result<OwnedAttemptCgroup, String> {
+    OwnedAttemptCgroup::create_in(parent_path, &attempt_cgroup_name(identity))
 }
 
 struct PidFd {
@@ -1191,13 +877,13 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
 
     let mut attempt_cgroup = invocation
         .cpu_budget_usec
-        .map(|_| OwnedAttemptCgroup::create(&identity))
+        .map(|_| create_attempt_cgroup(&identity))
         .transpose()?;
     if let (Some(cgroup), Some(path)) = (
         attempt_cgroup.as_ref(),
         env::var_os(CONTROL_CGROUP_PATH_FILE_ENV),
     ) {
-        if let Err(error) = fs::write(path, format!("{}\n", cgroup.path.display())) {
+        if let Err(error) = fs::write(path, format!("{}\n", cgroup.path().display())) {
             let cleanup = attempt_cgroup
                 .as_mut()
                 .expect("control path requires an owned cgroup")
@@ -2215,8 +1901,8 @@ fn self_test() -> Result<(), String> {
         test: "cgroup-ownership".into(),
         attempt: 1,
     };
-    let mut owned = OwnedAttemptCgroup::create(&ownership_identity)?;
-    if OwnedAttemptCgroup::create(&ownership_identity).is_ok() {
+    let mut owned = create_attempt_cgroup(&ownership_identity)?;
+    if create_attempt_cgroup(&ownership_identity).is_ok() {
         return Err("owned attempt cgroup creation clobbered an existing name".into());
     }
     owned.remove_empty()?;
@@ -2230,11 +1916,11 @@ fn self_test() -> Result<(), String> {
             test: "read-only-cgroup-child".into(),
             ..ownership_identity.clone()
         };
-        let mut read_only_parent = OwnedAttemptCgroup::create(&read_only_identity)?;
-        fs::set_permissions(&read_only_parent.path, fs::Permissions::from_mode(0o555))
+        let mut read_only_parent = create_attempt_cgroup(&read_only_identity)?;
+        fs::set_permissions(read_only_parent.path(), fs::Permissions::from_mode(0o555))
             .map_err(|error| format!("cannot make cgroup delegation control read-only: {error}"))?;
-        let nested = OwnedAttemptCgroup::create_in(&read_only_parent.path, &nested_identity);
-        fs::set_permissions(&read_only_parent.path, fs::Permissions::from_mode(0o755)).map_err(
+        let nested = create_attempt_cgroup_in(read_only_parent.path(), &nested_identity);
+        fs::set_permissions(read_only_parent.path(), fs::Permissions::from_mode(0o755)).map_err(
             |error| format!("cannot restore cgroup delegation control permissions: {error}"),
         )?;
         if let Ok(mut nested) = nested {
@@ -2245,13 +1931,13 @@ fn self_test() -> Result<(), String> {
         read_only_parent.remove_empty()?;
     }
     let missing_parent = scratch.0.join("missing-cgroup-parent");
-    if OwnedAttemptCgroup::create_in(&missing_parent, &ownership_identity).is_ok() {
+    if create_attempt_cgroup_in(&missing_parent, &ownership_identity).is_ok() {
         return Err("missing cgroup delegation was accepted".into());
     }
     let replaced_parent = scratch.0.join("replaced-cgroup-parent");
     std::os::unix::fs::symlink(current_cgroup_directory()?, &replaced_parent)
         .map_err(|error| format!("cannot create replaced-cgroup control: {error}"))?;
-    if OwnedAttemptCgroup::create_in(&replaced_parent, &ownership_identity).is_ok() {
+    if create_attempt_cgroup_in(&replaced_parent, &ownership_identity).is_ok() {
         return Err("a substituted cgroup delegation path was accepted".into());
     }
 
