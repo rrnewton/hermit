@@ -4493,12 +4493,12 @@ fn apply_validate_results(
             observation.hermit_shas.insert(hermit_sha.to_string());
             // Infrastructure diagnoses remain in the exact invocation below;
             // the product-result set keeps its existing, checked vocabulary.
-            if let Some(result) = result
-                && !matches!(
+            if let Some(result) = result.filter(|result| {
+                !matches!(
                     result,
                     ObservedResult::SandboxDenied | ObservedResult::InfrastructureError
                 )
-            {
+            }) {
                 observation.results.insert(result);
             }
             if let Some((left_info_messages, right_info_messages)) = comparison {
