@@ -5169,69 +5169,231 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
 /// the same `-ex` sequence then shuts GDB down.
 #[test]
 fn record_classifies_a_gdbserver_replay_stage_container_child_failure() {
+    use std::io::Read;
+    use std::io::Write;
+    use std::io::{self};
+    use std::os::fd::AsRawFd;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    const CAPTURE_LIMIT: u64 = 1024 * 1024;
+
+    fn identity(pid: u32) -> io::Result<serde_json::Value> {
+        let root = PathBuf::from(format!("/proc/{pid}"));
+        let stat = fs::read_to_string(root.join("stat"))?;
+        let fields: Vec<_> = stat
+            .rsplit_once(')')
+            .ok_or_else(|| io::Error::other("missing stat command delimiter"))?
+            .1
+            .split_whitespace()
+            .collect();
+        let field = |index: usize| -> io::Result<u64> {
+            fields
+                .get(index)
+                .ok_or_else(|| io::Error::other("short process stat"))?
+                .parse()
+                .map_err(io::Error::other)
+        };
+        let cmdline = fs::read(root.join("cmdline"))?;
+        Ok(serde_json::json!({
+            "pid": pid,
+            "ppid": field(1)?,
+            "start_ticks": field(19)?,
+            "pid_namespace": fs::read_link(root.join("ns/pid"))?.to_string_lossy(),
+            "cmdline": cmdline.split(|b| *b == 0).filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned()).collect::<Vec<_>>(),
+        }))
+    }
+
+    fn capture<R: Read + AsRawFd + Send + 'static>(
+        mut reader: R,
+        path: PathBuf,
+        stop: Arc<AtomicBool>,
+    ) -> (thread::JoinHandle<io::Result<()>>, Arc<AtomicU64>) {
+        // Only this owned pipe's read end becomes nonblocking. This lets the
+        // fixture join its readers even if a descendant never closes a writer.
+        let fd = reader.as_raw_fd();
+        // SAFETY: fd remains owned by reader, and these calls take no pointers.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "failed to read capture descriptor flags");
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0,
+            "failed to make capture reader nonblocking"
+        );
+        let total = Arc::new(AtomicU64::new(0));
+        let count = Arc::clone(&total);
+        let handle = thread::spawn(move || {
+            let mut file = fs::File::create(path)?;
+            let mut buffer = [0u8; 8192];
+            loop {
+                if stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                match reader.read(&mut buffer) {
+                    Ok(0) => return Ok(()),
+                    Ok(length) => {
+                        let previous = count.fetch_add(length as u64, Ordering::Relaxed);
+                        let retained = CAPTURE_LIMIT.saturating_sub(previous).min(length as u64);
+                        file.write_all(&buffer[..retained as usize])?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if stop.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        });
+        (handle, total)
+    }
+
+    fn diagnostic_tail(path: &Path) -> String {
+        match fs::read(path) {
+            Ok(bytes) => {
+                String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(8192)..]).into_owned()
+            }
+            Err(error) => format!("unavailable: {error}"),
+        }
+    }
+
     let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create a recording dir");
-    let script = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kill-gdbserver-replay-peer.py");
-    // Finds the OUTER `hermit record` by walking GDB's own ancestry, then kills
-    // that process's non-ancestor children -- the replay container. Written from
-    // inside the run rather than supervised from outside, so the test does not
-    // have to guess a pid or race the fork.
+    // Retain bounded diagnostics even when an assertion fails or Nextest kills
+    // this test before its own 120-second cleanup branch can run.
+    let diagnostics = tempfile::Builder::new()
+        .prefix("gdb-replay-diagnostic-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create diagnostic directory")
+        .keep();
+    let script = diagnostics.join("kill-gdbserver-replay-peer.py");
+    let acknowledgement = diagnostics.join("injection.jsonl");
+    let stdout_path = diagnostics.join("stdout");
+    let stderr_path = diagnostics.join("stderr");
+    let source = r#"import json, os, select, signal, time
+
+directory = @DIAGNOSTIC_DIRECTORY@
+acknowledgement = os.path.join(directory, "injection.jsonl")
+
+def emit(event, **fields):
+    with open(acknowledgement, "a") as output:
+        output.write(json.dumps(dict(event=event, **fields), sort_keys=True) + "\n")
+        output.flush()
+
+def identity(pid):
+    with open("/proc/%d/stat" % pid) as source:
+        fields = source.read().rsplit(")", 1)[-1].split()
+    with open("/proc/%d/cmdline" % pid, "rb") as source:
+        argv = [s.decode("utf-8", "replace") for s in source.read().split(b"\0") if s]
+    return dict(pid=pid, ppid=int(fields[1]), start_ticks=int(fields[19]),
+                pid_namespace=os.readlink("/proc/%d/ns/pid" % pid), cmdline=argv)
+
+def alive(fd):
+    poll = select.poll()
+    poll.register(fd, select.POLLIN)
+    return not poll.poll(0)
+
+def bind(pid):
+    before = identity(pid)
+    fd = os.pidfd_open(pid)
+    try:
+        if identity(pid) != before or not alive(fd):
+            raise RuntimeError("process changed while acquiring pidfd")
+        return fd, before
+    except BaseException:
+        os.close(fd)
+        raise
+
+handles = []
+try:
+    emit("python-entered", gdb=identity(os.getpid()))
+    binding_path = os.path.join(directory, "outer.json")
+    deadline = time.monotonic() + 5
+    while not os.path.exists(binding_path) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    with open(binding_path) as source:
+        expected_outer = json.load(source)
+    outer_fd, outer = bind(expected_outer["pid"])
+    handles.append(outer_fd)
+    if outer != expected_outer:
+        raise RuntimeError("outer Hermit generation or command changed")
+
+    # Prove GDB belongs to this exact Child rather than choosing an argv match.
+    ancestors = []
+    current = os.getpid()
+    for _ in range(30):
+        fd, process = bind(current)
+        handles.append(fd)
+        ancestors.append((fd, process))
+        if current == outer["pid"]:
+            break
+        current = process["ppid"]
+        if current <= 1:
+            raise RuntimeError("GDB is not a descendant of the expected outer Hermit")
+    else:
+        raise RuntimeError("GDB ancestry exceeded the bounded walk")
+
+    # Read only the owned outer process's task children, not the process fleet.
+    children = set()
+    for task in os.listdir("/proc/%d/task" % outer["pid"]):
+        with open("/proc/%d/task/%s/children" % (outer["pid"], task)) as source:
+            children.update(int(pid) for pid in source.read().split())
+    known = {process["pid"] for _, process in ancestors}
+    candidates = []
+    for pid in sorted(children - known):
+        fd, process = bind(pid)
+        handles.append(fd)
+        if process["ppid"] != outer["pid"]:
+            raise RuntimeError("candidate is no longer an outer child")
+        with open("/proc/%d/status" % pid) as source:
+            nspid = [line.split()[1:] for line in source if line.startswith("NSpid:")]
+        if process["pid_namespace"] == outer["pid_namespace"] or len(nspid) != 1 or nspid[0][-1] != "1":
+            raise RuntimeError("candidate is not the replay PID-namespace init")
+        candidates.append((fd, process))
+    if len(candidates) != 1:
+        raise RuntimeError("expected one owned replay container child, got %d" % len(candidates))
+    target_fd, target = candidates[0]
+
+    # An open pidfd does not prevent numeric PID reuse. Recheck every parent
+    # after acquiring the target handle, and never signal a tentative child.
+    for fd, process in ancestors:
+        if not alive(fd) or identity(process["pid"]) != process:
+            raise RuntimeError("ancestry changed during target discovery")
+    if not alive(outer_fd) or identity(outer["pid"]) != outer:
+        raise RuntimeError("outer parent changed during target discovery")
+    if not alive(target_fd) or identity(target["pid"]) != target:
+        raise RuntimeError("target changed before injection")
+    emit("target-bound", outer=outer, target=target)
+    signal.pidfd_send_signal(target_fd, signal.SIGKILL)
+    emit("kill-sent", target=target, signal="SIGKILL")
+    emit("script-complete")
+except BaseException as error:
+    emit("injection-failed", error=repr(error))
+    raise
+finally:
+    for fd in handles:
+        os.close(fd)
+"#;
     fs::write(
         &script,
-        r#"import os, signal
-
-def parent_of(pid):
-    try:
-        return int(open("/proc/%d/stat" % pid).read().rsplit(")", 1)[-1].split()[1])
-    except (OSError, IndexError, ValueError):
-        return None
-
-def cmdline(pid):
-    try:
-        with open("/proc/%d/cmdline" % pid, "rb") as handle:
-            return handle.read().replace(b"\0", b" ").decode("utf-8", "replace")
-    except OSError:
-        return ""
-
-ancestors = []
-current = os.getpid()
-for _ in range(30):
-    ancestors.append(current)
-    current = parent_of(current)
-    if current is None or current <= 1:
-        break
-
-outer = None
-for candidate in ancestors:
-    text = cmdline(candidate)
-    if "hermit" in text and " record " in text:
-        outer = candidate
-        break
-
-if outer is not None:
-    known = set(ancestors)
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        pid = int(entry)
-        if pid in known:
-            continue
-        if parent_of(pid) == outer:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-"#,
+        source.replace(
+            "@DIAGNOSTIC_DIRECTORY@",
+            &serde_json::to_string(&diagnostics.to_string_lossy()).unwrap(),
+        ),
     )
     .expect("failed to write the gdb kill script");
-
-    let gdb_commands = format!("pi exec(open(\"{}\").read());quit", script.display());
+    let gdb_commands = format!(
+        "pi exec(open({}).read());quit",
+        serde_json::to_string(&script.to_string_lossy()).unwrap()
+    );
     let mut child = hermit_command(&[
         "record",
         "--verify-with-gdbex",
-        // `;` is the -ex delimiter: kill the replay container, then shut GDB
-        // down. ⚠️ THE `quit` IS LOAD-BEARING -- without it GDB stays alive
-        // holding this test's stderr pipe and the run never appears to end.
         gdb_commands.as_str(),
         "--",
         "/bin/true",
@@ -5241,33 +5403,113 @@ if outer is not None:
     .stderr(Stdio::piped())
     .spawn()
     .expect("failed to spawn the gdbserver verify");
+    let stop = Arc::new(AtomicBool::new(false));
+    let (stdout_reader, stdout_count) = capture(
+        child.stdout.take().expect("missing child stdout"),
+        stdout_path.clone(),
+        Arc::clone(&stop),
+    );
+    let (stderr_reader, stderr_count) = capture(
+        child.stderr.take().expect("missing child stderr"),
+        stderr_path.clone(),
+        Arc::clone(&stop),
+    );
+    let outer = identity(child.id()).expect("failed to bind the spawned outer Hermit");
+    fs::write(
+        diagnostics.join("outer.pending"),
+        serde_json::to_vec(&outer).unwrap(),
+    )
+    .expect("failed to write outer identity");
+    fs::rename(
+        diagnostics.join("outer.pending"),
+        diagnostics.join("outer.json"),
+    )
+    .expect("failed to publish outer identity");
+    eprintln!("GDB replay diagnostic files: {}", diagnostics.display());
 
-    // ⚠️ A DEADLINE, SO A HANG IS A FAILURE RATHER THAN A STUCK SUITE. This
-    // drives hermit into an error path on purpose and an earlier version of the
-    // probe really did wedge; a test that can stall CI is not an acceptable
-    // price for a covered call site.
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(120);
     let mut timed_out = false;
+    let mut status = None;
+    let mut reported = false;
     loop {
-        match child.try_wait().expect("failed to poll hermit") {
-            Some(_) => break,
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                timed_out = true;
-                break;
-            }
-            None => thread::sleep(Duration::from_millis(50)),
+        if status.is_none() {
+            status = child.try_wait().expect("failed to poll hermit");
         }
+        if status.is_some() && stdout_reader.is_finished() && stderr_reader.is_finished() {
+            break;
+        }
+        if !reported && started.elapsed() >= Duration::from_secs(40) {
+            reported = true;
+            eprintln!(
+                "GDB replay at40s: child_status={status:?}, stdout_reader_done={}, stderr_reader_done={}, stdout_bytes={}, stderr_bytes={}, current_identity={:?}, expected_identity={outer}\ninjection:\n{}\nstdout tail:\n{}\nstderr tail:\n{}",
+                stdout_reader.is_finished(),
+                stderr_reader.is_finished(),
+                stdout_count.load(Ordering::Relaxed),
+                stderr_count.load(Ordering::Relaxed),
+                if status.is_none() {
+                    identity(child.id())
+                } else {
+                    Ok(serde_json::json!({"state": "direct child already reaped"}))
+                },
+                diagnostic_tail(&acknowledgement),
+                diagnostic_tail(&stdout_path),
+                diagnostic_tail(&stderr_path),
+            );
+        }
+        if Instant::now() >= deadline {
+            if status.is_none() {
+                let _ = child.kill();
+            }
+            timed_out = true;
+            stop.store(true, Ordering::Release);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
     }
-    let output = child
-        .wait_with_output()
-        .expect("failed to collect the gdbserver verify output");
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    stdout_reader
+        .join()
+        .expect("stdout reader panicked")
+        .expect("stdout capture failed");
+    stderr_reader
+        .join()
+        .expect("stderr reader panicked")
+        .expect("stderr capture failed");
+    // Child caches a status returned by try_wait; this is immediate after a
+    // normal exit and also reaps the owned child after the timeout kill.
+    status = Some(child.wait().expect("failed to reap the outer Hermit"));
+    let stderr = fs::read(&stderr_path).expect("failed to read captured stderr");
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    let injection = fs::read_to_string(&acknowledgement).unwrap_or_default();
+    eprintln!("GDB replay final child_status={status:?}; injection:\n{injection}");
 
     assert!(
         !timed_out,
         "hermit did not exit within 120s after its gdbserver replay container was killed\n\
          stderr:\n{stderr}"
+    );
+    assert!(
+        stdout_count.load(Ordering::Relaxed) <= CAPTURE_LIMIT
+            && stderr_count.load(Ordering::Relaxed) <= CAPTURE_LIMIT,
+        "GDB replay capture exceeded its per-stream1MiB diagnostic limit; retained files: {}",
+        diagnostics.display()
+    );
+    let events: Vec<serde_json::Value> = injection
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("malformed injection acknowledgement"))
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "kill-sent")
+            .count(),
+        1,
+        "the owned replay-child SIGKILL was not acknowledged: {injection}"
+    );
+    assert_eq!(
+        events.last().map(|event| event["event"].as_str()),
+        Some(Some("script-complete")),
+        "GDB did not complete the injection script: {injection}"
     );
     assert!(
         stderr.contains("HERMIT_INTERNAL_FAILURE class=container-child-exit"),
