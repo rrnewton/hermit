@@ -11,6 +11,7 @@ import json
 import os
 import re
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -372,7 +373,7 @@ class PinnedGuestPathContract(unittest.TestCase):
         self.assertEqual(len(paths), len(set(paths)), "duplicate guest paths")
         self.assertTrue(paths)
         for path in paths:
-            self.assertRegex(path, r"^/usr/bin/[A-Za-z0-9_-]+$")
+            self.assertRegex(path, r"^/(bin|usr/(bin|sbin))/([A-Za-z0-9_][A-Za-z0-9_+-]*|\[)$")
         source = (here.parents[1] / "hermit-cli/tests/liteinst_advanced.rs").read_text()
         literals = set(re.findall(r'"(/usr/bin/[A-Za-z0-9_-]+)"', source))
         self.assertTrue(literals, "the source population must not disappear")
@@ -381,6 +382,88 @@ class PinnedGuestPathContract(unittest.TestCase):
                     "bash date df du find git node nodejs nproc python3 sort stat tr".split()}
         self.assertEqual(portable - set(paths), set(), "lost existing portable guest")
         self.assertIn("/usr/bin/printf", paths, "DBT ptrace argument-forwarding reference")
+
+    def test_declared_paths_cover_default_compat_payloads_and_selected_fixtures(self):
+        here = Path(__file__).resolve().parent
+        repository = here.parents[1]
+        declared = set((here / "guest-paths.txt").read_text().splitlines())
+        self.assertEqual(len(declared), 153)
+        graph = json.loads((repository / "ci/dag/validate.json").read_text())
+        steps = [step for step in graph["steps"] if step["group"] == "compat"
+                 and "portable" in step.get("labels", [])]
+        self.assertEqual(len(steps), 189)
+        commands = []
+        for step in steps:
+            args = shlex.split(step["cmd"])
+            self.assertEqual(args[0], "./ci/hermetic/run-in-pinned-root.sh")
+            tail = args[args.index("--") + 1:]
+            self.assertEqual(len(tail), 5)
+            self.assertEqual(tail[:2], ["bash", "-c"])
+            self.assertEqual(tail[3], "bash")
+            commands.append(tail[4])
+        selected = {match.group(1) for command in commands
+                    if (match := re.search(r"real_compat_workload\.sh ([A-Za-z0-9_+-]+)(?: |$)", command))}
+        self.assertEqual(len(selected), 50)
+        workload = (repository / "tests/compat/real_compat_workload.sh").read_text()
+        prefix, body = workload.split('case "$PROGRAM" in\n', 1)
+        parts = re.split(r"(?m)^    ([A-Za-z0-9_+*-]+)\)\n", body)
+        cases = dict(zip(parts[1::2], parts[2::2]))
+        self.assertEqual(len(cases), len(parts[1::2]), "ambiguous fixture case")
+        self.assertEqual(selected - cases.keys(), set(), "missing selected fixture")
+        fixture = (repository / "tests/compat/prepare_real_compat_fixtures.sh").read_text()
+        source = "\n".join(commands + [prefix, fixture] + [cases[name] for name in selected])
+        # Match root literals, not the /bin suffix of /usr/local/bin or $ROOT/bin.
+        literals = set(re.findall(
+            r"(?<![A-Za-z0-9_./$-])/(?:usr/(?:bin|sbin)|bin)/(?:[A-Za-z0-9_][A-Za-z0-9_+.-]*|\[)", source))
+        self.assertEqual(len(literals), 119)
+        self.assertEqual(literals - declared, set(), "missing default compatibility executable")
+        self.assertEqual({"/bin/cargo", "/bin/rustc", "/bin/cpio"} - declared, set())
+        self.assertIn("cpio ", cases["cpio-roundtrip"])
+
+    def test_actual_guest_guard_refuses_invalid_manifests(self):
+        here = Path(__file__).resolve().parent
+        original = (here / "guest-paths.txt").read_text()
+        with tempfile.TemporaryDirectory(prefix="hermit-guest-manifest-") as temporary:
+            root = Path(temporary)
+            script = root / "assert-build-dependencies.sh"
+            shutil.copyfile(here / script.name, script)
+            manifest = root / "guest-paths.txt"
+            guest = root / "guest"
+            stub = root / "executable"
+            stub.write_text("#!/bin/sh\nexit 0\n")
+            stub.chmod(0o755)
+            for path in original.splitlines():
+                target = guest / path.lstrip("/")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(stub)
+            cases = [
+                ("valid", original, 0, "153/153 absolute guest paths"),
+                ("missing", None, 2, "missing guest-path manifest"),
+                ("empty", "", 2, "empty guest-path manifest"),
+                ("duplicate", original + "/usr/bin/printf\n", 2, "invalid or duplicate guest path"),
+            ]
+            for bad in ["/usr/bin/../printf", "/usr/bin/a b", "/etc/printf", "/usr/bin/", "relative", "", "/usr/bin/$(true)"]:
+                cases.append((repr(bad), original + bad + "\n", 2, "invalid or duplicate guest path"))
+            for name, text, status, diagnostic in cases:
+                with self.subTest(case=name):
+                    if text is None:
+                        manifest.unlink(missing_ok=True)
+                    else:
+                        manifest.write_text(text)
+                    # Source the unchanged production functions through the
+                    # existing --print route, then call the real guest check.
+                    result = subprocess.run(
+                        ["bash", "-c", 'source "$1" --print >/dev/null; check_guest_paths "$2"',
+                         "bash", str(script), str(guest)],
+                        capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    self.assertIn(diagnostic, result.stderr)
+            manifest.write_text(original)
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1" --print >/dev/null; check_guest_paths "$2"',
+                 "bash", str(script), str(guest)], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("153/153 absolute guest paths", result.stderr)
 
 
 if __name__ == "__main__":

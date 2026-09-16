@@ -338,8 +338,7 @@ pub(super) fn execution_command(step: &dagrun::model::Step) -> Result<String, St
             if shell == "bash"
                 && option == "-c"
                 && argv0 == "bash"
-                && (guard == crate::validation_dag::PINNED_ROOT_COMMAND_GUARD
-                    || guard == crate::validation_dag::LEGACY_PINNED_ROOT_COMMAND_GUARD) =>
+                && crate::validation_dag::is_pinned_root_guard(step, guard) =>
         {
             Ok(payload.clone())
         }
@@ -510,6 +509,52 @@ mod tests {
     use super::*;
     use crate::nextest_binaries::REQUIRED_ENV;
     use crate::nextest_binaries::SELECTION_ENV;
+
+    #[test]
+    fn pinned_execution_reader_binds_compat_guard_to_its_exact_family() {
+        use crate::validation_dag::PINNED_ROOT_COMMAND_GUARD;
+        use crate::validation_dag::PINNED_ROOT_COMPAT_COMMAND_GUARD;
+        let graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let original = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "compat.echo")
+            .unwrap();
+        let payload = "printf '%s\\n' 'literal command; $(not expanded)'";
+        let render = |guard: &str| {
+            format!(
+                "./ci/hermetic/run-in-pinned-root.sh -- bash -c {} bash {}",
+                shell_words::quote(guard),
+                shell_words::quote(payload),
+            )
+        };
+        let mut step = original.clone();
+        step.cmd = render(PINNED_ROOT_COMPAT_COMMAND_GUARD);
+        assert_eq!(execution_command(&step).unwrap(), payload);
+        for guard in [PINNED_ROOT_COMMAND_GUARD, "exec bash -c \"$1\"", "unknown"] {
+            let mut changed = step.clone();
+            changed.cmd = render(guard);
+            assert!(
+                execution_command(&changed).is_err(),
+                "wrong default-compat guard accepted: {guard}"
+            );
+        }
+        for (group, job, labels) in [
+            ("compat", "echo_on_host", vec!["hosted-portable"]),
+            ("compat", "super_echo", vec!["super"]),
+            ("test", "hermit_unit", vec!["portable"]),
+        ] {
+            let mut changed = step.clone();
+            changed.group = group.into();
+            changed.job = job.into();
+            changed.labels = labels.into_iter().map(str::to_owned).collect();
+            assert!(
+                execution_command(&changed).is_err(),
+                "compat guard accepted for {}",
+                changed.tag()
+            );
+        }
+    }
 
     #[test]
     fn child_time_rpc_is_prepared_and_executed_in_both_integration_variants() {
