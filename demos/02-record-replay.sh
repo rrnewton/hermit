@@ -26,30 +26,20 @@ echo '=========================================='
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-# The current release build returns EFAULT while replaying the bootstrap exec;
-# the same source built in the debug profile passes Hermit's record/replay
-# integration test and this complete workflow. Keep the demo honest about the
-# binary it exercises rather than reporting a product failure as a demo pass.
-if [ "${DEMO_SKIP_BUILD:-0}" != "1" ]; then
-  (cd "$HERMIT_REPO" && cargo build --locked -p hermit --bin hermit)
-fi
-HERMIT="$HERMIT_REPO/target/debug/hermit"
-if [ ! -x "$HERMIT" ]; then
-  echo "missing debug hermit binary: $HERMIT" >&2
-  echo "run the demo without DEMO_SKIP_BUILD=1 so its prerequisites are built" >&2
-  exit 1
-fi
+# This demo exercises the RELEASE binary, which is common.sh's default and the
+# profile every other demo uses. It previously substituted the debug build,
+# because release replay failed EFAULT while replaying the bootstrap exec. That
+# defect is fixed: the root cause was a 4 KiB clone stack overflowing during
+# release replay mount setup, repaired in reverie by
+# ce841d744cc74b1627ac52b42f711b33b1c72a45, which this change's pin now
+# includes. The invalid envp and the EFAULT were symptoms of memory corruption a
+# layer down, which is also why only the release profile showed them -- the
+# margin was never there and debug happened to fit.
+#
+# No binary selection or existence check belongs here. common.sh already builds
+# the release binary, exports HERMIT to it, and exits with a clear message when
+# it is missing; a second copy of that logic is how the substitution persisted.
 echo "Hermit record/replay binary: $HERMIT"
-# Say this at RUNTIME, not only in the comment above. A reader of the demo's
-# output would otherwise see a clean pass and have no way to know the release
-# path is untested here, which is how a substitution becomes permanent.
-echo "NOTE: this demo exercises the DEBUG profile only. Release replay is"
-echo "      currently broken -- it injects an execveat whose envp is invalid and"
-echo "      fails EFAULT at hermit-cli/src/replayer.rs:748, while record"
-echo "      succeeds. The release record/replay path is therefore NOT covered by"
-echo "      this demo. Tracked as release_profile_replay_injects; when that is"
-echo "      fixed, restore the release binary here and add a required release"
-echo "      record/replay regression."
 
 export DEMO_DATA_DIR="$DEMO_TMP/recordings"
 mkdir -p "$DEMO_DATA_DIR"
