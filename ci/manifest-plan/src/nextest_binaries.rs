@@ -1646,4 +1646,109 @@ mod tests {
         .unwrap();
         assert_ne!(sources(&f.cargo, &f.root).unwrap(), before);
     }
+
+    /// A disposable run summary must not move source identity, and a stray one
+    /// still must.
+    ///
+    /// Validate run 1819 on hermit main ba3bfc9767 failed 26 nodes, 20 of them
+    /// because `hermit run` wrote `.hermit-verify-summary-*` into the checkout
+    /// root. This enumeration counts untracked, non-ignored files, so creating
+    /// and dropping one during a run changed the identity under the prepared
+    /// executables: 13 nodes refused "prepared executables are stale: source
+    /// identity changed" and 6 more could not read a path that had vanished
+    /// between enumeration and hashing. None of them ran a single test.
+    ///
+    /// The repair moves those summaries into `ignored/`, whose .gitignore entry
+    /// already says everything under it "is disposable and must not taint
+    /// source provenance". The SECOND HALF OF THIS TEST IS THE POINT: the fix
+    /// must not be an exemption for the name. `scripts/validate.rs`
+    /// checkout_attribution_bracket exists because run 1573 leaked these same
+    /// files and its stated property is "No pathname is excused" -- so a stray
+    /// summary anywhere the scanner still looks has to keep changing the
+    /// identity, exactly as any other untracked file does.
+    #[test]
+    fn a_disposable_run_summary_is_not_source_but_a_stray_one_still_is() {
+        let f = Fixture::new();
+        fs::write(f.root.join(".gitignore"), "ignored/\n").unwrap();
+        fs::write(f.root.join("Cargo.toml"), "[package]\nname='fixture'\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "Cargo.toml", ".gitignore"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            git_bytes(&f.root, &args).unwrap();
+        }
+        let before = sources(&f.cargo, &f.root).unwrap();
+
+        // Positive: the summary where the repair puts it is invisible to source
+        // accounting, both while it exists and after it is dropped. Either
+        // transition is what refused the twenty nodes.
+        let disposable = f.root.join("ignored");
+        fs::create_dir_all(&disposable).unwrap();
+        let summary = disposable.join(".hermit-verify-summary-fixture");
+        fs::write(&summary, "summary").unwrap();
+        assert_eq!(
+            sources(&f.cargo, &f.root).unwrap(),
+            before,
+            "a disposable run summary tainted source identity"
+        );
+        fs::remove_file(&summary).unwrap();
+        assert_eq!(
+            sources(&f.cargo, &f.root).unwrap(),
+            before,
+            "dropping a disposable run summary tainted source identity"
+        );
+
+        // Negative, and it must stay this way: the same file name in the
+        // scanned tree is still an untracked source. A repair that made this
+        // pass too would have excused the pathname instead of moving the file.
+        let stray = f.root.join(".hermit-verify-summary-fixture");
+        fs::write(&stray, "summary").unwrap();
+        assert_ne!(
+            sources(&f.cargo, &f.root).unwrap(),
+            before,
+            "a stray summary in the scanned tree was excused rather than counted"
+        );
+        fs::remove_file(&stray).unwrap();
+        assert_eq!(sources(&f.cargo, &f.root).unwrap(), before);
+    }
+
+    /// This repository's own .gitignore must not exempt a run summary by name.
+    ///
+    /// ⚠️ THE TEST ABOVE CANNOT CATCH THAT, and neither can
+    /// `scripts/validate.rs` checkout_attribution_bracket, which guards the
+    /// same property. Both build a fixture repository with a .gitignore they
+    /// write themselves, so neither ever reads this one. Someone "fixing" a
+    /// future summary collision by adding `.hermit-verify-summary-*` here would
+    /// leave every fixture-based guard green while removing the property they
+    /// exist to defend -- a check that cannot fail for the reason it names.
+    ///
+    /// So this reads the real file. The repair is to move disposable state into
+    /// `ignored/`, not to stop looking at the source tree.
+    #[test]
+    fn the_repository_gitignore_does_not_exempt_a_run_summary_by_name() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .find(|candidate| candidate.join(".gitignore").is_file())
+            .expect("locating the repository .gitignore");
+        let text = fs::read_to_string(root.join(".gitignore")).expect("reading .gitignore");
+        for line in text.lines() {
+            let rule = line.split('#').next().unwrap_or_default().trim();
+            assert!(
+                !rule.contains("hermit-verify-summary")
+                    && !rule.contains("hermit-backend-engagement-summary"),
+                "{}/.gitignore exempts a run summary by name ({rule:?}); move the file into \
+                 ignored/ instead of hiding it from source accounting",
+                root.display()
+            );
+        }
+    }
 }
