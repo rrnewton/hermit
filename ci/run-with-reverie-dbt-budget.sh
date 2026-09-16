@@ -181,7 +181,7 @@ fi
 # enum dispatch, and the common Backend output API, but no native DBT recipe
 # input. The measured native-build budget therefore carries unchanged; the Rust
 # API change still requires a fresh Hermit build and validation.
-expected_pin=c2e2c8fbe52c2e5e8c65a56c2a547785f76c731e
+expected_pin=a158914eceeca02a9ab4c7dd4e9916926d5e5c1e
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

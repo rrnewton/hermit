@@ -193,8 +193,26 @@ fi
 # The five intervening commits do not touch a native DBT recipe input. The
 # measured native-build budget carries unchanged; fresh Rust build and validate
 # evidence is still required for the Backend API change.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c2e2c8fbe52c2e5e8c65a56c2a547785f76c731e ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c2e2c8fbe52c2e5e8c65a56c2a547785f76c731e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO a158914e (2026-09-16), ACROSS 74 COMMITS. Both repository inputs to
+# the DynamoRIO content-key miss are byte-identical to c2e2c8fb by git object
+# id, and BOTH PATHS EXIST AT BOTH ENDS -- checked explicitly, because this
+# checker warns that a path query at an older revision can return nothing
+# rather than a difference, so absent would read as unchanged:
+#     reverie-dbt/vendor/dynamorio  a3c41e5d3630 -> a3c41e5d3630
+#     reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974
+# reverie-dbt itself DOES differ over this range -- 14 files, +1913/-168 --
+# so this is not a "the subtree is identical" argument. The changed files are
+# src and tests plus new process-clone and signal-identity fixtures; none is a
+# content-key input. The key is hashed over exactly four things: the vendored
+# DynamoRIO tree, build.rs, CMAKE and CMAKE_GENERATOR. The first two are
+# byte-identical above and the last two are host state a pin move cannot touch,
+# so a miss configures and builds the same DynamoRIO source with the same build
+# script and the measured miss cost cannot have moved. Carry, not recalibration.
+# The advance is taken for reverie ce841d74, which repairs a 4 KiB clone stack
+# overflowing during release replay mount setup; that is a runtime fix in
+# reverie-process and is not a DBT recipe input either.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a158914eceeca02a9ab4c7dd4e9916926d5e5c1e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a158914eceeca02a9ab4c7dd4e9916926d5e5c1e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
