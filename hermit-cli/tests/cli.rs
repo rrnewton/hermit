@@ -5169,10 +5169,14 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
 /// the same `-ex` sequence then shuts GDB down.
 #[test]
 fn record_classifies_a_gdbserver_replay_stage_container_child_failure() {
+    use std::env;
     use std::io::Read;
     use std::io::Write;
     use std::io::{self};
     use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU64;
@@ -5262,6 +5266,209 @@ fn record_classifies_a_gdbserver_replay_stage_container_child_failure() {
         }
     }
 
+    fn file_identity(metadata: &fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.size(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    }
+
+    struct ObservedProcess {
+        handle: OwnedFd,
+        identity: serde_json::Value,
+    }
+
+    impl ObservedProcess {
+        fn bind(pid: u32) -> io::Result<Self> {
+            let before = identity(pid)?;
+            // SAFETY: pidfd_open takes integer arguments and returns a new fd.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let process = Self {
+                // SAFETY: successful pidfd_open returned this owned descriptor.
+                handle: unsafe { OwnedFd::from_raw_fd(fd as i32) },
+                identity: before,
+            };
+            process.recheck()?;
+            Ok(process)
+        }
+
+        fn pid(&self) -> u32 {
+            self.identity["pid"].as_u64().unwrap() as u32
+        }
+
+        fn recheck(&self) -> io::Result<()> {
+            let mut poll = libc::pollfd {
+                fd: self.handle.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // An open pidfd does not reserve the numeric PID. Check both the
+            // held generation's liveness and the currently named process.
+            for after_identity in [false, true] {
+                if after_identity && identity(self.pid())? != self.identity {
+                    return Err(io::Error::other("observed process identity changed"));
+                }
+                // SAFETY: poll points to one initialized pollfd; timeout is zero.
+                let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+                if ready < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if ready != 0 {
+                    return Err(io::Error::other(
+                        "held process generation is no longer live",
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn bounded_proc_text(path: &Path) -> io::Result<String> {
+        let mut bytes = Vec::new();
+        fs::File::open(path)?
+            .take(16 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 16 * 1024 {
+            return Err(io::Error::other("proc observation exceeded16KiB"));
+        }
+        String::from_utf8(bytes).map_err(io::Error::other)
+    }
+
+    fn observed_text(path: &Path) -> serde_json::Value {
+        match bounded_proc_text(path) {
+            Ok(value) => serde_json::json!({"value": value}),
+            Err(error) => serde_json::json!({"error": error.to_string()}),
+        }
+    }
+
+    fn owned_wait_snapshot(outer: &serde_json::Value) -> io::Result<serde_json::Value> {
+        let root = ObservedProcess::bind(outer["pid"].as_u64().unwrap() as u32)?;
+        if root.identity != *outer {
+            return Err(io::Error::other(
+                "outer identity changed before observation",
+            ));
+        }
+        let mut owned = vec![root];
+        let mut rows = Vec::new();
+        let mut threads_left = 128usize;
+        let mut cursor = 0;
+        while cursor < owned.len() {
+            let process = &owned[cursor];
+            cursor += 1;
+            let parent = PathBuf::from(format!("/proc/{}", process.pid()));
+            let capture = (|| -> io::Result<(serde_json::Value, Vec<ObservedProcess>)> {
+                process.recheck()?;
+                let tasks = fs::read_dir(parent.join("task"))?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<io::Result<Vec<_>>>()?;
+                if tasks.len() > threads_left {
+                    return Err(io::Error::other(
+                        "owned observation exceeded128 total tasks",
+                    ));
+                }
+                threads_left -= tasks.len();
+                let mut threads = Vec::new();
+                let mut children = std::collections::BTreeSet::new();
+                for task in tasks {
+                    let before = bounded_proc_text(&task.join("stat"))?;
+                    let child_text = bounded_proc_text(&task.join("children"))?;
+                    for child in child_text.split_whitespace() {
+                        children.insert(child.parse::<u32>().map_err(io::Error::other)?);
+                    }
+                    let status = bounded_proc_text(&task.join("status"))?;
+                    let selected_status: Vec<_> = status
+                        .lines()
+                        .filter(|line| {
+                            [
+                                "Name:",
+                                "State:",
+                                "Tgid:",
+                                "Pid:",
+                                "PPid:",
+                                "TracerPid:",
+                                "Uid:",
+                                "NSpid:",
+                                "CoreDumping:",
+                            ]
+                            .iter()
+                            .any(|key| line.starts_with(key))
+                        })
+                        .collect();
+                    let row = serde_json::json!({
+                        "task": task, "stat": before, "status": selected_status,
+                        "wchan": observed_text(&task.join("wchan")),
+                        "syscall": observed_text(&task.join("syscall")),
+                    });
+                    let after = bounded_proc_text(&task.join("stat"))?;
+                    let generation = |stat: &str| {
+                        stat.rsplit_once(')')
+                            .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+                            .map(str::to_owned)
+                    };
+                    if generation(&before).is_none() || generation(&before) != generation(&after) {
+                        return Err(io::Error::other(
+                            "task generation changed during observation",
+                        ));
+                    }
+                    threads.push(row);
+                }
+                let mut staged = Vec::new();
+                for pid in children {
+                    if owned.iter().any(|known| known.pid() == pid) {
+                        continue;
+                    }
+                    if owned.len() + staged.len() >= 32 {
+                        return Err(io::Error::other("owned observation exceeded32 processes"));
+                    }
+                    let child = ObservedProcess::bind(pid)?;
+                    if child.identity["ppid"].as_u64() != Some(u64::from(process.pid())) {
+                        return Err(io::Error::other(
+                            "child no longer belongs to observed parent",
+                        ));
+                    }
+                    staged.push(child);
+                }
+                let links: Vec<_> = ["exe", "fd/0", "fd/1", "fd/2"].iter().map(|name| {
+                    let value = fs::read_link(parent.join(name)).map(|p| p.to_string_lossy().into_owned());
+                    // This metadata identifies the mapped executable through
+                    // procfs, not just the file now installed at its pathname.
+                    let mapped = (*name == "exe").then(|| fs::metadata(parent.join(name)).map(|m| file_identity(&m)));
+                    serde_json::json!({"path": name, "value": value.as_ref().ok(), "error": value.as_ref().err().map(ToString::to_string),
+                        "mapped_file_identity": mapped.as_ref().and_then(|m| m.as_ref().ok()),
+                        "mapped_identity_error": mapped.as_ref().and_then(|m| m.as_ref().err()).map(ToString::to_string)})
+                }).collect();
+                // Do not admit tentative children if the original parent died
+                // or its numeric PID changed while their handles were acquired.
+                process.recheck()?;
+                for child in &staged {
+                    child.recheck()?;
+                }
+                Ok((
+                    serde_json::json!({"identity": process.identity, "threads": threads, "links": links}),
+                    staged,
+                ))
+            })();
+            match capture {
+                Ok((row, staged)) => {
+                    rows.push(row);
+                    owned.extend(staged);
+                }
+                Err(error) => rows.push(serde_json::json!({"identity": process.identity, "observation_error": error.to_string()})),
+            }
+        }
+        owned[0].recheck()?;
+        Ok(serde_json::json!({"processes": rows,
+            "limits": "sequential owned-descendant observations; errors mean unavailable, not exited; wchan/CoreDumping are observations, not wait statuses; no signal, trace attachment or pipe read"}))
+    }
+
     let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create a recording dir");
     // Retain bounded diagnostics even when an assertion fails or Nextest kills
@@ -5275,6 +5482,50 @@ fn record_classifies_a_gdbserver_replay_stage_container_child_failure() {
     let acknowledgement = diagnostics.join("injection.jsonl");
     let stdout_path = diagnostics.join("stdout");
     let stderr_path = diagnostics.join("stderr");
+    // Resolve GDB before changing this Child's PATH. The fixture wrapper execs
+    // that exact binary, adding display-only diagnostics before target remote.
+    let original_path = env::var_os("PATH").expect("PATH is required to locate the real GDB");
+    let debugger = env::split_paths(&original_path)
+        .map(|directory| directory.join("gdb"))
+        .find(|path| fs::metadata(path).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0))
+        .and_then(|path| fs::canonicalize(path).ok())
+        .expect("failed to resolve the real GDB before installing diagnostic wrapper");
+    let before = fs::metadata(&debugger).expect("failed to stat the real GDB");
+    let digest = Command::new("sha256sum")
+        .arg("--")
+        .arg(&debugger)
+        .output()
+        .expect("failed to hash the real GDB");
+    assert!(digest.status.success(), "GDB identity hash failed");
+    let digest = String::from_utf8(digest.stdout).expect("GDB hash is not UTF-8");
+    let digest = digest
+        .split_whitespace()
+        .next()
+        .expect("missing GDB digest");
+    assert!(digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let after = fs::metadata(&debugger).expect("failed to recheck the real GDB");
+    assert_eq!(
+        file_identity(&before),
+        file_identity(&after),
+        "GDB changed during hashing"
+    );
+    fs::write(diagnostics.join("debugger.json"), serde_json::to_vec(&serde_json::json!({
+        "resolved": debugger, "sha256": digest, "file_identity": file_identity(&after),
+        "early_commands": ["set debug remote-packet-max-chars 128", "set debug remote on"],
+        "limits": "packet display is truncated to128characters; protocol bytes and timing settings are unchanged; both output streams use the existing1MiB continuously drained captures"
+    })).unwrap()).expect("failed to retain real GDB identity");
+    let wrapper_dir = diagnostics.join("bin");
+    fs::create_dir(&wrapper_dir).expect("failed to create private GDB wrapper directory");
+    let wrapper = wrapper_dir.join("gdb");
+    fs::write(&wrapper, format!(
+        "#!/bin/sh\nexec {} -iex 'set debug remote-packet-max-chars 128' -iex 'set debug remote on' \"$@\"\n",
+        shell_words::quote(debugger.to_str().expect("GDB path is not UTF-8"))
+    )).expect("failed to write GDB diagnostic wrapper");
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
+        .expect("failed to make GDB wrapper executable");
+    let wrapped_path =
+        env::join_paths(std::iter::once(wrapper_dir).chain(env::split_paths(&original_path)))
+            .expect("failed to construct fixture-scoped GDB PATH");
     let source = r#"import json, os, select, signal, time
 
 directory = @DIAGNOSTIC_DIRECTORY@
@@ -5398,6 +5649,7 @@ finally:
         "--",
         "/bin/true",
     ])
+    .env("PATH", wrapped_path)
     .env("HERMIT_DATA_DIR", data_dir.path())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
@@ -5441,6 +5693,19 @@ finally:
         }
         if !reported && started.elapsed() >= Duration::from_secs(40) {
             reported = true;
+            let waits = owned_wait_snapshot(&outer);
+            let waits = match waits {
+                Ok(snapshot) => snapshot,
+                Err(error) => serde_json::json!({"observation_error": error.to_string()}),
+            };
+            let waits_bytes = serde_json::to_vec_pretty(&waits).unwrap();
+            assert!(
+                waits_bytes.len() <= CAPTURE_LIMIT as usize,
+                "owned wait observation exceeded1MiB"
+            );
+            fs::write(diagnostics.join("waits-at40s.json"), waits_bytes)
+                .expect("failed to retain owned wait observations");
+            eprintln!("GDB owned wait observations at40s: {waits}");
             eprintln!(
                 "GDB replay at40s: child_status={status:?}, stdout_reader_done={}, stderr_reader_done={}, stdout_bytes={}, stderr_bytes={}, current_identity={:?}, expected_identity={outer}\ninjection:\n{}\nstdout tail:\n{}\nstderr tail:\n{}",
                 stdout_reader.is_finished(),
