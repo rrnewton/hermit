@@ -1721,24 +1721,84 @@ mod tests {
         assert_eq!(sources(&f.cargo, &f.root).unwrap(), before);
     }
 
-    /// This repository's own .gitignore must not exempt a run summary by name.
+    /// Resolve this repository's root the way git does, not by guessing.
     ///
-    /// ⚠️ THE TEST ABOVE CANNOT CATCH THAT, and neither can
-    /// `scripts/validate.rs` checkout_attribution_bracket, which guards the
-    /// same property. Both build a fixture repository with a .gitignore they
-    /// write themselves, so neither ever reads this one. Someone "fixing" a
-    /// future summary collision by adding `.hermit-verify-summary-*` here would
-    /// leave every fixture-based guard green while removing the property they
-    /// exist to defend -- a check that cannot fail for the reason it names.
-    ///
-    /// So this reads the real file. The repair is to move disposable state into
-    /// `ignored/`, not to stop looking at the source tree.
-    #[test]
-    fn the_repository_gitignore_does_not_exempt_a_run_summary_by_name() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+    /// ⚠️ AN EARLIER VERSION TOOK THE FIRST ANCESTOR HOLDING A `.gitignore`.
+    /// Adding `ci/.gitignore` — an ordinary thing to do — would have silently
+    /// redirected every assertion below to that file instead, and they would
+    /// all still have passed. Resolving by `.git` and then cross-checking
+    /// against git's own answer removes the guess.
+    fn repository_root() -> PathBuf {
+        let candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
-            .find(|candidate| candidate.join(".gitignore").is_file())
-            .expect("locating the repository .gitignore");
+            .find(|candidate| candidate.join(".git").exists())
+            .expect("locating the repository root by .git")
+            .to_path_buf();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&candidate)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .expect("asking git for the work-tree root");
+        assert!(
+            output.status.success(),
+            "git could not resolve the work tree"
+        );
+        let toplevel = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+        assert_eq!(
+            candidate.canonicalize().unwrap(),
+            toplevel.canonicalize().unwrap(),
+            "the resolved root disagrees with git's own"
+        );
+        candidate
+    }
+
+    fn is_ignored(root: &Path, relative: &str) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["check-ignore", "-q", relative])
+            .status()
+            .expect("running git check-ignore")
+            .success()
+    }
+
+    /// This repository must ACTUALLY ignore `ignored/`, and must not exempt a
+    /// run summary by name.
+    ///
+    /// ⚠️ TWO GAPS THIS CLOSES, BOTH FOUND BY A REVIEWER OF PR 3026. The
+    /// fixture-based test above writes its own `.gitignore`, so it proves the
+    /// mechanism and says nothing about this repository's configuration. And
+    /// the earlier version of this test asserted only the ABSENCE of a by-name
+    /// exemption. Between them, deleting `/ignored/` from the real file left
+    /// both passing while the fix silently stopped working — the summaries
+    /// would go back to being counted as prepared source.
+    ///
+    /// So this asks git rather than reading the file: `git check-ignore` is the
+    /// same judgement `git ls-files --others --exclude-standard` makes, so it
+    /// cannot drift from how the rule is spelled.
+    #[test]
+    fn the_repository_really_ignores_the_disposable_directory() {
+        let root = repository_root();
+
+        assert!(
+            is_ignored(&root, "ignored/.hermit-verify-summary-probe"),
+            "{}/.gitignore no longer ignores ignored/, so run summaries written \
+             there are counted as prepared source again",
+            root.display()
+        );
+
+        // Control: the check must discriminate. A tracked source path is not
+        // ignored, so a version of `is_ignored` that answered yes to everything
+        // would fail here.
+        assert!(
+            !is_ignored(&root, "ci/manifest-plan/src/nextest_binaries.rs"),
+            "the ignore check answered yes for a tracked source file, so it is \
+             not measuring anything"
+        );
+
+        // And the name itself must still not be exempted anywhere, so a stray
+        // summary outside ignored/ keeps moving the identity.
         let text = fs::read_to_string(root.join(".gitignore")).expect("reading .gitignore");
         for line in text.lines() {
             let rule = line.split('#').next().unwrap_or_default().trim();
@@ -1750,5 +1810,10 @@ mod tests {
                 root.display()
             );
         }
+        assert!(
+            !is_ignored(&root, ".hermit-verify-summary-probe"),
+            "a stray summary in the repository root is ignored, so a leak there \
+             would no longer be visible to source accounting"
+        );
     }
 }
