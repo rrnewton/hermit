@@ -79,6 +79,8 @@ mod validate_cell_results;
 mod validate_artifacts;
 #[path = "lib/validate_test_results.rs"]
 mod validate_test_results;
+#[path = "lib/validate_evidence.rs"]
+mod validate_evidence;
 
 #[path = "lib/validate_plan.rs"]
 mod validate_plan;
@@ -1441,6 +1443,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         "scripts/lib/validate_history.rs",
         "scripts/lib/validate_artifacts.rs",
         "scripts/lib/validate_test_results.rs",
+        "scripts/lib/validate_evidence.rs",
         "scripts/lib/validate_plan.rs",
         "scripts/lib/validate_super.rs",
         "tests/e2e/manifests/applications.yaml",
@@ -1472,6 +1475,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "scripts/lib/validate_history.rs",
                 "scripts/lib/validate_artifacts.rs",
                 "scripts/lib/validate_test_results.rs",
+                "scripts/lib/validate_evidence.rs",
                 "scripts/lib/validate_plan.rs",
                 "scripts/lib/validate_super.rs",
                 "tests/e2e/manifests/applications.yaml",
@@ -17673,6 +17677,7 @@ fn write_ledger(
     execution_complete: bool,
     coverage: serde_json::Value,
     cell_results: Option<&validate_cell_results::RetainedCellResults>,
+    cumulative_evidence: Option<&validate_evidence::RetainedEvidence>,
 ) {
     let (coverage_schema, coverage) = ledger_schema_and_coverage(coverage);
     let ledger_schema = ledger_schema_version(coverage_schema, cell_results);
@@ -17764,7 +17769,7 @@ fn write_ledger(
         .map(|results| results.run_id.as_str())
         .or_else(|| coverage.get("run_id").and_then(serde_json::Value::as_str))
         .or(environment_run_id.as_deref());
-    let record = serde_json::json!({
+    let mut record = serde_json::json!({
         "schema_version": ledger_schema,
         "repo": "hermit",
         "producer": LEDGER_PRODUCER,
@@ -17883,6 +17888,15 @@ fn write_ledger(
         "cell_results": cell_results.map(|results| &results.evidence),
         "gates": gates,
     });
+    if let Some(evidence) = cumulative_evidence {
+        if let Err(error) = evidence.add_to_record(&mut record) {
+            eprintln!("validate: ERROR: refusing malformed cumulative ledger row: {error}");
+            return;
+        }
+    } else if ledger_schema == 10 {
+        eprintln!("validate: ERROR: schema 10 requires all cumulative evidence components");
+        return;
+    }
     let typed = match serde_json::from_value::<HistoryRow>(record.clone()) {
         Ok(typed) => typed,
         Err(error) => {
@@ -17892,6 +17906,12 @@ fn write_ledger(
             return;
         }
     };
+    if let Some(evidence) = cumulative_evidence {
+        if let Err(error) = evidence.verify_record(&typed) {
+            eprintln!("validate: ERROR: refusing unbound cumulative ledger row: {error}");
+            return;
+        }
+    }
     if typed.retry_rounds() != Ok(Some(ctx.retry_rounds)) {
         eprintln!(
             "validate: warning: generated ledger row has malformed HistoryRow retry_rounds"
@@ -20145,6 +20165,17 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         );
     }
 
+    let cumulative_selection = if validate_evidence::ENABLED
+        && !nesting.nested && !args.allow_local_off_the_record_run
+        && (plan.suite_complete || plan.cell_evidence_expected.is_some())
+    {
+        match validate_evidence::SelectedEvidence::capture(&root, &plan) {
+            Ok(selected) => Some(selected),
+            Err(error) => return RunSummary::refused(2, &plan.profile,
+                "constructed evidence plan", vec![error]),
+        }
+    } else { None };
+
     // Fail-closed caps audit. A node without declared caps would run UNBOXED
     // while the driver still printed "boxing ACTIVE" — a green verifying less
     // than it claims. Refuse rather than run.
@@ -20549,6 +20580,21 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         };
     eprintln!("validate: per-cell results: {}", e2e_result_root.display());
 
+    let prepared_evidence = match cumulative_selection {
+        Some(selected) => {
+            let retained = std::env::var("E2E_RUN_ID")
+                .map_err(|error| format!("cannot bind evidence run identity: {error}"))
+                .and_then(|run_id| selected.publish(parent.as_deref().unwrap_or(&root), &plan,
+                    &run_id, &commit));
+            match retained {
+                Ok(evidence) => Some(evidence),
+                Err(error) => return RunSummary::refused(4, &plan.profile,
+                    "constructed evidence publication", vec![error]),
+            }
+        }
+        None => None,
+    };
+
     // ---- box-wide concurrency observation (validate.sh:1499) -----------------
     //
     // PORTED CORRECTED, NOT VERBATIM. The bash counted process-group EXISTENCE
@@ -20912,6 +20958,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
                 false,
                 coverage.clone(),
                 None,
+                None,
             );
         }
         // This is below the interrupted run's ledger write. Keep the checkout
@@ -21145,7 +21192,24 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // the artifact has actually been published and bound by checksum.
     let mut evidence_refusal_details = Vec::new();
     let should_retain_cells = plan.suite_complete || plan.cell_evidence_expected.is_some();
-    let retained_cell_results = if !nesting.nested
+    let cumulative_expected = prepared_evidence.is_some();
+    let retained_evidence = if execution_complete {
+        match prepared_evidence {
+            Some(prepared) => match prepared.retain(parent.as_deref().unwrap_or(&root),
+                &e2e_result_root, &ctx, &outcomes, &attempts, plan.compat_prefix) {
+                Ok(evidence) => Some(evidence),
+                Err(error) => {
+                    let detail = format!("cannot retain cumulative validation evidence: {error}; refusing a schema-10 receipt");
+                    eprintln!("validate: ERROR: {detail}");
+                    evidence_refusal_details.push(detail);
+                    exit_code = exit_code_with_evidence_refusal(exit_code);
+                    None
+                }
+            },
+            None => None,
+        }
+    } else { None };
+    let legacy_cell_results = if !cumulative_expected && !nesting.nested
         && !args.allow_local_off_the_record_run
         && should_retain_cells
         && execution_complete
@@ -21177,6 +21241,8 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     } else {
         None
     };
+    let retained_cell_results = retained_evidence.as_ref().map(|evidence| &evidence.cells)
+        .or(legacy_cell_results.as_ref());
     let retained_coverage = if plan.suite_complete
         && !nesting.nested
         && !args.allow_local_off_the_record_run
@@ -21282,7 +21348,8 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             &log_path.to_string_lossy(),
             execution_complete,
             coverage,
-            retained_cell_results.as_ref(),
+            retained_cell_results,
+            retained_evidence.as_ref(),
         );
     }
 
@@ -21637,6 +21704,7 @@ fn stop_test_seam(
             "",
             false,
             serde_json::json!({}),
+            None,
             None,
         );
     }
