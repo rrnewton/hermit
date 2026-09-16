@@ -5439,6 +5439,66 @@ mod tests {
         );
     }
 
+    /// Serialises the two tests that change the process working directory.
+    ///
+    /// `private_verify_summary` reads the cwd through `private_summary_dir`, so
+    /// exercising the WRITER means setting it. That is process-global, so it
+    /// cannot run beside another test that also depends on it.
+    static CWD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Both writers must route through the resolver, not merely agree with it.
+    ///
+    /// ⚠️ THIS IS THE THIRD LEVEL OF THE SAME DEFECT ON THIS CHANGE, and the
+    /// reviewer found it by mutation: reverting BOTH writers to
+    /// `tempfile_in(current_dir())` left every test green. The resolver tests
+    /// prove `summary_dir_under` computes the right directory; they say nothing
+    /// about whether anything calls it. A future writer, or a revert of either
+    /// existing one, would restore the original defect undetected.
+    ///
+    /// The earlier two levels were: the first test could not see the real
+    /// .gitignore, and then ALL of them sat in a crate that cannot reach a
+    /// private `src/bin` item. Each level was found by a different reader.
+    ///
+    /// So this calls the writers and looks at where the file actually landed.
+    /// Under the mutation the parent is the work tree itself rather than its
+    /// disposable directory, and both assertions below fail.
+    #[test]
+    fn both_writers_put_their_summary_in_the_disposable_directory() {
+        let _guard = CWD_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = tempfile::tempdir().expect("fixture root");
+        let root = tmp.path().canonicalize().expect("canonical fixture root");
+        std::fs::create_dir(root.join(".git")).expect("fixture work tree");
+        std::fs::write(root.join(".gitignore"), "/ignored/\n").expect("fixture ignore rule");
+
+        let previous = std::env::current_dir().expect("saving the working directory");
+        std::env::set_current_dir(&root).expect("entering the fixture work tree");
+        let produced = [
+            ("verification", private_verify_summary()),
+            ("backend engagement", private_backend_engagement_summary()),
+        ];
+        std::env::set_current_dir(&previous).expect("restoring the working directory");
+
+        let expected = root.join("ignored");
+        for (what, result) in produced {
+            let file = result.unwrap_or_else(|error| panic!("{what} summary: {error:#}"));
+            let parent = file
+                .path()
+                .parent()
+                .expect("a summary has a parent")
+                .canonicalize()
+                .expect("canonical summary parent");
+            assert_eq!(
+                parent,
+                expected,
+                "the {what} summary was written to {} rather than the disposable \
+                 directory, so it is counted as prepared source again",
+                parent.display()
+            );
+        }
+    }
+
     /// The control, and the reviewer's own case: a regular FILE named `ignored`.
     ///
     /// `create_dir_all` fails, and the first version answered by returning the
