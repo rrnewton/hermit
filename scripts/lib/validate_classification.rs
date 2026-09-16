@@ -60,24 +60,73 @@ impl NodeClassification {
     }
 }
 
+/// A result that was never written is not evidence about the product.
+///
+/// `dagrun` funnels three different conditions into one refusal prefix at
+/// `scheduler.rs::run_step`, and they are not the same kind of fact:
+///
+///   "cannot read structured test results <path>: ..."   a file exists and cannot be read
+///   "malformed structured test results <path>: ..."     a file exists and its content is wrong
+///   "required structured test results were not written" NOTHING EXISTS
+///
+/// The first two are statements about a report the run produced, so the suite
+/// is a fair suspect -- a duplicate test identity is a malformed suite, and the
+/// bracket below pins exactly that case as a product failure. The third is a
+/// statement that NO evidence exists in either direction. Calling that a
+/// product failure asserts something the run cannot know.
+///
+/// MEASURED, run 1819 on hermit main ba3bfc9767: all 26 failed nodes were
+/// recorded `product_failure`, including 17 whose own detail was verbatim
+/// "required structured test results were not written". Nineteen of those nodes
+/// refused before executing a single test. A consumer counting product failures
+/// from that row gets 26 where the evidence supports 6, and the scorecard's Red
+/// definition depends on exactly this distinction.
+///
+/// So only the never-written case is reclassified. `NodeClassification::result`
+/// already maps `UnderstoodInfrastructureFailure` to "no_result", which is what
+/// the ruling requires in both directions: such a node stops counting as red
+/// AND cannot count as green evidence for landing.
+const RESULTS_NEVER_WRITTEN: &str = "required structured test results were not written";
+
+pub(super) fn refused_without_writing_results(attempt: &NodeAttempt) -> bool {
+    attempt
+        .reason
+        .starts_with("STRUCTURED TEST RESULTS REFUSED: ")
+        && attempt.reason.contains(RESULTS_NEVER_WRITTEN)
+}
+
 /// Evidence of a failed condition remains authoritative alongside a diagnostic.
 ///
 /// Test results were parsed from the controlled runner's structured report.
 /// The refusal prefix is written by dagrun itself after rejecting that report
 /// (`scheduler.rs::run_step`), rather than copied from the child's output.
+///
+/// ⚠️ A MEASURED FAILING TEST STILL WINS over any refusal. The first disjunct is
+/// checked independently, so a node that both reported a failed test and then
+/// refused to write its report is still a product failure. That ordering is
+/// deliberate: only the absence of evidence is reclassified, never its presence.
 pub(super) fn has_product_failure_evidence(attempt: &NodeAttempt) -> bool {
     attempt
         .test_results
         .as_ref()
         .is_some_and(|results| results.iter().any(|result| !result.passed))
-        || attempt
+        || (attempt
             .reason
             .starts_with("STRUCTURED TEST RESULTS REFUSED: ")
+            && !refused_without_writing_results(attempt))
 }
 
 pub(super) fn attempt_classification(attempt: &NodeAttempt) -> NodeClassification {
     if has_product_failure_evidence(attempt) {
         return NodeClassification::ProductFailure;
+    }
+    // Checked BEFORE the fall-through below, because a refused node is
+    // `reported`, `Completed` and `ok == Some(false)`, so it reaches none of
+    // those arms and would otherwise land on the ProductFailure default at the
+    // end of this function -- which is how 17 never-written results were
+    // recorded as product failures in run 1819.
+    if refused_without_writing_results(attempt) {
+        return NodeClassification::UnderstoodInfrastructureFailure;
     }
     if !attempt.reported
         || attempt.execution != AttemptExecution::Completed
@@ -393,7 +442,7 @@ fn product_evidence_bracket() -> Result<(), String> {
         );
     }
     let failed_test = dagrun::TestResult::new("fixture::fails".into(), false, 1)?;
-    outcome.test_results = Some(vec![failed_test]);
+    outcome.test_results = Some(vec![failed_test.clone()]);
     let mut mixed = reported_attempt(&outcome, 1);
     mixed.understood_infrastructure_class = infra.understood_infrastructure_class.clone();
     if attempt_classification(&mixed) != NodeClassification::ProductFailure {
@@ -408,6 +457,40 @@ fn product_evidence_bracket() -> Result<(), String> {
         return Err(
             "classification: infrastructure diagnostic erased the controlled result-import refusal"
                 .into(),
+        );
+    }
+    // A report that was WRITTEN and rejected stays a product failure, above.
+    // A report that was never written says nothing about the product, and
+    // calling it a product failure asserts what the run could not observe.
+    // Run 1819 recorded 17 of these as product failures; 19 of its nodes
+    // refused before executing a single test.
+    // ⚠️ BUILT FROM A BASE WITH NO INFRASTRUCTURE DIAGNOSIS, deliberately.
+    // Cloning `infra` here passed whether or not the never-written case was
+    // reclassified, because its understood_infrastructure_class already
+    // produces UnderstoodInfrastructureFailure through a different arm. That
+    // first version of this assertion could not fail for the reason it names,
+    // which is the same defect the reclassification exists to fix. Controlled:
+    // with the reclassification disabled, this fixture now reports
+    // product_failure and this bracket refuses.
+    let never_written_outcome = fixture_outcome("test.never_written", 1);
+    let mut never_written = reported_attempt(&never_written_outcome, 1);
+    never_written.reason =
+        "STRUCTURED TEST RESULTS REFUSED: required structured test results were not written to /x"
+            .into();
+    if attempt_classification(&never_written) != NodeClassification::UnderstoodInfrastructureFailure
+    {
+        return Err(
+            "classification: a result that was never written was reported as a product failure"
+                .into(),
+        );
+    }
+    // Both directions, because reclassifying absence must not reclassify
+    // presence: a measured failing test still wins over the same refusal.
+    let mut measured_then_refused = never_written.clone();
+    measured_then_refused.test_results = Some(vec![failed_test.clone()]);
+    if attempt_classification(&measured_then_refused) != NodeClassification::ProductFailure {
+        return Err(
+            "classification: a measured failing test was excused by a later write refusal".into(),
         );
     }
     for bits in 1_u8..8 {
