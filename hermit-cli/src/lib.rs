@@ -4659,6 +4659,7 @@ sys.exit(0 if passed else 1)
     fn dbt_private_loader_observes_existing_true_dispatch() {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
         use std::os::unix::process::CommandExt;
 
         let executable = std::env::current_exe()
@@ -4669,6 +4670,7 @@ sys.exit(0 if passed else 1)
         // owned persistent output mount in the official pinned-root runner.
         let directory = tempfile::Builder::new()
             .prefix("hermit-dbt-file-trace-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir_in(executable.parent().expect("test executable has a parent"))
             .expect("create private retained diagnostic directory")
             .keep();
