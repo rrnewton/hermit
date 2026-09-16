@@ -404,6 +404,7 @@ fn runs_in_pinned_root(step: &Step) -> bool {
     !is_hosted_variant(step)
         && (is_manifest_run(step)
             || PINNED_ROOT_EXECUTION_STEPS.contains(&step.tag().as_str())
+            || generated_partition(step) == Some(GeneratedPartition::PortableCompat)
             || matches!(step.group.as_str(), "portablecompat" | "portablecompatprep"))
 }
 
@@ -412,6 +413,24 @@ fn runs_in_pinned_root(step: &Step) -> bool {
 // preserve literal bytes and the original command's argument placement.
 pub const PINNED_ROOT_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ "$#" -gt 0 ]; then printf -v hermit_extra ' %q' "$@"; hermit_payload+=$hermit_extra; fi && exec bash -c "$hermit_payload""#;
 pub(super) const LEGACY_PINNED_ROOT_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1""#;
+// Keep the original payload and admitted argv intact. Only the image's default
+// compatibility family uses this run-owned subtree; hosted fixtures and guests
+// retain the original state even when both profiles are selected together.
+pub(super) const PINNED_ROOT_COMPAT_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ "$#" -gt 0 ]; then printf -v hermit_extra ' %q' "$@"; hermit_payload+=$hermit_extra; fi && VALIDATE_RUN_STATE="${VALIDATE_RUN_STATE:?}/pinned-default-compat" exec bash -c "$hermit_payload""#;
+
+fn pinned_root_guard(step: &Step) -> &'static str {
+    if generated_partition(step) == Some(GeneratedPartition::PortableCompat) {
+        PINNED_ROOT_COMPAT_COMMAND_GUARD
+    } else {
+        PINNED_ROOT_COMMAND_GUARD
+    }
+}
+
+pub(super) fn is_pinned_root_guard(step: &Step, guard: &str) -> bool {
+    guard == pinned_root_guard(step)
+        || (generated_partition(step) != Some(GeneratedPartition::PortableCompat)
+            && guard == LEGACY_PINNED_ROOT_COMMAND_GUARD)
+}
 
 fn pinned_root_command(step: &Step) -> String {
     let mut env_names = PINNED_ROOT_FORWARDED_ENV
@@ -445,7 +464,7 @@ fn pinned_root_command(step: &Step) -> String {
         "--".into(),
         "bash".into(),
         "-c".into(),
-        PINNED_ROOT_COMMAND_GUARD.into(),
+        pinned_root_guard(step).into(),
         "bash".into(),
         step.cmd.clone(),
     ]);
@@ -458,7 +477,9 @@ fn pinned_root_command(step: &Step) -> String {
 // The authored source already contains wrapped manifest commands. Keep their
 // command payload unchanged while carrying the current environment policy into
 // the outer wrapper; otherwise only newly cloned producers see added settings.
-fn refresh_pinned_root_environment(tag: &str, command: &str) -> Result<String, String> {
+fn refresh_pinned_root_environment(step: &Step) -> Result<String, String> {
+    let tag = step.tag();
+    let command = &step.cmd;
     let (header, payload) = command
         .split_once(" -- bash -c ")
         .ok_or_else(|| format!("{tag} has an unrecognized pinned-root command boundary"))?;
@@ -480,8 +501,11 @@ fn refresh_pinned_root_environment(tag: &str, command: &str) -> Result<String, S
         }
     }
     let legacy = format!("{} bash ", shell_quote(LEGACY_PINNED_ROOT_COMMAND_GUARD));
-    let current = format!("{} bash ", shell_quote(PINNED_ROOT_COMMAND_GUARD));
-    let payload = if let Some(command) = payload.strip_prefix(&legacy) {
+    let current = format!("{} bash ", shell_quote(pinned_root_guard(step)));
+    let payload = if let Some(command) = payload
+        .strip_prefix(&legacy)
+        .filter(|_| is_pinned_root_guard(step, LEGACY_PINNED_ROOT_COMMAND_GUARD))
+    {
         format!("{current}{command}")
     } else if payload.starts_with(&current) {
         payload.to_owned()
@@ -542,10 +566,48 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
         })
         .map(Step::tag)
         .collect::<BTreeSet<_>>();
-    if split.len() != 16 {
+    let original_roots = [
+        "app_strict_verify",
+        "applications_e2e",
+        "arbitrary_binaries",
+        "command_strict_verify",
+        "dbt_parity",
+        "detcore_misc",
+        "detcore_parallel",
+        "detcore_unit",
+        "envelope_levels",
+        "hermit_integration",
+        "hermit_unit",
+        "ignored_syscall_regressions",
+        "liteinst_strict",
+        "regular_crates",
+        "rr_suite_contract",
+        "sabre_examples",
+    ]
+    .map(|job| format!("test.{job}"))
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let compat_roots = cfg
+        .steps
+        .iter()
+        .filter(|step| generated_partition(step) == Some(GeneratedPartition::PortableCompat))
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
+    if compat_roots.len() != 190
+        || !compat_roots.contains("compatprep.fixtures")
+        || !original_roots.is_disjoint(&compat_roots)
+    {
+        return Err(
+            "default compatibility roots must retain their fixture and all 189 commands".into(),
+        );
+    }
+    let expected_roots = original_roots
+        .union(&compat_roots)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if split != expected_roots {
         return Err(format!(
-            "hosted test split has {} roots, expected 16",
-            split.len()
+            "hosted test split must retain the original 16 plus 190 compatibility roots: expected={expected_roots:?}, actual={split:?}"
         ));
     }
     loop {
@@ -688,9 +750,18 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
         step.deps.sort();
         step.deps.dedup();
         if !step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
+            if step.tag() == "compatprep.fixtures" {
+                let fixture = "./tests/compat/prepare_real_compat_fixtures.sh $VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures";
+                if !step.cmd.ends_with(fixture) || step.cmd.matches(fixture).count() != 1 {
+                    return Err(
+                        "default compatibility fixture lost its exact preparation command".into(),
+                    );
+                }
+                step.cmd.push_str(" --pinned-toolchain");
+            }
             step.cmd = pinned_root_command(step);
         } else {
-            step.cmd = refresh_pinned_root_environment(&step.tag(), &step.cmd)?;
+            step.cmd = refresh_pinned_root_environment(step)?;
         }
     }
 
@@ -2036,8 +2107,12 @@ mod tests {
         }
         fs::write(
             root.join("guards.json"),
-            serde_json::to_vec(&[PINNED_ROOT_COMMAND_GUARD, LEGACY_PINNED_ROOT_COMMAND_GUARD])
-                .unwrap(),
+            serde_json::to_vec(&[
+                PINNED_ROOT_COMMAND_GUARD,
+                LEGACY_PINNED_ROOT_COMMAND_GUARD,
+                PINNED_ROOT_COMPAT_COMMAND_GUARD,
+            ])
+            .unwrap(),
         )
         .unwrap();
         write_executable(
@@ -2112,6 +2187,7 @@ sys.exit(37)
             )
             .env("LC_ALL", "C")
             .env("WRAPPER_TEST_ROOT", root)
+            .env("VALIDATE_RUN_STATE", root.join("run-state"))
             .env("NEXTEST_TEST_THREADS", "99");
         if let Some((name, value)) = env_with_inner_jobs(&command_step, "", Some(width)) {
             command.env(name, value);
@@ -2171,7 +2247,11 @@ sys.exit(37)
         step.cmd = original.map(shell_quote).join(" ");
         step.jobs_flag = Some(format!("--jobs %d {}", literal.map(shell_quote).join(" ")));
         step.jobs_env = Some(String::new());
-        for width in [1, 3] {
+        for (default_compat, width) in [(false, 1), (false, 3), (true, 1), (true, 3)] {
+            if default_compat {
+                step.group = "compat".into();
+                step.labels = vec!["portable".into(), "full".into()];
+            }
             let plain = renderer_wrapper_capture(&step, width, false);
             let wrapped = renderer_wrapper_capture(&step, width, true);
             let expected = original
@@ -2228,6 +2308,297 @@ sys.exit(37)
             .arg(script)
             .output()
             .expect("run the actual wrapper with the recorded Podman fixture");
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn default_compat_image_rows_preserve_host_payloads_and_all_policy_fields() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let default = committed
+            .steps
+            .iter()
+            .filter(|step| step.group == "compat" && step.labels.iter().any(|v| v == "portable"))
+            .collect::<Vec<_>>();
+        assert_eq!(default.len(), 189);
+        let hosted = committed
+            .steps
+            .iter()
+            .filter(|step| step.group == "compat" && step.labels == [HOSTED_PORTABLE_LABEL])
+            .map(|step| (step.tag(), step))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(hosted.len(), 189);
+        let policy = |step: &Step| {
+            let graph: serde_json::Value =
+                serde_json::from_str(&dag_to_json(&committed.with_steps(vec![step.clone()])))
+                    .unwrap();
+            let mut value = graph["steps"][0].clone();
+            let object = value.as_object_mut().unwrap();
+            for field in ["cmd", "deps", "labels", "job", "fail_fast_family"] {
+                object.remove(field);
+            }
+            object
+                .get_mut("env")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove("HERMIT_E2E_EMPTY_WORKDIR");
+            value
+        };
+        for step in default {
+            let host = hosted[&format!("{}_on_host", step.tag())];
+            assert!(step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh "));
+            assert_eq!(
+                crate::nextest_build_selections::execution_command(step).unwrap(),
+                host.cmd
+            );
+            assert_eq!(
+                policy(step),
+                policy(host),
+                "policy changed for {}",
+                step.tag()
+            );
+            assert_eq!(step.fail_fast_family.as_deref(), Some(step.tag().as_str()));
+            assert_eq!(host.fail_fast_family.as_deref(), Some(host.tag().as_str()));
+            assert_eq!(
+                step.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str),
+                Some("/test")
+            );
+            assert!(host.cmd.contains("--base-env=minimal"));
+            assert!(
+                host.cmd
+                    .contains("--mount=type=tmpfs,target=/test --workdir=/test")
+            );
+            let mut dependencies = host
+                .deps
+                .iter()
+                .map(|tag| {
+                    tag.strip_suffix(HOSTED_VARIANT_SUFFIX)
+                        .unwrap_or(tag)
+                        .to_owned()
+                })
+                .collect::<BTreeSet<_>>();
+            dependencies.extend([
+                "build.rust_scripts_in_pinned_root".into(),
+                PINNED_ROOT_FETCH_TAG.into(),
+            ]);
+            assert_eq!(
+                step.deps.iter().cloned().collect::<BTreeSet<_>>(),
+                dependencies
+            );
+            assert_eq!(refresh_pinned_root_environment(step).unwrap(), step.cmd);
+        }
+        let fixture = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == "compatprep.fixtures")
+            .unwrap();
+        let payload = crate::nextest_build_selections::execution_command(fixture).unwrap();
+        assert!(payload.ends_with("real-compat-fixtures --pinned-toolchain"));
+        assert!(
+            fixture
+                .deps
+                .iter()
+                .any(|v| v == "build.runtime_release_in_pinned_root")
+        );
+        let super_rows = committed
+            .steps
+            .iter()
+            .filter(|step| generated_partition(step) == Some(GeneratedPartition::SuperCompat))
+            .collect::<Vec<_>>();
+        assert!(!super_rows.is_empty());
+        assert!(
+            super_rows
+                .iter()
+                .all(|step| !runs_in_pinned_root(step)
+                    && !step.cmd.contains("run-in-pinned-root.sh"))
+        );
+    }
+
+    #[test]
+    fn mixed_default_and_hosted_compat_state_does_not_collide() {
+        // Run the actual shell guard/state assignment with only the two image
+        // preflights replaced by inert commands. This is a local control, not
+        // an image, mount-namespace, Hermit, or guest-environment execution.
+        let script = r###"
+import json, os, pathlib, subprocess, sys, tempfile, time
+ordinary, image = sys.argv[1:]
+def local_guard(guard):
+    for name in ('assert-no-network.sh', 'assert-build-dependencies.sh'):
+        original = '/src/ci/hermetic/' + name
+        assert guard.count(original) == 1
+        guard = guard.replace(original, '/bin/true')
+    return guard
+payload = '''set -euo pipefail
+directory="$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures"
+mkdir -p "$directory"
+touch "$CONTROL/$ROLE-started"
+while [ ! -e "$CONTROL/$ROLE-write" ]; do sleep 0.01; done
+printf '%s' "$ROLE" > "$directory/marker"
+printf '%s' "$directory" > "$CONTROL/$ROLE-path"
+touch "$CONTROL/$ROLE-ready"
+while [ ! -e "$CONTROL/release" ]; do sleep 0.01; done
+test "$(cat "$directory/marker")" = "$ROLE"
+'''
+def run_pair(image_guard):
+    with tempfile.TemporaryDirectory(prefix='compat-state-control-') as temporary:
+        root = pathlib.Path(temporary); state = root/'state'; control = root/'control'
+        control.mkdir(); children = []
+        try:
+            for role, guard in [('host', ordinary), ('image', image_guard)]:
+                env = {'PATH':'/usr/bin:/bin', 'VALIDATE_RUN_STATE':str(state),
+                       'CONTROL':str(control), 'ROLE':role}
+                children.append(subprocess.Popen(['bash','-c',local_guard(guard),'bash',payload],
+                    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+            deadline = time.monotonic()+5
+            def await_files(names):
+                while not all((control/name).exists() for name in names):
+                    assert time.monotonic()<deadline, 'marker workers must reach the ordered barriers'
+                    assert all(child.poll() is None for child in children)
+                    time.sleep(.01)
+            await_files(['host-started','image-started'])
+            # Both workers are live, but ordered writes avoid a partial shared
+            # marker such as "hoste" in the intentionally broken control.
+            for role in ('host','image'):
+                (control/(role+'-write')).touch()
+                await_files([role+'-ready'])
+            host = pathlib.Path((control/'host-path').read_text())
+            image_path = pathlib.Path((control/'image-path').read_text())
+            assert host == state/'strict-compat/real-compat-fixtures'
+            disjoint = image_path == state/'pinned-default-compat/strict-compat/real-compat-fixtures'
+            (control/'release').touch()
+            outputs = [child.communicate(timeout=5) for child in children]
+            codes = [child.returncode for child in children]
+            if disjoint:
+                assert codes == [0,0], (codes, outputs)
+                assert [path.joinpath('marker').read_text() for path in (host,image_path)] == ['host','image']
+                marker=host/'marker'; before=(marker.stat().st_ino,marker.stat().st_mtime_ns,marker.read_bytes())
+                # Recreating only the image fixture cannot destroy hosted input.
+                import shutil
+                shutil.rmtree(image_path); image_path.mkdir(); (image_path/'marker').write_text('image-new')
+                assert (marker.stat().st_ino,marker.stat().st_mtime_ns,marker.read_bytes()) == before
+            else:
+                assert image_path == host
+                assert (host/'marker').read_bytes() == b'image'
+                assert codes == [1,0], (codes,outputs)
+            return disjoint
+        finally:
+            (control/'release').touch(exist_ok=True)
+            for child in children:
+                if child.poll() is None: child.kill()
+                child.communicate(timeout=5)
+assert run_pair(image), 'image and host state must be disjoint'
+assert not run_pair(ordinary), 'restoring the original shared state must fail the collision control'
+print('mixed-selection state control: disjoint new paths; original shared-state control collided')
+"###;
+        let output = Command::new("timeout")
+            .args([
+                "--kill-after=1s",
+                "20s",
+                "python3",
+                "-c",
+                script,
+                PINNED_ROOT_COMMAND_GUARD,
+                PINNED_ROOT_COMPAT_COMMAND_GUARD,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn compat_fixture_toolchain_mode_is_explicit_and_refuses_fallback() {
+        // Execute the real parser and symlink setup. The first compiler is an
+        // exit-77 sentinel, so these controls do not compile or run a workload.
+        let script = r###"
+import os, pathlib, subprocess, sys, tempfile
+repository = pathlib.Path(sys.argv[1])
+source = repository/'tests/compat/prepare_real_compat_fixtures.sh'
+with tempfile.TemporaryDirectory(prefix='compat-toolchain-control-') as temporary:
+    root = pathlib.Path(temporary); tools = root/'tools'; tools.mkdir()
+    def executable(path, text):
+        path.write_text(text); path.chmod(0o755)
+    executable(tools/'readlink', '''#!/bin/bash
+set -euo pipefail
+printf 'readlink:%s:%s:%s\\n' "$1" "$2" "$3" >> "$CAPTURE"
+test "$#" = 3 && test "$1" = -f && test "$2" = --
+case "$3" in
+  /bin/cargo) printf '%s\\n' "$PINNED_CARGO" ;;
+  /bin/rustc) printf '%s\\n' "$PINNED_RUSTC" ;;
+  *) exit 91 ;;
+esac
+''')
+    executable(tools/'rustup', '''#!/bin/bash
+set -euo pipefail
+printf 'rustup:%s:%s\\n' "$1" "$2" >> "$CAPTURE"
+test "$#" = 2 && test "$1" = which
+case "$2" in
+  cargo) printf '%s\\n' "$HOST_CARGO" ;;
+  rustc) printf '%s\\n' "$HOST_RUSTC" ;;
+  *) exit 92 ;;
+esac
+''')
+    executable(tools/'gcc', '#!/bin/bash\nprintf "compiler-reached\\n" >> "$CAPTURE"\nexit 77\n')
+    targets = {}
+    for role in ('pinned', 'host'):
+        directory = root/role; directory.mkdir()
+        for tool in ('cargo','rustc'):
+            target = directory/tool; executable(target, '#!/bin/bash\nexit 93\n')
+            targets[(role,tool)] = target
+    cases = [('host',[],77), ('pinned',['--pinned-toolchain'],77),
+             ('unknown',['--unknown'],2), ('extra',['--pinned-toolchain','extra'],2)]
+    for tool in ('cargo','rustc'):
+        cases.extend((f'{kind}-{tool}', ['--pinned-toolchain'], 2)
+                     for kind in ('missing','non-executable','rustup-proxy'))
+    for name, flags, expected in cases:
+        case = root/('case-'+name); case.mkdir(); fixture = case/'fixture'; fixture.mkdir()
+        sentinel = fixture/'existing-input'; sentinel.write_bytes(b'preserve-on-refusal')
+        before = (sentinel.stat().st_ino, sentinel.stat().st_mtime_ns, sentinel.read_bytes())
+        capture = case/'capture'
+        env = {'PATH':str(tools)+':/usr/bin:/bin', 'CAPTURE':str(capture),
+               'HOST_CARGO':str(targets[('host','cargo')]), 'HOST_RUSTC':str(targets[('host','rustc')]),
+               'PINNED_CARGO':str(targets[('pinned','cargo')]), 'PINNED_RUSTC':str(targets[('pinned','rustc')])}
+        for tool in ('cargo','rustc'):
+            if name.endswith('-'+tool):
+                kind = name[:-(len(tool)+1)]
+                target = case/('rustup' if kind == 'rustup-proxy' else tool)
+                if kind != 'missing':
+                    executable(target, '#!/bin/bash\nexit 94\n')
+                    if kind == 'non-executable': target.chmod(0o644)
+                env['PINNED_'+tool.upper()] = str(target)
+        result = subprocess.run(['/bin/bash',str(source),str(fixture),*flags], cwd=repository,
+                                env=env, capture_output=True, timeout=5)
+        assert result.returncode == expected, (name,result.returncode,result.stdout,result.stderr)
+        calls = capture.read_text().splitlines() if capture.exists() else []
+        if expected == 77:
+            assert not sentinel.exists(), name
+            role = 'host' if name == 'host' else 'pinned'
+            assert [os.readlink(fixture/'toolchain'/tool) for tool in ('cargo','rustc')] == [
+                str(targets[(role,tool)]) for tool in ('cargo','rustc')]
+            expected_calls = (['rustup:which:cargo','rustup:which:rustc'] if role == 'host' else
+                              ['readlink:-f:--:/bin/cargo','readlink:-f:--:/bin/rustc'])
+            assert calls == expected_calls+['compiler-reached'], (name,calls)
+        else:
+            assert (sentinel.stat().st_ino,sentinel.stat().st_mtime_ns,sentinel.read_bytes()) == before, name
+            assert 'compiler-reached' not in calls and not any(v.startswith('rustup:') for v in calls), (name,calls)
+    empty = subprocess.run(['/bin/bash',str(source)], cwd=repository, capture_output=True, timeout=5)
+    assert empty.returncode == 2
+print('fixture mode controls: host selection, pinned selection, and nine refusal cases')
+"###;
+        let output = Command::new("timeout")
+            .args(["--kill-after=1s", "20s", "python3", "-c", script])
+            .arg(repo_root().unwrap())
+            .output()
+            .unwrap();
         assert!(
             output.status.success(),
             "{}{}",
