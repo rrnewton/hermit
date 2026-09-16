@@ -129,21 +129,82 @@ fn first_run_rejected_report(
     report
 }
 
+/// Where the private run summaries below are written.
+///
+/// Hermit's isolated /tmp is not the host /tmp, so these cannot go to the
+/// default temporary directory: they must live on a path BOTH run containers
+/// can see, which is why they were written into the checkout in the first
+/// place. That part of the original reasoning is correct and is preserved.
+///
+/// ⚠️ WHAT WAS WRONG WITH THE CHECKOUT ROOT, measured on hermit main
+/// ba3bfc97671666ae946841804624e7a2c355a0e4 in validate run 1819. Prepared
+/// source identity enumerates untracked, non-ignored files:
+///
+///     git ls-files --others --exclude-standard -z
+///
+/// (`ci/manifest-plan/src/nextest_binaries.rs` source_identity, and the
+/// byte-identical enumeration in `ci/prepare-rust-scripts.sh` write_state).
+/// A summary here IS such a file, so creating one and dropping it on the same
+/// run changes the identity, and dropping it between enumeration and hashing
+/// makes it vanish mid-read. Both were observed: 13 nodes refused with
+/// "prepared executables are stale: source identity changed", 6 with "cannot
+/// inspect prepared input <path>: No such file or directory", and one with
+/// "sha256sum: .hermit-verify-summary-...: No such file or directory". That is
+/// 20 of the run's 26 failed nodes, none of which had run a single test.
+///
+/// ⚠️ THE FIX MOVES THE FILE; IT DOES NOT EXCUSE THE NAME. Adding
+/// `.hermit-verify-summary-*` to .gitignore would also satisfy the enumeration,
+/// and it is the wrong repair: `scripts/validate.rs` checkout_attribution_bracket
+/// exists because run 1573 leaked these same files, and its stated property is
+/// "No pathname is excused". Excusing the name would hide a genuine leak
+/// anywhere in the tree -- and that bracket builds its own repository under a
+/// temporary directory, so it would never have read this repo's .gitignore and
+/// would not have caught the weakening.
+///
+/// `ignored/` is the existing directory for exactly this. Its .gitignore entry
+/// reads "Everything under ignored/ is disposable and must not taint source
+/// provenance or the version string." Using it adds no new ignore rule, and a
+/// stray summary left anywhere else is still caught -- verified both ways.
+fn private_summary_dir() -> Result<PathBuf, Error> {
+    let cwd = std::env::current_dir()?;
+    // The enumeration is rooted at the work tree, not at the process cwd, so a
+    // summary in ANY tracked subdirectory still trips it. Resolve the work-tree
+    // root rather than assuming this runs from it.
+    let mut root = cwd.as_path();
+    loop {
+        if root.join(".git").exists() {
+            let disposable = root.join("ignored");
+            // Fail soft: outside a work tree, or when this cannot be created,
+            // fall back to the previous behaviour. Nothing computes prepared
+            // source identity there, so the collision cannot arise.
+            if std::fs::create_dir_all(&disposable).is_ok() {
+                return Ok(disposable);
+            }
+            break;
+        }
+        match root.parent() {
+            Some(parent) => root = parent,
+            None => break,
+        }
+    }
+    Ok(cwd)
+}
+
 fn private_verify_summary() -> Result<tempfile::NamedTempFile, Error> {
     tempfile::Builder::new()
         .prefix(".hermit-verify-summary-")
-        // Hermit's isolated /tmp is not the host /tmp. The checkout is visible
-        // to both run containers, and the temporary file is removed on drop.
-        .tempfile_in(std::env::current_dir()?)
+        // See private_summary_dir: visible to both run containers, and outside
+        // prepared source identity. Removed on drop.
+        .tempfile_in(private_summary_dir()?)
         .context("creating private verification run summary")
 }
 
 fn private_backend_engagement_summary() -> Result<tempfile::NamedTempFile, Error> {
     tempfile::Builder::new()
         .prefix(".hermit-backend-engagement-summary-")
-        // Hermit's isolated /tmp is not the host /tmp. The checkout is visible
-        // to the run container, and the temporary file is removed on drop.
-        .tempfile_in(std::env::current_dir()?)
+        // See private_summary_dir: visible to the run container, and outside
+        // prepared source identity. Removed on drop.
+        .tempfile_in(private_summary_dir()?)
         .context("creating private backend-engagement run summary")
 }
 
