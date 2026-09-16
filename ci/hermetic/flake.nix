@@ -150,7 +150,10 @@
 
       # The CLI replay tests run GDB outside Hermit and execute Python commands.
       # Keep this test driver separate from guest and compiler dependencies.
-      testTools = [ (pkgs.gdb.override { pythonSupport = true; }) ];
+      testTools = [
+        (pkgs.gdb.override { pythonSupport = true; })
+        pkgs.strace
+      ];
 
       # Native libraries need both their runtime and development outputs. A Nix
       # image does not populate FHS search paths, so the environment below makes

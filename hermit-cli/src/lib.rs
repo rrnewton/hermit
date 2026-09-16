@@ -4420,6 +4420,351 @@ mod tests {
         assert_eq!(status, super::ExitStatus::Exited(0));
     }
 
+    #[cfg(feature = "dbt")]
+    const DBT_FILE_TRACE_HELPER: &str = r#"# This single-purpose child process owns the tracer; the Cargo/libtest parent
+# never becomes a subreaper and never enumerates or reaps another test's children.
+import ctypes
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+DIRECTORY = Path(sys.argv[1])
+EXECUTABLE = Path(sys.argv[2]).resolve(strict=True)
+TEST = "tests::dbt_public_status_dispatch_runs_true_through_detcore"
+CAP = 1024 * 1024
+STARTED = time.monotonic()
+LIBC = ctypes.CDLL(None, use_errno=True)
+STOP = None
+
+
+def private_file(name):
+    fd = os.open(DIRECTORY / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+    return os.fdopen(fd, "wb")
+
+
+def save(name, value):
+    with private_file(name) as stream:
+        stream.write((json.dumps(value, indent=2) + "\n").encode())
+
+
+def identity(path):
+    metadata = path.stat()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return {"path": str(path), "device": metadata.st_dev, "inode": metadata.st_ino,
+            "size": metadata.st_size, "sha256": digest.hexdigest()}
+
+
+def stop_requested(signum, _frame):
+    global STOP
+    if STOP is None:
+        STOP = "helper received signal " + str(signum)
+
+
+def initial_environment(data):
+    # CPython can change LC_CTYPE at startup. Forward the original exec bytes,
+    # not its mutated os.environ; never persist an environment/credential dump.
+    if data and not data.endswith(b"\0"):
+        raise RuntimeError("initial environment lacks its terminating NUL")
+    result = {}
+    for row in data[:-1].split(b"\0") if data else []:
+        key, separator, value = row.partition(b"=")
+        if not separator or not key or key in result:
+            raise RuntimeError("malformed or duplicate initial environment entry")
+        result[key] = value
+    return result
+
+
+def tracer_parent_link():
+    # The helper is single-threaded when Popen forks. Close parent-death's
+    # before-arming race before exec, without changing the traced environment.
+    if LIBC.prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != HELPER_PID:
+        os._exit(125)
+
+
+metadata = DIRECTORY.lstat()
+if not DIRECTORY.is_absolute() or not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o700 or metadata.st_uid != os.geteuid():
+    raise RuntimeError("diagnostic directory must be an absolute private directory")
+if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+    raise RuntimeError("diagnostic requires pidfd support before tracer launch")
+tracer_name = shutil.which("strace")
+if tracer_name is None:
+    raise RuntimeError("pinned image lacks strace; no host fallback")
+TRACER = Path(tracer_name).resolve(strict=True)
+TRACED_ENVIRONMENT = initial_environment(Path("/proc/self/environ").read_bytes())
+HELPER_PID = os.getpid()
+death_signal = ctypes.c_int()
+if LIBC.prctl(2, ctypes.byref(death_signal), 0, 0, 0) != 0 or death_signal.value != signal.SIGKILL:
+    raise RuntimeError("helper lacks its outer-parent-death SIGKILL link")
+if LIBC.prctl(36, 1, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), "cannot make the dedicated helper a subreaper")
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
+    signal.signal(sig, stop_requested)
+save("input.json", {"schema": 1, "helper_pid": HELPER_PID,
+    "helper_stat": Path("/proc/self/stat").read_text(), "helper_parent": os.getppid(),
+    "tracer": identity(TRACER), "test_binary": identity(EXECUTABLE), "test": TEST,
+    "tracer_environment_source": "initial /proc/self/environ bytes; never persisted",
+    "observation_seconds": 40, "cleanup_seconds_from_start": 47, "stream_cap_bytes": CAP})
+
+trace_read, trace_write = os.pipe2(os.O_CLOEXEC)
+argv = [str(TRACER), "-f", "--kill-on-exit", "-yy", "-s4096",
+        "-e", "trace=%file,%process,mmap,munmap,close", "-o", f"/proc/self/fd/{trace_write}",
+        "--", str(EXECUTABLE), "--exact", TEST, "--nocapture"]
+child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         pass_fds=(trace_write,), preexec_fn=tracer_parent_link, env=TRACED_ENVIRONMENT)
+os.close(trace_write)
+pidfd = None
+streams = {}
+selector = selectors.DefaultSelector()
+counts = {}
+tracer_status = None
+reaped = []
+no_children = False
+try:
+    pidfd = os.pidfd_open(child.pid)
+    save("tracer.json", {"argv": argv, "pid": child.pid,
+        "stat": Path(f"/proc/{child.pid}/stat").read_text()})
+    for pipe, name in [(child.stdout, "nested.stdout"), (child.stderr, "nested.stderr"),
+                       (os.fdopen(trace_read, "rb", buffering=0), "trace.log")]:
+        os.set_blocking(pipe.fileno(), False)
+        selector.register(pipe, selectors.EVENT_READ, name)
+        streams[name] = private_file(name)
+        counts[name] = {"retained": 0, "observed": 0, "overflow": False}
+    killed = False
+    while selector.get_map() or child.poll() is None:
+        elapsed = time.monotonic() - STARTED
+        if STOP is None and elapsed >= 40:
+            STOP = "observation deadline"
+        if STOP is not None and not killed:
+            try:
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            killed = True
+        if elapsed >= 47:
+            if STOP is None:
+                STOP = "cleanup deadline"
+            break
+        for key, _event in selector.select(0.05):
+            block = os.read(key.fd, 65536)
+            if not block:
+                selector.unregister(key.fileobj)
+                key.fileobj.close()
+                continue
+            row = counts[key.data]
+            row["observed"] += len(block)
+            keep = block[:max(0, CAP - row["retained"])]
+            streams[key.data].write(keep)
+            row["retained"] += len(keep)
+            if len(keep) != len(block):
+                row["overflow"] = True
+                if STOP is None:
+                    STOP = key.data + " exceeds byte cap"
+    tracer_status = child.poll()
+finally:
+    # Also cover I/O/readback errors. This signals only our direct tracer.
+    # EXITKILL and the parent-death link cover its tracees, not a guessed PGID.
+    if child.poll() is None:
+        if pidfd is None:
+            child.kill()  # Direct unreaped Child; no PID/name discovery.
+        else:
+            try:
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    try:
+        tracer_status = child.wait(timeout=max(0.01, 47 - (time.monotonic() - STARTED)))
+    except subprocess.TimeoutExpired:
+        STOP = STOP or "tracer termination unconfirmed"
+    if pidfd is not None:
+        os.close(pidfd)
+    for stream in streams.values():
+        stream.flush()
+        os.fsync(stream.fileno())
+        stream.close()
+    for key in list(selector.get_map().values()):
+        key.fileobj.close()
+    selector.close()
+    # Never steal Popen's own child status; waitpid(-1) is confined to this
+    # separately spawned helper, after its direct tracer was actually reaped.
+    if tracer_status is not None:
+        while time.monotonic() - STARTED < 47:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                no_children = True
+                break
+            if pid:
+                reaped.append({"pid": pid, "wait_status": status})
+            else:
+                time.sleep(0.01)  # Zero is live/unknown, never an empty family.
+
+trace = (DIRECTORY / "trace.log").read_text()
+root_pid = None
+root_outcome = None
+terminal_rows = []
+successful_execve = []
+pending_execve = {}
+for line_number, line in enumerate(trace.splitlines(), 1):
+    # Only a successful, complete execve is execution evidence. Keep both line
+    # numbers for strace's unfinished/resumed form; an open or failed exec is not.
+    call = re.match(r'^(\d+)\s+execve\(("(?:[^"\\]|\\.)*"),', line)
+    if call:
+        entry = {"pid": int(call[1]), "path": json.loads(call[2]), "entry_line": line_number}
+        if line.endswith("<unfinished ...>"):
+            pending_execve[entry["pid"]] = entry
+        elif line.endswith(" = 0"):
+            successful_execve.append(dict(entry, completion_line=line_number))
+    resumed = re.match(r"^(\d+)\s+<\.\.\. execve resumed>", line)
+    if resumed:
+        entry = pending_execve.pop(int(resumed[1]), None)
+        if entry is not None and line.endswith(" = 0"):
+            successful_execve.append(dict(entry, completion_line=line_number))
+    entered = re.match(r"^(\d+)\s+execve\(", line)
+    if root_pid is None and entered and ("execve(" + json.dumps(str(EXECUTABLE)) + ",") in line:
+        root_pid = int(entered[1])
+    exited = re.match(r"^(\d+)\s+\+\+\+ exited with (\d+) \+\+\+$", line)
+    killed = re.match(r"^(\d+)\s+\+\+\+ killed by (SIG[A-Z0-9]+)(?: .*?)? \+\+\+$", line)
+    if exited or killed:
+        match = exited or killed
+        row = {"pid": int(match[1]), "kind": "exit" if exited else "signal", "value": match[2]}
+        terminal_rows.append(row)
+        if row["pid"] == root_pid:
+            root_outcome = row
+complete = STOP is None and no_children and not any(r["overflow"] for r in counts.values())
+passed = complete and tracer_status == 0 and root_outcome == {"pid": root_pid, "kind": "exit", "value": "0"}
+result = {"schema": 1, "tracer_status": tracer_status, "root_pid": root_pid,
+    "root_outcome": root_outcome, "trace_terminal_rows": terminal_rows, "successful_execve": successful_execve, "streams": counts,
+    "stop_reason": STOP, "all_helper_children_reaped": no_children, "adopted_reaped": reaped,
+    "elapsed_seconds": time.monotonic() - STARTED, "traced_command_succeeded": passed}
+save("result.json", result)
+print(json.dumps({"diagnostic": str(DIRECTORY), "tracer_status": tracer_status,
+                  "root_outcome": root_outcome, "all_children_reaped": no_children}), flush=True)
+sys.exit(0 if passed else 1)
+"#;
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_private_loader_observes_existing_true_dispatch() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::process::CommandExt;
+
+        let executable = std::env::current_exe()
+            .expect("find the actual library test executable")
+            .canonicalize()
+            .expect("resolve the actual library test executable");
+        // Keep evidence beside the actual test artifact: /src/target is an
+        // owned persistent output mount in the official pinned-root runner.
+        let directory = tempfile::Builder::new()
+            .prefix("hermit-dbt-file-trace-")
+            .tempdir_in(executable.parent().expect("test executable has a parent"))
+            .expect("create private retained diagnostic directory")
+            .keep();
+        let helper = directory.join("helper.py");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&helper)
+            .expect("create the dedicated helper source")
+            .write_all(DBT_FILE_TRACE_HELPER.as_bytes())
+            .expect("write the dedicated helper source");
+        eprintln!("DBT file trace retained at {}", directory.display());
+        Backend::Dbt.ensure_available().expect(
+            "diagnostic requires DBT; the unchanged nested test may otherwise return early",
+        );
+        // Match prepare_native_client's packaged/bundled selection without
+        // preparing another client or changing the nested test's environment.
+        let runtime = hermit_resources::resource("dynamorio/lib64/release/libdynamorio.so")
+            .expect("resolve the selected installation")
+            .unwrap_or_else(|| {
+                reverie_dbt::bundled_dynamorio_cmake_dir()
+                    .parent()
+                    .expect("bundled CMake directory has its install parent")
+                    .join("lib64/release/libdynamorio.so")
+            })
+            .canonicalize()
+            .expect("resolve the selected DynamoRIO release runtime");
+        let parent = std::process::id() as libc::pid_t;
+        let mut command = std::process::Command::new("python3");
+        command
+            .args(["-I", "-B"])
+            .arg(helper)
+            .arg(&directory)
+            .arg(executable);
+        // SAFETY: these child-side syscalls run before exec. No process-wide
+        // state in Cargo/libtest changes. Recheck closes death-before-arming.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+        let status = command.status().expect("run the dedicated strace helper");
+        let result: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.join("result.json")).expect("read the real tracer result"),
+        )
+        .expect("parse the real tracer result");
+        let runtime_execs: Vec<_> = result["successful_execve"]
+            .as_array()
+            .expect("tracer result must contain observed successful execve rows")
+            .iter()
+            .filter(|row| {
+                row["path"].as_str().is_some_and(|path| {
+                    Path::new(path)
+                        .canonicalize()
+                        .is_ok_and(|path| path == runtime)
+                })
+            })
+            .collect();
+        // This proves a successful exec of the selected runtime path. It does
+        // not prove the private loader's dependent/search-set call chain.
+        let observation = serde_json::json!({
+            "selected_dynamorio_runtime": runtime,
+            "successful_runtime_execve": runtime_execs,
+            "traced_command_succeeded": result["traced_command_succeeded"],
+        });
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join("runtime-observation.json"))
+            .expect("create the runtime execution observation")
+            .write_all(
+                serde_json::to_string_pretty(&observation)
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .expect("retain the runtime execution observation");
+        assert!(
+            !runtime_execs.is_empty(),
+            "no successful exec of the selected DynamoRIO runtime; retained {}",
+            directory.display()
+        );
+        assert!(
+            status.success(),
+            "unchanged DBT true assertion or file observation failed ({status}); retained {}",
+            directory.display()
+        );
+    }
+
     #[test]
     fn kvm_runs_dynamic_echo_through_detcore() {
         use clap::Parser;
