@@ -316,6 +316,13 @@ pub struct CellArtifactResultV10 {
     pub backend: String,
     pub cell_verdict: CellVerdict,
     pub backend_parity: RequiredNullable<CellBackendParity>,
+    /// The attempt ordinal this row's verdict was read from.
+    ///
+    /// Recorded so the artifact verifier can RE-DERIVE the ledger row's
+    /// evidence binding independently instead of reading it back out of the
+    /// row it is supposed to be checking. Without it the digest-bound check
+    /// would compare the binding against itself and pass for any value.
+    pub selected_attempt: u64,
 }
 
 #[derive(Deserialize)]
@@ -328,6 +335,7 @@ struct CellArtifactResultV10Wire {
     backend: String,
     cell_verdict: CellVerdictV8,
     backend_parity: RequiredNullable<CellBackendParity>,
+    selected_attempt: u64,
 }
 
 impl<'de> Deserialize<'de> for CellArtifactResultV10 {
@@ -341,6 +349,7 @@ impl<'de> Deserialize<'de> for CellArtifactResultV10 {
             backend: value.backend,
             cell_verdict: value.cell_verdict.into(),
             backend_parity: value.backend_parity,
+            selected_attempt: value.selected_attempt,
         })
     }
 }
@@ -364,6 +373,12 @@ impl CellArtifactResultV10 {
             mode: self.mode.clone(),
             backend: self.backend.clone(),
             cell_verdict: self.cell_verdict.clone(),
+            // The per-cell ARTIFACT row carries no binding of its own; the
+            // ledger row does. Left explicitly unbound rather than
+            // reconstructed here, because a binding invented at a conversion
+            // boundary is exactly the inferred foreign key this field exists
+            // to replace.
+            evidence_binding: None,
         }
     }
 }
@@ -414,6 +429,11 @@ pub struct CellResultV10 {
     #[serde(deserialize_with = "deserialize_verdict")]
     pub cell_verdict: CellVerdict,
     pub backend_parity: RequiredNullable<CellBackendParitySummary>,
+    /// The exact series event this verdict's evidence was selected from. See
+    /// [`CellResult::evidence_binding`]: absent means the row predates the
+    /// binding and is UNBOUND, which a reader renders rather than infers past.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_binding: Option<CellEvidenceBinding>,
 }
 
 impl CellResultV10 {
@@ -435,6 +455,7 @@ impl CellResultV10 {
             mode: self.mode.clone(),
             backend: self.backend.clone(),
             cell_verdict: self.cell_verdict.clone(),
+            evidence_binding: self.evidence_binding.clone(),
         }
     }
 }
@@ -498,24 +519,55 @@ pub fn compact_cell_verdict(verdict: &CellVerdict) -> CellVerdict {
 }
 
 impl CellArtifactResultV10 {
-    pub fn summary(&self) -> Result<CellResultV10, String> {
+    /// Compact this artifact row into the terminal ledger record, binding a
+    /// COMPARED verdict to the exact attempt it was computed from.
+    ///
+    /// The coordinates are parameters rather than fields so that no caller can
+    /// produce a terminal record without stating which attempt it read. That
+    /// is the whole point: an unbound compared verdict is exactly the row this
+    /// work exists to stop being written.
+    pub fn summary(&self, run_id: &str, hermit_sha: &str) -> Result<CellResultV10, String> {
         let backend_parity = match &self.backend_parity {
             RequiredNullable::Null => RequiredNullable::Null,
             RequiredNullable::Value(parity) => {
                 if parity.candidate_verdict(&self.identity())? != self.cell_verdict {
                     return Err("schema 10 cell ordinary verdict differs from the selected candidate attempt".into());
                 }
+                // A parity row carries its whole attempt history, so the
+                // recorded ordinal is checkable rather than merely asserted.
+                if parity.candidate_attempt_number(&self.identity())? != self.selected_attempt {
+                    return Err(
+                        "schema 10 parity cell recorded an attempt its own history did not select"
+                            .into(),
+                    );
+                }
                 RequiredNullable::Value(parity.summary(&self.identity())?)
             }
         };
+        let cell_verdict = compact_cell_verdict(&self.cell_verdict);
+        // Only a compared verdict read an attempt. Binding a by-design or
+        // unavailable verdict would name an event that was never published.
+        let evidence_binding = matches!(
+            cell_verdict,
+            CellVerdict::ComparedAndMatched { .. } | CellVerdict::ComparedAndDiverged { .. }
+        )
+        .then(|| {
+            CellEvidenceBinding::for_validate_compared(
+                run_id,
+                &self.identity(),
+                hermit_sha,
+                self.selected_attempt,
+            )
+        });
         Ok(CellResultV10 {
             lane: self.lane.clone(),
             category: self.category.clone(),
             test: self.test.clone(),
             mode: self.mode.clone(),
             backend: self.backend.clone(),
-            cell_verdict: compact_cell_verdict(&self.cell_verdict),
+            cell_verdict,
             backend_parity,
+            evidence_binding,
         })
     }
 }
@@ -1203,16 +1255,29 @@ impl CellBackendParity {
         Ok(outcomes)
     }
 
-    pub fn candidate_verdict(&self, identity: &CellIdentity) -> Result<CellVerdict, String> {
+    /// The index of the attempt whose outcome the retry fold selected.
+    ///
+    /// Shared by the verdict and by the attempt ordinal a binding names, so the
+    /// two cannot drift apart and describe different attempts of the same cell.
+    fn selected_attempt_index(&self, identity: &CellIdentity) -> Result<usize, String> {
         let outcomes = self.outer_outcomes(identity)?;
         let selected = crate::runner::outcome_after_retries(outcomes.iter().copied())?;
-        let index = outcomes
+        outcomes
             .iter()
             .rposition(|(_, outcome)| *outcome == selected)
-            .ok_or("schema 10 parity history has no selected terminal outcome")?;
+            .ok_or_else(|| "schema 10 parity history has no selected terminal outcome".into())
+    }
+
+    pub fn candidate_verdict(&self, identity: &CellIdentity) -> Result<CellVerdict, String> {
+        let index = self.selected_attempt_index(identity)?;
         self.attempts[index]
             .candidate_attempt()
             .ordinary_verdict(&identity.backend, "1")
+    }
+
+    /// The attempt ordinal that [`Self::candidate_verdict`] read.
+    pub fn candidate_attempt_number(&self, identity: &CellIdentity) -> Result<u64, String> {
+        Ok(self.attempts[self.selected_attempt_index(identity)?].attempt())
     }
 
     pub fn observations(
@@ -1676,7 +1741,7 @@ impl CellResultsEvidenceV10 {
         }
         let summaries = cells
             .iter()
-            .map(CellArtifactResultV10::summary)
+            .map(|cell| cell.summary(&self.run_id, &self.hermit_sha))
             .collect::<Result<Vec<_>, _>>()?;
         if summaries != self.cells
             || cells.len() as u64 != self.recorded_count
