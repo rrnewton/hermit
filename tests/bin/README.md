@@ -92,9 +92,10 @@ precise futex model parks waiters in Detcore's own pool.
 ### Polling-mode diagnostic
 
 Polling mode observes the kernel's owner-death word update instead of relying
-on Detcore's precise waiter queue. It passes Stripped verification, not L2
-(ptrace backend, ERROR log level, `--debug-futex-mode polling`, no determinism
-relaxations):
+on Detcore's precise waiter queue. The historical attempt below passed
+Stripped verification, not L2 (ptrace backend, ERROR log level,
+`--debug-futex-mode polling`, no determinism relaxations). Its banner does not
+establish a result under the current canonical default:
 
 ```text
 $ timeout 20s target/release/hermit --log error run --strict --verify \

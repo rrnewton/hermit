@@ -77,7 +77,7 @@ for guest in "$state_guest" "$signal_guest" "$periodic_guest"; do
         tail -20 "$verify_output"
         exit 1
     fi
-    if ! "$VERIFICATION_REPORT_BIN" matched "$verify_report"; then
+    if ! "$VERIFICATION_REPORT_BIN" canonical-match "$verify_report"; then
         echo "FAIL: $(basename "$guest") typed verification report did not match"
         tail -20 "$verify_output"
         exit 1

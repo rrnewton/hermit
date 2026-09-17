@@ -1,14 +1,14 @@
 # Targeted determinism stress tests
 
-These scripts exercise the ptrace backend with Stripped verification, not L2.
-Every test case invokes the exact verifier path:
+These scripts exercise the ptrace backend with the default canonical INFO
+comparison. Every test case invokes the exact verifier path:
 
 ```text
 hermit --log info run --strict --verify -- PROGRAM [ARGS...]
 ```
 
-Canonical strictness reports `relaxations=none`. Stripped strictness records two
-stripped-prefix policy tokens: `real-wall-clock-prefix/v1` and
+Canonical strictness reports `relaxations=none`. Historical Stripped reports
+recorded two stripped-prefix policy tokens: `real-wall-clock-prefix/v1` and
 `unsafe-numeric-address-and-path-normalization/v1`; the latter erases numbers,
 addresses, and paths wholesale. The stress summary reports the comparison and
 its comparator relaxations exactly as Hermit emitted them. This is
@@ -27,10 +27,11 @@ tests/e2e/lib/determinism-stress/run.sh
 ```
 
 `DETERMINISM_STRESS_REPETITIONS=20` repeats every internal two-run comparison
-twenty times for repeated Stripped stress evidence. Repetition does not promote
-Stripped evidence to L4 because the underlying comparison is not L2. The
-default is one Stripped comparison so the full targeted matrix remains
-practical. Other controls are:
+twenty times. Each repetition needs its own valid comparison evidence; a
+repetition count or success marker alone does not establish L4. Historical
+Stripped results are not promoted by the default-policy change. The default is
+one canonical comparison so the full targeted matrix remains practical. Other
+controls are:
 
 ```text
 HERMIT_BIN                           release Hermit path
@@ -100,6 +101,7 @@ Cargo targets. Detcore's Rust test infrastructure provides
 `make_det_test_variants!` and direct `#[test]` cases for syscall semantics in
 `detcore/tests/{misc,time,...}`, including Jason White's historical lit-test
 and scheduler-affinity work. There is no generated one-test-per-syscall
-completeness manifest. This shell suite therefore adds explicit Stripped
-verification coverage at the CLI boundary rather than treating green unit
-tests as complete end-to-end syscall coverage. It does not establish L2.
+completeness manifest. This shell suite exercises the CLI verifier boundary;
+green unit tests are not complete end-to-end syscall coverage. Its marker-based
+acceptance and textual summaries alone do not establish a typed nonempty
+canonical verdict, and the policy change supplies no new measured result.

@@ -291,9 +291,7 @@ fn cell_verdict(row: &Value) -> Result<CellVerdict, String> {
         }
     }
     let classify = |(report, _, _): &(VerificationReport, ComparisonSpec, ComparedLogCounts)| {
-        let matched = report.verified
-            && report.verdict == VerificationVerdict::Matched
-            && report.bitwise_parity;
+        let matched = report.require_canonical_match().is_ok();
         let diverged = report.verdict == VerificationVerdict::Diverged && !report.bitwise_parity;
         (matched, diverged)
     };
@@ -1402,6 +1400,58 @@ mod tests {
         assert_eq!(verdict["state"], "unavailable-with-reason");
         assert!(verdict.get("comparison").is_none());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn matched_projection_rejects_unequal_counts_and_retains_sticky_divergence() {
+        let mut row = result_row(
+            "validate-counts",
+            "1818181818181818181818181818181818181818",
+        );
+        assert!(matches!(
+            cell_verdict(&row).unwrap(),
+            CellVerdict::ComparedAndMatched { .. }
+        ));
+        let mut contradictory: Value = serde_json::from_str(&report("matched", "info")).unwrap();
+        contradictory["compared_log_messages"]["right"] = Value::from(124);
+        replace_report(&mut row, &contradictory);
+        let CellVerdict::UnavailableWithReason { reason, .. } = cell_verdict(&row).unwrap() else {
+            panic!("a claimed 123/124 match became compared evidence");
+        };
+        assert_eq!(
+            reason,
+            "typed canonical report was neither a match nor a divergence"
+        );
+        let unequal_match = serde_json::to_string(&contradictory).unwrap();
+        let divergent = report("diverged", "info");
+        let matched = report("matched", "info");
+        for attempts in [
+            vec![attempt(&divergent)],
+            vec![attempt(&unequal_match), attempt(&divergent)],
+            vec![attempt(&divergent), attempt(&unequal_match)],
+            vec![attempt(&matched), attempt(&divergent)],
+            vec![attempt(&divergent), attempt(&matched)],
+        ] {
+            row["attempts"] = Value::Array(attempts);
+            let CellVerdict::ComparedAndDiverged {
+                comparison_tier,
+                bitwise_parity,
+                compared_log_messages: RequiredNullable::Value(counts),
+                ..
+            } = cell_verdict(&row).unwrap()
+            else {
+                panic!("the real unequal-count divergence was lost: {row}");
+            };
+            assert_eq!(comparison_tier, ComparisonTier::CanonicalBitwise);
+            assert!(!bitwise_parity);
+            assert_eq!(
+                counts,
+                ComparedLogCounts {
+                    left: 123,
+                    right: 124
+                }
+            );
+        }
     }
 
     #[test]

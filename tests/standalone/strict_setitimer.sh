@@ -99,7 +99,7 @@ strict_count="${strict_count:-<none>}"
 verify_report="$work/verify.json"
 verify_out="$("$hermit" run --strict --verify --verify-json "$verify_report" -- \
     "$guest" < /dev/null 2>&1 || true)"
-if "$VERIFICATION_REPORT_BIN" matched "$verify_report"; then
+if "$VERIFICATION_REPORT_BIN" canonical-match "$verify_report"; then
     deterministic=1
 else
     deterministic=0

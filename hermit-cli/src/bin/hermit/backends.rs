@@ -78,8 +78,6 @@ use super::verify::ComparisonOptions;
 #[cfg(feature = "dbt")]
 use super::verify::DbtCountedBranchComparison;
 #[cfg(feature = "dbt")]
-use super::verify::LogCompareStrictness;
-#[cfg(feature = "dbt")]
 use super::verify::Verdict;
 #[cfg(feature = "dbt")]
 use super::verify::VerificationOutcome;
@@ -707,11 +705,7 @@ fn dbt_evidence_log_level(
     requested: Option<LevelFilter>,
     diagnostic_full_trace: bool,
 ) -> DbtEvidenceLogLevel {
-    let level = verification_log_level(
-        requested,
-        LogCompareStrictness::Canonical,
-        diagnostic_full_trace,
-    );
+    let level = verification_log_level(requested, diagnostic_full_trace);
     if level >= LevelFilter::TRACE {
         DbtEvidenceLogLevel::Trace
     } else if level >= LevelFilter::DEBUG {
@@ -1199,7 +1193,6 @@ pub(super) fn run_dbt(
         },
         ComparisonOptions {
             verbose: verify_verbose,
-            strictness: LogCompareStrictness::Canonical,
             compare_logs: true,
             diagnostic_full_trace: verify_verbose,
             compare_io_buffers: config.detlog_io_buffers,
@@ -1778,7 +1771,6 @@ mod tests {
             }),
             guest_status: ExitStatus::Exited(guest_exit),
             comparison: ComparisonSpec::new(
-                LogCompareStrictness::Canonical,
                 true,
                 false,
                 true,

@@ -334,7 +334,7 @@ fi
 # not a new timing calibration or Hermit guest result.
 # CARRY TO c8f4ca9d (2026-09-17): the landed KVM failure-notification repair
 # https://github.com/rrnewton/reverie/pull/577 preserves the SDK recipe from
-# 30fee360: build.rs blob 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 and
+# 526c21cf: build.rs blob 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 and
 # DynamoRIO vendor tree 42dd83f76cef3e730c39d2313c11fdc78d12ae35 are identical.
 # Root Cargo.toml, rust-toolchain.toml and the third-party gitlink also match.
 # CMAKE remains the default cmake and CMAKE_GENERATOR remains unset, retaining

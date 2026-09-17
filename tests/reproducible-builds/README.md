@@ -9,15 +9,20 @@ The runner builds the timestamp-bearing leaf crate twice natively and twice
 under Hermit. Native object files differ because they embed host wall time.
 Hermit virtualizes that clock, so its two object files are byte-for-byte
 identical. It also runs the compiler command with `--strict --verify` to check
-status, output, and Stripped execution logs. That comparison removes selected
-numeric, address, path, and time fields; it is not an L2 comparison.
+status, output, and canonical INFO logs under the default policy. The runner
+retains `verify.json` beside the objects and requires the current typed reader's
+nonempty canonical match before accepting the verification command's status.
+The independent object-file comparison remains the artifact oracle.
 
 ```bash
-cargo build --release -p hermit --bin hermit
+cargo build --release -p hermit --bin hermit --bin verification-report
 with-proxy ./tests/reproducible-builds/run.sh
 ```
 
-Set `HERMIT_BIN` to test another Hermit binary. Generated objects remain under
+Set `HERMIT_BIN` to test another Hermit binary. The typed reader defaults to its
+sibling `verification-report`; use `VERIFICATION_REPORT_BIN` to select an
+already-built reader at another path. Missing readers are refused before the
+fixture builds. Generated objects remain under
 the fixture's ignored `target/reproducible-builds/` directory for inspection.
 
 ## Scope
@@ -25,9 +30,9 @@ the fixture's ignored `target/reproducible-builds/` directory for inspection.
 - Backend: ptrace (the default).
 - Hermit mode: strict, with no determinism relaxations.
 - Assurance: two independent L1 builds with a direct bitwise artifact check,
-  plus a Stripped `--strict --verify` run of the same compiler command. The
-  direct object-file comparison, not bare `--verify`, supplies the bitwise
-  artifact claim.
+  plus a default canonical `--strict --verify` invocation of the same compiler
+  command whose current typed report must satisfy canonical-match. The
+  direct object-file comparison supplies the bitwise artifact claim.
 - Artifact: an ELF object produced with `rustc --emit=obj`. Avoiding the linker
   keeps the example focused on the compile-time clock input.
 - Compiler: Hermit's pinned nightly with `-Z threads=1`, which keeps `rustc`

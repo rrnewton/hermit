@@ -24,23 +24,9 @@ pub struct UseCaseOptions {
     pub output_stderr: bool,
     pub verify_stdout: bool,
     pub verify_stderr: bool,
-    pub verify_detlog_syscalls: bool,
-    pub verify_detlog_syscall_results: bool,
-    pub verify_detlog_others: bool,
     pub verify_desync: bool,
-    pub verify_commits: bool,
     pub verify_exit_statuses: bool,
     pub verify_schedules: bool,
-    pub ignore_lines: Vec<String>,
-}
-
-impl UseCaseOptions {
-    fn should_log_diff(&self) -> bool {
-        self.verify_commits
-            || self.verify_detlog_others
-            || self.verify_detlog_syscalls
-            || self.verify_detlog_syscall_results
-    }
 }
 
 pub trait UseCase {
@@ -50,14 +36,9 @@ pub trait UseCase {
             output_stderr: true,
             verify_stdout: true,
             verify_stderr: true,
-            verify_detlog_syscalls: true,
-            verify_detlog_syscall_results: true,
-            verify_detlog_others: true,
-            verify_commits: true,
             verify_exit_statuses: true,
             verify_desync: true,
             verify_schedules: false,
-            ignore_lines: Vec::new(),
         }
     }
 

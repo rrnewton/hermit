@@ -11,12 +11,14 @@ generated TSV here. It does **not** touch the tracked
 publisher `compat-envelope/publish-scorecard.py`, whose exact invocation the
 runner prints at the end of the run.
 
-## Current ratchet
+## Recorded ratchets
 
 The L1 ratchet (`--strict`, run three times, byte-identical stdout) and the
-Stripped verification ratchet (`--strict --verify`, Hermit's double-run
-comparison after selected numeric, address, path, and time fields are stripped)
-are tracked separately. Stripped verification is not L2.
+historical Stripped verification ratchet are recorded separately below. The
+Stripped measurements used a double-run comparison that removed selected
+numeric, address, path, and time fields; they are not L2. Current `--verify`
+selects canonical INFO comparison and requires fresh typed evidence. The
+policy change does not remeasure any row in these tables.
 
 L1 (`hermit run --strict`):
 
@@ -38,9 +40,10 @@ The verification results must name the comparator that actually ran. **Stripped 
 means Hermit re-ran the guest and found the two normalized DETLOG
 streams equal after stripping selected fields; it does not mean the full syscall
 and scheduling traces were bitwise-identical and does not establish L2.
-KVM now compares retained logs too. Plain `--verify` uses the Stripped policy on
-every backend; `--verify-strict` selects canonical `BitwiseInfoV1` on every
-backend. Whether a KVM cell matches is a measured property of that workload.
+KVM now compares retained logs too. Plain `--verify` selects canonical
+`BitwiseInfoV1` on every backend; `--verify-strict` remains an accepted
+compatibility spelling. Whether a KVM cell matches is a measured property of
+that workload, established from the typed report and equal positive counts.
 The historical 22/28 guest-visible count predates retained-log comparison and
 is therefore not reused as a current result.
 
@@ -181,25 +184,34 @@ Without `--strict`, repeat-run results are compatibility evidence rather than
 an assurance level. With `--strict`, they are L1 strict-mode evidence backed by
 three byte-identical runs. The runner disables PMU timeslicing for portability.
 
-### Stripped verification (`--verify`)
+### Canonical verification (`--verify`)
 
 Passing `--verify` adds a two-run comparison: the runner invokes
-`hermit run --strict --verify --verify-allow both`. Plain `--verify` now uses
-the Stripped retained-log comparison for ptrace, DBT, and KVM;
-`--verify-strict` selects canonical `BitwiseInfoV1` for all three. The KVM
-statuses above predate that change and came from the older guest-output and
-exit-status comparison; they must not be reused as current log-comparison
-results. A fresh matrix run must be judged from its typed `--verify-json`
-report. The matrix still hard-codes KVM's expected tier, printed ratchet, and
-observation description to `guest`; those three consumers must be updated
-before the 28 cells can be remeasured under the current comparator.
+`hermit run --strict --verify --verify-allow both`. Plain `--verify` selects
+canonical `BitwiseInfoV1` for ptrace, DBT, and KVM. `--verify-strict` remains a
+compatibility spelling for the same policy. The historical KVM statuses above
+came from the older guest-output and exit-status comparison; they must not be
+reused as current log-comparison results. A fresh matrix run must be judged
+from its typed `--verify-json` report. Historical `guest` and Stripped tier
+decoding remains useful for old reports, but cannot substitute for a current
+matched canonical verdict with `bitwise_parity: true` and equal positive
+compared-message counts.
 
-Because `--verify` diverts the guest's own stdout into per-run temporary logs,
-this path cannot re-check stdout the way the L1 path does; instead it enforces
-that the guest exit status matches and that Hermit's double-run comparison
-succeeded at *at least* the verification kind expected for the backend. A
-DETLOG result satisfies a `guest` contract because it compares more
-observations; the reverse fails.
+The matrix retains its existing minimum tiers and known gaps. For every
+current run, including a probed gap, it first requests `canonical-match` from
+the shared reader and classifies the same checked JSON. A weaker historical
+minimum cannot admit a Stripped, output-only, empty or unequal-count current
+match. The mode description names canonical INFO; the ratchet counts remain
+historical minimum contracts, not measured passes. Historical inspection still
+uses the separate `matched` requirement to preserve weaker recorded tiers.
+
+Because `--verify` diverts guest stdout into per-run temporary logs, the matrix
+checks the report's exact output operands through the current typed reader. It
+also checks the verification process against the guest's expected exit status,
+including deliberate nonzero exits. A saved canonical report cannot excuse an
+unexpected process exit or timeout. A typed infrastructure error remains an
+`ERROR`, separately from a product mismatch. None of these admission changes
+remeasures the historical tables or establishes cross-backend INFO parity.
 
 One contract holds at L1 but not under `--verify` and is recorded as a `gap`
 with its reason in the runner:
@@ -406,25 +418,29 @@ rewrite path — which is why e9patch is not a column here. Its parity is instea
 ratcheted by `e9patch_corpus.py` over a freestanding, statically linked,
 raw-`syscall` corpus under `e9patch_corpus/`, where `candidate_sites > 0`.
 
-For each guest that harness enforces exit-status parity, stdout parity, golden
-Stripped verification (`hermit run --strict --verify`), e9patch Stripped
-verification (`hermit --backend e9patch run --strict --verify`), full direct-AOT
-coverage
-(`mapped_sites == candidate_sites > 0`), no signal fallback (`b0_sites == 0`),
-and guest-syscall DETLOG **tail-match**: the golden guest-syscall sequence
-equals the suffix of the e9patch sequence. Byte-identical DETLOG parity is
-impossible by construction because the e9patch image runs a fixed deterministic
+For each guest the harness enforces exit-status parity, stdout parity and a
+canonical verification of both plain ptrace and e9patch preprocessing.
+Each verification process must finish successfully, and each typed report
+must satisfy `canonical-match`; a saved matching report cannot excuse a failed
+or timed-out producer. The independent full direct-AOT coverage check
+(`mapped_sites == candidate_sites > 0`) and no-signal-fallback check
+(`b0_sites == 0`) remain required.
+
+The separate guest-syscall DETLOG **tail-match** compares a normalized golden
+sequence with the suffix of the e9patch sequence. The e9patch image executes an
 e9loader prologue (readlink/open/arch_prctl/`N`×mmap/close) before the guest's
-`_start`; that prologue is a pure prefix, so the enforced parity is guest-syscall
-DETLOG identity *modulo* the deterministic prologue, plus Stripped and
-guest-visible equality. No strict-detlog-identity or L2 claim is made.
+`_start`. This tail check retains its existing weaker semantics: it normalizes
+addresses and large integers, does not check the extraction process status,
+and can accept two empty tails. The canonical verification requirements do not
+repair those limitations or establish canonical cross-backend INFO parity.
+`PASS_L2` records the combined enforced checks, not a new corpus measurement.
 
 Like the KVM `/dev/kvm` gate, this harness is `BLOCKED` in CI: it needs a hermit
 built `--features e9patch` and a built e9tool/e9patch pair
 (`HERMIT_E9TOOL`/`HERMIT_E9PATCH_BACKEND`). Run it locally:
 
 ```bash
-cargo build -p hermit --features e9patch
+cargo build -p hermit --features e9patch --bin hermit --bin verification-report
 HERMIT_E9TOOL=<path>/e9tool HERMIT_E9PATCH_BACKEND=<path>/e9patch \
     python3 tests/backend-parity/e9patch_corpus.py \
     --hermit target/debug/hermit --require-backend
@@ -467,18 +483,23 @@ unlandable PR becomes landable code plus explicit, queryable test debt.
 
 ## Running
 
-The portable `check.backend_parity_suites` DAG node runs the three driver-side
-contract suites on every portable-lane validation without building Hermit or starting a guest:
+The portable `check.backend_parity_suites` DAG node runs four driver-side
+contract suites after its existing build dependency, without starting a Hermit
+guest. The evidence controls use the built `verification-report` reader; when
+running them separately, set `VERIFICATION_REPORT_BIN` to that executable.
 
 ```bash
-python3 tests/backend-parity/test_verify_tier_evidence.py
-python3 tests/backend-parity/test_scorecard_header_compat.py
-python3 tests/backend-parity/test_run_matrix_output_skew.py
+python3 -B tests/backend-parity/test_verify_tier_evidence.py
+python3 -B tests/backend-parity/test_scorecard_header_compat.py
+python3 -B tests/backend-parity/test_run_matrix_output_skew.py
+python3 -B tests/backend-parity/test_e9patch_corpus_verification.py
 ```
 
-These are separate from `parity_mutation.py` and from executing `run_matrix.py`
-as a backend matrix. They protect the evidence-tier, scorecard-schema, and
-whole-artifact writer contracts used by that driver.
+These are separate from `parity_mutation.py` and from executing a backend
+matrix or the twenty e9patch guests. They protect current canonical admission,
+historical evidence tiers, scorecard schema, whole-artifact writing, and the
+e9patch caller's process-status and independent-oracle decisions. Controlled
+transport supplies synthetic reports; the real shared reader checks them.
 
 Validate the case catalog and known-gap invariants without backend prerequisites:
 
@@ -507,9 +528,9 @@ Run KVM on a host with read-write `/dev/kvm` access:
 python3 tests/backend-parity/run_matrix.py --backend kvm --require-backend
 ```
 
-Enforce the Stripped verification ratchet on any backend by adding `--verify`
-(it implies `--strict`); Hermit's double-run then asserts the recorded
-verification kind per contract:
+Request canonical verification on any backend by adding `--verify` (it implies
+`--strict`). Judge the fresh typed report under the current contract; the old
+Stripped ratchet values above remain historical measurements:
 
 ```bash
 python3 tests/backend-parity/run_matrix.py --backend ptrace --verify --require-backend

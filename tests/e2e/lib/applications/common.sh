@@ -12,6 +12,7 @@ readonly APPLICATION_DIR
 REPO_ROOT=$(cd -- "$APPLICATION_DIR/../../../.." && pwd)
 readonly REPO_ROOT
 readonly HERMIT_BIN=${HERMIT_BIN:-"$REPO_ROOT/target/debug/hermit"}
+readonly VERIFICATION_REPORT_BIN=${VERIFICATION_REPORT_BIN:-$(dirname -- "$HERMIT_BIN")/verification-report}
 readonly HERMIT_APPLICATION_TIMEOUT=${HERMIT_APPLICATION_TIMEOUT:-120}
 
 function require_commands {
@@ -58,6 +59,10 @@ function assert_native_nondeterminism {
 # too. `bitwise_parity` is true only under the canonical (`--verify-strict`)
 # policy with syscall output-buffer hashes present, and `compared_log_messages` is what makes it falsifiable: a strict
 # CONFIGURATION is not evidence that the configured comparison had any data.
+# The field reads below preserve established diagnostics. Positive acceptance
+# additionally requires the producer-owned verification-report canonical-match
+# reader, which checks the current report, canonical strictness/envelope,
+# log comparison, positive equal counts, and the verified/matched/parity claim.
 #
 # Four outcomes are kept distinct, because collapsing them is how a harness
 # reports green for work it never did:
@@ -134,6 +139,12 @@ function run_hermit_verify {
         execution_root_args=("--mount=type=tmpfs,target=/test" "--workdir=/test")
     fi
 
+    if [[ ! -x $VERIFICATION_REPORT_BIN ]]; then
+        printf '%s: REFUSED: verification-report reader unavailable: %s; build with cargo build -p hermit --bin verification-report or set VERIFICATION_REPORT_BIN\n' \
+            "$label" "$VERIFICATION_REPORT_BIN" >&2
+        return 1
+    fi
+
     local stdout_file stderr_file verdict_file status=0
     stdout_file=$(mktemp "${TMPDIR:-/tmp}/hermit-app-stdout.XXXXXX")
     stderr_file=$(mktemp "${TMPDIR:-/tmp}/hermit-app-stderr.XXXXXX")
@@ -203,6 +214,8 @@ function run_hermit_verify {
             failure="NO-RESULT: compared 0 log messages (left=$counts_left right=$counts_right); a strict configuration is not evidence the comparison had data"
         elif [[ $parity != True ]]; then
             failure="DIVERGED: bitwise_parity=$parity verdict=$verdict_name (a stripped match does NOT earn L2)"
+        elif ! "$VERIFICATION_REPORT_BIN" canonical-match "$verdict_file"; then
+            failure="REFUSED: typed report did not establish nonempty canonical parity"
         fi
     fi
 

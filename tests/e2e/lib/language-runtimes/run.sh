@@ -82,7 +82,7 @@ function run_l2 {
   fi
 
   cat "$verify_output"
-  if ! "$VERIFICATION_REPORT_BIN" matched "$verify_report"; then
+  if ! "$VERIFICATION_REPORT_BIN" canonical-match "$verify_report"; then
     echo "FAIL: $label typed verification report did not match" >&2
     return 1
   fi

@@ -119,30 +119,11 @@ impl UseCase for TraceReplayOpts {
             output_stderr: true,
             verify_stdout: true,
             verify_stderr: true,
-            verify_detlog_syscalls: true,
-            verify_detlog_syscall_results: true,
-            // A chaos recording uses precise ptrace single-stepping while schedule replay does
-            // not. On x86, syscall saves RFLAGS in r11, so the tracer-owned Trap Flag (0x100)
-            // appears only in the recording's register DETLOGs. Scheduler bookkeeping also
-            // differs by design. Keep comparing guest-visible syscall traffic and results, but
-            // exclude these instrumentation-only entries for chaos trace replay.
-            verify_detlog_others: !self.split_branches && !self.chaos,
-            verify_commits: false,
+            // Comparison includes all INFO records, including instrumentation
+            // differences. A mismatch must be diagnosed rather than filtered.
             verify_exit_statuses: true,
             verify_desync: true,
             verify_schedules: false,
-            ignore_lines: if self.chaos {
-                vec![
-                    "CHAOSRAND".to_string(),
-                    "advance global time for scheduler turn".to_string(),
-                    // exit_group has no result, and schedule replay can finish at the end of the
-                    // recorded schedule without re-entering its syscall callback. Exit status is
-                    // compared separately.
-                    "inbound syscall: exit_group".to_string(),
-                ]
-            } else {
-                Vec::new()
-            },
         }
     }
 
@@ -197,26 +178,22 @@ mod tests {
     }
 
     #[test]
-    fn non_chaos_replay_compares_all_detlogs() {
+    fn non_chaos_replay_preserves_output_and_status_checks() {
         let options = trace_replay_opts(false).options();
 
-        assert!(options.verify_detlog_syscalls);
-        assert!(options.verify_detlog_syscall_results);
-        assert!(options.verify_detlog_others);
+        assert!(options.verify_stdout);
+        assert!(options.verify_stderr);
+        assert!(options.verify_exit_statuses);
+        assert!(options.verify_desync);
     }
 
     #[test]
-    fn chaos_replay_excludes_instrumentation_only_detlogs() {
+    fn chaos_replay_preserves_output_and_status_checks() {
         let options = trace_replay_opts(true).options();
 
-        assert!(options.verify_detlog_syscalls);
-        assert!(options.verify_detlog_syscall_results);
-        assert!(!options.verify_detlog_others);
-        assert!(
-            options
-                .ignore_lines
-                .iter()
-                .any(|line| line == "inbound syscall: exit_group")
-        );
+        assert!(options.verify_stdout);
+        assert!(options.verify_stderr);
+        assert!(options.verify_exit_statuses);
+        assert!(options.verify_desync);
     }
 }

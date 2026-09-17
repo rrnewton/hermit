@@ -5,11 +5,18 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
 fixture="$script_dir/build-time-0.1.3"
 hermit_bin=${HERMIT_BIN:-"$repo_root/target/release/hermit"}
+VERIFICATION_REPORT_BIN=${VERIFICATION_REPORT_BIN:-$(dirname -- "$hermit_bin")/verification-report}
 artifact_dir="$fixture/target/reproducible-builds"
 
 if [[ ! -x "$hermit_bin" ]]; then
     printf 'Hermit binary not found: %s\n' "$hermit_bin" >&2
     printf 'Build it with: cargo build --release -p hermit --bin hermit\n' >&2
+    exit 1
+fi
+
+if [[ ! -x "$VERIFICATION_REPORT_BIN" ]]; then
+    printf 'verification-report reader unavailable: %s\n' "$VERIFICATION_REPORT_BIN" >&2
+    printf 'Build it with: cargo build --release -p hermit --bin verification-report, or set VERIFICATION_REPORT_BIN\n' >&2
     exit 1
 fi
 
@@ -67,11 +74,20 @@ fi
 
 # Pre-create the output so both verification runs observe the same unlink.
 : > "$artifact_dir/verified.o"
+verify_report="$artifact_dir/verify.json"
+rm -f -- "$verify_report"
+verify_status=0
 # The single-quoted variables expand in the guest bash process.
 # shellcheck disable=SC2016
-"$hermit_bin" run --strict --verify --workdir "$fixture" -- \
+"$hermit_bin" run --strict --verify --verify-json "$verify_report" --workdir "$fixture" -- \
     bash -c 'output=$1; shift; rm -f "$output"; "$@" -o "$output"' \
-    _ "$artifact_dir/verified.o" "${compile[@]}"
+    _ "$artifact_dir/verified.o" "${compile[@]}" || verify_status=$?
+
+"$VERIFICATION_REPORT_BIN" canonical-match "$verify_report" || exit 1
+if ((verify_status != 0)); then
+    printf 'Compiler verification matched, but the guest exited %s\n' "$verify_status" >&2
+    exit "$verify_status"
+fi
 
 printf 'native-one  %s\n' "$native_one"
 printf 'native-two  %s\n' "$native_two"

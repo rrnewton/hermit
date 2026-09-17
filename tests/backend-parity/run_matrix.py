@@ -185,30 +185,22 @@ def scorecard_fieldnames(actual_header, path):
         )
     return actual, parity_column
 
-# `--verify` evidence kinds, ordered weakest to strongest. "gap" means the
-# contract cannot currently be verified on that backend. "guest" means the two
-# runs produced identical stdout+exit but the internal trace is not compared
-# (KVM concurrent mode). "bitwise" is full L2: the two runs produced matching
-# INFO streams under the canonical BitwiseInfoV1 policy (ptrace, DBT).
-#
-# `stripped` is the rung that was missing, and its absence is what made every
-# green over-tiered: plain `--verify` DOES compare the DETLOG, but under the
-# `Stripped` policy, whose own `--verify-json` reports `bitwise_parity: false`.
-# Calling that `detlog` conflated "the DETLOG was compared" with "the DETLOG was
-# identical".  `bitwise` is the real thing and is claimable only from a typed
-# verdict (see `verify_tier_from_json`).
+# Retained verification tiers, ordered weakest to strongest. Historical
+# output-only and Stripped matches remain readable at their original tiers.
+# Current runs additionally require canonical INFO evidence before they can
+# pass; an old minimum tier does not weaken that requirement.
 L2_RANK = {"gap": 0, "guest": 1, "stripped": 2, "bitwise": 3}
-# Per-backend L2 values the matrix may record. KVM's concurrent verify path can
-# never emit a DETLOG witness, so it is capped at guest-visible L2.
+# Preserve historical result values and admit the current KVM canonical result.
+# These values do not change the minimum expectations in expectation().
 L2_ALLOWED = {
     "ptrace": {"stripped", "bitwise"},
     "dbt": {"stripped", "bitwise", "gap"},
-    "kvm": {"guest", "gap"},
+    "kvm": {"guest", "bitwise", "gap"},
 }
 
 
 class VerifyPolicy(NamedTuple):
-    """The one verification policy this matrix actually requests."""
+    """Current canonical verification flags and retained minimum expectations."""
 
     hermit_flags: tuple[str, ...]
     expected_non_kvm_tier: str
@@ -234,19 +226,15 @@ class VerifyPolicy(NamedTuple):
             raise ValueError(
                 "a non-KVM verification policy must expect stripped or bitwise evidence"
             )
-        requests_canonical = "--verify-strict" in hermit_flags
-        expects_bitwise = expected_non_kvm_tier == "bitwise"
-        if requests_canonical != expects_bitwise:
-            raise ValueError(
-                "--verify-strict and the bitwise evidence tier must move together"
-            )
+        # Canonical comparison is now the default; --verify-strict remains a
+        # compatible spelling. Historical minimum tiers do not select policy.
         return cls(hermit_flags, expected_non_kvm_tier, comparison_claim)
 
     def displayed_flags(self) -> tuple[str, ...]:
         return ("--strict", *self.hermit_flags)
 
     def assurance_label(self) -> str:
-        return "L2" if self.expected_non_kvm_tier == "bitwise" else "below L2"
+        return "L2"
 
     def mode_summary(self) -> str:
         return (
@@ -260,8 +248,8 @@ DEFAULT_VERIFY_POLICY = VerifyPolicy.checked(
     hermit_flags=("--verify", "--verify-allow", "both"),
     expected_non_kvm_tier="stripped",
     comparison_claim=(
-        "Stripped DETLOG comparison "
-        "(numbers/addresses/paths normalized; NOT bitwise)"
+        "canonical BitwiseInfoV1 INFO comparison "
+        "(current results require a canonical match)"
     ),
 )
 
@@ -707,11 +695,8 @@ def expectation(backend: str, name: str, verify: bool) -> tuple[str, str]:
         return "gap", reason
     if not verify:
         return "pass", "-"
-    # `stripped`, not `bitwise`: this is the tier the probe's own comparator can
-    # actually earn today.  Raising it to `bitwise` is a RATCHET that belongs
-    # with the INFO-tier comparator work, not with this correction -- asserting
-    # it now would red every ptrace/DBT cell for a comparator limitation rather
-    # than a guest defect, which is the mirror image of the bug being fixed.
+    # Retain the existing minimums and known gaps. Current execution has an
+    # additional canonical-match requirement in run_case_verify().
     return (
         "guest" if backend == "kvm" else DEFAULT_VERIFY_POLICY.expected_non_kvm_tier
     ), "-"
@@ -769,16 +754,9 @@ def hermit_command(
     if strict:
         command.append("--strict")
     if verify:
-        # hermit runs the guest twice internally and compares them.  `--verify`
-        # ALONE is the `Stripped` comparison, NOT a bitwise one: it strips the
-        # wall-clock prefix and applies
-        # `unsafe-numeric-address-and-path-normalization/v1`, which normalises
-        # numbers generally -- so a differing read() return length, a differing
-        # pointer argument and a differing openat path all collapse to the same
-        # token.  Mutation testing measured 3 of 5 planted defects surviving it
-        # (dev-hermit experiments/strict-certification-mutation-sweep_20260806).
-        # Whatever this run earns is read off `--verify-json` below; it is not
-        # assumed from the flag and it is not scraped from the banner.
+        # Hermit compares two runs with its default canonical INFO policy.
+        # The typed canonical-match requirement below checks the actual result;
+        # neither these flags nor a success banner establish a match by itself.
         #
         # `--verify-allow both` keeps the guest's own exit status (including
         # deliberate non-zero cases such as exit_status) flowing through so the
@@ -1031,17 +1009,11 @@ def capture_ptrace_reference(
     return reference.stdout, "", False
 
 
-# Two distinct `--verify` success witnesses, and they are NOT the same assurance:
-#
-#  * DETLOG-bitwise (ptrace, DBT): hermit re-runs the guest and finds the two
-#    DETLOG streams bitwise-identical after normalization. This is full L2 -- the
-#    internal syscall/scheduling trace is itself reproducible.
-#  * guest-visible (KVM): reverie-kvm runs concurrently and states outright that
-#    "internal syscall trace order is not deterministic", so `--verify` compares
-#    only guest stdout and exit status across the two runs. That is a strictly
-#    weaker guest-visible L2; do not report it as DETLOG determinism.
-#
-def verify_tier_from_json(path: Path) -> dict[str, str] | None:
+# Historical inspection preserves weaker tiers. Active verification selects
+# the stronger requirement while obtaining the checked JSON in the same read.
+def verify_tier_from_json(
+    path: Path, *, require_canonical: bool = False
+) -> dict[str, str] | None:
     """Read the tier a `--verify` run actually earned from its typed verdict.
 
     This is the whole point of the correction.  The banner strings above are a
@@ -1088,8 +1060,9 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
     which are the rungs it already belonged on.
 
     The producer-owned Rust type is the vocabulary authority. Python reads the
-    evidence fields from `verification-report --json matched`, which parses the
-    complete current shape and checks the closed `Verdict` enum. Its JSON is the
+    evidence fields from the shared reader's `matched` requirement for retained
+    classification, or `canonical-match` for active runs. Both parse the
+    complete current shape and check the closed `Verdict` enum. Its JSON is the
     same report that was checked, without a second read of a mutable file. A
     non-match never earns a positive tier; a typed infrastructure error retains
     its cause beside `gap` so the caller can report `ERROR`.
@@ -1097,9 +1070,10 @@ def verify_tier_from_json(path: Path) -> dict[str, str] | None:
     Returns ``None`` for absent, malformed, contradictory or other non-match
     reports. A well-formed infrastructure error returns `gap`, never a match.
     """
+    requirement = "canonical-match" if require_canonical else "matched"
     try:
         typed = subprocess.run(
-            [str(VERIFICATION_REPORT_BIN), "--json", "matched", str(path)],
+            [str(VERIFICATION_REPORT_BIN), "--json", requirement, str(path)],
             capture_output=True,
             text=True,
             check=False,
@@ -1249,10 +1223,9 @@ def run_case_verify(
     `--verify` runs the guest twice inside hermit and diverts the guest's own
     stdout into per-run temp logs, so this path cannot compare guest stdout the
     way the L1 path does. The contract it enforces instead is: the guest exit
-    status matches, and Hermit's internal double-run comparison reports success
-    at *at least* the evidence tier the matrix records (`expected_l2`). A
-    Stripped DETLOG result satisfies a `guest` contract because it compares more
-    observations; the reverse fails. Only a bitwise result establishes L2.
+    status matches and the same typed report qualifies as a canonical match.
+    The retained minimum (`expected_l2`) is checked afterward; a weaker minimum
+    or a probed gap cannot make a noncanonical current result pass.
     """
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="hermit-verify-json-") as verify_dir:
@@ -1269,7 +1242,8 @@ def run_case_verify(
         )
         result = run_with_timeout(command)
         observed_evidence = (
-            verify_tier_from_json(verdict_path) if verdict_path.exists() else None
+            verify_tier_from_json(verdict_path, require_canonical=True)
+            if verdict_path.exists() else None
         )
     if evidence is not None and observed_evidence:
         evidence.update(observed_evidence)
@@ -1299,14 +1273,14 @@ def run_case_verify(
     if observed_evidence is None:
         return (
             "FAIL",
-            "verify produced no usable current typed verification report: "
+            "verify produced no usable current canonical match: "
             f"{diagnostic[-300:]}",
             time.monotonic() - started,
         )
     # Typed verdict: authoritative.
     observed = observed_evidence["tier"]
-    # A gap being probed (--probe-gaps) has no positive contract to meet; report
-    # what it actually reached so it can be evaluated for promotion.
+    # A probed gap has no additional minimum, but reaching this point already
+    # required successful canonical admission of the same typed report.
     if expected_l2 != "gap" and L2_RANK[observed] < L2_RANK[expected_l2]:
         return (
             "FAIL",
@@ -1759,7 +1733,12 @@ def append_parent_scorecard(
         # parity boolean is derived solely from the two hashes captured above.
         parity = stdout_evidence.get("stdout_parity", "")
         detail = result["detail"]
-        if verify and result["backend"] == "kvm" and passed:
+        if (
+            verify
+            and result["backend"] == "kvm"
+            and passed
+            and stdout_evidence.get("tier") != "bitwise"
+        ):
             detail = (
                 "Guest-visible verification only (stdout+exit compared; internal "
                 f"trace not compared): {detail}"
@@ -1975,8 +1954,8 @@ def main() -> int:
     args = parse_args()
     names = validate_catalog()
     backends = args.backends or list(BACKENDS)
-    # --verify presupposes strict mode.  The default Stripped comparator remains
-    # below L2; only canonical --verify-strict evidence can establish L2.
+    # --verify presupposes strict mode and uses canonical INFO comparison.
+    # Successful current evidence must qualify independently of the old minima.
     strict = args.strict or args.verify
     if args.verify:
         print(DEFAULT_VERIFY_POLICY.mode_summary())
@@ -1992,9 +1971,11 @@ def main() -> int:
     # --verify, split
     # by assurance kind.  These are CONTRACTS, not earned results: the tier a run
     # actually reaches is read from its own verdict (`verify_tier_from_json`).
-    # The split used to print `detlog=`, which asserted bitwise identity for a
-    # comparison that only ever normalised-and-compared; it prints `stripped=`
-    # now so the headline cannot overstate the corpus.
+    # Preserve these historical minimum counts; they are not measured passes
+    # and do not describe the stronger admission rule for a current run.
+    if args.verify:
+        print("Current verification requires canonical INFO evidence; "
+              "ratchet counts retain historical minimum tiers.")
     for backend in BACKENDS:
         verified = baseline - sum(gap_backend == backend for gap_backend, _ in L2_GAPS)
         tier_counts = {"stripped": 0, "guest": 0, "bitwise": 0}

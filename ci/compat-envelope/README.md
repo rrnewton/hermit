@@ -88,11 +88,12 @@ denominator. `scorecard.rs check` refuses unless every selected row is accounted
 for by either the comparable green cells or that custom-command list.
 
 The Basic Sanity Milestone 1 `verify` cells run each selected backend twice against
-itself. Bare `--verify` still uses the legacy Stripped comparator. These cells
-therefore measure same-backend repeatability under the current contract; they
-do not establish strict INFO-log determinism or cross-backend parity. The
-scorecard says this directly and reports no cross-backend parity count until
-the manifest has cells that really compare fresh ptrace and non-ptrace logs.
+itself. Bare `--verify` now selects canonical INFO comparison. A fresh typed
+report must establish a matched comparison with `bitwise_parity: true` and equal
+positive message counts; old Stripped results are not promoted by the new
+default. These remain same-backend comparisons, not cross-backend parity. No
+cross-backend parity count is justified until cells actually compare fresh
+ptrace and non-ptrace logs.
 
 Scorecard colour records whether an enabled cell is in the selected plan.
 Measurement is separate: importing a pass or divergence records what happened

@@ -216,7 +216,7 @@ def verification_report_bin(hermit: Path) -> Path:
 
 def verification_matched(hermit: Path, report: Path) -> tuple[bool, str]:
     code, _, stderr = run(
-        [str(verification_report_bin(hermit)), "matched", str(report)], timeout=10
+        [str(verification_report_bin(hermit)), "canonical-match", str(report)], timeout=10
     )
     return code == 0, stderr.decode(errors="replace").strip()
 
@@ -279,7 +279,7 @@ def run_guest(hermit: Path, name: str, out_dir: Path) -> tuple[str, str]:
     golden_report = out_dir / f"{name}-golden-verify.json"
     e9patch_report = out_dir / f"{name}-e9patch-verify.json"
     engagement_report = out_dir / f"{name}-e9patch-engagement.json"
-    _, _, _ = run(
+    golden_verify_status, _, _ = run(
         hermit_command(
             hermit,
             False,
@@ -301,7 +301,7 @@ def run_guest(hermit: Path, name: str, out_dir: Path) -> tuple[str, str]:
         ),
         timeout=60,
     )
-    _, _, _ = run(
+    e9patch_verify_status, _, _ = run(
         hermit_command(
             hermit,
             True,
@@ -323,6 +323,15 @@ def run_guest(hermit: Path, name: str, out_dir: Path) -> tuple[str, str]:
         return "FAIL", f"stdout divergence golden={gout!r} e9patch={eout!r}"
     if expected_stdout is not None and gout != expected_stdout:
         return "FAIL", f"golden stdout {gout!r}, expected {expected_stdout!r}"
+    # A saved matching report cannot excuse a failed verification process.
+    if golden_verify_status == 124:
+        return "FAIL", "golden verification timed out"
+    if golden_verify_status != 0:
+        return "FAIL", f"golden verification exited {golden_verify_status}"
+    if e9patch_verify_status == 124:
+        return "FAIL", "e9patch verification timed out"
+    if e9patch_verify_status != 0:
+        return "FAIL", f"e9patch verification exited {e9patch_verify_status}"
     golden_matched, golden_reason = verification_matched(hermit, golden_report)
     if not golden_matched:
         return "FAIL", f"golden typed verification report did not match: {golden_reason}"

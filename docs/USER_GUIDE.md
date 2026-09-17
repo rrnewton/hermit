@@ -181,12 +181,12 @@ Hermit verifies the DSO architecture, required exports, and preload constructor
 before activation; an arbitrary shared object or constructor-free runtime is
 rejected rather than silently falling back.
 
-LiteInst uses the normal Hermit run and verification paths. A successful
-`--strict --verify` run compares status/stdout/stderr exactly and applies the
-`Stripped` comparison to selected Detcore scheduler messages; it is useful
-diagnostic evidence, but it is not strict determinism. Strict verification requires
-`--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
-compared-message counts. Verification snapshots guest stdin once and supplies
+LiteInst uses the normal Hermit run and verification paths. `--strict --verify`
+compares status/stdout/stderr exactly and uses the canonical INFO comparison by
+default. `--verify-strict` remains a compatibility spelling. Use
+`--verify-json REPORT.json` to inspect `bitwise_parity`, nonzero compared-message
+counts, and the reported execution policy; selecting verification alone does not
+establish that a workload passes. Verification snapshots guest stdin once and supplies
 the identical bytes to both runs. The supported execution scope is dynamically
 linked, single-threaded, single-process Linux x86-64 guests. Thread clone,
 `fork`, and `vfork` fail closed with `EOPNOTSUPP`, and `exec` remains
@@ -205,9 +205,10 @@ guest-kernel ABI.
 
 SaBRe is available only in builds using the non-default
 `third-party-backends` feature. See
-[SaBRe backend compatibility](SABRE_COMPATIBILITY.md) for the measured
-`Stripped` allowlist, build commands, and known gaps. An enabled probe is
-not a blanket support claim for every workload in its subsystem.
+[SaBRe backend compatibility](SABRE_COMPATIBILITY.md) for historical measurements
+under the `Stripped` policy, build commands, and known gaps. Those measurements
+do not establish success under the current canonical default. An enabled probe
+is not a blanket support claim for every workload in its subsystem.
 
 `e9patch` is an experimental hybrid rather than a standalone Detcore runtime.
 It uses the cached offline instruction map and conservative `e9tool -O0` mode
@@ -290,11 +291,16 @@ Hermit runs the guest twice and compares observable output, including stdout,
 stderr, and its internal deterministic execution log. Verification fails if
 the compared observations differ or if the guest exit status is not allowed.
 
-The default log comparison is `Stripped`: it can erase numbers, addresses,
-temporary paths, and time values from selected messages. It is a fast
-diagnostic, not strict determinism. Use
-`--verify-strict --verify-json REPORT.json` when a canonical strict result is
-required.
+The default log comparison is canonical INFO: it removes real wall-clock
+prefixes, replaces explicitly marked host addresses with first-appearance
+ordinals, and compares every remaining INFO byte exactly. Numeric values,
+virtual time, temporary paths, syscall arguments and results remain compared.
+`--verify-strict` is an accepted compatibility spelling for this same default.
+Use `--verify-json REPORT.json` for the typed verdict and comparison evidence.
+An explicit DEBUG/TRACE log level preserves diagnostics without changing the
+INFO comparison; `--verify-verbose` requests an all-level diagnostic comparison.
+Historical reports naming `Stripped` remain readable, but no active option can
+select that lossy policy.
 
 Matching verification logs are temporary by default; divergent comparisons
 retain both. Hermit keeps the newest 64 implicitly retained failed comparisons
@@ -327,13 +333,18 @@ that position. An empty or unreadable comparison exits with an error rather
 than reporting a match.
 
 For a two-log comparison, add `--print-logs` to print both selected streams to
-stderr exactly as the comparator receives them. The output names the active
-policy: `Deterministic` for the default DETLOG/scheduler-COMMIT subset,
-`Stripped` when `--unsafe-strip-lines` applies its lossy substitutions, or
-`Canonical` when `--canonical-info` selects the INFO stream and canonicalizes
-marked host addresses. This output is produced by the shared comparator path,
-after wall-clock-prefix removal, line filtering, message selection, and any
-requested substitutions.
+stderr exactly as the comparator receives them. The active policy is
+`Canonical`, with or without JSON or the compatibility spelling
+`--canonical-info`. Follow mode uses the same policy on the complete common
+prefix. Printed comparison streams reflect the declared record envelope, INFO
+selection, wall-clock-prefix removal and marked host-address canonicalization.
+
+Lossy comparison options are removed: `--unsafe-strip-lines`, `--strip-lines`,
+`--ignore-lines`, `--skip-commit`, `--skip-detlog`, `--include-detlogs`, and
+`--git-diff` are rejected. Diagnose a difference using the retained logs and
+positions rather than discarding differing records. The analysis and
+hermit-verify callers also preserve CHAOSRAND, SCHEDRAND and other INFO records;
+previously filtered differences can therefore become visible.
 
 The guest must be idempotent. A first run that modifies an input file,
 database, cache, or other host-visible state can legitimately change the

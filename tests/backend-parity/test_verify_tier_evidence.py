@@ -128,7 +128,7 @@ def record(verified=True, bitwise=False, left=239, right=239, strictness="stripp
 
 
 # --------------------------------------------------------------------------
-print("case STRIPPED — the exact shape the scorecard producer emits today")
+print("case STRIPPED — preserve the historical weaker report shape")
 # The historical live probe had rc=0, banner ":: Success: deterministic.
 # Determinism verified.", and bitwise_parity false in the same record.
 got = tier_of(record(bitwise=False, strictness="stripped"))
@@ -215,6 +215,87 @@ for process_status in (0, 1, 126, 127):
           detail == "verification recorded 2 HERMIT_SKID_OVERSHOOT report(s)", detail)
     check(f"matrix evidence remains gap with process status {process_status}",
           evidence.get("tier") == "gap", repr(evidence))
+
+# These controls replace only guest transport. The real emitted Rust reader
+# checks the exact report written by that transport, once per current result.
+print("case CURRENT RUN — canonical admission precedes every retained minimum")
+
+
+def current_result(rec, *, process_status=0, expected_status=0,
+                   minimum="guest", backend="kvm", timed_out=False):
+    calls = []
+    reader_run = subprocess.run
+
+    def transport(command):
+        report_path = next(arg.split("=", 1)[1] for arg in command
+                           if arg.startswith("--verify-json="))
+        if rec is not None:
+            text = rec if isinstance(rec, str) else json.dumps(rec)
+            Path(report_path).write_text(text, encoding="utf-8")
+        if timed_out:
+            return None
+        return subprocess.CompletedProcess(command, process_status, b"", b"")
+
+    def observe_reader(command, **kwargs):
+        calls.append(command)
+        return reader_run(command, **kwargs)
+
+    with tempfile.TemporaryDirectory(prefix="current-canonical-tier-") as tmp:
+        evidence = {}
+        with patch("run_matrix.run_with_timeout", side_effect=transport), \
+             patch("run_matrix.subprocess.run", side_effect=observe_reader):
+            result, detail, _ = run_case_verify(
+                Path("/fixture-hermit"), backend, "exit_status", ["/bin/true"],
+                expected_status, minimum, Path(tmp), {}, evidence,
+            )
+    return result, detail, evidence, calls
+
+
+canonical = record(bitwise=True, strictness="canonical", left=239, right=239)
+for backend, minimum in (("ptrace", "stripped"), ("kvm", "guest"),
+                         ("dbt", "gap"), ("ptrace", "bitwise")):
+    status, detail, evidence, calls = current_result(
+        canonical, minimum=minimum, backend=backend)
+    check(f"canonical current result passes {backend}/{minimum}",
+          status == "PASS" and evidence.get("tier") == "bitwise", repr((status, detail)))
+    check(f"one actual canonical reader supplies {backend}/{minimum} evidence",
+          len(calls) == 1 and calls[0][1:3] == ["--json", "canonical-match"], repr(calls))
+
+incomplete = json.loads(json.dumps(canonical))
+del incomplete["compared_outputs"]
+for label, weaker in (
+    ("stripped", record()),
+    ("output-only", record(compare_logs=False, left=None)),
+    ("zero records", record(bitwise=True, strictness="canonical", left=0, right=0)),
+    ("unequal records", record(bitwise=True, strictness="canonical", left=239, right=240)),
+    ("missing file", None), ("invalid JSON", "not json{"),
+    ("missing current outputs", incomplete),
+):
+    for minimum in ("guest", "stripped", "gap"):
+        status, detail, _, _ = current_result(weaker, minimum=minimum)
+        check(f"current {label} cannot pass retained minimum {minimum}",
+              status == "FAIL", repr((status, detail)))
+
+exit23 = json.loads(json.dumps(canonical))
+exit23["guest_exit_code"] = 23
+for side in ("left", "right"):
+    exit23["compared_outputs"][side]["exit_code"] = 23
+status, detail, _, _ = current_result(exit23, process_status=23, expected_status=23)
+check("canonical admission preserves expected nonzero guest status",
+      status == "PASS", repr((status, detail)))
+weak23 = json.loads(json.dumps(exit23))
+weak23["bitwise_parity"] = False
+weak23["comparison"] = spec("stripped")
+status, detail, _, _ = current_result(weak23, process_status=23, expected_status=23)
+check("expected nonzero guest status cannot excuse weaker evidence",
+      status == "FAIL", repr((status, detail)))
+for process_status in (1, 126, 127):
+    status, detail, _, _ = current_result(canonical, process_status=process_status)
+    check(f"canonical report cannot excuse unexpected process status {process_status}",
+          status == "FAIL" and f"exited {process_status}" in detail, repr((status, detail)))
+status, detail, _, _ = current_result(canonical, timed_out=True)
+check("canonical report cannot excuse a timed-out producer",
+      status == "FAIL" and "timed out" in detail, repr((status, detail)))
 
 # --------------------------------------------------------------------------
 # Ported from the closed hermit#2303, re-expected against THIS ladder.
@@ -404,32 +485,30 @@ check("guest < stripped < bitwise",
 check("'detlog' is no longer a tier name", "detlog" not in L2_RANK, repr(L2_RANK))
 
 print("case MODE — the summary and Hermit flags come from one comparison policy")
-stripped_summary = DEFAULT_VERIFY_POLICY.mode_summary()
+current_summary = DEFAULT_VERIFY_POLICY.mode_summary()
 mode_host_tmp = Path("/host-tmp")
-stripped_command = hermit_command(
+current_command = hermit_command(
     Path("/hermit"), "ptrace", ["/bin/true"], "hello_stdout", True,
     host_tmp=mode_host_tmp,
     verify=True,
 )
 expected_prefix = ["/hermit", "run", *DEFAULT_VERIFY_POLICY.displayed_flags()]
 check("the policy supplies the exact Hermit command prefix",
-      stripped_command[:len(expected_prefix)] == expected_prefix,
-      repr(stripped_command))
+      current_command[:len(expected_prefix)] == expected_prefix,
+      repr(current_command))
 check("the command uses the supplied host temporary directory",
-      f"--tmp={mode_host_tmp}" in stripped_command,
-      repr(stripped_command))
+      f"--tmp={mode_host_tmp}" in current_command,
+      repr(current_command))
 check("the summary prints the exact requested flags",
-      shlex.join(DEFAULT_VERIFY_POLICY.displayed_flags()) in stripped_summary,
-      stripped_summary)
-check("Stripped summary names the lossy policy", "Stripped" in stripped_summary,
-      stripped_summary)
-check("Stripped summary does NOT claim byte identity",
-      "byte-identical" not in stripped_summary, stripped_summary)
-check("Stripped summary does NOT label the mode L2",
-      "MODE: L2" not in stripped_summary and "below L2" in stripped_summary,
-      stripped_summary)
-check("Stripped command does NOT request --verify-strict",
-      "--verify-strict" not in stripped_command, repr(stripped_command))
+      shlex.join(DEFAULT_VERIFY_POLICY.displayed_flags()) in current_summary,
+      current_summary)
+check("current summary names canonical INFO policy",
+      "canonical BitwiseInfoV1 INFO" in current_summary, current_summary)
+check("current policy requires L2 despite the retained stripped minimum",
+      DEFAULT_VERIFY_POLICY.assurance_label() == "L2"
+      and DEFAULT_VERIFY_POLICY.expected_non_kvm_tier == "stripped", current_summary)
+check("default canonical verification needs no extra compatibility flag",
+      "--verify-strict" not in current_command, repr(current_command))
 check("the default policy preserves the exact command flags",
       DEFAULT_VERIFY_POLICY.hermit_flags ==
       ("--verify", "--verify-allow", "both"),
@@ -447,12 +526,19 @@ check("a genuinely canonical policy still claims L2",
 check("the canonical bracket requests --verify-strict",
       "--verify-strict" in canonical_policy.hermit_flags,
       repr(canonical_policy.hermit_flags))
+for flags, minimum in (
+    (("--verify", "--verify-allow", "both"), "bitwise"),
+    (("--verify", "--verify-strict", "--verify-allow", "both"), "stripped"),
+):
+    compatible = VerifyPolicy.checked(flags, minimum, "canonical INFO comparison")
+    check("canonical flags and retained minimum remain independent",
+          compatible.hermit_flags == flags
+          and compatible.expected_non_kvm_tier == minimum
+          and compatible.assurance_label() == "L2", repr(compatible))
 for name, flags, tier in (
-    ("bitwise without --verify-strict",
-     ("--verify", "--verify-allow", "both"), "bitwise"),
-    ("--verify-strict without bitwise",
-     ("--verify", "--verify-strict", "--verify-allow", "both"), "stripped"),
+    ("missing verification", ("--verify-allow", "both"), "stripped"),
     ("missing exit-status handling", ("--verify",), "stripped"),
+    ("invalid minimum tier", ("--verify", "--verify-allow", "both"), "guest"),
 ):
     try:
         VerifyPolicy.checked(flags, tier, "invalid test policy")
@@ -477,9 +563,8 @@ check("the public output has no false L2 mode or ratchet label",
 check("the public ratchet names the actual --verify mode",
       "RATCHET --verify ptrace:" in check_only.stdout, check_only.stdout)
 
-print("case CONTRACT — today's contracts demand 'stripped', not 'bitwise'")
-# Asserting bitwise before an INFO-tier comparator exists would red every
-# ptrace/DBT cell for a comparator limitation, not a guest defect.
+print("case CONTRACT — retained minimum tiers remain unchanged")
+# Active canonical qualification is additional to these historical minimums.
 check("ptrace verify contract is 'stripped'",
       expectation("ptrace", "exit_status", True)[0] == "stripped")
 # `exit_status` is a declared dbt L2 gap, so it would report "gap" regardless of

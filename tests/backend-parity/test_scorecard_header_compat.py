@@ -759,6 +759,50 @@ if err is None:
         hdr,
     )
 
+print("case KVM REASON — canonical evidence and historical output-only rows stay distinct")
+for header in (None, CURRENT_20):
+    with tempfile.TemporaryDirectory(prefix="scorecard-kvm-evidence-") as td:
+        destination = Path(td) / "observations.csv"
+        if header is not None:
+            destination.write_text(header + "\n", encoding="utf-8")
+        planted = []
+        for status, tier in (("PASS", "bitwise"), ("XPASS", "bitwise"),
+                             ("FAIL", "bitwise"), ("PASS", "guest"), ("PASS", "")):
+            evidence = ({"tier": tier, "verify_compare": "canonical",
+                         "bitwise_parity": "1", "compared_log_messages": "239|239"}
+                        if tier == "bitwise" else {"tier": tier})
+            planted.append({
+                "result": status, "backend": "kvm",
+                "test_name": f"planted-kvm-{status}-{tier or 'legacy'}",
+                "expectation": "guest", "seconds": "1.0",
+                "detail": f"synthetic {status} {tier or 'legacy'} detail",
+                "evidence": evidence,
+            })
+        run_matrix.append_parent_scorecard(
+            destination, planted, strict=True, verify=True, probe_gaps=False,
+            run_id="synthetic-kvm-reason", epoch=1,
+        )
+        stored = read_planted(destination)
+        for result in planted:
+            row = stored[result["test_name"]]
+            tier = result["evidence"]["tier"]
+            historical = tier != "bitwise"
+            check(f"{header is None}/{result['test_name']} preserves its outcome",
+                  row["outcome"] == ("fail" if result["result"] == "FAIL" else "pass"),
+                  repr(row))
+            expected_reason = result["detail"]
+            if historical:
+                expected_reason = (
+                    "Guest-visible verification only (stdout+exit compared; internal "
+                    f"trace not compared): {expected_reason}"
+                )
+            check(f"{header is None}/{result['test_name']} reason matches its evidence",
+                  row["reason"] == expected_reason, repr(row))
+            if header is None and tier == "bitwise":
+                check(f"{result['test_name']} retains the complete canonical columns",
+                      all(row[key] == value for key, value in result["evidence"].items()),
+                      repr(row))
+
 print("case ROUTING — validation writes an ignored observation, never current scorecard")
 with tempfile.TemporaryDirectory(prefix="scorecard-routing-") as td:
     root = Path(td)

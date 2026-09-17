@@ -137,11 +137,14 @@ invocation of each eligible syscall site and installs an instruction-punning
 hook. Later invocations enter the LiteInst trampoline and return to the same
 ptrace-owned Detcore lifecycle.
 
-`--verify` compares captured status and output and applies the `Stripped`
-comparison to selected Detcore scheduler messages. A successful result is a
-useful diagnostic, but it is not strict determinism. Strict verification requires
-`--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
-compared-message counts.
+`--verify` compares captured status, output, and canonical INFO messages by
+default. Numeric fields are preserved; only the defined log envelope and
+explicitly marked address fields are canonicalized. Use `--verify-json REPORT.json`
+to retain the typed verdict, and require a matched canonical comparison,
+`bitwise_parity: true`, and equal positive compared-message counts before claiming
+strict verification. `--verify-strict` remains an accepted compatibility spelling
+for this default policy. Historical `Stripped` reports remain readable, but do
+not establish the current canonical guarantee.
 Guests may create threads and child processes: `clone`, `clone3` and `fork` run
 under the ordinary ptrace lifecycle. Hook installation is single-task only,
 though -- the patch helper runs on a process-global stack and the installer is
@@ -158,7 +161,7 @@ e9patch runtime artifacts. KVM requires read-write `/dev/kvm` access plus its
 guest-kernel Linux ABI.
 
 SaBRe is built only with the non-default `third-party-backends` feature. Its
-measured post-0.2 `Stripped` envelope, build instructions, and explicit
+historical post-0.2 `Stripped` measurements, build instructions, and explicit
 unsupported cases are documented in
 [SaBRe backend compatibility](docs/SABRE_COMPATIBILITY.md).
 
@@ -209,7 +212,7 @@ virtual-machine configuration.
 | Goal | Command | Status |
 | --- | --- | --- |
 | Deterministic execution | `hermit run -- PROGRAM ARGS...` | Default and recommended mode |
-| Verify two executions | `hermit run --verify -- PROGRAM` | Runs the `Stripped` diagnostic over output, status, and selected logs; not strict determinism |
+| Verify two executions | `hermit run --verify -- PROGRAM` | Compares output, status, and canonical INFO logs; retain `--verify-json` and check the typed verdict and nonzero counts |
 | Explore schedules | `hermit run --chaos --sched-seed=N -- PROGRAM` | Seeded, reproducible schedule variation |
 | Record an execution | `hermit record start -- PROGRAM ARGS...` | Experimental |
 | Replay the latest recording | `hermit replay --autopilot` | Experimental |

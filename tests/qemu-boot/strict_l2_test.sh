@@ -216,7 +216,7 @@ cat "$verifier_stderr" >&2
 if ((status != 0)); then
   fail "QEMU strict L2 verification exited with status $status"
 fi
-"$VERIFICATION_REPORT_BIN" matched "$verify_report" || \
+"$VERIFICATION_REPORT_BIN" canonical-match "$verify_report" || \
   fail "typed verification report did not match"
 stop_active_group
 

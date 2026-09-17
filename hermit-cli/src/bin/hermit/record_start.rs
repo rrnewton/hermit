@@ -54,7 +54,6 @@ use super::run::parse_assignment;
 use super::run::path_resolution_visits_prefix;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
-use super::verify::LogCompareStrictness;
 use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
 use super::verify::setup_double_run;
@@ -271,22 +270,10 @@ pub struct StartOpts {
     /// or opaque filtered match.
     #[clap(long, requires = "verify", value_name = "PATH")]
     verify_json: Option<PathBuf>,
-
-    /// With --verify, compare the record and replay logs under the CANONICAL
-    /// parity policy: strip only the real wall-clock timestamp prefix, canonicalize
-    /// host memory addresses to first-appearance ordinals (tolerating an ASLR
-    /// shift while still diverging on allocation-order or aliasing changes), and
-    /// compare every INFO message's remaining bytes — virtual-time timestamps,
-    /// raw syscall argument/result values, counts, sizes, flags — exactly. An
-    /// explicit DEBUG/TRACE level remains captured for diagnostics but does not
-    /// change the INFO verdict. Without this the
-    /// default `--verify` normalizes away numbers, addresses, tmp paths, and
-    /// timestamps before comparing, so a "verified" result asserts only stripped
-    /// parity, not bitwise identity. A record/replay determinism ratchet keying on
-    /// the verdict should set this so it cannot be silently weakened to a stripped
-    /// comparison.
-    #[clap(long, requires = "verify")]
-    verify_strict: bool,
+    /// Compatibility spelling for the default canonical INFO comparison.
+    /// Recording and replay still report their actual time-virtualization policy.
+    #[clap(long = "verify-strict", requires = "verify")]
+    _verify_strict: bool,
 
     /// After recording, immediately replays the command to verify that it works
     /// With provided gdb command (passed by `-ex`).
@@ -503,13 +490,7 @@ impl StartOpts {
         if let Some(path) = &self.verify_json {
             write_pending_verification_json(path)?;
         }
-        let strictness = if self.verify_strict {
-            LogCompareStrictness::Canonical
-        } else {
-            LogCompareStrictness::Stripped
-        };
-        let ((global1, log1), (global2, log2)) =
-            setup_double_run(global, "record", "replay", strictness);
+        let ((global1, log1), (global2, log2)) = setup_double_run(global, "record", "replay");
 
         let (mut recording_container, record_identity_guard) = self.recording_container(global)?;
 
@@ -567,7 +548,6 @@ impl StartOpts {
             },
             ComparisonOptions {
                 verbose: false,
-                strictness,
                 compare_logs: true,
                 diagnostic_full_trace: false,
                 // Recording DOES enable the syscall output-buffer hash, so a
@@ -733,7 +713,7 @@ mod tests {
             record_timeout: None,
             verify: false,
             verify_json: None,
-            verify_strict: false,
+            _verify_strict: false,
             gdbex: Vec::new(),
         }
     }
@@ -844,7 +824,7 @@ mod tests {
             record_timeout: None,
             verify: false,
             verify_json: None,
-            verify_strict: false,
+            _verify_strict: false,
             gdbex: Vec::new(),
         };
         let error = options.resolve_e9patch_record_target().unwrap_err();

@@ -792,8 +792,8 @@ fn check_output(output: &Output, logs: Vec<String>, dts: &mut DetTestState) {
                 )
             }
             for ix in 0..x.len().min(filtered.len()) {
-                let str_a = detcore::logdiff::strip_log_entry(&x[ix]);
-                let str_b = detcore::logdiff::strip_log_entry(&filtered[ix]);
+                let str_a = &x[ix];
+                let str_b = &filtered[ix];
                 assert_eq!(
                     str_a, str_b,
                     "\n  Consecutive runs of test had different COMMITs #{}, run1:\n{:?}\n  Run2:\n{:?}",
@@ -823,6 +823,37 @@ mod tests {
     use super::install_global_test_subscriber;
     use super::requested_test_workdir;
     use super::test_fn_with_config;
+
+    #[test]
+    fn commit_comparison_preserves_numeric_values_and_record_count() {
+        let output = reverie::process::Output {
+            status: ExitStatus::Exited(0),
+            stdout: b"same output\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        let line =
+            |time| format!("INFO detcore::scheduler: COMMIT turn 3, dettid 2 at time {time}");
+        let mut same = super::DetTestState::default();
+        super::check_output(&output, vec![line(100)], &mut same);
+        super::check_output(&output, vec![line(100)], &mut same);
+        std::assert_eq!(same.test_run_num, 2);
+        std::assert_eq!(
+            same.last_log,
+            Some(vec![" turn 3, dettid 2 at time 100".to_owned()])
+        );
+
+        for differing in [vec![line(200)], vec![line(100), line(100)]] {
+            let mut state = super::DetTestState::default();
+            super::check_output(&output, vec![line(100)], &mut state);
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::check_output(&output, differing, &mut state);
+            }));
+            assert!(
+                failure.is_err(),
+                "a COMMIT value or count difference must fail"
+            );
+        }
+    }
 
     #[test]
     fn isolated_workdir_request_is_exact_and_fail_closed() {

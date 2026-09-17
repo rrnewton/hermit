@@ -132,13 +132,10 @@ if [[ -n $skid_margin ]]; then
   hermit_args+=(--skid-margin="$skid_margin")
 fi
 if [[ $verify == 1 ]]; then
-  # ⚠️ `--verify-strict` IS LOAD-BEARING FOR THE L2 LABEL PRINTED BELOW.
-  # A plain `--verify` stays on the lossy Stripped comparator on every backend
-  # -- `RunOpts::verification_strictness` returns `Canonical` only under
-  # `--verify-strict`/`--verify-verbose`, and
-  # `comparator_choice_does_not_depend_on_the_backend` pins that. AGENTS.md is
-  # explicit that default `--verify` "cannot establish L2", so requesting it
-  # while printing `level=L2` claimed a tier the run never reached.
+  # Current --verify uses canonical INFO by default. Retain --verify-strict
+  # for compatibility with older binaries whose default was Stripped.
+  # The typed verdict and positive compared-message counts below still decide
+  # whether this execution qualifies; selecting the policy alone is not proof.
   hermit_args+=(--verify --verify-strict --verify-json "$verify_json")
 fi
 hermit_args+=(--)
@@ -198,10 +195,10 @@ printf 'console_sha256=%s\n' \
   "$(sha256sum "$console_log" | cut -d' ' -f1)"
 
 if [[ $verify == 1 ]]; then
-  # Read the TYPED verdict, not the banner. ":: Success: deterministic.
-  # Determinism verified." is printed by a run whose own --verify-json says
-  # `bitwise_parity: false`, so scraping it cannot tell a stripped match from a
-  # canonical one -- which is precisely how this demo used to certify L2.
+  # Read the TYPED verdict, not the banner. Historically ":: Success:
+  # deterministic. Determinism verified." was also printed for Stripped
+  # matches with `bitwise_parity: false`. Keep rejecting those old results and
+  # any current comparison that lacks the evidence required below.
   #
   # These conjuncts mirror `verify_tier_from_json` in
   # tests/backend-parity/run_matrix.py, the repository's enforcing definition of

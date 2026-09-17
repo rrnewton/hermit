@@ -69,6 +69,7 @@ use super::tracing::init_sync_file_tracing;
 use super::tracing::log_max_bytes;
 use super::verify::ComparedRun;
 use super::verify::ComparisonOptions;
+#[cfg(test)]
 use super::verify::LogCompareStrictness;
 use super::verify::NoResultReason;
 use super::verify::VerificationReport;
@@ -551,21 +552,11 @@ pub struct RunOpts {
     #[clap(long, requires = "verify")]
     verify_verbose: bool,
 
-    /// Compare the internal logs under the CANONICAL parity policy: strip only
-    /// the real wall-clock timestamp prefix (genuinely irreproducible),
-    /// canonicalize host memory addresses to first-appearance ordinals (so an
-    /// ASLR shift is tolerated but allocation-order and aliasing changes still
-    /// diverge), and compare every INFO message's remaining bytes — virtual-time
-    /// timestamps, raw syscall argument/result values, counts, sizes, flags —
-    /// exactly. An explicit `--log=debug` or `--log=trace` remains captured for
-    /// `--print-verify-logs` diagnostics but does not change this INFO verdict; use
-    /// `--verify-verbose` to request an all-level diagnostic comparison. Without
-    /// this (and without --verify-verbose) the default `--verify` normalizes away
-    /// numbers, addresses, tmp paths, and timestamps before comparing, so a
-    /// "verified" result asserts only stripped parity, not bitwise identity.
-    /// Unlike --verify-verbose this stays quiet: it changes only the comparison,
-    /// not the diff output volume, so a determinism ratchet can require parity
-    /// without drowning in trace logs.
+    /// Compatibility spelling for the default canonical INFO comparison.
+    /// Every --verify compares exit status, stdout and stderr exactly, and all
+    /// INFO records after removing real wall-clock prefixes and ordinalizing
+    /// explicitly marked host addresses. Numeric values remain exact.
+    /// Use --verify-verbose for an all-level diagnostic comparison.
     #[clap(long, requires = "verify")]
     verify_strict: bool,
 
@@ -1347,7 +1338,7 @@ fn backend_values_parse_and_round_trip() {
 /// its return. `bitwise_parity_contract_accepts_only_named_canonical_envelopes`
 /// already pins that only a canonical envelope may claim parity, but nothing
 /// pinned WHICH REQUESTS REACH canonical — so re-introducing a backend term in
-/// `verification_strictness` would have restored the original defect silently.
+/// verification option construction would have restored the original defect silently.
 /// Iterating every `Backend` variant is what makes that impossible: a KVM-shaped
 /// special case fails here by name.
 #[test]
@@ -1360,30 +1351,32 @@ fn comparator_choice_does_not_depend_on_the_backend() {
         ("kvm", Backend::Kvm),
         ("e9patch", Backend::E9patch),
     ] {
-        let plain = RunOpts::parse_from(["fakehermit", "--backend", value, "--verify", "fakeprog"]);
-        assert_eq!(plain.selected_backend(), backend);
-        assert_eq!(
-            plain.verification_strictness(),
-            LogCompareStrictness::Stripped,
-            "plain --verify on {value} must stay on the lossy comparator, so it \
-             cannot claim canonical bitwise parity"
-        );
-
-        for flag in ["--verify-strict", "--verify-verbose"] {
-            let canonical = RunOpts::parse_from([
-                "fakehermit",
-                "--backend",
-                value,
-                "--verify",
-                flag,
-                "fakeprog",
-            ]);
-            assert_eq!(
-                canonical.verification_strictness(),
-                LogCompareStrictness::Canonical,
-                "{flag} on {value} must reach the canonical comparator; KVM \
-                 bypassing it unconditionally was the hermit#2217 defect"
+        for flag in [None, Some("--verify-strict"), Some("--verify-verbose")] {
+            let mut argv = vec!["fakehermit", "--backend", value, "--verify"];
+            argv.extend(flag);
+            argv.push("fakeprog");
+            let run = RunOpts::parse_from(argv);
+            assert_eq!(run.selected_backend(), backend);
+            let options = run.verification_comparison_options();
+            assert!(
+                options.compare_logs,
+                "--verify on {value} must compare both logs"
             );
+            assert_eq!(
+                options.diagnostic_full_trace,
+                flag == Some("--verify-verbose")
+            );
+            let spec = super::verify::ComparisonSpec::new(
+                options.compare_logs,
+                options.diagnostic_full_trace,
+                options.compare_io_buffers,
+                options.record_envelope.policy(),
+                options.virtualize_time,
+            );
+            assert_eq!(spec.strictness, LogCompareStrictness::Canonical);
+            assert!(!spec.strip_lines);
+            assert!(spec.canonicalize_addresses);
+            assert!(spec.exact_remainder);
         }
     }
 }
@@ -2880,33 +2873,6 @@ impl RunOpts {
         }
     }
 
-    /// Which comparator a `--verify` run uses, as a function of the request
-    /// ALONE.
-    ///
-    /// DELIBERATELY BACKEND-INDEPENDENT, AND THAT IS THE PROPERTY UNDER GUARD.
-    /// This used to read `let kvm_output_only = self.selected_backend() ==
-    /// Backend::Kvm`, so plain KVM verification bypassed internal-log comparison
-    /// entirely and `--verify-strict` could not reach the canonical comparator on
-    /// that backend at all. The special case was not narrowed, it was removed:
-    /// every backend now retains both logs and picks its comparator here from
-    /// `verify_verbose`/`verify_strict` only.
-    ///
-    /// Removing a branch leaves nothing behind to notice its return, so
-    /// `comparator_choice_does_not_depend_on_the_backend` pins the absence
-    /// across every `Backend` variant. Re-introducing a backend term here is the
-    /// regression it exists to catch.
-    ///
-    /// `--verify-verbose` historically implied a bitwise compare (it flipped
-    /// `strip_lines` off and `FullTrace` on); that is preserved, and
-    /// `--verify-strict` selects the same comparison quietly.
-    fn verification_strictness(&self) -> LogCompareStrictness {
-        if self.verify_verbose || self.verify_strict {
-            LogCompareStrictness::Canonical
-        } else {
-            LogCompareStrictness::Stripped
-        }
-    }
-
     fn verification_comparison_options(&self) -> ComparisonOptions {
         // Use the configuration the selected runtime backend actually receives.
         // `run_with_output_backend` applies this same normalization before
@@ -2917,7 +2883,6 @@ impl RunOpts {
             hermit::prepare_backend_config(self.effective_det_config(), self.runtime_backend());
         ComparisonOptions {
             verbose: self.verify_verbose,
-            strictness: self.verification_strictness(),
             // The original KVM defect made this false for one backend, reducing
             // verification to guest-output comparison. Keep the actual options
             // consumed by compare_two_runs behind the all-backend regression
@@ -5001,8 +4966,7 @@ impl RunOpts {
         // `log_file` by value. Guaranteed by caller to never panic.
         let log_file = log_file.take().unwrap();
 
-        let strictness = self.verification_strictness();
-        let level = verification_log_level(global.log, strictness, self.verify_verbose);
+        let level = verification_log_level(global.log, self.verify_verbose);
 
         // Bound this log too. `hermit run --verify` opens its own file and
         // calls `init_file_tracing` directly instead of going through

@@ -824,6 +824,12 @@
     },
     {
       "disposition": "special-driver",
+      "path": "tests/backend-parity/test_e9patch_corpus_verification.py",
+      "runner": "check.backend_parity_suites",
+      "why": "tests/backend-parity/test_e9patch_corpus_verification.py is run by portable DAG node check.backend_parity_suites: it uses controlled Hermit transport and the actual shared canonical-report reader to require canonical verification of both plain ptrace and e9patch preprocessing, retain producer-status and timeout failures, and preserve stdout, AOT coverage, no-fallback and tail checks. It observes no guest program, so it is a driver-side suite rather than a manifest test."
+    },
+    {
+      "disposition": "special-driver",
       "path": "tests/backend-parity/test_parallel_validate_paths.py",
       "runner": "check.backend_parity_suites",
       "why": "tests/backend-parity/test_parallel_validate_paths.py is owned by check.backend_parity_suites: This driver-side unittest suite proves concurrent backend-parity runs use isolated host temporary paths and fixed guest workdirs. It tests orchestration rather than serving as a guest program."

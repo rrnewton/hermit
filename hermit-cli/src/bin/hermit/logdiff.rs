@@ -151,11 +151,10 @@ pub struct LogDiffCLIOpts {
     #[clap(long, value_name = "FILE")]
     json: Option<PathBuf>,
 
-    /// Compare the canonical INFO stream used by --verify-strict within the
-    /// selected record envelope. With --json this comparison is mandatory and
-    /// selected automatically.
-    #[clap(long)]
-    canonical_info: bool,
+    /// Compatibility spelling for the default canonical INFO comparison.
+    /// The selected record envelope also applies without this flag or --json.
+    #[clap(long = "canonical-info")]
+    _canonical_info: bool,
 
     /// Versioned record envelope applied before selecting messages. DBT logs
     /// must opt into their transport envelope explicitly; the default preserves
@@ -195,7 +194,7 @@ impl LogDiffCLIOpts {
             file_a: PathBuf::from(a),
             file_b: Some(PathBuf::from(b)),
             json: None,
-            canonical_info: false,
+            _canonical_info: false,
             record_envelope: RecordEnvelopeArg::AllRecordsV1,
             follow: false,
             follow_interval_ms: 500,
@@ -207,15 +206,9 @@ impl LogDiffCLIOpts {
 
     fn one_input_uses_only_canonical_options(&self) -> bool {
         let defaults = logdiff::LogDiffOpts::default();
-        !self.more.strip_lines
-            && self.more.limit == defaults.limit
-            && self.more.ignore_lines.is_empty()
+        self.more.limit == defaults.limit
             && self.more.syscall_history == defaults.syscall_history
             && !self.more.no_color
-            && !self.more.skip_commit
-            && !self.more.skip_detlog
-            && !self.more.git_diff
-            && self.more.include_detlogs == defaults.include_detlogs
     }
 
     /// Print one log canonically or compare two logs.
@@ -269,15 +262,12 @@ impl LogDiffCLIOpts {
         };
 
         let mut options = self.more.clone();
-        if self.canonical_info || self.json.is_some() {
-            if let Err(message) = canonical_comparison_is_unrelaxed(&options) {
-                eprintln!("hermit log-diff: {message}");
-                return ExitStatus::Exited(2);
-            }
-            options.comparison = logdiff::LogComparisonMode::Info;
-            options.canonicalize_addresses = true;
-        }
-        if record_envelope.policy() == RecordEnvelopePolicy::CrossBackendDetcoreV1 {
+        options.comparison = logdiff::LogComparisonMode::Info;
+        options.canonicalize_addresses = true;
+        if matches!(
+            record_envelope.policy(),
+            RecordEnvelopePolicy::AllRecordsV1 | RecordEnvelopePolicy::CrossBackendDetcoreV1
+        ) {
             options.require_structured_events = true;
         }
 
@@ -298,9 +288,7 @@ impl LogDiffCLIOpts {
             return self.follow_two_runs(file_b, &options, record_envelope);
         }
 
-        let comparison = if (self.canonical_info || self.json.is_some())
-            && record_envelope.policy() == RecordEnvelopePolicy::AllRecordsV1
-        {
+        let comparison = if record_envelope.policy() == RecordEnvelopePolicy::AllRecordsV1 {
             try_bitwise_info_v1_with_records(&self.file_a, file_b, &options)
                 .map(|(summary, left, right)| (summary, left, right, None))
         } else {
@@ -396,8 +384,7 @@ impl LogDiffCLIOpts {
         let deadline = (self.follow_timeout_secs > 0)
             .then(|| Instant::now() + Duration::from_secs(self.follow_timeout_secs));
 
-        let fixed_bitwise_info_v1 = (self.canonical_info || self.json.is_some())
-            && record_envelope.policy() == RecordEnvelopePolicy::AllRecordsV1;
+        let fixed_bitwise_info_v1 = record_envelope.policy() == RecordEnvelopePolicy::AllRecordsV1;
         let mut previous_sizes: Option<(usize, usize)> = None;
         let mut unchanged_polls = 0u32;
         let mut last_reported_records = usize::MAX;
@@ -591,26 +578,6 @@ impl LogDiffCLIOpts {
     }
 }
 
-fn canonical_comparison_is_unrelaxed(options: &logdiff::LogDiffOpts) -> Result<(), &'static str> {
-    let defaults = logdiff::LogDiffOpts::default();
-    if options.strip_lines {
-        return Err("canonical INFO comparison conflicts with --unsafe-strip-lines");
-    }
-    if !options.ignore_lines.is_empty() {
-        return Err("canonical INFO comparison does not permit --ignore-lines");
-    }
-    if options.skip_commit || options.skip_detlog {
-        return Err("canonical INFO comparison does not permit message skipping");
-    }
-    if options.git_diff {
-        return Err("canonical INFO JSON does not support --git-diff");
-    }
-    if options.include_detlogs != defaults.include_detlogs {
-        return Err("canonical INFO comparison does not permit DETLOG filtering");
-    }
-    Ok(())
-}
-
 fn json_report(
     summary: &logdiff::LogDiffSummary,
     options: &logdiff::LogDiffOpts,
@@ -627,19 +594,9 @@ fn json_report(
         LogDiffVerdict::Matched
     };
     let stream = match options.comparison {
-        logdiff::LogComparisonMode::Deterministic => "deterministic",
         logdiff::LogComparisonMode::Info => "info",
         logdiff::LogComparisonMode::FullTrace => "full_trace",
     };
-    let included_detlog_kinds = options
-        .include_detlogs
-        .iter()
-        .map(|kind| match kind {
-            logdiff::DetLogFilter::Syscall => "syscall".to_owned(),
-            logdiff::DetLogFilter::SyscallResult => "syscall_result".to_owned(),
-            logdiff::DetLogFilter::Other => "other".to_owned(),
-        })
-        .collect();
     LogDiffReport {
         schema: LOG_DIFF_REPORT_SCHEMA,
         verdict,
@@ -656,14 +613,15 @@ fn json_report(
         comparison: LogDiffComparison {
             stream: stream.to_owned(),
             record_envelope,
-            unsafe_strip_lines: options.strip_lines,
+            unsafe_strip_lines: false,
             canonicalize_host_addresses: options.canonicalize_addresses,
-            require_structured_events: options.require_structured_events,
-            ignored_line_substrings: options.ignore_lines.clone(),
-            skip_commit: options.skip_commit,
-            skip_detlog: options.skip_detlog,
-            included_detlog_kinds,
-            git_diff: options.git_diff,
+            require_structured_events: options.require_structured_events
+                || record_envelope == RecordEnvelopePolicy::AllRecordsV1,
+            ignored_line_substrings: Vec::new(),
+            skip_commit: false,
+            skip_detlog: false,
+            included_detlog_kinds: vec!["syscall".into(), "syscall_result".into(), "other".into()],
+            git_diff: false,
         },
         first_divergent_scheduler_turn: summary.first_divergent_scheduler_turn,
         first_divergent_virtual_nanoseconds: summary.first_divergent_virtual_nanoseconds,
@@ -783,7 +741,7 @@ mod tests {
 
         let mut options = LogDiffCLIOpts::new(&left, &right);
         options.follow = true;
-        options.canonical_info = true;
+        options._canonical_info = true;
         options.json = Some(json.clone());
         options.follow_interval_ms = 1;
         options.follow_timeout_secs = 1;
@@ -1376,7 +1334,7 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
         .unwrap();
         assert_eq!(value["verdict"], "diverged");
         assert_eq!(value["selected_messages"]["left"], 8);
-        assert_eq!(value["comparison"]["stream"], "deterministic");
+        assert_eq!(value["comparison"]["stream"], "info");
         assert_eq!(value["first_divergent_scheduler_turn"], 17);
         assert_eq!(value["first_divergent_virtual_nanoseconds"], 123);
         assert_eq!(value["first_divergent_left_message"], "INFO detcore: left");
@@ -1437,20 +1395,99 @@ Apr 09 06:08:02.100  INFO detcore: DETLOG unfinished\n";
     #[test]
     fn canonical_json_refuses_relaxed_comparisons_and_starts_as_no_result() {
         let options = logdiff::LogDiffOpts::default();
-        assert!(canonical_comparison_is_unrelaxed(&options).is_ok());
-
-        let mut stripped = options.clone();
-        stripped.strip_lines = true;
-        assert!(canonical_comparison_is_unrelaxed(&stripped).is_err());
-
-        let mut ignored = options.clone();
-        ignored.ignore_lines.push("difference".to_owned());
-        assert!(canonical_comparison_is_unrelaxed(&ignored).is_err());
-
+        for flag in [
+            "--strip-lines",
+            "--unsafe-strip-lines",
+            "--ignore-lines=payload",
+            "--skip-commit",
+            "--skip-detlog",
+            "--include-detlogs=syscall",
+            "--git-diff",
+        ] {
+            let error =
+                LogDiffCLIOpts::try_parse_from(["log-diff", "left", "right", flag]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag}"
+            );
+            assert!(error.to_string().contains(flag.split('=').next().unwrap()));
+        }
+        for argv in [
+            vec!["log-diff", "left", "right"],
+            vec!["log-diff", "--canonical-info", "left", "right"],
+        ] {
+            let parsed = LogDiffCLIOpts::try_parse_from(argv).unwrap();
+            assert_eq!(parsed.more.comparison, logdiff::LogComparisonMode::Info);
+            assert!(parsed.more.canonicalize_addresses);
+        }
         let report = pending_json_report(&options, RecordEnvelopePolicy::AllRecordsV1);
         assert_eq!(
             serde_json::to_value(report).unwrap()["verdict"],
             "no_result"
+        );
+    }
+
+    #[test]
+    fn plain_logdiff_compares_all_info_without_json_or_compatibility_flags() {
+        let directory = tempfile::tempdir().unwrap();
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+        let json = directory.path().join("comparison.json");
+        let stable = current_record(1, "DETLOG stable");
+        let text = |value| format!("{stable}Apr 09 06:08:02.100  INFO unrelated: value={value}\n");
+        std::fs::write(&left, text(100)).unwrap();
+        let global = GlobalOpts::try_parse_from(["hermit"]).unwrap();
+        for compatibility in [false, true] {
+            for with_json in [false, true] {
+                let mut options = LogDiffCLIOpts::new(&left, &right);
+                options._canonical_info = compatibility;
+                options.json = with_json.then(|| json.clone());
+                std::fs::write(&right, text(200)).unwrap();
+                assert_eq!(
+                    options.main(&global),
+                    ExitStatus::Exited(HERMIT_VERIFICATION_DIVERGENCE_EXIT)
+                );
+                if with_json {
+                    let report: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&json).unwrap()).unwrap();
+                    assert_eq!(report["verdict"], "diverged");
+                    assert_eq!(report["selected_messages"]["left"], 2);
+                    assert_eq!(report["selected_messages"]["right"], 2);
+                    assert_eq!(report["comparison"]["stream"], "info");
+                    assert_eq!(report["comparison"]["require_structured_events"], true);
+                    assert_eq!(report["comparison"]["unsafe_strip_lines"], false);
+                }
+                std::fs::write(&right, text(100)).unwrap();
+                assert_eq!(options.main(&global), ExitStatus::Exited(0));
+                std::fs::write(&right, b"INFO detcore: DETLOG invalid=\xff").unwrap();
+                assert_eq!(options.main(&global), ExitStatus::Exited(2));
+            }
+        }
+    }
+
+    #[test]
+    fn plain_follow_compares_all_info_without_json_or_compatibility_flags() {
+        let directory = tempfile::tempdir().unwrap();
+        let left = directory.path().join("left.log");
+        let right = directory.path().join("right.log");
+        let text = |value| {
+            format!(
+                "{}Apr 09 06:08:02.100  INFO unrelated: value={value}\n{}",
+                current_record(1, "DETLOG stable"),
+                current_record(3, "DETLOG unfinished tail"),
+            )
+        };
+        std::fs::write(&left, text(100)).unwrap();
+        std::fs::write(&right, text(200)).unwrap();
+        let mut options = LogDiffCLIOpts::new(&left, &right);
+        options.follow = true;
+        options.follow_interval_ms = 1;
+        options.follow_timeout_secs = 1;
+        let global = GlobalOpts::try_parse_from(["hermit"]).unwrap();
+        assert_eq!(
+            options.main(&global),
+            ExitStatus::Exited(HERMIT_VERIFICATION_DIVERGENCE_EXIT)
         );
     }
 

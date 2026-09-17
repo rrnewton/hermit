@@ -242,7 +242,7 @@ run_scenario() {
   if ((status != 0)); then
     fail "[$name] strict L2 verification exited with status $status"
   fi
-  "$VERIFICATION_REPORT_BIN" matched "$verify_report" || \
+  "$VERIFICATION_REPORT_BIN" canonical-match "$verify_report" || \
     fail "[$name] typed verification report did not match"
   stop_active_group
 

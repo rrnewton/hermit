@@ -171,7 +171,7 @@ run_strict_verify() {
         fail "strict verification exited $status"
     fi
 
-    if ! "$VERIFICATION_REPORT_BIN" matched "$VERIFY_REPORT"; then
+    if ! "$VERIFICATION_REPORT_BIN" canonical-match "$VERIFY_REPORT"; then
         cat "$VERIFY_STDOUT" >&2
         tail -80 "$VERIFY_STDERR" >&2
         fail "typed verification report did not match"
@@ -203,7 +203,7 @@ assert_stdout_matches() {
 
 pass_test() {
     if [[ $SYSTEM_UTIL_BACKEND == kvm ]]; then
-        printf 'PASS [%s/kvm]: strict --verify output/exit parity with INFO logging; internal trace comparison unavailable; relaxations=none\n' \
+        printf 'PASS [%s/kvm]: strict --verify canonical INFO and output/exit match; relaxations=none\n' \
             "$SYSTEM_UTIL_TEST_NAME"
     else
         printf 'PASS [%s/%s]: L2 with INFO logging; relaxations=none\n' \

@@ -26,6 +26,13 @@ trap 'rm -rf -- "$WORK"' EXIT
 
 failures=0
 
+# The producer is synthetic; the report reader is the real current binary.
+export VERIFICATION_REPORT_BIN=${VERIFICATION_REPORT_BIN:-"$HERE/../../../../target/debug/verification-report"}
+if [[ ! -x $VERIFICATION_REPORT_BIN ]]; then
+    printf 'Build the current reader with cargo build -p hermit --bin verification-report, or set VERIFICATION_REPORT_BIN\n' >&2
+    exit 1
+fi
+
 # A fake Hermit that writes $FAKE_REPORT (if set) to the --verify-json path and
 # exits $FAKE_STATUS. Nothing here depends on a real guest or a real comparison.
 cat >"$WORK/fake-hermit" <<'FAKE'
@@ -39,6 +46,9 @@ for arg in "$@"; do
 done
 if [[ -n ${FAKE_REPORT:-} && -n $verdict_path ]]; then
     printf '%s' "$FAKE_REPORT" >"$verdict_path"
+fi
+if [[ ${FAKE_EMPTY_REPORT:-0} == 1 && -n $verdict_path ]]; then
+    : >"$verdict_path"
 fi
 if [[ -n ${FAKE_ARGS_FILE:-} ]]; then
     printf '%s\n' "$@" >"$FAKE_ARGS_FILE"
@@ -70,6 +80,16 @@ function expect {
         run_hermit_verify "$name" "${invocation[@]}" 2>&1) || rc=$?
     unset FAKE_REPORT FAKE_STATUS
 
+    if [[ $want == STATUS23 ]]; then
+        if ((rc == 23)) && [[ $out == *'strict L2 parity held, but the guest exited nonzero (status 23)'* ]]; then
+            printf '  ok   %-28s valid evidence before guest status 23\n' "$name"
+        else
+            printf '  FAIL %-28s expected typed parity and status 23, got rc=%s:\n%s\n' "$name" "$rc" "$out"
+            failures=$((failures + 1))
+        fi
+        return
+    fi
+
     if [[ $want == PASS ]]; then
         if ((rc == 0)); then
             printf '  ok   %-28s PASS as expected\n' "$name"
@@ -80,7 +100,7 @@ function expect {
         return
     fi
 
-    if ((rc == 0)); then
+    if ((rc == 0 || rc == 23)); then
         printf '  FAIL %-28s expected refusal (%s) but it PASSED\n' "$name" "$want"
         failures=$((failures + 1))
     elif [[ $out != *"$want"* ]]; then
@@ -91,13 +111,63 @@ function expect {
     fi
 }
 
-parity_report='{"verified":true,"bitwise_parity":true,"verdict":"matched","comparison":{"strictness":"canonical"},"compared_log_messages":{"left":1200,"right":1200},"guest_exit_code":0,"guest_signal":null}'
+# Complete synthetic current producer report, including both output operands.
+# The retained historical reports below intentionally remain unchanged.
+parity_report=$(python3 - <<'PY'
+import json
+empty = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+output = dict(exit_code=0, signal=None, stdout_sha256=empty, stdout_bytes=0,
+              stderr_sha256=empty, stderr_bytes=0)
+print(json.dumps(dict(
+    verified=True, bitwise_parity=True, verdict='matched',
+    infrastructure_error=None, no_result_reason=None,
+    comparison=dict(strictness='canonical', display_name='BitwiseInfoV1',
+        compare_logs=True, compare_io_buffers=True, log_scope='info',
+        record_envelope='all_records_v1', virtualize_time=True, strip_lines=False,
+        canonicalize_addresses=True, full_trace=True, exact_remainder=True,
+        stripped_prefixes=['real-wall-clock-prefix/v1'],
+        canonicalizations=['host-address-to-first-appearance-ordinal/v1'],
+        ignore_lines=False, skip_commit=False, skip_detlog=False),
+    compared_log_messages=dict(left=1200, right=1200),
+    compared_outputs=dict(left=output, right=output),
+    guest_exit_code=0, guest_signal=None,
+    first_divergent_scheduler_turn=None, first_divergent_virtual_nanoseconds=None,
+    first_divergent_record=None, first_divergent_syscall=None,
+    first_divergent_left_message=None, first_divergent_right_message=None)))
+PY
+)
 
 printf 'run_hermit_verify verdict discrimination\n'
 
 # POSITIVE. Without this the negatives prove nothing: a reader that always
 # refused would pass every one of them.
 expect strict-parity PASS "$parity_report" 0
+
+status23_report=$(python3 -c 'import json,sys; r=json.loads(sys.argv[1]); r["guest_exit_code"]=23; r["compared_outputs"]["left"]["exit_code"]=23; r["compared_outputs"]["right"]["exit_code"]=23; print(json.dumps(r))' "$parity_report")
+expect valid-guest-status23 STATUS23 "$status23_report" 23
+
+for mutation in strictness compare_logs verified missing_field unequal_counts; do
+    report=$(python3 - "$parity_report" "$mutation" <<'PY'
+import json,sys
+r=json.loads(sys.argv[1])
+if sys.argv[2] == 'strictness': r['comparison']['strictness']='stripped'
+elif sys.argv[2] == 'compare_logs': r['comparison']['compare_logs']=False
+elif sys.argv[2] == 'verified': r['verified']=False
+elif sys.argv[2] == 'missing_field': del r['guest_signal']
+elif sys.argv[2] == 'unequal_counts': r['compared_log_messages']['right']=1199
+else: raise AssertionError(sys.argv[2])
+print(json.dumps(r))
+PY
+)
+    expect "contradictory-$mutation" REFUSED "$report" 23
+done
+
+export FAKE_EMPTY_REPORT=1
+expect empty-report REFUSED "$parity_report" 0
+unset FAKE_EMPTY_REPORT
+
+expect infrastructure-error 'INFRASTRUCTURE ERROR: kind=skid_overshoot count=2' \
+    '{"verified":false,"bitwise_parity":false,"verdict":"infrastructure_error","infrastructure_error":{"kind":"skid_overshoot","count":2},"comparison":null,"compared_log_messages":null}' 1
 
 export HERMIT_E2E_EMPTY_WORKDIR=/test FAKE_ARGS_FILE="$WORK/pinned-root-args"
 expect pinned-root-workdir PASS "$parity_report" 0

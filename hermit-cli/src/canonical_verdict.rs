@@ -621,6 +621,21 @@ impl VerificationReport {
             self.require_exact_output_match()?;
         }
         if self.verified && self.verdict == Verdict::Matched && self.bitwise_parity {
+            if !self
+                .compared_log_messages
+                .as_ref()
+                .is_some_and(|counts| counts.left == counts.right)
+            {
+                return Err(format!(
+                    "canonical match has unequal compared log-message counts: {}/{}",
+                    self.compared_log_messages
+                        .as_ref()
+                        .map_or(0, |counts| counts.left),
+                    self.compared_log_messages
+                        .as_ref()
+                        .map_or(0, |counts| counts.right),
+                ));
+            }
             Ok(())
         } else {
             Err(format!(
@@ -824,6 +839,31 @@ mod tests {
         let mut weak = report(LogCompareStrictness::Canonical, true, 1, 1);
         weak.comparison.as_mut().unwrap().record_envelope = RecordEnvelopeReport::CallerDefined;
         assert!(weak.require_canonical_match().is_err());
+    }
+
+    #[test]
+    fn canonical_match_rejects_unequal_counts_without_rewriting_history() {
+        let unequal = report(LogCompareStrictness::Canonical, true, 2, 3);
+        let raw = serde_json::to_vec(&unequal).unwrap();
+        let retained = VerificationReport::from_json_slice(&raw).unwrap();
+        assert_eq!(retained, unequal);
+        assert_eq!(serde_json::to_vec(&retained).unwrap(), raw);
+        assert!(retained.require_canonical_comparison().is_ok());
+        assert_eq!(
+            retained.require_canonical_match().unwrap_err(),
+            "canonical match has unequal compared log-message counts: 2/3"
+        );
+        let mut divergence = retained;
+        divergence.verdict = Verdict::Diverged;
+        divergence.verified = false;
+        divergence.bitwise_parity = false;
+        assert!(divergence.require_canonical_comparison().is_ok());
+        assert!(divergence.require_canonical_match().is_err());
+        assert!(
+            report(LogCompareStrictness::Canonical, true, 2, 2)
+                .require_canonical_match()
+                .is_ok()
+        );
     }
 
     /// The exact bytes hermit writes for a run that reached no verdict, copied

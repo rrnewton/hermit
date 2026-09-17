@@ -130,7 +130,7 @@ function assert_deterministic_with_hermit {
         rm -rf -- "$evidence"
         return 1
     fi
-    if ! "$VERIFICATION_REPORT_BIN" matched "$verify_report"; then
+    if ! "$VERIFICATION_REPORT_BIN" canonical-match "$verify_report"; then
         echo "$label: typed verification report did not match" >&2
         cat "$stdout" >&2
         cat "$stderr" >&2

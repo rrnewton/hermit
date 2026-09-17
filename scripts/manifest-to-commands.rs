@@ -17,6 +17,9 @@
 //! shell command per enabled `(test, mode, backend)` cell. Commands compile
 //! implicit C/Rust guests and prepare shell wrappers before invoking Hermit, so
 //! any individual line can be rerun from the repository root.
+//! Verification cells also require the sibling `verification-report` binary
+//! (`cargo build --release -p hermit --bin hermit --bin verification-report`),
+//! or an already-built reader selected with `VERIFICATION_REPORT_BIN`.
 //!
 //! ```cargo
 //! [dependencies]
@@ -28,6 +31,9 @@
 
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
+
+#[path = "lib/verified_command.rs"]
+mod verified_command;
 
 #[path = "../ci/manifest-plan/src/manifest_value.rs"]
 mod manifest_value;
@@ -365,7 +371,7 @@ fn hermit_command(
         }
         other => fail(format!("unsupported mode `{other}`")),
     };
-    command
+    verified_command::hermit_verification_command(mode, seed, &command)
 }
 
 fn bounded_invocation(command: &str, id: &str, attempt: &str) -> String {

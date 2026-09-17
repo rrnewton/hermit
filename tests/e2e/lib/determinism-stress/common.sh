@@ -213,7 +213,7 @@ verify_guest() {
       printf 'error: %s failed under hermit run --strict --verify\n' "$label" >&2
       return 1
     fi
-    if ! "$VERIFICATION_REPORT_BIN" matched "$verify_report"; then
+    if ! "$VERIFICATION_REPORT_BIN" canonical-match "$verify_report"; then
       cat "$stdout" >&2
       tail -200 "$stderr" >&2
       printf 'error: %s typed verification report did not match\n' "$label" >&2

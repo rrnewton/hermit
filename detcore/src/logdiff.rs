@@ -15,14 +15,11 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
-use std::process::Command;
-use std::str::FromStr;
 use std::sync::LazyLock;
 
 use clap;
 use clap::Parser;
 use regex::Regex;
-use tempfile::NamedTempFile;
 
 use crate::detlog::DetLogEvent;
 use crate::detlog::DetLogRecord;
@@ -92,12 +89,10 @@ pub fn log_was_truncated(log_text: &str) -> bool {
 /// Selects the set of log messages compared for determinism.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum LogComparisonMode {
-    /// Compare deterministic Detcore and scheduler messages.
-    #[default]
-    Deterministic,
     /// Compare every INFO message exactly, while leaving any captured DEBUG or
     /// TRACE messages available for diagnostics. This is the observation
     /// envelope used by the `BitwiseInfoV1` verification policy.
+    #[default]
     Info,
     /// Compare every captured log message without filtering.
     FullTrace,
@@ -135,22 +130,14 @@ impl Default for ComparisonSideLabels {
 /// Options for calling `log_diff`.
 #[derive(Debug, Parser, Clone)]
 pub struct LogDiffOpts {
-    /// UNSAFE: strips numbers and temporary paths before comparison.
-    ///
-    /// This erases timestamps and syscall values that bitwise parity exists to
-    /// compare. Never use this option to make a failing parity diff pass; doing
-    /// so is cheating. It is only for non-parity diagnostic localization.
-    #[clap(long = "unsafe-strip-lines")]
-    pub strip_lines: bool,
-
     /// Canonicalize host memory addresses before comparison WITHOUT erasing them.
     ///
     /// Only addresses a producer has explicitly marked with the
     /// `<hostaddr 0x...>` wrapper (see [`host_addr`]) are canonicalized; each
     /// distinct marked address is rewritten to an ordinal placeholder
     /// `<addr{N}>` assigned by order of first appearance within a single run
-    /// (see `canonicalize_addresses_in_line`). Unlike [`Self::strip_lines`],
-    /// this discards ONLY the host-specific raw pointer value: it preserves
+    /// (see `canonicalize_addresses_in_line`). This
+    /// discards ONLY the host-specific raw pointer value: it preserves
     /// identity (same address -> same ordinal), ordering (introduction
     /// sequence), and aliasing (two names for one address collapse to one
     /// ordinal), and it leaves every other byte -- virtual-time timestamps,
@@ -166,7 +153,7 @@ pub struct LogDiffOpts {
     /// content digests, cpuid leaves. A blanket `0x` canonicalization would
     /// collapse those too, silently erasing real syscall-argument divergence:
     /// a "softer strip" and exactly the fake-green this policy exists to prevent.
-    #[clap(skip)]
+    #[clap(skip = true)]
     pub canonicalize_addresses: bool,
 
     /// The internal message set to compare.
@@ -194,10 +181,6 @@ pub struct LogDiffOpts {
     #[clap(long, default_value = "20")]
     pub limit: u64,
 
-    /// Before comparison, filter out lines which contain this substring.
-    #[clap(long)]
-    pub ignore_lines: Vec<String>,
-
     /// Show this many completed syscalls before each side-specific divergence point.
     /// Set to 0 to omit history.
     #[clap(long, default_value = "0")]
@@ -205,75 +188,11 @@ pub struct LogDiffOpts {
     /// Disable colored console output for line diffs.
     #[clap(long)]
     pub no_color: bool,
-
-    /// Do not consider "COMMIT" messages for deterministic checks.
-    #[clap(long)]
-    pub skip_commit: bool,
-
-    /// Do not consider "DETLOG" messages for deterministic checks.
-    #[clap(long)]
-    pub skip_detlog: bool,
-
-    /// Use git diff instead of the internal, basic log comparison.
-    #[clap(long)]
-    pub git_diff: bool,
-
-    /// In case --skip-detlog=false this parameter further filters which
-    /// "DETLOG" messages will be included for deterministic checks
-    #[clap(long, default_values = &["syscall", "syscallresult", "other"])]
-    pub include_detlogs: Vec<DetLogFilter>,
-}
-
-impl LogDiffOpts {
-    fn is_skip(&self, filter: DetLogFilter) -> bool {
-        !self.include_detlogs.contains(&filter)
-    }
-
-    fn skip_detlog(&self, entry: &LogMessage<'_>) -> bool {
-        if self.skip_detlog {
-            return true;
-        }
-
-        if is_detlog_syscall(entry) && self.is_skip(DetLogFilter::Syscall) {
-            return true;
-        }
-        if is_detlog_syscall_result(entry) && self.is_skip(DetLogFilter::SyscallResult) {
-            return true;
-        }
-
-        if !is_detlog_syscall(entry)
-            && !is_detlog_syscall_result(entry)
-            && self.is_skip(DetLogFilter::Other)
-        {
-            return true;
-        }
-
-        false
-    }
-
-    fn filter_deterministic<'a>(&self, v: &[LogMessage<'a>]) -> Vec<LogMessage<'a>> {
-        v.iter()
-            .filter_map(|message| {
-                if (is_detlog(message)
-                    && !self.skip_detlog(message)
-                    && !is_scheduler_committed_time(message))
-                    || (is_commit(message)
-                        && !self.skip_commit
-                        && !is_internal_io_poll_commit(message))
-                {
-                    Some(*message)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogNormalization {
     Exact,
-    Stripped,
     Canonical,
 }
 
@@ -290,9 +209,7 @@ struct LogComparisonPolicy {
 
 impl LogComparisonPolicy {
     fn from_options(options: &LogDiffOpts) -> Self {
-        let normalization = if options.strip_lines {
-            LogNormalization::Stripped
-        } else if options.canonicalize_addresses {
+        let normalization = if options.canonicalize_addresses {
             LogNormalization::Canonical
         } else {
             LogNormalization::Exact
@@ -305,50 +222,12 @@ impl LogComparisonPolicy {
 
     fn name(self) -> &'static str {
         match (self.comparison, self.normalization) {
-            (LogComparisonMode::Deterministic, LogNormalization::Exact) => "Deterministic",
-            (LogComparisonMode::Deterministic, LogNormalization::Stripped) => "Stripped",
-            (LogComparisonMode::Deterministic, LogNormalization::Canonical) => {
-                "Deterministic with Canonical host-address normalization"
-            }
             (LogComparisonMode::Info, LogNormalization::Exact) => "Info",
-            (LogComparisonMode::Info, LogNormalization::Stripped) => {
-                "Info with Stripped normalization"
-            }
             (LogComparisonMode::Info, LogNormalization::Canonical) => "Canonical",
             (LogComparisonMode::FullTrace, LogNormalization::Exact) => "FullTrace",
-            (LogComparisonMode::FullTrace, LogNormalization::Stripped) => {
-                "FullTrace with Stripped normalization"
-            }
             (LogComparisonMode::FullTrace, LogNormalization::Canonical) => {
                 "FullTrace with Canonical host-address normalization"
             }
-        }
-    }
-}
-
-/// Indicates which DETLOG entries to be used for log-diff comparison
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DetLogFilter {
-    ///the start of syscall will be used for logdiff
-    Syscall,
-    ///the syscall result  will be used for logdiff
-    SyscallResult,
-    ///all other unspecified DETLOG entries will be used for logdiff
-    Other,
-}
-
-impl FromStr for DetLogFilter {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "syscall" => Ok(DetLogFilter::Syscall),
-            "syscallresult" => Ok(DetLogFilter::SyscallResult),
-            "other" => Ok(DetLogFilter::Other),
-            _ => Err(anyhow::Error::msg(format!(
-                "unknown value {} for DetLogFilter",
-                s
-            ))),
         }
     }
 }
@@ -360,64 +239,6 @@ impl Default for LogDiffOpts {
         let v: Vec<String> = vec![];
         LogDiffOpts::parse_from(v.iter())
     }
-}
-
-/// In fully-deterministic modes, many log lines should be fully determinstic across runs.
-/// But as that is a work-in-progress, this utility strips known-nondeterministic
-/// information from logs.
-///
-/// This erasure is deliberately lossy and is NOT a parity claim: it backs the
-/// `Stripped` comparator only (`bitwise_parity: false`). `BitwiseInfoV1`
-/// canonicalizes rather than erases -- see `canonicalize_addresses_in_line`.
-/// Lossy as it is, each pattern must still erase only what it names: erasing a
-/// neighbouring field turns a real divergence into a reported match.
-///
-/// Example input/output:
-///   `Input:  COMMIT turn 3, dettid 231635 using resources Resources { tid: DetPid { inner: 231635 }, resources: {Path("/proc/231635/fd/1"): W} }`
-///   `Output: COMMIT turn <NUM>, dettid <NUM> using resources Resources { tid: DetPid { inner: <NUM> }, resources: {Path("/proc/<pid>/fd/<num>"): W} }`
-///
-/// As you can see this is overkill and smarter strategies would be possible. For example,
-/// ones that remember and post-facto-determinize certain identifiers.
-pub fn strip_log_entry(log: &str) -> String {
-    // Memory addresses, like 0x7fcfb7e7d450
-    //
-    // TODO: use a debug allocator that increases only, never reusing. Also, consider
-    // post-facto processing all of these into new virtual addresses based on the order they're seen.
-    static RE0: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b0[xX][A-Fa-f0-9]+\b").unwrap());
-
-    // Every number, plus common duration suffixes so fractional timing jitter is
-    // not left behind. This one is terrible overkill: for `hermit run` itself and
-    // for all command tests the full contents of a COMMIT line should already be
-    // deterministic, so nothing here should need erasing. It is retained for
-    // `spawn_fn_*` variants, which fork from another process and so exercise only
-    // a *partial* detcore setup without a true process tree of their own.
-    //
-    // N.B. RE4 must run BEFORE this pattern, or `800.709_180s` is consumed here as
-    // a bare number and never reaches the duration rule.
-    static RE1: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\b[\d][\d_]*(?:\.[\d][\d_]*)?(?:ns|us|µs|ms)?\b").unwrap());
-
-    // A quoted /tmp path. `[^"]*` stops at the path's OWN closing quote: a greedy
-    // `.*` here ran to the last quote on the line and erased every field after the
-    // path, so two entries differing only downstream of a /tmp path compared equal.
-    //
-    // TODO: only strip this information if the config specified to the host /tmp through.
-    // Otherwise we can determinize /tmp access fully.
-    static RE2: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"/tmp/[^"]*""#).unwrap());
-
-    // TODO: only strip this one if we're allowing through the host /proc or failing to determinize tids/pids:
-    static RE3: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"/proc/[\d]+/").unwrap());
-
-    // TODO: only strip this if we're running a library-based test where we can't
-    // guarantee the starting state of the allocator/etc.
-    static RE4: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[\d][\d_.]*s\b").unwrap());
-
-    let log = RE4.replace_all(log, "<NANOSECONDS>");
-    let log = RE3.replace_all(&log, "/proc/<PID>/");
-    let log = RE0.replace_all(&log, "<ADDR>");
-    let log = RE1.replace_all(&log, "<NUM>");
-    let log = RE2.replace_all(&log, "/tmp/<somewhere>\"");
-    String::from(log)
 }
 
 /// Wrap a host memory address so `canonicalize_addresses_in_line` will
@@ -445,7 +266,7 @@ pub fn host_addr(addr: usize) -> String {
 ///
 /// Canonical parity strips the wall-clock prefix, canonicalizes these marked
 /// addresses, and compares everything else exactly. This step differs
-/// from [`strip_log_entry`]'s `<ADDR>` erasure in one decisive way: erasure maps
+/// from wholesale `<ADDR>` erasure in one decisive way: erasure maps
 /// every address to a single token, so two runs that allocate in a DIFFERENT
 /// ORDER, or that ALIAS differently (one address printed twice vs. two distinct
 /// addresses), compare EQUAL -- the exact defect parity exists to catch. An
@@ -491,10 +312,6 @@ fn messages_for_comparison(
     policy: LogComparisonPolicy,
 ) -> Vec<String> {
     match policy.normalization {
-        LogNormalization::Stripped => messages
-            .iter()
-            .map(|message| strip_log_entry(message.text))
-            .collect(),
         LogNormalization::Canonical => {
             let mut addresses = HashMap::new();
             let mut next_address = 1usize;
@@ -542,9 +359,8 @@ fn canonical_info_from_str_with_filter(
 /// one captured log.
 ///
 /// This removes the real wall-clock prefix and rewrites only explicitly marked
-/// host addresses to first-appearance ordinals. It does not run the lossy
-/// `--unsafe-strip-lines` transformation: scheduler turns, virtual time, syscall
-/// values, counts, flags, and every other substantive byte are preserved.
+/// host addresses to first-appearance ordinals. Scheduler turns, virtual time,
+/// syscall values, counts, flags, and every other substantive byte are preserved.
 pub fn write_canonical_info(file: &Path, writer: &mut impl Write) -> std::io::Result<usize> {
     write_canonical_info_with_filter(file, writer, |_| true)
 }
@@ -735,70 +551,6 @@ fn is_commit(message: &LogMessage<'_>) -> bool {
     }
 }
 
-fn is_detlog(message: &LogMessage<'_>) -> bool {
-    match message.event {
-        Some(
-            DetLogEvent::Other
-            | DetLogEvent::Syscall
-            | DetLogEvent::SyscallResult { .. }
-            | DetLogEvent::SchedulerCommittedTime,
-        ) => true,
-        Some(_) => false,
-        None => historical_is_detlog(message.text),
-    }
-}
-
-/// A scheduler COMMIT turn that only grants the `InternalIOPolling` resource, i.e. a
-/// granted retry of a nonblocking poll (poll/epoll_wait/wait4/futex/recv/send...). These
-/// grants are internal bookkeeping of Hermit's blocking-via-polling mechanism: how many
-/// times a thread is re-granted permission to re-attempt a nonblocking syscall before it
-/// stops returning would-block depends on when a concurrent external-IO action (e.g. a
-/// child linker process writing to a pipe) becomes ready on the host, which is wall-clock
-/// dependent and not tied to the (RCB-deterministic) logical schedule. The corresponding
-/// `NONCOMMIT ... polling resource` skips are already excluded from comparison (they are
-/// not tagged `COMMIT`); excluding the matching grant-COMMITs keeps the deterministic
-/// comparison consistent and focused on guest-observable events (the actual syscall
-/// results, still compared via their DETLOG entries).
-///
-/// SaBRe's inherited stdio pipes emit an outer device-resource turn before the inner polling
-/// turn. The scheduler tags that outer turn with `[sabre-internal-pipe-io]`; it is the same
-/// host-timing-sensitive operation and is normalized here as well. A SaBRe task with a loopback
-/// peer similarly tags the strong yield before each zero-timeout poll with
-/// `[sabre-loopback-poll-zero-timeout]`. The scheduler additionally suppresses the per-retry
-/// "advance global time for scheduler turn" DETLOG line for these turns at the source (see
-/// `Scheduler::bump_global_time`), so the two mechanisms together make the deterministic
-/// comparison insensitive to host-timing-dependent polling-loop counts.
-fn is_internal_io_poll_commit(message: &LogMessage<'_>) -> bool {
-    match message.event {
-        Some(DetLogEvent::SchedulerCommit {
-            internal_io_poll, ..
-        }) => internal_io_poll,
-        Some(_) => false,
-        None => {
-            historical_is_commit(message.text)
-                && (message.text.contains("{InternalIOPolling: ")
-                    || message.text.contains(" [sabre-internal-pipe-io]")
-                    || message.text.contains(" [sabre-loopback-poll-zero-timeout]"))
-        }
-    }
-}
-
-/// The scheduler's per-turn `committed_time` advance bookkeeping. `committed_time` tracks
-/// the global logical clock, which still moves forward when an `InternalIOPolling` retry
-/// (see `is_internal_io_poll_commit`) advances time -- and the number of those retries is
-/// host-timing nondeterministic. That makes the *presence* of this line on a given turn
-/// retry-count sensitive, so we exclude it from the deterministic comparison. No
-/// guest-observable signal is lost: the value is redundant with the (retained,
-/// retry-count-insensitive) "advance global time for scheduler turn" DETLOG line and with
-/// the per-turn committed time echoed on each COMMIT line.
-fn is_scheduler_committed_time(message: &LogMessage<'_>) -> bool {
-    match message.event {
-        Some(DetLogEvent::SchedulerCommittedTime) => true,
-        Some(_) => false,
-        None => message.text.contains("advancing committed_time from "),
-    }
-}
-
 fn is_detcore(message: &LogMessage<'_>) -> bool {
     static PREFIX: LazyLock<Regex> =
         LazyLock::new(|| Regex::new("^(ERROR|WARN|INFO|DEBUG|TRACE).* detcore:").unwrap());
@@ -975,21 +727,6 @@ fn maps_read_commits(v: &[LogMessage<'_>]) -> (usize, Option<(u64, Option<u64>)>
     (count, first)
 }
 
-fn filter_ignored<'a>(lines: Vec<LogMessage<'a>>, omits: &Vec<String>) -> Vec<LogMessage<'a>> {
-    lines
-        .into_iter()
-        .filter(|message| {
-            let mut keep = true;
-            for omit in omits {
-                if message.text.contains(omit) {
-                    keep = false
-                }
-            }
-            keep
-        })
-        .collect()
-}
-
 fn collect_syscalls<'a>(v: &[LogMessage<'a>]) -> Vec<LogMessage<'a>> {
     v.iter()
         .filter(|entry| is_detlog_syscall(entry))
@@ -1021,10 +758,9 @@ fn first_different_message_indices(
 /// Keep the content that identifies a differing event while removing only
 /// values already carried in separate fields beside it.
 ///
-/// This is deliberately narrower than [`strip_log_entry`]. Syscall arguments,
-/// resource names, thread identities, payload bytes, and all other numbers stay
-/// exact. Record position is not part of the message and remains a separate
-/// observation.
+/// Syscall arguments, resource names, thread identities, payload bytes, and all
+/// other numbers stay exact. Record position is not part of the message and
+/// remains a separate observation.
 fn first_divergent_message(message: &LogMessage<'_>) -> String {
     static FINISHED_SYSCALL: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(finish syscall #)[0-9][0-9_]*").unwrap());
@@ -1301,7 +1037,7 @@ impl<'a> Display for Comparison<'a> {
 /// Returns `true` if a difference is found.
 ///
 /// We could use an existing diff library on the entire log, but this provides us more
-/// control over how to present the (stripped/unstripped) differences, and to focus on the
+/// control over how to present original and canonical differences, and to focus on the
 /// per-line divergence(s), and potentially focus on the first point of divergence.
 //
 // Future TODO:
@@ -1350,7 +1086,7 @@ fn diff_vecs(
             opts.side_labels.right,
             Comparison::new(opts.no_color, left_compared, right_compared)
         )?;
-        if opts.strip_lines || opts.canonicalize_addresses {
+        if opts.canonicalize_addresses {
             write!(
                 w,
                 "({which}) Original entries before normalization: {}",
@@ -1432,47 +1168,6 @@ fn write_compared_logs(
     Ok(())
 }
 
-fn git_diff(
-    which: &str,
-    left: (&[LogMessage<'_>], &[String]),
-    right: (&[LogMessage<'_>], &[String]),
-    opts: &LogDiffOpts,
-    w: &mut impl std::io::Write,
-    left_syscalls: &[LogMessage<'_>],
-    right_syscalls: &[LogMessage<'_>],
-) -> std::io::Result<bool> {
-    let (v1, compared_left) = left;
-    let (v2, compared_right) = right;
-    writeln!(w, "  Comparing {which} messages...\n")?;
-
-    let mut file1 = NamedTempFile::new()?;
-    let mut file2 = NamedTempFile::new()?;
-
-    write_compared_messages(&mut file1, compared_left)?;
-    write_compared_messages(&mut file2, compared_right)?;
-
-    match Command::new("git")
-        .args(["diff", "--color", "--color-words", "-w"])
-        .arg(file1.path())
-        .arg(file2.path())
-        .status()
-    {
-        Ok(code) => Ok(!code.success()),
-        Err(error) => {
-            eprintln!("Error launching git, falling back to basic diff: {error}");
-            diff_vecs(
-                which,
-                (v1, compared_left),
-                (v2, compared_right),
-                opts,
-                w,
-                left_syscalls,
-                right_syscalls,
-            )
-        }
-    }
-}
-
 /// What a log comparison actually compared, alongside whether it differed.
 ///
 /// A bare "no difference found" boolean cannot distinguish *"the two message
@@ -1544,17 +1239,15 @@ impl LogDiffSummary {
 ///
 /// With some complexities:
 ///  * Some entries are multi-line (contain newlines).
-///  * Some stripping of nondeterministic information is needed for direct comparability.
-///  * Certain lines are intended to be deterministic/comparable, in their contents,
-///    and others in their *presence* but not their details.
+///  * Real wall-clock prefixes are removed and marked host addresses are canonicalized.
+///  * Every selected message is compared exactly, including its numeric values.
 ///
 /// Reports only whether the two files differ. See [`log_diff_detailed`] when the
 /// caller must also know how many messages were actually compared; a bare
 /// `false` here cannot distinguish a match from an empty comparison.
 //
 // TODO: we should replace this with a diff algorithm that can handle insertions while maintaining
-// alignment. There's also no reason we can't output the stripped relevant lines and use a separate
-// diff tool.
+// alignment.
 pub fn log_diff(file_a: &Path, file_b: &Path, opts: &LogDiffOpts) -> bool {
     log_diff_detailed(file_a, file_b, opts).diff_found
 }
@@ -1717,24 +1410,14 @@ pub fn try_compare_bitwise_info_v1_bytes_with_records_and_diagnostics(
 /// Construct the complete fixed policy used by `BitwiseInfoV1` callers.
 fn bitwise_info_v1_options(side_labels: ComparisonSideLabels) -> LogDiffOpts {
     LogDiffOpts {
-        strip_lines: false,
         canonicalize_addresses: true,
         comparison: LogComparisonMode::Info,
         side_labels,
         require_structured_events: true,
         print_logs: false,
         limit: 20,
-        ignore_lines: Vec::new(),
         syscall_history: 5,
         no_color: false,
-        skip_commit: false,
-        skip_detlog: false,
-        git_diff: false,
-        include_detlogs: vec![
-            DetLogFilter::Syscall,
-            DetLogFilter::SyscallResult,
-            DetLogFilter::Other,
-        ],
     }
 }
 
@@ -1756,8 +1439,10 @@ pub fn try_log_diff_detailed_with_filter(
     // the identical prefixes of very large logs.
     let vec_a = std::fs::read(file_a)?;
     let vec_b = std::fs::read(file_b)?;
-    let str_a = String::from_utf8_lossy(&vec_a);
-    let str_b = String::from_utf8_lossy(&vec_b);
+    let str_a = std::str::from_utf8(&vec_a)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let str_b = std::str::from_utf8(&vec_b)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     log_diff_summary_from_strs_with_filter(str_a, str_b, opts, &mut std::io::stderr(), keep_record)
 }
 
@@ -1789,13 +1474,15 @@ pub fn try_log_diff_with_records_and_filter(
 ) -> std::io::Result<(LogDiffSummary, usize, usize)> {
     let vec_a = std::fs::read(file_a)?;
     let vec_b = std::fs::read(file_b)?;
-    let str_a = String::from_utf8_lossy(&vec_a);
-    let str_b = String::from_utf8_lossy(&vec_b);
-    let records_a = record_count(&str_a);
-    let records_b = record_count(&str_b);
+    let str_a = std::str::from_utf8(&vec_a)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let str_b = std::str::from_utf8(&vec_b)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let records_a = record_count(str_a);
+    let records_b = record_count(str_b);
     let summary = log_diff_summary_from_strs_with_filter(
-        &str_a,
-        &str_b,
+        str_a,
+        str_b,
         opts,
         &mut std::io::stderr(),
         keep_record,
@@ -2046,20 +1733,14 @@ pub fn log_diff_summary_from_strs_with_filter(
         &extracted_b,
         opts.require_structured_events,
     )?;
-    let all_a = filter_ignored(
-        extracted_a
-            .into_iter()
-            .filter(|record| keep_record(record.text))
-            .collect(),
-        &opts.ignore_lines,
-    );
-    let all_b = filter_ignored(
-        extracted_b
-            .into_iter()
-            .filter(|record| keep_record(record.text))
-            .collect(),
-        &opts.ignore_lines,
-    );
+    let all_a: Vec<_> = extracted_a
+        .into_iter()
+        .filter(|record| keep_record(record.text))
+        .collect();
+    let all_b: Vec<_> = extracted_b
+        .into_iter()
+        .filter(|record| keep_record(record.text))
+        .collect();
 
     writeln!(
         w,
@@ -2072,8 +1753,6 @@ pub fn log_diff_summary_from_strs_with_filter(
     let detcore_b = filter_detcore(&all_b);
     let infos_a = filter_infos(&all_a);
     let infos_b = filter_infos(&all_b);
-    let detlogs_a = opts.filter_deterministic(&detcore_a);
-    let detlogs_b = opts.filter_deterministic(&detcore_b);
     let left_syscalls = collect_syscalls(&all_a);
     let right_syscalls = collect_syscalls(&all_b);
     writeln!(
@@ -2088,21 +1767,9 @@ pub fn log_diff_summary_from_strs_with_filter(
         infos_a.len(),
         infos_b.len(),
     )?;
-    writeln!(
-        w,
-        "Logs contain {} | {} DETLOG & scheduler COMMIT messages",
-        detlogs_a.len(),
-        detlogs_b.len(),
-    )?;
-
     let policy = LogComparisonPolicy::from_options(opts);
 
-    if policy.normalization == LogNormalization::Stripped {
-        writeln!(
-            w,
-            "Normalizing known nondeterministic numerical data before comparison..."
-        )?;
-    } else if policy.normalization == LogNormalization::Canonical {
+    if policy.normalization == LogNormalization::Canonical {
         writeln!(
             w,
             "Canonicalizing host addresses (ordinal by first appearance); comparing everything else exactly..."
@@ -2110,7 +1777,6 @@ pub fn log_diff_summary_from_strs_with_filter(
     }
 
     let (which, compared_a, compared_b) = match policy.comparison {
-        LogComparisonMode::Deterministic => ("DETLOG", &detlogs_a, &detlogs_b),
         LogComparisonMode::Info => ("INFO", &infos_a, &infos_b),
         LogComparisonMode::FullTrace => ("full trace", &all_a, &all_b),
     };
@@ -2143,27 +1809,15 @@ pub fn log_diff_summary_from_strs_with_filter(
     let first_divergent_right_message = first_different
         .and_then(|(_, right)| compared_message_at_record(compared_b, &prepared_b, right));
 
-    let diff_found = if opts.git_diff {
-        git_diff(
-            which,
-            (compared_a, &prepared_a),
-            (compared_b, &prepared_b),
-            opts,
-            w,
-            &left_syscalls,
-            &right_syscalls,
-        )?
-    } else {
-        diff_vecs(
-            which,
-            (compared_a, &prepared_a),
-            (compared_b, &prepared_b),
-            opts,
-            w,
-            &left_syscalls,
-            &right_syscalls,
-        )?
-    };
+    let diff_found = diff_vecs(
+        which,
+        (compared_a, &prepared_a),
+        (compared_b, &prepared_b),
+        opts,
+        w,
+        &left_syscalls,
+        &right_syscalls,
+    )?;
 
     let summary = LogDiffSummary {
         diff_found,
@@ -2233,15 +1887,9 @@ pub fn log_diff_summary_from_strs_with_filter(
         // BOTH runs' values are printed, not just run 1's, and this is a
         // correctness requirement rather than a precaution.
         //
-        // Measured: with `strip_lines` -- the lossy comparator that plain
-        // `--verify` uses -- known nondeterministic numerical data is normalized
-        // before comparison, so a pair whose two runs committed the map read at
-        // *different* virtual times is a MATCHING pair and reaches this branch.
-        // Quoting one side there would report agreement on precisely the
-        // quantity this record exists to expose: a drift that `--verify-strict`
-        // catches and `--verify` does not. The counts above can likewise differ
-        // on a matching pair -- under the default `Deterministic` mode a kick
-        // asymmetry is not compared, so `1 | 0` is a pass.
+        // Earlier lossy comparisons could match different committed times.
+        // Keep both sides explicit even though the current exact comparison
+        // rejects those differences before reaching this matching-pair output.
         //
         // A run with no such record therefore has to read as "no such record"
         // rather than being silently represented by the other run's value.
@@ -2268,14 +1916,12 @@ pub fn log_diff_summary_from_strs_with_filter(
 
 #[cfg(test)]
 mod test {
-    use clap::CommandFactory;
     use clap::Parser;
     use pretty_assertions::assert_eq;
 
     use super::finished_syscall_at_or_before;
     use super::finished_syscall_number;
     use crate::detlog::DetLogEvent;
-    use crate::logdiff::DetLogFilter;
 
     /// One well-formed log record. Records are delimited by their leading
     /// timestamp, so `body` may contain newlines and still be one record.
@@ -2324,30 +1970,57 @@ mod test {
     }
 
     #[test]
+    fn public_file_comparisons_reject_invalid_utf8_on_either_side() -> std::io::Result<()> {
+        for invalid_left in [true, false] {
+            let left = temp_log("INFO detcore: DETLOG value=100");
+            let right = temp_log("INFO detcore: DETLOG value=100");
+            std::fs::write(
+                if invalid_left {
+                    left.path()
+                } else {
+                    right.path()
+                },
+                b"INFO detcore: DETLOG value=\xff",
+            )?;
+            let options = super::LogDiffOpts::default();
+            assert_eq!(
+                super::try_log_diff_detailed_with_filter(
+                    left.path(),
+                    right.path(),
+                    &options,
+                    |_| true
+                )
+                .unwrap_err()
+                .kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                super::try_log_diff_with_records_and_filter(
+                    left.path(),
+                    right.path(),
+                    &options,
+                    |_| true
+                )
+                .unwrap_err()
+                .kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn bitwise_info_v1_binds_the_complete_policy() {
         let labels = super::ComparisonSideLabels::new("left", "right");
         let options = super::bitwise_info_v1_options(labels.clone());
-        assert!(!options.strip_lines);
         assert!(options.canonicalize_addresses);
         assert_eq!(options.comparison, super::LogComparisonMode::Info);
         assert_eq!(options.side_labels, labels);
         assert!(options.require_structured_events);
         assert!(!options.print_logs);
         assert_eq!(options.limit, 20);
-        assert!(options.ignore_lines.is_empty());
         assert_eq!(options.syscall_history, 5);
         assert!(!options.no_color);
-        assert!(!options.skip_commit);
-        assert!(!options.skip_detlog);
-        assert!(!options.git_diff);
-        assert_eq!(
-            options.include_detlogs,
-            [
-                DetLogFilter::Syscall,
-                DetLogFilter::SyscallResult,
-                DetLogFilter::Other,
-            ]
-        );
     }
 
     #[test]
@@ -2881,7 +2554,7 @@ mod test {
     }
 
     #[test]
-    fn structured_scheduler_flags_control_filtering_and_retained_counts() {
+    fn structured_scheduler_flags_preserve_info_and_retained_counts() {
         let text = "INFO detcore::scheduler: COMMIT turn 999 at time 999";
         let internal = super::LogMessage {
             index: 0,
@@ -2903,17 +2576,8 @@ mod test {
             ..internal
         };
 
-        assert!(
-            super::LogDiffOpts::default()
-                .filter_deterministic(&[internal])
-                .is_empty()
-        );
-        assert_eq!(
-            super::LogDiffOpts::default()
-                .filter_deterministic(&[maps_read])
-                .len(),
-            1
-        );
+        assert_eq!(super::filter_infos(&[internal]).len(), 1);
+        assert_eq!(super::filter_infos(&[maps_read]).len(), 1);
         assert_eq!(super::maps_read_commits(&[internal]), (0, None));
         assert_eq!(
             super::maps_read_commits(&[maps_read]),
@@ -2934,23 +2598,27 @@ mod test {
     }
 
     #[test]
-    fn unsafe_strip_lines_cli_name_and_warning_are_explicit() {
-        let options = super::LogDiffOpts::try_parse_from(["log-diff", "--unsafe-strip-lines"])
-            .expect("the explicitly unsafe spelling should parse");
-        assert!(options.strip_lines);
-
-        assert!(super::LogDiffOpts::try_parse_from(["log-diff", "--strip-lines"]).is_err());
-
-        let mut help = Vec::new();
-        super::LogDiffOpts::command()
-            .write_long_help(&mut help)
-            .expect("write clap help");
-        let help = String::from_utf8(help).expect("help is UTF-8");
-        assert!(help.contains("--unsafe-strip-lines"));
-        assert!(help.contains("erases timestamps and syscall values"));
-        assert!(help.contains("make a failing parity diff pass"));
-        assert!(help.contains("doing so is cheating"));
-        assert!(!help.contains("--strip-lines"));
+    fn legacy_comparison_options_are_deleted_and_default_is_canonical_info() {
+        let defaults = super::LogDiffOpts::try_parse_from(["log-diff"]).unwrap();
+        assert_eq!(defaults.comparison, super::LogComparisonMode::Info);
+        assert!(defaults.canonicalize_addresses);
+        for flag in [
+            "--strip-lines",
+            "--unsafe-strip-lines",
+            "--ignore-lines=payload",
+            "--skip-commit",
+            "--skip-detlog",
+            "--include-detlogs=syscall",
+            "--git-diff",
+        ] {
+            let error = super::LogDiffOpts::try_parse_from(["log-diff", flag]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag}"
+            );
+            assert!(error.to_string().contains(flag.split('=').next().unwrap()));
+        }
     }
 
     #[test]
@@ -3156,29 +2824,19 @@ mod test {
             str2,
             &super::LogDiffOpts {
                 limit: 1,
-                strip_lines: false,
                 canonicalize_addresses: false,
-                comparison: super::LogComparisonMode::Deterministic,
+                comparison: super::LogComparisonMode::Info,
                 side_labels: super::ComparisonSideLabels::default(),
                 require_structured_events: false,
                 print_logs: false,
                 syscall_history: 5,
                 no_color: false,
-                skip_commit: false,
-                skip_detlog: false,
-                git_diff: false,
-                ignore_lines: Vec::new(),
-                include_detlogs: vec![
-                    DetLogFilter::Syscall,
-                    DetLogFilter::SyscallResult,
-                    DetLogFilter::Other,
-                ],
             },
             &mut result,
         )?;
 
         let output = String::from_utf8(result).unwrap();
-        assert!(output.contains("  Comparing DETLOG messages..."));
+        assert!(output.contains("  Comparing INFO messages..."));
         assert!(output.contains("Mismatch at log messages 0 (run 1) and 0 (run 2)"));
         assert!(output.contains("run 1, log message 0: INFO detcore: DETLOG [syscall][detcore, dtid 3]  finish syscall #11"));
         assert!(output.contains("run 2, log message 0: INFO detcore: DETLOG [syscall][detcore, dtid 3]  finish syscall #15"));
@@ -3334,116 +2992,72 @@ mod test {
 
     #[test]
     fn printed_logs_are_the_exact_selected_comparator_inputs() -> std::io::Result<()> {
-        let left = "2026-08-15T01:02:03.000000Z INFO detcore: DETLOG value=101\n\
-2026-08-15T01:02:03.000001Z INFO unrelated: omitted value=303";
-        let right = "2026-08-15T04:05:06.000000Z INFO detcore: DETLOG value=202\n\
-2026-08-15T04:05:06.000001Z INFO unrelated: omitted value=404";
-
-        let exact = super::LogDiffOpts {
+        let left = "2026-08-15T01:02:03.000000Z INFO detcore: DETLOG value=100\n2026-08-15T01:02:03.000001Z INFO unrelated: value=303";
+        let right = "2026-08-15T04:05:06.000000Z INFO detcore: DETLOG value=200\n2026-08-15T04:05:06.000001Z INFO unrelated: value=404";
+        let options = super::LogDiffOpts {
             print_logs: true,
             no_color: true,
             ..Default::default()
         };
-        let mut exact_output = Vec::new();
-        let exact_summary =
-            super::log_diff_summary_from_strs(left, right, &exact, &mut exact_output)?;
-        let exact_output = String::from_utf8(exact_output).unwrap();
-
-        assert!(exact_summary.diff_found);
-        assert!(exact_output.contains("Comparison policy: Deterministic\n"));
+        let mut output = Vec::new();
+        let summary = super::log_diff_summary_from_strs(left, right, &options, &mut output)?;
+        let output = String::from_utf8(output).unwrap();
+        assert!(summary.diff_found);
+        assert!(!summary.matched_with_evidence());
+        assert_eq!((summary.compared_left, summary.compared_right), (2, 2));
+        assert!(output.contains("Comparison policy: Canonical\n"));
         assert_eq!(
-            printed_log(&exact_output, 1).as_bytes(),
-            b"INFO detcore: DETLOG value=101\n"
+            printed_log(&output, 1),
+            "INFO detcore: DETLOG value=100\nINFO unrelated: value=303\n"
         );
         assert_eq!(
-            printed_log(&exact_output, 2).as_bytes(),
-            b"INFO detcore: DETLOG value=202\n"
-        );
-
-        let stripped = super::LogDiffOpts {
-            strip_lines: true,
-            print_logs: true,
-            no_color: true,
-            ..Default::default()
-        };
-        let mut stripped_output = Vec::new();
-        let stripped_summary =
-            super::log_diff_summary_from_strs(left, right, &stripped, &mut stripped_output)?;
-        let stripped_output = String::from_utf8(stripped_output).unwrap();
-
-        assert!(stripped_summary.matched_with_evidence());
-        assert!(stripped_output.contains("Comparison policy: Stripped\n"));
-        assert_eq!(
-            printed_log(&stripped_output, 1).as_bytes(),
-            b"INFO detcore: DETLOG value=<NUM>\n"
-        );
-        assert_eq!(
-            printed_log(&stripped_output, 1),
-            printed_log(&stripped_output, 2)
-        );
-        assert_ne!(
-            printed_log(&exact_output, 1),
-            printed_log(&stripped_output, 1)
+            printed_log(&output, 2),
+            "INFO detcore: DETLOG value=200\nINFO unrelated: value=404\n"
         );
         Ok(())
     }
 
     #[test]
     fn printed_policy_name_tracks_the_selected_scope_and_normalization() -> std::io::Result<()> {
-        let log = "2026-08-15T01:02:03.000000Z INFO detcore: DETLOG stable=1 address=<hostaddr 0xaaaa>\n\
-2026-08-15T01:02:03.000001Z DEBUG unrelated: diagnostic=2";
-
-        let cases = [
+        let log = "2026-08-15T01:02:03.000000Z INFO detcore: DETLOG stable=1 address=<hostaddr 0xaaaa>\n2026-08-15T01:02:03.000001Z DEBUG unrelated: diagnostic=2";
+        for (comparison, canonicalize_addresses, expected_name, expected_log) in [
             (
-                super::LogDiffOpts {
-                    comparison: super::LogComparisonMode::Info,
-                    print_logs: true,
-                    no_color: true,
-                    ..Default::default()
-                },
-                "Comparison policy: Info\n",
+                super::LogComparisonMode::Info,
+                false,
+                "Info",
                 "INFO detcore: DETLOG stable=1 address=<hostaddr 0xaaaa>\n",
             ),
             (
-                super::LogDiffOpts {
-                    comparison: super::LogComparisonMode::FullTrace,
-                    print_logs: true,
-                    no_color: true,
-                    ..Default::default()
-                },
-                "Comparison policy: FullTrace\n",
-                "INFO detcore: DETLOG stable=1 address=<hostaddr 0xaaaa>\nDEBUG unrelated: diagnostic=2\n",
-            ),
-            (
-                super::LogDiffOpts {
-                    comparison: super::LogComparisonMode::Deterministic,
-                    canonicalize_addresses: true,
-                    print_logs: true,
-                    no_color: true,
-                    ..Default::default()
-                },
-                "Comparison policy: Deterministic with Canonical host-address normalization\n",
+                super::LogComparisonMode::Info,
+                true,
+                "Canonical",
                 "INFO detcore: DETLOG stable=1 address=<addr1>\n",
             ),
             (
-                super::LogDiffOpts {
-                    comparison: super::LogComparisonMode::Deterministic,
-                    strip_lines: true,
-                    print_logs: true,
-                    no_color: true,
-                    ..Default::default()
-                },
-                "Comparison policy: Stripped\n",
-                "INFO detcore: DETLOG stable=<NUM> address=<hostaddr <ADDR>>\n",
+                super::LogComparisonMode::FullTrace,
+                false,
+                "FullTrace",
+                "INFO detcore: DETLOG stable=1 address=<hostaddr 0xaaaa>\nDEBUG unrelated: diagnostic=2\n",
             ),
-        ];
-
-        for (options, expected_name, expected_log) in cases {
+            (
+                super::LogComparisonMode::FullTrace,
+                true,
+                "FullTrace with Canonical host-address normalization",
+                "INFO detcore: DETLOG stable=1 address=<addr1>\nDEBUG unrelated: diagnostic=2\n",
+            ),
+        ] {
+            let options = super::LogDiffOpts {
+                comparison,
+                canonicalize_addresses,
+                print_logs: true,
+                no_color: true,
+                ..Default::default()
+            };
             let mut output = Vec::new();
             let summary = super::log_diff_summary_from_strs(log, log, &options, &mut output)?;
             let output = String::from_utf8(output).unwrap();
             assert!(summary.matched_with_evidence());
-            assert!(output.contains(expected_name), "{output}");
+            assert!(output.contains(&format!("Comparison policy: {expected_name}\n")));
             assert_eq!(printed_log(&output, 1), expected_log);
             assert_eq!(printed_log(&output, 2), expected_log);
         }
@@ -3456,30 +3070,6 @@ mod test {
 2026-08-15T01:02:03.000001Z INFO unrelated: value=101 address=<hostaddr 0xaaaa>";
         let right = "2026-08-15T04:05:06.000000Z INFO detcore: DETLOG stable=1\n\
 2026-08-15T04:05:06.000001Z INFO unrelated: value=202 address=<hostaddr 0xbbbb>";
-
-        let deterministic = super::LogDiffOpts {
-            print_logs: true,
-            no_color: true,
-            ..Default::default()
-        };
-        let mut deterministic_output = Vec::new();
-        let deterministic_summary = super::log_diff_summary_from_strs(
-            left,
-            right,
-            &deterministic,
-            &mut deterministic_output,
-        )?;
-        let deterministic_output = String::from_utf8(deterministic_output).unwrap();
-        assert!(deterministic_summary.matched_with_evidence());
-        assert!(deterministic_output.contains("Comparison policy: Deterministic\n"));
-        assert_eq!(
-            printed_log(&deterministic_output, 1).as_bytes(),
-            b"INFO detcore: DETLOG stable=1\n"
-        );
-        assert_eq!(
-            printed_log(&deterministic_output, 1),
-            printed_log(&deterministic_output, 2)
-        );
 
         let options = super::LogDiffOpts {
             comparison: super::LogComparisonMode::Info,
@@ -3509,22 +3099,20 @@ mod test {
     fn test_full_trace_detects_unnormalized_timing_difference() -> std::io::Result<()> {
         let log_a = "INFO detcore: DETLOG [syscall] finish syscall #1: clock_gettime(CLOCK_MONOTONIC, 100) = Ok(0)";
         let log_b = "INFO detcore: DETLOG [syscall] finish syscall #1: clock_gettime(CLOCK_MONOTONIC, 101) = Ok(0)";
-        let normalized = super::LogDiffOpts {
-            strip_lines: true,
+        let ordinary = super::LogDiffOpts {
             no_color: true,
             ..Default::default()
         };
 
-        assert!(!super::log_diff_from_strs(
+        assert!(super::log_diff_from_strs(
             log_a,
             log_b,
-            &normalized,
+            &ordinary,
             &mut Vec::new()
         )?);
 
         let verbose = super::LogDiffOpts {
             comparison: super::LogComparisonMode::FullTrace,
-            strip_lines: false,
             syscall_history: 1,
             no_color: true,
             ..Default::default()
@@ -3605,7 +3193,6 @@ mod test {
 
         let log_options = super::LogDiffOpts {
             no_color: true,
-            git_diff: false,
             ..Default::default()
         };
         super::log_diff_from_strs(log_file_a, log_file_b, &log_options, &mut result)?;
@@ -3620,84 +3207,53 @@ mod test {
     }
 
     #[test]
-    fn test_filter_deterministic() {
-        let opts = super::LogDiffOpts {
-            include_detlogs: vec![
-                DetLogFilter::Syscall,
-                DetLogFilter::SyscallResult,
-                DetLogFilter::Other,
-            ],
-            ..Default::default()
-        };
-
-        let v = opts.filter_deterministic(
-            &[
-                historical(
-                    1,
-                    "INFO detcore: registers [dtid 3]. user_regs_struct { r15...",
-                ),
-                historical(
-                    2,
-                    "INFO DETLOG detcore: registers [dtid 3]. user_regs_struct { r15...",
-                ),
-                historical(
-                    3,
-                    "INFO COMMIT turn 5, dettid 2 using resources {Path(\"/proc/2/fd/1\"): W} at time 946684799205300000",
-                ),
-            ],
-        );
-
+    fn test_info_selection() {
+        let input = [
+            historical(
+                1,
+                "INFO detcore: registers [dtid 3]. user_regs_struct { r15...",
+            ),
+            historical(
+                2,
+                "INFO DETLOG detcore: registers [dtid 3]. user_regs_struct { r15...",
+            ),
+            historical(
+                3,
+                "INFO COMMIT turn 5, dettid 2 using resources {Path(\"/proc/2/fd/1\"): W} at time 946684799205300000",
+            ),
+        ];
+        let v = super::filter_infos(&input);
         assert_eq!(
             indexed_text(&v),
-            vec![
-                (
-                    2,
-                    "INFO DETLOG detcore: registers [dtid 3]. user_regs_struct { r15..."
-                ),
-                (
-                    3,
-                    "INFO COMMIT turn 5, dettid 2 using resources {Path(\"/proc/2/fd/1\"): W} at time 946684799205300000",
-                ),
-            ]
+            indexed_text(&[input[0], input[1], input[2]])
         );
     }
 
     #[test]
-    fn test_filter_deterministic_with_filter() {
-        let opts = super::LogDiffOpts {
-            include_detlogs: vec![DetLogFilter::Syscall],
-            skip_commit: true,
-            ..Default::default()
-        };
-
-        let v = opts.filter_deterministic(
-            &[
-                historical(
-                    1,
-                    "INFO detcore: registers [dtid 3]. user_regs_struct { r15...",
-                ),
-                historical(2, "INFO DETLOG detcore:[syscall] syscall 1"),
-                historical(
-                    3,
-                    "INFO COMMIT turn 5, dettid 2 using resources {Path(\"/proc/2/fd/1\"): W} at time 946684799205300000",
-                ),
-            ],
-        );
+    fn test_info_selection_preserves_all_classes() {
+        let input = [
+            historical(
+                1,
+                "INFO detcore: registers [dtid 3]. user_regs_struct { r15...",
+            ),
+            historical(2, "INFO DETLOG detcore:[syscall] syscall 1"),
+            historical(
+                3,
+                "INFO COMMIT turn 5, dettid 2 using resources {Path(\"/proc/2/fd/1\"): W} at time 946684799205300000",
+            ),
+        ];
+        let v = super::filter_infos(&input);
         assert_eq!(
             indexed_text(&v),
-            vec![(2, "INFO DETLOG detcore:[syscall] syscall 1")]
+            indexed_text(&[input[0], input[1], input[2]])
         );
     }
 
-    /// Regression: the deterministic comparison must ignore the scheduler bookkeeping emitted
-    /// by nonblocking-IO poll retries, whose count is host-timing nondeterministic (e.g. how
-    /// many times a thread re-polls a pipe before a child process makes it ready). Only the
-    /// `{InternalIOPolling: ...}` COMMIT turn and the `advancing committed_time` clock line
-    /// should be dropped; ordinary COMMIT turns and DETLOG entries must be retained.
+    /// INFO scheduler bookkeeping remains compared; only DEBUG diagnostics are
+    /// outside the default observation scope.
     #[test]
-    fn test_filter_deterministic_drops_io_polling_bookkeeping() {
-        let opts = super::LogDiffOpts::default();
-        let v = opts.filter_deterministic(&[
+    fn test_info_selection_preserves_io_polling_bookkeeping() {
+        let input = [
             historical(
                 0,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {InternalIOPolling: W}, on previously committed 1s",
@@ -3714,28 +3270,17 @@ mod test {
                 3,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Path(\"/proc/5/fd/3\"): R}, on previously committed 2s",
             ),
-        ]);
-        // The InternalIOPolling COMMIT (0) and the committed_time line (1) are dropped; the
-        // guest-observable syscall (2) and the ordinary COMMIT turn (3) survive.
+        ];
+        let v = super::filter_infos(&input);
         assert_eq!(
             indexed_text(&v),
-            vec![
-                (
-                    2,
-                    "INFO detcore: DETLOG [syscall][detcore, dtid 5] finish syscall #9: read(3, 0x1000, 1) = Ok(1)"
-                ),
-                (
-                    3,
-                    "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Path(\"/proc/5/fd/3\"): R}, on previously committed 2s"
-                ),
-            ]
+            indexed_text(&[input[0], input[2], input[3]])
         );
     }
 
     #[test]
-    fn test_filter_deterministic_drops_sabre_internal_pipe_resource_turn() {
-        let opts = super::LogDiffOpts::default();
-        let v = opts.filter_deterministic(&[
+    fn test_info_selection_preserves_sabre_internal_pipe_resource_turn() {
+        let input = [
             historical(
                 0,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 1s [sabre-internal-pipe-io]",
@@ -3744,21 +3289,14 @@ mod test {
                 1,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 2s",
             ),
-        ]);
-
-        assert_eq!(
-            indexed_text(&v),
-            vec![(
-                1,
-                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {Device(ContainerStdout): W}, on previously committed 2s"
-            )]
-        );
+        ];
+        let v = super::filter_infos(&input);
+        assert_eq!(indexed_text(&v), indexed_text(&[input[0], input[1]]));
     }
 
     #[test]
-    fn test_filter_deterministic_drops_sabre_loopback_poll_yield() {
-        let opts = super::LogDiffOpts::default();
-        let v = opts.filter_deterministic(&[
+    fn test_info_selection_preserves_sabre_loopback_poll_yield() {
+        let input = [
             historical(
                 0,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {SchedYield: W}, on previously committed 1s [sabre-loopback-poll-zero-timeout]",
@@ -3767,23 +3305,14 @@ mod test {
                 1,
                 "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {SchedYield: W}, on previously committed 2s",
             ),
-        ]);
-
-        assert_eq!(
-            indexed_text(&v),
-            vec![(
-                1,
-                "INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 18, dettid 5 using resources {SchedYield: W}, on previously committed 2s"
-            )]
-        );
+        ];
+        let v = super::filter_infos(&input);
+        assert_eq!(indexed_text(&v), indexed_text(&[input[0], input[1]]));
     }
 
-    /// Regression: two runs that differ only in how many nonblocking-IO poll retries occurred
-    /// must compare as deterministic, while a genuine guest-observable divergence must still be
-    /// reported. `run_b` below performs one extra poll retry (an extra InternalIOPolling COMMIT
-    /// plus its committed_time advance) but the guest syscalls are identical.
+    /// An extra INFO poll-retry turn is a difference even if guest syscalls agree.
     #[test]
-    fn test_log_diff_ignores_extra_io_poll_retries() -> std::io::Result<()> {
+    fn test_log_diff_detects_extra_io_poll_retries() -> std::io::Result<()> {
         let common_head = "2022-09-06T14:15:47.000000Z  INFO detcore: DETLOG [syscall][detcore, dtid 5] inbound syscall: poll(0x1000, 1, -1) = ?";
         let common_tail = "2022-09-06T14:15:47.100000Z  INFO detcore: DETLOG [syscall][detcore, dtid 5] finish syscall #9: poll(0x1000, 1, -1) = Ok(1)";
         let poll_retry = "2022-09-06T14:15:47.050000Z  INFO detcore::scheduler: [sched-step5] >>> COMMIT turn 17, dettid 5 using resources {InternalIOPolling: W}, on previously committed 1s\n2022-09-06T14:15:47.050000Z DEBUG detcore::scheduler: DETLOG [sched-step1] advancing committed_time from 1 to 2";
@@ -3794,19 +3323,17 @@ mod test {
 
         let opts = super::LogDiffOpts {
             no_color: true,
-            strip_lines: true,
             ..Default::default()
         };
-        // Differ only in retry count -> deterministic (no diff reported):
-        assert!(!super::log_diff_from_strs(
+        // An extra INFO scheduler turn must be compared even if syscalls match:
+        assert!(super::log_diff_from_strs(
             &run_a,
             &run_b,
             &opts,
             &mut Vec::new()
         )?);
 
-        // But a real divergence in the guest-observable syscall result is still caught. (Use a
-        // non-numeric change: numeric-only differences are erased by `strip_lines` normalization.)
+        // Real syscall return values remain exact too.
         let run_c = run_a.replace("= Ok(1)", "= Err(Errno(EBADF))");
         assert!(super::log_diff_from_strs(
             &run_a,
@@ -3884,17 +3411,15 @@ mod test {
             "an allocation-order difference must compare UNEQUAL under canonicalization"
         );
 
-        // And wholesale stripping DOES hide it: both addresses collapse to a
-        // single <ADDR> token.
-        let stripped = super::LogDiffOpts {
+        // The default canonical policy must retain the same distinction.
+        let default = super::LogDiffOpts {
             comparison: super::LogComparisonMode::FullTrace,
-            strip_lines: true,
             no_color: true,
             ..Default::default()
         };
         assert!(
-            !super::log_diff_from_strs(run_a, run_b, &stripped, &mut Vec::new())?,
-            "wholesale stripping erases the allocation-order difference (the defect)"
+            super::log_diff_from_strs(run_a, run_b, &default, &mut Vec::new())?,
+            "the default comparison must preserve allocation order"
         );
         Ok(())
     }
@@ -4275,59 +3800,99 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
     }
 
     #[test]
-    fn test_strip_log() {
-        assert_eq!(super::strip_log_entry("800.709_180s"), "<NANOSECONDS>");
-        assert_eq!(super::strip_log_entry("98.91618ms"), "<NUM>");
-        assert_eq!(super::strip_log_entry("98.91619ms"), "<NUM>");
-        assert_eq!(super::strip_log_entry("x86_64"), "x86_64");
-        assert_eq!(
-            super::strip_log_entry(
-                "COMMIT turn 66, dettid 2 using resources {Path(\"/proc/2/fd/1\"): W} at time 946_684_800.709_180_000s"
+    fn default_comparison_preserves_numeric_values() -> std::io::Result<()> {
+        for (left, right) in [
+            (r#"value=100"#, r#"value=200"#),
+            (r#"CHAOSRAND value=100"#, r#"CHAOSRAND value=200"#),
+            (r#"SCHEDRAND value=100"#, r#"SCHEDRAND value=200"#),
+            (r#"time=800.709_180s"#, r#"time=800.709_181s"#),
+            (r#"value=98.91618ms"#, r#"value=98.91619ms"#),
+        ] {
+            let left = format!("INFO detcore: DETLOG {left}");
+            let right = format!("INFO detcore: DETLOG {right}");
+            let options = super::LogDiffOpts::default();
+            let summary =
+                super::log_diff_summary_from_strs(&left, &right, &options, &mut Vec::new())?;
+            assert!(summary.diff_found, "{left} versus {right}");
+            assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+            assert!(!summary.matched_with_evidence());
+            assert!(
+                super::log_diff_summary_from_strs(&left, &left, &options, &mut Vec::new())?
+                    .matched_with_evidence()
+            );
+        }
+        Ok(())
+    }
+
+    /// Preserve the exact fields after a temporary path.
+    #[test]
+    fn default_comparison_preserves_fields_after_tmp_paths() -> std::io::Result<()> {
+        let (left, right) = (
+            r#"open path="/tmp/scratch" flags="O_RDONLY""#,
+            r#"open path="/tmp/scratch" flags="O_WRONLY""#,
+        );
+        let left = format!("INFO detcore: DETLOG {left}");
+        let right = format!("INFO detcore: DETLOG {right}");
+        let options = super::LogDiffOpts::default();
+        let summary = super::log_diff_summary_from_strs(&left, &right, &options, &mut Vec::new())?;
+        assert!(summary.diff_found, "{left} versus {right}");
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+        assert!(!summary.matched_with_evidence());
+        assert!(
+            super::log_diff_summary_from_strs(&left, &left, &options, &mut Vec::new())?
+                .matched_with_evidence()
+        );
+        Ok(())
+    }
+
+    /// Different temporary paths must remain distinguishable.
+    #[test]
+    fn default_comparison_preserves_differing_tmp_paths() -> std::io::Result<()> {
+        let (left, right) = (
+            r#"open path="/tmp/hermit-aaaa/f" flags="O_RDONLY""#,
+            r#"open path="/tmp/hermit-bbbb/f" flags="O_RDONLY""#,
+        );
+        let left = format!("INFO detcore: DETLOG {left}");
+        let right = format!("INFO detcore: DETLOG {right}");
+        let options = super::LogDiffOpts::default();
+        let summary = super::log_diff_summary_from_strs(&left, &right, &options, &mut Vec::new())?;
+        assert!(summary.diff_found, "{left} versus {right}");
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+        assert!(!summary.matched_with_evidence());
+        assert!(
+            super::log_diff_summary_from_strs(&left, &left, &options, &mut Vec::new())?
+                .matched_with_evidence()
+        );
+        Ok(())
+    }
+
+    /// Every temporary path on one record remains exact.
+    #[test]
+    fn default_comparison_preserves_each_tmp_path() -> std::io::Result<()> {
+        for (left, right) in [
+            (
+                r#"rename from="/tmp/a" to="/tmp/b" ok="1""#,
+                r#"rename from="/tmp/a" to="/tmp/c" ok="1""#,
             ),
-            "COMMIT turn <NUM>, dettid <NUM> using resources {Path(\"/proc/<PID>/fd/<NUM>\"): W} at time <NANOSECONDS>"
-        );
-    }
-
-    /// Erasing a `/tmp` path must consume the path and nothing else.
-    ///
-    /// The pattern was previously `/tmp/.*"`, whose greedy `.*` ran to the LAST
-    /// quote on the line rather than the path's own closing quote. Every field
-    /// after the path was therefore erased too, so two entries differing only
-    /// downstream of a `/tmp` path compared EQUAL under the stripped
-    /// comparator -- a divergence silently reported as a match.
-    #[test]
-    fn strip_tmp_path_does_not_swallow_rest_of_line() {
-        let read = super::strip_log_entry(r#"open path="/tmp/scratch" flags="O_RDONLY""#);
-        let write = super::strip_log_entry(r#"open path="/tmp/scratch" flags="O_WRONLY""#);
-
-        assert_eq!(read, r#"open path="/tmp/<somewhere>" flags="O_RDONLY""#);
-        assert_eq!(write, r#"open path="/tmp/<somewhere>" flags="O_WRONLY""#);
-        assert_ne!(
-            read, write,
-            "entries differing after a /tmp path must not collapse to equal"
-        );
-    }
-
-    /// The narrowed pattern must still do its job: two entries whose only
-    /// difference is the host-chosen `/tmp` path still compare equal, which is
-    /// the whole reason this erasure exists.
-    #[test]
-    fn strip_tmp_path_still_erases_a_differing_tmp_path() {
-        assert_eq!(
-            super::strip_log_entry(r#"open path="/tmp/hermit-aaaa/f" flags="O_RDONLY""#),
-            super::strip_log_entry(r#"open path="/tmp/hermit-bbbb/f" flags="O_RDONLY""#),
-        );
-    }
-
-    /// Two distinct `/tmp` paths on one line are each erased individually,
-    /// rather than the first one swallowing the second along with everything
-    /// between them.
-    #[test]
-    fn strip_tmp_path_erases_each_path_separately() {
-        assert_eq!(
-            super::strip_log_entry(r#"rename from="/tmp/a" to="/tmp/b" ok="1""#),
-            r#"rename from="/tmp/<somewhere>" to="/tmp/<somewhere>" ok="<NUM>""#
-        );
+            (
+                r#"rename from="/tmp/a" to="/tmp/b" ok="1""#,
+                r#"rename from="/tmp/c" to="/tmp/b" ok="1""#,
+            ),
+        ] {
+            let left = format!("INFO detcore: DETLOG {left}");
+            let right = format!("INFO detcore: DETLOG {right}");
+            let options = super::LogDiffOpts::default();
+            let summary =
+                super::log_diff_summary_from_strs(&left, &right, &options, &mut Vec::new())?;
+            assert!(summary.diff_found, "{left} versus {right}");
+            assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+            assert!(!summary.matched_with_evidence());
+            assert!(
+                super::log_diff_summary_from_strs(&left, &left, &options, &mut Vec::new())?
+                    .matched_with_evidence()
+            );
+        }
+        Ok(())
     }
 
     const KICK_LINE_PREFIX: &str = "Logs contain";
@@ -4507,12 +4072,8 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
         Ok(())
     }
 
-    /// Every other test here forces `LogComparisonMode::Info`, but the default
-    /// is `Deterministic`, which selects a different set of messages. Both
-    /// retained lines must appear on that path too, and the kick counts must be
-    /// attributed per side — under this mode a kick asymmetry is *not* compared,
-    /// so `1 | 0` is a passing pair and quoting a single side would report it as
-    /// agreement.
+    /// The default INFO scope compares kick asymmetry and preserves diagnostic
+    /// counts on a matching pair.
     #[test]
     fn both_records_are_retained_under_the_default_comparison_mode() -> std::io::Result<()> {
         let default_opts = super::LogDiffOpts {
@@ -4521,7 +4082,7 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
         };
         assert_eq!(
             default_opts.comparison,
-            super::LogComparisonMode::Deterministic,
+            super::LogComparisonMode::Info,
             "this test exists to cover the default mode; if the default changes \
              it must be re-pointed, not deleted"
         );
@@ -4533,22 +4094,11 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
             &default_opts,
             &mut out,
         )?;
-        let out = String::from_utf8(out).expect("diff output is utf-8");
         assert!(
-            summary.matched_with_evidence(),
-            "a kick asymmetry is not compared under the default mode, so this \
-             pair must pass; got:\n{out}"
+            summary.diff_found,
+            "the default INFO comparison must include the kick asymmetry"
         );
-        assert!(
-            out.contains(&format!("Logs contain 1 | 0 {KICK_LINE_SUFFIX}")),
-            "the asymmetry must be visible per side on the default path, \
-             got:\n{out}"
-        );
-        assert!(
-            out.contains(&format!("Logs contain 0 | 0 {MAPS_LINE_SUFFIX}")),
-            "the map-read line must also be emitted on the default path, \
-             got:\n{out}"
-        );
+        assert!(!summary.matched_with_evidence());
 
         // The same path, with the map read present, must attribute both sides.
         let scanned = log_with_maps_read("12.345_678_901s");
@@ -4568,42 +4118,25 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
         Ok(())
     }
 
-    /// The reason both sides must be printed, as a reachable case rather than a
-    /// precaution. `strip_lines` is the lossy comparator plain `--verify` uses:
-    /// it normalizes numeric data before comparing, so two runs that committed
-    /// the map read at different virtual times are a *matching* pair. Reporting
-    /// only run 1 there would claim agreement on the exact quantity this record
-    /// exists to expose — a drift `--verify-strict` catches and `--verify` does
-    /// not.
+    /// Different committed virtual times must diverge under the default policy.
     #[test]
-    fn a_stripped_pass_shows_both_runs_diverging_map_read_times() -> std::io::Result<()> {
-        let opts = super::LogDiffOpts {
-            strip_lines: true,
+    fn default_comparison_rejects_diverging_map_read_times() -> std::io::Result<()> {
+        let options = super::LogDiffOpts {
             no_color: true,
             ..Default::default()
         };
-        let mut out = Vec::new();
+        let mut output = Vec::new();
         let summary = super::log_diff_summary_from_strs(
             log_with_maps_read("12.345_678_901s"),
             log_with_maps_read("12.345_678_902s"),
-            &opts,
-            &mut out,
+            &options,
+            &mut output,
         )?;
-        let out = String::from_utf8(out).expect("diff output is utf-8");
-        assert!(
-            summary.matched_with_evidence(),
-            "the stripped comparator normalizes the times, so this pair passes; \
-             got:\n{out}"
-        );
-        assert!(
-            out.contains(
-                "(run 1 first at turn 10, committed virtual time 12345678901ns, \
-                 run 2 first at turn 10, committed virtual time 12345678902ns)"
-            ),
-            "a passing pair whose runs committed at DIFFERENT times must show \
-             both values; showing one would report agreement on a real drift, \
-             got:\n{out}"
-        );
+        assert!(summary.diff_found);
+        assert!(!summary.matched_with_evidence());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("12.345_678_901s"));
+        assert!(output.contains("12.345_678_902s"));
         Ok(())
     }
 

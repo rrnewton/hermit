@@ -54,9 +54,11 @@ VERIFY=1 DEMO_TIMEOUT_SECONDS=900 ./demos/05-qemu-busybox.sh
 `VERIFY=1` adds `--verify --verify-strict --verify-json` and reads the typed
 verdict rather than a banner, requiring `verified=true`, `verdict=matched`,
 `bitwise_parity=true`, a canonical log comparison with no filtering, and equal
-positive compared-INFO-message counts on both sides. `--verify-strict` is
-required for that: a plain `--verify` stays on the lossy Stripped comparator and
-cannot establish L2. It needs `jq`, which the demo preflights before booting.
+positive compared-INFO-message counts on both sides. Plain `--verify` now uses
+that canonical policy too; the demo retains `--verify-strict` as a compatibility
+spelling. The typed verdict and counts, rather than flag selection alone,
+establish what this invocation compared. It needs `jq`, which the demo preflights
+before booting.
 
 It can take several minutes because QEMU's host threads execute under the strict
 ptrace scheduler. Hermit captures guest output internally so it can compare both
@@ -130,10 +132,11 @@ Pinning `q35` and `max` produced no QEMU stderr warnings.
 
 On the measured AMD EPYC 9D85 host, the repository PMU benchmark observed a
 33,138-RCB maximum skid over 1,000 samples and recommended a 66,276-RCB margin.
-Current Reverie's 1,000-RCB processor default panicked during verification Run 1. The
+The measured Reverie revision's 1,000-RCB processor default panicked during verification Run 1. The
 measured override passed the prior failure point, but Run 1 had not completed
-after nine minutes and was stopped; current-main Stripped verification therefore
-remains blocked on practical PMU calibration.
+after nine minutes and was stopped. That historical Stripped-verification
+attempt did not complete; it supplies no result for the current canonical
+default or evidence that the PMU calibration issue has been resolved.
 
 Further diagnostics did not produce an acceptable workaround. Margins of
 10,000 and 40,000 RCBs avoided the assertion but still had not completed Run 1
