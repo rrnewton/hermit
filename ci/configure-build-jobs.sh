@@ -281,8 +281,18 @@ fi
 # CMAKE/CMAKE_GENERATOR, native options, 16-job clamp and 1050 effective-job-
 # second threshold are unchanged. This is a source-identity carry, not a new
 # timing sample or Hermit guest result; the SaBRe behavior intentionally changes.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c164a0854f5782d5c5d4548f532ffb55dd16e8bc ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c164a0854f5782d5c5d4548f532ffb55dd16e8bc (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 6ae69f57 (2026-09-17): the tenth commit after b3049e54
+# intentionally changes reverie-dbt/native/CMakeLists.txt: GNU builds of the
+# on-demand client now use -mtls-dialect=gnu, matching the installed client.
+# The complete reverie-dbt subtree and client compiler flags are NOT identical.
+# This is the sole DBT delta across the ten commits. DynamoRIO vendor source,
+# build.rs, root Cargo/toolchain and CMAKE/CMAKE_GENERATOR selection are unchanged;
+# native/CMakeLists.txt is not an input to the DynamoRIO SDK recipe key above.
+# That SDK key, MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds therefore carry.
+# Client preparation still reruns CMake and uses the new Cargo source directory.
+# This carry is source evidence, not a new timing sample or Hermit guest result.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6ae69f57fa9d675b503f5e631140644e652724ab ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 6ae69f57fa9d675b503f5e631140644e652724ab (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
