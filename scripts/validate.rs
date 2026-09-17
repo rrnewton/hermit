@@ -1418,7 +1418,11 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
             // the real rust-script so a missing path dependency remains visible
             // instead of consuming this checkout's prepared executable.
             .env_remove("HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED")
-            .env_remove("HERMIT_RUST_SCRIPT_ARTIFACT_ROOT");
+            .env_remove("HERMIT_RUST_SCRIPT_ARTIFACT_ROOT")
+            // Keep the real release-profile bootstrap and pinned path API
+            // checks without spending the gate's CPU budget optimizing this
+            // disposable driver's failure paths. Other builds are unchanged.
+            .env("CARGO_PROFILE_RELEASE_OPT_LEVEL", "0");
         let output = command
             .output()
             .map_err(|error| format!("submodule service result: cannot launch fixture: {error}"))?;
