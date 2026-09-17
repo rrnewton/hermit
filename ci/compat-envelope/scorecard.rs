@@ -15059,23 +15059,57 @@ red/`measured-and-passed` count is **0**.",
             restored_import_fixture()?;
             let mut changed = second.clone();
             match invalid {
-                "missing-first" => write_import_rows(&[&changed])?,
-                "gap" => {
-                    changed.attempt = 3;
-                    write_import_rows(&[&first, &changed])?;
-                }
-                "conflicting-first" => {
-                    changed.attempt = 1;
-                    write_import_rows(&[&first, &changed])?;
-                }
+                "missing-first" => {}
+                "gap" => changed.attempt = 3,
+                "conflicting-first" => changed.attempt = 1,
                 _ => unreachable!(),
             }
+            // Reach the sequence/duplicate guard with valid producer metadata;
+            // a stale attempt-2 fixture must not mask the intended refusal.
+            relocate_retry_fixture(&mut changed, "/results")?;
+            if invalid == "conflicting-first" && terminal == "FAIL" {
+                // A second synthetic divergence at the same ordinal must be
+                // distinct evidence, not an identical replay of the first.
+                changed.first_divergent_record = Some(3);
+                changed
+                    .backend_parity
+                    .as_mut()
+                    .unwrap()
+                    .comparison
+                    .first_divergent_record = Some(3);
+            }
+            for row in [&first, &changed] {
+                row.require_literal_invocation()?;
+                row.comparison_evidence()?;
+                if row.retry_fixture()?.is_none() {
+                    return Err(format!("{invalid} fixture lacks retry metadata"));
+                }
+            }
+            if !first.same_retry_guest_command(&changed)? {
+                return Err(format!("{invalid} fixture changed the logical command"));
+            }
+            if invalid == "conflicting-first"
+                && first.evidence_identity()? == changed.evidence_identity()?
+            {
+                return Err("conflicting-first fixture has identical evidence".into());
+            }
+            if invalid == "missing-first" {
+                write_import_rows(&[&changed])?;
+            } else {
+                write_import_rows(&[&first, &changed])?;
+            }
             let refused = run_result_command("import-results", Some(&current_summary))?;
+            let expected_error = if invalid == "conflicting-first" {
+                "ambiguous parity evidence"
+            } else {
+                "invalid parity history"
+            };
             if refused.status.success()
+                || !String::from_utf8_lossy(&refused.stderr).contains(expected_error)
                 || read_generated_files(&result_command_root)? != result_command_before
             {
                 return Err(format!(
-                    "retained parity admitted invalid {invalid} sequence"
+                    "retained parity {terminal}/{invalid} did not refuse with {expected_error}: {refused:?}"
                 ));
             }
         }
