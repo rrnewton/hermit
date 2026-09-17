@@ -268,8 +268,30 @@ fi
 # Keep the existing 1050 effective-job-second threshold and 16-job clamp.
 # Source comparison 89b2eb0abe05008a21974668602c288452108270c85132ea48f87bb325d91ca2 is a carry decision,
 # not a new timing sample or Hermit guest receipt.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 596b9adee8473dc0a7e62dce18580eead3d0c5c9 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 596b9adee8473dc0a7e62dce18580eead3d0c5c9 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 6ae69f57 (2026-09-17): UNLIKE EVERY CARRY ABOVE, THIS ONE DOES CHANGE
+# THE reverie-dbt SUBTREE, so do not read it as another unchanged-bytes carry.
+# The subtree moves 6232257769144e8f63891a5efc8935abc3cd836b ->
+# df7f4e8c655698849f0356a2bb41121ddff15be8, entirely from one file:
+# reverie-dbt/native/CMakeLists.txt gains 6 lines adding -mtls-dialect=gnu under
+# a CMAKE_C_COMPILER_ID STREQUAL "GNU" guard. Nothing else in the subtree moves.
+# What the budget actually bounds is unchanged. build.rs stays blob
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 and the DynamoRIO vendor tree stays
+# 42dd83f76cef3e730c39d2313c11fdc78d12ae35, so the expensive DynamoRIO
+# compilation is byte-identical in scope; build.rs's own source_recipe_key
+# hashes vendor/dynamorio plus build.rs plus CMAKE/CMAKE_GENERATOR and does not
+# read native/, so that key does not move either. CMAKE remains the default
+# cmake and CMAKE_GENERATOR remains unset. The added work is one compiler option
+# on the single-translation-unit client, which Hermit's own packaged producer at
+# hermit-install/native-client/CMakeLists.txt:35-37 has passed since f0e404b6c
+# without a budget change. Keep the existing 1050 effective-job-second threshold
+# and 16-job clamp.
+# Hermit's on-demand consumer DOES rebuild: detcore-dbt's
+# native_client_build_directory keys on the source PATH, which carries the pin's
+# checkout directory, so the new pin gets a fresh client build directory.
+# This is a source-identity carry decision. It supplies no new timing sample and
+# no Hermit guest receipt.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6ae69f57fa9d675b503f5e631140644e652724ab ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 6ae69f57fa9d675b503f5e631140644e652724ab (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
