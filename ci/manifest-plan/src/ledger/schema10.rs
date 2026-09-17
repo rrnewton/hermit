@@ -429,7 +429,19 @@ pub struct CellResultV10 {
     #[serde(deserialize_with = "deserialize_verdict")]
     pub cell_verdict: CellVerdict,
     pub backend_parity: RequiredNullable<CellBackendParitySummary>,
-    /// The exact series event this verdict's evidence was selected from. See
+    /// The attempt ordinal this verdict was computed from, recorded on the
+    /// LEDGER row as well as inside the binding.
+    ///
+    /// It is duplicated on purpose, and the purpose is narrow enough to state:
+    /// it gives the decode-time guard a second operand. Without it the guard
+    /// had nothing to compare the binding's attempt against, so it compared the
+    /// binding against itself and accepted every ordinal. This does NOT
+    /// establish that the recorded ordinal is the one the verdict came from --
+    /// see `verify_cell_artifact_bytes` and the parity cross-check for what
+    /// does, and does not, close that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_attempt: Option<u64>,
+    /// The exact source attempt this verdict's evidence was read from. See
     /// [`CellResult::evidence_binding`]: absent means the row predates the
     /// binding and is UNBOUND, which a reader renders rather than infers past.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -559,6 +571,9 @@ impl CellArtifactResultV10 {
                 self.selected_attempt,
             )
         });
+        let recorded_attempt = evidence_binding
+            .as_ref()
+            .map(|binding| binding.selected_attempt);
         Ok(CellResultV10 {
             lane: self.lane.clone(),
             category: self.category.clone(),
@@ -567,6 +582,7 @@ impl CellArtifactResultV10 {
             backend: self.backend.clone(),
             cell_verdict,
             backend_parity,
+            selected_attempt: recorded_attempt,
             evidence_binding,
         })
     }
@@ -1400,70 +1416,82 @@ fn validate_ordinary_verdict(identity: &CellIdentity, verdict: &CellVerdict) -> 
 }
 
 impl CellResultsEvidenceV10 {
-    /// Refuse cell evidence whose COMPARED verdicts do not each resolve to the
-    /// exact attempt they were computed from.
+    /// Refuse cell evidence whose COMPARED verdicts are not each bound to a
+    /// source attempt consistent with the row that carries them.
     ///
-    /// ⚠️ THIS MUST STAY CALLED FROM [`Self::validate_for_row`]. The binding
-    /// field is fail-open on its own: a producer that simply stopped writing it
-    /// would emit rows indistinguishable from the pre-binding ones, and nothing
-    /// would notice. A guard that exists and is never invoked is the same
-    /// defect wearing a reassuring name.
+    /// WHAT THIS ESTABLISHES, stated exactly, because the previous version
+    /// claimed an axis it did not check:
     ///
-    /// Scoped to compared verdicts on purpose. A compared verdict read an
-    /// attempt, so it can always name one; a by-design or unavailable verdict
-    /// read none, so demanding a binding there would require a reference to an
-    /// event that does not exist.
+    /// * presence -- a compared verdict carries a binding, and a non-comparing
+    ///   verdict does not;
+    /// * run, tree and cell -- the binding belongs to this evidence;
+    /// * attempt CONSISTENCY -- the binding's ordinal equals the ledger row's
+    ///   own `selected_attempt`, which is a real second operand rather than
+    ///   the same expression twice;
+    /// * uniqueness -- two compared cells cannot bind the same attempt of the
+    ///   same cell.
     ///
-    /// A duplicate event is REFUSED rather than deduplicated: one attempt
-    /// cannot be the evidence for two different cells, and folding it would let
-    /// one measurement be counted twice.
+    /// WHAT IT DOES NOT ESTABLISH, and nothing in the ledger can: that the
+    /// recorded ordinal is the attempt the verdict was actually computed from.
+    /// `verify_cell_artifact_bytes` re-derives it from the digest-bound
+    /// artifact, which protects it from later tampering but not from being
+    /// wrong when written; only the parity path re-derives it from an attempt
+    /// history. For an ordinary cell it remains a producer assertion, and the
+    /// end-to-end resolution against published rows is what would refute it.
     pub fn require_bound_compared_cells(&self) -> Result<(), String> {
         let mut seen = BTreeSet::new();
         for cell in &self.cells {
-            if !matches!(
+            let compared = matches!(
                 cell.cell_verdict,
                 CellVerdict::ComparedAndMatched { .. } | CellVerdict::ComparedAndDiverged { .. }
-            ) {
-                if cell.evidence_binding.is_some() {
+            );
+            let identity = cell.identity();
+            let named = CellEvidenceBinding::series_cell_key(&identity);
+            if !compared {
+                if cell.evidence_binding.is_some() || cell.selected_attempt.is_some() {
                     return Err(format!(
-                        "cell {} states no comparison yet carries an evidence binding",
-                        CellEvidenceBinding::series_cell_key(&cell.identity())
+                        "cell {named} states no comparison yet carries an evidence binding"
                     ));
                 }
                 continue;
             }
-            let identity = cell.identity();
-            let binding = cell.evidence_binding.as_ref().ok_or_else(|| {
-                format!(
-                    "compared cell {} carries no evidence binding",
-                    CellEvidenceBinding::series_cell_key(&identity)
-                )
+            let binding = cell
+                .evidence_binding
+                .as_ref()
+                .ok_or_else(|| format!("compared cell {named} carries no evidence binding"))?;
+            binding.verify_against(&self.run_id, &self.hermit_sha, &identity)?;
+            let recorded = cell.selected_attempt.ok_or_else(|| {
+                format!("compared cell {named} carries a binding but no selected_attempt")
             })?;
-            binding.verify_against(
-                &self.run_id,
-                &self.hermit_sha,
-                &identity,
-                binding.attempt_ordinal(),
-            )?;
-            if !seen.insert(binding.event_id.clone()) {
+            if binding.selected_attempt != recorded {
                 return Err(format!(
-                    "series event {} is bound by more than one compared cell",
-                    binding.event_id
+                    "compared cell {named} binds attempt {} while the row records {recorded}",
+                    binding.selected_attempt
+                ));
+            }
+            if !seen.insert((named.clone(), binding.selected_attempt)) {
+                return Err(format!(
+                    "attempt {} of cell {named} is bound by more than one compared cell",
+                    binding.selected_attempt
                 ));
             }
         }
         Ok(())
     }
 
-    /// The distinct series events this evidence binds, for a reader that must
-    /// count comparisons only from the binding.
-    pub fn bound_event_ids(&self) -> Result<BTreeSet<String>, String> {
+    /// The bound source attempts, for a reader that must count comparisons
+    /// only from the binding.
+    ///
+    /// Deliberately NOT a list of published `event_id`s. Predicting one is
+    /// unsound for a collapsible row, which every compared verdict is; a
+    /// reader holding the published rows resolves each attempt by interval.
+    pub fn bound_attempts(&self) -> Result<BTreeSet<(String, u64)>, String> {
         self.require_bound_compared_cells()?;
         Ok(self
             .cells
             .iter()
             .filter_map(|cell| cell.evidence_binding.as_ref())
-            .map(|binding| binding.event_id.clone())
+            .map(|binding| (binding.series_cell.clone(), binding.selected_attempt))
             .collect())
     }
 
