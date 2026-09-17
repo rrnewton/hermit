@@ -2477,6 +2477,20 @@ impl<T> ThreadState<T> {
         self.metadata().abandon_captured_fd(captured)
     }
 
+    /// Diagnostic scalar view; state() and borrowed pedigree formatting do not draw.
+    pub(crate) fn random_diagnostic_record(
+        &self,
+        kind: u64,
+        seed: u64,
+    ) -> crate::getrandom_diagnostic::Record {
+        crate::getrandom_diagnostic::Record::new(kind).thread(
+            self.dettid.as_raw(),
+            seed,
+            self.prng.state(),
+            &self.pedigree,
+        )
+    }
+
     /// get thread prng, note this rng is deterministic and should not be used
     /// for crypto.
     pub fn thread_prng(&mut self) -> &mut Pcg64Mcg {

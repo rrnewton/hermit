@@ -208,6 +208,21 @@ impl MappingCache {
         }
     }
 
+    /// Diagnostic observation only; never creates or changes an mm identity.
+    fn diagnostic_boundary(&self, pid: Pid, tracees: &HashSet<Pid>) -> (Option<u64>, usize, bool) {
+        let mm = self.spaces.get(&pid).copied();
+        let members = self
+            .spaces
+            .values()
+            .filter(|space| Some(**space) == mm)
+            .count();
+        let all_known = tracees.contains(&pid)
+            && tracees
+                .iter()
+                .all(|tracee| self.spaces.contains_key(tracee));
+        (mm.map(|id| id.0), members, all_known)
+    }
+
     /// Place a newly announced `child` in the right address space.
     ///
     /// `shares_mm` is an OBSERVATION of the child that now exists -- see
@@ -245,6 +260,7 @@ struct Supervisor {
     trusted_shared_objects: HashSet<PathBuf>,
     signal_diagnostics: HashMap<Pid, SignalDiagnostic>,
     physical_exit_observer: Arc<detcore::GlobalState>,
+    random_diagnostic: Option<crate::getrandom_diagnostic::Session>,
 }
 
 impl Supervisor {
@@ -254,6 +270,7 @@ impl Supervisor {
         plugin: PathBuf,
         readiness: Arc<AtomicBool>,
         physical_exit_observer: Arc<detcore::GlobalState>,
+        random_diagnostic: Option<crate::getrandom_diagnostic::Session>,
     ) -> Self {
         Self {
             root,
@@ -269,6 +286,7 @@ impl Supervisor {
             trusted_shared_objects: HashSet::new(),
             signal_diagnostics: HashMap::new(),
             physical_exit_observer,
+            random_diagnostic,
         }
     }
 
@@ -366,9 +384,13 @@ impl Supervisor {
                         "SaBRe tracee terminated by a fatal signal",
                     );
                 }
+                let observed_mm = self.mapping_cache.spaces.get(&pid).copied();
                 self.remove_tracee(pid);
                 self.physical_exit_observer
                     .complete_physical_process_exit(pid.as_raw());
+                if let Some(diagnostic) = &mut self.random_diagnostic {
+                    diagnostic.event(serde_json::json!({"event":"physical_exit_after_existing_accounting","pid":pid.as_raw(),"mm":observed_mm.map(|id|id.0)}));
+                }
                 if pid == self.root {
                     root_status = Some(exit_status);
                 }
@@ -458,6 +480,10 @@ impl Supervisor {
         }
 
         let status = root_status.ok_or_else(|| anyhow!("SaBRe root tracee disappeared"))?;
+        if let Some(diagnostic) = &self.random_diagnostic {
+            diagnostic.finish_sabre()?;
+        }
+
         let mut trusted_shared_objects = self
             .trusted_shared_objects
             .into_iter()
@@ -588,11 +614,29 @@ impl Supervisor {
             // rather than predicted from the clone arguments.
             let shares_mm = mm_sharing(pid, child);
             self.mapping_cache.admit_child(pid, child, shares_mm);
+            if let Some(diagnostic) = &mut self.random_diagnostic {
+                let parent_mm = self.mapping_cache.spaces.get(&pid).copied();
+                let child_mm = self.mapping_cache.spaces.get(&child).copied();
+                diagnostic.lineage(serde_json::json!({"event":"child_admitted","parent":pid.as_raw(),"child":child.as_raw(),"parent_mm":parent_mm.map(|id|id.0),"child_mm":child_mm.map(|id|id.0)}), true);
+                // The target fixture has no clone/fork. Even a conservatively
+                // shared kcmp fallback must not authenticate one whole history
+                // when a private copied buffer may exist. Keep each capture
+                // separate and mark the aggregate attribution unavailable.
+            }
         } else if event == libc::PTRACE_EVENT_EXEC {
             // exec installs a brand-new mm and tears down the old one.
             self.mapping_cache.replace_address_space(pid);
             self.states.insert(pid, TraceeState::default());
             self.signal_diagnostics.remove(&pid);
+            if let Some(diagnostic) = &mut self.random_diagnostic {
+                diagnostic.lineage(serde_json::json!({"event":"exec_replaced_previous_mm_without_terminal_snapshot","pid":pid.as_raw(),"new_mm":self.mapping_cache.spaces.get(&pid).map(|id|id.0)}), true);
+            }
+        } else if event == libc::PTRACE_EVENT_EXIT {
+            let (mm, members, all_known) =
+                self.mapping_cache.diagnostic_boundary(pid, &self.tracees);
+            if let Some(diagnostic) = &mut self.random_diagnostic {
+                diagnostic.exit_stop(pid.as_raw(), mm, members, all_known)?;
+            }
         }
         self.resume(pid, None)
     }
@@ -982,6 +1026,9 @@ pub async fn run(
     if capture_output {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
+    // Bind the intended plugin before spawn, in this already-entered namespace.
+    let random_diagnostic = crate::getrandom_diagnostic::Session::begin("sabre", Some(&plugin))?;
+    command.env_remove(crate::getrandom_diagnostic::DIRECTORY_ENV);
     // Spawn before creating the blocking supervisor worker. A worker thread consumes a task ID
     // in the guest PID namespace; creating it first shifts the root guest from PID 3 to PID 4 and
     // makes otherwise identical ptrace and SaBRe programs observe different process identities.
@@ -997,7 +1044,14 @@ pub async fn run(
     ptrace::detach(root, Some(Signal::SIGSTOP))
         .context("failed to hand SaBRe tracee to supervisor worker")?;
     tokio::task::spawn_blocking(move || {
-        run_blocking(child, sabre, plugin, readiness, physical_exit_observer)
+        run_blocking(
+            child,
+            sabre,
+            plugin,
+            readiness,
+            physical_exit_observer,
+            random_diagnostic,
+        )
     })
     .await
     .context("SaBRe ptrace supervisor task panicked")?
@@ -1033,6 +1087,7 @@ fn run_blocking(
     plugin: PathBuf,
     readiness: Arc<AtomicBool>,
     physical_exit_observer: Arc<detcore::GlobalState>,
+    random_diagnostic: Option<crate::getrandom_diagnostic::Session>,
 ) -> Result<Output, Error> {
     let root = Pid::from_raw(child.id() as i32);
     let stdout = child.stdout.take();
@@ -1041,7 +1096,15 @@ fn run_blocking(
 
     let stdout_thread = std::thread::spawn(move || read_pipe(stdout));
     let stderr_thread = std::thread::spawn(move || read_pipe(stderr));
-    let supervised = Supervisor::new(root, sabre, plugin, readiness, physical_exit_observer).run();
+    let supervised = Supervisor::new(
+        root,
+        sabre,
+        plugin,
+        readiness,
+        physical_exit_observer,
+        random_diagnostic,
+    )
+    .run();
     if supervised.is_err() {
         let _ = nix::sys::signal::kill(root, Signal::SIGKILL);
     }
@@ -1758,6 +1821,10 @@ mod tests {
         let child = Pid::from_raw(101);
         let mut cache = MappingCache::new(parent);
         cache.new_address_space(child);
+        let parent_boundary = cache.diagnostic_boundary(parent, &HashSet::from([parent, child]));
+        let child_boundary = cache.diagnostic_boundary(child, &HashSet::from([parent, child]));
+        assert_ne!(parent_boundary.0, child_boundary.0);
+        assert_eq!((parent_boundary.1, child_boundary.1), (1, 1));
 
         cache.insert(child, PAGE, trusted());
         cache.invalidate_address_space(parent);
@@ -1777,7 +1844,11 @@ mod tests {
         let mut cache = MappingCache::new(pid);
         cache.insert(pid, PAGE, trusted());
 
+        let old = cache.diagnostic_boundary(pid, &HashSet::from([pid]));
         cache.replace_address_space(pid);
+        let new = cache.diagnostic_boundary(pid, &HashSet::from([pid]));
+        assert_ne!(old.0, new.0);
+        assert_eq!((new.1, new.2), (1, true));
 
         assert!(
             cache.get(pid, PAGE).is_none(),
@@ -1796,13 +1867,34 @@ mod tests {
         cache.share_address_space(a, b);
         cache.insert(a, PAGE, trusted());
 
+        assert_eq!(
+            cache.diagnostic_boundary(a, &HashSet::from([a, b])),
+            (Some(0), 2, true)
+        );
+        let unknown = Pid::from_raw(999);
+        assert_eq!(
+            cache.diagnostic_boundary(a, &HashSet::from([a, b, unknown])),
+            (Some(0), 2, false)
+        );
+        assert_eq!(
+            cache.diagnostic_boundary(unknown, &HashSet::from([a, b, unknown])),
+            (None, 0, false)
+        );
         cache.forget(b);
+        assert_eq!(
+            cache.diagnostic_boundary(a, &HashSet::from([a])),
+            (Some(0), 1, true)
+        );
         assert!(
             cache.get(a, PAGE).is_some(),
             "a sibling exiting does not invalidate the surviving thread's view"
         );
 
         cache.forget(a);
+        assert_eq!(
+            cache.diagnostic_boundary(a, &HashSet::new()),
+            (None, 0, false)
+        );
         assert!(
             cache.entries.is_empty(),
             "the last user of an address space releases its cached pages"

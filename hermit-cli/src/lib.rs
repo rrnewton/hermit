@@ -316,6 +316,8 @@ const _: () = assert!(
         && GUEST_PROGRAM_NOT_EXECUTABLE_EXIT != 0,
     "a failure code of 0 would invert every assert_eq!(code, Some(CONST)) into demanding success"
 );
+mod getrandom_diagnostic;
+mod getrandom_diagnostic_reader;
 mod record;
 mod record_replay_path;
 mod recorder;
@@ -2311,6 +2313,14 @@ pub fn run_with_backend_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<ExitStatus, Error> {
+    let diagnostic = if backend == Backend::Ptrace {
+        getrandom_diagnostic::Session::begin("ptrace", None)?
+    } else {
+        None
+    };
+    let mut command = command;
+    command.env_remove(getrandom_diagnostic::DIRECTORY_ENV);
+
     let skid_overshoot_report = SkidOvershootReport::begin(backend.uses_ptrace_pmu_timers());
     if backend == Backend::Kvm {
         ensure_kvm_stdin_reserved()?;
@@ -2324,6 +2334,11 @@ pub fn run_with_backend_timeout(
         backend,
         timeout,
     );
+    let result = if let Some(diagnostic) = diagnostic {
+        diagnostic.finish_local(result)
+    } else {
+        result
+    };
     skid_overshoot_report.finish(result)
 }
 
@@ -2799,6 +2814,14 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<(Output, u64), Error> {
+    let diagnostic = if backend == Backend::Ptrace {
+        getrandom_diagnostic::Session::begin("ptrace", None)?
+    } else {
+        None
+    };
+    let mut command = command;
+    command.env_remove(getrandom_diagnostic::DIRECTORY_ENV);
+
     let skid_overshoot_report = SkidOvershootReport::begin(backend.uses_ptrace_pmu_timers());
     if backend == Backend::Kvm {
         // Reserve before the Tokio runtime can reuse a closed fd 0. KVM
@@ -2815,6 +2838,11 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
         backend,
         timeout,
     );
+    let result = if let Some(diagnostic) = diagnostic {
+        diagnostic.finish_local(result)
+    } else {
+        result
+    };
     skid_overshoot_report.finish_with_count(result)
 }
 

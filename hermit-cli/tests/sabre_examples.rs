@@ -314,18 +314,27 @@ fn parity_run(example: &Path, args: &[&str], backend: Option<&Path>, label: &str
         .prefix("sabre-parity-")
         .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap_or_else(|error| panic!("failed to create {label} diagnostic log: {error}"));
-    let output = run_bounded(
-        example_command(
-            example,
-            args,
-            backend,
-            false,
-            Some(diagnostic_log.path()),
-            None,
-        ),
-        label,
+    let mut command = example_command(
+        example,
+        args,
+        backend,
+        false,
         Some(diagnostic_log.path()),
+        None,
     );
+    if matches!(
+        label,
+        "ptrace strict portable reference for public libc getrandom"
+            | "SaBRe strict portable parity run for public libc getrandom"
+    ) {
+        // Reuse the already-fresh sidecar name; no additional random draw, guest
+        // environment entry, output stream, test selection or comparison changes.
+        command.env(
+            "HERMIT_GETRANDOM_DIAGNOSTIC_DIR",
+            diagnostic_log.path().with_extension("rng"),
+        );
+    }
+    let output = run_bounded(command, label, Some(diagnostic_log.path()));
     let diagnostics = controller_diagnostics(Some(diagnostic_log.path()));
     let guest_stderr = String::from_utf8_lossy(&output.stderr);
 

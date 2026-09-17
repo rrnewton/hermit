@@ -44,7 +44,9 @@ mod dirents;
 /// Schedule-alignment and edit-distance algorithms shared by Hermit tools.
 #[allow(missing_docs)]
 pub mod edit_distance;
+// Temporary bounded observations; no backend dependency or random draws.
 mod fd;
+pub mod getrandom_diagnostic;
 mod io_buffers;
 #[allow(unused)]
 mod ivar;
@@ -1462,7 +1464,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .init_thread_state(tid, parent.map(|(ptid, ts)| (ptid, ts.as_ref())));
 
         // TODO(T78538674): virtualize tid, extend tid<=>dettid mapping here.
-        match parent {
+        let state = match parent {
             None => ThreadState::new(DetPid::from_raw(tid.into()), &self.cfg, record_or_replay),
             Some(pts) => {
                 let clone_flags = pts
@@ -1619,7 +1621,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                 }
             }
-        }
+        };
+        getrandom_diagnostic::BUFFER.record(
+            state.random_diagnostic_record(getrandom_diagnostic::INIT, self.cfg.rng_seed()),
+        );
+        state
     }
 
     async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
@@ -1711,7 +1717,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if let Some(ptr) = guest.auxv().at_random() {
             // It is safe to mutate this address since libc has not yet had a
             // chance to modify or copy the auxv table.
+            let before = guest
+                .thread_state()
+                .random_diagnostic_record(getrandom_diagnostic::POST_EXEC, self.cfg.rng_seed());
             let bytes: [u8; 16] = guest.thread_state_mut().thread_prng().random();
+            let mut observation = before.bytes(&bytes).request(0, bytes.len());
+            let after = guest
+                .thread_state()
+                .random_diagnostic_record(getrandom_diagnostic::POST_EXEC, self.cfg.rng_seed());
+            observation.0[24] = after.0[6];
+            observation.0[25] = after.0[7];
+            getrandom_diagnostic::BUFFER.record(observation);
             detlog!(
                 "[post_exec, dtid {}] init auxv AT_RANDOM value to {:?}",
                 guest.thread_state().dettid,
@@ -1719,6 +1735,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
             let ptr = unsafe { ptr.into_mut() };
             guest.memory().write_value(ptr, &bytes)?;
+        } else {
+            let mut observation = guest
+                .thread_state()
+                .random_diagnostic_record(getrandom_diagnostic::POST_EXEC, self.cfg.rng_seed());
+            observation.0[26] = 1; // Callback ran without an AT_RANDOM pointer; no draw.
+            getrandom_diagnostic::BUFFER.record(observation);
         }
 
         // Successful exec never returns through handle_syscall_event, so the

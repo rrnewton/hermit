@@ -25,6 +25,7 @@ use std::sync::atomic::Ordering;
 pub use detcore::CONFIG_FINGERPRINT_ENV;
 use detcore::Detcore;
 use detcore::config_wire_fingerprint;
+use detcore::getrandom_diagnostic as rng_diag;
 use reverie::Signal;
 use reverie_memory::LocalMemory;
 use reverie_memory::MemoryAccess;
@@ -192,6 +193,22 @@ pub fn runtime_library_path() -> io::Result<PathBuf> {
     })
 }
 
+// Temporary immutable ELF reference for coordinator-only stopped-memory reads.
+#[repr(transparent)]
+pub struct RandomDiagnosticReference(*const rng_diag::Buffer);
+// The address is immutable; the pointed-to buffer contains atomic slots.
+unsafe impl Sync for RandomDiagnosticReference {}
+#[unsafe(no_mangle)]
+#[used]
+pub static HERMIT_GETRANDOM_DIAGNOSTIC_V1: RandomDiagnosticReference =
+    RandomDiagnosticReference(&rng_diag::BUFFER);
+
+fn random_route(kind: u64, route: u64, length: usize, flags: u64) -> rng_diag::Record {
+    let mut record = rng_diag::Record::new(kind).request(flags, length);
+    record.0[24] = route; // 1 public detour, 2 rewritten syscall, 3 injected syscall.
+    record
+}
+
 struct Plugin {
     adapter: RemoteReverieAdapter<Detcore>,
     // The SaBRe-injected runtime requests its hash seed on the first rewritten
@@ -258,7 +275,18 @@ impl Plugin {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1117): Review SaBRe bootstrap-random isolation.
     fn handle_post_load_syscall(&self, syscall: &Syscall) -> Option<Result<usize, Errno>> {
-        if !self.post_load_syscall_pending.swap(false, Ordering::AcqRel) {
+        let pending = self.post_load_syscall_pending.swap(false, Ordering::AcqRel);
+        if pending || matches!(syscall, Syscall::Getrandom(_)) {
+            let mut record = rng_diag::Record::new(rng_diag::BOOTSTRAP_DECISION);
+            record.0[24] = u64::from(pending);
+            record.0[25] = u64::from(is_post_load_bootstrap_random(syscall));
+            if let Syscall::Getrandom(call) = syscall {
+                record = record.request(call.flags() as u64, call.buflen());
+                record.0[26] = 1;
+            }
+            rng_diag::BUFFER.record(record);
+        }
+        if !pending {
             return None;
         }
 
@@ -300,18 +328,39 @@ impl reverie_sabre::Tool for Plugin {
     ) -> libc::ssize_t {
         LIBC_GETRANDOM_ACTIVE.with(|active| {
             if active.replace(true) {
-                return Self::libc_getrandom_undetoured(buffer, length, flags);
+                let mut record = random_route(rng_diag::DETOUR_ENTRY, 1, length, flags as u64);
+                record.0[1] |= rng_diag::REENTRANT_ORIGINAL;
+                rng_diag::BUFFER.record(record);
+                let result = Self::libc_getrandom_undetoured(buffer, length, flags);
+                let mut record = random_route(rng_diag::DETOUR_RESULT, 1, length, flags as u64)
+                    .result(result as i64);
+                record.0[1] |= rng_diag::REENTRANT_ORIGINAL;
+                rng_diag::BUFFER.record(record);
+                return result;
             }
             let _guard = DetourGuard(active);
+            rng_diag::BUFFER.record(random_route(
+                rng_diag::DETOUR_ENTRY,
+                1,
+                length,
+                flags as u64,
+            ));
 
             let syscall = Syscall::from_raw(
                 Sysno::getrandom,
                 SyscallArgs::new(buffer as usize, length, flags as usize, 0, 0, 0),
             );
-            match <Self as reverie_sabre::ToolGlobal>::global()
+            let result = <Self as reverie_sabre::ToolGlobal>::global()
                 .adapter
-                .handle_syscall(syscall)
-            {
+                .handle_syscall(syscall);
+            rng_diag::BUFFER.record(
+                random_route(rng_diag::DETOUR_RESULT, 1, length, flags as u64).result(
+                    result
+                        .as_ref()
+                        .map_or_else(|error| -(error.into_raw() as i64), |value| *value as i64),
+                ),
+            );
+            match result {
                 Ok(result) => result as libc::ssize_t,
                 Err(error) => {
                     unsafe { *libc::__errno_location() = error.into_raw() };
@@ -330,6 +379,14 @@ impl reverie_sabre::Tool for Plugin {
     }
 
     fn syscall(&self, syscall: Syscall, _memory: &LocalMemory) -> Result<usize, Errno> {
+        if let Syscall::Getrandom(call) = &syscall {
+            rng_diag::BUFFER.record(random_route(
+                rng_diag::DETOUR_ENTRY,
+                2,
+                call.buflen(),
+                call.flags() as u64,
+            ));
+        }
         if let Some(result) = self.handle_post_load_syscall(&syscall) {
             return result;
         }
@@ -345,6 +402,14 @@ impl reverie_sabre::Tool for Plugin {
     where
         F: FnMut() -> usize + Send + Sync,
     {
+        if let Syscall::Getrandom(call) = &syscall {
+            rng_diag::BUFFER.record(random_route(
+                rng_diag::DETOUR_ENTRY,
+                3,
+                call.buflen(),
+                call.flags() as u64,
+            ));
+        }
         self.adapter.handle_syscall_with_inject(syscall, inject)
     }
 
@@ -425,9 +490,13 @@ impl reverie_sabre::Tool for Plugin {
     }
 
     fn on_post_load(&self) {
+        rng_diag::BUFFER.record(rng_diag::Record::new(rng_diag::POST_LOAD));
         self.adapter.handle_post_exec();
         self.post_load_syscall_pending
             .store(true, Ordering::Release);
+        let mut record = rng_diag::Record::new(rng_diag::POST_LOAD);
+        record.0[24] = 1;
+        rng_diag::BUFFER.record(record);
     }
 
     fn on_thread_exit(&self, thread_id: u32) {

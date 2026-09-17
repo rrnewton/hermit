@@ -23,6 +23,7 @@ use reverie::syscalls::MemoryAccess;
 
 use crate::consts::DEFAULT_HOSTNAME;
 use crate::detlog;
+use crate::getrandom_diagnostic as rng_diag;
 use crate::record_or_replay::RecordOrReplay;
 use crate::tool_global::create_session;
 use crate::tool_global::set_process_group;
@@ -488,7 +489,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             let local_buf = unsafe {
                 std::slice::from_raw_parts_mut(local_words.as_mut_ptr().cast::<u8>(), chunk_len)
             };
+            let mut observation = guest
+                .thread_state()
+                .random_diagnostic_record(rng_diag::RANDOM_FILL, self.cfg.rng_seed())
+                .request(0, chunk_len);
+            observation.0[26] = written as u64;
+            observation.0[27] = match source {
+                "getrandom" => 1,
+                "/dev/random" => 2,
+                "/dev/urandom" => 3,
+                _ => 0,
+            };
             guest.thread_state_mut().thread_prng().fill(local_buf);
+            let after = guest
+                .thread_state()
+                .random_diagnostic_record(rng_diag::RANDOM_FILL, self.cfg.rng_seed());
+            observation.0[24] = after.0[6];
+            observation.0[25] = after.0[7];
+            rng_diag::BUFFER.record(observation.bytes(local_buf));
             let n = match write_random_chunk(guest.memory(), remote_chunk, local_buf) {
                 Ok(n) => n,
                 Err(_) if written > 0 => break,
@@ -627,16 +645,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Getrandom,
     ) -> Result<i64, Error> {
-        validate_getrandom_flags(call.flags())?;
-        let len = getrandom_request_len(call.buflen());
-        if len == 0 {
-            return Ok(0);
+        rng_diag::BUFFER.record(
+            guest
+                .thread_state()
+                .random_diagnostic_record(rng_diag::GETRANDOM_ENTRY, self.cfg.rng_seed())
+                .request(call.flags() as u64, call.buflen()),
+        );
+        let result = (|| {
+            validate_getrandom_flags(call.flags())?;
+            let len = getrandom_request_len(call.buflen());
+            if len == 0 {
+                return Ok(0);
+            }
+
+            let buf = call.buf().ok_or(Errno::EFAULT)?;
+
+            let n = self.fill_random_bytes(guest, buf, len, "getrandom")?;
+            Ok(n as i64)
+        })();
+        let mut observation = guest
+            .thread_state()
+            .random_diagnostic_record(rng_diag::GETRANDOM_RESULT, self.cfg.rng_seed())
+            .request(call.flags() as u64, call.buflen());
+        observation.0[24] = u64::from(result.is_ok());
+        if let Ok(value) = &result {
+            observation.0[8] = *value as u64;
         }
-
-        let buf = call.buf().ok_or(Errno::EFAULT)?;
-
-        let n = self.fill_random_bytes(guest, buf, len, "getrandom")?;
-        Ok(n as i64)
+        rng_diag::BUFFER.record(observation);
+        result
     }
 
     /// setsid system call
