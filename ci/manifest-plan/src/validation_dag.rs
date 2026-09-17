@@ -270,6 +270,9 @@ fn generated_plan(root: &Path, scratch: &Path) -> Result<DagConfig, String> {
         "HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS",
         "DAGRUN_CPU_TIMEOUT_MULTIPLIER",
         "DAGRUN_CPU_TIMEOUT_PLATFORM",
+        // This metadata-only export owns scratch/run-state, not the enclosing
+        // validation's execution state or its authenticated nesting marker.
+        "HERMIT_VALIDATE_ACTIVE",
         "VALIDATE_RUN_STATE",
     ] {
         command.env_remove(name);
@@ -279,8 +282,9 @@ fn generated_plan(root: &Path, scratch: &Path) -> Result<DagConfig, String> {
         .map_err(|error| format!("cannot run scripts/validate.rs for generated nodes: {error}"))?;
     if !output.status.success() {
         return Err(format!(
-            "generated-partition export failed with {}: {}",
+            "generated-partition export failed with {}\nstdout:\n{}\nstderr:\n{}",
             output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
