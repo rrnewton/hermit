@@ -220,6 +220,14 @@ fi
 # build.rs, vendor tree, native key, and CMAKE/CMAKE_GENERATOR selection unchanged.
 # Keep the existing 1050 effective-job-second threshold and 16-job clamp.
 # This source-identity carry supplies no new timing or Hermit guest evidence.
+# CARRY TO 596b9ade (2026-09-17): the complete b3049e54-to-landed
+# comparison preserves reverie-dbt tree 6232257769144e8f63891a5efc8935abc3cd836b,
+# build.rs blob 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 and DynamoRIO vendor
+# tree 42dd83f76cef3e730c39d2313c11fdc78d12ae35, including all build/config bytes.
+# CMAKE remains the default cmake and CMAKE_GENERATOR remains unset.
+# Keep the existing 1050 effective-job-second threshold and 16-job clamp.
+# Source comparison 89b2eb0abe05008a21974668602c288452108270c85132ea48f87bb325d91ca2 is a carry decision,
+# not a new timing sample or Hermit guest receipt.
 # CARRY TO 94d97270 (2026-09-17): all eight commits after b3049e54
 # (f918218c, 2fabda5b, 4866241e, 596b9ade, 545faab1, ca4e61a9,
 # 78e5d73a, 94d97270) preserve the complete reverie-dbt and third-party
