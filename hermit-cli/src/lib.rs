@@ -4400,7 +4400,12 @@ mod tests {
         let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
             .expect("run /bin/echo through DbtGuest<Detcore>");
 
-        assert_eq!(output.status, super::ExitStatus::Exited(0));
+        assert_eq!(
+            output.status,
+            super::ExitStatus::Exited(0),
+            "DBT echo failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(output.stdout, b"hello\n");
         assert!(
             String::from_utf8_lossy(&output.stderr)

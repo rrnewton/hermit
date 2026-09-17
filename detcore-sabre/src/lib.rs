@@ -200,6 +200,33 @@ struct Plugin {
     post_load_syscall_pending: AtomicBool,
 }
 
+fn initial_image_generation(pid: i32, bytes: &[u8]) -> io::Result<u64> {
+    // The kernel's comm field is raw bytes, including possible ") " bytes.
+    // Decode only the PID and start-time fields, outside the final delimiter.
+    let end = bytes
+        .windows(2)
+        .rposition(|pair| pair == b") ")
+        .ok_or_else(|| io::Error::other("invalid process stat"))?;
+    let prefix = &bytes[..end];
+    let owner_end = prefix
+        .windows(2)
+        .position(|pair| pair == b" (")
+        .ok_or_else(|| io::Error::other("invalid stat owner"))?;
+    let owner = std::str::from_utf8(&prefix[..owner_end]).map_err(io::Error::other)?;
+    if owner.parse::<i32>().map_err(io::Error::other)? != pid {
+        return Err(io::Error::other("initial random handoff owner mismatch"));
+    }
+    let start = bytes[end + 2..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+        .nth(19)
+        .ok_or_else(|| io::Error::other("missing process generation"))?;
+    std::str::from_utf8(start)
+        .map_err(io::Error::other)?
+        .parse()
+        .map_err(io::Error::other)
+}
+
 fn own_initial_image(pid: i32) -> io::Result<detcore::random::InitialImage> {
     fn bounded(path: &str) -> io::Result<Vec<u8>> {
         let mut bytes = Vec::new();
@@ -212,22 +239,7 @@ fn own_initial_image(pid: i32) -> io::Result<detcore::random::InitialImage> {
         Ok(bytes)
     }
     let before = bounded("/proc/self/stat")?;
-    let text = std::str::from_utf8(&before).map_err(io::Error::other)?;
-    let (prefix, rest) = text
-        .rsplit_once(") ")
-        .ok_or_else(|| io::Error::other("invalid process stat"))?;
-    let owner = prefix
-        .split_once(" (")
-        .ok_or_else(|| io::Error::other("invalid stat owner"))?
-        .0;
-    let start = rest
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| io::Error::other("missing process generation"))?;
-    if owner.parse::<i32>().map_err(io::Error::other)? != pid {
-        return Err(io::Error::other("initial random handoff owner mismatch"));
-    }
-    let start_time_ticks = start.parse().map_err(io::Error::other)?;
+    let start_time_ticks = initial_image_generation(pid, &before)?;
     let auxv = bounded("/proc/self/auxv")?;
     if auxv.len() % 16 != 0 {
         return Err(io::Error::other("incomplete initial auxv"));
@@ -515,6 +527,65 @@ mod tests {
     use std::ffi::CStr;
 
     use super::*;
+
+    #[test]
+    fn initial_generation_accepts_raw_worker_comm_and_rejects_invalid_identity() {
+        struct RestoreComm {
+            tid: i32,
+            name: [u8; 16],
+        }
+        impl Drop for RestoreComm {
+            fn drop(&mut self) {
+                assert_eq!(unsafe { libc::syscall(libc::SYS_gettid) } as i32, self.tid);
+                assert_eq!(
+                    unsafe { libc::prctl(libc::PR_SET_NAME, self.name.as_ptr()) },
+                    0
+                );
+            }
+        }
+        // /proc/self/stat names the leader. Use this owned libtest worker's
+        // actual stat to exercise the same production parser without renaming
+        // the leader or claiming that an injected SaBRe guest was executed.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        let path = format!("/proc/{tid}/stat");
+        let expected = initial_image_generation(tid, &std::fs::read(&path).unwrap()).unwrap();
+        let mut restore = RestoreComm { tid, name: [0; 16] };
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_GET_NAME, restore.name.as_mut_ptr()) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_NAME, c"raw) \xff) task".as_ptr()) },
+            0
+        );
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.len() <= 4096);
+        assert!(std::str::from_utf8(&bytes).is_err());
+        assert!(bytes.windows(12).any(|row| row == b"raw) \xff) task"));
+        assert_eq!(initial_image_generation(tid, &bytes).unwrap(), expected);
+        assert!(
+            initial_image_generation(tid + 1, &bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("owner mismatch")
+        );
+        assert!(initial_image_generation(tid, b"missing delimiter").is_err());
+        let end = bytes.windows(2).rposition(|row| row == b") ").unwrap();
+        let mut fields: Vec<&[u8]> = bytes[end + 2..]
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty())
+            .collect();
+        let mut malformed = bytes[..end + 2].to_vec();
+        fields[19] = b"not-a-number";
+        malformed.extend(fields.join(&b' '));
+        assert!(initial_image_generation(tid, &malformed).is_err());
+        assert!(initial_image_generation(tid, &bytes[..end + 2]).is_err());
+        let owner_end = bytes.windows(2).position(|row| row == b" (").unwrap();
+        let mut malformed_owner = b"not-a-pid".to_vec();
+        malformed_owner.extend_from_slice(&bytes[owner_end..]);
+        assert!(initial_image_generation(tid, &malformed_owner).is_err());
+        drop(restore);
+    }
 
     #[test]
     fn guest_comm_uses_target_basename_and_linux_limit() {

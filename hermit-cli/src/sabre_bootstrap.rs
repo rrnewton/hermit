@@ -668,24 +668,31 @@ fn remote_bytes(pid: Pid, address: usize, length: usize) -> Result<Vec<u8>> {
 
 fn generation(pid: Pid) -> Result<u64> {
     let bytes = read_path(format!("/proc/{pid}/stat"), 4096)?;
-    let text = std::str::from_utf8(&bytes)?;
-    let (prefix, fields) = text
-        .rsplit_once(") ")
+    stat_generation(pid, &bytes)
+}
+
+fn stat_generation(pid: Pid, bytes: &[u8]) -> Result<u64> {
+    // Linux comm is raw bytes and may itself contain ") ". Only the PID
+    // prefix and the numeric fields following its final delimiter are text.
+    let end = bytes
+        .windows(2)
+        .rposition(|pair| pair == b") ")
         .ok_or_else(|| anyhow!("malformed bootstrap process stat"))?;
+    let prefix = &bytes[..end];
+    let owner_end = prefix
+        .windows(2)
+        .position(|pair| pair == b" (")
+        .ok_or_else(|| anyhow!("missing process stat owner"))?;
     ensure!(
-        prefix
-            .split_once(" (")
-            .ok_or_else(|| anyhow!("missing process stat owner"))?
-            .0
-            .parse::<i32>()?
-            == pid.as_raw(),
+        std::str::from_utf8(&prefix[..owner_end])?.parse::<i32>()? == pid.as_raw(),
         "bootstrap stat owner mismatch"
     );
-    Ok(fields
-        .split_whitespace()
+    let start = bytes[end + 2..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
         .nth(19)
-        .ok_or_else(|| anyhow!("missing process generation"))?
-        .parse()?)
+        .ok_or_else(|| anyhow!("missing process generation"))?;
+    Ok(std::str::from_utf8(start)?.parse()?)
 }
 
 fn script_interpreter(bytes: &[u8]) -> Result<Option<&Path>> {
@@ -1701,6 +1708,67 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    #[test]
+    fn generation_accepts_raw_worker_comm_and_rejects_invalid_identity() {
+        struct RestoreComm {
+            tid: i32,
+            name: [u8; 16],
+        }
+        impl Drop for RestoreComm {
+            fn drop(&mut self) {
+                assert_eq!(unsafe { libc::syscall(libc::SYS_gettid) } as i32, self.tid);
+                assert_eq!(
+                    unsafe { libc::prctl(libc::PR_SET_NAME, self.name.as_ptr()) },
+                    0
+                );
+            }
+        }
+        // Change only this libtest worker's name, never the process leader or
+        // another test's thread. This is a native reader control, not a guest.
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        let pid = Pid::from_raw(tid);
+        let expected = generation(pid).unwrap();
+        let mut restore = RestoreComm { tid, name: [0; 16] };
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_GET_NAME, restore.name.as_mut_ptr()) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_NAME, c"raw) \xff) task".as_ptr()) },
+            0
+        );
+        let bytes = read_path(format!("/proc/{pid}/stat"), 4096).unwrap();
+        // These are actual kernel bytes rejected by the former whole-file
+        // UTF-8 conversion, including an embedded closing delimiter.
+        assert!(std::str::from_utf8(&bytes).is_err());
+        assert!(bytes.windows(12).any(|row| row == b"raw) \xff) task"));
+        assert_eq!(generation(pid).unwrap(), expected);
+        assert_eq!(stat_generation(pid, &bytes).unwrap(), expected);
+        expect_error(
+            stat_generation(Pid::from_raw(tid + 1), &bytes),
+            "owner mismatch",
+        );
+        expect_error(stat_generation(pid, b"missing delimiter"), "malformed");
+        let end = bytes.windows(2).rposition(|row| row == b") ").unwrap();
+        let mut fields: Vec<&[u8]> = bytes[end + 2..]
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty())
+            .collect();
+        let mut malformed = bytes[..end + 2].to_vec();
+        fields[19] = b"not-a-number";
+        malformed.extend(fields.join(&b' '));
+        assert!(stat_generation(pid, &malformed).is_err());
+        expect_error(
+            stat_generation(pid, &bytes[..end + 2]),
+            "missing process generation",
+        );
+        let owner_end = bytes.windows(2).position(|row| row == b" (").unwrap();
+        let mut malformed_owner = b"not-a-pid".to_vec();
+        malformed_owner.extend_from_slice(&bytes[owner_end..]);
+        assert!(stat_generation(pid, &malformed_owner).is_err());
+        drop(restore);
+    }
 
     struct Mapping {
         address: *mut libc::c_void,

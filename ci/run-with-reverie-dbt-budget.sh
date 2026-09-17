@@ -232,7 +232,16 @@ fi
 # MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged. This is
 # recipe identity evidence, not a new timing measurement or runtime receipt.
 # The carried KVM, RPC/log-capture and SaBRe behavior is not claimed unchanged.
-expected_pin=94d9727065f5f9e2b588ef77a522ab61f53148f2
+# CARRY TO c164a085 (2026-09-17): the ninth commit after b3049e54
+# restores SaBRe's original PROT_* mapping protections and adds native controls.
+# Its five-path delta leaves all DBT inputs unchanged. Across all nine commits,
+# the complete reverie-dbt/third-party trees and root Cargo.toml/toolchain
+# retain the exact Git objects recorded above. The native recipe key remains
+# 0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4;
+# CMAKE/CMAKE_GENERATOR, native options, 16-job clamp and 1050 effective-job-
+# second threshold are unchanged. This is a source-identity carry, not a new
+# timing sample or Hermit guest result; the SaBRe behavior intentionally changes.
+expected_pin=c164a0854f5782d5c5d4548f532ffb55dd16e8bc
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

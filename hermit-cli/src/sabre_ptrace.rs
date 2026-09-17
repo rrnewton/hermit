@@ -1161,9 +1161,8 @@ fn run_blocking(
         bootstrap_launch,
     )
     .run();
-    if supervised.is_err() {
-        let _ = nix::sys::signal::kill(root, Signal::SIGKILL);
-    }
+    // Supervisor owns error cleanup and reaping. Its former root PID may be
+    // reused after run returns, including when cleanup reports an error.
     let stdout = stdout_thread
         .join()
         .map_err(|_| anyhow!("SaBRe stdout reader panicked"))??;
