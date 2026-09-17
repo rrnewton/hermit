@@ -4,6 +4,14 @@
 //! Captured runs publish a bounded summary before their authoritative result.
 //! The library still serializes and writes its temporary summary without a
 //! bound. This module bounds the later read and final publication only.
+//!
+//! Captured summary publication deliberately requests creation mode 0600 (the
+//! process umask may further restrict it). It creates a new inode and does not
+//! preserve the previous inode's mode, owner, or extended attributes. Uncaptured
+//! summary writing is unchanged: direct fs::write retains an existing inode and
+//! follows its ordinary creation permissions and umask for an absent file.
+//! Cleanup's identity check followed by unlink shares the publication checks'
+//! non-atomic limit against concurrent namespace changes.
 
 use std::ffi::CString;
 use std::ffi::OsStr;
@@ -431,6 +439,7 @@ impl Drop for StagedChild<'_> {
     fn drop(&mut self) {
         // No cleanup after successful rename (the old name is absent). Never
         // intentionally unlink a name observed to refer to somebody else's inode.
+        // The identity check and unlink are not atomic against concurrent rename.
         if self.check().is_ok()
             && let Ok(name) = cstring(&self.name)
         {
