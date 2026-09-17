@@ -220,7 +220,7 @@ fi
 # build.rs, vendor tree, native key, and CMAKE/CMAKE_GENERATOR selection unchanged.
 # Keep the existing 1050 effective-job-second threshold and 16-job clamp.
 # This source-identity carry supplies no new timing or Hermit guest evidence.
-expected_pin=b3049e54c644e28e2894402a36bb65664ab4508b
+expected_pin=94d9727065f5f9e2b588ef77a522ab61f53148f2
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

@@ -8,11 +8,11 @@
 
 //! SaBRe plugin that executes Hermit's Detcore tool inside each guest process.
 
-use std::cell::Cell;
 use std::ffi::CString;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io;
+use std::io::Read;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -45,22 +45,6 @@ pub const DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-771): Review fork-inherited SaBRe coordinator discovery.
 static RPC_SOCKET: OnceLock<PathBuf> = OnceLock::new();
-
-thread_local! {
-    // Function detours are registered before the process-local tool is built.
-    // Adapter construction may itself call libc getrandom, so recursive calls
-    // must use the captured original while the first call initializes the
-    // process-local Plugin.
-    static LIBC_GETRANDOM_ACTIVE: Cell<bool> = const { Cell::new(false) };
-}
-
-struct DetourGuard<'a>(&'a Cell<bool>);
-
-impl Drop for DetourGuard<'_> {
-    fn drop(&mut self) {
-        self.0.set(false);
-    }
-}
 
 fn coordinator_socket() -> Option<PathBuf> {
     if let Some(socket) = RPC_SOCKET.get() {
@@ -192,12 +176,85 @@ pub fn runtime_library_path() -> io::Result<PathBuf> {
     })
 }
 
+/// Optional loader transport for a supervisor-authenticated later exec or
+/// initial static image. Absence of initial opt-in alone grants no authority.
+///
+/// # Safety
+/// Called once by the loader before plugin initialization with its own held
+/// callback. The callback itself must return an authenticated typed result.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_sabre_install_loader_continuation_v1(
+    callback: sabre::bootstrap::TakeStateFn,
+) -> i32 {
+    match unsafe { sabre::bootstrap::install(callback) } {
+        Ok(()) => 0,
+        Err(error) => -error.into_raw(),
+    }
+}
+
 struct Plugin {
     adapter: RemoteReverieAdapter<Detcore>,
     // The SaBRe-injected runtime requests its hash seed on the first rewritten
     // syscall after post-load. Keep that tool-private draw out of Detcore's
     // guest-visible random stream.
     post_load_syscall_pending: AtomicBool,
+}
+
+fn own_initial_image(pid: i32) -> io::Result<detcore::random::InitialImage> {
+    fn bounded(path: &str) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(4097)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 4096 {
+            return Err(io::Error::other("initial image identity exceeds bound"));
+        }
+        Ok(bytes)
+    }
+    let before = bounded("/proc/self/stat")?;
+    let text = std::str::from_utf8(&before).map_err(io::Error::other)?;
+    let (prefix, rest) = text
+        .rsplit_once(") ")
+        .ok_or_else(|| io::Error::other("invalid process stat"))?;
+    let owner = prefix
+        .split_once(" (")
+        .ok_or_else(|| io::Error::other("invalid stat owner"))?
+        .0;
+    let start = rest
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| io::Error::other("missing process generation"))?;
+    if owner.parse::<i32>().map_err(io::Error::other)? != pid {
+        return Err(io::Error::other("initial random handoff owner mismatch"));
+    }
+    let start_time_ticks = start.parse().map_err(io::Error::other)?;
+    let auxv = bounded("/proc/self/auxv")?;
+    if auxv.len() % 16 != 0 {
+        return Err(io::Error::other("incomplete initial auxv"));
+    }
+    let mut at_random = None;
+    let mut terminated = false;
+    for row in auxv.as_chunks::<16>().0 {
+        let key = u64::from_ne_bytes(row[..8].try_into().unwrap());
+        let value = u64::from_ne_bytes(row[8..].try_into().unwrap());
+        if key == libc::AT_NULL {
+            terminated = value == 0;
+            break;
+        }
+        if key == libc::AT_RANDOM && at_random.replace(value as usize).is_some() {
+            return Err(io::Error::other("duplicate initial AT_RANDOM"));
+        }
+    }
+    if !terminated {
+        return Err(io::Error::other("unterminated initial auxv"));
+    }
+    Ok(detcore::random::InitialImage {
+        pid,
+        start_time_ticks,
+        at_random: at_random
+            .filter(|p| *p != 0)
+            .ok_or_else(|| io::Error::other("missing initial AT_RANDOM"))?,
+    })
 }
 
 impl Plugin {
@@ -246,8 +303,38 @@ impl Plugin {
         Self::check_coordinator_compatibility();
         let socket = coordinator_socket().unwrap_or_else(|| panic!("{RPC_SOCKET_ENV} is not set"));
 
-        let adapter = RemoteReverieAdapter::connect(socket)
-            .expect("failed to connect Detcore SaBRe plugin to coordinator");
+        let adapter = RemoteReverieAdapter::<Detcore>::connect_with_root_initializer(
+            socket,
+            |config, pid, state| {
+                // This runs only after the existing inherited-fork decision, on
+                // the normally constructed guest root. No clocks/metadata are
+                // imported and no coordinator readiness event is manufactured.
+                let image = own_initial_image(pid.as_raw())?;
+                let mut bytes = [0; detcore::random::MAX_INITIAL_STATE_BYTES];
+                let count = sabre::bootstrap::take_state(&mut bytes)
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| {
+                        io::Error::other("required initial random handoff was not negotiated")
+                    })?;
+                match detcore::random::decode_loader_state(&bytes[..count], config, image)
+                    .map_err(io::Error::other)?
+                {
+                    detcore::random::LoaderState::InitialRandom { .. } => {
+                        state
+                            .apply_initial_random_state(&bytes[..count], config, image)
+                            .map_err(io::Error::other)?;
+                    }
+                    detcore::random::LoaderState::ObservedExecContinuation
+                    | detcore::random::LoaderState::InitialStaticLegacy => {
+                        // The held loader and supervisor proved this legacy
+                        // image. Preserve every normal constructor field and
+                        // let the existing post-exec callback run unchanged.
+                    }
+                }
+                Ok(())
+            },
+        )
+        .expect("failed to connect Detcore SaBRe plugin to coordinator");
 
         Self {
             adapter,
@@ -289,36 +376,20 @@ impl reverie_sabre::Tool for Plugin {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1214): Review libc getrandom function interception.
-    // GNU patch calls glibc's getrandom wrapper from libc, whose raw syscall
-    // site SaBRe deliberately does not rewrite. Route that wrapper through the
-    // same Detcore syscall handler used by rewritten guest call sites.
+    // Preserve libc's vDSO/key-refill algorithm. This detour wrapper does not
+    // switch the guest/plugin recursion domain; the captured original retains
+    // it, and actual rewritten syscall sites route through the normal handler.
     #[detour(lib = "libc", func = "getrandom")]
     fn libc_getrandom(
         buffer: *mut libc::c_void,
         length: libc::size_t,
         flags: libc::c_uint,
     ) -> libc::ssize_t {
-        LIBC_GETRANDOM_ACTIVE.with(|active| {
-            if active.replace(true) {
-                return Self::libc_getrandom_undetoured(buffer, length, flags);
-            }
-            let _guard = DetourGuard(active);
+        Self::libc_getrandom_undetoured(buffer, length, flags)
+    }
 
-            let syscall = Syscall::from_raw(
-                Sysno::getrandom,
-                SyscallArgs::new(buffer as usize, length, flags as usize, 0, 0, 0),
-            );
-            match <Self as reverie_sabre::ToolGlobal>::global()
-                .adapter
-                .handle_syscall(syscall)
-            {
-                Ok(result) => result as libc::ssize_t,
-                Err(error) => {
-                    unsafe { *libc::__errno_location() = error.into_raw() };
-                    -1
-                }
-            }
-        })
+    fn supports_loader_bootstrap() -> bool {
+        true
     }
 
     fn new(_client: Self::Client) -> Self {

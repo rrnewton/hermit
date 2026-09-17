@@ -260,8 +260,18 @@ fi
 # build.rs, vendor tree, native key, and CMAKE/CMAKE_GENERATOR selection unchanged.
 # Keep the existing 1050 effective-job-second threshold and 16-job clamp.
 # This source-identity carry supplies no new timing or Hermit guest evidence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b3049e54c644e28e2894402a36bb65664ab4508b ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie b3049e54c644e28e2894402a36bb65664ab4508b (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 4866241e (2026-09-17): the landed optional SaBRe random-bootstrap
+# API changes only experimental/reverie-sabre. From b3049e54, the complete
+# reverie-dbt subtree, build.rs, vendor/dynamorio, third-party tree and root
+# Cargo/toolchain inputs retain identical Git objects. In particular:
+#   reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+#   reverie-dbt/vendor/dynamorio: 42dd83f76cef3e730c39d2313c11fdc78d12ae35
+# CMAKE/CMAKE_GENERATOR selection and native build options are unchanged, so
+# recipe key 0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4,
+# MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged. This is
+# recipe identity evidence, not a new timing measurement or runtime receipt.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 94d9727065f5f9e2b588ef77a522ab61f53148f2 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 94d9727065f5f9e2b588ef77a522ab61f53148f2 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
