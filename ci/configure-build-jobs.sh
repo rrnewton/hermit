@@ -324,8 +324,8 @@ fi
 # Preserve CMAKE/CMAKE_GENERATOR selection, the 1050 effective-job-second
 # threshold and the 16-job clamp. This is a source-identity carry,
 # not a new timing calibration or Hermit guest result.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 114b309413612fafc2657c74e83811c71aac7b19 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 114b309413612fafc2657c74e83811c71aac7b19 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 30fee360d6359e38a429f6bf19d30cdfac9c1d0d ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 30fee360d6359e38a429f6bf19d30cdfac9c1d0d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

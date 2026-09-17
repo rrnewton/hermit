@@ -284,7 +284,7 @@ fi
 # Preserve CMAKE/CMAKE_GENERATOR selection, the 1050 effective-job-second
 # threshold and the 16-job clamp. This is a source-identity carry,
 # not a new timing calibration or Hermit guest result.
-expected_pin=114b309413612fafc2657c74e83811c71aac7b19
+expected_pin=30fee360d6359e38a429f6bf19d30cdfac9c1d0d
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
