@@ -388,19 +388,26 @@ impl reverie_sabre::Tool for Plugin {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1214): Review libc getrandom function interception.
-    // Keep the registered entry transparent: it must preserve libc's algorithm,
-    // return/errno and guest/plugin domain without constructing the tool. The
-    // registration itself does not intercept entropy. Rewritten libc syscall
-    // sites do that; initial dynamic bootstrap also rewrites vDSO getrandom
-    // syscall sites. Static and later-exec images retain the existing vDSO
-    // coverage limit. Serving a public request directly from Detcore would
-    // bypass libc's key-refill/ChaCha path and change ptrace-parity bytes.
+    // Guest calls retain libc's algorithm, return/errno and domain without
+    // constructing the tool. Plugin calls use Linux directly so their native
+    // entropy cannot seed libc/vDSO opaque state later shared with the guest.
+    // Rewritten libc and initial dynamic-bootstrap vDSO syscall sites still
+    // intercept guest entropy; static/later-exec vDSO coverage is unchanged.
+    // Serving a guest public request directly from Detcore would bypass libc's
+    // key-refill/ChaCha path and change ptrace-parity bytes.
     #[detour(lib = "libc", func = "getrandom")]
     fn libc_getrandom(
         buffer: *mut libc::c_void,
         length: libc::size_t,
         flags: libc::c_uint,
     ) -> libc::ssize_t {
+        if unsafe { sabre::ffi::calling_from_plugin() } {
+            // libc::syscall preserves the C return/errno convention and leaves
+            // the caller's domain intact. The kernel validates the buffer.
+            return unsafe {
+                libc::syscall(libc::SYS_getrandom, buffer, length, flags) as libc::ssize_t
+            };
+        }
         Self::libc_getrandom_undetoured(buffer, length, flags)
     }
 
@@ -701,7 +708,7 @@ mod tests {
         };
         // The macro stores Original's Rust signature and returns its C-ABI
         // stub through SaBRe's erased function-pointer ABI. Exercise those
-        // generated functions, not a direct call to the transparent body.
+        // generated functions, not a direct call to the detour body.
         // This test alone installs the original; all probe state is per-thread.
         let original = unsafe {
             std::mem::transmute::<Original, sabre::ffi::void_void_fn>(
@@ -713,53 +720,78 @@ mod tests {
                 original,
             ))
         };
-        for from_plugin in [false, true] {
-            unsafe {
-                if from_plugin {
-                    sabre::ffi::enter_plugin();
-                } else {
-                    sabre::ffi::exit_plugin();
-                }
+        unsafe { sabre::ffi::exit_plugin() };
+        for (length, flags, expected_result, expected_errno) in [
+            (16, 0, 7, libc::E2BIG),
+            (16, 0x8000_0001, -1, libc::EINVAL),
+            (0, 0, 0, libc::E2BIG),
+        ] {
+            let mut bytes = [0xa5u8; 16];
+            let buffer = if length == 0 {
+                std::ptr::null_mut()
+            } else {
+                bytes.as_mut_ptr().cast::<libc::c_void>()
+            };
+            EXPECTED_BUFFER.set(buffer);
+            OBSERVED.set(None);
+            CALLS.set(0);
+            unsafe { *libc::__errno_location() = libc::E2BIG };
+            let result = unsafe { stub(buffer, length, flags) };
+            let errno = unsafe { *libc::__errno_location() };
+            let domain_after = unsafe { sabre::ffi::calling_from_plugin() };
+            assert_eq!(CALLS.get(), 1);
+            assert_eq!(
+                OBSERVED.get(),
+                Some(Observation {
+                    buffer: buffer as usize,
+                    length,
+                    flags,
+                    from_plugin: false,
+                    errno: libc::E2BIG,
+                })
+            );
+            assert_eq!(result, expected_result);
+            assert_eq!(errno, expected_errno);
+            assert!(!domain_after);
+            let mut expected_bytes = [0xa5; 16];
+            if expected_result == 7 {
+                expected_bytes[..7].copy_from_slice(b"libc-vd");
             }
-            for (length, flags, expected_result, expected_errno) in [
-                (16, 0, 7, libc::E2BIG),
-                (16, 0x8000_0001, -1, libc::EINVAL),
-                (0, 0, 0, libc::E2BIG),
-            ] {
-                let mut bytes = [0xa5u8; 16];
-                let buffer = if length == 0 {
-                    std::ptr::null_mut()
-                } else {
-                    bytes.as_mut_ptr().cast::<libc::c_void>()
-                };
-                EXPECTED_BUFFER.set(buffer);
-                OBSERVED.set(None);
-                CALLS.set(0);
-                unsafe { *libc::__errno_location() = libc::E2BIG };
-                let result = unsafe { stub(buffer, length, flags) };
-                let errno = unsafe { *libc::__errno_location() };
-                let domain_after = unsafe { sabre::ffi::calling_from_plugin() };
-                assert_eq!(CALLS.get(), 1);
-                assert_eq!(
-                    OBSERVED.get(),
-                    Some(Observation {
-                        buffer: buffer as usize,
-                        length,
-                        flags,
-                        from_plugin,
-                        errno: libc::E2BIG,
-                    })
-                );
-                assert_eq!(result, expected_result);
-                assert_eq!(errno, expected_errno);
-                assert_eq!(domain_after, from_plugin);
-                let mut expected_bytes = [0xa5; 16];
-                if expected_result == 7 {
-                    expected_bytes[..7].copy_from_slice(b"libc-vd");
-                }
-                assert_eq!(bytes, expected_bytes);
-                EXPECTED_BUFFER.set(std::ptr::null_mut());
+            assert_eq!(bytes, expected_bytes);
+            EXPECTED_BUFFER.set(std::ptr::null_mut());
+        }
+
+        unsafe { sabre::ffi::enter_plugin() };
+        for (length, flags, null_buffer, expected_result, expected_errno) in [
+            (16, 0, false, 16, libc::E2BIG),
+            (16, 0x8000_0001, false, -1, libc::EINVAL),
+            (0, 0, true, 0, libc::E2BIG),
+            (1, 0, true, -1, libc::EFAULT),
+        ] {
+            let mut bytes = [0xa5u8; 24];
+            let buffer = if null_buffer {
+                std::ptr::null_mut()
+            } else {
+                bytes[4..20].as_mut_ptr().cast::<libc::c_void>()
+            };
+            EXPECTED_BUFFER.set(buffer);
+            OBSERVED.set(None);
+            CALLS.set(0);
+            unsafe { *libc::__errno_location() = libc::E2BIG };
+            let result = unsafe { stub(buffer, length, flags) };
+            let errno = unsafe { *libc::__errno_location() };
+            let domain_after = unsafe { sabre::ffi::calling_from_plugin() };
+            assert_eq!(CALLS.get(), 0, "plugin entropy must bypass libc state");
+            assert_eq!(OBSERVED.get(), None);
+            assert_eq!(result, expected_result);
+            assert_eq!(errno, expected_errno);
+            assert!(domain_after);
+            assert_eq!(&bytes[..4], &[0xa5; 4]);
+            assert_eq!(&bytes[20..], &[0xa5; 4]);
+            if expected_result <= 0 {
+                assert_eq!(bytes, [0xa5; 24]);
             }
+            EXPECTED_BUFFER.set(std::ptr::null_mut());
         }
     }
 
