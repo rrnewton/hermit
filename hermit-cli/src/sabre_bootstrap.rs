@@ -875,16 +875,25 @@ fn script_words(bytes: &[u8]) -> Result<Vec<&[u8]>> {
     }
     let line = &bytes[..bytes.len().min(255)];
     let line = &line[..line.iter().position(|b| *b == b'\n').unwrap_or(line.len())];
-    let words: Vec<_> = line[2..]
+    let mut tokens = line[2..]
         .split(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
-        .filter(|part| !part.is_empty())
-        .take(2)
-        .collect();
-    ensure!(!words.is_empty(), "missing SaBRe script interpreter");
-    ensure!(
-        !words.iter().any(|word| word.contains(&0)),
-        "NUL in SaBRe script interpreter"
-    );
+        .filter(|part| !part.is_empty());
+    let path = tokens
+        .next()
+        .ok_or_else(|| anyhow!("missing SaBRe script interpreter"))?;
+    // Preserve the existing interpreter-path NUL refusal. C strtok ends the
+    // optional argument at its first NUL and never considers later tokens.
+    ensure!(!path.contains(&0), "NUL in SaBRe script interpreter");
+    let mut words = vec![path];
+    if let Some(token) = tokens.next() {
+        let token = &token[..token
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(token.len())];
+        if !token.is_empty() {
+            words.push(token);
+        }
+    }
     Ok(words)
 }
 
@@ -2830,6 +2839,42 @@ mod tests {
 
     #[test]
     fn interpreter_parsers_preserve_raw_unix_paths() {
+        for (script, expected) in [
+            (
+                b"#!/interpreter --op\0ignored later\n".as_slice(),
+                vec![b"/interpreter".as_slice(), b"--op".as_slice()],
+            ),
+            (
+                b"#!/interpreter \0ignored later\n".as_slice(),
+                vec![b"/interpreter".as_slice()],
+            ),
+        ] {
+            assert_eq!(script_words(script).unwrap(), expected);
+            let arguments = guest_arguments(
+                vec![
+                    b"loader\0".to_vec(),
+                    b"plugin\0".to_vec(),
+                    b"--\0".to_vec(),
+                    b"script\0".to_vec(),
+                ],
+                Some(script),
+            )
+            .unwrap();
+            let mut expected_arguments: Vec<_> = expected
+                .iter()
+                .map(|word| {
+                    let mut value = word.to_vec();
+                    value.push(0);
+                    value
+                })
+                .collect();
+            expected_arguments.push(b"script\0".to_vec());
+            assert_eq!(arguments, expected_arguments);
+        }
+        expect_error(
+            script_words(b"#!/interpreter\0bad --option\n"),
+            "NUL in SaBRe script interpreter",
+        );
         let script = b"#! /interpreter-\xff\\012 --option\nbody\n";
         assert_eq!(
             script_interpreter(script)
