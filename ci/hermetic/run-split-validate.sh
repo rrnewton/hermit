@@ -90,6 +90,11 @@ set -euo pipefail
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$HERE/../.." && pwd)
+# Bounded retry for this phase's network operations. Kept in its own file so the
+# retry behaviour can be exercised directly by a test rather than only through a
+# full validate run -- the test sources THIS file, not a copy of it.
+# shellcheck source=ci/hermetic/retry-fetch.sh
+source "$HERE/retry-fetch.sh"
 
 lane=portable
 out="$ROOT/ignored/hermetic/split"
@@ -288,6 +293,9 @@ if [[ $dry -eq 1 ]]; then
             fi
         done
         echo "   CARGO_HOME=$cargo_home ./ci/prepare-rust-scripts.sh --fetch-only"
+        echo "   # each of the above is retried up to $HERMETIC_FETCH_ATTEMPTS time(s),"
+        echo "   # linear ${HERMETIC_FETCH_BACKOFF_SECONDS}s backoff, no new attempt after"
+        echo "   # ${HERMETIC_FETCH_RETRY_DEADLINE_SECONDS}s; the failing command's own error is what surfaces"
     fi
     if [[ $do_offline -eq 1 ]]; then
         echo
@@ -347,15 +355,18 @@ if [[ $do_fetch -eq 1 ]]; then
                     [[ "$cargo_bin" == /* ]] || cargo_bin="$PWD/$cargo_bin"
                     absolute_cargo_home=$(realpath -- "$cargo_home")
                     cd /
-                    env -u CARGO_BUILD_TARGET -u CARGO_TARGET_DIR \
+                    retry_fetch "cargo fetch $manifest" \
+                        env -u CARGO_BUILD_TARGET -u CARGO_TARGET_DIR \
                         CARGO_HOME="$absolute_cargo_home" "$cargo_bin" fetch --locked \
                         --manifest-path "$ROOT/$manifest"
                 )
             else
-                CARGO_HOME="$cargo_home" cargo fetch --locked --manifest-path "$manifest"
+                retry_fetch "cargo fetch $manifest" \
+                    env CARGO_HOME="$cargo_home" cargo fetch --locked --manifest-path "$manifest"
             fi
         done
-        CARGO_HOME="$cargo_home" ./ci/prepare-rust-scripts.sh --fetch-only
+        retry_fetch "prepare-rust-scripts --fetch-only" \
+            env CARGO_HOME="$cargo_home" ./ci/prepare-rust-scripts.sh --fetch-only
     )
     echo ":::: FETCH PHASE complete -- every byte checked against its Cargo.lock"
 fi
