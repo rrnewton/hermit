@@ -4439,11 +4439,274 @@ import time
 
 DIRECTORY = Path(sys.argv[1])
 EXECUTABLE = Path(sys.argv[2]).resolve(strict=True)
+LAUNCHER = Path(sys.argv[3]).resolve(strict=True)
+RUNTIME = Path(sys.argv[4]).resolve(strict=True)
 TEST = "tests::dbt_public_status_dispatch_runs_true_through_detcore"
 CAP = 1024 * 1024
 STARTED = time.monotonic()
 LIBC = ctypes.CDLL(None, use_errno=True)
 STOP = None
+
+
+class TraceWindow:
+    # Raw trace allocation: incomplete preparation tail plus contiguous window.
+    PREPARATION_CAP = 64 * 1024
+    WINDOW_CAP = CAP - PREPARATION_CAP
+    LINE_CAP = 64 * 1024
+    PENDING_CAP = 128
+    METADATA_CAP = 512
+
+    def __init__(self, executable, launcher):
+        self.executable, self.launcher = str(executable), str(launcher)
+        self.observed = self.processed = self.lines = self.prefix_bytes = 0
+        self.discarded_lines = 0
+        self.tail_starts_fragment = False
+        self.digest, self.prefix_digest = hashlib.sha256(), hashlib.sha256()
+        self.tail, self.window, self.partial, self.tentative = (bytearray() for _ in range(4))
+        self.tentative_start = self.window_start = self.window_line = None
+        self.pending, self.execs, self.terminals = {}, [], []
+        self.root_pid = self.root_outcome = self.failure = None
+        self.root_exec_succeeded = self.eof = self.overflow = False
+
+    def refuse(self, reason):
+        self.failure = self.failure or reason
+
+    def preparation(self, block):
+        self.prefix_bytes += len(block)
+        self.prefix_digest.update(block)
+        self.tail.extend(block)
+        drop = max(0, len(self.tail) - self.PREPARATION_CAP)
+        if drop:
+            self.discarded_lines += self.tail[:drop].count(b"\n")
+            self.tail_starts_fragment = self.tail[drop - 1] != 10
+            del self.tail[:drop]
+
+    def retain_window(self, block):
+        keep = max(0, self.WINDOW_CAP - len(self.window))
+        self.window.extend(block[:keep])
+        if len(block) > keep:
+            self.overflow = True
+            self.refuse("launch/runtime trace exceeds byte cap")
+
+    @staticmethod
+    def path(text):
+        # strace uses C quoting, not JSON. Support plain ASCII and its two
+        # quote/backslash escapes; octal, hex, truncation and other forms refuse.
+        match = re.match(r'^"((?:[^"\\]|\\.)*)",', text)
+        if match is None:
+            raise ValueError("unsupported or truncated execve pathname")
+        raw, decoded, index = match[1], [], 0
+        while index < len(raw):
+            char = raw[index]
+            if char == "\\":
+                index += 1
+                if index == len(raw) or raw[index] not in ['\\', '"']:
+                    raise ValueError("unsupported strace pathname escape")
+                char = raw[index]
+            if not 32 <= ord(char) <= 126:
+                raise ValueError("non-ASCII strace pathname")
+            decoded.append(char)
+            index += 1
+        return "".join(decoded)
+
+    def record(self, line, offset):
+        text = line.decode("ascii").removesuffix("\n")
+        match = re.fullmatch(r"([1-9][0-9]*)\s+(.+)", text)
+        if match is None:
+            raise ValueError("unsupported strace PID/record notation")
+        pid, body = int(match[1]), match[2]
+        if any(row["pid"] == pid for row in self.terminals):
+            raise ValueError("trace record follows terminal PID")
+        entry = None
+        if body.startswith("execve("):
+            if pid in self.pending:
+                raise ValueError("second execve entry before completion")
+            entry = {"pid": pid, "path": self.path(body[7:]),
+                     "entry_line": self.lines, "entry_byte": offset}
+            if self.root_pid is None:
+                if entry["path"] != self.executable:
+                    raise ValueError("initial traced exec is not the bound test executable")
+                self.root_pid = pid
+            if body.endswith("<unfinished ...>"):
+                if len(self.pending) >= self.PENDING_CAP:
+                    raise ValueError("pending execve metadata exceeds bound")
+                self.pending[pid] = entry
+                return None
+        elif body.startswith("<... execve resumed>"):
+            entry = self.pending.pop(pid, None)
+            if entry is None:
+                raise ValueError("execve completion has no matching entry")
+        elif "execve" in body or body.startswith("+++"):
+            # PID-switch/superseded exec notation cannot establish correlation.
+            # Ordinary terminal records are handled below.
+            if not body.startswith("+++ exited with ") and not body.startswith("+++ killed by "):
+                raise ValueError("unsupported exec or PID-switch notation")
+        if entry is not None:
+            if body.endswith(" = 0"):
+                if len(self.execs) >= self.METADATA_CAP:
+                    raise ValueError("successful execve metadata exceeds bound")
+                entry["completion_line"] = self.lines
+                entry["completion_end_byte"] = offset + len(line)
+                self.execs.append(entry)
+                if entry["pid"] == self.root_pid and entry["path"] == self.executable:
+                    self.root_exec_succeeded = True
+                if entry["path"] == self.launcher:
+                    if not self.root_exec_succeeded:
+                        raise ValueError("launcher preceded successful root exec")
+                    return entry
+            elif re.search(r" = -1 [A-Z0-9_]+(?: \(.*\))?$", body) is None:
+                raise ValueError("unsupported execve completion")
+        exited = re.fullmatch(r"\+\+\+ exited with ([0-9]+) \+\+\+", body)
+        killed = re.fullmatch(r"\+\+\+ killed by (SIG[A-Z0-9]+)(?: \(core dumped\))? \+\+\+", body)
+        if exited or killed:
+            if pid in self.pending:
+                raise ValueError("terminal PID has an unfinished execve")
+            if len(self.terminals) >= self.METADATA_CAP:
+                raise ValueError("terminal metadata exceeds bound")
+            row = {"pid": pid, "kind": "exit" if exited else "signal", "value": (exited or killed)[1]}
+            self.terminals.append(row)
+            if pid == self.root_pid:
+                self.root_outcome = row
+        elif body.startswith("+++"):
+            raise ValueError("unsupported terminal notation")
+        return None
+
+    def line(self, block):
+        offset = self.processed
+        self.processed += len(block)
+        self.lines += 1
+        if len(block) > self.LINE_CAP:
+            self.refuse("strace line exceeds bound")
+            if self.tentative_start is not None:
+                self.preparation(self.tentative)
+                self.tentative.clear()
+                self.tentative_start = None
+        if self.window_start is not None:
+            self.retain_window(block)
+            if self.failure is None:
+                try:
+                    self.record(block, offset)
+                except (ValueError, UnicodeError) as error:
+                    self.refuse(str(error))
+            return
+        if self.failure is not None:
+            self.preparation(block)
+            return
+        if self.tentative_start is not None:
+            self.tentative.extend(block)
+        try:
+            selected = self.record(block, offset)
+            if selected is not None:
+                if self.tentative_start is None:
+                    self.tentative_start = offset
+                    self.tentative.extend(block)
+                cut = selected["entry_byte"] - self.tentative_start
+                self.preparation(self.tentative[:cut])
+                self.window_start, self.window_line = selected["entry_byte"], selected["entry_line"]
+                self.retain_window(self.tentative[cut:])
+                self.tentative.clear()
+                self.tentative_start = None
+                return
+            candidates = [row["entry_byte"] for row in self.pending.values() if row["path"] == self.launcher]
+            if candidates:
+                earliest = min(candidates)
+                if self.tentative_start is None:
+                    self.tentative_start = offset
+                    self.tentative.extend(block)
+                cut = earliest - self.tentative_start
+                self.preparation(self.tentative[:cut])
+                del self.tentative[:cut]
+                self.tentative_start = earliest
+                if len(self.tentative) > self.WINDOW_CAP:
+                    self.overflow = True
+                    raise ValueError("tentative launch trace exceeds byte cap")
+            elif self.tentative_start is not None:
+                self.preparation(self.tentative)
+                self.tentative.clear()
+                self.tentative_start = None
+            else:
+                self.preparation(block)
+        except (ValueError, UnicodeError) as error:
+            self.refuse(str(error))
+            self.preparation(self.tentative if self.tentative_start is not None else block)
+            self.tentative.clear()
+            self.tentative_start = None
+
+    def feed(self, block):
+        self.observed += len(block)
+        self.digest.update(block)
+        self.partial.extend(block)
+        while b"\n" in self.partial:
+            length = self.partial.index(b"\n") + 1
+            line = bytes(self.partial[:length])
+            del self.partial[:length]
+            self.line(line)
+        if len(self.partial) > self.LINE_CAP:
+            self.refuse("strace partial line exceeds bound")
+            self.flush_partial()
+
+    def flush_partial(self):
+        if self.window_start is not None:
+            self.retain_window(self.partial)
+        else:
+            self.preparation(self.tentative)
+            self.tentative.clear()
+            self.tentative_start = None
+            self.preparation(self.partial)
+        self.processed += len(self.partial)
+        self.partial.clear()
+
+    def finish(self, eof):
+        self.eof = eof
+        if self.partial:
+            self.refuse("incomplete final strace line")
+            self.flush_partial()
+        if self.tentative:
+            self.preparation(self.tentative)
+            self.tentative.clear()
+            self.tentative_start = None
+        if self.pending:
+            self.refuse("unfinished execve remains at end of observation")
+        if not eof:
+            self.refuse("trace EOF was not observed")
+        if self.window_start is None:
+            self.refuse("selected drrun never successfully executed")
+        if not self.root_exec_succeeded or self.root_outcome is None:
+            self.refuse("original root execution/outcome is incomplete")
+
+    def window_execs(self):
+        if self.window_start is None:
+            return []
+        end = self.window_start + len(self.window)
+        return [row for row in self.execs
+                if self.window_start <= row["entry_byte"] < row["completion_end_byte"] <= end]
+
+    def report(self):
+        return {"policy": "incomplete preparation tail plus contiguous selected-drrun window",
+                "observed_bytes": self.observed, "observed_sha256": self.digest.hexdigest(),
+                "preparation_bytes": self.prefix_bytes, "preparation_sha256": self.prefix_digest.hexdigest(),
+                "preparation_tail_bytes": len(self.tail), "preparation_discarded_bytes": self.prefix_bytes - len(self.tail),
+                "preparation_tail_start_byte": self.prefix_bytes - len(self.tail),
+                "preparation_tail_start_line": self.discarded_lines + 1,
+                "preparation_tail_first_line_fragment": self.tail_starts_fragment,
+                "preparation_tail_last_line_fragment": bool(self.tail and not self.tail.endswith(b"\n")),
+                "window_start_byte": self.window_start, "window_start_line": self.window_line,
+                "window_observed_bytes": self.observed - self.prefix_bytes if self.window_start is not None else 0,
+                "window_retained_bytes": len(self.window), "window_cap_bytes": self.WINDOW_CAP,
+                "preparation_cap_bytes": self.PREPARATION_CAP, "line_cap_bytes": self.LINE_CAP,
+                "pending_cap": self.PENDING_CAP, "metadata_cap": self.METADATA_CAP,
+                "eof_observed": self.eof, "parser_refusal": self.failure,
+                "complete_launch_window": self.failure is None and self.eof and self.window_start is not None}
+
+
+def retain_reaped(pid, status):
+    global reaped_total, STOP
+    reaped_total += 1
+    if len(reaped) < TraceWindow.METADATA_CAP:
+        reaped.append({"pid": pid, "wait_status": status})
+    else:
+        STOP = STOP or "adopted-child metadata exceeds bound"
+    # The caller still waits/reaps to ECHILD; this only bounds retained records.
 
 
 def private_file(name):
@@ -4514,6 +4777,7 @@ for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
 save("input.json", {"schema": 1, "helper_pid": HELPER_PID,
     "helper_stat": Path("/proc/self/stat").read_text(), "helper_parent": os.getppid(),
     "tracer": identity(TRACER), "test_binary": identity(EXECUTABLE), "test": TEST,
+    "selected_drrun": identity(LAUNCHER), "selected_runtime": identity(RUNTIME),
     "tracer_environment_source": "initial /proc/self/environ bytes; never persisted",
     "observation_seconds": 40, "cleanup_seconds_from_start": 47, "stream_cap_bytes": CAP})
 
@@ -4528,8 +4792,11 @@ pidfd = None
 streams = {}
 selector = selectors.DefaultSelector()
 counts = {}
+window = TraceWindow(EXECUTABLE, LAUNCHER)
+trace_eof = False
 tracer_status = None
 reaped = []
+reaped_total = 0
 no_children = False
 try:
     pidfd = os.pidfd_open(child.pid)
@@ -4559,11 +4826,18 @@ try:
         for key, _event in selector.select(0.05):
             block = os.read(key.fd, 65536)
             if not block:
+                if key.data == "trace.log":
+                    trace_eof = True
                 selector.unregister(key.fileobj)
                 key.fileobj.close()
                 continue
             row = counts[key.data]
             row["observed"] += len(block)
+            if key.data == "trace.log":
+                window.feed(block)
+                if window.failure is not None:
+                    STOP = STOP or window.failure
+                continue
             keep = block[:max(0, CAP - row["retained"])]
             streams[key.data].write(keep)
             row["retained"] += len(keep)
@@ -4589,6 +4863,14 @@ finally:
         STOP = STOP or "tracer termination unconfirmed"
     if pidfd is not None:
         os.close(pidfd)
+    window.finish(trace_eof)
+    STOP = STOP or window.failure
+    if "trace.log" in streams:
+        streams["trace.log"].write(window.window)
+        with private_file("preparation-tail.log") as tail:
+            tail.write(window.tail)
+        counts["trace.log"]["retained"] = len(window.window) + len(window.tail)
+        counts["trace.log"]["overflow"] = window.overflow
     for stream in streams.values():
         stream.flush()
         os.fsync(stream.fileno())
@@ -4606,47 +4888,20 @@ finally:
                 no_children = True
                 break
             if pid:
-                reaped.append({"pid": pid, "wait_status": status})
+                retain_reaped(pid, status)
             else:
                 time.sleep(0.01)  # Zero is live/unknown, never an empty family.
 
-trace = (DIRECTORY / "trace.log").read_text()
-root_pid = None
-root_outcome = None
-terminal_rows = []
-successful_execve = []
-pending_execve = {}
-for line_number, line in enumerate(trace.splitlines(), 1):
-    # Only a successful, complete execve is execution evidence. Keep both line
-    # numbers for strace's unfinished/resumed form; an open or failed exec is not.
-    call = re.match(r'^(\d+)\s+execve\(("(?:[^"\\]|\\.)*"),', line)
-    if call:
-        entry = {"pid": int(call[1]), "path": json.loads(call[2]), "entry_line": line_number}
-        if line.endswith("<unfinished ...>"):
-            pending_execve[entry["pid"]] = entry
-        elif line.endswith(" = 0"):
-            successful_execve.append(dict(entry, completion_line=line_number))
-    resumed = re.match(r"^(\d+)\s+<\.\.\. execve resumed>", line)
-    if resumed:
-        entry = pending_execve.pop(int(resumed[1]), None)
-        if entry is not None and line.endswith(" = 0"):
-            successful_execve.append(dict(entry, completion_line=line_number))
-    entered = re.match(r"^(\d+)\s+execve\(", line)
-    if root_pid is None and entered and ("execve(" + json.dumps(str(EXECUTABLE)) + ",") in line:
-        root_pid = int(entered[1])
-    exited = re.match(r"^(\d+)\s+\+\+\+ exited with (\d+) \+\+\+$", line)
-    killed = re.match(r"^(\d+)\s+\+\+\+ killed by (SIG[A-Z0-9]+)(?: .*?)? \+\+\+$", line)
-    if exited or killed:
-        match = exited or killed
-        row = {"pid": int(match[1]), "kind": "exit" if exited else "signal", "value": match[2]}
-        terminal_rows.append(row)
-        if row["pid"] == root_pid:
-            root_outcome = row
-complete = STOP is None and no_children and not any(r["overflow"] for r in counts.values())
+root_pid, root_outcome = window.root_pid, window.root_outcome
+terminal_rows, successful_execve = window.terminals, window.execs
+complete = STOP is None and no_children and window.report()["complete_launch_window"] and not any(r["overflow"] for r in counts.values())
 passed = complete and tracer_status == 0 and root_outcome == {"pid": root_pid, "kind": "exit", "value": "0"}
 result = {"schema": 1, "tracer_status": tracer_status, "root_pid": root_pid,
     "root_outcome": root_outcome, "trace_terminal_rows": terminal_rows, "successful_execve": successful_execve, "streams": counts,
-    "stop_reason": STOP, "all_helper_children_reaped": no_children, "adopted_reaped": reaped,
+    "capture": window.report(),
+    "successful_execve_scope": "whole observed stream, including discarded preparation",
+    "successful_window_execve": window.window_execs(),
+    "stop_reason": STOP, "all_helper_children_reaped": no_children, "adopted_reaped": reaped, "adopted_reaped_total": reaped_total,
     "elapsed_seconds": time.monotonic() - STARTED, "traced_command_succeeded": passed}
 save("result.json", result)
 print(json.dumps({"diagnostic": str(DIRECTORY), "tracer_status": tracer_status,
@@ -4699,13 +4954,20 @@ sys.exit(0 if passed else 1)
             })
             .canonicalize()
             .expect("resolve the selected DynamoRIO release runtime");
+        let launcher = hermit_resources::resource("dynamorio/bin64/drrun")
+            .expect("resolve the selected launcher installation")
+            .unwrap_or_else(|| reverie_dbt::bundled_drrun_path().to_path_buf())
+            .canonicalize()
+            .expect("resolve the selected DynamoRIO launcher");
         let parent = std::process::id() as libc::pid_t;
         let mut command = std::process::Command::new("python3");
         command
             .args(["-I", "-B"])
             .arg(helper)
             .arg(&directory)
-            .arg(executable);
+            .arg(executable)
+            .arg(launcher)
+            .arg(&runtime);
         // SAFETY: these child-side syscalls run before exec. No process-wide
         // state in Cargo/libtest changes. Recheck closes death-before-arming.
         unsafe {
@@ -4724,9 +4986,9 @@ sys.exit(0 if passed else 1)
             &std::fs::read(directory.join("result.json")).expect("read the real tracer result"),
         )
         .expect("parse the real tracer result");
-        let runtime_execs: Vec<_> = result["successful_execve"]
+        let runtime_execs: Vec<_> = result["successful_window_execve"]
             .as_array()
-            .expect("tracer result must contain observed successful execve rows")
+            .expect("tracer result must contain successful execve rows wholly inside the retained window")
             .iter()
             .filter(|row| {
                 row["path"].as_str().is_some_and(|path| {
