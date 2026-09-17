@@ -1102,12 +1102,15 @@ mod tests {
                 Value::String(format!("{}/verify/kvm", retained["test"].as_str().unwrap())),
                 "{case}"
             );
-            // A compared validate row carries its ordinal in run_index and no
-            // separate attempt key, because that key changes the digest.
-            assert_eq!(binding["run_index"], Value::from(1), "{case}");
-            assert!(binding["attempt"].is_null(), "{case}");
-            // And the identity is the producer's, recomputed here rather than
-            // copied from the row being checked.
+            // The bound ordinal, and the row's own independent copy of it.
+            // Recording it twice is what gives the decode-time guard a second
+            // operand; without it the guard compared the binding against
+            // itself and accepted every ordinal.
+            assert_eq!(binding["selected_attempt"], Value::from(1), "{case}");
+            assert_eq!(cell["selected_attempt"], Value::from(1), "{case}");
+            // It must NOT carry a predicted published identity. Predicting one
+            // is unsound for a compared verdict, which is always collapsible.
+            assert!(binding.get("event_id").is_none(), "{case}: {binding}");
             let typed: hermit_manifest_plan::ledger::CellEvidenceBinding =
                 serde_json::from_value(binding.clone()).unwrap();
             typed
@@ -1121,7 +1124,6 @@ mod tests {
                         mode: cell["mode"].as_str().unwrap().into(),
                         backend: cell["backend"].as_str().unwrap().into(),
                     },
-                    1,
                 )
                 .unwrap_or_else(|error| panic!("{case}: {error}"));
             let attempt = &cell["backend_parity"]["attempts"][0];

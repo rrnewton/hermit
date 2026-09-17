@@ -949,19 +949,22 @@ fn focused_artifacts_require_the_same_profile_at_every_identity_boundary() {
     }
 }
 
-/// The binding guard must actually RUN on a real row, not merely exist.
+/// The binding guard must actually RUN on a real row, and its attempt arm must
+/// actually be able to fire.
 ///
-/// A field that a producer can silently stop writing is fail-open, so the guard
-/// is the whole mechanism; a guard nothing invokes is the same defect with a
-/// reassuring name. Everything here goes through `schema10_cell_results`, which
-/// is the live decode path, rather than calling the guard directly.
+/// ⚠️ THE FIVE-ORDINAL PROBE BELOW IS THE REVIEWER'S, REPRODUCED. At
+/// `c4b692ada` the guard passed the binding's own ordinal in as the value it
+/// checked against, so attempts 1, 2, 7, 999 and `u64::MAX` all returned `Ok`
+/// while producing five distinct bindings. Every one of them must now be
+/// REFUSED, because the ledger row records the ordinal independently and the
+/// guard compares against that instead of against the binding itself.
 #[test]
-fn the_live_row_decode_refuses_a_compared_verdict_that_names_no_attempt() {
+fn the_live_row_decode_refuses_a_compared_verdict_whose_binding_is_inconsistent() {
     let (row, _plan, _cells, _tests) =
         fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
 
-    // The control that makes the rest mean something: the untouched fixture
-    // decodes, and it really does carry a compared verdict with a binding.
+    // Control: the untouched fixture decodes and really does carry a compared
+    // verdict with a binding and a recorded ordinal.
     let evidence = row
         .schema10_cell_results()
         .expect("the untouched fixture must decode")
@@ -970,11 +973,16 @@ fn the_live_row_decode_refuses_a_compared_verdict_that_names_no_attempt() {
         evidence.cells[0].cell_verdict,
         CellVerdict::ComparedAndMatched { .. }
     ));
-    let bound = evidence.cells[0]
-        .evidence_binding
-        .clone()
-        .expect("the producer bound the compared verdict");
-    assert_eq!(evidence.bound_event_ids().unwrap().len(), 1);
+    assert_eq!(evidence.cells[0].selected_attempt, Some(1));
+    assert_eq!(
+        evidence.cells[0]
+            .evidence_binding
+            .as_ref()
+            .expect("the producer bound the compared verdict")
+            .selected_attempt,
+        1
+    );
+    assert_eq!(evidence.bound_attempts().unwrap().len(), 1);
 
     let decode = |mutate: &dyn Fn(&mut Value)| -> String {
         let mut row = row.clone();
@@ -985,14 +993,42 @@ fn the_live_row_decode_refuses_a_compared_verdict_that_names_no_attempt() {
             .expect_err("the live decode must refuse this row")
     };
 
-    // MISSING: the producer stopped writing the field. This is the case the
-    // guard exists for and the one a plain optional field cannot catch.
+    // THE REVIEWER'S PROBE. Each of these was accepted at c4b692ada.
+    for ordinal in [2_u64, 7, 999, u64::MAX] {
+        let error = decode(&|cell| {
+            cell["evidence_binding"]["selected_attempt"] = Value::from(ordinal);
+        });
+        assert!(
+            error.contains(&format!("binds attempt {ordinal} while the row records 1")),
+            "attempt {ordinal} was not refused: {error}"
+        );
+    }
+    // And the same ordinal on the ROW rather than the binding is refused too,
+    // so the check cannot be satisfied by moving the lie to the other operand.
+    for ordinal in [2_u64, 7, 999, u64::MAX] {
+        let error = decode(&|cell| {
+            cell["selected_attempt"] = Value::from(ordinal);
+        });
+        assert!(
+            error.contains(&format!("binds attempt 1 while the row records {ordinal}")),
+            "row ordinal {ordinal} was not refused: {error}"
+        );
+    }
+
+    // MISSING: the producer stopped writing the binding.
     let error = decode(&|cell| {
         cell.as_object_mut().unwrap().remove("evidence_binding");
     });
     assert!(error.contains("carries no evidence binding"), "{error}");
 
-    // TRANSCRIBED: a well-formed identity for a different cell, pasted on.
+    // MISSING the row's own operand, which would otherwise let the attempt arm
+    // quietly stop checking anything again.
+    let error = decode(&|cell| {
+        cell.as_object_mut().unwrap().remove("selected_attempt");
+    });
+    assert!(error.contains("no selected_attempt"), "{error}");
+
+    // WRONG CELL: internally well-formed, evidence for another cell.
     let foreign = CellEvidenceBinding::for_validate_compared(
         &evidence.run_id,
         &CellIdentity {
@@ -1002,12 +1038,6 @@ fn the_live_row_decode_refuses_a_compared_verdict_that_names_no_attempt() {
         &evidence.hermit_sha,
         1,
     );
-    let error = decode(&|cell| {
-        cell["evidence_binding"]["event_id"] = Value::String(foreign.event_id.clone());
-    });
-    assert!(error.contains("its coordinates produce"), "{error}");
-
-    // WRONG CELL: internally perfect, and evidence for another cell entirely.
     let error = decode(&|cell| {
         cell["evidence_binding"] = serde_json::to_value(&foreign).unwrap();
     });
@@ -1025,9 +1055,7 @@ fn the_live_row_decode_refuses_a_compared_verdict_that_names_no_attempt() {
     });
     assert!(error.contains("is for run"), "{error}");
 
-    // A VERDICT THAT COMPARED NOTHING MUST NOT CARRY ONE. The guard is
-    // symmetric: binding a verdict that read no attempt would name an event
-    // that was never published.
+    // A VERDICT THAT COMPARED NOTHING MUST NOT CARRY ONE.
     let error = decode(&|cell| {
         cell["cell_verdict"] = serde_json::json!({
             "state": "unavailable-with-reason",
@@ -1040,20 +1068,15 @@ fn the_live_row_decode_refuses_a_compared_verdict_that_names_no_attempt() {
         "{error}"
     );
 
-    // And the positive control in the other direction, so none of the above is
-    // passing merely because every mutation is refused: rebuilding the SAME
-    // binding from its own coordinates still decodes.
+    // Positive control, so none of the above is passing because every mutation
+    // is refused: moving BOTH operands together to the same new ordinal still
+    // decodes. That is also the honest statement of the guard's limit -- it
+    // establishes consistency, not that the ordinal is the right one.
     let mut good = row.clone();
     let mut cells = serde_json::to_value(good.cell_results.as_ref().unwrap()).unwrap();
-    cells["cells"][0]["evidence_binding"] =
-        serde_json::to_value(CellEvidenceBinding::for_validate_compared(
-            &evidence.run_id,
-            &identity(),
-            &evidence.hermit_sha,
-            bound.attempt_ordinal(),
-        ))
-        .unwrap();
+    cells["cells"][0]["selected_attempt"] = Value::from(4);
+    cells["cells"][0]["evidence_binding"]["selected_attempt"] = Value::from(4);
     good.cell_results = Some(serde_json::from_value(cells).unwrap());
     good.schema10_cell_results()
-        .expect("a correctly rebuilt binding must still decode");
+        .expect("a consistently rebound row must still decode");
 }
