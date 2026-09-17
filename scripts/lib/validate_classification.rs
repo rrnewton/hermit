@@ -60,12 +60,53 @@ impl NodeClassification {
     }
 }
 
+pub(super) const STRUCTURED_REFUSAL_PREFIX: &str = "STRUCTURED TEST RESULTS REFUSED: ";
+
+/// The one refusal cause that is an ABSENCE of evidence rather than bad evidence.
+///
+/// The refusal prefix funnels three distinct causes, all built in dagrun's
+/// `resolved_test_counts`:
+///
+/// 1. `cannot read structured test results {path}: {error}` -- the file exists
+///    and could not be read;
+/// 2. `malformed structured test results {path}: {error}` -- it was written and
+///    its content is invalid;
+/// 3. `required structured test results were not written to {location}` --
+///    nothing was written at all.
+///
+/// Causes 1 and 2 are statements about a report that EXISTS and is wrong, and a
+/// malformed suite is a fair product suspect: the test defending this file uses
+/// `duplicate test identity`, which is cause 2 and is a real product defect.
+/// Cause 3 says no evidence exists in either direction, which is the owner's
+/// infrastructure case -- an infrastructure failure is not a product failure,
+/// and a run containing one is incomplete rather than red.
+const MISSING_REPORT: &str = "required structured test results were not written";
+
+/// True when the node completed cleanly and the ONLY thing wrong is that no
+/// report was written.
+///
+/// ⚠️ THE PREFIX IS DOING MORE WORK HERE THAN NAMING THE CAUSE, and that is why
+/// the test is on `reason` rather than on `test_results_error`. dagrun rewrites
+/// `reason` to the prefixed refusal ONLY when the outer run was otherwise clean
+/// -- `returncode == Some(0) && !timed_out && !cpu_timed_out && oom == 0 &&
+/// !was_aborted`. `test_results_error` is set in every case, including alongside
+/// a genuine outer failure. So the prefix already encodes "nothing else went
+/// wrong", and keying on it means a node that failed for a real reason AND
+/// happened to write no report is still judged on the real reason.
+fn refusal_is_missing_report_only(attempt: &NodeAttempt) -> bool {
+    attempt.reason.starts_with(STRUCTURED_REFUSAL_PREFIX) && attempt.reason.contains(MISSING_REPORT)
+}
+
 /// Evidence of a failed condition remains authoritative alongside a diagnostic.
 ///
 /// Test results were parsed from the controlled runner's structured report.
 /// Current dagrun retains a refused required report in `test_results_error`,
 /// separately from the exit reason. The legacy reason prefix is also retained.
 /// A refusal alone cannot turn an uncollected or aborted attempt into a result.
+///
+/// A measured failed test still wins over everything below it: a node that
+/// reports a real failure AND writes no report is a product failure, because the
+/// failure was observed.
 pub(super) fn has_product_failure_evidence(attempt: &NodeAttempt) -> bool {
     attempt
         .test_results
@@ -75,10 +116,9 @@ pub(super) fn has_product_failure_evidence(attempt: &NodeAttempt) -> bool {
             && attempt.execution == AttemptExecution::Completed
             && attempt.ok.is_some()
             && !attempt.aborted
+            && !refusal_is_missing_report_only(attempt)
             && (attempt.test_results_error.is_some()
-                || attempt
-                    .reason
-                    .starts_with("STRUCTURED TEST RESULTS REFUSED: ")))
+                || attempt.reason.starts_with(STRUCTURED_REFUSAL_PREFIX)))
 }
 
 pub(super) fn attempt_classification(attempt: &NodeAttempt) -> NodeClassification {
@@ -112,6 +152,15 @@ pub(super) fn attempt_classification(attempt: &NodeAttempt) -> NodeClassificatio
         return NodeClassification::UnderstoodPrerequisiteFailure;
     }
     if attempt.understood_infrastructure_class.is_some() {
+        return NodeClassification::UnderstoodInfrastructureFailure;
+    }
+    // A node that ran to a clean exit and wrote no report measured nothing. It
+    // is not a failure of the product and it is not evidence of a pass either:
+    // `result()` maps this to `no_result`, so it stops counting as red AND
+    // cannot be counted as green for landing. Measured in run 1819, all 17
+    // refusals were this cause and every one was recorded as product_failure,
+    // which is what made a mostly-unrecorded run read as a broken product.
+    if refusal_is_missing_report_only(attempt) {
         return NodeClassification::UnderstoodInfrastructureFailure;
     }
     NodeClassification::ProductFailure
@@ -389,6 +438,90 @@ fn fold_bracket() -> Result<(), String> {
     Ok(())
 }
 
+/// The three refusal causes must not classify alike.
+///
+/// ⚠️ BOTH DIRECTIONS ARE LOAD-BEARING AND THEY PULL OPPOSITE WAYS. Treating
+/// every refusal as a product failure -- what this file did -- makes a run that
+/// recorded nothing read as a badly broken product: measured in run 1819, all 17
+/// refusals were the missing-report cause and all 17 were recorded as
+/// `product_failure`, against 9 nodes with a genuinely named failure. Treating
+/// every refusal as infrastructure is the opposite mistake and erases a real
+/// product defect, because a malformed report is a malformed suite.
+fn refusal_cause_bracket() -> Result<(), String> {
+    let outcome = fixture_outcome("test.refusal", 1);
+    let clean = reported_attempt(&outcome, 1);
+
+    let missing_report = |reason: &str| {
+        let mut attempt = clean.clone();
+        attempt.reason = reason.into();
+        attempt.test_results_error =
+            Some(reason.trim_start_matches(STRUCTURED_REFUSAL_PREFIX).into());
+        attempt.ok = Some(false);
+        attempt
+    };
+
+    // Cause 3, the real observed shape including the location and the captured
+    // tail dagrun now appends, so a `contains` rather than an equality is what
+    // the classifier must be doing.
+    let absent = missing_report(
+        "STRUCTURED TEST RESULTS REFUSED: required structured test results were not written to          /x/.dagrun-test-counts-1.json; the step's last output was: error: no such command",
+    );
+    if attempt_classification(&absent) != NodeClassification::UnderstoodInfrastructureFailure {
+        return Err(
+            "classification: a node that wrote no report was judged a product failure".into(),
+        );
+    }
+    if NodeClassification::UnderstoodInfrastructureFailure.result() != "no_result" {
+        return Err("classification: an unrecorded node must not count as a result".into());
+    }
+
+    // Causes 1 and 2 describe a report that EXISTS and is wrong. They stay
+    // product, and the test defending this file already relies on that.
+    for reason in [
+        "STRUCTURED TEST RESULTS REFUSED: malformed structured test results /x/r.json: expected value",
+        "STRUCTURED TEST RESULTS REFUSED: cannot read structured test results /x/r.json: Is a directory",
+        "STRUCTURED TEST RESULTS REFUSED: duplicate test identity",
+    ] {
+        let present = missing_report(reason);
+        if attempt_classification(&present) != NodeClassification::ProductFailure {
+            return Err(format!(
+                "classification: a refusal about a report that EXISTS stopped being a product failure: {reason}"
+            ));
+        }
+    }
+
+    // A measured failed test outranks the absence of a report. The node saw a
+    // failure; that it also failed to file one does not unsee it.
+    let mut with_failure = absent.clone();
+    let failed_test = dagrun::TestResult::new("fixture::fails".into(), false, 1)?;
+    with_failure.test_results = Some(vec![failed_test]);
+    if attempt_classification(&with_failure) != NodeClassification::ProductFailure {
+        return Err(
+            "classification: a missing report erased the same node's measured failed test".into(),
+        );
+    }
+
+    // ⚠️ AND A REAL OUTER FAILURE OUTRANKS IT TOO. dagrun rewrites `reason` to
+    // the prefixed refusal ONLY when the outer run exited cleanly; when the node
+    // failed for its own reason that reason is kept and only
+    // `test_results_error` carries the refusal. Keying on the prefix is what
+    // preserves this, and keying on `test_results_error` instead would silently
+    // reclassify every genuinely failing node that also wrote no report.
+    let mut outer_failure = clean.clone();
+    outer_failure.reason = "node exited 1".into();
+    outer_failure.test_results_error =
+        Some("required structured test results were not written to /x/r.json".into());
+    outer_failure.ok = Some(false);
+    outer_failure.returncode = Some(1);
+    if attempt_classification(&outer_failure) != NodeClassification::ProductFailure {
+        return Err(
+            "classification: a node that failed on its own terms was excused by a missing report"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn product_evidence_bracket() -> Result<(), String> {
     let mut outcome = fixture_outcome("test.mixed", 1);
     let mut infra = reported_attempt(&outcome, 1);
@@ -614,6 +747,7 @@ fn populations_bracket() -> Result<(), String> {
 pub(super) fn self_test() -> Result<String, String> {
     fold_bracket()?;
     product_evidence_bracket()?;
+    refusal_cause_bracket()?;
     populations_bracket()?;
     Ok("classification: exact selected populations; stale/raw fold agreement; failed tests and node limits outrank infrastructure; missing super repetitions remain unmeasured".into())
 }
@@ -629,6 +763,10 @@ mod tests {
     #[test]
     fn measured_product_evidence_outranks_infrastructure() {
         product_evidence_bracket().unwrap();
+    }
+    #[test]
+    fn a_missing_report_is_unrecorded_while_a_bad_one_is_a_product_failure() {
+        refusal_cause_bracket().unwrap();
     }
     #[test]
     fn selected_populations_and_super_denominators_are_exact() {
