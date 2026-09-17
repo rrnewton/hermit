@@ -948,3 +948,112 @@ fn focused_artifacts_require_the_same_profile_at_every_identity_boundary() {
         );
     }
 }
+
+/// The binding guard must actually RUN on a real row, not merely exist.
+///
+/// A field that a producer can silently stop writing is fail-open, so the guard
+/// is the whole mechanism; a guard nothing invokes is the same defect with a
+/// reassuring name. Everything here goes through `schema10_cell_results`, which
+/// is the live decode path, rather than calling the guard directly.
+#[test]
+fn the_live_row_decode_refuses_a_compared_verdict_that_names_no_attempt() {
+    let (row, _plan, _cells, _tests) =
+        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+
+    // The control that makes the rest mean something: the untouched fixture
+    // decodes, and it really does carry a compared verdict with a binding.
+    let evidence = row
+        .schema10_cell_results()
+        .expect("the untouched fixture must decode")
+        .expect("schema 10 row carries cell results");
+    assert!(matches!(
+        evidence.cells[0].cell_verdict,
+        CellVerdict::ComparedAndMatched { .. }
+    ));
+    let bound = evidence.cells[0]
+        .evidence_binding
+        .clone()
+        .expect("the producer bound the compared verdict");
+    assert_eq!(evidence.bound_event_ids().unwrap().len(), 1);
+
+    let decode = |mutate: &dyn Fn(&mut Value)| -> String {
+        let mut row = row.clone();
+        let mut cells = serde_json::to_value(row.cell_results.as_ref().unwrap()).unwrap();
+        mutate(&mut cells["cells"][0]);
+        row.cell_results = Some(serde_json::from_value(cells).unwrap());
+        row.schema10_cell_results()
+            .expect_err("the live decode must refuse this row")
+    };
+
+    // MISSING: the producer stopped writing the field. This is the case the
+    // guard exists for and the one a plain optional field cannot catch.
+    let error = decode(&|cell| {
+        cell.as_object_mut().unwrap().remove("evidence_binding");
+    });
+    assert!(error.contains("carries no evidence binding"), "{error}");
+
+    // TRANSCRIBED: a well-formed identity for a different cell, pasted on.
+    let foreign = CellEvidenceBinding::for_validate_compared(
+        &evidence.run_id,
+        &CellIdentity {
+            test: "somewhere/else".into(),
+            ..identity()
+        },
+        &evidence.hermit_sha,
+        1,
+    );
+    let error = decode(&|cell| {
+        cell["evidence_binding"]["event_id"] = Value::String(foreign.event_id.clone());
+    });
+    assert!(error.contains("its coordinates produce"), "{error}");
+
+    // WRONG CELL: internally perfect, and evidence for another cell entirely.
+    let error = decode(&|cell| {
+        cell["evidence_binding"] = serde_json::to_value(&foreign).unwrap();
+    });
+    assert!(error.contains("is for cell"), "{error}");
+
+    // FOREIGN RUN.
+    let other_run = CellEvidenceBinding::for_validate_compared(
+        "some-other-run",
+        &identity(),
+        &evidence.hermit_sha,
+        1,
+    );
+    let error = decode(&|cell| {
+        cell["evidence_binding"] = serde_json::to_value(&other_run).unwrap();
+    });
+    assert!(error.contains("is for run"), "{error}");
+
+    // A VERDICT THAT COMPARED NOTHING MUST NOT CARRY ONE. The guard is
+    // symmetric: binding a verdict that read no attempt would name an event
+    // that was never published.
+    let error = decode(&|cell| {
+        cell["cell_verdict"] = serde_json::json!({
+            "state": "unavailable-with-reason",
+            "comparison_tier": "canonical-bitwise",
+            "reason": "synthetic",
+        });
+    });
+    assert!(
+        error.contains("states no comparison yet carries an evidence binding"),
+        "{error}"
+    );
+
+    // And the positive control in the other direction, so none of the above is
+    // passing merely because every mutation is refused: rebuilding the SAME
+    // binding from its own coordinates still decodes.
+    let mut good = row.clone();
+    let mut cells = serde_json::to_value(good.cell_results.as_ref().unwrap()).unwrap();
+    cells["cells"][0]["evidence_binding"] =
+        serde_json::to_value(CellEvidenceBinding::for_validate_compared(
+            &evidence.run_id,
+            &identity(),
+            &evidence.hermit_sha,
+            bound.attempt_ordinal(),
+        ))
+        .unwrap();
+    good.cell_results = Some(serde_json::from_value(cells).unwrap());
+    good.schema10_cell_results()
+        .expect("a correctly rebuilt binding must still decode");
+}

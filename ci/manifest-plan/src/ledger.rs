@@ -1081,63 +1081,6 @@ impl<'de> Deserialize<'de> for CellResultsEvidenceV8 {
     }
 }
 
-impl CellResultsEvidence {
-    /// Refuse cell evidence whose COMPARED verdicts do not each resolve to the
-    /// exact attempt they were computed from.
-    ///
-    /// Fail-closed on purpose, and scoped to compared verdicts on purpose. A
-    /// compared verdict read an attempt, so it can always name one; a
-    /// by-design or unavailable verdict read none, so requiring a binding
-    /// there would demand a reference to an event that does not exist.
-    ///
-    /// This is the guard that makes the binding mean something. Without it a
-    /// producer that simply stopped writing the field would emit rows
-    /// indistinguishable from pre-binding ones and nothing would notice.
-    pub fn require_bound_compared_cells(&self) -> Result<(), String> {
-        for cell in &self.cells {
-            if !cell.is_compared() {
-                continue;
-            }
-            let identity = cell.identity();
-            let binding = cell.evidence_binding.as_ref().ok_or_else(|| {
-                format!(
-                    "compared cell {}/{}/{} carries no evidence binding",
-                    identity.test, identity.mode, identity.backend
-                )
-            })?;
-            binding.verify_against(
-                &self.run_id,
-                &self.hermit_sha,
-                &identity,
-                binding.attempt_ordinal(),
-            )?;
-        }
-        Ok(())
-    }
-
-    /// The distinct series events this evidence binds, for a reader that must
-    /// count comparisons only from the binding.
-    ///
-    /// A duplicate event across two cells is refused rather than deduplicated:
-    /// one attempt cannot be the evidence for two different cells, and
-    /// silently folding it would let one measurement be counted twice.
-    pub fn bound_event_ids(&self) -> Result<BTreeSet<String>, String> {
-        let mut seen = BTreeSet::new();
-        for cell in self.cells.iter().filter(|cell| cell.is_compared()) {
-            let Some(binding) = cell.evidence_binding.as_ref() else {
-                continue;
-            };
-            if !seen.insert(binding.event_id.clone()) {
-                return Err(format!(
-                    "series event {} is bound by more than one compared cell",
-                    binding.event_id
-                ));
-            }
-        }
-        Ok(seen)
-    }
-}
-
 impl CellResultsEvidenceV8 {
     fn into_evidence(self) -> CellResultsEvidence {
         CellResultsEvidence {
