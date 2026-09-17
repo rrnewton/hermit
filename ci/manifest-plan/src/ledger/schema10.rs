@@ -1400,6 +1400,73 @@ fn validate_ordinary_verdict(identity: &CellIdentity, verdict: &CellVerdict) -> 
 }
 
 impl CellResultsEvidenceV10 {
+    /// Refuse cell evidence whose COMPARED verdicts do not each resolve to the
+    /// exact attempt they were computed from.
+    ///
+    /// ⚠️ THIS MUST STAY CALLED FROM [`Self::validate_for_row`]. The binding
+    /// field is fail-open on its own: a producer that simply stopped writing it
+    /// would emit rows indistinguishable from the pre-binding ones, and nothing
+    /// would notice. A guard that exists and is never invoked is the same
+    /// defect wearing a reassuring name.
+    ///
+    /// Scoped to compared verdicts on purpose. A compared verdict read an
+    /// attempt, so it can always name one; a by-design or unavailable verdict
+    /// read none, so demanding a binding there would require a reference to an
+    /// event that does not exist.
+    ///
+    /// A duplicate event is REFUSED rather than deduplicated: one attempt
+    /// cannot be the evidence for two different cells, and folding it would let
+    /// one measurement be counted twice.
+    pub fn require_bound_compared_cells(&self) -> Result<(), String> {
+        let mut seen = BTreeSet::new();
+        for cell in &self.cells {
+            if !matches!(
+                cell.cell_verdict,
+                CellVerdict::ComparedAndMatched { .. } | CellVerdict::ComparedAndDiverged { .. }
+            ) {
+                if cell.evidence_binding.is_some() {
+                    return Err(format!(
+                        "cell {} states no comparison yet carries an evidence binding",
+                        CellEvidenceBinding::series_cell_key(&cell.identity())
+                    ));
+                }
+                continue;
+            }
+            let identity = cell.identity();
+            let binding = cell.evidence_binding.as_ref().ok_or_else(|| {
+                format!(
+                    "compared cell {} carries no evidence binding",
+                    CellEvidenceBinding::series_cell_key(&identity)
+                )
+            })?;
+            binding.verify_against(
+                &self.run_id,
+                &self.hermit_sha,
+                &identity,
+                binding.attempt_ordinal(),
+            )?;
+            if !seen.insert(binding.event_id.clone()) {
+                return Err(format!(
+                    "series event {} is bound by more than one compared cell",
+                    binding.event_id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The distinct series events this evidence binds, for a reader that must
+    /// count comparisons only from the binding.
+    pub fn bound_event_ids(&self) -> Result<BTreeSet<String>, String> {
+        self.require_bound_compared_cells()?;
+        Ok(self
+            .cells
+            .iter()
+            .filter_map(|cell| cell.evidence_binding.as_ref())
+            .map(|binding| binding.event_id.clone())
+            .collect())
+    }
+
     pub fn ordinary_evidence(&self) -> CellResultsEvidence {
         CellResultsEvidence {
             run_id: self.run_id.clone(),
@@ -1446,6 +1513,10 @@ impl CellResultsEvidenceV10 {
         for identity in &self.selected {
             validate_identity(identity)?;
         }
+        // Every compared verdict must name the exact attempt it read. Placed
+        // with the other population invariants because it IS one: a comparison
+        // whose evidence cannot be resolved is not a countable comparison.
+        self.require_bound_compared_cells()?;
         let population = serde_json::to_vec(
             &serde_json::to_value(&self.selected).map_err(|error| error.to_string())?,
         )
