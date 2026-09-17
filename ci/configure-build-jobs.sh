@@ -299,8 +299,25 @@ fi
 # That SDK key, MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds therefore carry.
 # Client preparation still reruns CMake and uses the new Cargo source directory.
 # This carry is source evidence, not a new timing sample or Hermit guest result.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6ae69f57fa9d675b503f5e631140644e652724ab ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 6ae69f57fa9d675b503f5e631140644e652724ab (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 4db9ddb6 (2026-09-17): the host-hybrid LiteInst exec repair and
+# intervening runtime changes preserve the DynamoRIO cache recipe inputs:
+# vendor/dynamorio is 42dd83f76cef, and build.rs is 0ff8ae24b974.
+# The GNU-only -mtls-dialect=gnu addition changes native/CMakeLists.txt for
+# the on-demand client, not this DynamoRIO content-key miss. Rebuild that
+# client at the new pin; this carry is not runtime validation.
+# Preserve CMAKE/CMAKE_GENERATOR selection, the 1050 effective-job-second
+# threshold and the 16-job clamp. No new calibration is claimed.
+# CARRY TO 226c3e31 (2026-09-17): the four commits after 6ae69f57
+# repair LiteInst exec reactivation/owned worker-exec waits, observe returned
+# native PKRU, and declare SaBRe's zlib dependency. The complete reverie-dbt
+# subtree, build.rs, DynamoRIO vendor, root Cargo/toolchain and CMake selection
+# are byte-identical to 6ae69f57. The earlier GNU client TLS flag is preserved;
+# it remains the sole DBT change across b3049e54..226c3e31, not an SDK key input.
+# Keep SDK key 0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4,
+# the 16-job clamp and 1050 effective-job-seconds. No new timing or guest claim;
+# the carried LiteInst/ptrace/preload and SaBRe behavior intentionally changes.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 226c3e31389599a00400938e93461c59d56f846e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 226c3e31389599a00400938e93461c59d56f846e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
