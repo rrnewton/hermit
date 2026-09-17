@@ -10,14 +10,19 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::CString;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::IoSlice;
 use std::io::IoSliceMut;
 use std::io::Read;
+use std::io::Write;
+use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -55,14 +60,14 @@ mod bootstrap {
 pub(super) const ENVIRONMENT: &str = "REVERIE_SABRE_BOOTSTRAP_V1";
 const LAYOUT_SYMBOL: &str = "sbr_bootstrap_frame_layout_v1";
 
-const MAX_FILE: usize = 128 * 1024 * 1024;
+const IN_MEMORY_SNAPSHOT_LIMIT: usize = 128 * 1024 * 1024;
 const MAX_MAPS: usize = 1024 * 1024;
 const MAX_OBJECTS: usize = 16;
 const PAGE: usize = 4096;
 
 fn bounded_file(mut file: &File, maximum: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take(maximum as u64 + 1)
         .read_to_end(&mut bytes)?;
     ensure!(
@@ -104,11 +109,42 @@ impl Map {
         address >= self.start && address.checked_add(size).is_some_and(|end| end <= self.end)
     }
 
-    fn unescaped_path(&self) -> Result<&str> {
-        let path = std::str::from_utf8(&self.path)?;
+    fn displays_path(&self, path: &Path) -> bool {
+        // Linux maps escapes newline as \\012 but leaves a literal backslash
+        // unchanged. Never decode this ambiguous display into an object path.
+        let mut displayed = Vec::new();
+        for byte in path.as_os_str().as_bytes() {
+            if *byte == b'\n' {
+                displayed.extend_from_slice(b"\\012");
+            } else {
+                displayed.push(*byte);
+            }
+        }
+        self.path == displayed
+    }
+
+    fn mapped_path(&self, pid: Pid) -> Result<PathBuf> {
         ensure!(
-            !path.contains('\\'),
-            "escaped mapped paths unsupported for bootstrap"
+            self.path.starts_with(b"/") && self.inode != 0,
+            "unsupported anonymous early getrandom source"
+        );
+        // Ordinary path displays are already raw bytes. Only ambiguous kernel
+        // displays need map_files; do not add that proc capability requirement
+        // to an otherwise unambiguous legacy path.
+        if !self.path.windows(4).any(|part| part == b"\\012") && !self.path.ends_with(b" (deleted)")
+        {
+            return Ok(PathBuf::from(OsStr::from_bytes(&self.path)));
+        }
+        // The magic link returns actual pathname bytes. Authenticate its
+        // display and then the opened FD/device/inode/root-relative contents;
+        // a newline and a literal \\012 alone cannot select the same object.
+        let path = std::fs::read_link(format!(
+            "/proc/{pid}/map_files/{:x}-{:x}",
+            self.start, self.end
+        ))?;
+        ensure!(
+            self.displays_path(&path),
+            "mapped object path display changed"
         );
         Ok(path)
     }
@@ -124,7 +160,7 @@ fn maps(pid: Pid) -> Result<Vec<Map>> {
             // Only the five structural fields are whitespace-separated text.
             // The remaining pathname may contain spaces, kernel escapes or
             // non-UTF8 bytes in an unrelated mapping. Retain those bytes and
-            // apply object-path restrictions only when selecting that object.
+            // authenticate pathname bytes only when selecting that object.
             let mut rest = line;
             let mut fields = Vec::with_capacity(5);
             for _ in 0..5 {
@@ -168,19 +204,14 @@ fn containing(rows: &[Map], address: usize, size: usize) -> Result<&Map> {
 }
 
 fn open_under_root(pid: Pid, path: &Path) -> Result<File> {
-    let path = path
-        .to_str()
-        .ok_or_else(|| anyhow!("non-UTF8 bootstrap object path"))?;
-    ensure!(
-        path.starts_with('/') && !path.contains('\\') && !path.ends_with(" (deleted)"),
-        "ambiguous bootstrap object path"
-    );
-    let components: Vec<_> = path[1..].split('/').collect();
+    let path = path.as_os_str().as_bytes();
+    ensure!(path.starts_with(b"/"), "nonabsolute bootstrap object path");
+    let components: Vec<_> = path[1..].split(|byte| *byte == b'/').collect();
     ensure!(
         !components.is_empty()
             && components
                 .iter()
-                .all(|c| !c.is_empty() && *c != "." && *c != ".."),
+                .all(|c| !c.is_empty() && *c != b"." && *c != b".."),
         "noncanonical bootstrap object path"
     );
     // Follow only the proc magic link to this owned task's root. Every actual
@@ -204,10 +235,156 @@ fn open_under_root(pid: Pid, path: &Path) -> Result<File> {
     Ok(file)
 }
 
+struct DiskSnapshot {
+    address: usize,
+    length: usize,
+}
+
+fn require_supported_snapshot_filesystem(file: &File) -> Result<()> {
+    let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(file.as_raw_fd(), fs.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let fs = unsafe { fs.assume_init() };
+    // XFS_SUPER_MAGIC from linux/magic.h is not exported by this libc version.
+    // Limit this storage path to qualified regular filesystems; this is not a
+    // claim about their physical block-device backing. The mapped snapshot
+    // pages must be reclaimable independently of the supervisor's heap.
+    const XFS_SUPER_MAGIC: libc::c_long = 0x58465342;
+    ensure!(
+        matches!(
+            fs.f_type,
+            libc::BTRFS_SUPER_MAGIC | libc::EXT4_SUPER_MAGIC | XFS_SUPER_MAGIC
+        ),
+        "large bootstrap snapshot requires a supported cache filesystem (unqualified filesystem {:#x})",
+        fs.f_type
+    );
+    Ok(())
+}
+
+impl DiskSnapshot {
+    fn new(file: &File, length: usize) -> Result<Self> {
+        ensure!(
+            length <= isize::MAX as usize,
+            "bootstrap snapshot exceeds address space"
+        );
+        // Reuse the existing Hermit cache placement, never cwd or a new
+        // hardcoded scratch directory. Small objects do not need this cache.
+        let data = super::HermitData::new();
+        ensure!(
+            data.data_dir().is_absolute(),
+            "bootstrap snapshot cache must be absolute"
+        );
+        let parent = data.data_dir().join("tmp");
+        std::fs::create_dir_all(&parent)?;
+        let directory = tempfile::Builder::new()
+            .prefix("sabre-snapshot-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(parent)?;
+        let mut output = tempfile::tempfile_in(directory.path())?;
+        require_supported_snapshot_filesystem(&output)?;
+        let mut buffer = [0; 64 * 1024];
+        let mut offset = 0;
+        while offset < length {
+            let size = buffer.len().min(length - offset);
+            file.read_exact_at(&mut buffer[..size], offset as u64)?;
+            output.write_all(&buffer[..size])?;
+            offset += size;
+        }
+        ensure!(
+            file.metadata()?.len() == length as u64,
+            "bootstrap object size changed during snapshot"
+        );
+        // Reopen read-only, then discard the writer. After mmap discard even
+        // the read-only FD: the guest shares this supervisor's PID namespace
+        // and must not obtain a snapshot alias through /proc/<parent>/fd.
+        let readonly = File::open(format!("/proc/self/fd/{}", output.as_raw_fd()))?;
+        drop(output);
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                readonly.as_raw_fd(),
+                0,
+            )
+        };
+        if address == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let snapshot = Self {
+            address: address as usize,
+            length,
+        };
+        drop(readonly);
+        directory.close()?;
+        Ok(snapshot)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // The anonymous copied backing has no writable handle or exposed
+        // pathname. It is owned solely by this read-only mapping until Drop,
+        // under the same trusted-supervisor assumption as the former Vec.
+        unsafe { std::slice::from_raw_parts(self.address as *const u8, self.length) }
+    }
+}
+
+impl Drop for DiskSnapshot {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.address as *mut libc::c_void, self.length) };
+    }
+}
+
+enum OriginalBytes {
+    Memory(Vec<u8>),
+    Disk(DiskSnapshot),
+}
+
+impl OriginalBytes {
+    fn new(file: &File, length: usize) -> Result<Self> {
+        if length <= IN_MEMORY_SNAPSHOT_LIMIT {
+            Ok(Self::Memory(bounded_file(file, IN_MEMORY_SNAPSHOT_LIMIT)?))
+        } else {
+            Ok(Self::Disk(DiskSnapshot::new(file, length)?))
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Memory(bytes) => bytes,
+            Self::Disk(snapshot) => snapshot.as_slice(),
+        }
+    }
+
+    fn matches_file(&self, file: &File) -> Result<bool> {
+        if file.metadata()?.len() != self.len() as u64 {
+            return Ok(false);
+        }
+        let mut buffer = [0; 64 * 1024];
+        for (index, expected) in self.chunks(buffer.len()).enumerate() {
+            let actual = &mut buffer[..expected.len()];
+            file.read_exact_at(actual, (index * 64 * 1024) as u64)?;
+            if actual != expected {
+                return Ok(false);
+            }
+        }
+        Ok(file.metadata()?.len() == self.len() as u64)
+    }
+}
+
+impl Deref for OriginalBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
 struct HeldObject {
     path: PathBuf,
     file: File,
-    bytes: Vec<u8>,
+    bytes: OriginalBytes,
     device: String,
     inode: u64,
 }
@@ -230,10 +407,15 @@ impl HeldObject {
         let file = File::open(&path)?;
         let meta = file.metadata()?;
         ensure!(
-            meta.is_file() && meta.len() > 0 && meta.len() <= MAX_FILE as u64,
+            meta.is_file() && meta.len() > 0,
             "unsupported bootstrap ELF object size"
         );
-        let bytes = bounded_file(&file, MAX_FILE)?;
+        let length = usize::try_from(meta.len())?;
+        let bytes = OriginalBytes::new(&file, length)?;
+        ensure!(
+            bytes.matches_file(&file)?,
+            "bootstrap object changed during snapshot"
+        );
         // Compare maps-device to maps-device for this exact held FD. Btrfs's
         // maps superblock device need not equal its subvolume st_dev.
         let address = unsafe {
@@ -254,9 +436,7 @@ impl HeldObject {
             let own = maps(Pid::this())?;
             let row = containing(&own, address as usize, 1)?;
             ensure!(
-                row.unescaped_path()?.as_bytes() == path.as_os_str().as_bytes()
-                    && row.inode == meta.ino()
-                    && row.offset == 0,
+                row.displays_path(&path) && row.inode == meta.ino() && row.offset == 0,
                 "held bootstrap FD mapping mismatch"
             );
             Ok::<_, anyhow::Error>(row.device.clone())
@@ -272,11 +452,13 @@ impl HeldObject {
         })
     }
 
+    fn matches_mapping(&self, row: &Map) -> bool {
+        row.displays_path(&self.path) && row.inode == self.inode && row.device == self.device
+    }
+
     fn authenticate(&self, pid: Pid, row: &Map) -> Result<()> {
         ensure!(
-            row.unescaped_path()?.as_bytes() == self.path.as_os_str().as_bytes()
-                && row.inode == self.inode
-                && row.device == self.device,
+            self.matches_mapping(row),
             "bootstrap mapped object identity mismatch"
         );
         self.authenticate_path(pid)
@@ -291,7 +473,7 @@ impl HeldObject {
             "bootstrap root-relative object changed"
         );
         ensure!(
-            bounded_file(&other, MAX_FILE)? == self.bytes,
+            self.bytes.matches_file(&other)?,
             "bootstrap mapped pathname content changed"
         );
         Ok(())
@@ -300,10 +482,7 @@ impl HeldObject {
     fn bias(&self, pid: Pid, rows: &[Map]) -> Result<usize> {
         let elf = object::File::parse(self.bytes.as_slice())?;
         let mut common: Option<BTreeSet<usize>> = None;
-        for row in rows
-            .iter()
-            .filter(|r| r.path == self.path.as_os_str().as_bytes())
-        {
+        for row in rows.iter().filter(|r| self.matches_mapping(r)) {
             self.authenticate(pid, row)?;
             if !row.permissions.contains('x') {
                 continue;
@@ -509,6 +688,69 @@ fn generation(pid: Pid) -> Result<u64> {
         .parse()?)
 }
 
+fn script_interpreter(bytes: &[u8]) -> Result<Option<&Path>> {
+    // Match the loader's single BINPRM_BUF_SIZE/fgets/strtok resolution.
+    if !bytes.starts_with(b"#!") {
+        return Ok(None);
+    }
+    let line = &bytes[..bytes.len().min(255)];
+    let line = &line[..line.iter().position(|b| *b == b'\n').unwrap_or(line.len())];
+    let path = line[2..]
+        .split(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
+        .find(|part| !part.is_empty())
+        .ok_or_else(|| anyhow!("missing SaBRe script interpreter"))?;
+    ensure!(!path.contains(&0), "NUL in SaBRe script interpreter");
+    Ok(Some(Path::new(OsStr::from_bytes(path))))
+}
+
+fn elf_interpreter(bytes: &[u8]) -> Result<Option<PathBuf>> {
+    // PT_INTERP is a program header, not a PT_LOAD segment.
+    let phoff = word(bytes, 32)?;
+    let phnum = u16::from_le_bytes(
+        bytes
+            .get(56..58)
+            .ok_or_else(|| anyhow!("short ELF header"))?
+            .try_into()?,
+    ) as usize;
+    ensure!(
+        phnum <= 128 && bytes.get(54..56) == Some(&56u16.to_le_bytes()),
+        "unsupported ELF program headers"
+    );
+    ensure!(
+        phnum > 0
+            && phoff
+                .checked_add(phnum * 56)
+                .is_some_and(|end| end <= bytes.len()),
+        "program headers outside held ELF"
+    );
+    let mut path = None;
+    for i in 0..phnum {
+        let p = phoff
+            .checked_add(i * 56)
+            .ok_or_else(|| anyhow!("program header overflow"))?;
+        if bytes.get(p..p + 4) == Some(&3u32.to_le_bytes()) {
+            ensure!(path.is_none(), "duplicate guest interpreter");
+            let offset = word(bytes, p + 8)?;
+            let size = word(bytes, p + 32)?;
+            ensure!((2..=4096).contains(&size), "invalid guest interpreter path");
+            let bytes = bytes
+                .get(
+                    offset
+                        ..offset
+                            .checked_add(size)
+                            .ok_or_else(|| anyhow!("interpreter extent overflow"))?,
+                )
+                .ok_or_else(|| anyhow!("short interpreter path"))?;
+            ensure!(
+                bytes.last() == Some(&0) && !bytes[..size - 1].contains(&0),
+                "invalid interpreter terminator"
+            );
+            path = Some(PathBuf::from(OsStr::from_bytes(&bytes[..size - 1])));
+        }
+    }
+    Ok(path)
+}
+
 /// Launch inputs are retained before the owned child can execute the loader.
 pub(super) struct Launch {
     loader: HeldObject,
@@ -524,19 +766,8 @@ impl Launch {
         loader.symbol(bootstrap::SYSCALL_SYMBOL)?;
         let layout = loader.layout()?;
         let input = HeldObject::open_file(program)?;
-        // Match the loader's single BINPRM_BUF_SIZE/fgets/strtok shebang
-        // resolution. Retain the script too so the actual loader cannot read
-        // a different interpreter selection after our classification.
-        let (program, script) = if input.bytes.starts_with(b"#!") {
-            let line = &input.bytes[..input.bytes.len().min(255)];
-            let line = &line[..line.iter().position(|b| *b == b'\n').unwrap_or(line.len())];
-            let path = line[2..]
-                .split(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
-                .find(|part| !part.is_empty())
-                .ok_or_else(|| anyhow!("missing SaBRe script interpreter"))?;
-            ensure!(!path.contains(&0), "NUL in SaBRe script interpreter");
-            let interpreter = HeldObject::open(Path::new(std::str::from_utf8(path)?))?;
-            (interpreter, Some(input))
+        let (program, script) = if let Some(path) = script_interpreter(&input.bytes)? {
+            (HeldObject::open(path)?, Some(input))
         } else {
             let elf = object::File::parse(input.bytes.as_slice())?;
             ensure!(
@@ -547,52 +778,7 @@ impl Launch {
             );
             (input, None)
         };
-        // PT_INTERP is a program header, not a PT_LOAD segment.
-        let phoff = word(&program.bytes, 32)?;
-        let phnum = u16::from_le_bytes(
-            program
-                .bytes
-                .get(56..58)
-                .ok_or_else(|| anyhow!("short ELF header"))?
-                .try_into()?,
-        ) as usize;
-        ensure!(
-            phnum <= 128 && program.bytes.get(54..56) == Some(&56u16.to_le_bytes()),
-            "unsupported ELF program headers"
-        );
-        ensure!(
-            phnum > 0
-                && phoff
-                    .checked_add(phnum * 56)
-                    .is_some_and(|end| end <= program.bytes.len()),
-            "program headers outside held ELF"
-        );
-        let mut path = None;
-        for i in 0..phnum {
-            let p = phoff
-                .checked_add(i * 56)
-                .ok_or_else(|| anyhow!("program header overflow"))?;
-            if program.bytes.get(p..p + 4) == Some(&3u32.to_le_bytes()) {
-                ensure!(path.is_none(), "duplicate guest interpreter");
-                let offset = word(&program.bytes, p + 8)?;
-                let size = word(&program.bytes, p + 32)?;
-                ensure!((2..=4096).contains(&size), "invalid guest interpreter path");
-                let bytes = program
-                    .bytes
-                    .get(
-                        offset
-                            ..offset
-                                .checked_add(size)
-                                .ok_or_else(|| anyhow!("interpreter extent overflow"))?,
-                    )
-                    .ok_or_else(|| anyhow!("short interpreter path"))?;
-                ensure!(
-                    bytes.last() == Some(&0) && !bytes[..size - 1].contains(&0),
-                    "invalid interpreter terminator"
-                );
-                path = Some(PathBuf::from(std::str::from_utf8(&bytes[..size - 1])?));
-            }
-        }
+        let path = elf_interpreter(&program.bytes)?;
         let interpreter = path.as_deref().map(HeldObject::open).transpose()?;
         Ok(Self {
             loader,
@@ -622,6 +808,11 @@ struct SigillOrigin {
     mapping: Map,
 }
 
+struct VdsoSnapshot {
+    mapping: Map,
+    bytes: Vec<u8>,
+}
+
 /// State is single-root/single-image until TAKE. Ordinary post-handoff process
 /// and robust-exit accounting remains in the existing supervisor.
 pub(super) struct Bootstrap {
@@ -633,8 +824,7 @@ pub(super) struct Bootstrap {
     taken: bool,
     sigill: Option<SigillOrigin>,
     initial_random: usize,
-    vdso: Map,
-    vdso_bytes: Vec<u8>,
+    vdso: Option<VdsoSnapshot>,
     other_objects: Vec<HeldObject>,
     // Only real kernel EXEC events create these entries. They are removed on
     // successful TAKE or final physical exit, never copied across fork.
@@ -713,32 +903,71 @@ fn auxv_random(bytes: &[u8]) -> Result<usize> {
     Err(anyhow!("unterminated initial kernel auxv"))
 }
 
+fn initial_vdso<'a>(rows: &'a [Map], auxv: &[u8]) -> Result<Option<&'a Map>> {
+    ensure!(auxv.len().is_multiple_of(16), "short initial kernel auxv");
+    let mut address = None;
+    let mut terminated = false;
+    for pair in auxv.as_chunks::<16>().0 {
+        let kind = word(pair, 0)?;
+        let value = word(pair, 8)?;
+        if kind == libc::AT_NULL as usize {
+            ensure!(value == 0, "invalid auxv terminator");
+            terminated = true;
+            break;
+        }
+        if kind == libc::AT_SYSINFO_EHDR as usize {
+            ensure!(
+                address.replace(value).is_none(),
+                "ambiguous initial vDSO auxv"
+            );
+        }
+    }
+    ensure!(terminated, "unterminated initial kernel auxv");
+    let mut candidates = rows.iter().filter(|row| row.path == b"[vdso]");
+    let mapping = candidates.next();
+    ensure!(candidates.next().is_none(), "ambiguous initial kernel vDSO");
+    match (address.filter(|value| *value != 0), mapping) {
+        (None, None) => Ok(None),
+        (Some(address), Some(row)) => {
+            ensure!(address == row.start, "initial vDSO auxv/mapping mismatch");
+            ensure!(
+                row.permissions == "r-xp" && row.inode == 0 && row.offset == 0,
+                "unsupported initial vDSO mapping"
+            );
+            Ok(Some(row))
+        }
+        _ => Err(anyhow!("initial vDSO auxv/mapping mismatch")),
+    }
+}
+
 impl Bootstrap {
     pub(super) fn new(root: Pid, launch: Launch) -> Result<Self> {
-        let rows = maps(root)?;
-        let candidates: Vec<_> = rows
-            .iter()
-            .filter(|row| row.path == b"[vdso]")
-            .cloned()
-            .collect();
-        ensure!(
-            candidates.len() == 1,
-            "missing/ambiguous initial kernel vDSO"
-        );
-        let vdso = candidates.into_iter().next().unwrap();
-        ensure!(
-            vdso.permissions == "r-xp" && vdso.inode == 0 && vdso.offset == 0,
-            "unsupported initial vDSO mapping"
-        );
-        let vdso_bytes = remote_bytes(root, vdso.start, vdso.end - vdso.start)?;
-        let elf = object::File::parse(vdso_bytes.as_slice())?;
-        ensure!(
-            elf.architecture() == object::Architecture::X86_64 && elf.is_little_endian(),
-            "invalid initial kernel vDSO ELF"
-        );
-        let initial_random = auxv_random(&read_path(format!("/proc/{root}/auxv"), 4096)?)?;
         let generation = generation(root)?;
         ensure!(generation != 0, "invalid initial process generation");
+        let rows = maps(root)?;
+        let auxv = read_path(format!("/proc/{root}/auxv"), 4096)?;
+        // The caller still owns the initial attach stop. Capture pristine
+        // bytes now; absence requires agreement between maps and kernel auxv,
+        // and cannot stand in for an unreadable or already rewritten vDSO.
+        let vdso = initial_vdso(&rows, &auxv)?
+            .map(|mapping| {
+                let bytes = remote_bytes(root, mapping.start, mapping.end - mapping.start)?;
+                let elf = object::File::parse(bytes.as_slice())?;
+                ensure!(
+                    elf.architecture() == object::Architecture::X86_64 && elf.is_little_endian(),
+                    "invalid initial kernel vDSO ELF"
+                );
+                Ok::<_, anyhow::Error>(VdsoSnapshot {
+                    mapping: mapping.clone(),
+                    bytes,
+                })
+            })
+            .transpose()?;
+        let initial_random = auxv_random(&auxv)?;
+        ensure!(
+            self::generation(root)? == generation,
+            "initial process generation changed"
+        );
         let prng = root_prng(launch.config.rng_seed());
         Ok(Self {
             launch,
@@ -750,7 +979,6 @@ impl Bootstrap {
             sigill: None,
             initial_random,
             vdso,
-            vdso_bytes,
             other_objects: Vec::new(),
             continuations: BTreeMap::new(),
             static_reexec_observed: false,
@@ -965,41 +1193,42 @@ impl Bootstrap {
             "early getrandom source is not executable"
         );
         if row.path == b"[vdso]" {
-            ensure!(row == self.vdso, "initial kernel vDSO mapping changed");
-            let offset = site - self.vdso.start;
-            Ok(self
-                .vdso_bytes
+            let vdso = self
+                .vdso
+                .as_ref()
+                .ok_or_else(|| anyhow!("vDSO origin lacks an initial snapshot"))?;
+            ensure!(row == vdso.mapping, "initial kernel vDSO mapping changed");
+            let offset = site - vdso.mapping.start;
+            Ok(vdso
+                .bytes
                 .get(offset..offset + length)
                 .ok_or_else(|| anyhow!("short original vDSO instruction range"))?
                 .to_vec())
         } else {
-            let object = if row.path == self.launch.program.path.as_os_str().as_bytes() {
+            let object = if self.launch.program.matches_mapping(&row) {
                 &self.launch.program
             } else if let Some(interpreter) = self.launch.interpreter.as_ref()
-                && row.path == interpreter.path.as_os_str().as_bytes()
+                && interpreter.matches_mapping(&row)
             {
                 interpreter
             } else {
-                ensure!(
-                    row.unescaped_path()?.starts_with('/') && row.inode != 0,
-                    "unsupported anonymous early getrandom source"
-                );
                 if !self
                     .other_objects
                     .iter()
-                    .any(|object| object.path.as_os_str().as_bytes() == row.path)
+                    .any(|object| object.matches_mapping(&row))
                 {
                     ensure!(
                         self.other_objects.len() < MAX_OBJECTS,
                         "too many early bootstrap source objects"
                     );
-                    self.other_objects
-                        .push(HeldObject::open(Path::new(row.unescaped_path()?))?);
+                    let object = HeldObject::open(&row.mapped_path(pid)?)?;
+                    object.authenticate(pid, &row)?;
+                    self.other_objects.push(object);
                 }
                 self.other_objects
                     .iter()
-                    .find(|object| object.path.as_os_str().as_bytes() == row.path)
-                    .unwrap()
+                    .find(|object| object.matches_mapping(&row))
+                    .ok_or_else(|| anyhow!("bootstrap source object identity changed"))?
             };
             object.authenticate(pid, &row)?;
             let bias = object.bias(pid, rows)?;
@@ -1462,5 +1691,650 @@ impl Bootstrap {
             "clone/fork/exec before initial random handoff is unsupported"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::io::Write;
+
+    use super::*;
+
+    struct Mapping {
+        address: *mut libc::c_void,
+        _file: File,
+    }
+
+    impl Mapping {
+        fn new(path: &Path) -> Self {
+            let file = File::open(path).unwrap();
+            let address = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    PAGE,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(address, libc::MAP_FAILED);
+            Self {
+                address,
+                _file: file,
+            }
+        }
+    }
+
+    impl Drop for Mapping {
+        fn drop(&mut self) {
+            assert_eq!(unsafe { libc::munmap(self.address, PAGE) }, 0);
+        }
+    }
+
+    fn fixture_file(directory: &Path, name: &[u8]) -> PathBuf {
+        let path = directory.join(std::ffi::OsStr::from_bytes(name));
+        std::fs::write(&path, [0x5a; PAGE]).unwrap();
+        path
+    }
+
+    fn expect_error<T>(result: Result<T>, expected: &str) {
+        let error = result.err().expect("invalid bootstrap input was accepted");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?}, got {error:#}"
+        );
+    }
+
+    fn unrelated_mapping(name: &[u8], deleted: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let clean = fixture_file(directory.path(), b"selected");
+        let unrelated = fixture_file(directory.path(), name);
+        let _mapping = Mapping::new(&unrelated);
+        if deleted {
+            std::fs::remove_file(&unrelated).unwrap();
+        }
+        // Exercise the actual /proc reader while the unrelated VMA is live.
+        let held = HeldObject::open_file(&clean).unwrap();
+        held.authenticate_path(Pid::this()).unwrap();
+    }
+
+    #[test]
+    fn unrelated_space_mapping_preserves_selected_object() {
+        unrelated_mapping(b"unrelated space", false);
+    }
+
+    #[test]
+    fn unrelated_deleted_mapping_preserves_selected_object() {
+        unrelated_mapping(b"unrelated-deleted", true);
+    }
+
+    #[test]
+    fn unrelated_non_utf8_mapping_preserves_selected_object() {
+        unrelated_mapping(b"unrelated-\xff", false);
+    }
+
+    #[test]
+    fn unrelated_newline_mapping_preserves_selected_object() {
+        unrelated_mapping(b"unrelated-\n-name", false);
+    }
+
+    #[test]
+    fn selected_mapping_authenticates_identity_and_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = fixture_file(directory.path(), b"selected");
+        let held = HeldObject::open_file(&path).unwrap();
+        let mapping = Mapping::new(&path);
+        let rows = maps(Pid::this()).unwrap();
+        held.authenticate(
+            Pid::this(),
+            containing(&rows, mapping.address as usize, 1).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn selected_mapping_rejects_same_bytes_in_another_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = fixture_file(directory.path(), b"selected");
+        let held = HeldObject::open_file(&path).unwrap();
+        let other = fixture_file(directory.path(), b"same-bytes-distinct-object");
+        let mapping = Mapping::new(&other);
+        let rows = maps(Pid::this()).unwrap();
+        expect_error(
+            held.authenticate(
+                Pid::this(),
+                containing(&rows, mapping.address as usize, 1).unwrap(),
+            ),
+            "bootstrap mapped object identity mismatch",
+        );
+    }
+
+    #[test]
+    fn selected_mapping_rejects_changed_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = fixture_file(directory.path(), b"selected");
+        let held = HeldObject::open_file(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(128)).unwrap();
+        file.write_all(&[held.bytes[128] ^ 1]).unwrap();
+        expect_error(
+            held.authenticate_path(Pid::this()),
+            "bootstrap mapped pathname content changed",
+        );
+    }
+
+    fn raw_selected_mismatch(name: &[u8]) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = fixture_file(directory.path(), name);
+        let held = HeldObject::open_file(&path).unwrap();
+        let other = fixture_file(directory.path(), b"different-object");
+        let mapping = Mapping::new(&other);
+        let rows = maps(Pid::this()).unwrap();
+        expect_error(
+            held.authenticate(
+                Pid::this(),
+                containing(&rows, mapping.address as usize, 1).unwrap(),
+            ),
+            "bootstrap mapped object identity mismatch",
+        );
+    }
+
+    #[test]
+    fn selected_non_utf8_mapping_rejects_another_object() {
+        raw_selected_mismatch(b"selected-\xff");
+    }
+
+    #[test]
+    fn selected_newline_mapping_rejects_another_object() {
+        raw_selected_mismatch(b"selected-\n-name");
+    }
+
+    #[test]
+    fn selected_deleted_mapping_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = fixture_file(directory.path(), b"selected");
+        let held = HeldObject::open_file(&path).unwrap();
+        let mapping = Mapping::new(&path);
+        std::fs::remove_file(&path).unwrap();
+        let rows = maps(Pid::this()).unwrap();
+        expect_error(
+            held.authenticate(
+                Pid::this(),
+                containing(&rows, mapping.address as usize, 1).unwrap(),
+            ),
+            "bootstrap mapped object identity mismatch",
+        );
+    }
+
+    fn words(values: &[u64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    // The descriptor exported by the landed x86-64 SaBRe C frame definition.
+    const FRAME_WORDS: [u64; 9] = [1, 144, 72, 80, 88, 128, 136, 8, 9];
+
+    #[test]
+    fn frame_descriptor_decodes_the_exported_layout() {
+        let layout = FrameLayout::decode(&words(&FRAME_WORDS)).unwrap();
+        assert_eq!(
+            (
+                layout.size,
+                layout.rdi,
+                layout.rsi,
+                layout.rdx,
+                layout.architectural_return,
+                layout.scratch_return
+            ),
+            (144, 72, 80, 88, 128, 136)
+        );
+    }
+
+    #[test]
+    fn frame_descriptor_rejects_invalid_protocol() {
+        let bytes = words(&FRAME_WORDS);
+        expect_error(
+            FrameLayout::decode(&bytes[..71]),
+            "unsupported bootstrap frame descriptor",
+        );
+        let mut extended = bytes;
+        extended.extend_from_slice(&0u64.to_le_bytes());
+        expect_error(
+            FrameLayout::decode(&extended),
+            "unsupported bootstrap frame descriptor",
+        );
+        for (field, value) in [(0, 2), (7, 4), (8, 8)] {
+            let mut descriptor = FRAME_WORDS;
+            descriptor[field] = value;
+            expect_error(
+                FrameLayout::decode(&words(&descriptor)),
+                "unsupported bootstrap frame descriptor",
+            );
+        }
+    }
+
+    #[test]
+    fn frame_descriptor_rejects_invalid_size() {
+        for size in [0, 7, 145, 4104] {
+            let mut descriptor = FRAME_WORDS;
+            descriptor[1] = size;
+            expect_error(
+                FrameLayout::decode(&words(&descriptor)),
+                "invalid bootstrap full frame size",
+            );
+        }
+    }
+
+    #[test]
+    fn frame_descriptor_rejects_invalid_offsets() {
+        for offset in [73, 144, u64::MAX - 7] {
+            let mut descriptor = FRAME_WORDS;
+            descriptor[2] = offset;
+            expect_error(
+                FrameLayout::decode(&words(&descriptor)),
+                "bootstrap frame field outside extent",
+            );
+        }
+        let mut descriptor = FRAME_WORDS;
+        descriptor[3] = descriptor[2];
+        expect_error(
+            FrameLayout::decode(&words(&descriptor)),
+            "overlapping bootstrap frame fields",
+        );
+    }
+
+    #[test]
+    fn auxv_random_accepts_a_terminated_vector() {
+        let bytes = words(&[
+            libc::AT_PAGESZ,
+            4096,
+            libc::AT_RANDOM,
+            0x1234,
+            libc::AT_NULL,
+            0,
+        ]);
+        assert_eq!(auxv_random(&bytes).unwrap(), 0x1234);
+    }
+
+    #[test]
+    fn auxv_random_requires_a_valid_terminator_and_random_entry() {
+        expect_error(
+            auxv_random(&words(&[libc::AT_RANDOM, 0x1234])),
+            "unterminated initial kernel auxv",
+        );
+        expect_error(
+            auxv_random(&words(&[libc::AT_RANDOM, 0x1234, libc::AT_NULL, 1])),
+            "invalid auxv terminator",
+        );
+        expect_error(
+            auxv_random(&words(&[libc::AT_PAGESZ, 4096, libc::AT_NULL, 0])),
+            "initial kernel auxv has no AT_RANDOM",
+        );
+    }
+
+    #[test]
+    fn auxv_random_rejects_duplicate_or_zero_random_entries() {
+        expect_error(
+            auxv_random(&words(&[
+                libc::AT_RANDOM,
+                0x1234,
+                libc::AT_RANDOM,
+                0x5678,
+                libc::AT_NULL,
+                0,
+            ])),
+            "ambiguous initial kernel AT_RANDOM",
+        );
+        expect_error(
+            auxv_random(&words(&[libc::AT_RANDOM, 0, libc::AT_NULL, 0])),
+            "ambiguous initial kernel AT_RANDOM",
+        );
+    }
+
+    #[test]
+    fn auxv_random_rejects_partial_entries() {
+        let bytes = words(&[libc::AT_RANDOM, 0x1234, libc::AT_NULL, 0]);
+        for length in [1, 8, 15, 17, 31] {
+            expect_error(auxv_random(&bytes[..length]), "short initial kernel auxv");
+        }
+    }
+
+    #[test]
+    fn selected_raw_paths_authenticate_the_held_object() {
+        for name in [
+            b"space name".as_slice(),
+            b"non-utf8-\xff",
+            b"newline-\n",
+            b"literal-\\012",
+            b"back\\slash",
+            b"literal (deleted)",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = fixture_file(directory.path(), name);
+            let held = HeldObject::open_file(&path).unwrap();
+            let mapping = Mapping::new(&path);
+            let rows = maps(Pid::this()).unwrap();
+            let row = containing(&rows, mapping.address as usize, 1).unwrap();
+            held.authenticate(Pid::this(), row).unwrap();
+            assert_eq!(row.mapped_path(Pid::this()).unwrap(), held.path);
+        }
+    }
+
+    #[test]
+    fn ambiguous_kernel_path_display_does_not_select_another_inode() {
+        let directory = tempfile::tempdir().unwrap();
+        let newline = fixture_file(directory.path(), b"same-\n");
+        let literal = fixture_file(directory.path(), b"same-\\012");
+        let a = HeldObject::open_file(&newline).unwrap();
+        let b = HeldObject::open_file(&literal).unwrap();
+        let ma = Mapping::new(&newline);
+        let mb = Mapping::new(&literal);
+        let rows = maps(Pid::this()).unwrap();
+        let ra = containing(&rows, ma.address as usize, 1).unwrap();
+        let rb = containing(&rows, mb.address as usize, 1).unwrap();
+        assert_eq!(
+            ra.path, rb.path,
+            "exercise the real kernel's ambiguous display"
+        );
+        assert_ne!(ra.inode, rb.inode);
+        assert_eq!(ra.mapped_path(Pid::this()).unwrap(), a.path);
+        assert_eq!(rb.mapped_path(Pid::this()).unwrap(), b.path);
+        a.authenticate(Pid::this(), ra).unwrap();
+        b.authenticate(Pid::this(), rb).unwrap();
+        expect_error(
+            a.authenticate(Pid::this(), rb),
+            "bootstrap mapped object identity mismatch",
+        );
+        expect_error(
+            b.authenticate(Pid::this(), ra),
+            "bootstrap mapped object identity mismatch",
+        );
+    }
+
+    #[test]
+    fn raw_root_relative_open_preserves_no_follow_and_canonical_guards() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = fixture_file(directory.path(), b"selected-\xff");
+        let link = directory.path().join("alias");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(open_under_root(Pid::this(), &link).is_err());
+        expect_error(
+            open_under_root(Pid::this(), Path::new("relative")),
+            "nonabsolute bootstrap object path",
+        );
+        expect_error(
+            open_under_root(Pid::this(), &directory.path().join("../outside")),
+            "noncanonical bootstrap object path",
+        );
+        assert_eq!(
+            open_under_root(Pid::this(), &path)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .ino(),
+            path.metadata().unwrap().ino()
+        );
+    }
+
+    fn executable_fixture(interpreter: Option<&[u8]>) -> Vec<u8> {
+        // A real ELF64 ET_EXEC with one executable PT_LOAD, a Linux exit(0)
+        // entry, and an optional PT_INTERP. No native execution is needed to
+        // test object parsing, pathname identity or trailing file data.
+        let mut bytes = vec![0; PAGE];
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&0x400100u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58]
+            .copy_from_slice(&(if interpreter.is_some() { 2u16 } else { 1 }).to_le_bytes());
+        bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
+        bytes[68..72].copy_from_slice(&5u32.to_le_bytes());
+        bytes[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+        bytes[96..104].copy_from_slice(&(PAGE as u64).to_le_bytes());
+        bytes[104..112].copy_from_slice(&(PAGE as u64).to_le_bytes());
+        bytes[112..120].copy_from_slice(&(PAGE as u64).to_le_bytes());
+        bytes[256..265].copy_from_slice(&[0xb8, 60, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05]);
+        if let Some(path) = interpreter {
+            bytes[120..124].copy_from_slice(&3u32.to_le_bytes());
+            bytes[128..136].copy_from_slice(&512u64.to_le_bytes());
+            bytes[152..160].copy_from_slice(&((path.len() + 1) as u64).to_le_bytes());
+            bytes[512..512 + path.len()].copy_from_slice(path);
+        }
+        bytes
+    }
+
+    #[test]
+    fn interpreter_parsers_preserve_raw_unix_paths() {
+        let script = b"#! /interpreter-\xff\\012 --option\nbody\n";
+        assert_eq!(
+            script_interpreter(script)
+                .unwrap()
+                .unwrap()
+                .as_os_str()
+                .as_bytes(),
+            b"/interpreter-\xff\\012"
+        );
+        let path = b"/interpreter-\xff\n\\012";
+        let bytes = executable_fixture(Some(path));
+        object::File::parse(bytes.as_slice()).unwrap();
+        assert_eq!(
+            elf_interpreter(&bytes)
+                .unwrap()
+                .unwrap()
+                .as_os_str()
+                .as_bytes(),
+            path
+        );
+        assert!(
+            elf_interpreter(&executable_fixture(None))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn interpreter_parsers_preserve_terminator_and_header_refusals() {
+        expect_error(
+            script_interpreter(b"#! \n"),
+            "missing SaBRe script interpreter",
+        );
+        expect_error(
+            script_interpreter(b"#!/bad\0path\n"),
+            "NUL in SaBRe script interpreter",
+        );
+        let mut bytes = executable_fixture(Some(b"/interpreter"));
+        bytes[524] = b'x';
+        expect_error(elf_interpreter(&bytes), "invalid interpreter terminator");
+        let mut bytes = executable_fixture(Some(b"/bad\0path"));
+        expect_error(elf_interpreter(&bytes), "invalid interpreter terminator");
+        bytes[56..58].copy_from_slice(&129u16.to_le_bytes());
+        expect_error(elf_interpreter(&bytes), "unsupported ELF program headers");
+        let mut bytes = executable_fixture(None);
+        bytes[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
+        expect_error(elf_interpreter(&bytes), "program headers outside held ELF");
+    }
+
+    #[test]
+    fn large_sparse_elf_snapshot_preserves_bytes_and_closes_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large-elf");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all_at(&executable_fixture(None), 0).unwrap();
+        let length = (IN_MEMORY_SNAPSHOT_LIMIT + PAGE) as u64;
+        file.set_len(length).unwrap();
+        file.write_all_at(b"X", length - 1).unwrap();
+        let held = HeldObject::open(&path).unwrap();
+        let OriginalBytes::Disk(snapshot) = &held.bytes else {
+            panic!("large object must use disk backing")
+        };
+        let rows = maps(Pid::this()).unwrap();
+        let row = containing(&rows, snapshot.address, snapshot.length)
+            .unwrap()
+            .clone();
+        assert_eq!(row.permissions, "r--p");
+        let raw = row.mapped_path(Pid::this()).unwrap();
+        assert!(
+            !raw.parent().unwrap().exists(),
+            "private snapshot directory survived construction"
+        );
+        let cache_device = super::super::HermitData::new()
+            .data_dir()
+            .metadata()
+            .unwrap()
+            .dev();
+        for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+            if let Ok(metadata) = entry.unwrap().path().metadata() {
+                assert_ne!(
+                    (metadata.dev(), metadata.ino()),
+                    (cache_device, row.inode),
+                    "snapshot FD alias survived construction"
+                );
+            }
+        }
+        assert_eq!(held.bytes.len() as u64, length);
+        assert_eq!(held.bytes.last(), Some(&b'X'));
+        held.authenticate_path(Pid::this()).unwrap();
+        file.write_all_at(b"Y", length - 1).unwrap();
+        expect_error(
+            held.authenticate_path(Pid::this()),
+            "bootstrap mapped pathname content changed",
+        );
+        assert_eq!(held.bytes.last(), Some(&b'X'));
+        drop(held);
+        assert!(
+            !maps(Pid::this())
+                .unwrap()
+                .iter()
+                .any(|current| current.start == row.start
+                    && current.end == row.end
+                    && current.inode == row.inode
+                    && current.device == row.device),
+            "snapshot mapping survived Drop"
+        );
+    }
+
+    #[test]
+    fn small_snapshot_preserves_memory_storage_and_content_authentication() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = fixture_file(directory.path(), b"small");
+        let held = HeldObject::open_file(&path).unwrap();
+        assert!(matches!(held.bytes, OriginalBytes::Memory(_)));
+        held.authenticate_path(Pid::this()).unwrap();
+    }
+
+    #[test]
+    fn disk_snapshot_refuses_a_real_memory_backed_file() {
+        let fd =
+            unsafe { libc::memfd_create(c"bootstrap-backing-control".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let file = unsafe { File::from_raw_fd(fd) };
+        expect_error(
+            require_supported_snapshot_filesystem(&file),
+            "large bootstrap snapshot requires a supported cache filesystem",
+        );
+    }
+
+    fn vdso_row() -> Map {
+        Map {
+            start: 0x1000,
+            end: 0x2000,
+            offset: 0,
+            device: "00:00".into(),
+            inode: 0,
+            path: b"[vdso]".to_vec(),
+            permissions: "r-xp".into(),
+        }
+    }
+
+    #[test]
+    fn vdso_absence_requires_both_maps_and_kernel_auxv_absence() {
+        assert!(
+            initial_vdso(&[], &words(&[libc::AT_NULL, 0]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            initial_vdso(&[], &words(&[libc::AT_SYSINFO_EHDR, 0, libc::AT_NULL, 0]))
+                .unwrap()
+                .is_none()
+        );
+        expect_error(
+            initial_vdso(
+                &[],
+                &words(&[libc::AT_SYSINFO_EHDR, 0x1000, libc::AT_NULL, 0]),
+            ),
+            "initial vDSO auxv/mapping mismatch",
+        );
+        expect_error(
+            initial_vdso(&[vdso_row()], &words(&[libc::AT_NULL, 0])),
+            "initial vDSO auxv/mapping mismatch",
+        );
+    }
+
+    #[test]
+    fn vdso_selection_preserves_identity_and_ambiguity_refusals() {
+        let rows = [vdso_row()];
+        let auxv = words(&[libc::AT_SYSINFO_EHDR, 0x1000, libc::AT_NULL, 0]);
+        assert_eq!(initial_vdso(&rows, &auxv).unwrap(), Some(&rows[0]));
+        expect_error(
+            initial_vdso(&[vdso_row(), vdso_row()], &auxv),
+            "ambiguous initial kernel vDSO",
+        );
+        expect_error(
+            initial_vdso(
+                &rows,
+                &words(&[libc::AT_SYSINFO_EHDR, 0x2000, libc::AT_NULL, 0]),
+            ),
+            "initial vDSO auxv/mapping mismatch",
+        );
+        let mut writable = vdso_row();
+        writable.permissions = "rwxp".into();
+        expect_error(
+            initial_vdso(&[writable], &auxv),
+            "unsupported initial vDSO mapping",
+        );
+        expect_error(
+            initial_vdso(
+                &rows,
+                &words(&[
+                    libc::AT_SYSINFO_EHDR,
+                    0x1000,
+                    libc::AT_SYSINFO_EHDR,
+                    0x1000,
+                    libc::AT_NULL,
+                    0,
+                ]),
+            ),
+            "ambiguous initial vDSO auxv",
+        );
+        expect_error(
+            initial_vdso(&rows, &auxv[..24]),
+            "short initial kernel auxv",
+        );
+    }
+
+    #[test]
+    fn vdso_selection_matches_actual_proc_inputs() {
+        let rows = maps(Pid::this()).unwrap();
+        let auxv = read_path("/proc/self/auxv", 4096).unwrap();
+        let selected = initial_vdso(&rows, &auxv).unwrap();
+        assert_eq!(
+            selected.is_some(),
+            rows.iter().any(|row| row.path == b"[vdso]")
+        );
     }
 }

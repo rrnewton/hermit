@@ -376,9 +376,13 @@ impl reverie_sabre::Tool for Plugin {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1214): Review libc getrandom function interception.
-    // Preserve libc's vDSO/key-refill algorithm. This detour wrapper does not
-    // switch the guest/plugin recursion domain; the captured original retains
-    // it, and actual rewritten syscall sites route through the normal handler.
+    // Keep the registered entry transparent: it must preserve libc's algorithm,
+    // return/errno and guest/plugin domain without constructing the tool. The
+    // registration itself does not intercept entropy. Rewritten libc syscall
+    // sites do that; initial dynamic bootstrap also rewrites vDSO getrandom
+    // syscall sites. Static and later-exec images retain the existing vDSO
+    // coverage limit. Serving a public request directly from Detcore would
+    // bypass libc's key-refill/ChaCha path and change ptrace-parity bytes.
     #[detour(lib = "libc", func = "getrandom")]
     fn libc_getrandom(
         buffer: *mut libc::c_void,
@@ -549,6 +553,143 @@ mod tests {
             unsafe { CStr::from_ptr(detour.lib_name) }.to_bytes(),
             b"libc"
         );
+
+        use std::cell::Cell;
+
+        type Original = fn(*mut libc::c_void, libc::size_t, libc::c_uint) -> libc::ssize_t;
+        type Detour =
+            unsafe extern "C" fn(*mut libc::c_void, libc::size_t, libc::c_uint) -> libc::ssize_t;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct Observation {
+            buffer: usize,
+            length: usize,
+            flags: libc::c_uint,
+            from_plugin: bool,
+            errno: libc::c_int,
+        }
+
+        thread_local! {
+            static EXPECTED_BUFFER: Cell<*mut libc::c_void> = const { Cell::new(std::ptr::null_mut()) };
+            static OBSERVED: Cell<Option<Observation>> = const { Cell::new(None) };
+            static CALLS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        fn controlled_original(
+            buffer: *mut libc::c_void,
+            length: libc::size_t,
+            flags: libc::c_uint,
+        ) -> libc::ssize_t {
+            OBSERVED.set(Some(Observation {
+                buffer: buffer as usize,
+                length,
+                flags,
+                from_plugin: unsafe { sabre::ffi::calling_from_plugin() },
+                errno: unsafe { *libc::__errno_location() },
+            }));
+            CALLS.set(CALLS.get() + 1);
+            if flags == 0x8000_0001 {
+                unsafe { *libc::__errno_location() = libc::EINVAL };
+                return -1;
+            }
+            if length == 0 {
+                return 0;
+            }
+            // Do not dereference a pointer or extent corrupted by the wrapper;
+            // the caller's exact observation and output assertions report it.
+            if !buffer.is_null() && buffer == EXPECTED_BUFFER.get() && length == 16 && flags == 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(b"libc-vd".as_ptr(), buffer.cast::<u8>(), 7);
+                }
+            }
+            7
+        }
+
+        struct RestoreThreadState {
+            from_plugin: bool,
+            errno: libc::c_int,
+        }
+
+        impl Drop for RestoreThreadState {
+            fn drop(&mut self) {
+                EXPECTED_BUFFER.set(std::ptr::null_mut());
+                unsafe {
+                    if self.from_plugin {
+                        sabre::ffi::enter_plugin();
+                    } else {
+                        sabre::ffi::exit_plugin();
+                    }
+                    *libc::__errno_location() = self.errno;
+                }
+            }
+        }
+
+        let _restore = RestoreThreadState {
+            from_plugin: unsafe { sabre::ffi::calling_from_plugin() },
+            errno: unsafe { *libc::__errno_location() },
+        };
+        // The macro stores Original's Rust signature and returns its C-ABI
+        // stub through SaBRe's erased function-pointer ABI. Exercise those
+        // generated functions, not a direct call to the transparent body.
+        // This test alone installs the original; all probe state is per-thread.
+        let original = unsafe {
+            std::mem::transmute::<Original, sabre::ffi::void_void_fn>(
+                controlled_original as Original,
+            )
+        };
+        let stub = unsafe {
+            std::mem::transmute::<sabre::ffi::void_void_fn, Detour>((detour.icept_callback)(
+                original,
+            ))
+        };
+        for from_plugin in [false, true] {
+            unsafe {
+                if from_plugin {
+                    sabre::ffi::enter_plugin();
+                } else {
+                    sabre::ffi::exit_plugin();
+                }
+            }
+            for (length, flags, expected_result, expected_errno) in [
+                (16, 0, 7, libc::E2BIG),
+                (16, 0x8000_0001, -1, libc::EINVAL),
+                (0, 0, 0, libc::E2BIG),
+            ] {
+                let mut bytes = [0xa5u8; 16];
+                let buffer = if length == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    bytes.as_mut_ptr().cast::<libc::c_void>()
+                };
+                EXPECTED_BUFFER.set(buffer);
+                OBSERVED.set(None);
+                CALLS.set(0);
+                unsafe { *libc::__errno_location() = libc::E2BIG };
+                let result = unsafe { stub(buffer, length, flags) };
+                let errno = unsafe { *libc::__errno_location() };
+                let domain_after = unsafe { sabre::ffi::calling_from_plugin() };
+                assert_eq!(CALLS.get(), 1);
+                assert_eq!(
+                    OBSERVED.get(),
+                    Some(Observation {
+                        buffer: buffer as usize,
+                        length,
+                        flags,
+                        from_plugin,
+                        errno: libc::E2BIG,
+                    })
+                );
+                assert_eq!(result, expected_result);
+                assert_eq!(errno, expected_errno);
+                assert_eq!(domain_after, from_plugin);
+                let mut expected_bytes = [0xa5; 16];
+                if expected_result == 7 {
+                    expected_bytes[..7].copy_from_slice(b"libc-vd");
+                }
+                assert_eq!(bytes, expected_bytes);
+                EXPECTED_BUFFER.set(std::ptr::null_mut());
+            }
+        }
     }
 
     #[test]

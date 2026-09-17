@@ -220,6 +220,18 @@ fi
 # build.rs, vendor tree, native key, and CMAKE/CMAKE_GENERATOR selection unchanged.
 # Keep the existing 1050 effective-job-second threshold and 16-job clamp.
 # This source-identity carry supplies no new timing or Hermit guest evidence.
+# CARRY TO 94d97270 (2026-09-17): all eight commits after b3049e54
+# (f918218c, 2fabda5b, 4866241e, 596b9ade, 545faab1, ca4e61a9,
+# 78e5d73a, 94d97270) preserve the complete reverie-dbt and third-party
+# trees and root Cargo.toml/rust-toolchain.toml Git objects. In particular:
+#   reverie-dbt: 6232257769144e8f63891a5efc8935abc3cd836b
+#   reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+#   reverie-dbt/vendor/dynamorio: 42dd83f76cef3e730c39d2313c11fdc78d12ae35
+# CMAKE/CMAKE_GENERATOR selection and native build options are unchanged, so
+# recipe key 0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4,
+# MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds carry unchanged. This is
+# recipe identity evidence, not a new timing measurement or runtime receipt.
+# The carried KVM, RPC/log-capture and SaBRe behavior is not claimed unchanged.
 expected_pin=94d9727065f5f9e2b588ef77a522ab61f53148f2
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
