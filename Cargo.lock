@@ -1042,6 +1042,7 @@ name = "hermit-install"
 version = "0.2.0"
 dependencies = [
  "reverie-dbt",
+ "reverie-sabre",
 ]
 
 [[package]]
