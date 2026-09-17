@@ -459,7 +459,16 @@ impl HeldObject {
     fn authenticate(&self, pid: Pid, row: &Map) -> Result<()> {
         ensure!(
             self.matches_mapping(row),
-            "bootstrap mapped object identity mismatch"
+            "bootstrap mapped object identity mismatch: map={:#x}..{:#x} offset={:#x} \
+             device={} inode={} permissions={} expected_device={} expected_inode={}",
+            row.start,
+            row.end,
+            row.offset,
+            row.device,
+            row.inode,
+            row.permissions,
+            self.device,
+            self.inode
         );
         self.authenticate_path(pid)
     }
@@ -527,6 +536,164 @@ impl HeldObject {
             common.ok_or_else(|| anyhow!("missing executable bootstrap object mapping"))?;
         ensure!(biases.len() == 1, "ambiguous bootstrap ELF load bias");
         Ok(*biases.first().unwrap())
+    }
+
+    /// Select the instance containing an observed executable address. The
+    /// loader and guest may map the same PT_INTERP file at different bases;
+    /// unrelated instances cannot contribute constraints to this address.
+    fn bias_at(&self, pid: Pid, rows: &[Map], anchor: usize, role: &str) -> Result<usize> {
+        let result = (|| {
+            let row = containing(rows, anchor, 1)?;
+            self.authenticate(pid, row)?;
+            ensure!(
+                row.permissions.contains('x'),
+                "anchor mapping is not executable"
+            );
+            let elf = object::File::parse(self.bytes.as_slice())?;
+            let mut candidates = BTreeSet::new();
+            for segment in elf.segments() {
+                let object::SegmentFlags::Elf { p_flags } = segment.flags() else {
+                    continue;
+                };
+                if p_flags & object::elf::PF_X == 0 {
+                    continue;
+                }
+                let (offset, size) = segment.file_range();
+                let offset = usize::try_from(offset)?;
+                let size = usize::try_from(size)?;
+                let virtual_start = usize::try_from(segment.address())?;
+                let file_anchor = row
+                    .offset
+                    .checked_add(anchor - row.start)
+                    .ok_or_else(|| anyhow!("anchor file offset overflow"))?;
+                if file_anchor < offset || file_anchor - offset >= size {
+                    continue;
+                }
+                let relative = virtual_start
+                    .checked_add(file_anchor - offset)
+                    .ok_or_else(|| anyhow!("anchor virtual address overflow"))?;
+                if let Some(bias) = anchor.checked_sub(relative)
+                    && bias.is_multiple_of(PAGE)
+                {
+                    candidates.insert(bias);
+                }
+            }
+            ensure!(
+                candidates.len() == 1,
+                "missing/ambiguous anchored ELF load bias"
+            );
+            Ok(*candidates.first().unwrap())
+        })();
+        result.map_err(|error: anyhow::Error| anyhow!("{role} anchor={anchor:#x}: {error:#}"))
+    }
+
+    fn program_headers(
+        &self,
+        pid: Pid,
+        rows: &[Map],
+        bias: usize,
+        address: usize,
+        count: usize,
+        size: usize,
+    ) -> Result<()> {
+        let result = (|| {
+            let phoff = word(&self.bytes, 32)?;
+            let phnum = u16::from_le_bytes(self.bytes[56..58].try_into()?) as usize;
+            ensure!(
+                count == phnum && size == 56,
+                "final program header count/size changed"
+            );
+            let length = phnum
+                .checked_mul(56)
+                .ok_or_else(|| anyhow!("program header extent overflow"))?;
+            let elf = object::File::parse(self.bytes.as_slice())?;
+            let first = elf
+                .segments()
+                .next()
+                .ok_or_else(|| anyhow!("missing first ELF load"))?;
+            let (offset, _) = first.file_range();
+            let virtual_address = usize::try_from(first.address())?
+                .checked_add(
+                    phoff
+                        .checked_sub(usize::try_from(offset)?)
+                        .ok_or_else(|| anyhow!("program headers precede first ELF load"))?,
+                )
+                .ok_or_else(|| anyhow!("program header virtual address overflow"))?;
+            ensure!(
+                bias.checked_add(virtual_address) == Some(address),
+                "final program header address differs from anchored ELF"
+            );
+            let row = containing(rows, address, length)?;
+            if self.matches_mapping(row) {
+                self.authenticate(pid, row)?;
+            } else {
+                // library_buf_get_original replaces precisely the first file
+                // page after saving the original image. Authenticate only the
+                // PHDR bytes there, anchored by the still-file-backed entry.
+                // This is not authority for anonymous instructions or frames.
+                let page = bias
+                    .checked_add(usize::try_from(first.address())? & !(PAGE - 1))
+                    .ok_or_else(|| anyhow!("copied ELF page address overflow"))?;
+                let object::SegmentFlags::Elf { p_flags } = first.flags() else {
+                    return Err(anyhow!("missing first ELF load flags"));
+                };
+                let permissions = format!(
+                    "{}{}{}p",
+                    if p_flags & object::elf::PF_R != 0 {
+                        'r'
+                    } else {
+                        '-'
+                    },
+                    if p_flags & object::elf::PF_W != 0 {
+                        'w'
+                    } else {
+                        '-'
+                    },
+                    if p_flags & object::elf::PF_X != 0 {
+                        'x'
+                    } else {
+                        '-'
+                    }
+                );
+                ensure!(
+                    offset == 0
+                        && row.start == page
+                        && page.checked_add(PAGE) == Some(row.end)
+                        && row.offset == 0
+                        && row.inode == 0
+                        && row.device == "00:00"
+                        && row.path.is_empty()
+                        && row.permissions == permissions,
+                    "unrecognized copied PHDR mapping: map={:#x}..{:#x} offset={:#x} \
+                     device={} inode={} permissions={} expected_page={page:#x} expected_permissions={permissions}",
+                    row.start,
+                    row.end,
+                    row.offset,
+                    row.device,
+                    row.inode,
+                    row.permissions
+                );
+                self.authenticate_path(pid)?;
+            }
+            let expected = self
+                .bytes
+                .get(
+                    phoff
+                        ..phoff
+                            .checked_add(length)
+                            .ok_or_else(|| anyhow!("program header range overflow"))?,
+                )
+                .ok_or_else(|| anyhow!("short program headers"))?;
+            ensure!(
+                self.at_virtual(virtual_address, length, false)? == expected
+                    && remote_bytes(pid, address, length)? == expected,
+                "final program headers differ from held ELF"
+            );
+            Ok(())
+        })();
+        result.map_err(|error: anyhow::Error| {
+            anyhow!("program PHDR address={address:#x} load_bias={bias:#x}: {error:#}")
+        })
     }
 
     fn at_virtual(&self, address: usize, length: usize, readonly: bool) -> Result<&[u8]> {
@@ -696,18 +863,29 @@ fn stat_generation(pid: Pid, bytes: &[u8]) -> Result<u64> {
 }
 
 fn script_interpreter(bytes: &[u8]) -> Result<Option<&Path>> {
+    Ok(script_words(bytes)?
+        .first()
+        .map(|&path| Path::new(OsStr::from_bytes(path))))
+}
+
+fn script_words(bytes: &[u8]) -> Result<Vec<&[u8]>> {
     // Match the loader's single BINPRM_BUF_SIZE/fgets/strtok resolution.
     if !bytes.starts_with(b"#!") {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let line = &bytes[..bytes.len().min(255)];
     let line = &line[..line.iter().position(|b| *b == b'\n').unwrap_or(line.len())];
-    let path = line[2..]
+    let words: Vec<_> = line[2..]
         .split(|b| matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
-        .find(|part| !part.is_empty())
-        .ok_or_else(|| anyhow!("missing SaBRe script interpreter"))?;
-    ensure!(!path.contains(&0), "NUL in SaBRe script interpreter");
-    Ok(Some(Path::new(OsStr::from_bytes(path))))
+        .filter(|part| !part.is_empty())
+        .take(2)
+        .collect();
+    ensure!(!words.is_empty(), "missing SaBRe script interpreter");
+    ensure!(
+        !words.iter().any(|word| word.contains(&0)),
+        "NUL in SaBRe script interpreter"
+    );
+    Ok(words)
 }
 
 fn elf_interpreter(bytes: &[u8]) -> Result<Option<PathBuf>> {
@@ -756,6 +934,129 @@ fn elf_interpreter(bytes: &[u8]) -> Result<Option<PathBuf>> {
         }
     }
     Ok(path)
+}
+
+// The initial exec stop precedes the loader's first instruction. Bound string
+// capture by the actual kernel-created stack mapping, with one non-overlapping
+// extent per argument. No smaller per-string limit is imposed. Only argv is
+// retained; environment values are not retained or included in diagnostics.
+fn initial_arguments(pid: Pid, rows: &[Map], stack: usize) -> Result<Vec<Vec<u8>>> {
+    let row = containing(rows, stack, 8)?;
+    ensure!(
+        row.path == b"[stack]" && row.permissions.starts_with("rw"),
+        "initial argv is not on the owned writable stack"
+    );
+    let argc = word(&remote_bytes(pid, stack, 8)?, 0)?;
+    // run_sabre prepends the loader, plugin and delimiter to the existing
+    // supported guest argc (4096). IMAGE retains that original guest bound.
+    ensure!(
+        (4..=4099).contains(&argc),
+        "unsupported initial loader argc"
+    );
+    let vector_size = (argc + 2) * 8;
+    ensure!(
+        row.contains(stack, vector_size),
+        "initial argv vector leaves stack"
+    );
+    let vector = remote_bytes(pid, stack, vector_size)?;
+    ensure!(
+        word(&vector, (argc + 1) * 8)? == 0,
+        "missing initial argv terminator"
+    );
+    let mut previous_end = stack + vector_size;
+    let mut arguments = Vec::with_capacity(argc);
+    for index in 0..argc {
+        let pointer = word(&vector, (index + 1) * 8)?;
+        ensure!(
+            pointer >= previous_end && row.contains(pointer, 1),
+            "initial argv string overlaps or leaves kernel stack: index={index}"
+        );
+        let mut value = Vec::new();
+        let mut at = pointer;
+        loop {
+            ensure!(
+                at < row.end,
+                "unterminated initial argv string: index={index}"
+            );
+            let chunk = remote_bytes(pid, at, (row.end - at).min(PAGE))?;
+            if let Some(end) = chunk.iter().position(|byte| *byte == 0) {
+                value.extend_from_slice(&chunk[..=end]);
+                previous_end = at + end + 1;
+                break;
+            }
+            value.extend_from_slice(&chunk);
+            at += chunk.len();
+        }
+        arguments.push(value);
+    }
+    Ok(arguments)
+}
+
+fn guest_arguments(initial: Vec<Vec<u8>>, script: Option<&[u8]>) -> Result<Vec<Vec<u8>>> {
+    // find_client_path_idx scans after argv[0], and stops at the first exact
+    // delimiter. Later literal "--" arguments belong to the client unchanged.
+    let delimiter = initial
+        .iter()
+        .skip(1)
+        .position(|value| value == b"--\0")
+        .map(|index| index + 1)
+        .ok_or_else(|| anyhow!("initial loader argv lacks delimiter"))?;
+    ensure!(
+        delimiter + 1 < initial.len(),
+        "initial loader argv lacks client"
+    );
+    let mut expected = Vec::new();
+    if let Some(script) = script {
+        for token in script_words(script)? {
+            let mut value = token.to_vec();
+            value.push(0);
+            expected.push(value);
+        }
+    }
+    expected.extend(initial.into_iter().skip(delimiter + 1));
+    ensure!(
+        !expected.is_empty() && expected.len() <= 4096,
+        "unsupported bootstrap argc"
+    );
+    Ok(expected)
+}
+
+fn authenticate_arguments(
+    pid: Pid,
+    rows: &[Map],
+    vector: &[u8],
+    expected: &[Vec<u8>],
+) -> Result<usize> {
+    let argc = word(vector, 0)?;
+    ensure!(
+        argc > 0 && argc <= 4096 && argc == expected.len(),
+        "final argv count changed"
+    );
+    for (index, value) in expected.iter().enumerate() {
+        let pointer = word(vector, (index + 1) * 8)?;
+        let row = containing(rows, pointer, value.len()).map_err(|error| {
+            anyhow!("final argv mapping index={index} address={pointer:#x}: {error:#}")
+        })?;
+        ensure!(
+            row.permissions.starts_with('r'),
+            "final argv mapping is not readable: index={index}"
+        );
+        // Values include the terminating NUL. Comparing the full retained
+        // extent rejects truncation, extension, reordered arguments and an
+        // unrelated readable pointer without assuming strings live on stack.
+        let mut offset = 0;
+        while offset < value.len() {
+            let length = (value.len() - offset).min(PAGE);
+            ensure!(
+                remote_bytes(pid, pointer + offset, length)? == value[offset..offset + length],
+                "final argv bytes/order changed: index={index}"
+            );
+            offset += length;
+        }
+    }
+    let at = (argc + 1) * 8;
+    ensure!(word(vector, at)? == 0, "missing final argv terminator");
+    Ok(at + 8)
 }
 
 /// Launch inputs are retained before the owned child can execute the loader.
@@ -831,6 +1132,7 @@ pub(super) struct Bootstrap {
     taken: bool,
     sigill: Option<SigillOrigin>,
     initial_random: usize,
+    expected_arguments: Vec<Vec<u8>>,
     vdso: Option<VdsoSnapshot>,
     other_objects: Vec<HeldObject>,
     // Only real kernel EXEC events create these entries. They are removed on
@@ -952,6 +1254,11 @@ impl Bootstrap {
         let generation = generation(root)?;
         ensure!(generation != 0, "invalid initial process generation");
         let rows = maps(root)?;
+        let registers = nix::sys::ptrace::getregs(root)?;
+        let expected_arguments = guest_arguments(
+            initial_arguments(root, &rows, registers.rsp as usize)?,
+            launch.script.as_ref().map(|script| script.bytes.as_slice()),
+        )?;
         let auxv = read_path(format!("/proc/{root}/auxv"), 4096)?;
         // The caller still owns the initial attach stop. Capture pristine
         // bytes now; absence requires agreement between maps and kernel auxv,
@@ -985,6 +1292,7 @@ impl Bootstrap {
             taken: false,
             sigill: None,
             initial_random,
+            expected_arguments,
             vdso,
             other_objects: Vec::new(),
             continuations: BTreeMap::new(),
@@ -1000,9 +1308,9 @@ impl Bootstrap {
         Ok(())
     }
 
-    fn syscall_site(&self, pid: Pid, rows: &[Map], site: usize) -> Result<()> {
+    fn syscall_site(&self, pid: Pid, rows: &[Map], site: usize) -> Result<usize> {
         let loader = &self.launch.loader;
-        let bias = loader.bias(pid, rows)?;
+        let bias = loader.bias_at(pid, rows, site, "loader private syscall")?;
         let symbol = loader.symbol(bootstrap::SYSCALL_SYMBOL)?;
         ensure!(
             site == bias
@@ -1037,7 +1345,7 @@ impl Bootstrap {
             remote_bytes(pid, address, 72)? == loader.at_virtual(descriptor, 72, true)?,
             "live bootstrap descriptor differs from held object"
         );
-        Ok(())
+        Ok(bias)
     }
 
     fn image(&mut self, pid: Pid, rows: &[Map], stack: usize, entry: usize) -> Result<i64> {
@@ -1053,19 +1361,7 @@ impl Bootstrap {
         );
         let length = (stack_map.end - stack).min(64 * 1024);
         let bytes = remote_bytes(pid, stack, length)?;
-        let argc = word(&bytes, 0)?;
-        ensure!(argc > 0 && argc <= 4096, "unsupported bootstrap argc");
-        let mut at = 8;
-        for _ in 0..argc {
-            let pointer = word(&bytes, at)?;
-            ensure!(
-                stack_map.contains(pointer, 1),
-                "argv pointer leaves initial stack"
-            );
-            at += 8;
-        }
-        ensure!(word(&bytes, at)? == 0, "missing final argv terminator");
-        at += 8;
+        let mut at = authenticate_arguments(pid, rows, &bytes, &self.expected_arguments)?;
         let mut env_count = 0;
         loop {
             let pointer = word(&bytes, at)?;
@@ -1107,7 +1403,7 @@ impl Bootstrap {
             "final AT_RANDOM is not the original owned writable target"
         );
         let program = &self.launch.program;
-        let bias = program.bias(pid, rows)?;
+        let bias = program.bias_at(pid, rows, get(libc::AT_ENTRY)?, "program entry")?;
         let elf = object::File::parse(program.bytes.as_slice())?;
         let expected_entry = bias
             .checked_add(elf.entry() as usize)
@@ -1122,42 +1418,21 @@ impl Bootstrap {
             entry_map.permissions.contains('x'),
             "guest entry not executable"
         );
-        let phoff = word(&program.bytes, 32)?;
-        let phnum = u16::from_le_bytes(program.bytes[56..58].try_into()?) as usize;
-        ensure!(
-            get(libc::AT_PHNUM)? == phnum && get(libc::AT_PHENT)? == 56,
-            "final program header count/size changed"
-        );
-        let phaddr = get(libc::AT_PHDR)?;
-        let phlen = phnum
-            .checked_mul(56)
-            .ok_or_else(|| anyhow!("program header extent overflow"))?;
-        let phmap = containing(rows, phaddr, phlen)?;
-        program.authenticate(pid, phmap)?;
-        let phvirtual = phaddr
-            .checked_sub(bias)
-            .ok_or_else(|| anyhow!("program header bias underflow"))?;
-        let expected = program
-            .bytes
-            .get(
-                phoff
-                    ..phoff
-                        .checked_add(phlen)
-                        .ok_or_else(|| anyhow!("program header range overflow"))?,
-            )
-            .ok_or_else(|| anyhow!("short program headers"))?;
-        ensure!(
-            program.at_virtual(phvirtual, phlen, false)? == expected
-                && remote_bytes(pid, phaddr, phlen)? == expected,
-            "final program headers differ from held ELF"
-        );
+        program.program_headers(
+            pid,
+            rows,
+            bias,
+            get(libc::AT_PHDR)?,
+            get(libc::AT_PHNUM)?,
+            get(libc::AT_PHENT)?,
+        )?;
         self.launch.authenticate_script(pid)?;
         let interpreter = self
             .launch
             .interpreter
             .as_ref()
             .ok_or_else(|| anyhow!("initial static image must not request random IMAGE"))?;
-        let interp_bias = interpreter.bias(pid, rows)?;
+        let interp_bias = interpreter.bias_at(pid, rows, entry, "guest interpreter entry")?;
         let interp = object::File::parse(interpreter.bytes.as_slice())?;
         ensure!(
             entry
@@ -1238,7 +1513,7 @@ impl Bootstrap {
                     .ok_or_else(|| anyhow!("bootstrap source object identity changed"))?
             };
             object.authenticate(pid, &row)?;
-            let bias = object.bias(pid, rows)?;
+            let bias = object.bias_at(pid, rows, site, "original instruction")?;
             let relative = site
                 .checked_sub(bias)
                 .ok_or_else(|| anyhow!("source bias underflow"))?;
@@ -1299,6 +1574,7 @@ impl Bootstrap {
         rows: &[Map],
         arguments: [usize; 3],
         wrapper: usize,
+        loader_bias: usize,
     ) -> Result<()> {
         let layout = self.launch.layout;
         if let Some(saved) = self.sigill.take() {
@@ -1383,7 +1659,7 @@ impl Bootstrap {
             "scratch trampoline names a different syscall continuation"
         );
         let handler = word(&code, 11)?;
-        let bias = self.launch.loader.bias(pid, rows)?;
+        let bias = loader_bias;
         let mut handlers = BTreeSet::new();
         for symbol in ["handle_syscall", "handle_syscall_loader"] {
             handlers.insert(
@@ -1519,7 +1795,7 @@ impl Bootstrap {
         let site = (regs.rip as usize)
             .checked_sub(2)
             .ok_or_else(|| anyhow!("private syscall RIP underflow"))?;
-        self.syscall_site(pid, &rows, site)?;
+        let loader_bias = self.syscall_site(pid, &rows, site)?;
         let initial_static = !self.taken && !self.launch.initializes_random();
         if continuation.is_some() || initial_static {
             ensure!(
@@ -1577,12 +1853,13 @@ impl Bootstrap {
                     self.sigill.is_none() && regs.r8 == bootstrap::VERSION && regs.r9 == 0,
                     "invalid IMAGE protocol shape"
                 );
-                self.image(pid, &rows, regs.rdx as usize, regs.r10 as usize)?
+                self.image(pid, &rows, regs.rdx as usize, regs.r10 as usize)
+                    .map_err(|error| anyhow!("bootstrap IMAGE authentication: {error:#}"))?
             }
             bootstrap::GETRANDOM => {
                 ensure!(self.image.is_some(), "early getrandom before IMAGE");
                 let args = [regs.rdx as usize, regs.r10 as usize, regs.r8 as usize];
-                self.origin(pid, &rows, args, regs.r9 as usize)?;
+                self.origin(pid, &rows, args, regs.r9 as usize, loader_bias)?;
                 let call = Syscall::from_raw(
                     Sysno::getrandom,
                     SyscallArgs::new(args[0], args[1], args[2], 0, 0, 0),
@@ -2178,6 +2455,371 @@ mod tests {
             bytes[512..512 + path.len()].copy_from_slice(path);
         }
         bytes
+    }
+
+    #[test]
+    fn initial_exec_arguments_preserve_kernel_bytes_and_client_delimiters() {
+        use std::os::unix::process::CommandExt;
+
+        use nix::sys::signal::Signal;
+        use nix::sys::wait::WaitStatus;
+        use nix::sys::wait::waitpid;
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                // This test remains the sole waiter; the child has not been
+                // reaped and cannot denote a reused PID at this point.
+                let _ = self.0.kill();
+                self.0.wait().expect("reap owned native exec-stop fixture");
+            }
+        }
+        let long = vec![b'a'; 64 * 1024];
+        let raw = b"raw-\xff\\012";
+        let mut command = std::process::Command::new("/bin/true");
+        command.args([
+            OsStr::new("plugin"),
+            OsStr::new("--"),
+            OsStr::new("client"),
+            OsStr::new("--"),
+            OsStr::from_bytes(&long),
+            OsStr::from_bytes(raw),
+        ]);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = OwnedChild(command.spawn().unwrap());
+        let pid = Pid::from_raw(child.0.id() as i32);
+        assert_eq!(
+            waitpid(pid, None).unwrap(),
+            WaitStatus::Stopped(pid, Signal::SIGTRAP)
+        );
+        let registers = nix::sys::ptrace::getregs(pid).unwrap();
+        let rows = maps(pid).unwrap();
+        let captured = initial_arguments(pid, &rows, registers.rsp as usize).unwrap();
+        let direct = guest_arguments(captured.clone(), None).unwrap();
+        assert_eq!(direct[0], b"client\0");
+        assert_eq!(direct[1], b"--\0");
+        assert_eq!(&direct[2][..long.len()], long);
+        assert_eq!(direct[2].last(), Some(&0));
+        assert_eq!(&direct[3][..raw.len()], raw);
+        let script =
+            guest_arguments(captured, Some(b"#! /raw-\xff --option ignored\nbody")).unwrap();
+        assert_eq!(
+            &script[..2],
+            &[b"/raw-\xff\0".to_vec(), b"--option\0".to_vec()]
+        );
+        assert_eq!(&script[2..], direct);
+        expect_error(
+            guest_arguments(vec![b"loader\0".to_vec(), b"--\0".to_vec()], None),
+            "lacks client",
+        );
+        expect_error(
+            guest_arguments(vec![b"loader\0".to_vec(), b"client\0".to_vec()], None),
+            "lacks delimiter",
+        );
+    }
+
+    #[test]
+    fn relocated_arguments_require_exact_bytes_order_and_terminators() {
+        let expected = vec![
+            b"/interpreter-\xff\0".to_vec(),
+            b"--option\0".to_vec(),
+            b"script\0".to_vec(),
+        ];
+        let mut actual = expected.clone();
+        let vector = |values: &[Vec<u8>]| {
+            let mut pointers = vec![values.len() as u64];
+            pointers.extend(values.iter().map(|value| value.as_ptr() as u64));
+            pointers.push(0);
+            words(&pointers)
+        };
+        let rows = maps(Pid::this()).unwrap();
+        assert_ne!(
+            containing(&rows, actual[0].as_ptr() as usize, actual[0].len())
+                .unwrap()
+                .path,
+            b"[stack]"
+        );
+        assert_eq!(
+            authenticate_arguments(Pid::this(), &rows, &vector(&actual), &expected).unwrap(),
+            40
+        );
+        actual.swap(0, 1);
+        expect_error(
+            authenticate_arguments(Pid::this(), &rows, &vector(&actual), &expected),
+            "bytes/order changed",
+        );
+        actual.swap(0, 1);
+        actual[0][0] ^= 1;
+        expect_error(
+            authenticate_arguments(Pid::this(), &rows, &vector(&actual), &expected),
+            "bytes/order changed",
+        );
+        actual[0][0] ^= 1;
+        *actual[1].last_mut().unwrap() = b'x';
+        expect_error(
+            authenticate_arguments(Pid::this(), &rows, &vector(&actual), &expected),
+            "bytes/order changed",
+        );
+        *actual[1].last_mut().unwrap() = 0;
+        let mut bad = vector(&actual);
+        bad[8..16].copy_from_slice(&1u64.to_le_bytes());
+        expect_error(
+            authenticate_arguments(Pid::this(), &rows, &bad, &expected),
+            "final argv mapping",
+        );
+        bad = vector(&actual);
+        bad[0..8].copy_from_slice(&2u64.to_le_bytes());
+        expect_error(
+            authenticate_arguments(Pid::this(), &rows, &bad, &expected),
+            "count changed",
+        );
+        bad = vector(&actual);
+        bad[32..40].copy_from_slice(&1u64.to_le_bytes());
+        expect_error(
+            authenticate_arguments(Pid::this(), &rows, &bad, &expected),
+            "missing final argv terminator",
+        );
+    }
+
+    struct ElfMapping {
+        address: *mut libc::c_void,
+        _file: File,
+    }
+    impl ElfMapping {
+        fn new(path: &Path) -> Self {
+            let file = File::open(path).unwrap();
+            let address = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    2 * PAGE,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(address, libc::MAP_FAILED);
+            assert_eq!(
+                unsafe {
+                    libc::mprotect(
+                        address.byte_add(PAGE),
+                        PAGE,
+                        libc::PROT_READ | libc::PROT_EXEC,
+                    )
+                },
+                0
+            );
+            Self {
+                address,
+                _file: file,
+            }
+        }
+        fn entry(&self) -> usize {
+            self.address as usize + PAGE + 256
+        }
+        fn bias(&self) -> usize {
+            self.address as usize - 0x400000
+        }
+        fn copy_phdr_page(&self, bytes: &[u8]) {
+            assert_eq!(
+                unsafe {
+                    libc::mmap(
+                        self.address,
+                        PAGE,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                        -1,
+                        0,
+                    )
+                },
+                self.address
+            );
+            // Match the real rewriter's --i loop: word zero is not copied.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr().add(8),
+                    self.address.cast::<u8>().add(8),
+                    PAGE - 8,
+                );
+            }
+            assert_eq!(
+                unsafe { libc::mprotect(self.address, PAGE, libc::PROT_READ) },
+                0
+            );
+        }
+    }
+    impl Drop for ElfMapping {
+        fn drop(&mut self) {
+            assert_eq!(unsafe { libc::munmap(self.address, 2 * PAGE) }, 0);
+        }
+    }
+    fn two_page_elf() -> Vec<u8> {
+        let mut bytes = executable_fixture(None);
+        bytes.resize(2 * PAGE, 0);
+        bytes[24..32].copy_from_slice(&0x401100u64.to_le_bytes());
+        bytes[56..58].copy_from_slice(&2u16.to_le_bytes());
+        bytes[68..72].copy_from_slice(&4u32.to_le_bytes());
+        let header = bytes[64..120].to_vec();
+        bytes[120..176].copy_from_slice(&header);
+        bytes[124..128].copy_from_slice(&5u32.to_le_bytes());
+        bytes[128..136].copy_from_slice(&(PAGE as u64).to_le_bytes());
+        bytes[136..144].copy_from_slice(&0x401000u64.to_le_bytes());
+        let code = bytes[256..265].to_vec();
+        bytes[PAGE + 256..PAGE + 265].copy_from_slice(&code);
+        bytes
+    }
+
+    #[test]
+    fn executable_anchor_selects_real_duplicate_instances_and_rejects_other_objects() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("held-elf");
+        let other = directory.path().join("different-inode");
+        let bytes = two_page_elf();
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(&other, &bytes).unwrap();
+        let held = HeldObject::open(&path).unwrap();
+        let first = ElfMapping::new(&path);
+        let second = ElfMapping::new(&path);
+        let wrong = ElfMapping::new(&other);
+        let rows = maps(Pid::this()).unwrap();
+        // The old unanchored intersection still refuses two distinct bases.
+        expect_error(
+            held.bias(Pid::this(), &rows),
+            "ambiguous bootstrap ELF load bias",
+        );
+        for mapping in [&first, &second] {
+            assert_eq!(
+                held.bias_at(Pid::this(), &rows, mapping.entry(), "test entry")
+                    .unwrap(),
+                mapping.bias()
+            );
+        }
+        expect_error(
+            held.bias_at(Pid::this(), &rows, wrong.entry(), "test entry"),
+            "identity mismatch",
+        );
+        expect_error(
+            held.bias_at(
+                Pid::this(),
+                &rows,
+                first.address as usize + 64,
+                "test entry",
+            ),
+            "not executable",
+        );
+        expect_error(
+            held.bias_at(Pid::this(), &rows, 1, "test entry"),
+            "test entry anchor=0x1",
+        );
+        // One real mapping can still have two candidate virtual addresses.
+        // Deliberately overlapping file extents must not become first-match
+        // selection merely because the observation names a single VMA.
+        let mut ambiguous = bytes.clone();
+        ambiguous[56..58].copy_from_slice(&3u16.to_le_bytes());
+        ambiguous[176..232].copy_from_slice(&bytes[120..176]);
+        ambiguous[192..200].copy_from_slice(&0x402000u64.to_le_bytes());
+        let ambiguous_path = directory.path().join("ambiguous-loads");
+        std::fs::write(&ambiguous_path, ambiguous).unwrap();
+        let ambiguous_held = HeldObject::open(&ambiguous_path).unwrap();
+        let ambiguous_mapping = ElfMapping::new(&ambiguous_path);
+        expect_error(
+            ambiguous_held.bias_at(
+                Pid::this(),
+                &maps(Pid::this()).unwrap(),
+                ambiguous_mapping.entry(),
+                "ambiguous entry",
+            ),
+            "missing/ambiguous anchored ELF load bias",
+        );
+        // Executable VMA permissions cannot extend the ELF's actual file
+        // extent: the observed anchor is beyond p_filesz in this object.
+        let mut short = bytes.clone();
+        short[152..160].copy_from_slice(&128u64.to_le_bytes());
+        let short_path = directory.path().join("short-executable-load");
+        std::fs::write(&short_path, short).unwrap();
+        let short_held = HeldObject::open(&short_path).unwrap();
+        let short_mapping = ElfMapping::new(&short_path);
+        expect_error(
+            short_held.bias_at(
+                Pid::this(),
+                &maps(Pid::this()).unwrap(),
+                short_mapping.entry(),
+                "beyond file extent",
+            ),
+            "missing/ambiguous anchored ELF load bias",
+        );
+    }
+
+    #[test]
+    fn copied_phdr_requires_anchored_page_geometry_and_immutable_header_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("held-elf");
+        let bytes = two_page_elf();
+        std::fs::write(&path, &bytes).unwrap();
+        let held = HeldObject::open(&path).unwrap();
+        let mapping = ElfMapping::new(&path);
+        let other = ElfMapping::new(&path);
+        let phdr = mapping.address as usize + 64;
+        let rows = maps(Pid::this()).unwrap();
+        let bias = held
+            .bias_at(Pid::this(), &rows, mapping.entry(), "test entry")
+            .unwrap();
+        held.program_headers(Pid::this(), &rows, bias, phdr, 2, 56)
+            .unwrap();
+        mapping.copy_phdr_page(&bytes);
+        let rows = maps(Pid::this()).unwrap();
+        expect_error(
+            held.authenticate(Pid::this(), containing(&rows, phdr, 112).unwrap()),
+            "identity mismatch",
+        );
+        assert_eq!(
+            held.bias_at(Pid::this(), &rows, mapping.entry(), "test entry")
+                .unwrap(),
+            bias
+        );
+        held.program_headers(Pid::this(), &rows, bias, phdr, 2, 56)
+            .unwrap();
+        expect_error(
+            held.program_headers(Pid::this(), &rows, other.bias(), phdr, 2, 56),
+            "address differs",
+        );
+        expect_error(
+            held.program_headers(Pid::this(), &rows, bias, phdr + 8, 2, 56),
+            "address differs",
+        );
+        expect_error(
+            held.program_headers(Pid::this(), &rows, bias, phdr, 3, 56),
+            "count/size changed",
+        );
+        expect_error(
+            held.program_headers(Pid::this(), &rows, bias, phdr, 2, 64),
+            "count/size changed",
+        );
+        assert_eq!(
+            unsafe { libc::mprotect(mapping.address, PAGE, libc::PROT_READ | libc::PROT_WRITE) },
+            0
+        );
+        expect_error(
+            held.program_headers(Pid::this(), &maps(Pid::this()).unwrap(), bias, phdr, 2, 56),
+            "unrecognized copied PHDR mapping",
+        );
+        unsafe {
+            *mapping.address.cast::<u8>().add(72) ^= 1;
+        }
+        assert_eq!(
+            unsafe { libc::mprotect(mapping.address, PAGE, libc::PROT_READ) },
+            0
+        );
+        expect_error(
+            held.program_headers(Pid::this(), &maps(Pid::this()).unwrap(), bias, phdr, 2, 56),
+            "headers differ",
+        );
     }
 
     #[test]
