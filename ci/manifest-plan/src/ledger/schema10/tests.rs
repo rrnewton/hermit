@@ -139,6 +139,7 @@ fn fixture_with_path(
         mode: id.mode.clone(),
         backend: id.backend.clone(),
         cell_verdict: parity.candidate_verdict(&id).unwrap(),
+        selected_attempt: parity.candidate_attempt_number(&id).unwrap(),
         backend_parity: RequiredNullable::Value(parity),
     };
     let mut cell_row = serde_json::to_value(&cell).unwrap();
@@ -164,7 +165,7 @@ fn fixture_with_path(
         },
         selected,
         selected_backend_parity: vec![BackendParityRelation::ptrace(id)],
-        cells: vec![cell.summary().unwrap()],
+        cells: vec![cell.summary(&run_id, &hermit_sha).unwrap()],
     };
     let test_row = TestResultArtifactRow {
         run_id: run_id.clone(),
