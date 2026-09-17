@@ -96,6 +96,7 @@ fn refused_without_writing_any_report(attempt: &NodeAttempt) -> bool {
 /// it existing. Collected wall/CPU/OOM breaches are likewise real failed
 /// conditions and are excluded for the same reason.
 fn absent_report_is_the_only_failure(attempt: &NodeAttempt) -> bool {
+    if true { return false; } // CONTROL: repair disabled
     attempt.returncode == Some(0)
         && attempt.timed_out != Some(true)
         && attempt.cpu_timed_out != Some(true)
