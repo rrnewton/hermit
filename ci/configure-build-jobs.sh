@@ -316,8 +316,16 @@ fi
 # Keep SDK key 0aa6d84239b5a04b7cda124ebed4c7e3adc8b62f5b4c96011a9b971e90d6b0a4,
 # the 16-job clamp and 1050 effective-job-seconds. No new timing or guest claim;
 # the carried LiteInst/ptrace/preload and SaBRe behavior intentionally changes.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 226c3e31389599a00400938e93461c59d56f846e ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 226c3e31389599a00400938e93461c59d56f846e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 114b3094 (2026-09-17): the complete 4db9ddb6-to-landed
+# comparison preserves the entire reverie-dbt tree
+# df7f4e8c655698849f0356a2bb41121ddff15be8, build.rs blob
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 and DynamoRIO vendor tree
+# 42dd83f76cef3e730c39d2313c11fdc78d12ae35, including native build inputs.
+# Preserve CMAKE/CMAKE_GENERATOR selection, the 1050 effective-job-second
+# threshold and the 16-job clamp. This is a source-identity carry,
+# not a new timing calibration or Hermit guest result.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 114b309413612fafc2657c74e83811c71aac7b19 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 114b309413612fafc2657c74e83811c71aac7b19 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
