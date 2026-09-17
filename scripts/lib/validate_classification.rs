@@ -60,6 +60,50 @@ impl NodeClassification {
     }
 }
 
+/// dagrun funnels three distinct conditions into one refusal, and they do not
+/// carry the same evidence. `cannot read structured test results {path}: ...`
+/// and `malformed structured test results {path}: ...` each describe a report
+/// the run actually produced, so the suite is a fair suspect -- a duplicate
+/// test identity is a malformed suite. Only the constant below says no report
+/// exists, which is an absence of evidence in either direction.
+const RESULTS_NEVER_WRITTEN: &str = "required structured test results were not written";
+const REFUSAL_REASON_PREFIX: &str = "STRUCTURED TEST RESULTS REFUSED: ";
+
+/// The refusal the producer recorded, if any. `test_results_error` is the
+/// current typed field; the reason prefix is the older contract, retained
+/// because attempts recorded under it are still read back.
+fn refusal_cause(attempt: &NodeAttempt) -> Option<&str> {
+    attempt
+        .test_results_error
+        .as_deref()
+        .or_else(|| attempt.reason.strip_prefix(REFUSAL_REASON_PREFIX))
+}
+
+/// Matched as a PREFIX rather than a substring deliberately. The other two
+/// causes interpolate a path, so a path that happens to contain this phrase
+/// must not be mistaken for a report that was never written.
+fn refused_without_writing_any_report(attempt: &NodeAttempt) -> bool {
+    refusal_cause(attempt).is_some_and(|cause| cause.starts_with(RESULTS_NEVER_WRITTEN))
+}
+
+/// The one case with no evidence in either direction: the node's own command
+/// succeeded, and the only thing marking it not-ok is a report that was never
+/// written. Nothing failed that anybody measured.
+///
+/// The command's own status is tested here rather than inferred from where
+/// this is called. A node that exited nonzero DID fail a condition; a missing
+/// report means that failure cannot be NAMED, and naming it is not the same as
+/// it existing. Collected wall/CPU/OOM breaches are likewise real failed
+/// conditions and are excluded for the same reason.
+fn absent_report_is_the_only_failure(attempt: &NodeAttempt) -> bool {
+    attempt.returncode == Some(0)
+        && attempt.timed_out != Some(true)
+        && attempt.cpu_timed_out != Some(true)
+        && attempt.oomed != Some(true)
+        && !attempt.oom_kills.is_some_and(|kills| kills > 0)
+        && refused_without_writing_any_report(attempt)
+}
+
 /// Evidence of a failed condition remains authoritative alongside a diagnostic.
 ///
 /// Test results were parsed from the controlled runner's structured report.
@@ -67,18 +111,19 @@ impl NodeClassification {
 /// separately from the exit reason. The legacy reason prefix is also retained.
 /// A refusal alone cannot turn an uncollected or aborted attempt into a result.
 pub(super) fn has_product_failure_evidence(attempt: &NodeAttempt) -> bool {
-    attempt
+    if attempt
         .test_results
         .as_ref()
         .is_some_and(|results| results.iter().any(|result| !result.passed))
-        || (attempt.reported
-            && attempt.execution == AttemptExecution::Completed
-            && attempt.ok.is_some()
-            && !attempt.aborted
-            && (attempt.test_results_error.is_some()
-                || attempt
-                    .reason
-                    .starts_with("STRUCTURED TEST RESULTS REFUSED: ")))
+    {
+        return true;
+    }
+    attempt.reported
+        && attempt.execution == AttemptExecution::Completed
+        && attempt.ok.is_some()
+        && !attempt.aborted
+        && refusal_cause(attempt).is_some()
+        && !absent_report_is_the_only_failure(attempt)
 }
 
 pub(super) fn attempt_classification(attempt: &NodeAttempt) -> NodeClassification {
@@ -113,6 +158,16 @@ pub(super) fn attempt_classification(attempt: &NodeAttempt) -> NodeClassificatio
     }
     if attempt.understood_infrastructure_class.is_some() {
         return NodeClassification::UnderstoodInfrastructureFailure;
+    }
+    // Last, so that every measured condition above still wins: a node whose
+    // command succeeded and whose required report was never written produced
+    // no evidence either way. `no_result` keeps it out of the failure count
+    // and equally out of any green evidence for landing, which is both halves
+    // of the ruling. It is deliberately NOT UnderstoodInfrastructureFailure:
+    // nothing here diagnosed a cause, and that bucket is projected with a
+    // named cause it would have to leave empty.
+    if absent_report_is_the_only_failure(attempt) {
+        return NodeClassification::NoResult;
     }
     NodeClassification::ProductFailure
 }
@@ -389,6 +444,149 @@ fn fold_bracket() -> Result<(), String> {
     Ok(())
 }
 
+/// A report that was never written is an absence of evidence, not a failure --
+/// and every other measured condition still outranks that absence.
+///
+/// The fixture deliberately starts from a plain failing outcome with NO
+/// infrastructure diagnosis, so the only thing that can satisfy the
+/// never-written expectations is this reclassification. Cloning the `infra`
+/// fixture instead would reach `no_result` through
+/// `understood_infrastructure_class` and the assertions could not fail.
+fn absent_report_bracket() -> Result<(), String> {
+    let clean = fixture_outcome("test.absent", 0);
+    // The producer marks any refusal not-ok while leaving the command's own
+    // zero exit status in place. That pairing is the whole subject here.
+    let refused_only = |cause: &str| {
+        let mut attempt = reported_attempt(&clean, 1);
+        attempt.ok = Some(false);
+        attempt.test_results_error = Some(cause.into());
+        attempt
+    };
+    let never_written =
+        "required structured test results were not written to /src/.dagrun-test-counts-x.json";
+    let malformed = "malformed structured test results /src/counts.json: \
+                     structured-test-results-results has 0 terminal row(s), expected exactly 1 \
+                     executed test(s)";
+    let unreadable = "cannot read structured test results /src/counts.json: \
+                      No such file or directory (os error 2)";
+
+    if attempt_classification(&refused_only(never_written)) != NodeClassification::NoResult {
+        return Err(
+            "classification: a report that was never written was reported as a product failure"
+                .into(),
+        );
+    }
+    for (label, cause) in [("malformed", malformed), ("unreadable", unreadable)] {
+        if attempt_classification(&refused_only(cause)) != NodeClassification::ProductFailure {
+            return Err(format!(
+                "classification: a {label} report stopped being product evidence"
+            ));
+        }
+    }
+    // The phrase inside an interpolated PATH must not be mistaken for absence.
+    // This is why the match is a prefix and not a substring.
+    let phrase_in_path = format!(
+        "malformed structured test results \
+         /src/{RESULTS_NEVER_WRITTEN}/counts.json: trailing characters at line 1"
+    );
+    if attempt_classification(&refused_only(&phrase_in_path)) != NodeClassification::ProductFailure
+    {
+        return Err(
+            "classification: a malformed report whose path contains the absence phrase was \
+             excused"
+                .into(),
+        );
+    }
+    // The legacy reason contract, which older attempts are still read back with.
+    for (label, cause, want) in [
+        ("never written", never_written, NodeClassification::NoResult),
+        ("malformed", malformed, NodeClassification::ProductFailure),
+    ] {
+        let mut legacy = reported_attempt(&clean, 1);
+        legacy.ok = Some(false);
+        legacy.reason = format!("{REFUSAL_REASON_PREFIX}{cause}");
+        if attempt_classification(&legacy) != want {
+            return Err(format!(
+                "classification: legacy reason form of a {label} report changed meaning"
+            ));
+        }
+    }
+    // A measured failing test outranks the absence of the report it came in.
+    let mut with_failed_test = refused_only(never_written);
+    with_failed_test.test_results = Some(vec![dagrun::TestResult::new(
+        "fixture::fails".into(),
+        false,
+        1,
+    )?]);
+    if attempt_classification(&with_failed_test) != NodeClassification::ProductFailure {
+        return Err(
+            "classification: an absent report erased the same node's measured failed test".into(),
+        );
+    }
+    // A command that failed on its own DID fail a condition; only the naming
+    // is lost. Every nonzero status stays a product failure.
+    for code in [1_i64, 2, 101, -15] {
+        let mut failed_command = refused_only(never_written);
+        failed_command.returncode = Some(code);
+        failed_command.reason = "exit 1".into();
+        if attempt_classification(&failed_command) != NodeClassification::ProductFailure {
+            return Err(format!(
+                "classification: an absent report excused a command that exited {code}"
+            ));
+        }
+    }
+    // Collected node-limit breaches are measured failed conditions and keep
+    // their precedence even when the report is missing.
+    for bits in 1_u8..8 {
+        let mut limited = refused_only(never_written);
+        limited.timed_out = Some(bits & 1 != 0);
+        limited.cpu_timed_out = Some(bits & 2 != 0);
+        limited.oomed = Some(bits & 4 != 0);
+        limited.oom_kills = Some(if bits & 4 != 0 { 2 } else { 0 });
+        limited.failure_class = Some(super::FailureClass::NoResult);
+        if attempt_classification(&limited) != NodeClassification::ProductFailure {
+            return Err(format!(
+                "classification: an absent report excused collected node limit {bits}"
+            ));
+        }
+    }
+    // An attempt that never completed was already unknown and stays unknown;
+    // the absence must not upgrade it into a diagnosed infrastructure cause.
+    for bits in 1_u8..16 {
+        let mut incomplete = refused_only(never_written);
+        incomplete.reported = bits & 1 == 0;
+        if bits & 2 != 0 {
+            incomplete.execution = AttemptExecution::Unknown;
+        }
+        incomplete.aborted = bits & 4 != 0;
+        if bits & 8 != 0 {
+            incomplete.ok = None;
+        }
+        if attempt_classification(&incomplete) != NodeClassification::NoResult {
+            return Err(format!(
+                "classification: incomplete attempt {bits} with an absent report left no_result"
+            ));
+        }
+    }
+    // A real infrastructure diagnosis is more informative than "cannot tell",
+    // so it keeps its own bucket rather than being flattened into no_result.
+    let mut diagnosed = refused_only(never_written);
+    diagnosed.understood_infrastructure_class = Some("PMU RCB overshoot".into());
+    if attempt_classification(&diagnosed) != NodeClassification::UnderstoodInfrastructureFailure {
+        return Err(
+            "classification: an absent report erased a real infrastructure diagnosis".into(),
+        );
+    }
+    // The projection a consumer actually reads, and it must not invent a cause.
+    let gate = super::ledger_gate_with_attempts(&clean, &[refused_only(never_written)]);
+    if gate["result"] != "no_result" || gate["failure_class"] != "no_result" {
+        return Err(format!(
+            "classification: absent-report projection did not read as no_result; gate={gate}"
+        ));
+    }
+    Ok(())
+}
+
 fn product_evidence_bracket() -> Result<(), String> {
     let mut outcome = fixture_outcome("test.mixed", 1);
     let mut infra = reported_attempt(&outcome, 1);
@@ -614,8 +812,9 @@ fn populations_bracket() -> Result<(), String> {
 pub(super) fn self_test() -> Result<String, String> {
     fold_bracket()?;
     product_evidence_bracket()?;
+    absent_report_bracket()?;
     populations_bracket()?;
-    Ok("classification: exact selected populations; stale/raw fold agreement; failed tests and node limits outrank infrastructure; missing super repetitions remain unmeasured".into())
+    Ok("classification: exact selected populations; stale/raw fold agreement; failed tests and node limits outrank infrastructure; an unwritten required report is undetermined rather than failed; missing super repetitions remain unmeasured".into())
 }
 
 #[cfg(test)]
@@ -629,6 +828,10 @@ mod tests {
     #[test]
     fn measured_product_evidence_outranks_infrastructure() {
         product_evidence_bracket().unwrap();
+    }
+    #[test]
+    fn an_unwritten_report_is_undetermined_and_never_outranks_a_measured_condition() {
+        absent_report_bracket().unwrap();
     }
     #[test]
     fn selected_populations_and_super_denominators_are_exact() {
