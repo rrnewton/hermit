@@ -1254,11 +1254,17 @@ impl Bootstrap {
         let generation = generation(root)?;
         ensure!(generation != 0, "invalid initial process generation");
         let rows = maps(root)?;
-        let registers = nix::sys::ptrace::getregs(root)?;
-        let expected_arguments = guest_arguments(
-            initial_arguments(root, &rows, registers.rsp as usize)?,
-            launch.script.as_ref().map(|script| script.bytes.as_slice()),
-        )?;
+        let expected_arguments = if launch.initializes_random() {
+            let registers = nix::sys::ptrace::getregs(root)?;
+            guest_arguments(
+                initial_arguments(root, &rows, registers.rsp as usize)?,
+                launch.script.as_ref().map(|script| script.bytes.as_slice()),
+            )?
+        } else {
+            // Static legacy TAKE has no IMAGE/argv proof. Preserve its
+            // existing admission instead of imposing the dynamic argc bound.
+            Vec::new()
+        };
         let auxv = read_path(format!("/proc/{root}/auxv"), 4096)?;
         // The caller still owns the initial attach stop. Capture pristine
         // bytes now; absence requires agreement between maps and kernel auxv,
