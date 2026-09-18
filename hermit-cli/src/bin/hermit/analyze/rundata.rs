@@ -546,14 +546,10 @@ mod tests {
             // This is the override launch_search applies, not a replay option.
             selected_config.imprecise_timers = true;
             let preempts = workspace.path().join("selected.preempts");
-            let replay = RunData::new_run1_replay(
-                &options,
-                "replay".to_owned(),
-                &selected.runopts,
-            )
-            .unwrap()
-            .with_preempts_path_in(preempts.clone())
-            .with_preemption_recording();
+            let replay = RunData::new_run1_replay(&options, "replay".to_owned(), &selected.runopts)
+                .unwrap()
+                .with_preempts_path_in(preempts.clone())
+                .with_preemption_recording();
             let config = &replay.runopts.det_opts.det_config;
             assert_eq!(config.seed, 101);
             assert_eq!(config.rng_seed, Some(102));

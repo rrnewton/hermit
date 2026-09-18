@@ -921,7 +921,8 @@ exit "$PRODUCER_STATUS"
     for path in ["scripts/manifest-to-commands.rs", "tests/manifest-cli.rs"] {
         let renderer = fs::read_to_string(root().join(path)).unwrap();
         assert!(
-            renderer.contains("verified_command::hermit_verification_command(mode, seed, &command)"),
+            renderer
+                .contains("verified_command::hermit_verification_command(mode, seed, &command)"),
             "{path} must use the shared verification gate"
         );
     }

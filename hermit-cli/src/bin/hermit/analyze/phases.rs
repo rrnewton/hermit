@@ -309,13 +309,9 @@ impl AnalyzeOpts {
             yellow_msg("[selfcheck] Verifying target run preserved under preemption-replay");
 
             let runname = "run1b_selfcheck";
-            let mut run1b = RunData::new_run1_replay(
-                self,
-                runname.to_string(),
-                &min_run.runopts,
-            )?
-            .with_preempts_path_in(min_preempts_path.clone())
-            .with_preemption_recording();
+            let mut run1b = RunData::new_run1_replay(self, runname.to_string(), &min_run.runopts)?
+                .with_preempts_path_in(min_preempts_path.clone())
+                .with_preemption_recording();
             eprintln!("    {}", run1b.to_repro());
 
             run1b.launch()?;

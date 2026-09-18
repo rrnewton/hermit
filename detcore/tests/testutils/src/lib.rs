@@ -1009,10 +1009,8 @@ mod tests {
                     std::fs::read_link("/proc/self").unwrap(),
                     std::path::PathBuf::from(pid.to_string()),
                 );
-                let status = std::fs::read_to_string(format!(
-                    "/proc/{pid}/task/{tid}/status"
-                ))
-                .unwrap();
+                let status =
+                    std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/status")).unwrap();
                 assert!(status.lines().any(|line| line == format!("Pid:\t{tid}")));
                 println!("pid={pid} tid={tid}");
                 eprintln!("real guest stderr");
@@ -1081,7 +1079,9 @@ mod tests {
                 },
                 |output, state| {
                     super::expect_success(output, state);
-                    oracle.send(b"successful guest before oracle panic").unwrap();
+                    oracle
+                        .send(b"successful guest before oracle panic")
+                        .unwrap();
                     panic!("deliberate reached oracle failure");
                 },
             );
@@ -1115,7 +1115,9 @@ mod tests {
             assert!(
                 matches!(
                     result,
-                    Err(reverie::process::RunError::ExitStatus(ExitStatus::Exited(29)))
+                    Err(reverie::process::RunError::ExitStatus(ExitStatus::Exited(
+                        29
+                    )))
                 ),
                 "must reject the reached post-publication cleanup failure: {result:?}",
             );
