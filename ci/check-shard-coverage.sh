@@ -28,9 +28,26 @@ cd "$ROOT_DIR"
 
 shards="ci/portable-shards.json"
 workflow=".github/workflows/ci-portable.yml"
+hosted_runner="ci/run-hosted-node.sh"
 command -v jq >/dev/null 2>&1 || { echo "check-shard-coverage.sh: jq is required" >&2; exit 2; }
 [[ -f $shards ]] || { echo "check-shard-coverage.sh: missing $shards" >&2; exit 2; }
 [[ -f $workflow ]] || { echo "check-shard-coverage.sh: missing $workflow" >&2; exit 2; }
+[[ -f $hosted_runner ]] || { echo "check-shard-coverage.sh: missing $hosted_runner" >&2; exit 2; }
+
+# Every hosted test job enters a network namespace. The outer validation driver
+# must therefore resolve to the artifact built before fan-out, never to Cargo.
+hosted_runner_text=$(<"$hosted_runner")
+for required in \
+    'export PATH="$ROOT_DIR/ci/rust-script-bin:$PATH"' \
+    'export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$ROOT_DIR/target/ci/rust-scripts"' \
+    'export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1' \
+    'exec unshare --user --map-root-user --pid --fork --uts --net --mount'
+do
+    if ! grep -Fq "$required" <<<"$hosted_runner_text"; then
+        echo "check-shard-coverage.sh: FAIL — hosted namespace wrapper omitted required bootstrap: $required" >&2
+        exit 1
+    fi
+done
 
 # Ask the same plan constructor the runner uses. The command is inert, may run
 # inside validate, and emits its JSON as the first stdout line.
