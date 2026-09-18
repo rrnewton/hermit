@@ -7772,7 +7772,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "542",
+        "NEXTEST_EXPECTED_EXECUTED": "544",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -7821,7 +7821,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "707",
+        "NEXTEST_EXPECTED_EXECUTED": "710",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -61831,7 +61831,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "542",
+        "NEXTEST_EXPECTED_EXECUTED": "544",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -61856,7 +61856,7 @@
       "group": "test",
       "job": "hermit_unit_on_host",
       "desc": "Test Hermit unit and binary targets (-p hermit --lib --bins)",
-      "description": "HOSTED CAPABILITY DIFFERENCE: The GitHub wrapper intentionally maps only the runner UID to root. The host filesystem root is therefore overflow-owned inside that user namespace, so this exact cache-ancestor ownership fixture refuses before testing the private cache directory. It remains blocking in canonical local validate; the other 706 Hermit unit cases remain blocking here.",
+      "description": "HOSTED CAPABILITY DIFFERENCE: The GitHub wrapper intentionally maps only the runner UID to root. The host filesystem root is therefore overflow-owned inside that user namespace, so this exact cache-ancestor ownership fixture refuses before testing the private cache directory. It remains blocking in canonical local validate; the other 709 Hermit unit cases remain blocking here.",
       "labels": [
         "hosted-portable"
       ],
@@ -61877,7 +61877,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "706",
+        "NEXTEST_EXPECTED_EXECUTED": "709",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
