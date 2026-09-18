@@ -362,10 +362,26 @@ jobs:
           sudo apt-get install -y liblzma-dev
       - name: Rust components
         run: rustup component add clippy rustfmt
+      # check.lint_checks runs the real structured-Nextest fixture.  Installing
+      # rust-script alone made that fixture fail with "no such command:
+      # nextest" on run 35335623037; the fixture is a test of the production
+      # adapter, not a reason to replace it with a mock in hosted CI.
+      - name: Install cargo-nextest (checks)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       - name: Install rust-script (checks)
         env:
           RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      # The real structured-Nextest fixture deliberately enters its execution
+      # namespace with CARGO_NET_OFFLINE=true.  Its standalone CPU-wrapper
+      # preparation still asks Cargo for locked workspace metadata, so a fresh
+      # runner must populate those sources before crossing that boundary.  Run
+      # 35342226342 reached the prepared runner and pinned Nextest correctly,
+      # then refused because addr2line was not yet present in Cargo's cache.
+      - name: Fetch locked workspace dependencies for offline checks
+        run: cargo fetch --locked
       - name: Download rust-script binaries
         uses: actions/download-artifact@v4
         with:
@@ -1073,7 +1089,10 @@ jobs:
     needs: [select, build-debug, build-complete]
     if: needs.select.outputs.run_e2e != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The widest bucket has a measured 720-second constructed-node budget plus
+    # setup and evidence packing. Other buckets retain their smaller committed
+    # node bounds; this outer cap only leaves room for that one complete stream.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.build-debug.outputs.e2e_matrix) }}
