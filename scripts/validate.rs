@@ -5758,7 +5758,7 @@ fn local_scorecard_writeback(
 /// The largest child explanation carried into the durable record.
 ///
 /// Sized from measurement rather than taste: the refusal that stranded seven
-/// hours of validation on 2026-09-17 was a SINGLE 317-byte line. This is an
+/// hours of validation on 2026-09-17 was a SINGLE 407-byte line. This is an
 /// order of magnitude above that, which is room for a multi-line refusal and
 /// still bounded, because the value lands in an append-only run handle.
 const REFUSAL_DETAIL_MAX_BYTES: usize = 4096;
