@@ -23864,11 +23864,21 @@ mod refusal_detail_tests {
         assert!(detail.starts_with("stderr: "), "{detail}");
         // The two facts a reader needs in order to act, and neither survives in
         // an exit status: WHICH cell disagreed and WHAT kind of disagreement.
-        assert!(detail.contains("backend-parity-c/aio-refusal/verify@kvm"), "{detail}");
-        assert!(detail.contains("parity history changes candidate identity"), "{detail}");
+        assert!(
+            detail.contains("backend-parity-c/aio-refusal/verify@kvm"),
+            "{detail}",
+        );
+        assert!(
+            detail.contains("parity history changes candidate identity"),
+            "{detail}",
+        );
         // Well under the bound, so this case is carried whole.
         assert!(!detail.contains("last "), "{detail}");
-        assert!(REAL.len() < REFUSAL_DETAIL_MAX_BYTES, "{} bytes", REAL.len());
+        assert!(
+            REAL.len() < REFUSAL_DETAIL_MAX_BYTES,
+            "{} bytes",
+            REAL.len(),
+        );
     }
 
     #[test]
@@ -23909,7 +23919,11 @@ mod refusal_detail_tests {
         );
         assert!(detail.starts_with("stderr (last "), "{}", &detail[..60]);
         // Bounded, with room for the framing.
-        assert!(detail.len() < REFUSAL_DETAIL_MAX_BYTES + 100, "{}", detail.len());
+        assert!(
+            detail.len() < REFUSAL_DETAIL_MAX_BYTES + 100,
+            "{}",
+            detail.len(),
+        );
     }
 
     /// ⚠️ THE CALL-SITE TEST, AND IT IS THE ONE THAT MATTERS.
