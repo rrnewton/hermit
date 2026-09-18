@@ -5611,7 +5611,7 @@ fn import_results(
     }
     if !fold.errored.is_empty() {
         return Err(format!(
-            "retained import selected {} rows that determined nothing; first is {}",
+            "retained import selected {} rows without an admitted canonical comparison; first is {}",
             fold.errored.len(),
             fold.errored[0]
         ));
@@ -6163,11 +6163,11 @@ where
     );
     if !fold.errored.is_empty() {
         println!(
-            "  {} current result row(s) determined no canonical product result; their exact invocation evidence was retained",
+            "  {} current result row(s) lack an admitted canonical comparison; their exact invocation evidence and any established product result were retained",
             fold.errored.len()
         );
         for row in &fold.errored {
-            println!("    determined nothing: {row}");
+            println!("    no canonical comparison: {row}");
         }
     }
     for skipped in &projection.skipped {
@@ -7255,7 +7255,7 @@ fn apply_series_rows_inner(
 
     if !rows.is_empty() && prepared.is_empty() {
         return Err(format!(
-            "every one of the {} readable series row(s) determined nothing, so the projection was not written:\n{}",
+            "every one of the {} readable series row(s) determined nothing for the legacy projection, so the projection was not written:\n{}",
             rows.len(),
             skipped
                 .iter()
