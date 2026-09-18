@@ -325,7 +325,12 @@ fi
 # That Cargo failure remains a failure; only its completed cold SDK work is
 # calibration evidence. The normal Hermit workspace/all-target check remains
 # independently required. No DBT guest correctness or new replay claim follows.
-expected_pin=99d1e4827cce2404442d7c27ab447886a5839326
+# BOUND TO 000c15a1 (2026-09-18): all reverie-dbt source, including build.rs
+# and the DynamoRIO gitlink, is byte-identical to the 99d1e482 observation above.
+# The later KVM signal-delivery and scalar-write changes leave the b0247764df7f
+# recipe unchanged. Carry the existing 1050 effective job-seconds and 16-job
+# ceiling conservatively; this pin update is not a new native timing sample.
+expected_pin=000c15a1161ea2d58749431b5ddaaa97f7aa37d5
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

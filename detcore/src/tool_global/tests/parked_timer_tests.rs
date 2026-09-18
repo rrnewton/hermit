@@ -657,3 +657,274 @@ async fn dequeue_acknowledges_without_a_turn_while_sibling_requests_are_unfilled
         }
     }
 }
+
+// Actual RPC/daemon controls. Backend receipts are controlled inputs: these
+// tests prove scheduler boundaries, not the backend's callback/frame ordering.
+async fn newer_dequeue_clock_reaches_next_deadline(caught: bool) {
+    let mut fixture = Fixture::started().await;
+    fixture.prepare_exec().await;
+    fixture.finish_exec().await;
+    let period = LogicalTime::from_nanos(100);
+    assert!(matches!(
+        fixture
+            .rpc(GlobalRequest::RegisterAlarm(
+                fixture.tid,
+                fixture.tid,
+                LogicalTime::from_nanos(1),
+                period,
+                SigWrapper::from(Signal::SIGALRM),
+            ))
+            .await,
+        GlobalResponse::RegisterAlarm(_)
+    ));
+    fixture.clock.add_syscall_with_cost(100);
+    let mut write = Resources::new(fixture.tid);
+    write.insert(
+        ResourceID::Device(crate::resources::Device::ContainerStdout),
+        Permission::W,
+    );
+    let sleep_until = fixture.now() + LogicalTime::from_nanos(10_000_000);
+    let (resources, capability) = if caught {
+        (
+            fixture.resources(ResourceID::SleepUntil(sleep_until)),
+            ControlCapability::ParkedWait {
+                policy: ParkedWaitPolicy::NanosleepNoHandlerRestart {
+                    absolute_deadline: sleep_until,
+                },
+                site: fixture.site,
+            },
+        )
+    } else {
+        (
+            write.clone(),
+            ControlCapability::CapturedWrite { site: fixture.site },
+        )
+    };
+    let initial_turn = fixture.state.sched.lock().unwrap().turn;
+    let mut original = Box::pin(fixture.rpc(GlobalRequest::ParkedRequest(
+        resources,
+        fixture.tid,
+        capability,
+    )));
+    assert!(futures::poll!(original.as_mut()).is_pending());
+    let skipped = Err(SkipTurn);
+    let mut daemon = Box::pin(do_a_turn_blocking(
+        fixture.state.sched.clone(),
+        fixture.state.global_time.clone(),
+        &skipped,
+    ));
+    assert!(futures::poll!(daemon.as_mut()).is_pending());
+    let GlobalResponse::ParkedRequest(ResourceReply::PublishAlarm(first)) = original.await else {
+        panic!("the first deadline must precede an original request grant");
+    };
+    let mut publication = Box::pin(fixture.rpc(GlobalRequest::AlarmPublicationAck(
+        *first,
+        ProcessAlarmSignalOutcome::Accepted(ProcessAlarmSignalReceipt {
+            // The no-hook case keeps SIGALRM masked through Write return;
+            // signalfd then consumes it instead of return-to-user delivery.
+            blocked: !caught,
+            disposition: ProcessAlarmSignalDisposition::Caught,
+            pending_generation: 1,
+            coalesced: false,
+        }),
+    )));
+    assert!(futures::poll!(publication.as_mut()).is_pending());
+    assert!(futures::poll!(daemon.as_mut()).is_pending());
+    let GlobalResponse::AlarmPublicationAck(Ok(activation)) = publication.await else {
+        panic!("publication must be acknowledged");
+    };
+    let mut model = GlobalTime::new(&fixture.state.cfg);
+    let model_start = model.as_nanos();
+    let charge = model.add_scheduler_time() - model_start;
+    assert!(charge > period);
+    let mut caught_observation = None;
+    let last_grant = match activation {
+        PublicationActivation::Observe { wait, lease } => {
+            assert!(caught);
+            let before = fixture.now();
+            fixture.clock.add_syscall_with_cost(37);
+            assert_eq!(
+                fixture
+                    .rpc(GlobalRequest::SignalDequeued {
+                        detpid: fixture.tid,
+                        identity: fixture.identity,
+                        dequeue: fixture.effect(1),
+                    })
+                    .await,
+                GlobalResponse::SignalDequeued {
+                    ack: Ok(DequeueAck::Applied { sequence: 1 }),
+                    terminal: false,
+                }
+            );
+            assert_eq!(fixture.now(), before + LogicalTime::from_nanos(37));
+            assert_eq!(fixture.state.sched.lock().unwrap().turn, initial_turn);
+            let mut hook = Box::pin(fixture.rpc(GlobalRequest::ParkedRequest(
+                fixture.resources(ResourceID::InboundSignal(SigWrapper::from(Signal::SIGALRM))),
+                fixture.tid,
+                ControlCapability::PublishOnly {
+                    lease,
+                    site: fixture.site,
+                },
+            )));
+            assert!(futures::poll!(hook.as_mut()).is_pending());
+            let granted = daemon
+                .await
+                .expect("the real signal hook must receive its grant");
+            assert!(matches!(
+                hook.await,
+                GlobalResponse::ParkedRequest(ResourceReply::Grant(_))
+            ));
+            // The refresh observes the newer dequeue clock; it must not charge
+            // a fictitious preceding turn merely because transport was awaited.
+            assert_eq!(fixture.now(), before + LogicalTime::from_nanos(37));
+            assert_eq!(
+                fixture.state.sched.lock().unwrap().committed_time,
+                fixture.now()
+            );
+            assert_eq!(fixture.state.sched.lock().unwrap().turn, initial_turn + 1);
+            caught_observation = Some((wait, lease));
+            granted
+        }
+        PublicationActivation::AwaitResume(ticket) => {
+            assert!(!caught);
+            let before = fixture.now();
+            let mut resumed = Box::pin(fixture.rpc(GlobalRequest::ResumeParkedRequest {
+                ticket,
+                current_site: fixture.site,
+            }));
+            assert!(futures::poll!(resumed.as_mut()).is_pending());
+            let written = daemon
+                .await
+                .expect("captured publication must restore its real Write");
+            assert_eq!(written, write);
+            assert!(matches!(
+                resumed.await,
+                GlobalResponse::ResumeParkedRequest(ResourceReply::Grant(_))
+            ));
+            assert_eq!(fixture.now(), before);
+            assert_eq!(fixture.state.sched.lock().unwrap().turn, initial_turn + 1);
+            // A normal polling read grant precedes a controlled signalfd
+            // removal. SignalFd has no structured signal hook; it still owes
+            // the real read turn's charge before another request can run.
+            let mut read = Box::pin(fixture.rpc(GlobalRequest::RequestResources(
+                fixture.resources(ResourceID::InternalIOPolling),
+                fixture.tid,
+            )));
+            assert!(futures::poll!(read.as_mut()).is_pending());
+            let granted = do_a_turn_blocking(
+                fixture.state.sched.clone(),
+                fixture.state.global_time.clone(),
+                &Ok(written),
+            )
+            .await
+            .expect("the consuming read must receive a real grant");
+            assert!(matches!(read.await, GlobalResponse::RequestResources(_)));
+            assert_eq!(fixture.now(), before + charge);
+            let mut effect = fixture.effect(1);
+            effect.consumer = SignalConsumer::SignalFd;
+            fixture.clock.add_syscall_with_cost(37);
+            assert_eq!(
+                fixture
+                    .rpc(GlobalRequest::SignalDequeued {
+                        detpid: fixture.tid,
+                        identity: fixture.identity,
+                        dequeue: effect,
+                    })
+                    .await,
+                GlobalResponse::SignalDequeued {
+                    ack: Ok(DequeueAck::Applied { sequence: 1 }),
+                    terminal: false,
+                }
+            );
+            assert_eq!(fixture.now(), before + charge + LogicalTime::from_nanos(37));
+            assert_eq!(fixture.state.sched.lock().unwrap().turn, initial_turn + 2);
+            granted
+        }
+    };
+    let before = fixture.now();
+    let before_turn = fixture.state.sched.lock().unwrap().turn;
+    let deadline = fixture
+        .state
+        .sched
+        .lock()
+        .unwrap()
+        .blocked
+        .timed_waiters
+        .next_deadline()
+        .unwrap();
+    assert!(before < deadline && deadline <= before + period);
+    let last_turn = Ok(last_grant);
+    let mut next = Box::pin(do_a_turn_blocking(
+        fixture.state.sched.clone(),
+        fixture.state.global_time.clone(),
+        &last_turn,
+    ));
+    assert!(futures::poll!(next.as_mut()).is_pending());
+    assert_eq!(
+        fixture.now(),
+        before,
+        "the current callback has not parked again"
+    );
+    if let Some((wait, lease)) = caught_observation {
+        let mut finish = Box::pin(fixture.rpc(GlobalRequest::FinishParkedObservation {
+            wait,
+            lease,
+            site: fixture.site,
+            finish: ObservationFinish::InterruptForCaught {
+                selection: PreparedSignalToken {
+                    site: fixture.site,
+                    selection_nonce: 1,
+                },
+            },
+        }));
+        assert!(futures::poll!(finish.as_mut()).is_pending());
+        assert!(futures::poll!(next.as_mut()).is_pending());
+        assert_eq!(
+            finish.await,
+            GlobalResponse::FinishParkedObservation(Ok(FinishAck::Interrupted))
+        );
+        assert_eq!(
+            fixture.now(),
+            before,
+            "caught return still owns the empty gate"
+        );
+    }
+    // A fresh callback after the actual grant contributes newer guest time.
+    // This fixture supplies the receipt/site: backend frame ordering is
+    // independently exercised by the real guest and backend controls.
+    fixture.clock.add_syscall_with_cost(11);
+    fixture.site.callback_nonce += 1;
+    fixture.site.boundary_nonce += 1;
+    let mut original = Box::pin(fixture.rpc(GlobalRequest::ParkedRequest(
+        write,
+        fixture.tid,
+        ControlCapability::CapturedWrite { site: fixture.site },
+    )));
+    assert!(futures::poll!(original.as_mut()).is_pending());
+    assert_eq!(fixture.now(), before + LogicalTime::from_nanos(11));
+    assert!(futures::poll!(next.as_mut()).is_pending());
+    let GlobalResponse::ParkedRequest(ResourceReply::PublishAlarm(second)) = original.await else {
+        panic!("the adjacent periodic deadline must precede the next guest grant");
+    };
+    assert_eq!(second.expiry.life, first.expiry.life);
+    assert_eq!(second.expiry.arm, first.expiry.arm);
+    assert_eq!(second.expiry.ordinal, first.expiry.ordinal + 1);
+    assert_eq!(fixture.now(), before + LogicalTime::from_nanos(11) + charge);
+    let scheduler = fixture.state.sched.lock().unwrap();
+    assert_eq!(scheduler.committed_time, fixture.now());
+    assert_eq!(
+        scheduler.turn, before_turn,
+        "publication is not another COMMIT"
+    );
+    assert!(scheduler.blocked.timed_waiters.next_deadline().is_none());
+}
+
+#[tokio::test]
+async fn newer_caught_dequeue_time_expires_adjacent_timer_before_the_next_grant() {
+    newer_dequeue_clock_reaches_next_deadline(true).await;
+}
+
+#[tokio::test]
+async fn newer_signalfd_dequeue_time_expires_adjacent_timer_before_the_next_grant() {
+    newer_dequeue_clock_reaches_next_deadline(false).await;
+}

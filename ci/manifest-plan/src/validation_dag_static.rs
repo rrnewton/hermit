@@ -206,7 +206,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests to regular crates and nine to Hermit's library/binary selection.
     ("test.regular_crates", 533),
     ("test.hermit_unit", 707),
-    ("test.detcore_unit", 704),
+    ("test.detcore_unit", 738),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     ("test.hermit_integration", 158),
@@ -232,7 +232,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 704),
+    ("test.detcore_unit_on_host", 738),
     ("test.hermit_integration_on_host", 158),
     ("test.hermit_unit_on_host", 707),
     ("test.ignored_syscall_regressions_on_host", 4),

@@ -354,8 +354,12 @@ fi
 # failed enclosing Cargo check, and conservative 1050 effective-job-second
 # threshold with a 16-job clamp. The single local sample does not replace
 # the original hosted calibration.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 99d1e4827cce2404442d7c27ab447886a5839326 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 99d1e4827cce2404442d7c27ab447886a5839326 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# BOUND TO 000c15a1 (2026-09-18): reverie-dbt/build.rs and the DynamoRIO
+# gitlink remain identical to the 99d1e482 source below (recipe b0247764df7f).
+# Preserve the measured sample identity and conservative 1050/16 budget; the
+# intervening KVM signal and scalar-write changes provide no new SDK timing.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 000c15a1161ea2d58749431b5ddaaa97f7aa37d5 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 000c15a1161ea2d58749431b5ddaaa97f7aa37d5 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
