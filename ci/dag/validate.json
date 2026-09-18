@@ -58,7 +58,7 @@
         "quick",
         "super"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; with-proxy ./ci/run-reverie-pin-check.sh --repo \"$PWD\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; pin_check=(./ci/run-reverie-pin-check.sh --repo \"$PWD\"); if command -v with-proxy >/dev/null 2>&1; then with-proxy \"${pin_check[@]}\"; else \"${pin_check[@]}\"; fi",
       "result_manifests": [],
       "deps": [
         "pre.submodules"
@@ -20939,7 +20939,7 @@
       "labels": [
         "hosted-privileged"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; with-proxy ./ci/run-reverie-pin-check.sh --repo \"$PWD\"",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; pin_check=(./ci/run-reverie-pin-check.sh --repo \"$PWD\"); if command -v with-proxy >/dev/null 2>&1; then with-proxy \"${pin_check[@]}\"; else \"${pin_check[@]}\"; fi",
       "result_manifests": [],
       "deps": [],
       "env": {},
