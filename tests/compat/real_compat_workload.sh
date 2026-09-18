@@ -379,12 +379,16 @@ EOF
         # Coreutils df reads /proc/self/mountinfo before statfs(2). Feed that
         # read from the immutable fixture through an inherited descriptor so
         # Hermit's per-attempt private mount roots cannot contaminate the
-        # strict comparison. The redirect marker proves the fixture was used.
+        # strict comparison. The stable run-owned redirect marker lives beside
+        # the fixture instead of in /tmp: Hermit's child filesystem writes are
+        # visible there, while the hosted wrapper can retain its deterministic
+        # private /tmp inode baseline for the other strict workloads.
+        : >"$FIXTURE_ROOT/df/redirected"
         output=$(HERMIT_LSOF_MOUNTS_FD=0 \
-            HERMIT_LSOF_REDIRECT_MARKER="$WORK_DIR/df.redirected" \
+            HERMIT_LSOF_REDIRECT_MARKER="$FIXTURE_ROOT/df/redirected" \
             LD_PRELOAD="$FIXTURE_ROOT/lsof/libmount_redirect.so" \
             /usr/bin/df -P / <"$FIXTURE_ROOT/df/mountinfo")
-        [[ $(cat "$WORK_DIR/df.redirected") == fixed-mount-fd ]]
+        [[ $(cat "$FIXTURE_ROOT/df/redirected") == fixed-mount-fd ]]
         printf '%s\n' "$output"
         ;;
     rustc)
