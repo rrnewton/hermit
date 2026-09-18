@@ -190,7 +190,7 @@ const INTEGRATION_ARTIFACT_WRAPPER: &str =
 /// placeholder tag. The committed DAG contains the real `compat.*` population;
 /// this name is never a node and never triggers runtime graph generation.
 const STRICT_COMPAT_SELECTION_ALIAS: &str = "test.strict_compat";
-const NEXTEST_PORTABLE_PREPARE_COMMAND: &str = "./ci/nextest-binaries.rs prepare portable";
+const NEXTEST_WORKSPACE_PREPARE_COMMAND: &str = "./ci/nextest-binaries.rs prepare full";
 const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str = "./ci/nextest-binaries.rs assert privileged";
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1"#;
 
@@ -329,7 +329,7 @@ fn prepared_nextest_commands_bracket(workspace: &Step, privileged: &Step) -> Res
         || !privileged_command.contains(NEXTEST_PRIVILEGED_ASSERT_COMMAND)
         || !privileged_command.contains(TESTS_MISC_EXECUTABLE_READ_COMMAND)
         || privileged_command.contains("cargo ")
-        || !workspace_command.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND)
+        || !workspace_command.ends_with(NEXTEST_WORKSPACE_PREPARE_COMMAND)
     {
         return Err("full-plan bracket: prepared Nextest population must come from the workspace producer and the privileged barrier must verify it without Cargo compilation".into());
     }
@@ -3595,10 +3595,10 @@ cleared-caps refusal names {} starved step(s)",
             .ok_or("full-plan bracket: privileged focused build disappeared")?;
         privileged_artifact_barriers(privileged_build)?;
         prepared_nextest_commands_bracket(portable_build, privileged_build)?;
-        let prepared = hermit_manifest_plan::nextest_binaries::profile_selections(&root, "portable")?;
+        let prepared = hermit_manifest_plan::nextest_binaries::profile_selections(&root, "full")?;
         for required in hermit_manifest_plan::nextest_binaries::profile_selections(&root, "privileged")?.keys() {
             if !prepared.contains_key(required) {
-                return Err(format!("full-plan bracket: portable preparation omits privileged Cargo selection {required}"));
+                return Err(format!("full-plan bracket: full preparation omits privileged Cargo selection {required}"));
             }
         }
         if ["test.cli", "test.hermit_modes"]
@@ -13587,7 +13587,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .ok_or("retry bounds: privileged lane is absent")?;
     for (tag, expected) in [
         ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
-        ("privileged-only-test.cli_kvm", 24usize),
+        ("privileged-only-test.cli_kvm", 25usize),
     ] {
         let step = privileged
             .steps
@@ -22738,8 +22738,9 @@ mod fused_privileged_build_tests {
         let repository = Path::new(file!()).parent().and_then(Path::parent).unwrap();
         let committed = validate_plan::validation_config(repository).unwrap();
         let workspace = committed.steps.iter().find(|step| step.tag() == "build.workspace").unwrap();
-        assert!(workspace.cmd.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND));
-        let preparation = &workspace.cmd[workspace.cmd.len() - NEXTEST_PORTABLE_PREPARE_COMMAND.len()..];
+        assert!(workspace.cmd.ends_with(NEXTEST_WORKSPACE_PREPARE_COMMAND));
+        let preparation =
+            &workspace.cmd[workspace.cmd.len() - NEXTEST_WORKSPACE_PREPARE_COMMAND.len()..];
         let mut consumer = committed.steps.iter().find(|step| step.tag() == "privileged-build.privileged_tests").unwrap().clone();
         // This fixture supplies a fake Cargo executable and an empty target.
         // Preserve its full cold/prepared contract against the exact authored
@@ -23361,8 +23362,8 @@ mod prepared_command_tests {
         let payload = guarded_command_source(&pinned.tag(), &pinned.cmd).unwrap();
         let changed = outer_decoy(
             pinned,
-            &payload.replacen(NEXTEST_PORTABLE_PREPARE_COMMAND, "missing-preparation", 1),
-            NEXTEST_PORTABLE_PREPARE_COMMAND,
+            &payload.replacen(NEXTEST_WORKSPACE_PREPARE_COMMAND, "missing-preparation", 1),
+            NEXTEST_WORKSPACE_PREPARE_COMMAND,
         );
         assert!(prepared_nextest_commands_bracket(&changed, barrier).is_err());
 
