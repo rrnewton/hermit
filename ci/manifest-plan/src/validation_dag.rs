@@ -1480,6 +1480,17 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
             .find(|step| step.tag() == tag)
             .ok_or_else(|| format!("committed DAG lost {tag}"))
     };
+    for tag in ["build.workspace", "build.runtime_release"] {
+        let producer = step(tag)?;
+        if producer.hint.preferred_inner_jobs != Some(32)
+            || producer.jobs_env.as_deref() != Some("CARGO_BUILD_JOBS")
+            || producer.jobs_flag.as_deref() != Some("")
+        {
+            return Err(format!(
+                "{tag} must expose CARGO_BUILD_JOBS so a smaller admitted CPU cap can lower its 32-worker preference"
+            ));
+        }
+    }
     for tag in crate::validation_dag_static::PMU_MEMORY_FAILURE_FAMILY_MEMBERS {
         if step(tag)?.fail_fast_family.as_deref()
             != Some(crate::validation_dag_static::PMU_MEMORY_FAILURE_FAMILY)

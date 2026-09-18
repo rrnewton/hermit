@@ -747,7 +747,7 @@
       "timeout": 1200,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 130.0,
@@ -782,7 +782,7 @@
       "timeout": 1200,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 185.0,
@@ -69151,7 +69151,7 @@
       "timeout": 1200,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 130.0,
@@ -69188,7 +69188,7 @@
       "timeout": 1200,
       "cpu_timeout": 7200,
       "jobs_flag": "",
-      "jobs_env": null,
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 185.0,
