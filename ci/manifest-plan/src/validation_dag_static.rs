@@ -202,9 +202,10 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.isolated_dbt_workdir", 2),
     ("test.isolated_detcore_workdir", 1),
-    // Five function-isolation controls and one wrapper argument control add
-    // six tests to the regular-crate population of 523 on main.
-    ("test.regular_crates", 529),
+    // Five function-isolation controls, one wrapper argument control, and the
+    // hosted pin-gate transport control add seven tests to the base population
+    // of 523.
+    ("test.regular_crates", 530),
     ("test.hermit_unit", 698),
     ("test.detcore_unit", 704),
     ("test.detcore_misc", 27),
@@ -238,7 +239,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 529),
+    ("test.regular_crates_on_host", 530),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
