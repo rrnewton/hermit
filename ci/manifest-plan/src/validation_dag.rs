@@ -661,6 +661,98 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn materialize_hosted_completion_budgets(cfg: &mut DagConfig) -> Result<(), String> {
+    let step = cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == "e2e.manifest_backend_parity_c_on_host")
+        .ok_or("hosted backend-parity node is absent")?;
+    if step.timeout != 600 {
+        return Err(format!(
+            "hosted backend-parity budget expected the inherited 600s bound, got {}s",
+            step.timeout
+        ));
+    }
+    // Run 35335623037 used all 600 seconds on this 276-cell bucket: 94
+    // classified product failures legitimately consumed their one retained
+    // retry, and the timeout cut the final identities before their result
+    // stream could be published. This 20% measured headroom is specific to the
+    // hosted variant. It does not make a product verdict pass; the workflow
+    // still records every FAIL/ERROR while requiring all 276 identities.
+    step.timeout = 720;
+    step.description = "Hosted backend-parity-c contains 276 selected cells. Run 35335623037 reached the inherited 600-second boundary after 94 classified product retries and before it could publish the complete identity set. The hosted variant therefore carries 720 seconds of measured completion headroom; product FAIL/ERROR rows remain non-gating only in the supplemental portable workflow, while missing identities and other evidence failures remain blocking.".into();
+    Ok(())
+}
+
+/// Keep host capability differences explicit without narrowing canonical local
+/// validation. These exact cases need PMU/CPUID facilities or stable LiteInst
+/// read-chunk boundaries that GitHub's hosted runner does not provide. The
+/// supplemental lane records the difference in its committed command and
+/// description; local validate continues to execute every case.
+fn materialize_hosted_capability_exclusions(cfg: &mut DagConfig) -> Result<(), String> {
+    const EXCLUSIONS: &[(&str, u64, &[&str], &str)] = &[
+        (
+            "test.cli_on_host",
+            73,
+            &[
+                "namespace_only_applies_a_fresh_private_tmpfs_workdir",
+                "namespace_only_applies_minimal_and_explicit_environment",
+                "namespace_only_preserves_default_host_environment",
+                "namespace_only_propagates_guest_exit_status",
+                "skid_overshoot_and_guest_failure_have_different_exit_codes",
+            ],
+            "GitHub-hosted runners expose no usable PMU. Four namespace-only assertions otherwise receive the explicit PMU fallback warning on stderr, and the skid-injection assertion cannot create its required overshoot. These five exact tests remain blocking in canonical local validate.",
+        ),
+        (
+            "test.hermit_integration_on_host",
+            153,
+            &[
+                "chroot_mountinfo_subset_keeps_fdinfo_identity_consistent",
+                "private_evidence_does_not_reuse_the_public_log_file_or_add_a_worker",
+                "sidecar_does_not_replace_or_reopen_guest_standard_descriptors",
+                "sidecar_preserves_session_and_process_group_identity",
+                "sidecar_preserves_stdout_stderr_status_and_reports_nonzero_info",
+            ],
+            "GitHub-hosted runners expose neither a usable PMU nor the local host's CPUID-faulting behavior. The nested chroot case requires PMU support, while four byte-for-byte evidence comparisons otherwise include the hosted fallback diagnostics. These five exact tests remain blocking in canonical local validate.",
+        ),
+        (
+            "test.liteinst_strict_on_host",
+            23,
+            &["liteinst_strict_verify_shell_and_entropy_consumer"],
+            "Run 35347497730 reproduced matching deterministic stdout but different LiteInst read-buffer chunk hashes on the GitHub-hosted kernel. This exact strict entropy-consumer case remains blocking in canonical local validate; the other 23 LiteInst strict cases remain blocking here.",
+        ),
+    ];
+
+    for (tag, expected_count, tests, reason) in EXCLUSIONS {
+        let step = cfg
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == *tag)
+            .ok_or_else(|| format!("hosted capability-exclusion node {tag} is absent"))?;
+        for test in *tests {
+            if step.cmd.contains(test) {
+                return Err(format!("{tag} already contains hosted exclusion {test}"));
+            }
+        }
+        // cli_on_host already has the Nextest/libtest separator for its local
+        // product skips. The other two commands may contain an unrelated `--`
+        // in an outer helper, so do not infer this boundary from raw text.
+        if *tag != "test.cli_on_host" {
+            step.cmd.push_str(" --");
+        }
+        for test in *tests {
+            step.cmd.push_str(" --skip ");
+            step.cmd.push_str(test);
+        }
+        step.env.insert(
+            "NEXTEST_EXPECTED_EXECUTED".into(),
+            expected_count.to_string(),
+        );
+        step.description = format!("HOSTED CAPABILITY DIFFERENCE: {reason}");
+    }
+    Ok(())
+}
+
 /// Materialize the pinned-root execution split as ordinary committed nodes.
 ///
 /// This transform belongs to maintenance-time generation. Runtime validation
@@ -1983,6 +2075,8 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     let mut refreshed = refresh_generated_partitions(static_source, generated)?;
     materialize_hosted_portable_selection(&mut refreshed);
     materialize_hosted_test_variants(&mut refreshed)?;
+    materialize_hosted_completion_budgets(&mut refreshed)?;
+    materialize_hosted_capability_exclusions(&mut refreshed)?;
     materialize_pinned_root(&mut refreshed)?;
     materialize_focused_preflight(&mut refreshed)?;
     materialize_quick_super_budgets(&mut refreshed);
@@ -2611,6 +2705,10 @@ sys.exit(37)
             assert_eq!(selector.backend, None);
             assert_eq!(step.hint.resources.get("manifest_guest"), Some(&8));
             assert!(!step.cmd.contains("--probe-disabled"));
+            if step.tag() == "e2e.manifest_backend_parity_c_on_host" {
+                assert_eq!(step.timeout, 720);
+                assert!(step.description.contains("276 selected cells"));
+            }
         }
     }
 
@@ -2767,6 +2865,71 @@ sys.exit(37)
             error.contains("hosted-portable label has 250 direct steps"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn hosted_capability_exclusions_are_exact_and_leave_local_validation_intact() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        for (hosted_tag, local_tag, expected_count, excluded) in [
+            (
+                "test.cli_on_host",
+                "test.cli",
+                "73",
+                &[
+                    "namespace_only_applies_a_fresh_private_tmpfs_workdir",
+                    "namespace_only_applies_minimal_and_explicit_environment",
+                    "namespace_only_preserves_default_host_environment",
+                    "namespace_only_propagates_guest_exit_status",
+                    "skid_overshoot_and_guest_failure_have_different_exit_codes",
+                ][..],
+            ),
+            (
+                "test.hermit_integration_on_host",
+                "test.hermit_integration",
+                "153",
+                &[
+                    "chroot_mountinfo_subset_keeps_fdinfo_identity_consistent",
+                    "private_evidence_does_not_reuse_the_public_log_file_or_add_a_worker",
+                    "sidecar_does_not_replace_or_reopen_guest_standard_descriptors",
+                    "sidecar_preserves_session_and_process_group_identity",
+                    "sidecar_preserves_stdout_stderr_status_and_reports_nonzero_info",
+                ][..],
+            ),
+            (
+                "test.liteinst_strict_on_host",
+                "test.liteinst_strict",
+                "23",
+                &["liteinst_strict_verify_shell_and_entropy_consumer"][..],
+            ),
+        ] {
+            let hosted = committed
+                .steps
+                .iter()
+                .find(|step| step.tag() == hosted_tag)
+                .unwrap();
+            let local = committed
+                .steps
+                .iter()
+                .find(|step| step.tag() == local_tag)
+                .unwrap();
+            assert_eq!(
+                hosted
+                    .env
+                    .get("NEXTEST_EXPECTED_EXECUTED")
+                    .map(String::as_str),
+                Some(expected_count)
+            );
+            assert!(
+                hosted
+                    .description
+                    .starts_with("HOSTED CAPABILITY DIFFERENCE:"),
+                "{hosted_tag} omits its divergence description"
+            );
+            for test in excluded {
+                assert_eq!(hosted.cmd.matches(test).count(), 1, "{hosted_tag}: {test}");
+                assert!(!local.cmd.contains(test), "{local_tag} excluded {test}");
+            }
+        }
     }
 
     #[test]
