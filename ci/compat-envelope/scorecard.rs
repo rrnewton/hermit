@@ -11491,6 +11491,11 @@ red/`measured-and-passed` count is **0**.",
     let provenance_enabled = BTreeSet::from([id.clone()]);
     let provenance_fold = |mut row: ResultRow, sha: &str, source_sha: Option<&str>, reports| {
         row.hermit_sha = sha.into();
+        row.attempts[0]["index"] = "1".into();
+        row.attempts[0]["outcome"] = row.outcome.clone().into();
+        row.attempts[0]["status"] = serde_json::json!(if row.outcome == "PASS" { 0 } else { 1 });
+        row.attempts[0]["signal"] = JsonValue::Null;
+        row.attempts[0]["timed_out"] = false.into();
         let rows = BTreeMap::from([(id.clone(), vec![parity_candidate(row)?])]);
         let mut tracked = TrackedCells {
             schema: SCHEMA,
