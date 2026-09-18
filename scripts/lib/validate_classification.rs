@@ -941,11 +941,15 @@ mod tests {
                 );
             } else if name == "refused" {
                 let refusal = outcome.test_results_error.as_deref().unwrap();
+                let expected =
+                    ": structured-test-results-results has 0 terminal row(s), expected exactly 1 executed test(s)";
+                let expected_with_output = format!(
+                    "{expected}; last output: {}",
+                    diagnostic.replace('\n', " | ")
+                );
                 assert!(
                     refusal.starts_with("malformed structured test results ")
-                        && refusal.ends_with(
-                            ": structured-test-results-results has 0 terminal row(s), expected exactly 1 executed test(s)"
-                        ),
+                        && refusal.ends_with(&expected_with_output),
                     "{refusal}"
                 );
                 assert_eq!(outcome.reason, "exit 1");
