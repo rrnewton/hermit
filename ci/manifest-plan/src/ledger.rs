@@ -18,6 +18,9 @@ use crate::runner::FailureClass;
 mod schema10;
 pub use schema10::*;
 
+mod admission;
+pub use admission::*;
+
 /// The stable fields emitted by `validate/aggregate.py --json` and JSONL stores.
 /// Optional fields reflect honest reconstructed rows where a measurement was not
 /// available; unrecognized fields are retained for forward compatibility.
@@ -152,7 +155,7 @@ pub struct HistoryRow {
     /// order followed by this `BTreeMap`'s key order. Moving `tree` into an
     /// ordinary struct field would change existing receipt digests without
     /// changing their meaning.
-    #[serde(flatten)]
+    #[serde(flatten, deserialize_with = "admission::deserialize_extensions")]
     pub extra: BTreeMap<String, Value>,
 }
 
@@ -293,8 +296,15 @@ impl HistoryRow {
 /// This is the per-node replacement for the blunt aggregate `filtered_tests == 0`
 /// predicate, which could not distinguish a full run's legitimate cross-shard
 /// filtering (~693 tests) from a narrowed-subset masquerade.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct CoverageRow {
+    /// Decode-only identity retained for admission row binding. Historical
+    /// receipt serialization intentionally omitted this newer extension;
+    /// keeping it out of serialization preserves those exact canonical bytes.
+    /// Duplicate occurrences are retained as a non-string array so admission
+    /// validation refuses them, while historical rows remain readable.
+    #[serde(skip_serializing)]
+    pub admission_run_id: Option<Value>,
     /// Test-bearing DAG nodes the run PLANNED (manifest `test.*` steps for the
     /// lanes actually run). `0` = the producer could not determine a planned set;
     /// never treated as a satisfied obligation.
