@@ -710,6 +710,59 @@ struct LastTested {
     /// keyspaces and a bare number would be read against the wrong one.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     depth: BTreeMap<String, SourceDepth>,
+    /// WHICH CHECK produced this result, alongside WHEN it was produced.
+    ///
+    /// ⚠️ THIS EXISTS BECAUSE `hermit_sha` ANSWERS THE WRONG QUESTION. Measured
+    /// 2026-09-17: five `backend-parity-c` cells read green at shas that
+    /// PREDATE the backend-parity mechanism, one by five hours on the same
+    /// calendar day. Comparing today's red against that green says "regression"
+    /// when the truth is "this check has never run here" -- a BAR RAISE. The
+    /// consequence is not a wrong number, it is a wrong investigation: the next
+    /// lane bisects a ~99 commit window for a commit that does not exist.
+    ///
+    /// ⚠️ `None` MEANS THE ROW CANNOT SAY, AND MUST BE REPORTED THAT WAY.
+    /// It is never inferred, and specifically never inferred from a date --
+    /// dates are the thing already shown to be actively misleading here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    check: Option<CheckIdentity>,
+    /// Whether the cell was ENABLED when this stamp was written. A green from a
+    /// period when the cell was disabled is not a baseline, and `enabled` today
+    /// does not say what was true then. `None` means unrecorded, not `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enabled_when_tested: Option<bool>,
+}
+
+/// The identity of the check that produced a result.
+///
+/// Recorded from what the producer actually applied, never reconstructed. Two
+/// results are comparable only when their identities match; when they differ,
+/// the newer failure is a bar raise rather than a regression.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct CheckIdentity {
+    /// The comparison policy's own name, e.g. `BitwiseInfoV1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comparison: Option<String>,
+    /// The reference backend of a cross-backend parity comparison, e.g.
+    /// `ptrace`. Present EXACTLY when parity was applied, so `None` here is the
+    /// discriminator that catches the case this type exists for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parity_reference: Option<String>,
+}
+
+impl CheckIdentity {
+    /// Whether two identities describe the same check. Deliberately exact: a
+    /// near-match is the failure mode being prevented.
+    fn matches(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    fn describe(&self) -> String {
+        let comparison = self.comparison.as_deref().unwrap_or("unnamed comparison");
+        match &self.parity_reference {
+            Some(reference) => format!("{comparison} with parity against {reference}"),
+            None => format!("{comparison} without a parity comparison"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4773,6 +4826,11 @@ fn apply_pressure_summary(
             hermit_sha: summary.hermit_sha.clone(),
             detcore_tree: summary.detcore_tree.clone(),
             depth: depth.clone(),
+            // A pressure summary does not carry the comparison identity, so
+            // this says so rather than guessing. The cell's enabled state IS
+            // known here, because this writer is stamping it now.
+            check: None,
+            enabled_when_tested: Some(tracked.cells[index].enabled),
         });
         let observations = &mut tracked.cells[index].observations;
         // Keyed by tree AND provenance. Keying by tree alone would let a
@@ -5083,6 +5141,18 @@ fn apply_validate_results_from(
                 hermit_sha: hermit_sha.to_string(),
                 detcore_tree: detcore_tree.to_string(),
                 depth: depth.clone(),
+                // The one writer that KNOWS which check ran, because the
+                // evidence it just folded says so. `parity_reference` is
+                // Some exactly when a cross-backend comparison was applied,
+                // which is the discriminator a later reader needs to tell a
+                // regression from a bar raise.
+                check: Some(CheckIdentity {
+                    comparison: None,
+                    parity_reference: backend_parity
+                        .as_ref()
+                        .map(|report| report.reference.backend.clone()),
+                }),
+                enabled_when_tested: Some(updated.cells[index].enabled),
             });
             if result == Some(ObservedResult::Pass) && !located_nothing {
                 return Err(format!(
@@ -5695,17 +5765,43 @@ fn import_results(
         tracked.cells.len(),
         after_counts
     );
+    // ⚠️ THIS LOOP USED TO PRINT A BARE SHA NEXT TO A green -> red TRANSITION.
+    // A reader takes that sha as the last-good baseline and bisects it. Measured
+    // 2026-09-17: for five backend-parity cells that sha named a revision from
+    // BEFORE the parity comparison existed, so there was no breaking commit to
+    // find, and for a sixth it named a rebased-away revision that is not
+    // reachable from HEAD at all. Both look like ordinary shas. So the
+    // transition is now reported through a resolver that REFUSES, and says why.
+    let resolution_head = git_head(root)?;
     for (old, new) in changed {
-        println!(
-            "  {}: {} -> {} at {}",
-            display_id(&new.id),
-            old.measurement.as_str(),
-            new.measurement.as_str(),
-            new.last_tested
-                .as_ref()
-                .map(|last| last.hermit_sha.as_str())
-                .unwrap_or("no recorded SHA")
-        );
+        let current_check = new
+            .last_tested
+            .as_ref()
+            .and_then(|last| last.check.clone())
+            .unwrap_or_default();
+        let resolution = resolve_last_tested_baseline(
+            root,
+            old.last_tested.as_ref(),
+            &current_check,
+            &resolution_head,
+        )?;
+        match &resolution {
+            BaselineResolution::Regression { baseline_sha } => println!(
+                "  {}: {} -> {} — REGRESSION since {baseline_sha}",
+                display_id(&new.id),
+                old.measurement.as_str(),
+                new.measurement.as_str(),
+            ),
+            BaselineResolution::Refused { reason } => {
+                println!(
+                    "  {}: {} -> {} — NO USABLE BASELINE",
+                    display_id(&new.id),
+                    old.measurement.as_str(),
+                    new.measurement.as_str(),
+                );
+                println!("      {reason}");
+            }
+        }
     }
     Ok(())
 }
@@ -5723,6 +5819,89 @@ fn git_is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool
             "git merge-base could not compare Hermit revisions {ancestor} and {descendant} (exit {code:?})"
         )),
     }
+}
+
+/// Whether a recorded green may be used as a baseline for today's failure.
+///
+/// ⚠️ THE POINT OF THIS TYPE IS THAT `Refused` IS A FIRST-CLASS ANSWER.
+/// Returning a sha that cannot serve as a baseline is worse than returning
+/// nothing, because the caller spends real time bisecting against it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BaselineResolution {
+    /// The recorded green was produced by the same check, with the cell
+    /// enabled, at a revision reachable from HEAD. A genuine REGRESSION window.
+    Regression { baseline_sha: String },
+    /// The recorded green exists but cannot bound today's failure. Carries the
+    /// reason so the caller reports it instead of guessing.
+    Refused { reason: String },
+}
+
+/// Decide whether `last_tested` bounds a current failure, or refuses to.
+///
+/// Four ways a recorded green fails to be a baseline, and every one of them was
+/// observed on 2026-09-17:
+///
+/// 1. **No stamp at all.** Absence means no writer recorded one.
+/// 2. **The row cannot say which check was in force.** Historical rows predate
+///    [`CheckIdentity`]. They are reported as unknown and NEVER backfilled by
+///    inference -- reconstructing the identity from a date would reproduce the
+///    exact defect this function exists to remove.
+/// 3. **A different check was in force.** This is a BAR RAISE, not a
+///    regression: the cell has never passed the check now failing it.
+/// 4. **The sha is not reachable from HEAD.** A rebased-away revision is not a
+///    baseline; it points at history that no longer exists.
+///
+/// The cell's enabled state at stamp time gates all of it, because a green
+/// recorded while the cell was disabled bounds nothing.
+fn resolve_last_tested_baseline(
+    root: &Path,
+    last_tested: Option<&LastTested>,
+    current_check: &CheckIdentity,
+    head: &str,
+) -> Result<BaselineResolution, String> {
+    let Some(last) = last_tested else {
+        return Ok(BaselineResolution::Refused {
+            reason: "no writer recorded a last_tested stamp for this cell".into(),
+        });
+    };
+    let Some(recorded_check) = &last.check else {
+        return Ok(BaselineResolution::Refused {
+            reason: format!(
+                "the green at {} does not record WHICH CHECK was in force, so it cannot be                  compared with today's {}; not inferred, because a date cannot establish it",
+                last.hermit_sha,
+                current_check.describe()
+            ),
+        });
+    };
+    if !recorded_check.matches(current_check) {
+        return Ok(BaselineResolution::Refused {
+            reason: format!(
+                "BAR RAISE, not a regression: the green at {} was produced by {}, but today's                  failure comes from {}. This cell has never passed the check now failing it, so                  there is no commit that broke it",
+                last.hermit_sha,
+                recorded_check.describe(),
+                current_check.describe()
+            ),
+        });
+    }
+    if last.enabled_when_tested == Some(false) {
+        return Ok(BaselineResolution::Refused {
+            reason: format!(
+                "the green at {} was recorded while the cell was DISABLED, so it bounds nothing",
+                last.hermit_sha
+            ),
+        });
+    }
+    if !git_is_ancestor(root, &last.hermit_sha, head)? {
+        return Ok(BaselineResolution::Refused {
+            reason: format!(
+                "the recorded baseline {} is NOT REACHABLE from HEAD {head}; it points at history                  that no longer exists, most likely rebased away, and cannot bound a bisect",
+                last.hermit_sha
+            ),
+        });
+    }
+    Ok(BaselineResolution::Regression {
+        baseline_sha: last.hermit_sha.clone(),
+    })
 }
 
 fn update_observations(
@@ -7412,6 +7591,12 @@ fn apply_series_rows_inner(
                 hermit_sha: row.hermit_sha.clone(),
                 detcore_tree: detcore_tree.to_string(),
                 depth: row.depth.clone(),
+                // Projected from historical series rows. Neither the check
+                // identity nor the enabled state AT THAT TIME survives in the
+                // row, and today's enabled flag is not evidence about then, so
+                // both stay unrecorded. This is the case the type exists for.
+                check: None,
+                enabled_when_tested: None,
             });
         }
     }
@@ -9823,6 +10008,8 @@ fn self_test() -> Result<(), String> {
     let current_last_tested = LastTested {
         hermit_sha: "current-sha".into(),
         detcore_tree: "current-tree".into(),
+        check: None,
+        enabled_when_tested: None,
         depth: BTreeMap::from([(
             "hermit".into(),
             SourceDepth {
@@ -18268,6 +18455,8 @@ red/`measured-and-passed` count is **0**.",
     let current_last_tested = LastTested {
         hermit_sha: fixture_hermit_tree.clone(),
         detcore_tree: fixture_detcore_tree.clone(),
+        check: None,
+        enabled_when_tested: None,
         depth: BTreeMap::from([(
             "hermit".into(),
             SourceDepth {
@@ -19750,4 +19939,197 @@ red/`measured-and-passed` count is **0**.",
         "compatibility scorecard self-test: retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, disabled-parity-front-doors, empty-result command, source-identity, writer-boundary, projection, projection-schema, object-store-independence, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
     );
     Ok(())
+}
+
+/// Tests for baseline resolution.
+///
+/// ⚠️ THE POSITIVE CONTROL IS LOAD-BEARING. Three of these assert a REFUSAL, and
+/// a resolver that refuses everything would pass all three while being useless.
+/// `a_matching_check_at_a_reachable_revision_is_a_regression` is what makes the
+/// refusals mean something.
+#[cfg(test)]
+mod baseline_resolution_tests {
+    use super::*;
+
+    fn identity(comparison: &str, parity: Option<&str>) -> CheckIdentity {
+        CheckIdentity {
+            comparison: Some(comparison.to_string()),
+            parity_reference: parity.map(str::to_string),
+        }
+    }
+
+    fn stamp(sha: &str, check: Option<CheckIdentity>) -> LastTested {
+        LastTested {
+            hermit_sha: sha.to_string(),
+            detcore_tree: "tree".into(),
+            depth: BTreeMap::new(),
+            check,
+            enabled_when_tested: Some(true),
+        }
+    }
+
+    /// A repository with two commits on `main` and one on an abandoned branch,
+    /// so a non-ancestor revision is a real object rather than a bad sha. That
+    /// distinction matters: the failure being prevented is a revision that
+    /// resolves perfectly and still cannot bound a bisect.
+    fn repository() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        fs::write(root.join("a"), "1").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "first"]);
+        let reachable = git(&["rev-parse", "HEAD"]);
+        // An abandoned line of development: committed, then left behind. This
+        // is what a rebased-away `last_tested` sha looks like on disk.
+        git(&["checkout", "-q", "-b", "abandoned"]);
+        fs::write(root.join("b"), "2").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "abandoned work"]);
+        let orphan = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "main"]);
+        fs::write(root.join("c"), "3").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "second"]);
+        (dir, reachable, orphan)
+    }
+
+    #[test]
+    fn a_matching_check_at_a_reachable_revision_is_a_regression() {
+        let (dir, reachable, _) = repository();
+        let head = "main";
+        let check = identity("BitwiseInfoV1", None);
+        let resolved = resolve_last_tested_baseline(
+            dir.path(),
+            Some(&stamp(&reachable, Some(check.clone()))),
+            &check,
+            head,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved,
+            BaselineResolution::Regression { baseline_sha: reachable.clone() },
+            "same check, cell enabled, revision reachable: this IS a regression and must resolve"
+        );
+        // The enum is the protection: a caller cannot reach a sha without
+        // having matched the Regression arm, so a refusal cannot be unwrapped
+        // into a revision by accident.
+        let BaselineResolution::Regression { baseline_sha } = &resolved else {
+            unreachable!()
+        };
+        assert_eq!(baseline_sha, &reachable);
+    }
+
+    /// The 2026-09-17 case: five backend-parity cells read green at revisions
+    /// that predate the parity mechanism by as little as five hours.
+    #[test]
+    fn a_green_predating_a_stricter_check_is_a_bar_raise_not_a_regression() {
+        let (dir, reachable, _) = repository();
+        // Green recorded before parity existed: no parity reference.
+        let recorded = identity("BitwiseInfoV1", None);
+        // Today's failure comes from the cross-backend parity comparison.
+        let today = identity("BitwiseInfoV1", Some("ptrace"));
+        let resolved = resolve_last_tested_baseline(
+            dir.path(),
+            Some(&stamp(&reachable, Some(recorded))),
+            &today,
+            "main",
+        )
+        .unwrap();
+        let BaselineResolution::Refused { reason } = &resolved else {
+            panic!("a green produced by a different check must not bound today's failure: {resolved:?}");
+        };
+        assert!(reason.contains("BAR RAISE"), "{reason}");
+        assert!(
+            reason.contains("never passed the check now failing it"),
+            "the refusal must say why there is nothing to bisect: {reason}"
+        );
+        assert!(
+            !matches!(resolved, BaselineResolution::Regression { .. }),
+            "a bar raise must not hand back a revision; that is what sends a lane bisecting"
+        );
+    }
+
+    #[test]
+    fn a_baseline_that_is_not_reachable_from_head_is_refused() {
+        let (dir, _, orphan) = repository();
+        let check = identity("BitwiseInfoV1", None);
+        let resolved = resolve_last_tested_baseline(
+            dir.path(),
+            Some(&stamp(&orphan, Some(check.clone()))),
+            &check,
+            "main",
+        )
+        .unwrap();
+        let BaselineResolution::Refused { reason } = &resolved else {
+            panic!("an unreachable revision must be refused, not returned: {resolved:?}");
+        };
+        assert!(reason.contains("NOT REACHABLE"), "{reason}");
+        // The revision is a real, resolvable object. Being resolvable is
+        // exactly why returning it would be believed.
+        let exists = Command::new("git")
+            .args(["cat-file", "-e", &format!("{orphan}^{{commit}}")])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(exists.success(), "the fixture's orphan revision must really exist");
+    }
+
+    #[test]
+    fn a_row_that_cannot_say_which_check_ran_is_refused_rather_than_inferred() {
+        let (dir, reachable, _) = repository();
+        let resolved = resolve_last_tested_baseline(
+            dir.path(),
+            Some(&stamp(&reachable, None)),
+            &identity("BitwiseInfoV1", Some("ptrace")),
+            "main",
+        )
+        .unwrap();
+        let BaselineResolution::Refused { reason } = &resolved else {
+            panic!("a historical row cannot be assumed comparable: {resolved:?}");
+        };
+        assert!(reason.contains("does not record WHICH CHECK"), "{reason}");
+        assert!(
+            reason.contains("not inferred"),
+            "the refusal must state that the identity was not reconstructed: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_green_recorded_while_the_cell_was_disabled_bounds_nothing() {
+        let (dir, reachable, _) = repository();
+        let check = identity("BitwiseInfoV1", None);
+        let mut last = stamp(&reachable, Some(check.clone()));
+        last.enabled_when_tested = Some(false);
+        let resolved =
+            resolve_last_tested_baseline(dir.path(), Some(&last), &check, "main").unwrap();
+        assert!(matches!(resolved, BaselineResolution::Refused { .. }), "{resolved:?}");
+    }
+
+    #[test]
+    fn an_absent_stamp_is_refused_and_says_no_writer_recorded_one() {
+        let (dir, _, _) = repository();
+        let resolved = resolve_last_tested_baseline(
+            dir.path(),
+            None,
+            &identity("BitwiseInfoV1", None),
+            "main",
+        )
+        .unwrap();
+        let BaselineResolution::Refused { reason } = &resolved else {
+            panic!("absence is not a baseline: {resolved:?}");
+        };
+        assert!(reason.contains("no writer recorded"), "{reason}");
+    }
 }
