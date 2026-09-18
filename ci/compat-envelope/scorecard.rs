@@ -21108,7 +21108,7 @@ mod baseline_resolution_tests {
     fn unknown_applicability_and_unproven_stamp_verdicts_remain_readable_and_refused() {
         let check = identity("BitwiseInfoV1", None);
         let full = serde_json::to_value(stamp("does-not-exist", Some(check.clone()))).unwrap();
-        for field in ["enabled_when_tested", "comparison_verdict"] {
+        for field in ["applicable_when_tested", "comparison_verdict"] {
             for explicit_null in [false, true] {
                 let mut legacy = full.clone();
                 if explicit_null {
