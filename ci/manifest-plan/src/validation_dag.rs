@@ -35,7 +35,7 @@ const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SUPER_REPETITIONS: &str = "20";
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
-const PIN_GATE_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; with-proxy ./ci/run-reverie-pin-check.sh --repo "$PWD""#;
+const PIN_GATE_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; pin_check=(./ci/run-reverie-pin-check.sh --repo "$PWD"); if command -v with-proxy >/dev/null 2>&1; then with-proxy "${pin_check[@]}"; else "${pin_check[@]}"; fi"#;
 const OUTCOME_CONSUMERS_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/check-outcome-consumers-node.sh"#;
 const PINNED_ROOT_TWIN_SUFFIX: &str = "_in_pinned_root";
 pub const HOSTED_PORTABLE_LABEL: &str = "hosted-portable";
@@ -1661,7 +1661,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         .ok_or("committed DAG lost pre.reverie_pin")?;
     if pin.cmd != PIN_GATE_COMMAND {
         return Err(format!(
-            "pre.reverie_pin must use the unconditional with-proxy command; got {:?}",
+            "pre.reverie_pin must use the portable proxy-when-present command; got {:?}",
             pin.cmd
         ));
     }
@@ -1982,6 +1982,66 @@ pub fn require_fresh(committed: &str, generated: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pin_gate_uses_proxy_only_when_the_runner_provides_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = Scratch::create().unwrap();
+        let root = &scratch.0;
+        let ci = root.join("ci");
+        let bin = ci.join("rust-script-bin");
+        fs::create_dir_all(&bin).unwrap();
+        let checker = ci.join("run-reverie-pin-check.sh");
+        fs::write(
+            &checker,
+            "#!/bin/bash\nprintf 'checker:%s\\n' \"$*\" >>\"$CAPTURE\"\nexit \"${CHECKER_STATUS:-0}\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&checker, fs::Permissions::from_mode(0o755)).unwrap();
+        let capture = root.join("capture");
+
+        let run = |checker_status: i32| {
+            Command::new("bash")
+                .args(["-c", PIN_GATE_COMMAND])
+                .current_dir(root)
+                .env("PATH", "/usr/bin:/bin")
+                .env("CAPTURE", &capture)
+                .env("CHECKER_STATUS", checker_status.to_string())
+                .output()
+                .unwrap()
+        };
+
+        let direct = run(0);
+        assert!(direct.status.success(), "{direct:?}");
+        assert_eq!(
+            fs::read_to_string(&capture).unwrap(),
+            format!("checker:--repo {}\n", root.display())
+        );
+        fs::write(&capture, "").unwrap();
+        assert_eq!(run(23).status.code(), Some(23));
+
+        fs::write(
+            bin.join("with-proxy"),
+            "#!/bin/bash\nprintf 'proxy:%s\\n' \"$*\" >>\"$CAPTURE\"\nexec \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(bin.join("with-proxy"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&capture, "").unwrap();
+
+        let proxied = run(0);
+        assert!(proxied.status.success(), "{proxied:?}");
+        assert_eq!(
+            fs::read_to_string(&capture).unwrap(),
+            format!(
+                "proxy:./ci/run-reverie-pin-check.sh --repo {}\nchecker:--repo {}\n",
+                root.display(),
+                root.display()
+            )
+        );
+        fs::write(&capture, "").unwrap();
+        assert_eq!(run(23).status.code(), Some(23));
+    }
 
     #[test]
     fn manifest_setup_prepares_tracked_dagrun_before_cargo_with_admitted_width() {
@@ -2636,15 +2696,15 @@ sys.exit(37)
             "{error}"
         );
 
-        let mut planted_pin_fallback = committed.clone();
-        planted_pin_fallback
+        let mut planted_unconditional_proxy = committed.clone();
+        planted_unconditional_proxy
             .steps
             .iter_mut()
             .find(|step| step.tag() == "pre.reverie_pin")
             .unwrap()
-            .cmd = "if command -v with-proxy; then with-proxy true; else true; fi".into();
-        let error = assert_invariants(&planted_pin_fallback, &cells).unwrap_err();
-        assert!(error.contains("unconditional with-proxy"), "{error}");
+            .cmd = "with-proxy ./ci/run-reverie-pin-check.sh --repo \"$PWD\"".into();
+        let error = assert_invariants(&planted_unconditional_proxy, &cells).unwrap_err();
+        assert!(error.contains("portable proxy-when-present"), "{error}");
 
         let mut planted_missing_rust_script_dep = committed.clone();
         planted_missing_rust_script_dep
