@@ -17,6 +17,41 @@ use crate::runner::AttemptResult;
 
 pub const VALIDATION_EVIDENCE_SCHEMA_VERSION: u32 = 10;
 
+/// The comparison-linkage contract, separate from the outer evidence schema.
+/// Legacy rows remain authenticated observations, never inferred bindings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CellBindingContract {
+    #[default]
+    LegacyUnbound,
+    SelectedAttemptV1,
+}
+
+impl CellBindingContract {
+    pub fn is_legacy_unbound(&self) -> bool {
+        *self == Self::LegacyUnbound
+    }
+}
+
+impl Serialize for CellBindingContract {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::SelectedAttemptV1 => serializer.serialize_u64(1),
+            Self::LegacyUnbound => Err(serde::ser::Error::custom(
+                "legacy binding contract must be omitted, not encoded",
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CellBindingContract {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match u64::deserialize(deserializer)? {
+            1 => Ok(Self::SelectedAttemptV1),
+            _ => Err(serde::de::Error::custom("unknown cell binding contract")),
+        }
+    }
+}
+
 /// Read the original harness row before any map conversion can erase duplicate
 /// fields. Non-null durations must fit an exact unsigned 64-bit integer before
 /// buffering; other numbers retain serde_json's existing representation, which
@@ -322,7 +357,8 @@ pub struct CellArtifactResultV10 {
     /// evidence binding independently instead of reading it back out of the
     /// row it is supposed to be checking. Without it the digest-bound check
     /// would compare the binding against itself and pass for any value.
-    pub selected_attempt: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_attempt: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -349,8 +385,37 @@ impl<'de> Deserialize<'de> for CellArtifactResultV10 {
             backend: value.backend,
             cell_verdict: value.cell_verdict.into(),
             backend_parity: value.backend_parity,
-            selected_attempt: value.selected_attempt,
+            selected_attempt: Some(value.selected_attempt),
         })
+    }
+}
+
+/// Exact pre-binding artifact shape. In particular a null/new ordinal is not
+/// legacy absence. The full verdict/parity implementation is shared below.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCellArtifactResultV10Wire {
+    lane: String,
+    category: String,
+    test: String,
+    mode: String,
+    backend: String,
+    cell_verdict: CellVerdictV8,
+    backend_parity: RequiredNullable<CellBackendParity>,
+}
+
+impl From<LegacyCellArtifactResultV10Wire> for CellArtifactResultV10 {
+    fn from(value: LegacyCellArtifactResultV10Wire) -> Self {
+        Self {
+            lane: value.lane,
+            category: value.category,
+            test: value.test,
+            mode: value.mode,
+            backend: value.backend,
+            cell_verdict: value.cell_verdict.into(),
+            backend_parity: value.backend_parity,
+            selected_attempt: None,
+        }
     }
 }
 
@@ -383,9 +448,10 @@ impl CellArtifactResultV10 {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CellResultsEvidenceV10 {
+    #[serde(skip_serializing_if = "CellBindingContract::is_legacy_unbound")]
+    pub binding_contract: CellBindingContract,
     pub path: ValidatePath,
     pub run_id: String,
     pub hermit_sha: String,
@@ -397,6 +463,57 @@ pub struct CellResultsEvidenceV10 {
     pub selected: Vec<CellIdentity>,
     pub selected_backend_parity: Vec<BackendParityRelation>,
     pub cells: Vec<CellResultV10>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CellResultsEvidenceV10Wire {
+    // Only absence selects legacy. Present null is rejected by the typed
+    // deserializer, rather than being collapsed into the default.
+    #[serde(default)]
+    binding_contract: CellBindingContract,
+    path: ValidatePath,
+    run_id: String,
+    hermit_sha: String,
+    source_tree_dirty: bool,
+    selected_count: u64,
+    recorded_count: u64,
+    population_sha256: String,
+    artifact: CellResultsArtifact,
+    selected: Vec<CellIdentity>,
+    selected_backend_parity: Vec<BackendParityRelation>,
+    cells: Vec<Value>,
+}
+
+impl<'de> Deserialize<'de> for CellResultsEvidenceV10 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = CellResultsEvidenceV10Wire::deserialize(deserializer)?;
+        let cells = value
+            .cells
+            .into_iter()
+            .map(|cell| match value.binding_contract {
+                CellBindingContract::LegacyUnbound => {
+                    serde_json::from_value::<LegacyCellResultV10Wire>(cell).map(Into::into)
+                }
+                CellBindingContract::SelectedAttemptV1 => serde_json::from_value(cell),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            binding_contract: value.binding_contract,
+            path: value.path,
+            run_id: value.run_id,
+            hermit_sha: value.hermit_sha,
+            source_tree_dirty: value.source_tree_dirty,
+            selected_count: value.selected_count,
+            recorded_count: value.recorded_count,
+            population_sha256: value.population_sha256,
+            artifact: value.artifact,
+            selected: value.selected,
+            selected_backend_parity: value.selected_backend_parity,
+            cells,
+        })
+    }
 }
 
 fn deserialize_verdict<'de, D: Deserializer<'de>>(
@@ -441,11 +558,40 @@ pub struct CellResultV10 {
     /// does, and does not, close that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_attempt: Option<u64>,
-    /// The exact source attempt this verdict's evidence was read from. See
-    /// [`CellResult::evidence_binding`]: absent means the row predates the
-    /// binding and is UNBOUND, which a reader renders rather than infers past.
+    /// The exact source attempt this verdict's evidence was read from.
+    /// A compared legacy row is explicitly UNBOUND; a compared v1 row with
+    /// this field absent is malformed, not a legacy fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_binding: Option<CellEvidenceBinding>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyCellResultV10Wire {
+    lane: String,
+    category: String,
+    test: String,
+    mode: String,
+    backend: String,
+    #[serde(deserialize_with = "deserialize_verdict")]
+    cell_verdict: CellVerdict,
+    backend_parity: RequiredNullable<CellBackendParitySummary>,
+}
+
+impl From<LegacyCellResultV10Wire> for CellResultV10 {
+    fn from(value: LegacyCellResultV10Wire) -> Self {
+        Self {
+            lane: value.lane,
+            category: value.category,
+            test: value.test,
+            mode: value.mode,
+            backend: value.backend,
+            cell_verdict: value.cell_verdict,
+            backend_parity: value.backend_parity,
+            selected_attempt: None,
+            evidence_binding: None,
+        }
+    }
 }
 
 impl CellResultV10 {
@@ -539,6 +685,24 @@ impl CellArtifactResultV10 {
     /// is the whole point: an unbound compared verdict is exactly the row this
     /// work exists to stop being written.
     pub fn summary(&self, run_id: &str, hermit_sha: &str) -> Result<CellResultV10, String> {
+        self.summary_for_contract(CellBindingContract::SelectedAttemptV1, run_id, hermit_sha)
+    }
+
+    /// A legacy summary retains the original observations, without inventing
+    /// the attempt metadata that its producer did not record.
+    pub fn summary_for_contract(
+        &self,
+        contract: CellBindingContract,
+        run_id: &str,
+        hermit_sha: &str,
+    ) -> Result<CellResultV10, String> {
+        match (contract, self.selected_attempt) {
+            (CellBindingContract::LegacyUnbound, None)
+            | (CellBindingContract::SelectedAttemptV1, Some(1..)) => {}
+            _ => {
+                return Err("schema 10 artifact attempt differs from its binding contract".into());
+            }
+        }
         let backend_parity = match &self.backend_parity {
             RequiredNullable::Null => RequiredNullable::Null,
             RequiredNullable::Value(parity) => {
@@ -547,11 +711,13 @@ impl CellArtifactResultV10 {
                 }
                 // A parity row carries its whole attempt history, so the
                 // recorded ordinal is checkable rather than merely asserted.
-                if parity.candidate_attempt_number(&self.identity())? != self.selected_attempt {
-                    return Err(
-                        "schema 10 parity cell recorded an attempt its own history did not select"
-                            .into(),
-                    );
+                if let Some(attempt) = self.selected_attempt {
+                    if parity.candidate_attempt_number(&self.identity())? != attempt {
+                        return Err(
+                            "schema 10 parity cell recorded an attempt its own history did not select"
+                                .into(),
+                        );
+                    }
                 }
                 RequiredNullable::Value(parity.summary(&self.identity())?)
             }
@@ -559,17 +725,19 @@ impl CellArtifactResultV10 {
         let cell_verdict = compact_cell_verdict(&self.cell_verdict);
         // Only a compared verdict read an attempt. Binding a by-design or
         // unavailable verdict would name an event that was never published.
-        let evidence_binding = matches!(
-            cell_verdict,
-            CellVerdict::ComparedAndMatched { .. } | CellVerdict::ComparedAndDiverged { .. }
-        )
-        .then(|| {
-            CellEvidenceBinding::for_validate_compared(
-                run_id,
-                &self.identity(),
-                hermit_sha,
-                self.selected_attempt,
+        let evidence_binding = self.selected_attempt.and_then(|attempt| {
+            matches!(
+                cell_verdict,
+                CellVerdict::ComparedAndMatched { .. } | CellVerdict::ComparedAndDiverged { .. }
             )
+            .then(|| {
+                CellEvidenceBinding::for_validate_compared(
+                    run_id,
+                    &self.identity(),
+                    hermit_sha,
+                    attempt,
+                )
+            })
         });
         let recorded_attempt = evidence_binding
             .as_ref()
@@ -1439,6 +1607,9 @@ impl CellResultsEvidenceV10 {
     /// history. For an ordinary cell it remains a producer assertion, and the
     /// end-to-end resolution against published rows is what would refute it.
     pub fn require_bound_compared_cells(&self) -> Result<(), String> {
+        if self.binding_contract != CellBindingContract::SelectedAttemptV1 {
+            return Err("schema 10 comparison evidence is legacy-unbound".into());
+        }
         let mut seen = BTreeSet::new();
         for cell in &self.cells {
             let compared = matches!(
@@ -1541,10 +1712,20 @@ impl CellResultsEvidenceV10 {
         for identity in &self.selected {
             validate_identity(identity)?;
         }
-        // Every compared verdict must name the exact attempt it read. Placed
-        // with the other population invariants because it IS one: a comparison
-        // whose evidence cannot be resolved is not a countable comparison.
-        self.require_bound_compared_cells()?;
+        // Old observations remain readable, but cannot satisfy bound evidence.
+        // The new contract never permits a missing comparison binding.
+        match self.binding_contract {
+            CellBindingContract::SelectedAttemptV1 => self.require_bound_compared_cells()?,
+            CellBindingContract::LegacyUnbound => {
+                if self
+                    .cells
+                    .iter()
+                    .any(|cell| cell.selected_attempt.is_some() || cell.evidence_binding.is_some())
+                {
+                    return Err("legacy schema 10 cell carries binding fields".into());
+                }
+            }
+        }
         let population = serde_json::to_vec(
             &serde_json::to_value(&self.selected).map_err(|error| error.to_string())?,
         )
@@ -1833,14 +2014,21 @@ impl CellResultsEvidenceV10 {
                     "schema 10 cell artifact row has a different run or source identity".into(),
                 );
             }
-            let cell: CellArtifactResultV10 = serde_json::from_value(value)
-                .map_err(|error| format!("invalid schema 10 full cell evidence: {error}"))?;
+            let cell: CellArtifactResultV10 = match self.binding_contract {
+                CellBindingContract::LegacyUnbound => {
+                    serde_json::from_value::<LegacyCellArtifactResultV10Wire>(value).map(Into::into)
+                }
+                CellBindingContract::SelectedAttemptV1 => serde_json::from_value(value),
+            }
+            .map_err(|error| format!("invalid schema 10 full cell evidence: {error}"))?;
             validate_ordinary_verdict(&cell.identity(), &cell.cell_verdict)?;
             cells.push(cell);
         }
         let summaries = cells
             .iter()
-            .map(|cell| cell.summary(&self.run_id, &self.hermit_sha))
+            .map(|cell| {
+                cell.summary_for_contract(self.binding_contract, &self.run_id, &self.hermit_sha)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         if summaries != self.cells
             || cells.len() as u64 != self.recorded_count

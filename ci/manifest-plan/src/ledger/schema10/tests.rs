@@ -139,7 +139,7 @@ fn fixture_with_path(
         mode: id.mode.clone(),
         backend: id.backend.clone(),
         cell_verdict: parity.candidate_verdict(&id).unwrap(),
-        selected_attempt: parity.candidate_attempt_number(&id).unwrap(),
+        selected_attempt: Some(parity.candidate_attempt_number(&id).unwrap()),
         backend_parity: RequiredNullable::Value(parity),
     };
     let mut cell_row = serde_json::to_value(&cell).unwrap();
@@ -151,6 +151,7 @@ fn fixture_with_path(
     let selected = vec![id.clone()];
     let population = serde_json::to_vec(&serde_json::to_value(&selected).unwrap()).unwrap();
     let cells = CellResultsEvidenceV10 {
+        binding_contract: CellBindingContract::SelectedAttemptV1,
         path,
         run_id: run_id.clone(),
         hermit_sha: hermit_sha.clone(),
@@ -230,6 +231,11 @@ fn exact_artifacts_derive_compact_summaries_and_refuse_independent_mutations() {
         .unwrap()
         .unwrap();
     assert!(verified.full_backend_parity && verified.full_test_results);
+    assert_eq!(
+        verified.cell_results.binding_contract,
+        CellBindingContract::SelectedAttemptV1
+    );
+    assert_eq!(verified.cell_results.bound_attempts().unwrap().len(), 1);
     retain_fixture("matched", &row, &plan, &cells, &tests);
     assert_eq!(verified.observations.len(), 3);
     assert!(verified.missing_cells.is_empty() && verified.missing_backend_parity.is_empty());
@@ -1079,4 +1085,429 @@ fn the_live_row_decode_refuses_a_compared_verdict_whose_binding_is_inconsistent(
     good.cell_results = Some(serde_json::from_value(cells).unwrap());
     good.schema10_cell_results()
         .expect("a consistently rebound row must still decode");
+}
+
+fn legacy_fixture(name: &str) -> (HistoryRow, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (row, plan, cells, tests): (&str, &[u8], &[u8], &[u8]) = match name {
+        "ordinary-only" => (
+            include_str!("fixtures/legacy/ordinary-only-row.json"),
+            include_bytes!("fixtures/legacy/ordinary-only-plan.json"),
+            include_bytes!("fixtures/legacy/ordinary-only-cells.jsonl"),
+            include_bytes!("fixtures/legacy/ordinary-only-tests.jsonl"),
+        ),
+        "reference-diverged" => (
+            include_str!("fixtures/legacy/reference-diverged-row.json"),
+            include_bytes!("fixtures/legacy/reference-diverged-plan.json"),
+            include_bytes!("fixtures/legacy/reference-diverged-cells.jsonl"),
+            include_bytes!("fixtures/legacy/reference-diverged-tests.jsonl"),
+        ),
+        _ => panic!("unknown preserved legacy fixture: {name}"),
+    };
+    (
+        serde_json::from_str(row).unwrap(),
+        plan.to_vec(),
+        cells.to_vec(),
+        tests.to_vec(),
+    )
+}
+
+fn decode_cell_evidence(value: Value) -> Result<CellResultsEvidenceV10, String> {
+    let row: HistoryRow = serde_json::from_value(value).map_err(|error| error.to_string())?;
+    row.schema10_cell_results()?
+        .ok_or_else(|| "fixture did not select schema 10".into())
+}
+
+#[test]
+fn exact_legacy_artifacts_remain_authenticated_without_inferred_bindings() {
+    for name in ["ordinary-only", "reference-diverged"] {
+        let (row, plan, cells, tests) = legacy_fixture(name);
+        let original = serde_json::to_value(row.cell_results.as_ref().unwrap()).unwrap();
+        let verified = row
+            .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+            .unwrap()
+            .unwrap();
+        let evidence = &verified.cell_results;
+        assert_eq!(
+            evidence.binding_contract,
+            CellBindingContract::LegacyUnbound
+        );
+        assert_eq!(serde_json::to_value(evidence).unwrap(), original, "{name}");
+        assert_eq!(evidence.run_id, "fixture-v10");
+        assert_eq!(evidence.hermit_sha, "a".repeat(40));
+        assert_eq!(evidence.selected, vec![identity()]);
+        assert_eq!(evidence.selected_count, 1);
+        assert_eq!(evidence.recorded_count, 1);
+        assert_eq!(evidence.cells.len(), 1);
+        assert!(matches!(
+            evidence.cells[0].cell_verdict,
+            CellVerdict::ComparedAndMatched { .. }
+        ));
+        assert_eq!(evidence.cells[0].selected_attempt, None);
+        assert_eq!(evidence.cells[0].evidence_binding, None);
+        let full_cells = evidence.verify_cell_artifact_bytes(&cells).unwrap();
+        assert_eq!(full_cells.len(), 1);
+        assert_eq!(full_cells[0].selected_attempt, None);
+        assert_eq!(
+            full_cells[0]
+                .summary_for_contract(
+                    CellBindingContract::LegacyUnbound,
+                    &evidence.run_id,
+                    &evidence.hermit_sha,
+                )
+                .unwrap(),
+            evidence.cells[0]
+        );
+        assert!(
+            evidence
+                .bound_attempts()
+                .unwrap_err()
+                .contains("legacy-unbound")
+        );
+        assert!(verified.full_test_results);
+        assert!(verified.missing_cells.is_empty());
+        assert!(verified.missing_backend_parity.is_empty());
+        assert!(verified.missing_test_producers.is_empty());
+        assert!(!verified.full_backend_parity);
+        assert_eq!(verified.test_results.totals.executed_tests, 1);
+        assert_eq!(verified.test_results.totals.passed_tests, 1);
+        assert_eq!(verified.test_results.totals.failed_tests, 0);
+        assert_eq!(verified.test_results.totals.filtered_tests, 0);
+
+        // Readability is not binding authority, even for an ordinary match.
+        assert!(
+            evidence
+                .require_bound_compared_cells()
+                .unwrap_err()
+                .contains("legacy-unbound")
+        );
+        if name == "ordinary-only" {
+            assert!(evidence.selected_backend_parity.is_empty());
+            assert_eq!(verified.observations.len(), 1);
+            let observation = &verified.observations[0];
+            assert_eq!(observation.identity, identity());
+            assert_eq!(observation.relation, ComparisonRelationV10::Ordinary);
+            assert_eq!(observation.outer_attempt, None);
+            assert_eq!(
+                observation.verdict,
+                ComparisonObservationVerdictV10::Matched
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_reference_failure_and_unavailable_cross_comparison_remain_visible() {
+    let (row, plan, cells, tests) = legacy_fixture("reference-diverged");
+    let verified = row
+        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        verified.cell_results.binding_contract,
+        CellBindingContract::LegacyUnbound
+    );
+    assert_eq!(verified.cell_results.selected_backend_parity.len(), 1);
+    assert_eq!(verified.observations.len(), 3);
+    assert!(!verified.full_backend_parity);
+    let mut reference = identity();
+    reference.backend = "ptrace".into();
+    let expected_relations = [
+        (identity(), ComparisonRelationV10::Ordinary),
+        (
+            reference,
+            ComparisonRelationV10::Reference {
+                candidate: identity(),
+            },
+        ),
+        (
+            identity(),
+            ComparisonRelationV10::BackendParity {
+                reference_backend: "ptrace".into(),
+                record_envelope: RecordEnvelopePolicy::CrossBackendDetcoreV1,
+            },
+        ),
+    ];
+    for ((identity, relation), observation) in expected_relations.iter().zip(&verified.observations)
+    {
+        assert_eq!(&observation.identity, identity);
+        assert_eq!(&observation.relation, relation);
+        assert_eq!(observation.outer_attempt, Some(1));
+    }
+    assert_eq!(
+        verified.observations[0].verdict,
+        ComparisonObservationVerdictV10::Matched
+    );
+    assert_eq!(
+        verified.observations[1].verdict,
+        ComparisonObservationVerdictV10::Diverged
+    );
+    assert_eq!(
+        verified.observations[2].verdict,
+        ComparisonObservationVerdictV10::UnavailableWithReason {
+            reason: "Cross-backend comparison unavailable; exact detail is retained in the cell artifact".into(),
+        }
+    );
+    let full_cells = verified
+        .cell_results
+        .verify_cell_artifact_bytes(&cells)
+        .unwrap();
+    let RequiredNullable::Value(parity) = &full_cells[0].backend_parity else {
+        panic!("the old artifact lost its parity evidence");
+    };
+    let BackendParityCellAttempt::UnavailableWithReason { reason, .. } = &parity.attempts[0] else {
+        panic!("the old artifact lost its unavailable attempt");
+    };
+    assert_eq!(
+        reason,
+        "reference strict verification diverged before cross comparison"
+    );
+}
+
+#[test]
+fn binding_contract_presence_requires_a_known_nonnull_integer_version() {
+    let (row, _plan, _cells, _tests) = legacy_fixture("ordinary-only");
+    let original = serde_json::to_value(row).unwrap();
+    assert_eq!(
+        decode_cell_evidence(original.clone())
+            .unwrap()
+            .binding_contract,
+        CellBindingContract::LegacyUnbound
+    );
+    for marker in [
+        Value::Null,
+        serde_json::json!(0),
+        serde_json::json!(2),
+        serde_json::json!(-1),
+        serde_json::json!("1"),
+        serde_json::json!(true),
+        serde_json::json!(1.0),
+        serde_json::json!([]),
+        serde_json::json!({}),
+    ] {
+        let mut changed = original.clone();
+        changed["cell_results"]["binding_contract"] = marker.clone();
+        let error = decode_cell_evidence(changed)
+            .expect_err("a present invalid marker is not legacy absence");
+        assert!(
+            error.contains("binding contract")
+                || error.contains("invalid type")
+                || error.contains("invalid value"),
+            "marker {marker} had the wrong refusal: {error}"
+        );
+    }
+    let mut marked = original;
+    marked["cell_results"]["binding_contract"] = serde_json::json!(1);
+    assert!(
+        decode_cell_evidence(marked)
+            .unwrap_err()
+            .contains("carries no evidence binding")
+    );
+}
+
+#[test]
+fn legacy_compact_shape_refuses_new_keys_even_when_their_values_are_null() {
+    let (row, _plan, _cells, _tests) = legacy_fixture("ordinary-only");
+    let original = serde_json::to_value(row).unwrap();
+    let binding = serde_json::to_value(CellEvidenceBinding::for_validate_compared(
+        "fixture-v10",
+        &identity(),
+        &"a".repeat(40),
+        1,
+    ))
+    .unwrap();
+    for (key, value) in [
+        ("selected_attempt", Value::Null),
+        ("selected_attempt", serde_json::json!(1)),
+        ("evidence_binding", Value::Null),
+        ("evidence_binding", binding),
+    ] {
+        let mut changed = original.clone();
+        changed["cell_results"]["cells"][0][key] = value;
+        let error = decode_cell_evidence(changed).unwrap_err();
+        assert!(
+            error.contains("unknown field") && error.contains(key),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn legacy_artifact_shape_refuses_new_keys_even_after_rehashing() {
+    let (row, plan, cells, tests) = legacy_fixture("ordinary-only");
+    let original_row = serde_json::to_value(row).unwrap();
+    let original_cell: Value = serde_json::from_slice(&cells).unwrap();
+    for (key, value) in [
+        ("selected_attempt", Value::Null),
+        ("selected_attempt", serde_json::json!(1)),
+        ("evidence_binding", Value::Null),
+    ] {
+        let mut changed_cell = original_cell.clone();
+        changed_cell[key] = value;
+        let mut changed_cells = serde_json::to_vec(&changed_cell).unwrap();
+        changed_cells.push(b'\n');
+        let mut changed_row = original_row.clone();
+        changed_row["cell_results"]["artifact"]["sha256"] =
+            Value::String(hex_digest(&changed_cells));
+        let changed_row: HistoryRow = serde_json::from_value(changed_row).unwrap();
+        let error = changed_row
+            .verify_schema10_artifact_bytes(&plan, &changed_cells, &tests)
+            .unwrap_err();
+        assert!(
+            error.contains("unknown field") && error.contains(key),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn removing_a_binding_contract_cannot_retain_bound_comparison_authority() {
+    let (row, plan, cells, tests) =
+        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let verified = row
+        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+        .unwrap()
+        .unwrap();
+    assert_eq!(verified.cell_results.bound_attempts().unwrap().len(), 1);
+    let mut downgraded = serde_json::to_value(row).unwrap();
+    downgraded["cell_results"]
+        .as_object_mut()
+        .unwrap()
+        .remove("binding_contract");
+    assert!(
+        decode_cell_evidence(downgraded.clone())
+            .unwrap_err()
+            .contains("unknown field")
+    );
+    for key in ["selected_attempt", "evidence_binding"] {
+        downgraded["cell_results"]["cells"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove(key);
+    }
+    let row_without_compact_binding: HistoryRow =
+        serde_json::from_value(downgraded.clone()).unwrap();
+    let error = row_without_compact_binding
+        .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+        .unwrap_err();
+    assert!(
+        error.contains("unknown field") && error.contains("selected_attempt"),
+        "{error}"
+    );
+
+    // Stripping every new field can yield readable old-format evidence, but
+    // never silently satisfy a request for bound comparisons.
+    let mut legacy_cell: Value = serde_json::from_slice(&cells).unwrap();
+    legacy_cell
+        .as_object_mut()
+        .unwrap()
+        .remove("selected_attempt");
+    let mut legacy_cells = serde_json::to_vec(&legacy_cell).unwrap();
+    legacy_cells.push(b'\n');
+    downgraded["cell_results"]["artifact"]["sha256"] = Value::String(hex_digest(&legacy_cells));
+    let downgraded: HistoryRow = serde_json::from_value(downgraded).unwrap();
+    let legacy = downgraded
+        .verify_schema10_artifact_bytes(&plan, &legacy_cells, &tests)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        legacy.cell_results.binding_contract,
+        CellBindingContract::LegacyUnbound
+    );
+    assert_eq!(legacy.observations, verified.observations);
+    assert!(
+        legacy
+            .cell_results
+            .cells
+            .iter()
+            .all(|cell| { cell.selected_attempt.is_none() && cell.evidence_binding.is_none() })
+    );
+    assert!(
+        legacy
+            .cell_results
+            .bound_attempts()
+            .unwrap_err()
+            .contains("legacy-unbound")
+    );
+}
+
+#[test]
+fn empty_legacy_cell_evidence_cannot_satisfy_bound_attempts() {
+    let (row, _plan, _cells, _tests) = legacy_fixture("ordinary-only");
+    let mut raw = serde_json::to_value(row).unwrap();
+    let evidence = &mut raw["cell_results"];
+    evidence["selected"] = serde_json::json!([]);
+    evidence["selected_backend_parity"] = serde_json::json!([]);
+    evidence["cells"] = serde_json::json!([]);
+    evidence["selected_count"] = serde_json::json!(0);
+    evidence["recorded_count"] = serde_json::json!(0);
+    evidence["population_sha256"] = Value::String(hex_digest(b"[]"));
+    evidence["artifact"]["row_count"] = serde_json::json!(0);
+    evidence["artifact"]["sha256"] = Value::String(hex_digest(b""));
+    let evidence = decode_cell_evidence(raw).unwrap();
+    assert_eq!(
+        evidence.binding_contract,
+        CellBindingContract::LegacyUnbound
+    );
+    assert!(evidence.verify_cell_artifact_bytes(b"").unwrap().is_empty());
+    assert!(
+        evidence
+            .bound_attempts()
+            .unwrap_err()
+            .contains("legacy-unbound")
+    );
+}
+
+#[test]
+fn raw_history_rows_refuse_duplicate_binding_contract_markers() {
+    // The narrow raw marker check must not discard unrelated future shapes.
+    for future in [
+        serde_json::json!(true),
+        serde_json::json!(-1),
+        serde_json::json!(u64::MAX),
+        serde_json::json!(1.25),
+        serde_json::json!("future"),
+        serde_json::json!([1, null, {"future": true}]),
+        serde_json::json!({"future": {"fields": [1, 2]}}),
+    ] {
+        let raw = serde_json::json!({"schema_version": 123, "cell_results": future}).to_string();
+        let row: HistoryRow = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            serde_json::to_value(row.cell_results.unwrap()).unwrap(),
+            future
+        );
+    }
+    let (row, plan, cells, tests) =
+        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let raw = serde_json::to_string(&row).unwrap();
+    let needle = "\"binding_contract\":1";
+    assert_eq!(raw.matches(needle).count(), 1);
+    let control: HistoryRow = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        control
+            .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+            .unwrap()
+            .unwrap()
+            .cell_results
+            .binding_contract,
+        CellBindingContract::SelectedAttemptV1
+    );
+    // Every other value and retained artifact is valid. Test both orders so a
+    // last-writer-wins parse cannot make the invalid first marker disappear.
+    for (first, second) in [
+        ("1", "1"),
+        ("0", "1"),
+        ("1", "0"),
+        ("null", "1"),
+        ("1", "null"),
+    ] {
+        let duplicate = format!("\"binding_contract\":{first},\"binding_contract\":{second}");
+        let changed = raw.replacen(needle, &duplicate, 1);
+        let error = serde_json::from_str::<HistoryRow>(&changed).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate field `binding_contract`"),
+            "{first}/{second}: {error}"
+        );
+    }
 }

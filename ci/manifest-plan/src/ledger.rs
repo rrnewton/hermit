@@ -1047,11 +1047,86 @@ impl CellResultsEvidenceV8 {
 /// this reader does not understand yet. Exact versioned shapes precede the raw
 /// fallback so supported rows retain typed access while unknown extensions stay
 /// readable.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum CellResultsValue {
     Typed(CellResultsEvidence),
     Other(Value),
+}
+
+impl<'de> Deserialize<'de> for CellResultsValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // V10 dispatch happens after this value is retained in HistoryRow.
+        // Refuse duplicate contract markers here, before Value can erase them.
+        // Other unknown shapes keep the same raw fallback as the old untagged
+        // enum; this is not a second artifact or historical-schema decoder.
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Value;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("cell evidence with at most one binding_contract marker")
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Value, E> {
+                Ok(Value::Bool(value))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> {
+                Ok(Value::from(value))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
+                Ok(Value::from(value))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(Value::Number)
+                    .ok_or_else(|| E::custom("non-finite cell evidence number"))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
+                Ok(Value::String(value.into()))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = seq.next_element::<Value>()? {
+                    values.push(value);
+                }
+                Ok(Value::Array(values))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "binding_contract" && values.contains_key(&key) {
+                        return Err(serde::de::Error::custom(
+                            "duplicate field `binding_contract` in cell evidence",
+                        ));
+                    }
+                    values.insert(key, map.next_value()?);
+                }
+                Ok(Value::Object(values))
+            }
+        }
+        let raw = deserializer.deserialize_any(Visitor)?;
+        Ok(match serde_json::from_value(raw.clone()) {
+            Ok(value) => Self::Typed(value),
+            Err(_) => Self::Other(raw),
+        })
+    }
 }
 
 impl CellResultsValue {
