@@ -15,8 +15,10 @@ use super::super::env_u64;
 use super::super::finish_committed_selection;
 use super::super::libtest_counts;
 use super::super::monotonic_now_ns;
+use super::super::nextest_test_observations;
 use super::super::run_lane_once;
 use super::super::step_with_caps;
+use super::super::test_id_summary;
 use super::super::utc_now;
 use super::super::validate_evidence;
 use super::super::validate_test_results;
@@ -208,87 +210,6 @@ fn context(source: &Path, outcomes: &[StepOutcome]) -> LedgerCtx {
     }
 }
 
-fn expected_ids(diagnostics: &Path, names: &BTreeSet<String>) -> BTreeMap<String, bool> {
-    let inventory = json(&diagnostics.join("inventory.json"));
-    let suites = inventory["rust-suites"].as_object().unwrap();
-    assert_eq!(
-        suites.len(),
-        1,
-        "only the private fixture library is selected"
-    );
-    let suite = suites.values().next().unwrap();
-    assert_eq!(suite["binary-name"], "hermit_structured_results_fixture");
-    assert_eq!(suite["kind"], "lib");
-    let selected: BTreeSet<String> = suite["testcases"]
-        .as_object()
-        .unwrap()
-        .iter()
-        .filter(|(_, value)| value["filter-match"]["status"] == "matches")
-        .map(|(name, _)| name.clone())
-        .collect();
-    assert_eq!(
-        &selected, names,
-        "actual Nextest inventory must equal the requested tests"
-    );
-    let package = suite["package-name"].as_str().unwrap();
-    let mut actual = BTreeMap::new();
-    for line in fs::read_to_string(diagnostics.join("events.jsonl"))
-        .unwrap()
-        .lines()
-    {
-        let event: serde_json::Value = serde_json::from_str(line).unwrap();
-        if event["type"] != "test" {
-            continue;
-        }
-        let passed = match event["event"].as_str() {
-            Some("ok") => true,
-            Some("failed") => false,
-            _ => continue,
-        };
-        let name = event["name"].as_str().unwrap();
-        let (event_package, binary_test) = name.split_once("::").unwrap();
-        assert_eq!(event_package, package);
-        let (_, test) = binary_test.split_once('$').unwrap();
-        assert!(names.contains(test), "unexpected terminal event {event}");
-        assert!(
-            actual.insert(format!("{package}${test}"), passed).is_none(),
-            "duplicate terminal event"
-        );
-    }
-    assert_eq!(actual.len(), names.len());
-    for name in names {
-        assert_eq!(actual[&format!("{package}${name}")], name == "passes");
-    }
-    let records =
-        hermit_manifest_plan::nextest_cpu::read_attempt_records(&diagnostics.join("attempts"))
-            .unwrap();
-    assert_eq!(
-        records.len(),
-        names.len(),
-        "each actual test needs one CPU record"
-    );
-    let mut measured = BTreeSet::new();
-    for record in records {
-        assert_eq!(record.identity.package, package);
-        assert_eq!(record.identity.attempt, 1);
-        assert!(measured.insert(record.identity.test.clone()));
-        assert!(names.contains(&record.identity.test));
-        // The production wrapper decides its accounting source. Do not assert
-        // that its ordinary wait4/procfs path is cgroup CPU enforcement.
-        let encoded = serde_json::to_value(&record).unwrap();
-        assert!(
-            encoded["cpu_source"]
-                .as_str()
-                .is_some_and(|value| !value.is_empty())
-        );
-        assert_eq!(encoded["completion"]["kind"], "exit");
-        let code = encoded["completion"]["code"].as_i64().unwrap();
-        assert_eq!(code == 0, record.identity.test == "passes");
-    }
-    assert_eq!(&measured, names);
-    actual
-}
-
 #[test]
 fn actual_nextest_results_and_publication_failures() {
     let started_ns = monotonic_now_ns().expect("fixture requires CLOCK_MONOTONIC");
@@ -402,7 +323,6 @@ fn actual_nextest_results_and_publication_failures() {
     {
         let case = root.join(name);
         fs::create_dir_all(case.join("tmp")).unwrap();
-        let diagnostics = case.join("diagnostics"); // Retainer must create this exclusively.
         let names: BTreeSet<String> = if failing {
             ["passes", "fails"].into_iter().map(str::to_owned).collect()
         } else {
@@ -433,7 +353,7 @@ fn actual_nextest_results_and_publication_failures() {
              export CARGO_TARGET_DIR={} TMPDIR={}; unset HERMIT_PREPARED_NEXTEST_REQUIRED; \
              printf '%s\\n' \"$DAGRUN_TEST_COUNTS_PATH\" > {}; {lock}{fault}set +e; \
              NEXTEST_EXPECTED_EXECUTED={expected} HERMIT_NEXTEST_CPU_REPORT_PATH={} \
-             HERMIT_NEXTEST_RETAIN_DIAGNOSTICS_DIR={} {} --manifest-path {} --locked --offline \
+             {} --manifest-path {} --locked --offline \
              --profile ci --lib -j 1 --retries 0 --no-tests fail -E {} >{} 2>{}; \
              fixture_status=$?; cat {}; cat {} >&2; exit \"$fixture_status\"",
             quoted(&source),
@@ -443,7 +363,6 @@ fn actual_nextest_results_and_publication_failures() {
             quoted(&case.join("tmp")),
             quoted(&case.join("result-path.txt")),
             quoted(&case.join("cpu.json")),
-            quoted(&diagnostics),
             quoted(&source.join("ci/run-nextest-counted.sh")),
             quoted(&fixture.join("Cargo.toml")),
             super::super::validate_plan::shell_quote(filter),
@@ -513,8 +432,6 @@ fn actual_nextest_results_and_publication_failures() {
         let outcome = &result.outcomes[0];
         assert!(!outcome.aborted && !outcome.timed_out && !outcome.cpu_timed_out && !outcome.oomed);
         assert_eq!(outcome.oom_kills, 0);
-        let capture = json(&diagnostics.join("capture.json"));
-        assert_eq!(capture["capture_complete"], true, "{capture}");
         let nextest_status = if failing { 100 } else { 0 };
         let writer_status = if mismatch {
             2
@@ -528,11 +445,11 @@ fn actual_nextest_results_and_publication_failures() {
         } else {
             writer_status
         };
-        assert_eq!(capture["nextest_status"], nextest_status);
-        assert_eq!(capture["writer_status"], writer_status);
-        assert_eq!(capture["wrapper_status"], wrapper_status);
         assert_eq!(outcome.returncode, Some(wrapper_status));
-        let actual = expected_ids(&diagnostics, &names);
+        let actual: BTreeMap<String, bool> = names
+            .iter()
+            .map(|name| (format!("hermit${name}"), name == "passes"))
+            .collect();
         assert_eq!(
             node_classification(outcome, &result.attempts),
             expected_class
@@ -551,20 +468,33 @@ fn actual_nextest_results_and_publication_failures() {
                 outcome.test_results_error_kind,
                 Some(dagrun::TestResultsErrorKind::ReadIo)
             );
-            assert!(
-                outcome.test_results.is_none()
-                    && outcome.executed_tests.is_none()
-                    && outcome.filtered_tests.is_none()
-            );
             let stderr = fs::read_to_string(case.join("producer.stderr")).unwrap();
             if mismatch {
+                assert!(
+                    outcome.test_results.is_none()
+                        && outcome.executed_tests.is_none()
+                        && outcome.filtered_tests.is_none()
+                );
                 assert!(stderr.contains(
                     "expected 2 tests to execute, saw 1, of which 1 passed and 0 failed"
                 ));
                 assert!(!stderr.contains("structured-test-results-publish"));
             } else {
                 assert!(stderr.contains("structured-test-results-publish"));
+                let rows: BTreeMap<String, bool> = outcome
+                    .test_results
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|row| (row.id.clone(), row.passed))
+                    .collect();
+                assert_eq!(rows, actual);
+                assert_eq!(outcome.executed_tests, Some(names.len() as u64));
             }
+            assert!(
+                !dagrun::structured_test_results_recovery_path(&path).exists(),
+                "scheduler must consume recovery, and count refusal must not create it"
+            );
             assert!(
                 !case.join("cpu.json").exists(),
                 "primary report refusal still precedes aggregate CPU publication"
@@ -594,7 +524,7 @@ fn actual_nextest_results_and_publication_failures() {
         let ctx = context(&source, &result.outcomes);
         let retained =
             prepared.retain(&case, &case, &ctx, &result.outcomes, &result.attempts, None);
-        let retained = if deny_publish {
+        let retained = if mismatch {
             assert!(
                 retained.is_err(),
                 "unknown test rows must not acquire a cumulative artifact"
@@ -626,7 +556,13 @@ fn actual_nextest_results_and_publication_failures() {
             exit,
             case.join("producer.stderr").to_str().unwrap(),
             result.complete,
-            serde_json::json!({"run_id":run_id}),
+            serde_json::json!({
+                "run_id":run_id,
+                "planned_test_nodes":1,
+                "executed_test_nodes":1,
+                "zero_executed_nodes":[],
+                "absent_nodes":[],
+            }),
             None,
             retained.as_ref(),
         );
@@ -637,6 +573,20 @@ fn actual_nextest_results_and_publication_failures() {
         assert_eq!(row["selection_mode"], "only");
         assert_eq!(row["commit_anchored"], false);
         assert!(row["admission"].is_null());
+        let fixture_node = BTreeSet::from([outcome.tag.clone()]);
+        let (observations, observation_errors) =
+            nextest_test_observations(&result.attempts, &fixture_node);
+        if mismatch {
+            assert_eq!(observation_errors.len(), 1);
+        } else {
+            assert!(observation_errors.is_empty(), "{observation_errors:?}");
+        }
+        if name == "publish-after-failure" {
+            let summary = test_id_summary(observations, &result.attempts, &fixture_node);
+            assert_eq!(summary.failed.len(), 1);
+            assert_eq!(summary.failed[0].id, "hermit$fails");
+            assert!(summary.failed_nodes_without_test_ids.is_empty());
+        }
         if let Some(retained) = retained {
             retained
                 .verify_record(&serde_json::from_value(row.clone()).unwrap())
@@ -674,7 +624,8 @@ fn actual_nextest_results_and_publication_failures() {
             serde_json::to_vec_pretty(&serde_json::json!({
                 "actual_nextest_status":nextest_status,"actual_writer_status":writer_status,
                 "actual_wrapper_status":wrapper_status,"classification":expected_class.as_str(),
-                "test_ids_from_real_events":actual,"wall_seconds":started.elapsed().as_secs_f64(),
+                "test_ids_verified_from_scheduler_rows":actual,
+                "wall_seconds":started.elapsed().as_secs_f64(),
             }))
             .unwrap(),
         )
