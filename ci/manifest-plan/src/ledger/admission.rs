@@ -442,7 +442,6 @@ impl AdmissionFloorEvidenceV1 {
         {
             return Err("admission context does not belong to the selected original row".into());
         }
-        let value = serde_json::to_value(row).map_err(|e| e.to_string())?;
         if let Some(run_id) = row
             .coverage
             .as_ref()
@@ -452,8 +451,21 @@ impl AdmissionFloorEvidenceV1 {
                 return Err("admission context disagrees with coverage.run_id".into());
             }
         }
-        for name in ["cell_results", "test_results"] {
-            if let Some(run_id) = value.get(name).and_then(|v| v.get("run_id")) {
+        for (name, run_id) in [
+            (
+                "cell_results",
+                row.cell_results
+                    .as_ref()
+                    .and_then(super::CellResultsValue::admission_run_id),
+            ),
+            (
+                "test_results",
+                row.test_results
+                    .as_ref()
+                    .and_then(super::TestResultsValue::admission_run_id),
+            ),
+        ] {
+            if let Some(run_id) = run_id {
                 if run_id.as_str() != Some(c.run_id.as_str()) {
                     return Err(format!("admission context disagrees with {name}.run_id"));
                 }
@@ -766,6 +778,208 @@ mod tests {
         assert_eq!(
             serde_json::to_vec(&legacy).unwrap(),
             serde_json::to_vec(&without).unwrap()
+        );
+    }
+
+    fn nested_identity_row(kind: &str, ids: &[Value], claim: bool) -> String {
+        let c = context();
+        let bytes = admission_context_bytes(&c).unwrap();
+        let mut row = serde_json::json!({"schema_version":7,"commit":c.target_sha,
+            "tree":c.target_tree,"host":c.host,"run_id":c.run_id,
+            "started_at":c.started_at,"log_file":c.log_file,"result":"fail"});
+        if claim {
+            row["admission_floor_evidence"] = serde_json::to_value(AdmissionFloorEvidenceV1 {
+                context: c.clone(),
+                artifact: AdmissionContextArtifactV1 {
+                    path: "/retained/fixture/context.json".into(),
+                    sha256: admission_sha256(&bytes),
+                    bytes: bytes.len() as u64,
+                },
+            })
+            .unwrap();
+        }
+        let mut nested = match kind {
+            "raw_tests" => serde_json::json!({"future_shape":true}),
+            "typed_tests" => serde_json::json!({"path":"full","hermit_sha":c.target_sha,
+                "source_tree_dirty":false,"selected_count":0,"recorded_count":0,
+                "population_sha256":"b".repeat(64),"selected":{"nodes":[],"compatibility":false},
+                "nodes":[],"compatibility":null,
+                "totals":{"executed_tests":0,"passed_tests":0,"failed_tests":0,"filtered_tests":0},
+                "artifact":{"path":"ignored/validate/artifacts/fixture/tests.jsonl","sha256":"c".repeat(64),"row_count":0}}),
+            _ => serde_json::json!({"hermit_sha":c.target_sha,"source_tree_dirty":false,
+                "selected_count":0,"recorded_count":0,"population_sha256":"b".repeat(64),
+                "artifact":{"path":"ignored/validate/artifacts/fixture/cells.jsonl","sha256":"c".repeat(64),"row_count":0},
+                "selected":[],"cells":[]}),
+        };
+        if kind == "schema8_cells" {
+            row["schema_version"] = serde_json::json!(8);
+            nested["path"] = serde_json::json!("quick");
+        }
+        let name = if kind.ends_with("tests") {
+            "test_results"
+        } else {
+            "cell_results"
+        };
+        let mut raw_nested = serde_json::to_string(&nested).unwrap();
+        raw_nested.pop();
+        for id in ids {
+            raw_nested.push_str(",\"run_id\":");
+            raw_nested.push_str(&serde_json::to_string(id).unwrap());
+        }
+        raw_nested.push('}');
+        let mut raw = serde_json::to_string(&row).unwrap();
+        raw.pop();
+        raw.push_str(&format!(",{name:?}:{raw_nested}}}"));
+        raw
+    }
+
+    fn nested_duplicate_ids() -> Vec<Vec<Value>> {
+        let right = serde_json::json!(context().run_id);
+        vec![
+            vec![serde_json::json!("wrong"), right.clone()],
+            vec![right.clone(), serde_json::json!("wrong")],
+            vec![right.clone(), right.clone()],
+            vec![Value::Null, right],
+        ]
+    }
+
+    #[test]
+    fn raw_nested_run_id_duplicates_are_preserved_for_admission() {
+        for kind in ["typed_cells", "schema8_cells", "raw_tests", "typed_tests"] {
+            for ids in nested_duplicate_ids() {
+                let mut row: HistoryRow =
+                    serde_json::from_str(&nested_identity_row(kind, &ids, true)).unwrap();
+                assert!(row.admission_floor_evidence().is_err(), "{kind}: {ids:?}");
+                let retained = if kind.ends_with("tests") {
+                    row.test_results.as_ref().unwrap().admission_run_id()
+                } else {
+                    row.cell_results.as_ref().unwrap().admission_run_id()
+                };
+                assert_eq!(retained, Some(Value::Array(ids.clone())));
+                assert!(row.clone().admission_floor_evidence().is_err());
+                if kind == "typed_cells" {
+                    let cell = row.cell_results.as_mut().unwrap();
+                    cell.typed_mut().unwrap().run_id = context().run_id;
+                    assert_eq!(cell.admission_run_id(), Some(Value::Array(ids.clone())));
+                    assert!(
+                        row.admission_floor_evidence().is_err(),
+                        "typed_mut erased original duplicate evidence"
+                    );
+                }
+            }
+            for ids in [vec![], vec![serde_json::json!(context().run_id)]] {
+                let row: HistoryRow =
+                    serde_json::from_str(&nested_identity_row(kind, &ids, true)).unwrap();
+                assert!(
+                    row.admission_floor_evidence().unwrap().is_some(),
+                    "{kind}: {ids:?}"
+                );
+            }
+            for invalid in [
+                Value::Null,
+                serde_json::json!(42),
+                serde_json::json!("wrong"),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            ] {
+                let row: HistoryRow =
+                    serde_json::from_str(&nested_identity_row(kind, &[invalid], true)).unwrap();
+                assert!(row.admission_floor_evidence().is_err());
+            }
+        }
+        for name in ["cell_results", "test_results"] {
+            for first in ["null", "{}"] {
+                assert!(
+                    serde_json::from_str::<HistoryRow>(&format!(
+                        "{{{name:?}:{first},{name:?}:{{}}}}"
+                    ))
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_nested_run_id_metadata_preserves_public_behavior() {
+        let mut cases = nested_duplicate_ids();
+        cases.extend([
+            vec![],
+            vec![serde_json::json!(context().run_id)],
+            vec![Value::Null],
+            vec![serde_json::json!(42)],
+            vec![serde_json::json!([])],
+            vec![serde_json::json!({})],
+        ]);
+        for kind in ["typed_cells", "schema8_cells", "raw_tests", "typed_tests"] {
+            for ids in &cases {
+                let raw = nested_identity_row(kind, ids, false);
+                let row: HistoryRow = serde_json::from_str(&raw).unwrap();
+                let normalized: HistoryRow =
+                    serde_json::from_value(serde_json::from_str::<Value>(&raw).unwrap()).unwrap();
+                assert!(row.admission_floor_evidence().unwrap().is_none());
+                assert_eq!(
+                    serde_json::to_vec(&row).unwrap(),
+                    serde_json::to_vec(&normalized).unwrap(),
+                    "{kind}: {ids:?}"
+                );
+                assert_eq!(row.cell_results, normalized.cell_results);
+                assert_eq!(row.test_results, normalized.test_results);
+                assert_eq!(
+                    row.cell_results_evidence(),
+                    normalized.cell_results_evidence()
+                );
+                assert_eq!(
+                    row.cell_results_validate_path(),
+                    normalized.cell_results_validate_path()
+                );
+                if kind == "typed_tests" && ids.last().is_some_and(Value::is_string) {
+                    let actual = row.test_results.as_ref().unwrap().schema9().unwrap();
+                    let expected = normalized.test_results.as_ref().unwrap().schema9().unwrap();
+                    assert_eq!(actual, expected);
+                }
+                if ids.len() < 2 {
+                    let actual = if kind.ends_with("tests") {
+                        row.test_results.as_ref().unwrap().admission_run_id()
+                    } else {
+                        row.cell_results.as_ref().unwrap().admission_run_id()
+                    };
+                    assert_eq!(actual, ids.first().cloned());
+                    if kind == "typed_cells" && ids.last().is_some_and(Value::is_string) {
+                        assert!(matches!(
+                            row.cell_results,
+                            Some(super::super::CellResultsValue::Typed(_))
+                        ));
+                    }
+                }
+            }
+        }
+        for raw in [
+            "null",
+            "true",
+            "42",
+            "-4",
+            "2.5",
+            "\"text\"",
+            "[]",
+            "{\"unknown\":1,\"unknown\":2}",
+        ] {
+            let expected: Value = serde_json::from_str(raw).unwrap();
+            let test: super::super::TestResultsValue = serde_json::from_str(raw).unwrap();
+            let cell: super::super::CellResultsValue = serde_json::from_str(raw).unwrap();
+            assert_eq!(serde_json::to_value(test).unwrap(), expected);
+            assert_eq!(serde_json::to_value(cell).unwrap(), expected);
+        }
+        assert!(
+            serde_json::from_str::<super::super::CellResultsValue>(
+                r#"{"binding_contract":"x","binding_contract":"x"}"#
+            )
+            .is_err()
+        );
+        let test: super::super::TestResultsValue =
+            serde_json::from_str(r#"{"binding_contract":"x","binding_contract":"x"}"#).unwrap();
+        assert_eq!(
+            serde_json::to_value(test).unwrap(),
+            serde_json::json!({"binding_contract":"x"})
         );
     }
 
