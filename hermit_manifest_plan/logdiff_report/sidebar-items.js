@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["LOG_DIFF_REPORT_SCHEMA"],"enum":["LogDiffVerdict","RecordEnvelopePolicy"],"struct":["LogDiffComparison","LogDiffInput","LogDiffInputs","LogDiffMessageCounts","LogDiffRecords","LogDiffReport"]};

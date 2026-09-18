@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["HOSTED_PORTABLE_LABEL","OUTPUT","PINNED_ROOT_COMMAND_GUARD"],"fn":["canonical_text","expected_cells_from_json","generate","repo_root","require_fresh"]};
