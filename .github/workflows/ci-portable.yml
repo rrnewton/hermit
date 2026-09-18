@@ -345,7 +345,12 @@ jobs:
     needs: [select, preflight]
     if: needs.select.outputs.decision != 'skip'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # check.lint_checks alone has a committed 2400s bound: its historical
+    # loaded run reached 8m54s, and it now owns every lint-checks script test.
+    # Run 35354614446 proved the old 10-minute outer job bound contradictory:
+    # it canceled the healthy node after 390s of visible progress. Preserve the
+    # inner 40-minute hang detector plus ten minutes for setup and artifacts.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
         with:
@@ -362,10 +367,26 @@ jobs:
           sudo apt-get install -y liblzma-dev
       - name: Rust components
         run: rustup component add clippy rustfmt
+      # check.lint_checks runs the real structured-Nextest fixture.  Installing
+      # rust-script alone made that fixture fail with "no such command:
+      # nextest" on run 35335623037; the fixture is a test of the production
+      # adapter, not a reason to replace it with a mock in hosted CI.
+      - name: Install cargo-nextest (checks)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       - name: Install rust-script (checks)
         env:
           RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      # The real structured-Nextest fixture deliberately enters its execution
+      # namespace with CARGO_NET_OFFLINE=true.  Its standalone CPU-wrapper
+      # preparation still asks Cargo for locked workspace metadata, so a fresh
+      # runner must populate those sources before crossing that boundary.  Run
+      # 35342226342 reached the prepared runner and pinned Nextest correctly,
+      # then refused because addr2line was not yet present in Cargo's cache.
+      - name: Fetch locked workspace dependencies for offline checks
+        run: cargo fetch --locked
       - name: Download rust-script binaries
         uses: actions/download-artifact@v4
         with:
@@ -785,7 +806,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
+          sudo apt-get install -y bc binutils bsdextrautils bzip2 clang cmake cpio curl dc default-jdk-headless file g++ gcc gawk gdb git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Rust components
         run: rustup component add clippy rustfmt
       - name: Install cargo-nextest (unit-parallel shard)
@@ -992,7 +1013,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc binutils bzip2 clang cmake file g++ gcc git jq libc6-dbg libelf-dev libunwind-dev liblzma-dev make pkg-config procps python3-full time zlib1g-dev zstd
+          sudo apt-get install -y bc binutils bzip2 clang cmake file g++ gcc git iproute2 jq libc6-dbg libelf-dev libunwind-dev liblzma-dev make pkg-config procps python3-full time zlib1g-dev zstd
       # Release shards now execute individual tests through the same pinned
       # nextest timeout policy as debug shards. The release artifact contains
       # product binaries, not Cargo subcommand tooling, so provision it here.
@@ -1073,7 +1094,10 @@ jobs:
     needs: [select, build-debug, build-complete]
     if: needs.select.outputs.run_e2e != 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The widest bucket has a measured 720-second constructed-node budget plus
+    # setup and evidence packing. Other buckets retain their smaller committed
+    # node bounds; this outer cap only leaves room for that one complete stream.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.build-debug.outputs.e2e_matrix) }}
