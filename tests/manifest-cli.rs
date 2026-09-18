@@ -26,7 +26,9 @@
 //!   the hermit invocation before the `-- <guest>` separator).
 //!
 //! The command construction mirrors `manifest-to-commands.rs` exactly so a
-//! `get`/`run` line is byte-for-byte the same contract the CI expansion uses.
+//! `get`/`run` line uses the same command as CI for identical shared inputs.
+//! Verification cells also require the sibling `verification-report` binary,
+//! or an already-built reader selected with `VERIFICATION_REPORT_BIN`.
 //! `run` executes from the repository root and uses `target/release/hermit`
 //! unless `HERMIT_BIN` is set (a release binary is required — the debug binary
 //! is far too slow for the corpus timeouts).
@@ -39,6 +41,9 @@
 
 #[path = "../scripts/lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
+
+#[path = "../scripts/lib/verified_command.rs"]
+mod verified_command;
 
 #[path = "../ci/manifest-plan/src/manifest_value.rs"]
 mod manifest_value;
@@ -422,7 +427,7 @@ fn guest_with_args(test: &Value, guest: &str, guest_args: &[String]) -> String {
 /// the `--log=` level; `extra` are additional hermit flags injected before the
 /// `-- <guest>` separator. Mirrors `manifest-to-commands.rs::hermit_command`
 /// with the added override hooks used by `get`/`run`.
-fn hermit_command(
+pub(crate) fn hermit_command(
     mode: &str,
     backend: &str,
     lane: &str,
@@ -491,7 +496,7 @@ fn hermit_command(
         }
         other => fail(format!("unsupported mode `{other}`")),
     };
-    command
+    verified_command::hermit_verification_command(mode, seed, &command)
 }
 
 fn bounded_invocation(command: &str, id: &str) -> String {
@@ -1390,7 +1395,8 @@ get/run:
   A chaos mode without declared seeds is unavailable; get/run refuse rather than invent seed 0.
 
 ENV:
-  HERMIT_BIN  hermit binary for `run` (default target/release/hermit; a RELEASE binary is required)"
+  HERMIT_BIN  hermit binary for `run` (default target/release/hermit; a RELEASE binary is required)
+  VERIFICATION_REPORT_BIN  typed report reader for verification modes (default beside HERMIT_BIN)"
     );
     std::process::exit(2)
 }

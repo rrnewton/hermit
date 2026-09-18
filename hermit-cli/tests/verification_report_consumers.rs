@@ -918,10 +918,13 @@ exit "$PRODUCER_STATUS"
         verified_command::hermit_verification_command("custom", None, "exit 23"),
         "exit 23"
     );
-    let generator = fs::read_to_string(root().join("scripts/manifest-to-commands.rs")).unwrap();
-    assert!(
-        generator.contains("verified_command::hermit_verification_command(mode, seed, &command)")
-    );
+    for path in ["scripts/manifest-to-commands.rs", "tests/manifest-cli.rs"] {
+        let renderer = fs::read_to_string(root().join(path)).unwrap();
+        assert!(
+            renderer.contains("verified_command::hermit_verification_command(mode, seed, &command)"),
+            "{path} must use the shared verification gate"
+        );
+    }
     fs::remove_dir_all(temporary).unwrap();
 }
 

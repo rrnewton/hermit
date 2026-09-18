@@ -1,4 +1,4 @@
-//! Shell rendering shared by the manifest command generator and its native controls.
+//! Shell rendering shared by the manifest command generator, manual runner, and native controls.
 
 /// Preserve the producer's exit status only after its fresh `--verify-json`
 /// report satisfies the current typed canonical-match requirement.

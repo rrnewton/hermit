@@ -35,6 +35,12 @@ mod rust_script_prelude;
 #[path = "lib/verified_command.rs"]
 mod verified_command;
 
+// Compile the real manual renderer for the command-equivalence regression test.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../tests/manifest-cli.rs"]
+mod manifest_cli;
+
 #[path = "../ci/manifest-plan/src/manifest_value.rs"]
 mod manifest_value;
 
@@ -746,6 +752,72 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_and_generated_commands_share_the_verification_gate() {
+        let guest = "\"$cell/guest\" 'value with spaces'";
+        let custom_args = vec![
+            "--base-env=minimal".to_owned(),
+            "--env".to_owned(),
+            "NAME=value with spaces".to_owned(),
+        ];
+        for backend in HERMIT_BACKENDS {
+            for lane in ["portable", "privileged"] {
+                for verify_bitwise_parity in [false, true] {
+                    for mode in ["verify", "replay", "chaos", "custom"] {
+                        let seed = (mode == "chaos").then_some(17);
+                        let mode_args = if mode == "custom" {
+                            custom_args.as_slice()
+                        } else {
+                            &[]
+                        };
+                        let generated = hermit_command(
+                            mode,
+                            backend,
+                            lane,
+                            seed,
+                            mode_args,
+                            verify_bitwise_parity,
+                            guest,
+                        );
+                        let manual = manifest_cli::hermit_command(
+                            mode,
+                            backend,
+                            lane,
+                            seed,
+                            mode_args,
+                            verify_bitwise_parity,
+                            "info",
+                            &[],
+                            guest,
+                        );
+                        assert_eq!(
+                            manual, generated,
+                            "{mode}/{backend}/{lane}/{verify_bitwise_parity}"
+                        );
+                        if mode == "custom" {
+                            assert_eq!(
+                                manual,
+                                format!(
+                                    "{HERMIT_RUN_ENV} \"$hermit_bin\" --log=info run --backend {backend} --base-env=minimal --env 'NAME=value with spaces' -- {guest}"
+                                )
+                            );
+                        } else {
+                            assert!(manual.contains(
+                                "\"$verification_report_bin\" canonical-match \"$verify_report\""
+                            ));
+                            let report_name = if mode == "chaos" {
+                                "verify-seed-17.json"
+                            } else {
+                                "verify.json"
+                            };
+                            assert!(manual.contains(&format!("$cell/captures/{report_name}")));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn manifest(body: &str) -> Vec<(String, i64, Value)> {
         let value: Value = body.parse().expect("test manifest must parse");
