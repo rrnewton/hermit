@@ -77,6 +77,8 @@ env:
   MANIFEST_PLAN_TARBALL: hermit-manifest-plan.tgz
   DEBUG_ARTIFACT: hermit-debug-${{ github.run_id }}
   DEBUG_TARBALL: hermit-portable-debug.tzst
+  NEXTEST_ARTIFACT: hermit-nextest-${{ github.run_id }}
+  NEXTEST_TARBALL: hermit-portable-nextest.tzst
   RELEASE_DBT_ARTIFACT: hermit-release-dbt-${{ github.run_id }}
   RELEASE_ARTIFACT: hermit-release-${{ github.run_id }}
   RELEASE_TARBALL: hermit-portable-release.tzst
@@ -557,6 +559,41 @@ jobs:
           path: ${{ env.DEBUG_TARBALL }}
           if-no-files-found: error
           retention-days: 1
+      - name: Pack prepared Nextest inputs
+        run: |
+          set -euo pipefail
+          nextest_inputs=$(mktemp)
+          trap 'rm -f "$nextest_inputs"' EXIT
+          jq -er --arg root "$PWD/" '
+            [
+              .selections[].binaries[].executable.path,
+              .selections[].runtime_files[].path,
+              .guests[].path
+            ]
+            | unique
+            | if length == 0 then error("prepared Nextest input set is empty")
+              elif all(.[]; startswith($root)) then .[] | ltrimstr($root)
+              else error("prepared Nextest input is outside the repository")
+              end
+          ' target/ci/nextest-binaries/current.json > "$nextest_inputs"
+          while IFS= read -r input; do
+            [[ -f $input && ! -L $input ]] || {
+              echo "prepared Nextest input is absent or a symlink: $input" >&2
+              exit 1
+            }
+          done < "$nextest_inputs"
+          tar --zstd -cf "$NEXTEST_TARBALL" \
+            -T "$nextest_inputs" \
+            target/debug/nextest-cpu-wrapper \
+            target/ci/nextest-binaries
+          ls -lh "$NEXTEST_TARBALL"
+      - name: Upload prepared Nextest inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NEXTEST_ARTIFACT }}
+          path: ${{ env.NEXTEST_TARBALL }}
+          if-no-files-found: error
+          retention-days: 1
 
   # ------------------------------------------ build (release DBT + SaBRe base)
   # Run the constructed release producer independently of the debug producer.
@@ -795,6 +832,11 @@ jobs:
         with:
           name: ${{ env.DEBUG_ARTIFACT }}
           path: .
+      - name: Download prepared Nextest inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.NEXTEST_ARTIFACT }}
+          path: .
       # The completed release tree carries the DBT and LiteInst runtimes plus
       # the constructed E2E artifact. A selective run may skip it only when the
       # selector proved the chosen debug shard needs none of those outputs.
@@ -809,6 +851,8 @@ jobs:
           set -euo pipefail
           tar --zstd -xf "$DEBUG_TARBALL"
           rm -f "$DEBUG_TARBALL"
+          tar --zstd -xf "$NEXTEST_TARBALL"
+          rm -f "$NEXTEST_TARBALL"
           test -x target/debug/hermit
           test -x target/debug/verification-report
           test -x target/debug/nextest-cpu-wrapper
@@ -892,6 +936,11 @@ jobs:
         with:
           name: ${{ env.DEBUG_ARTIFACT }}
           path: .
+      - name: Download prepared Nextest inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.NEXTEST_ARTIFACT }}
+          path: .
       - name: Download full release prebuilt tree
         uses: actions/download-artifact@v4
         with:
@@ -901,8 +950,12 @@ jobs:
         run: |
           set -euo pipefail
           tar --zstd -xf "$DEBUG_TARBALL"; rm -f "$DEBUG_TARBALL"
+          tar --zstd -xf "$NEXTEST_TARBALL"
+          rm -f "$NEXTEST_TARBALL"
           tar --zstd -xf "$RELEASE_TARBALL"; rm -f "$RELEASE_TARBALL"
           test -x target/debug/test-harness
+          test -x target/debug/nextest-cpu-wrapper
+          test -f target/ci/nextest-binaries/current.json
           test -x target/ci/hermit-strict
           ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
       - name: Run strict compatibility node
@@ -979,12 +1032,21 @@ jobs:
         with:
           name: ${{ env.RELEASE_ARTIFACT }}
           path: .
+      - name: Download prepared Nextest inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.NEXTEST_ARTIFACT }}
+          path: .
       - name: Unpack full release prebuilt tree
         run: |
           set -euo pipefail
           tar --zstd -xf "$RELEASE_TARBALL"
           rm -f "$RELEASE_TARBALL"
+          tar --zstd -xf "$NEXTEST_TARBALL"
+          rm -f "$NEXTEST_TARBALL"
           test -x target/release/hermit
+          test -x target/debug/nextest-cpu-wrapper
+          test -f target/ci/nextest-binaries/current.json
           ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
       - name: Run shard nodes (${{ matrix.slug }})
         env:
@@ -1038,6 +1100,7 @@ jobs:
           # product no-result.
           if [[ -e /dev/kvm ]]; then
             sudo chmod a+rw /dev/kvm
+            sudo sysctl -w kernel.perf_event_paranoid=-1
           fi
           sudo install -d -o "$(id -u)" -g "$(id -g)" /test
           sudo install -d -o "$(id -u)" -g "$(id -g)" /results
