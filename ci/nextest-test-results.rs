@@ -18,6 +18,7 @@ use std::process::ExitCode;
 use dagrun::TestResult;
 use dagrun::TestResults;
 use dagrun::TestResultsWriteError;
+use dagrun::structured_test_results_recovery_path;
 use nextest_cpu::AttemptIdentity;
 use nextest_cpu::AttemptRecord;
 use nextest_cpu::BinaryMap;
@@ -528,6 +529,10 @@ fn parse_u64(value: String, name: &str) -> Result<u64, String> {
 enum ProducerError {
     Invalid(String),
     Publication(TestResultsWriteError),
+    PublicationRecovery {
+        primary: TestResultsWriteError,
+        recovery: TestResultsWriteError,
+    },
 }
 
 impl ProducerError {
@@ -537,6 +542,7 @@ impl ProducerError {
             Self::Publication(
                 TestResultsWriteError::Write { .. } | TestResultsWriteError::Publish { .. },
             ) => 75,
+            Self::PublicationRecovery { .. } => 75,
         }
     }
 }
@@ -558,6 +564,28 @@ impl std::fmt::Display for ProducerError {
         match self {
             Self::Invalid(message) => formatter.write_str(message),
             Self::Publication(error) => std::fmt::Display::fmt(error, formatter),
+            Self::PublicationRecovery { primary, recovery } => write!(
+                formatter,
+                "{primary}; structured-test-results-recovery also failed: {recovery}"
+            ),
+        }
+    }
+}
+
+fn publish_with_recovery(report: &TestResults, path: &Path) -> Result<(), ProducerError> {
+    match report.write_current_typed(path) {
+        Ok(()) => Ok(()),
+        Err(primary @ TestResultsWriteError::Invalid(_)) => {
+            Err(ProducerError::Publication(primary))
+        }
+        Err(
+            primary @ (TestResultsWriteError::Write { .. } | TestResultsWriteError::Publish { .. }),
+        ) => {
+            let recovery = structured_test_results_recovery_path(path);
+            match report.write_current_typed(&recovery) {
+                Ok(()) => Err(ProducerError::Publication(primary)),
+                Err(recovery) => Err(ProducerError::PublicationRecovery { primary, recovery }),
+            }
         }
     }
 }
@@ -657,9 +685,7 @@ fn run() -> Result<(), ProducerError> {
         }
     }
     if output != "-" {
-        report
-            .write_current_typed(Path::new(&output))
-            .map_err(ProducerError::Publication)?;
+        publish_with_recovery(&report, Path::new(&output))?;
     }
     if let Some((cpu_report, output)) = cpu_report {
         if output != "-" {
@@ -732,6 +758,85 @@ mod tests {
             assert_eq!(mapped.exit_code(), 75);
             assert_eq!(mapped.to_string(), message);
         }
+    }
+
+    #[test]
+    fn publication_failure_preserves_validated_schema_two_rows_in_recovery() {
+        let scratch = Scratch::new();
+        let report = TestResults::current(
+            2,
+            3,
+            vec![
+                TestResult::new("suite$passes".into(), true, 1).unwrap(),
+                TestResult::new("suite$fails".into(), false, 1).unwrap(),
+            ],
+        )
+        .unwrap();
+        let expected = scratch.0.join("expected.json");
+        publish_with_recovery(&report, &expected).unwrap();
+        assert!(!structured_test_results_recovery_path(&expected).exists());
+
+        let primary = scratch.0.join("primary.json");
+        fs::create_dir(&primary).unwrap();
+        let error = publish_with_recovery(&report, &primary).unwrap_err();
+        assert_eq!(error.exit_code(), 75);
+        match error {
+            ProducerError::Publication(TestResultsWriteError::Publish { path, .. }) => {
+                assert_eq!(path, primary)
+            }
+            other => panic!("expected the original publish error, got {other:?}"),
+        }
+        let recovery = structured_test_results_recovery_path(&primary);
+        assert_eq!(fs::read(&recovery).unwrap(), fs::read(&expected).unwrap());
+        assert_eq!(
+            TestResults::from_json_slice(&fs::read(recovery).unwrap()).unwrap(),
+            report
+        );
+    }
+
+    #[test]
+    fn recovery_failure_reports_both_errors_without_weakening_status() {
+        let scratch = Scratch::new();
+        let report = TestResults::current(
+            1,
+            0,
+            vec![TestResult::new("suite$case".into(), true, 1).unwrap()],
+        )
+        .unwrap();
+        let primary = scratch.0.join("primary.json");
+        fs::create_dir(&primary).unwrap();
+        fs::create_dir(structured_test_results_recovery_path(&primary)).unwrap();
+        let error = publish_with_recovery(&report, &primary).unwrap_err();
+        assert_eq!(error.exit_code(), 75);
+        assert!(matches!(error, ProducerError::PublicationRecovery { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("structured-test-results-publish"),
+            "{message}"
+        );
+        assert!(
+            message.contains("structured-test-results-recovery also failed"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn invalid_report_never_writes_recovery() {
+        let scratch = Scratch::new();
+        let primary = scratch.0.join("primary.json");
+        let invalid = TestResults {
+            executed_tests: 2,
+            filtered_tests: 0,
+            results: Some(vec![TestResult::new("suite$case".into(), true, 1).unwrap()]),
+        };
+        let error = publish_with_recovery(&invalid, &primary).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(matches!(
+            error,
+            ProducerError::Publication(TestResultsWriteError::Invalid(_))
+        ));
+        assert!(!primary.exists());
+        assert!(!structured_test_results_recovery_path(&primary).exists());
     }
 
     struct Scratch(PathBuf);
