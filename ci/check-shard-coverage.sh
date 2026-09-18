@@ -188,12 +188,16 @@ workflow_step_body() {
 debug_artifact_contract() {
     local workflow_text=$1 pack_step unpack_step
     local archive_member='            target/debug/verification-report \'
+    local cpu_wrapper_member='            target/debug/nextest-cpu-wrapper \'
     local nextest_member='            target/ci/nextest-binaries \'
     pack_step=$(workflow_step_body "Pack debug prebuilt tree" "$workflow_text")
     unpack_step=$(workflow_step_body "Unpack debug tree" "$workflow_text")
     grep -Fqx '          test -x target/debug/verification-report' <<<"$pack_step" &&
         grep -Fqx "$archive_member" <<<"$pack_step" &&
         grep -Fqx '          test -x target/debug/verification-report' <<<"$unpack_step" &&
+        grep -Fqx '          test -x target/debug/nextest-cpu-wrapper' <<<"$pack_step" &&
+        grep -Fqx "$cpu_wrapper_member" <<<"$pack_step" &&
+        grep -Fqx '          test -x target/debug/nextest-cpu-wrapper' <<<"$unpack_step" &&
         grep -Fqx '          test -f target/ci/nextest-binaries/current.json' <<<"$pack_step" &&
         grep -Fqx "$nextest_member" <<<"$pack_step" &&
         grep -Fqx '          test -f target/ci/nextest-binaries/current.json' <<<"$unpack_step"
@@ -289,7 +293,8 @@ workflow_e2e_uses_pinned_result_root() {
     local workflow_text=$1 body
     body=$(workflow_job_body e2e "$workflow_text") || return 1
     grep -Fqx '      E2E_RESULT_ROOT: /results/${{ matrix.slug }}' <<<"$body" &&
-        grep -Fqx '          sudo install -d -o "$(id -u)" -g "$(id -g)" /results' <<<"$body"
+        grep -Fqx '          sudo install -d -o "$(id -u)" -g "$(id -g)" /results' <<<"$body" &&
+        grep -Fqx '            sudo chmod a+rw /dev/kvm' <<<"$body"
 }
 
 workflow_e2e_prepares_btrfs() {
@@ -394,6 +399,14 @@ elif debug_artifact_contract "$omitted_artifact"; then
     echo "check-shard-coverage.sh: FAIL — artifact guard accepted a planted missing verification-report member" >&2
     status=1
 fi
+omitted_cpu_wrapper=${workflow_text/$'            target/debug/nextest-cpu-wrapper \\\n'/}
+if [[ $omitted_cpu_wrapper == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — nextest CPU-wrapper artifact omission fixture did not change the workflow" >&2
+    status=1
+elif debug_artifact_contract "$omitted_cpu_wrapper"; then
+    echo "check-shard-coverage.sh: FAIL — artifact guard accepted a planted missing nextest CPU wrapper" >&2
+    status=1
+fi
 omitted_nextest=${workflow_text/$'            target/ci/nextest-binaries \\\n'/}
 if [[ $omitted_nextest == "$workflow_text" ]]; then
     echo "check-shard-coverage.sh: FAIL — prepared-nextest artifact omission fixture did not change the workflow" >&2
@@ -461,6 +474,15 @@ if [[ $wrong_result_root == "$workflow_text" ]]; then
     status=1
 elif workflow_wiring_contract "$wrong_result_root"; then
     echo "check-shard-coverage.sh: FAIL — workflow guard accepted a hosted result root outside /results" >&2
+    status=1
+fi
+kvm_access='            sudo chmod a+rw /dev/kvm'
+missing_kvm_access=${workflow_text/"$kvm_access"/}
+if [[ $missing_kvm_access == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — KVM-access mutation did not change the workflow fixture" >&2
+    status=1
+elif workflow_wiring_contract "$missing_kvm_access"; then
+    echo "check-shard-coverage.sh: FAIL — workflow guard accepted an E2E job that cannot open /dev/kvm" >&2
     status=1
 fi
 btrfs_setup_name="      - name: Provide Btrfs sysfs state for system-utils"
