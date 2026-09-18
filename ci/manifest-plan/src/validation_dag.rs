@@ -685,10 +685,10 @@ fn materialize_hosted_completion_budgets(cfg: &mut DagConfig) -> Result<(), Stri
 }
 
 /// Keep host capability differences explicit without narrowing canonical local
-/// validation. These exact cases need PMU/CPUID facilities or stable LiteInst
-/// read-chunk boundaries that GitHub's hosted runner does not provide. The
-/// supplemental lane records the difference in its committed command and
-/// description; local validate continues to execute every case.
+/// validation. These exact cases need host facilities or kernel behavior that
+/// GitHub's hosted runner does not provide. The supplemental lane records the
+/// difference in its committed command and description; local validate
+/// continues to execute every case.
 fn materialize_hosted_capability_exclusions(cfg: &mut DagConfig) -> Result<(), String> {
     const EXCLUSIONS: &[(&str, u64, &[&str], &str)] = &[
         (
@@ -717,9 +717,35 @@ fn materialize_hosted_capability_exclusions(cfg: &mut DagConfig) -> Result<(), S
         ),
         (
             "test.liteinst_strict_on_host",
-            23,
-            &["liteinst_strict_verify_shell_and_entropy_consumer"],
-            "Run 35347497730 reproduced matching deterministic stdout but different LiteInst read-buffer chunk hashes on the GitHub-hosted kernel. This exact strict entropy-consumer case remains blocking in canonical local validate; the other 23 LiteInst strict cases remain blocking here.",
+            22,
+            &[
+                "liteinst_strict_verify_shell_and_entropy_consumer",
+                "liteinst_strict_verify_semantic_file_and_sqlite_utilities",
+            ],
+            "Runs 35347497730 and 35354614446 reproduced matching semantic stdout but different LiteInst read-buffer chunk hashes on the GitHub-hosted kernel in these exact entropy/file-consumer cases. Both remain blocking in canonical local validate; the other 22 LiteInst strict cases remain blocking here.",
+        ),
+        (
+            "test.sabre_examples_on_host",
+            2,
+            &[
+                "sabre_libc_getrandom_is_deterministic",
+                "sabre_non_racy_examples_verify_current_envelope",
+                "sabre_root_pid_matches_ptrace",
+                "sabre_scheduler_empty_info_precedes_fallback_completed_info",
+            ],
+            "Run 35354614446 measured the GitHub-hosted vDSO containing RIP-relative instruction 0x80, which the pinned SaBRe rewriter refuses before any guest syscall reaches Detcore. These four exact backend-execution cases remain blocking in canonical local validate; the two SaBRe contract cases that do not hit this hosted vDSO remain blocking here.",
+        ),
+        (
+            "test.detcore_misc_on_host",
+            26,
+            &["vfork_parent_resumes_after_child_exec"],
+            "Runs 35347497730 and 35354614446 reproduced the same hosted-kernel ptrace state failure in this exact vfork lifecycle case, including after the outer PID namespace was removed. This case remains blocking in canonical local validate; the other 26 detcore-misc cases remain blocking here.",
+        ),
+        (
+            "test.hermit_unit_on_host",
+            706,
+            &["e9patch::tests::cache_directory_is_private_and_not_a_symlink"],
+            "The GitHub wrapper intentionally maps only the runner UID to root. The host filesystem root is therefore overflow-owned inside that user namespace, so this exact cache-ancestor ownership fixture refuses before testing the private cache directory. It remains blocking in canonical local validate; the other 706 Hermit unit cases remain blocking here.",
         ),
     ];
 
@@ -734,10 +760,10 @@ fn materialize_hosted_capability_exclusions(cfg: &mut DagConfig) -> Result<(), S
                 return Err(format!("{tag} already contains hosted exclusion {test}"));
             }
         }
-        // cli_on_host already has the Nextest/libtest separator for its local
-        // product skips. The other two commands may contain an unrelated `--`
-        // in an outer helper, so do not infer this boundary from raw text.
-        if *tag != "test.cli_on_host" {
+        // These two nodes already have the Nextest/libtest separator for their
+        // local product skips. Other commands may contain unrelated `--`
+        // tokens in an outer helper, so keep this an explicit node property.
+        if !matches!(*tag, "test.cli_on_host" | "test.detcore_misc_on_host") {
             step.cmd.push_str(" --");
         }
         for test in *tests {
@@ -2898,8 +2924,34 @@ sys.exit(37)
             (
                 "test.liteinst_strict_on_host",
                 "test.liteinst_strict",
-                "23",
-                &["liteinst_strict_verify_shell_and_entropy_consumer"][..],
+                "22",
+                &[
+                    "liteinst_strict_verify_shell_and_entropy_consumer",
+                    "liteinst_strict_verify_semantic_file_and_sqlite_utilities",
+                ][..],
+            ),
+            (
+                "test.sabre_examples_on_host",
+                "test.sabre_examples",
+                "2",
+                &[
+                    "sabre_libc_getrandom_is_deterministic",
+                    "sabre_non_racy_examples_verify_current_envelope",
+                    "sabre_root_pid_matches_ptrace",
+                    "sabre_scheduler_empty_info_precedes_fallback_completed_info",
+                ][..],
+            ),
+            (
+                "test.detcore_misc_on_host",
+                "test.detcore_misc",
+                "26",
+                &["vfork_parent_resumes_after_child_exec"][..],
+            ),
+            (
+                "test.hermit_unit_on_host",
+                "test.hermit_unit",
+                "706",
+                &["e9patch::tests::cache_directory_is_private_and_not_a_symlink"][..],
             ),
         ] {
             let hosted = committed
@@ -2928,6 +2980,13 @@ sys.exit(37)
             for test in excluded {
                 assert_eq!(hosted.cmd.matches(test).count(), 1, "{hosted_tag}: {test}");
                 assert!(!local.cmd.contains(test), "{local_tag} excluded {test}");
+            }
+            if hosted_tag == "test.detcore_misc_on_host" {
+                assert_eq!(
+                    hosted.cmd.matches(" -- ").count(),
+                    1,
+                    "{hosted_tag} must retain exactly one libtest separator"
+                );
             }
         }
     }
