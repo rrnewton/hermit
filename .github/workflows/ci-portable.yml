@@ -534,6 +534,7 @@ jobs:
           install -Dm755 target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/debug/verification-report
+          test -x target/debug/nextest-cpu-wrapper
           test -x target/ci/bin/cargo-nextest
           test -f target/ci/nextest-binaries/current.json
           tar --zstd -cf "$DEBUG_TARBALL" \
@@ -541,6 +542,7 @@ jobs:
             target/debug/test-harness \
             target/debug/hermit-manifest-plan \
             target/debug/verification-report \
+            target/debug/nextest-cpu-wrapper \
             target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so \
             target/ci/bin/cargo-nextest \
@@ -809,6 +811,7 @@ jobs:
           rm -f "$DEBUG_TARBALL"
           test -x target/debug/hermit
           test -x target/debug/verification-report
+          test -x target/debug/nextest-cpu-wrapper
           test -f target/debug/deps/libdetcore_dbt.so
           test -f target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
@@ -1028,6 +1031,13 @@ jobs:
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          # GitHub exposes nested virtualization but leaves /dev/kvm readable
+          # only by root. These shards contain declared KVM cells, so make the
+          # device usable instead of misclassifying permission denial as a
+          # product no-result.
+          if [[ -e /dev/kvm ]]; then
+            sudo chmod a+rw /dev/kvm
           fi
           sudo install -d -o "$(id -u)" -g "$(id -g)" /test
           sudo install -d -o "$(id -u)" -g "$(id -g)" /results
