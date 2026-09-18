@@ -1279,6 +1279,8 @@ fn portable_shard_step<'a>(
 
 const PORTABLE_PREFLIGHT_CRITICAL_PATH_SECONDS: u64 = 3780;
 const PORTABLE_PREFLIGHT_OVERHEAD_SECONDS: u64 = 420;
+const PORTABLE_CHECKS_CRITICAL_PATH_SECONDS: u64 = 2400;
+const PORTABLE_CHECKS_OVERHEAD_SECONDS: u64 = 600;
 const PRIVILEGED_WORKFLOW_OVERHEAD_SECONDS: u64 = 300;
 
 fn audit_portable_preflight_budget(
@@ -1314,6 +1316,41 @@ fn audit_portable_preflight_budget(
     if job_bound < required {
         return Err(format!(
             "portable preflight job {job_bound}s must cover its {critical_path}s constructed DAG critical path plus at least {PORTABLE_PREFLIGHT_OVERHEAD_SECONDS}s for checkout, package installation, artifact transfer, and teardown"
+        ));
+    }
+    Ok(())
+}
+
+fn audit_portable_checks_budget(
+    workflow: &YamlValue,
+    portable: &dagrun::DagConfig,
+    shards: &JsonValue,
+) -> Result<(), String> {
+    let check_nodes = shards["check_nodes"]
+        .as_array()
+        .ok_or_else(|| "portable shard map has no check_nodes array".to_string())?
+        .iter()
+        .map(|node| {
+            node.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "portable check_nodes contains a non-string node".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected = dagrun::select_steps_by_tags(portable, &check_nodes, true)
+        .map_err(|error| format!("cannot select portable checks closure: {error}"))?;
+    let critical_path = dag_critical_path(&selected)?;
+    if critical_path != PORTABLE_CHECKS_CRITICAL_PATH_SECONDS {
+        return Err(format!(
+            "portable checks critical path changed from {PORTABLE_CHECKS_CRITICAL_PATH_SECONDS}s to {critical_path}s"
+        ));
+    }
+    let job_bound = workflow_job_timeout(workflow, "checks")? * 60;
+    let required = critical_path
+        .checked_add(PORTABLE_CHECKS_OVERHEAD_SECONDS)
+        .ok_or_else(|| "portable checks required budget overflowed".to_string())?;
+    if job_bound < required {
+        return Err(format!(
+            "portable checks job {job_bound}s must cover its {critical_path}s constructed DAG critical path plus at least {PORTABLE_CHECKS_OVERHEAD_SECONDS}s for checkout, package installation, artifact transfer, and teardown"
         ));
     }
     Ok(())
@@ -1380,6 +1417,7 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
     )
     .map_err(|e| format!("invalid portable shard map: {e}"))?;
     audit_portable_preflight_budget(&portable_workflow, &portable, &shards)?;
+    audit_portable_checks_budget(&portable_workflow, &portable, &shards)?;
     let portable_steps = portable
         .steps
         .iter()
@@ -2815,6 +2853,7 @@ report.write_bytes((root/'verification.json').read_bytes())
             super::parse_yaml(&root.join(".github/workflows/ci-portable.yml"))
                 .expect("portable workflow");
         super::audit_portable_preflight_budget(&portable_workflow, &portable, &shards).unwrap();
+        super::audit_portable_checks_budget(&portable_workflow, &portable, &shards).unwrap();
         portable_workflow["jobs"]["preflight"]["timeout-minutes"] =
             serde_yaml::to_value(10_u64).unwrap();
         let error = super::audit_portable_preflight_budget(&portable_workflow, &portable, &shards)
@@ -2822,6 +2861,16 @@ report.write_bytes((root/'verification.json').read_bytes())
         assert!(
             error.contains(
                 "portable preflight job 600s must cover its 3780s constructed DAG critical path plus at least 420s"
+            ),
+            "{error}"
+        );
+        portable_workflow["jobs"]["checks"]["timeout-minutes"] =
+            serde_yaml::to_value(49_u64).unwrap();
+        let error = super::audit_portable_checks_budget(&portable_workflow, &portable, &shards)
+            .unwrap_err();
+        assert!(
+            error.contains(
+                "portable checks job 2940s must cover its 2400s constructed DAG critical path plus at least 600s"
             ),
             "{error}"
         );

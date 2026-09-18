@@ -1169,11 +1169,22 @@ test:
                         leaked_root.display()
                     ),
                 ] {
+                    let relative_only = permitted.starts_with("-fdebug-prefix-map=hermit-cli/");
                     let mut mapped = option_fixture.clone();
                     *mapped.pointer_mut(field).unwrap() = Value::String(permitted);
                     let mapped = serde_json::to_string(&mapped).unwrap();
-                    require_root_independent_exports(&vec![mapped; exports.len()], &checked_roots)
-                        .unwrap();
+                    // The sibling spelling is relative only to leaked_root.
+                    // Hosted validation deliberately puts TMPDIR below the
+                    // checkout, so an alias sibling there still is an absolute
+                    // descendant of the checkout root and must remain refused
+                    // by that separate root. Test the component boundary
+                    // against the root whose textual prefix this case varies.
+                    let roots = if relative_only {
+                        checked_roots.as_slice()
+                    } else {
+                        std::slice::from_ref(&leaked_root)
+                    };
+                    require_root_independent_exports(&vec![mapped; exports.len()], roots).unwrap();
                 }
                 let mut mapped = option_fixture.clone();
                 *mapped.pointer_mut(field).unwrap() = Value::String(format!(

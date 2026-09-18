@@ -41,13 +41,21 @@ for required in \
     'export PATH="$ROOT_DIR/ci/rust-script-bin:$PATH"' \
     'export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$ROOT_DIR/target/ci/rust-scripts"' \
     'export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1' \
-    'exec unshare --user --map-root-user --pid --fork --uts --net --mount'
+    'mkdir -p "$ROOT_DIR/target/tmp"' \
+    'exec unshare --user --map-root-user --uts --net --mount' \
+    'ip link set lo up' \
+    'mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /tmp' \
+    'export TMPDIR=/tmp'
 do
     if ! grep -Fq "$required" <<<"$hosted_runner_text"; then
         echo "check-shard-coverage.sh: FAIL — hosted namespace wrapper omitted required bootstrap: $required" >&2
         exit 1
     fi
 done
+if grep -Eq -- '--pid|--fork' <<<"$hosted_runner_text"; then
+    echo "check-shard-coverage.sh: FAIL — hosted wrapper reintroduced an outer PID namespace" >&2
+    exit 1
+fi
 
 # Ask the same plan constructor the runner uses. The command is inert, may run
 # inside validate, and emits its JSON as the first stdout line.

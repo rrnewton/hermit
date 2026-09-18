@@ -411,7 +411,8 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
         if !command.contains(marker) {
             continue;
         }
-        let parsed = split_arguments(&command_arguments(&command, marker)?)?;
+        let parsed = split_arguments(&command_arguments(&command, marker)?)
+            .map_err(|error| format!("{tag}: {error}"))?;
         if parsed.build != expected {
             return Err(format!(
                 "{tag} command has Cargo selection {:?}, declared {expected:?}",
@@ -538,7 +539,14 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "158");
+            assert_eq!(
+                step.env["NEXTEST_EXPECTED_EXECUTED"],
+                if tag.ends_with("_on_host") {
+                    "153"
+                } else {
+                    "158"
+                }
+            );
 
             let mut omitted_execution = step.clone();
             omitted_execution.cmd = omitted_execution.cmd.replace("--test child_time_rpc ", "");
