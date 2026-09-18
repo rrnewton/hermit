@@ -15,30 +15,16 @@
  * ~200ms window (twenty 10ms sleeps) during which SIGALRM should fire roughly
  * every 10ms. It counts the deliveries and prints the total.
  *
- * WHAT THIS DEMONSTRATES / GAP EXPOSED
- *   Detcore has no dedicated setitimer/getitimer handler. Under --strict the
- *   syscall is not rejected (no "unsupported syscall" abort), but the timer's
- *   expiration signal (SIGALRM) is NOT delivered against the virtual clock --
- *   exactly the same limitation Detcore documents for the POSIX per-process
- *   timer family (timer_create: "arming tracked against the virtual clock but
- *   expiration signals are not delivered"). So the guest observes ZERO SIGALRM
- *   deliveries under --strict, versus ~10-20 when run natively.
- *
- *   The zero-delivery outcome is itself DETERMINISTIC (it reproduces run to run
- *   and passes `--verify`), so this is a functional-completeness gap, not a
- *   nondeterminism bug: setitimer silently fails to fire rather than firing at
- *   an uncontrolled host-timed moment.
- *
  * CONTRACT
- *   Native:        deliveries >= 1  (timer fires; exact count host-timing bound)
- *   Hermit --strict (today): deliveries == 0, deterministically.
- *   Hermit --strict (goal):  deliveries deterministic and > 0, driven by the
- *                            virtual clock, matching the arming period.
+ *   Native: deliveries >= 1 (the exact count depends on host timing).
+ *   Hermit --strict: deliveries must be positive. Verification additionally
+ *   requires the same count, output, exit status and canonical INFO records
+ *   across repeated executions of the selected backend.
  *
- * The program always exits 0 and prints the observed count on the last line as
- *   "SIGALRM deliveries: <N>"
- * so a wrapper (see tests/standalone/strict_setitimer.sh) can compare the
- * native and --strict counts and assert the determinism verdict.
+ * A previous characterization accepted zero deliveries and returned success;
+ * that could make a deterministic failure to deliver signals appear green.
+ * Zero deliveries now fails the guest. The shared manifest's existing backend
+ * selections and execution bounds remain unchanged.
  */
 
 #include <signal.h>
@@ -99,5 +85,5 @@ int main(void) {
   setitimer(ITIMER_REAL, &off, NULL);
 
   printf("SIGALRM deliveries: %d\n", (int)deliveries);
-  return 0;
+  return deliveries > 0 ? 0 : 4;
 }

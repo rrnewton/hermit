@@ -34,7 +34,6 @@ use crate::scheduler::Priority;
 use crate::scheduler::entropy_to_priority;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::register_posix_timer;
-use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
 use crate::types::LogicalTime;
@@ -60,6 +59,22 @@ fn timespec_to_ns(ts: libc::timespec) -> u64 {
     let secs = ts.tv_sec.max(0) as u64;
     let nsec = ts.tv_nsec.max(0) as u64;
     secs.saturating_mul(1_000_000_000).saturating_add(nsec)
+}
+
+// Do not turn invalid arguments into an unsupported-delivery refusal. This
+// check is KVM-specific here to preserve the other backends' existing behavior.
+fn validate_kvm_posix_timer_request(
+    flags: libc::c_int,
+    value: &libc::itimerspec,
+) -> Result<(), Errno> {
+    if flags & !libc::TIMER_ABSTIME != 0
+        || [value.it_value, value.it_interval]
+            .iter()
+            .any(|time| time.tv_sec < 0 || !(0..1_000_000_000).contains(&time.tv_nsec))
+    {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
 }
 
 /// Inverse of [`timespec_to_ns`].
@@ -298,7 +313,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: NanosleepFamily,
     ) -> Result<i64, Error> {
         let target_time = time_from_resources(&request).expect("a sleepuntil resource request");
-        match resource_request(guest, request).await {
+        match crate::tool_global::parked_wait_request(
+            guest,
+            request,
+            crate::scheduler::parked::ParkedWaitPolicy::NanosleepNoHandlerRestart {
+                absolute_deadline: target_time,
+            },
+        )
+        .await
+        {
             ResumeStatus::Normal => Ok(0),
             ResumeStatus::Signaled(_) => {
                 let now = thread_observe_time(guest).await;
@@ -504,6 +527,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let id = call.timerid();
         let new_ptr = call.new_value().ok_or(Errno::EINVAL)?;
         let new: libc::itimerspec = guest.memory().read_value(new_ptr)?;
+        if self.cfg.backend_is_kvm {
+            validate_kvm_posix_timer_request(call.flags(), &new)?;
+        }
         let interval_ns = timespec_to_ns(new.it_interval);
         let value_ns = timespec_to_ns(new.it_value);
 
@@ -517,14 +543,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(now + Duration::from_nanos(value_ns))
         };
 
-        let (old, signal_number) = {
+        let (old_remaining_ns, old_interval_ns, signal_number) = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
-            let old = timers.settime(id, interval_ns, deadline, now);
-            let signal = timers.signal(id);
-            (old, signal)
+            // The KVM timer bridge publishes SIGALRM with SI_KERNEL. It cannot
+            // deliver POSIX SI_TIMER notifications. Refuse a nonzero signaling
+            // arm before mutation or old_value copyout, rather than accept it
+            // and fail when its deadline becomes due. SIGEV_NONE has no signal
+            // registration and remains supported, as do queries and disarms.
+            timers.settime_with_signal_delivery(
+                id,
+                interval_ns,
+                deadline,
+                now,
+                !self.cfg.backend_is_kvm,
+            )?
         };
-        let (old_remaining_ns, old_interval_ns) = old.ok_or(Errno::EINVAL)?;
-        let signal_number = signal_number.ok_or(Errno::EINVAL)?;
 
         if let Some(old_ptr) = call.old_value() {
             let old_spec = libc::itimerspec {
@@ -638,6 +671,57 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kvm_posix_timer_validates_arguments_before_capability() {
+        let zero = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let valid = libc::itimerspec {
+            it_value: zero,
+            it_interval: zero,
+        };
+        assert_eq!(validate_kvm_posix_timer_request(0, &valid), Ok(()));
+        assert_eq!(
+            validate_kvm_posix_timer_request(libc::TIMER_ABSTIME, &valid),
+            Ok(())
+        );
+        assert_eq!(
+            validate_kvm_posix_timer_request(2, &valid),
+            Err(Errno::EINVAL)
+        );
+        for time in [
+            libc::timespec {
+                tv_sec: -1,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: -1,
+            },
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000_000,
+            },
+        ] {
+            for request in [
+                libc::itimerspec {
+                    it_value: time,
+                    it_interval: zero,
+                },
+                libc::itimerspec {
+                    it_value: zero,
+                    it_interval: time,
+                },
+            ] {
+                assert_eq!(
+                    validate_kvm_posix_timer_request(0, &request),
+                    Err(Errno::EINVAL)
+                );
+            }
+        }
+    }
 
     #[test]
     fn timex_policy_distinguishes_queries_from_mutations() {
