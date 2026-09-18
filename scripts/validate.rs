@@ -1862,12 +1862,16 @@ fn self_test_runner_log_probe(logs: &Path, outer: &Path) -> Result<(), String> {
         10, 10, 64 * 1024 * 1024,
     );
     // Real production labels deliberately collide with the seeded outer files.
+    let mut skipped = step("post", "must_not_run", "exit 99");
+    skipped.deps = vec!["setup.manifest_plan".into()];
     let cfg = validate_plan::config_from(vec![
         step("pre", "submodules", "printf 'fixture pass\\n'"),
         step("setup", "manifest_plan", "printf 'fixture failure\\n'; exit 23"),
+        skipped,
     ], "runner log isolation fixture");
     let result = run_lane_once(&cfg, 1, true, 0, None, &logs.join("driver.log"), None, false);
-    if !result.complete || result.ok || result.run_timed_out || !result.skipped.is_empty()
+    if result.complete || result.ok || result.run_timed_out
+        || result.skipped != ["post.must_not_run".to_string()]
         || result.outcomes.len() != 2 || result.attempts.len() != 2
     {
         return Err(format!("runner log isolation: terminal result changed: complete={} ok={} outcomes={:?} skipped={:?}",
@@ -1891,14 +1895,46 @@ fn self_test_runner_log_probe(logs: &Path, outer: &Path) -> Result<(), String> {
         .map(serde_json::from_slice::<serde_json::Value>)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("runner log isolation: malformed private journal: {error}"))?;
-    for (tag, ok) in [("pre.submodules", "true"), ("setup.manifest_plan", "false")] {
+    if dagrun::require_step_end_ok(&serde_json::json!({
+        "event": "step_end",
+        "ok": "false",
+    }))
+    .is_ok()
+    {
+        return Err("runner log isolation: string `false` journal verdict was accepted".into());
+    }
+    let ends = rows.iter().filter(|row| row["event"] == "step_end").collect::<Vec<_>>();
+    let skips = rows.iter().filter(|row| row["event"] == "step_skip").collect::<Vec<_>>();
+    let terminal_steps = ends.iter().chain(&skips)
+        .filter_map(|row| row["step"].as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_terminal_steps = [
+        "pre.submodules",
+        "setup.manifest_plan",
+        "post.must_not_run",
+    ].into_iter().collect::<BTreeSet<_>>();
+    if ends.len() + skips.len() != expected_terminal_steps.len()
+        || terminal_steps != expected_terminal_steps
+    {
+        return Err(format!("runner log isolation: incomplete terminal accounting: {terminal_steps:?}"));
+    }
+    for (tag, ok) in [("pre.submodules", true), ("setup.manifest_plan", false)] {
         let starts = rows.iter().filter(|row| row["event"] == "step_start" && row["step"] == tag).count();
-        let ends = rows.iter().filter(|row| row["event"] == "step_end" && row["step"] == tag).collect::<Vec<_>>();
-        if starts != 1 || ends.len() != 1 || ends[0]["ok"] != ok
-            || ends[0]["timed_out"] != "false" || ends[0]["cpu_timed_out"] != "false"
+        let matching_ends = ends.iter().filter(|row| row["step"] == tag).collect::<Vec<_>>();
+        let observed_ok = matching_ends.first()
+            .ok_or_else(|| format!("runner log isolation: no terminal journal record for {tag}"))
+            .and_then(|row| dagrun::require_step_end_ok(row)
+                .map_err(|error| format!("runner log isolation: {tag}: {error}")))?;
+        if starts != 1 || matching_ends.len() != 1 || observed_ok != ok
+            || matching_ends[0]["timed_out"] != "false" || matching_ends[0]["cpu_timed_out"] != "false"
         {
             return Err(format!("runner log isolation: missing or changed start/end record for {tag}"));
         }
+    }
+    if skips.len() != 1 || skips[0]["step"] != "post.must_not_run"
+        || skips[0]["reason"] != "dependency_failed"
+    {
+        return Err(format!("runner log isolation: missing or changed skip record: {skips:?}"));
     }
     for name in ["journal.jsonl", "pre.submodules.log", "setup.manifest_plan.log"] {
         if read(&outer.join(name))? != RUNNER_LOG_SENTINEL {
@@ -2124,6 +2160,7 @@ fn self_test() -> Result<(), String> {
             filtered_tests: None,
             test_results: None,
             test_results_error: None,
+            test_results_error_kind: None,
             returncode: Some(if ok { 0 } else { 1 }),
             oomed: false,
             oom_kills: 0,
@@ -5696,13 +5733,84 @@ fn local_scorecard_writeback(
             .arg("--results")
             .arg(result_root)
             .current_dir(root)
-            .status()
+            .output()
             .map_err(|error| format!("cannot run {}: {error}", script.display()))
-            .and_then(|status| {
-                status.success().then_some(()).ok_or_else(|| {
-                    format!("{} observe-results refused with {status}", script.display())
-                })
+            .and_then(|output| {
+                // The child's streams used to be INHERITED, which is the only
+                // reason its explanation ever reached the run log. Capturing
+                // them must not take that away, so re-emit verbatim before
+                // deciding anything.
+                let _ = std::io::stdout().write_all(&output.stdout);
+                let _ = std::io::stderr().write_all(&output.stderr);
+                if output.status.success() {
+                    return Ok(());
+                }
+                Err(format!(
+                    "{} observe-results refused with {}: {}",
+                    script.display(),
+                    output.status,
+                    refusal_detail(&output.stderr, &output.stdout),
+                ))
             }),
+    )
+}
+
+/// The largest child explanation carried into the durable record.
+///
+/// Sized from measurement rather than taste: the refusal that stranded seven
+/// hours of validation on 2026-09-17 was a SINGLE 407-byte line. This is an
+/// order of magnitude above that, which is room for a multi-line refusal and
+/// still bounded, because the value lands in an append-only run handle.
+const REFUSAL_DETAIL_MAX_BYTES: usize = 4096;
+
+/// The child's own words, bounded, for a record that otherwise keeps only a
+/// number.
+///
+/// ⚠️ THE EXIT STATUS ALONE IS NOT A CAUSE, and recording only the status is
+/// what cost a day: a scorecard write-back refused with `exit status: 2`, the
+/// run handle kept exactly that, and a reader could not tell a data refusal
+/// from a usage error. The explanation existed the whole time, in a log nobody
+/// joins to the handle.
+///
+/// Truncation is STATED with the true byte count. A silently shortened cause is
+/// the same defect one size smaller, and the tail is kept rather than the head
+/// because a refusal is what a tool says last.
+fn refusal_detail(stderr: &[u8], stdout: &[u8]) -> String {
+    let collapse = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    // stderr first, because that is where a refusal belongs; stdout is the
+    // fallback for a tool that explains itself on the wrong stream rather than
+    // not at all.
+    let (stream, text) = match collapse(stderr) {
+        message if !message.is_empty() => ("stderr", message),
+        _ => ("stdout", collapse(stdout)),
+    };
+    if text.is_empty() {
+        // Not a cosmetic case. A tool that refuses and says nothing is a
+        // finding, and the record has to be able to report that rather than
+        // leave the field looking merely unset.
+        return "the tool refused without writing any explanation".into();
+    }
+    if text.len() <= REFUSAL_DETAIL_MAX_BYTES {
+        return format!("{stream}: {text}");
+    }
+    // The furthest-back byte offset that still fits, rounded UP to a character
+    // boundary. Walking back from the end instead returns the NEAREST offset
+    // that fits, which is a one-character tail -- the test caught exactly that,
+    // and a truncation that silently keeps the wrong end is the defect this
+    // function exists to remove, one size smaller.
+    let tail = (text.len() - REFUSAL_DETAIL_MAX_BYTES..text.len())
+        .find(|index| text.is_char_boundary(*index))
+        .unwrap_or(text.len());
+    format!(
+        "{stream} (last {} of {} bytes): {}",
+        text.len() - tail,
+        text.len(),
+        &text[tail..]
     )
 }
 
@@ -10290,6 +10398,7 @@ fn summary_listing_bracket() -> Result<String, String> {
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,
@@ -11778,6 +11887,8 @@ struct NodeAttempt {
     test_results: Option<Vec<dagrun::TestResult>>,
     /// Required-result refusal retained independently of the outer failure reason.
     test_results_error: Option<String>,
+    /// Typed result-import observation; absent historical kinds stay unknown.
+    test_results_error_kind: Option<dagrun::TestResultsErrorKind>,
 }
 
 fn attempt_is_no_result(attempt: &NodeAttempt) -> bool {
@@ -11871,6 +11982,7 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
         failure_class,
         test_results: outcome.test_results.clone(),
         test_results_error: outcome.test_results_error.clone(),
+        test_results_error_kind: outcome.test_results_error_kind,
     }
 }
 
@@ -11901,6 +12013,7 @@ fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
         failure_detail: Some("no completion payload was reported for this node".into()),
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
     }
 }
 
@@ -16565,6 +16678,7 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         filtered_tests: Some(0),
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -16619,6 +16733,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         filtered_tests,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -16810,6 +16925,9 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
     if let Some(error) = &outcome.test_results_error {
         gate["test_results_error"] = serde_json::json!(error);
     }
+    if let Some(kind) = outcome.test_results_error_kind {
+        gate["test_results_error_kind"] = serde_json::json!(kind.value());
+    }
     if let Some(failure_class) = outcome_failure_class(outcome) {
         gate["failure_class"] = serde_json::json!(failure_class);
         if failure_class == FailureClass::NoResult && !outcome.reason.is_empty() {
@@ -16871,6 +16989,9 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
             if let Some(error) = &a.test_results_error {
                 attempt["test_results_error"] = serde_json::json!(error);
             }
+            if let Some(kind) = a.test_results_error_kind {
+                attempt["test_results_error_kind"] = serde_json::json!(kind.value());
+            }
             if let Some(failure_class) = a.failure_class {
                 attempt["failure_class"] = serde_json::json!(failure_class);
             }
@@ -16904,6 +17025,13 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
             gate.as_object_mut()
                 .expect("ledger gate must remain a JSON object")
                 .remove("test_results_error");
+        }
+        if let Some(kind) = attempt.test_results_error_kind {
+            gate["test_results_error_kind"] = serde_json::json!(kind.value());
+        } else {
+            gate.as_object_mut()
+                .expect("ledger gate must remain a JSON object")
+                .remove("test_results_error_kind");
         }
         gate["aborted"] = serde_json::json!(attempt.aborted);
         gate["real_seconds"] = serde_json::json!(attempt.reported.then_some(attempt.duration_s));
@@ -16996,13 +17124,25 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
         );
         if bits & 8 != 0 {
             outcome.test_results_error = Some(format!("typed results refused in fixture {bits}"));
+            outcome.test_results_error_kind = Some(
+                [
+                    dagrun::TestResultsErrorKind::Missing,
+                    dagrun::TestResultsErrorKind::ReadIo,
+                    dagrun::TestResultsErrorKind::InvalidReport,
+                ][usize::from(bits) % 3],
+            );
         }
         let expected_error = outcome
             .test_results_error
             .as_ref()
             .map(|error| serde_json::json!(error));
+        let expected_kind = outcome
+            .test_results_error_kind
+            .map(|kind| serde_json::json!(kind.value()));
         let first = reported_attempt(&outcome, 1);
-        if first.test_results_error != outcome.test_results_error || first.reason != outcome.reason
+        if first.test_results_error != outcome.test_results_error
+            || first.test_results_error_kind != outcome.test_results_error_kind
+            || first.reason != outcome.reason
         {
             return Err(format!(
                 "typed gate {bits}: attempt conflated primary and result refusal"
@@ -17025,6 +17165,7 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
         }
         for row in [&fallback, &reported, &reported["attempts"][0]] {
             if row.get("test_results_error") != expected_error.as_ref()
+                || row.get("test_results_error_kind") != expected_kind.as_ref()
                 || row["reason"] != serde_json::json!(outcome.reason)
             {
                 return Err(format!(
@@ -17061,6 +17202,9 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
             if row.get("test_results_error").is_some()
                 || row["attempts"][1].get("test_results_error").is_some()
                 || row["attempts"][0].get("test_results_error") != expected_error.as_ref()
+                || row.get("test_results_error_kind").is_some()
+                || row["attempts"][1].get("test_results_error_kind").is_some()
+                || row["attempts"][0].get("test_results_error_kind") != expected_kind.as_ref()
             {
                 return Err(format!(
                     "typed gate {bits}: absent latest diagnostic inherited stale data: {row}"
@@ -17082,6 +17226,7 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
         let mut retry = outcome.clone();
         retry.reason = format!("independent outer retry reason {bits}");
         retry.test_results_error = Some(format!("distinct result refusal on retry {bits}"));
+        retry.test_results_error_kind = Some(dagrun::TestResultsErrorKind::ReadIo);
         let mut foreign = retry.clone();
         foreign.tag = "test.unrelated-diagnostic".into();
         foreign.test_results_error =
@@ -17099,6 +17244,9 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
             || retained["attempts"][0].get("test_results_error") != expected_error.as_ref()
             || retained["attempts"][1].get("test_results_error") != Some(&retry_error)
             || retained.get("test_results_error") != Some(&retry_error)
+            || retained["test_results_error_kind"] != "read_io"
+            || retained["attempts"][1]["test_results_error_kind"] != "read_io"
+            || retained["attempts"][0].get("test_results_error_kind") != expected_kind.as_ref()
             || retained["reason"] != serde_json::json!(retry.reason)
             || retained["attempts"][0]["reason"] != serde_json::json!(outcome.reason)
         {
@@ -17114,7 +17262,11 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
                     .map_err(|error| format!("typed gate reader refused emitted row: {error}"))?;
             let restored = serde_json::to_value(parsed)
                 .map_err(|error| format!("typed gate reader could not serialize row: {error}"))?;
-            for field in fields.into_iter().chain(["attempts", "test_results_error"]) {
+            for field in fields.into_iter().chain([
+                "attempts",
+                "test_results_error",
+                "test_results_error_kind",
+            ]) {
                 if row.get(field) != restored.get(field) {
                     return Err(format!(
                         "typed gate shared reader lost {field}: before={row} after={restored}"
@@ -17137,6 +17289,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         filtered_tests: Some(0),
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(1),
         oomed: false,
         oom_kills: 0,
@@ -18091,6 +18244,7 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode,
         oomed: false,
         oom_kills: 0,
@@ -18131,6 +18285,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(returncode),
         oomed: false,
         oom_kills: 0,
@@ -22220,6 +22375,7 @@ fn stop_test_seam(
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,
@@ -23690,5 +23846,144 @@ mod submodule_service_tests {
         assert!(stdout.contains("1 passed; 0 failed;"), "{stdout}{stderr}");
         assert_eq!(std::fs::read(outer.join("sentinel")).unwrap(), SENTINEL);
         assert_eq!(std::fs::read_dir(&outer).unwrap().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod refusal_detail_tests {
+    use super::*;
+
+    /// The real refusal that stranded seven hours of validation on 2026-09-17,
+    /// taken verbatim from run 1838's log rather than invented, so the bound
+    /// and the shape are sized against the thing they exist for.
+    const REAL: &str = include_str!("../tests/fixtures/scorecard-writeback/refusal.txt");
+
+    #[test]
+    fn the_real_refusal_survives_into_the_record_and_names_its_cell() {
+        let detail = refusal_detail(REAL.as_bytes(), b"");
+        assert!(detail.starts_with("stderr: "), "{detail}");
+        // The two facts a reader needs in order to act, and neither survives in
+        // an exit status: WHICH cell disagreed and WHAT kind of disagreement.
+        assert!(
+            detail.contains("backend-parity-c/aio-refusal/verify@kvm"),
+            "{detail}",
+        );
+        assert!(
+            detail.contains("parity history changes candidate identity"),
+            "{detail}",
+        );
+        // Well under the bound, so this case is carried whole.
+        assert!(!detail.contains("last "), "{detail}");
+        assert!(
+            REAL.len() < REFUSAL_DETAIL_MAX_BYTES,
+            "{} bytes",
+            REAL.len(),
+        );
+    }
+
+    #[test]
+    fn stdout_is_the_fallback_and_the_stream_is_named() {
+        // A tool that explains itself on the wrong stream is still explaining
+        // itself; losing that because it picked stdout would be the same defect.
+        let detail = refusal_detail(b"   \n\t ", b"refused: nothing to observe");
+        assert_eq!(detail, "stdout: refused: nothing to observe");
+        assert_eq!(
+            refusal_detail(b"on stderr", b"on stdout"),
+            "stderr: on stderr",
+            "stderr must win when both are present"
+        );
+    }
+
+    /// A tool that refuses and says nothing is a FINDING, not an empty field.
+    #[test]
+    fn a_silent_refusal_says_so_rather_than_leaving_the_field_looking_unset() {
+        let detail = refusal_detail(b"", b"");
+        assert_eq!(detail, "the tool refused without writing any explanation");
+        assert!(!detail.is_empty());
+        // Whitespace-only output is silence too.
+        assert_eq!(refusal_detail(b"\n \t\n", b"  "), detail);
+    }
+
+    #[test]
+    fn truncation_is_stated_with_the_true_size_and_keeps_the_tail() {
+        // The refusal is what a tool says LAST, so a head-truncated record
+        // would drop exactly the part worth keeping.
+        let noise = "x".repeat(REFUSAL_DETAIL_MAX_BYTES * 2);
+        let long = format!("{noise} THE-ACTUAL-CAUSE");
+        let detail = refusal_detail(long.as_bytes(), b"");
+        assert!(detail.contains("THE-ACTUAL-CAUSE"), "the tail was dropped");
+        assert!(
+            detail.contains(&format!("of {} bytes", long.len())),
+            "truncation must state the TRUE size: {}",
+            &detail[..detail.len().min(120)]
+        );
+        assert!(detail.starts_with("stderr (last "), "{}", &detail[..60]);
+        // Bounded, with room for the framing.
+        assert!(
+            detail.len() < REFUSAL_DETAIL_MAX_BYTES + 100,
+            "{}",
+            detail.len(),
+        );
+    }
+
+    /// ⚠️ THE CALL-SITE TEST, AND IT IS THE ONE THAT MATTERS.
+    ///
+    /// Every test above exercises `refusal_detail` directly. I removed the
+    /// `refusal_detail(...)` argument from `local_scorecard_writeback` as a
+    /// control and ALL FIVE STILL PASSED -- a helper proven correct and proven
+    /// nothing about whether it is wired in. That is the third time in one day
+    /// this shape has bitten, so this test runs the real function against a
+    /// real refusing child.
+    #[test]
+    fn the_writeback_error_carries_the_child_message_and_not_only_its_status() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("a temp root");
+        let script = root.path().join("ci/compat-envelope/scorecard.rs");
+        std::fs::create_dir_all(script.parent().expect("a parent")).expect("the tool dir");
+        // A stand-in for the real tool: refuses, and says why on stderr, which
+        // is exactly the shape that stranded seven hours of validation.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'parity history changes candidate identity for CELL-X' >&2\nexit 2\n",
+        )
+        .expect("write the stand-in tool");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make it executable");
+
+        let error = local_scorecard_writeback(root.path(), root.path(), false, false)
+            .expect("the writeback runs when not nested and on the record")
+            .expect_err("a refusing tool must produce an error");
+
+        // The status is still there...
+        assert!(error.contains("exit status: 2"), "{error}");
+        // ...and so is the cause, which is the whole point.
+        assert!(
+            error.contains("parity history changes candidate identity for CELL-X"),
+            "the child's explanation was dropped: {error}"
+        );
+
+        // Control in the other direction: a tool that succeeds produces no
+        // error at all, so the assertions above are not passing because every
+        // path errors.
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("rewrite the tool");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make it executable");
+        local_scorecard_writeback(root.path(), root.path(), false, false)
+            .expect("still runs")
+            .expect("a succeeding tool must not error");
+
+        // And the gate is still a gate: nested or off-the-record runs do not
+        // invoke the tool at all.
+        assert!(local_scorecard_writeback(root.path(), root.path(), true, false).is_none());
+        assert!(local_scorecard_writeback(root.path(), root.path(), false, true).is_none());
+    }
+
+    #[test]
+    fn newlines_are_collapsed_so_one_refusal_stays_one_record_line() {
+        assert_eq!(
+            refusal_detail(b"first line\n\n  second   line \n", b""),
+            "stderr: first line second line"
+        );
     }
 }
