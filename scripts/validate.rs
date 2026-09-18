@@ -2124,6 +2124,7 @@ fn self_test() -> Result<(), String> {
             filtered_tests: None,
             test_results: None,
             test_results_error: None,
+            test_results_error_kind: None,
             returncode: Some(if ok { 0 } else { 1 }),
             oomed: false,
             oom_kills: 0,
@@ -10290,6 +10291,7 @@ fn summary_listing_bracket() -> Result<String, String> {
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,
@@ -11778,6 +11780,8 @@ struct NodeAttempt {
     test_results: Option<Vec<dagrun::TestResult>>,
     /// Required-result refusal retained independently of the outer failure reason.
     test_results_error: Option<String>,
+    /// Typed result-import observation; absent historical kinds stay unknown.
+    test_results_error_kind: Option<dagrun::TestResultsErrorKind>,
 }
 
 fn attempt_is_no_result(attempt: &NodeAttempt) -> bool {
@@ -11871,6 +11875,7 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
         failure_class,
         test_results: outcome.test_results.clone(),
         test_results_error: outcome.test_results_error.clone(),
+        test_results_error_kind: outcome.test_results_error_kind,
     }
 }
 
@@ -11901,6 +11906,7 @@ fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
         failure_detail: Some("no completion payload was reported for this node".into()),
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
     }
 }
 
@@ -16565,6 +16571,7 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         filtered_tests: Some(0),
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -16619,6 +16626,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         filtered_tests,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -16810,6 +16818,9 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
     if let Some(error) = &outcome.test_results_error {
         gate["test_results_error"] = serde_json::json!(error);
     }
+    if let Some(kind) = outcome.test_results_error_kind {
+        gate["test_results_error_kind"] = serde_json::json!(kind.value());
+    }
     if let Some(failure_class) = outcome_failure_class(outcome) {
         gate["failure_class"] = serde_json::json!(failure_class);
         if failure_class == FailureClass::NoResult && !outcome.reason.is_empty() {
@@ -16871,6 +16882,9 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
             if let Some(error) = &a.test_results_error {
                 attempt["test_results_error"] = serde_json::json!(error);
             }
+            if let Some(kind) = a.test_results_error_kind {
+                attempt["test_results_error_kind"] = serde_json::json!(kind.value());
+            }
             if let Some(failure_class) = a.failure_class {
                 attempt["failure_class"] = serde_json::json!(failure_class);
             }
@@ -16904,6 +16918,13 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
             gate.as_object_mut()
                 .expect("ledger gate must remain a JSON object")
                 .remove("test_results_error");
+        }
+        if let Some(kind) = attempt.test_results_error_kind {
+            gate["test_results_error_kind"] = serde_json::json!(kind.value());
+        } else {
+            gate.as_object_mut()
+                .expect("ledger gate must remain a JSON object")
+                .remove("test_results_error_kind");
         }
         gate["aborted"] = serde_json::json!(attempt.aborted);
         gate["real_seconds"] = serde_json::json!(attempt.reported.then_some(attempt.duration_s));
@@ -16996,13 +17017,25 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
         );
         if bits & 8 != 0 {
             outcome.test_results_error = Some(format!("typed results refused in fixture {bits}"));
+            outcome.test_results_error_kind = Some(
+                [
+                    dagrun::TestResultsErrorKind::Missing,
+                    dagrun::TestResultsErrorKind::ReadIo,
+                    dagrun::TestResultsErrorKind::InvalidReport,
+                ][usize::from(bits) % 3],
+            );
         }
         let expected_error = outcome
             .test_results_error
             .as_ref()
             .map(|error| serde_json::json!(error));
+        let expected_kind = outcome
+            .test_results_error_kind
+            .map(|kind| serde_json::json!(kind.value()));
         let first = reported_attempt(&outcome, 1);
-        if first.test_results_error != outcome.test_results_error || first.reason != outcome.reason
+        if first.test_results_error != outcome.test_results_error
+            || first.test_results_error_kind != outcome.test_results_error_kind
+            || first.reason != outcome.reason
         {
             return Err(format!(
                 "typed gate {bits}: attempt conflated primary and result refusal"
@@ -17025,6 +17058,7 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
         }
         for row in [&fallback, &reported, &reported["attempts"][0]] {
             if row.get("test_results_error") != expected_error.as_ref()
+                || row.get("test_results_error_kind") != expected_kind.as_ref()
                 || row["reason"] != serde_json::json!(outcome.reason)
             {
                 return Err(format!(
@@ -17061,6 +17095,9 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
             if row.get("test_results_error").is_some()
                 || row["attempts"][1].get("test_results_error").is_some()
                 || row["attempts"][0].get("test_results_error") != expected_error.as_ref()
+                || row.get("test_results_error_kind").is_some()
+                || row["attempts"][1].get("test_results_error_kind").is_some()
+                || row["attempts"][0].get("test_results_error_kind") != expected_kind.as_ref()
             {
                 return Err(format!(
                     "typed gate {bits}: absent latest diagnostic inherited stale data: {row}"
@@ -17082,6 +17119,7 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
         let mut retry = outcome.clone();
         retry.reason = format!("independent outer retry reason {bits}");
         retry.test_results_error = Some(format!("distinct result refusal on retry {bits}"));
+        retry.test_results_error_kind = Some(dagrun::TestResultsErrorKind::ReadIo);
         let mut foreign = retry.clone();
         foreign.tag = "test.unrelated-diagnostic".into();
         foreign.test_results_error =
@@ -17099,6 +17137,9 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
             || retained["attempts"][0].get("test_results_error") != expected_error.as_ref()
             || retained["attempts"][1].get("test_results_error") != Some(&retry_error)
             || retained.get("test_results_error") != Some(&retry_error)
+            || retained["test_results_error_kind"] != "read_io"
+            || retained["attempts"][1]["test_results_error_kind"] != "read_io"
+            || retained["attempts"][0].get("test_results_error_kind") != expected_kind.as_ref()
             || retained["reason"] != serde_json::json!(retry.reason)
             || retained["attempts"][0]["reason"] != serde_json::json!(outcome.reason)
         {
@@ -17114,7 +17155,11 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
                     .map_err(|error| format!("typed gate reader refused emitted row: {error}"))?;
             let restored = serde_json::to_value(parsed)
                 .map_err(|error| format!("typed gate reader could not serialize row: {error}"))?;
-            for field in fields.into_iter().chain(["attempts", "test_results_error"]) {
+            for field in fields.into_iter().chain([
+                "attempts",
+                "test_results_error",
+                "test_results_error_kind",
+            ]) {
                 if row.get(field) != restored.get(field) {
                     return Err(format!(
                         "typed gate shared reader lost {field}: before={row} after={restored}"
@@ -17137,6 +17182,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         filtered_tests: Some(0),
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(1),
         oomed: false,
         oom_kills: 0,
@@ -18091,6 +18137,7 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode,
         oomed: false,
         oom_kills: 0,
@@ -18131,6 +18178,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(returncode),
         oomed: false,
         oom_kills: 0,
@@ -22220,6 +22268,7 @@ fn stop_test_seam(
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,
