@@ -345,6 +345,34 @@ workflow_e2e_prepares_btrfs() {
         grep -Fqx "          compgen -G '/sys/fs/btrfs/*/commit_stats' >/dev/null" <<<"$body"
 }
 
+# Product differences in the hosted E2E copy are additional signal. Keep that
+# exception narrower than the job: setup, execution completion, archive
+# transport, checksum verification, source identity, and the complete selected
+# cell population all remain hard failures. Local full validation is unchanged
+# and remains the blocking authority.
+workflow_e2e_diagnostic_contract() {
+    local workflow_text=$1 e2e_body run_step verdict_step reducer_step
+    e2e_body=$(workflow_job_body e2e "$workflow_text") || return 1
+    run_step=$(workflow_step_body 'Run constructed E2E diagnostic (${{ matrix.node }})' "$workflow_text") || return 1
+    verdict_step=$(workflow_step_body 'Run non-gating constructed E2E verdict' "$workflow_text") || return 1
+    reducer_step=$(workflow_step_body 'Verify completeness, checksums, and archive paths' "$workflow_text") || return 1
+
+    ! grep -Fqx '    continue-on-error: true' <<<"$e2e_body" &&
+        grep -Fqx '        id: product_diagnostic' <<<"$run_step" &&
+        grep -Fqx '        continue-on-error: true' <<<"$run_step" &&
+        grep -Fqx '        id: product_verdict' <<<"$verdict_step" &&
+        grep -Fqx '        continue-on-error: true' <<<"$verdict_step" &&
+        grep -Fqx '          EXPECTED_CELLS: ${{ needs.plan.outputs.selected_cell_count }}' <<<"$reducer_step" &&
+        grep -Fq '.repository_sha == $sha' <<<"$reducer_step" &&
+        grep -Fq '.hermit_sha == $sha' <<<"$reducer_step" &&
+        grep -Fq '.lane == "portable"' <<<"$reducer_step" &&
+        grep -Fq '.source_tree_dirty == false' <<<"$reducer_step" &&
+        grep -Fq '[.lane, .category, .test, .mode, .backend]' <<<"$reducer_step" &&
+        grep -Fq 'ci/expected-e2e-plan.json > ignored/reduced/expected-identities.json' <<<"$reducer_step" &&
+        grep -Fq 'ignored/reduced/results.jsonl > ignored/reduced/actual-identities.json' <<<"$reducer_step" &&
+        grep -Fq 'cmp -s ignored/reduced/expected-identities.json ignored/reduced/actual-identities.json' <<<"$reducer_step"
+}
+
 workflow_job_needs_exactly() {
     local job=$1 expected_csv=$2 workflow_text=$3 actual expected
     actual=$(workflow_job_needs "$job" "$workflow_text" | sort) || return 1
@@ -379,6 +407,7 @@ workflow_wiring_contract() {
         workflow_job_uses_hosted_namespace_wrapper e2e "$workflow_text" &&
         workflow_e2e_uses_pinned_result_root "$workflow_text" &&
         workflow_e2e_prepares_btrfs "$workflow_text" &&
+        workflow_e2e_diagnostic_contract "$workflow_text" &&
         workflow_job_needs_exactly preflight 'select' "$workflow_text" &&
         workflow_job_needs_exactly checks 'select,preflight' "$workflow_text" &&
         workflow_job_needs_exactly build-debug 'select,preflight' "$workflow_text" &&
@@ -464,6 +493,23 @@ elif prepared_nextest_artifact_contract "$missing_prepared_download"; then
 fi
 if ! workflow_wiring_contract "$workflow_text"; then
     echo "check-shard-coverage.sh: FAIL — workflow job needs/artifact transfers do not match the constructed dependency supply contract" >&2
+    status=1
+fi
+
+missing_e2e_non_gating=${workflow_text/$'        id: product_diagnostic\n        continue-on-error: true\n'/$'        id: product_diagnostic\n'}
+if [[ $missing_e2e_non_gating == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — E2E diagnostic mutation did not change the workflow fixture" >&2
+    status=1
+elif workflow_e2e_diagnostic_contract "$missing_e2e_non_gating"; then
+    echo "check-shard-coverage.sh: FAIL — workflow guard accepted a blocking hosted E2E product verdict" >&2
+    status=1
+fi
+missing_e2e_identity=${workflow_text/$'              and .hermit_sha == $sha\n'/}
+if [[ $missing_e2e_identity == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — E2E identity mutation did not change the workflow fixture" >&2
+    status=1
+elif workflow_e2e_diagnostic_contract "$missing_e2e_identity"; then
+    echo "check-shard-coverage.sh: FAIL — workflow guard accepted E2E evidence without source identity" >&2
     status=1
 fi
 
