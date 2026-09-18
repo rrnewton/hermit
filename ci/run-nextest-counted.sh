@@ -6,43 +6,15 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 readonly RESULT_WRITER="$SCRIPT_DIR/nextest-test-results.rs"
 readonly TIMEOUT_CONFIG_WRITER="$SCRIPT_DIR/nextest-timeout-config.rs"
-readonly DIAGNOSTIC_RETAINER="$SCRIPT_DIR/nextest-retain-diagnostics.rs"
 
 nextest_config=
 cpu_measurement_dir=
-events_log=
-retain_diagnostics=0
-observed_nextest_status=
-observed_writer_status=
 
 function cleanup_nextest_config {
-    # The opt-in EXIT capture owns this file until it has copied the evidence.
-    if ((retain_diagnostics)) && [[ ${1:-} != final ]]; then
-        return 0
-    fi
     if [[ -n $nextest_config ]]; then
         rm -f -- "$nextest_config"
         nextest_config=
     fi
-}
-
-function cleanup_nextest_run {
-    local final_status=$1 capture_status=0
-    trap - EXIT
-    set +e
-    if ((retain_diagnostics)); then
-        "$DIAGNOSTIC_RETAINER" "$cpu_measurement_dir" \
-            "${observed_nextest_status:--}" "${observed_writer_status:--}" \
-            "$final_status" || capture_status=$?
-        if ((capture_status != 0)); then
-            printf 'run-nextest-counted: diagnostic capture failed (status %s); producer status remains %s\n' \
-                "$capture_status" "$final_status" >&2
-        fi
-    fi
-    cleanup_nextest_config final
-    cleanup_cpu_measurement_dir
-    if [[ -n $events_log ]]; then rm -f -- "$events_log"; fi
-    exit "$final_status"
 }
 
 function cleanup_cpu_measurement_dir {
@@ -132,7 +104,6 @@ function emit_libtest_count {
     local attempts=${3-} binary_map=${4-} cpu_report=${5-}
     local writer_status=0
     local -a cpu_args=()
-    observed_writer_status=
     if [[ ! -s $events ]]; then
         printf 'run-nextest-counted: typed nextest event stream is empty\n' >&2
         return 2
@@ -145,7 +116,6 @@ function emit_libtest_count {
         cpu_args=("$attempts" "$binary_map" "$cpu_report")
     fi
     "$RESULT_WRITER" "$events" "$status" "$path" "${cpu_args[@]}" || writer_status=$?
-    observed_writer_status=$writer_status
     if ((writer_status != 0)); then
         printf 'run-nextest-counted: cannot derive typed test results from %s\n' "$events" >&2
         return "$writer_status"
@@ -158,8 +128,6 @@ function run_nextest {
     local status count_status=0
     local -a inventory_arguments=()
     shift 7
-    observed_nextest_status=
-    observed_writer_status=
 
     if [[ $cpu_report != - && $cpu_report == "${DAGRUN_TEST_COUNTS_PATH:--}" ]]; then
         printf 'run-nextest-counted: CPU report path must differ from DAGRUN_TEST_COUNTS_PATH\n' >&2
@@ -167,11 +135,7 @@ function run_nextest {
     fi
 
     cleanup_nextest_config
-    if [[ -n $cpu_measurement_dir ]]; then
-        nextest_config="$cpu_measurement_dir/nextest.toml"
-    else
-        nextest_config=$(mktemp "${TMPDIR:-/tmp}/hermit-nextest-config.XXXXXX.toml") || return $?
-    fi
+    nextest_config=$(mktemp "${TMPDIR:-/tmp}/hermit-nextest-config.XXXXXX.toml") || return $?
     if ! HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" "$TIMEOUT_CONFIG_WRITER" \
         "$SCRIPT_DIR/../.config/nextest.toml" "$wall_multiplier" "$nextest_config"; then
         cleanup_nextest_config
@@ -201,7 +165,6 @@ function run_nextest {
         --color never --message-format libtest-json-plus --message-format-version 0.1 \
         "$@" >"$events_log"
     status=$?
-    observed_nextest_status=$status
     set -e
     cleanup_nextest_config
 
@@ -466,14 +429,13 @@ if [[ ${1:-} == --self-test ]]; then
     exit
 fi
 
-if [[ ${HERMIT_NEXTEST_RETAIN_DIAGNOSTICS_DIR+x} ]]; then retain_diagnostics=1; fi
-trap 'cleanup_nextest_run "$?"' EXIT
+events_log=$(mktemp) || exit $?
 cpu_measurement_dir=$(mktemp -d "${TMPDIR:-/tmp}/hermit-nextest-cpu.XXXXXX") || exit $?
-events_log="$cpu_measurement_dir/events.jsonl"
 cpu_attempt_records="$cpu_measurement_dir/attempts"
 cpu_inventory="$cpu_measurement_dir/inventory.json"
 cpu_binary_map="$cpu_measurement_dir/binary-map.json"
 mkdir "$cpu_attempt_records" || exit $?
+trap 'cleanup_nextest_config; cleanup_cpu_measurement_dir; rm -f "$events_log"' EXIT
 cpu_wrapper=$(build_cpu_wrapper) || exit $?
 cpu_report=$(configured_cpu_report_path) || exit $?
 run_nextest "$events_log" "$(configured_wall_timeout_multiplier)" "$cpu_wrapper" \
