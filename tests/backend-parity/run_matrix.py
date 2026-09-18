@@ -1600,11 +1600,16 @@ def write_structured_test_results(
     configured = os.environ.get("DAGRUN_TEST_COUNTS_PATH")
     if not configured:
         return
-    terminal = [result for result in results if result["result"] != "GAP"]
-    if len(terminal) != executed:
+    blocked = [result for result in results if result["result"] == "BLOCKED"]
+    terminal = [
+        result for result in results if result["result"] not in {"GAP", "BLOCKED"}
+    ]
+    measured = executed - len(blocked)
+    if len(terminal) != measured:
         raise MatrixError(
             "structured DBT results disagree with the executed-case count: "
-            f"{len(terminal)} terminal row(s), {executed} executed case(s)"
+            f"{len(terminal)} terminal row(s), {measured} measured case(s), "
+            f"{len(blocked)} capability-blocked case(s)"
         )
     rows = [
         {
@@ -1623,8 +1628,8 @@ def write_structured_test_results(
     temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     payload = {
         "schema": 2,
-        "executed_tests": executed,
-        "filtered_tests": filtered,
+        "executed_tests": measured,
+        "filtered_tests": filtered + len(blocked),
         "results": rows,
     }
     try:

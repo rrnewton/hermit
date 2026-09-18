@@ -234,8 +234,13 @@ def main() -> int:
                         "backend": "dbt",
                         "result": "GAP",
                     },
+                    {
+                        "test_name": "capability-blocked",
+                        "backend": "dbt",
+                        "result": "BLOCKED",
+                    },
                 ],
-                2,
+                3,
                 1,
                 "strict",
             )
@@ -249,7 +254,7 @@ def main() -> int:
             == {
                 "schema": 2,
                 "executed_tests": 2,
-                "filtered_tests": 1,
+                "filtered_tests": 2,
                 "results": [
                     {
                         "id": "backend-parity/passes [dbt/strict]",
