@@ -17,17 +17,29 @@ export PATH="$ROOT_DIR/ci/rust-script-bin:$PATH"
 export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$ROOT_DIR/target/ci/rust-scripts"
 export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1
 
+# Transported test binaries retain Cargo's compile-time CARGO_TARGET_TMPDIR.
+# The artifact deliberately omits empty directories, so recreate that runtime
+# contract before entering the network-isolated namespace.
+mkdir -p "$ROOT_DIR/target/tmp"
+
 if [[ ! -f $HERMIT_RUST_SCRIPT_ARTIFACT_ROOT/manifest.tsv ]]; then
     echo "run-hosted-node.sh: missing prepared rust-script manifest: $HERMIT_RUST_SCRIPT_ARTIFACT_ROOT/manifest.tsv" >&2
     exit 2
 fi
 
-echo "HOSTED-ISOLATION: entering a per-job user/mount/PID/network namespace; local validate still uses its pinned-root and cgroup policy" >&2
-exec unshare --user --map-root-user --pid --fork --uts --net --mount \
+echo "HOSTED-ISOLATION: entering a per-job user/mount/network namespace; local validate still uses its pinned-root and cgroup policy" >&2
+exec unshare --user --map-root-user --uts --net --mount \
     bash -c '
         set -euo pipefail
-        mount -t proc proc /proc
-        mount -t sysfs sysfs /sys
+        # Keep outbound networking absent while making loopback usable by the
+        # local client/server unit tests. A new network namespace starts with
+        # lo down, which is a setup failure rather than product isolation.
+        ip link set lo up
+        # Give tempfile users a root-owned path inside the UID mapping. The
+        # runner checkout lives below host-owned /home, whose ancestors map to
+        # the overflow UID and correctly fail security-sensitive path checks.
+        mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /tmp
+        export TMPDIR=/tmp
         # Exercise the exact nested mount capability the per-physical-run /test
         # helper needs, without leaving the probe mount visible to validation.
         unshare --mount bash -c \
