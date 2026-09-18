@@ -31,7 +31,7 @@ scan_file() {
     awk '
         {
             probe = tolower($0)
-            gsub(/\/(home|users)\/(user|test|example)([^[:alnum:]_.-]|$)/,
+            gsub(/\/(home|users)\/(user|test|example|fixture)([^[:alnum:]_.-]|$)/,
                  "/generic/", probe)
             if (probe ~ /\/(home|users)\/[[:alnum:]_.-]+([^[:alnum:]_.-]|$)/ ||
                 probe ~ /(^|[^[:alnum:]_])newton([^[:alnum:]_]|$)/ ||
@@ -95,6 +95,32 @@ self_test() {
         rm -f "$fixture"
         return 1
     }
+
+    # `fixture` joins user/test/example as a CANONICAL PLACEHOLDER HOME, not as
+    # a location-based hole. The distinction matters: docs/TESTING_ENVIRONMENTS.md
+    # warns that exempting a PATH is how this rule gets evaded by relocation, so
+    # the exemption is on the placeholder NAME and the scanner keeps reading every
+    # file. Measured 2026-09-18: the digest-pinned legacy ledger fixture
+    # ci/manifest-plan/src/ledger/schema10/fixtures/legacy/reference-diverged-cells.jsonl
+    # carries /home/fixture ten times, its PROVENANCE.md records the paths as
+    # deliberately fabricated, and its bytes are frozen against a parent blob --
+    # so the fixture cannot be edited and is not a developer home either.
+    printf '%s\n' 'argv = ["/home/fixture/hermit", "/home/fixture/guest"]' >"$fixture"
+    scan_file "$fixture" >/dev/null || {
+        echo "portability self-test rejected the canonical placeholder home" >&2
+        rm -f "$fixture"
+        return 1
+    }
+
+    # EXACTNESS CONTROL. The placeholder list must match whole names only; if it
+    # degraded into a prefix test, /home/fixtures-owner would slip through and the
+    # accept case above would still pass.
+    printf '%s\n' 'cache_dir="/home/fixtures-owner/.cache/hermit"' >"$fixture"
+    if scan_file "$fixture" >/dev/null; then
+        echo "portability self-test treated the placeholder home as a prefix" >&2
+        rm -f "$fixture"
+        return 1
+    fi
 
     is_excluded ci/compat-envelope/cells.json || {
         echo "portability self-test failed to exclude literal compatibility evidence" >&2

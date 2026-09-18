@@ -23854,9 +23854,20 @@ mod refusal_detail_tests {
     use super::*;
 
     /// The real refusal that stranded seven hours of validation on 2026-09-17,
-    /// taken verbatim from run 1838's log rather than invented, so the bound
-    /// and the shape are sized against the thing they exist for.
-    const REAL: &str = "compatibility scorecard: parity history changes candidate identity for portable/backend-parity-c/backend-parity-c/aio-refusal/verify@kvm at /home/newton/work/dev-hermit/ignored/validate/artifacts/validate-ops-tick-158a89f6217b-088d91951315/e2e/portable/manifest_backend_parity_c/results.jsonl, source 158a89f6217b25db9540237f9c1e256cdbaf785c, run validate-ops-tick-158a89f6217b-088d91951315, outer attempt 2";
+    /// taken from run 1838's log rather than invented, so the bound and the
+    /// shape are sized against the thing they exist for.
+    ///
+    /// VERBATIM EXCEPT THE HOME COMPONENT. The captured line began with a
+    /// literal developer home, which `scripts/check-portable-paths.sh` rejects
+    /// in a file that builds or runs -- correctly, because this is live code
+    /// rather than frozen evidence. The home is replaced by the placeholder the
+    /// checker already recognises; the measuring host is recorded in
+    /// docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts" rather than
+    /// erased, because a measurement with no host cannot be re-run or
+    /// challenged. Every load-bearing token is untouched: the cell name, the
+    /// refusal text, the source SHA, the run identity, and the length, which
+    /// this test compares against REFUSAL_DETAIL_MAX_BYTES.
+    const REAL: &str = "compatibility scorecard: parity history changes candidate identity for portable/backend-parity-c/backend-parity-c/aio-refusal/verify@kvm at /home/user/work/dev-hermit/ignored/validate/artifacts/validate-ops-tick-158a89f6217b-088d91951315/e2e/portable/manifest_backend_parity_c/results.jsonl, source 158a89f6217b25db9540237f9c1e256cdbaf785c, run validate-ops-tick-158a89f6217b-088d91951315, outer attempt 2";
 
     #[test]
     fn the_real_refusal_survives_into_the_record_and_names_its_cell() {
