@@ -44,6 +44,7 @@ for required in \
     'mkdir -p "$ROOT_DIR/target/tmp"' \
     'exec unshare --user --map-root-user --uts --net --mount' \
     'ip link set lo up' \
+    'mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /tmp' \
     'export TMPDIR=/tmp'
 do
     if ! grep -Fq "$required" <<<"$hosted_runner_text"; then
@@ -51,10 +52,6 @@ do
         exit 1
     fi
 done
-if grep -Fq 'mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /tmp' <<<"$hosted_runner_text"; then
-    echo "check-shard-coverage.sh: FAIL — hosted wrapper hides pre-namespace /tmp fixtures" >&2
-    exit 1
-fi
 if grep -Eq -- '--pid|--fork' <<<"$hosted_runner_text"; then
     echo "check-shard-coverage.sh: FAIL — hosted wrapper reintroduced an outer PID namespace" >&2
     exit 1
