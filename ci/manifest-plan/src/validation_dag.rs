@@ -743,9 +743,9 @@ fn materialize_hosted_capability_exclusions(cfg: &mut DagConfig) -> Result<(), S
         ),
         (
             "test.hermit_unit_on_host",
-            706,
+            709,
             &["e9patch::tests::cache_directory_is_private_and_not_a_symlink"],
-            "The GitHub wrapper intentionally maps only the runner UID to root. The host filesystem root is therefore overflow-owned inside that user namespace, so this exact cache-ancestor ownership fixture refuses before testing the private cache directory. It remains blocking in canonical local validate; the other 706 Hermit unit cases remain blocking here.",
+            "The GitHub wrapper intentionally maps only the runner UID to root. The host filesystem root is therefore overflow-owned inside that user namespace, so this exact cache-ancestor ownership fixture refuses before testing the private cache directory. It remains blocking in canonical local validate; the other 709 Hermit unit cases remain blocking here.",
         ),
     ];
 
@@ -2950,7 +2950,7 @@ sys.exit(37)
             (
                 "test.hermit_unit_on_host",
                 "test.hermit_unit",
-                "706",
+                "709",
                 &["e9patch::tests::cache_directory_is_private_and_not_a_symlink"][..],
             ),
         ] {
