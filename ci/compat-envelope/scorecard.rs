@@ -696,7 +696,7 @@ struct ObservedAttemptInvocation {
 /// instead of being read as evidence.
 ///
 /// This is recorded for EVERY tested cell, including passing ones, and names
-/// the latest admitted comparison directly rather than asking readers to infer
+/// the latest admitted result directly rather than asking readers to infer
 /// recency from an aggregate observation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LastTested {
@@ -5562,6 +5562,7 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     )?;
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
+    let transitions = measurement_transitions(root, &before, &tracked, &head)?;
     let updated = generated_files(&derived, &tracked)?;
     let changed = replace_generated_files_with(
         root,
@@ -5594,6 +5595,9 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
         "compatibility scorecard: generated files {}",
         if changed { "changed" } else { "unchanged" }
     );
+    for transition in transitions {
+        println!("{transition}");
+    }
     // FOUR OUTCOMES, NOT TWO. This used to print the all-green sentence
     // whenever the located count was zero, which said "expected result for an
     // all-green run" over a batch whose cells had diverged without a locatable
@@ -5832,14 +5836,8 @@ fn import_results(
     };
     let before_counts = measurement_counts(&before);
     let after_counts = measurement_counts(&tracked);
-    let changed = before
-        .cells
-        .iter()
-        .filter_map(|old| {
-            let new = tracked.cells.iter().find(|cell| cell.id == old.id)?;
-            (old.measurement != new.measurement).then_some((old, new))
-        })
-        .collect::<Vec<_>>();
+    let resolution_head = git_head(root)?;
+    let transitions = measurement_transitions(root, &before, &tracked, &resolution_head)?;
 
     let scorecard = format!(
         "{}{}",
@@ -5924,18 +5922,32 @@ fn import_results(
         tracked.cells.len(),
         after_counts
     );
-    let resolution_head = git_head(root)?;
-    for (old, new) in changed {
-        println!(
-            "{}",
-            measurement_transition(root, old, new, &resolution_head)?
-        );
+    for transition in transitions {
+        println!("{transition}");
     }
     Ok(())
 }
 
-/// Render the actual import transition. An aggregate pass is not a claim that
-/// the latest stamp passed, and an improvement is not a regression.
+/// Prepare transition diagnostics before a writer publishes its generated pair.
+fn measurement_transitions(
+    root: &Path,
+    before: &TrackedCells,
+    after: &TrackedCells,
+    head: &str,
+) -> Result<Vec<String>, String> {
+    before
+        .cells
+        .iter()
+        .filter_map(|old| {
+            let new = after.cells.iter().find(|cell| cell.id == old.id)?;
+            (old.measurement != new.measurement).then_some((old, new))
+        })
+        .map(|(old, new)| measurement_transition(root, old, new, head))
+        .collect()
+}
+
+/// Render an admitted observation transition. An aggregate pass is not a claim
+/// that the latest stamp passed, and an improvement is not a regression.
 fn measurement_transition(
     root: &Path,
     old: &TrackedCell,
@@ -6456,6 +6468,7 @@ where
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
+    let transitions = measurement_transitions(root, &before, &tracked, &head)?;
     let updated = generated_files(&derived, &tracked)?;
     let partial_scorecard = updated.scorecard.clone();
 
@@ -6491,6 +6504,9 @@ where
         "compatibility scorecard: generated files {}",
         if changed { "changed" } else { "unchanged" }
     );
+    for transition in transitions {
+        println!("{transition}");
+    }
     if !fold.errored.is_empty() {
         println!(
             "  {} current result row(s) lack an admitted canonical comparison; their exact invocation evidence and any established product result were retained",
@@ -16226,6 +16242,164 @@ red/`measured-and-passed` count is **0**.",
             "observe-results did not retain exact verify no-verdict evidence without changing the prior same-tree result".into(),
         );
     }
+    // Exercise BOTH real current-writer CLIs. Helper-only positive controls
+    // cannot establish that an authenticated comparison reaches its diagnostic.
+    let result_before_transitions = fs::read(&result_path).map_err(|e| e.to_string())?;
+    let transition_row = |label: &str, divergence: Option<Option<u64>>, unavailable: bool| {
+        let mut row = verify_row.clone();
+        row.run_id = label.into();
+        let mut report = canonical_verdict::VerificationReport::from_json_slice(
+            row.attempts[0]["verification_report"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+        )?;
+        report.comparison.as_mut().unwrap().virtualize_time = Some(!unavailable);
+        if let Some(position) = divergence {
+            report.verified = false;
+            report.bitwise_parity = false;
+            report.verdict = canonical_verdict::Verdict::Diverged;
+            report.first_divergent_record = position;
+            row.first_divergent_record = position;
+            row.outcome = "FAIL".into();
+            row.result = Some(ObservedResult::DeterminismFailure);
+            row.failure_class = Some(FailureClass::ProductFailure);
+            row.attempts[0]["outcome"] = "FAIL".into();
+            row.attempts[0]["status"] = serde_json::json!(1);
+        }
+        let raw = serde_json::to_string(&report).map_err(|e| e.to_string())?;
+        row.attempts[0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(raw.as_bytes())).into();
+        row.attempts[0]["verification_report"] = raw.into();
+        Ok::<_, String>(row)
+    };
+    let read_transition_cell = || -> Result<TrackedCell, String> {
+        let cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+        cells
+            .cells
+            .into_iter()
+            .find(|cell| cell.id == verify_id)
+            .ok_or_else(|| "current writer lost transition fixture cell".into())
+    };
+    for combined in [false, true] {
+        let command = if combined {
+            "project-and-observe-results"
+        } else {
+            "observe-results"
+        };
+        let invoke = || {
+            if combined {
+                run_snapshot_command(&empty_snapshot_path, &empty_snapshot_sha)
+            } else {
+                run_result_command("observe-results", None)
+            }
+        };
+        let require_output =
+            |output: std::process::Output, regression: bool, baseline_refusal: bool| {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if !output.status.success()
+                    || stdout.contains("REGRESSION since") != regression
+                    || stdout.contains("NO USABLE BASELINE") != baseline_refusal
+                    || (regression && !stdout.contains(&format!("REGRESSION since {fixture_head}")))
+                {
+                    return Err(format!(
+                        "{command} transition control: status={} stdout={stdout:?} stderr={:?}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                Ok::<_, String>(())
+            };
+        for position in [None, Some(2)] {
+            restore_combined_baseline()?;
+            write_result_row(&transition_row("cli-provenance-pass", None, false)?)?;
+            require_output(invoke()?, false, false)?;
+            let old = read_transition_cell()?;
+            let last = old.last_tested.as_ref().ok_or("CLI pass omitted stamp")?;
+            if old.measurement != MeasurementState::MeasuredAndPassed
+                || last.enabled_when_tested != Some(true)
+                || last.comparison_verdict != Some(StampComparisonVerdict::Matched)
+                || last.check.as_ref().is_none_or(|check| !check.complete())
+            {
+                return Err(format!(
+                    "{command} CLI positive did not establish an actual comparable pass"
+                ));
+            }
+            write_result_row(&transition_row(
+                "cli-provenance-divergence",
+                Some(position),
+                false,
+            )?)?;
+            require_output(invoke()?, true, false)?;
+            let diverged = read_transition_cell()?;
+            if diverged.measurement
+                != if position.is_some() {
+                    MeasurementState::Diverged
+                } else {
+                    MeasurementState::DivergedUnlocated
+                }
+            {
+                return Err(format!(
+                    "{command} CLI divergence lost its location semantics"
+                ));
+            }
+            // A later pass remains real evidence without erasing failure history
+            // or printing a new regression for the recovery attempt.
+            write_result_row(&transition_row("cli-provenance-recovery", None, false)?)?;
+            require_output(invoke()?, false, false)?;
+            let recovered = read_transition_cell()?;
+            if recovered.last_tested.as_ref().unwrap().comparison_verdict
+                != Some(StampComparisonVerdict::Matched)
+                || !recovered.observations.iter().any(|observation| {
+                    observation
+                        .results
+                        .contains(&ObservedResult::DeterminismFailure)
+                })
+            {
+                return Err(format!(
+                    "{command} recovery lost its pass or erased actual failure history"
+                ));
+            }
+            println!(
+                "scorecard self-test: {command} CLI comparable-pass -> divergence {position:?}, recovery opposing control passed"
+            );
+        }
+        restore_combined_baseline()?;
+        write_result_row(&transition_row("cli-history-pass", None, false)?)?;
+        require_output(invoke()?, false, false)?;
+        write_result_row(&transition_row("cli-history-no-comparison", None, true)?)?;
+        require_output(invoke()?, false, false)?;
+        let unknown = read_transition_cell()?;
+        if unknown.measurement != MeasurementState::MeasuredAndPassed
+            || unknown.last_tested.as_ref().unwrap().check.is_some()
+            || unknown
+                .last_tested
+                .as_ref()
+                .unwrap()
+                .comparison_verdict
+                .is_some()
+        {
+            return Err(format!(
+                "{command} latest no-comparison stamp borrowed the aggregate pass"
+            ));
+        }
+        write_result_row(&transition_row(
+            "cli-history-divergence",
+            Some(None),
+            false,
+        )?)?;
+        require_output(invoke()?, false, true)?;
+        write_result_row(&transition_row(
+            "cli-history-located",
+            Some(Some(2)),
+            false,
+        )?)?;
+        require_output(invoke()?, false, false)?;
+        println!(
+            "scorecard self-test: {command} CLI no-comparison baseline refused; location-only transition not a regression"
+        );
+    }
+    fs::write(&result_path, result_before_transitions).map_err(|e| e.to_string())?;
     restore_generated()?;
 
     for (staged_clean, unrelated_clean, allowed) in [
