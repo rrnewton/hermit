@@ -791,7 +791,10 @@ jobs:
       && needs.build-release.result == 'success'
       && needs.build-complete.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Run 35390137055 spent the entire inherited 15-minute job bound downloading
+    # the immutable 2 GiB prepared-Nextest artifact and was cancelled before
+    # unpacking or executing integration. Preserve ten minutes for real work.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select.outputs.debug_matrix) }}
