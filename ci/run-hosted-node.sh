@@ -12,6 +12,16 @@ if [[ ${GITHUB_ACTIONS:-} != true ]]; then
     exit 2
 fi
 
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+export PATH="$ROOT_DIR/ci/rust-script-bin:$PATH"
+export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$ROOT_DIR/target/ci/rust-scripts"
+export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1
+
+if [[ ! -f $HERMIT_RUST_SCRIPT_ARTIFACT_ROOT/manifest.tsv ]]; then
+    echo "run-hosted-node.sh: missing prepared rust-script manifest: $HERMIT_RUST_SCRIPT_ARTIFACT_ROOT/manifest.tsv" >&2
+    exit 2
+fi
+
 echo "HOSTED-ISOLATION: entering a per-job user/mount/PID/network namespace; local validate still uses its pinned-root and cgroup policy" >&2
 exec unshare --user --map-root-user --pid --fork --uts --net --mount \
     bash -c '
