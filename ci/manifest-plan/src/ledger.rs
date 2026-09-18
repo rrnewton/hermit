@@ -771,12 +771,26 @@ impl CellEvidenceBinding {
     }
 }
 
-/// Encode one JSON string exactly as a canonical-JSON writer would.
-///
-/// `serde_json::to_string` on a `&str` produces the same escaping the series
-/// producer's encoder does, so the digest input is byte-identical.
+/// Match the series producer's Python `json.dumps` default `ensure_ascii=True`.
+/// Serde supplies JSON quote and control escapes; Python additionally escapes
+/// DEL and every non-ASCII scalar as lowercase UTF-16 code units. Supplementary
+/// scalars therefore need two surrogate escapes, not literal UTF-8 bytes.
 fn json_string(value: &str) -> String {
-    serde_json::to_string(value).expect("a string always encodes as JSON")
+    use std::fmt::Write;
+
+    let encoded = serde_json::to_string(value).expect("a string always encodes as JSON");
+    let mut ascii = String::with_capacity(encoded.len());
+    for scalar in encoded.chars() {
+        if scalar < '\u{7f}' {
+            ascii.push(scalar);
+        } else {
+            let mut units = [0; 2];
+            for unit in scalar.encode_utf16(&mut units) {
+                write!(ascii, "\\u{unit:04x}").expect("writing into a String cannot fail");
+            }
+        }
+    }
+    ascii
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -3195,6 +3209,50 @@ mod cell_evidence_binding_tests {
                 ),
                 expected,
                 "derivation drifted from the published identity for {cell} run_index {run_index}"
+            );
+        }
+
+        // Synthetic golden controls from the actual Python identity expression
+        // at parent 45fa84a89d773af4816afc02354adbb62952553f,
+        // ci-hub/series/series.py:3653. They are separate from the six published
+        // ASCII events above. Cover BMP, supplementary surrogate pairs (at both
+        // range endpoints), DEL, and JSON quote/backslash/control escaping.
+        let unicode_vectors: [Vector; 3] = [
+            (
+                "validate-caf\u{e9}-\u{4e2d}",
+                "validate",
+                "backend-parity-c/identity/verify/kvm",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                1,
+                Some(1),
+                "series-f3f6ebb451fc0b5ee6feb8fcea9749c7598133b12f430b77b90654abe1396d78",
+            ),
+            (
+                "validate-\u{1f680}-\u{10000}-\u{10ffff}",
+                "validate",
+                "backend-parity-c/identity/verify/kvm",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                2,
+                None,
+                "series-79fe7f02b6fe0b917fa1ee883ba616593e6e652b445c7b672e0361e46288d1ad",
+            ),
+            (
+                "validate-\u{7f}-\u{0}\u{8}\u{c}\u{a}\u{d}\u{9}\"\\",
+                "validate",
+                "backend-parity-c/identity/verify/kvm",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                3,
+                Some(3),
+                "series-1e748ca8c190012ee45a76e973760feeb4054a2e047d1b2550217c814238bed1",
+            ),
+        ];
+        for (run_id, producer, cell, tree, run_index, attempt, expected) in unicode_vectors {
+            assert_eq!(
+                CellEvidenceBinding::derive_event_id(
+                    run_id, producer, cell, tree, run_index, attempt
+                ),
+                expected,
+                "derivation differs from the Python producer's Unicode encoding"
             );
         }
     }
