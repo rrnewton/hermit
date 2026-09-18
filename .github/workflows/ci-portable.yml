@@ -535,6 +535,7 @@ jobs:
             target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/debug/verification-report
           test -x target/ci/bin/cargo-nextest
+          test -f target/ci/nextest-binaries/current.json
           tar --zstd -cf "$DEBUG_TARBALL" \
             target/debug/hermit \
             target/debug/test-harness \
@@ -543,6 +544,7 @@ jobs:
             target/debug/deps/libdetcore_dbt.so \
             target/install_pkg/rsrcs/libdetcore_dbt.so \
             target/ci/bin/cargo-nextest \
+            target/ci/nextest-binaries \
             target/ci/rust-scripts \
             ignored/e2e/build
           ls -lh "$DEBUG_TARBALL"
@@ -810,6 +812,7 @@ jobs:
           test -f target/debug/deps/libdetcore_dbt.so
           test -f target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
+          test -f target/ci/nextest-binaries/current.json
       # Install into CARGO_HOME/bin rather than adding target/ci/bin to PATH:
       # cargo searches $CARGO_HOME/bin BEFORE PATH when resolving
       # `cargo-<subcommand>`, so a PATH entry loses to whatever the rust-cache
@@ -839,7 +842,7 @@ jobs:
       - name: Run shard nodes (${{ matrix.slug }})
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-node.sh portable "${{ matrix.nodes }}"
+        run: ./ci/run-hosted-node.sh portable "${{ matrix.nodes }}"
       - name: Upload debug shard node performance report
         if: always()
         uses: actions/upload-artifact@v4
@@ -902,7 +905,7 @@ jobs:
       - name: Run strict compatibility node
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-node.sh portable "$(jq -r '.strict_compat_nodes|join(",")' ci/portable-shards.json)"
+        run: ./ci/run-hosted-node.sh portable "$(jq -r '.strict_compat_nodes|join(",")' ci/portable-shards.json)"
       - name: Upload strict-compat node performance report
         if: always()
         uses: actions/upload-artifact@v4
@@ -983,7 +986,7 @@ jobs:
       - name: Run shard nodes (${{ matrix.slug }})
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-node.sh portable "${{ matrix.nodes }}"
+        run: ./ci/run-hosted-node.sh portable "${{ matrix.nodes }}"
       - name: Upload release shard node performance report
         if: always()
         uses: actions/upload-artifact@v4
@@ -1058,7 +1061,7 @@ jobs:
       - name: Run constructed step (${{ matrix.node }})
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-node.sh portable "${{ matrix.node }}"
+        run: ./ci/run-hosted-node.sh portable "${{ matrix.node }}"
       - name: Pack deterministic parity transport archive
         if: always()
         env:
