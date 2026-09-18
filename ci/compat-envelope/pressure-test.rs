@@ -5855,6 +5855,14 @@ fn retained_pressure_attempt(
                             }
                             SeriesNoVerdictKind::FirstRunRejected
                         }
+                        Some(NoResultReason::ContainerFailed(failure)) => {
+                            failure.require_reporter_exit(
+                                attempt.status,
+                                attempt.signal,
+                                attempt.timed_out,
+                            )?;
+                            SeriesNoVerdictKind::ContainerFailed
+                        }
                         // The current reader requires the nullable field. An
                         // explicit null preserves an unspecified cause; a
                         // missing field was already refused above.
@@ -5943,7 +5951,13 @@ fn inner_pressure_category(attempt: &SeriesPressureAttempt) -> Option<Repetition
             Verdict::Matched | Verdict::Diverged => Some(RepetitionClassification::NoResult),
             Verdict::InfrastructureError => Some(RepetitionClassification::InfrastructureFailure),
             Verdict::NoResult
-                if comparison.no_result_kind == Some(SeriesNoVerdictKind::FirstRunRejected) =>
+                if matches!(
+                    comparison.no_result_kind,
+                    Some(
+                        SeriesNoVerdictKind::FirstRunRejected
+                            | SeriesNoVerdictKind::ContainerFailed
+                    )
+                ) =>
             {
                 Some(RepetitionClassification::ProductFailure)
             }
@@ -7424,6 +7438,9 @@ fn display_id(cell: &CellId) -> String {
 }
 
 fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Result<(), String> {
+    if dagrun::require_step_end_ok(&json!({"event": "step_end", "ok": "false"})).is_ok() {
+        return Err("prerequisite journal reader accepted string `false` as a verdict".into());
+    }
     let required = required_build_tags(None, true);
     let original: BTreeMap<_, _> = canonical.steps.iter()
         .filter(|step| required.contains(step.tag().as_str()))
@@ -7533,14 +7550,33 @@ fn prerequisite_scheduler_self_test(canonical: &DagConfig, scratch: &Path) -> Re
             .map_err(|e| format!("invalid isolated prerequisite journal: {e}"))?;
         let ends: Vec<_> = rows.iter().filter(|row| row["event"] == "step_end").collect();
         let ended: BTreeSet<_> = ends.iter().filter_map(|row| row["step"].as_str()).collect();
-        if ends.len() != expected.len()
-            || ended != expected.iter().map(String::as_str).collect()
-            || ends.iter().any(|row| {
-                row["ok"] != if row["step"].as_str() == failed { "false" } else { "true" }
-                    || row["cpu_limit_s"] != "5" || row["wall_limit_s"] != "5"
-            })
-        {
+        if ends.len() != expected.len() || ended != expected.iter().map(String::as_str).collect() {
             return Err(format!("isolated prerequisite fixture {failed:?} lost its exact terminal evidence"));
+        }
+        for row in &ends {
+            let step = row["step"].as_str().ok_or("prerequisite step_end has no string step")?;
+            let ok = dagrun::require_step_end_ok(row)
+                .map_err(|error| format!("prerequisite {step}: {error}"))?;
+            if ok != (Some(step) != failed)
+                || row["cpu_limit_s"] != "5" || row["wall_limit_s"] != "5"
+            {
+                return Err(format!("isolated prerequisite fixture {failed:?} lost its exact terminal evidence"));
+            }
+        }
+        let skips = rows.iter().filter(|row| row["event"] == "step_skip").collect::<Vec<_>>();
+        let skipped: BTreeSet<_> = skips.iter().filter_map(|row| row["step"].as_str()).collect();
+        let expected_skipped: BTreeSet<_> = original.keys()
+            .map(String::as_str)
+            .filter(|step| !expected.iter().any(|ended| ended == step))
+            .collect();
+        let accounted: BTreeSet<_> = ended.union(&skipped).copied().collect();
+        if ends.len() + skips.len() != original.len()
+            || skips.len() != expected_skipped.len()
+            || skipped != expected_skipped
+            || accounted != original.keys().map(String::as_str).collect()
+            || skips.iter().any(|row| row["reason"] != "dependency_failed")
+        {
+            return Err(format!("isolated prerequisite fixture {failed:?} lost its skip accounting"));
         }
     }
     println!("  prerequisite scheduler: ten-node positive and four failed-preflight controls retain exact execution identities");
@@ -13849,6 +13885,72 @@ mod pressure_sample_tests {
                 retained_pressure_attempt("verify", &bad).is_err(),
                 "{field}"
             );
+        }
+    }
+
+    #[test]
+    fn container_failure_pressure_retains_product_failure_without_comparison() {
+        for run in ["run1", "run2"] {
+            let mut attempt = fixture_attempt("FAIL", 125);
+            let mut report = serde_json::to_value(VerificationReport::no_result()).unwrap();
+            report["no_result_reason"] = json!({"kind":"container_failed","run":run,"disposition":{"kind":"signaled","signal":14,"core_dumped":false}});
+            replace_report(&mut attempt, report.clone());
+            let retained = retained_pressure_attempt("verify", &attempt).unwrap();
+            let comparison = retained.comparison.as_ref().unwrap();
+            assert_eq!(comparison.verdict, Verdict::NoResult);
+            assert!(!comparison.canonical);
+            assert_eq!(
+                comparison.no_result_kind,
+                Some(SeriesNoVerdictKind::ContainerFailed)
+            );
+            assert_eq!(
+                inner_pressure_category(&retained),
+                Some(RepetitionClassification::ProductFailure)
+            );
+            assert!(!qualifying_subruns(
+                "verify",
+                std::slice::from_ref(&attempt)
+            ));
+            let row = history_row("verify", "FAIL", 1, vec![attempt.clone()]);
+            assert_eq!(
+                inner_pressure_history(&[row]).unwrap(),
+                BTreeSet::from([RepetitionClassification::ProductFailure])
+            );
+            for mutation in [
+                "wrapper-zero",
+                "timeout",
+                "wrapper-signal",
+                "refusal",
+                "guest-status",
+                "comparison-count",
+                "pass",
+            ] {
+                let mut bad = attempt.clone();
+                let mut bad_report = report.clone();
+                match mutation {
+                    "wrapper-zero" => bad.status = Some(0),
+                    "timeout" => {
+                        bad.timed_out = true;
+                        bad.error_kind = Some("wall-timeout".into());
+                    }
+                    "wrapper-signal" => {
+                        bad.status = None;
+                        bad.signal = Some(14);
+                    }
+                    "refusal" => bad.error_kind = Some("guest-launch-refused".into()),
+                    "guest-status" => bad_report["guest_signal"] = json!(14),
+                    "comparison-count" => {
+                        bad_report["compared_log_messages"] = json!({"left":1,"right":1})
+                    }
+                    "pass" => bad.outcome = "PASS".into(),
+                    _ => unreachable!(),
+                }
+                replace_report(&mut bad, bad_report);
+                assert!(
+                    retained_pressure_attempt("verify", &bad).is_err(),
+                    "{mutation}"
+                );
+            }
         }
     }
 

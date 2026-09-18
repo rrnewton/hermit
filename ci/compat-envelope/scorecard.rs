@@ -1021,6 +1021,10 @@ struct ResultRow {
     effective_args: Vec<String>,
     argv: Vec<String>,
     guest_argv: Vec<String>,
+    /// Older rows lack this redundant producer-owned path. They can still
+    /// prove literal command equality, but cannot authorize fixture relocation.
+    #[serde(default)]
+    artifact_dir: Option<String>,
     env: BTreeMap<String, String>,
     cwd: String,
     shell_command: String,
@@ -1081,6 +1085,65 @@ fn default_attempt() -> u64 {
 }
 
 impl ResultRow {
+    fn retry_fixture(&self) -> Result<Option<RetryFixture>, String> {
+        let Some(artifact_dir) = self.artifact_dir.as_deref() else {
+            return Ok(None);
+        };
+        if !artifact_dir.starts_with('/')
+            || !normal_path_suffix(&artifact_dir[1..])
+            || !normal_path_suffix(&self.run_id)
+            || self.run_id.contains('/')
+        {
+            return Err("retry artifact identity contains a non-normal path".into());
+        }
+        let result_root = Path::new(artifact_dir)
+            .ancestors()
+            .nth(3)
+            .ok_or("retry artifact identity has no result root")?;
+        let expected = hermit_manifest_plan::runner::cell_artifact_path(
+            result_root,
+            &self.run_id,
+            &hermit_manifest_plan::runner::CellId {
+                test: self.test.clone(),
+                mode: self.mode.clone(),
+                backend: self.backend.clone(),
+            },
+            self.attempt,
+        );
+        if expected.as_os_str() != artifact_dir {
+            return Err("retry artifact directory disagrees with its run/cell/attempt".into());
+        }
+        let fixture_root = format!("{artifact_dir}/fixtures");
+        if self.env.get("E2E_FIXTURE_DIR") != Some(&fixture_root)
+            || self.attempts.iter().any(|attempt| {
+                attempt
+                    .get("env")
+                    .and_then(|env| env.get("E2E_FIXTURE_DIR"))
+                    .and_then(JsonValue::as_str)
+                    != Some(fixture_root.as_str())
+            })
+        {
+            return Err("retry fixture environment disagrees with its artifact directory".into());
+        }
+        Ok(Some(RetryFixture {
+            result_root: result_root.to_path_buf(),
+            fixture_root,
+        }))
+    }
+
+    fn same_retry_guest_command(&self, other: &Self) -> Result<bool, String> {
+        if self.guest_argv == other.guest_argv {
+            return Ok(true);
+        }
+        let (Some(this), Some(other_fixture)) = (self.retry_fixture()?, other.retry_fixture()?)
+        else {
+            return Ok(false);
+        };
+        Ok(this.result_root == other_fixture.result_root
+            && retry_guest_arguments(&self.guest_argv, &this.fixture_root)
+                == retry_guest_arguments(&other.guest_argv, &other_fixture.fixture_root))
+    }
+
     fn has_parity_evidence(&self) -> bool {
         self.backend_parity.is_some()
             || self.error_kind.as_deref() == Some("incomplete-parity-evidence")
@@ -1330,10 +1393,8 @@ impl ResultRow {
             .then_some(ObservedResult::Timeout)
     }
 
-    /// Return the typed reason when this FAIL records only completed first
-    /// runs rejected before comparison. Such a row is execution evidence, but
-    /// not product-behavior evidence: it must be named and retained as a
-    /// measured no-verdict rather than forced through the comparison path.
+    /// Retain a rejected guest or a typed container failure without crediting
+    /// either as a completed comparison.
     fn typed_no_result_reason(&self) -> Result<Option<String>, String> {
         if self.outcome != "FAIL" || !matches!(self.mode.as_str(), "verify" | "replay" | "chaos") {
             return Ok(None);
@@ -1488,9 +1549,23 @@ impl ResultRow {
                     }
                     report.no_result_reason.as_ref().unwrap()
                 }
+                Some(canonical_verdict::NoResultReason::ContainerFailed(failure)) => {
+                    failure.require_reporter_exit(
+                        attempt
+                            .get("status")
+                            .and_then(JsonValue::as_i64)
+                            .and_then(|value| i32::try_from(value).ok()),
+                        attempt
+                            .get("signal")
+                            .and_then(JsonValue::as_i64)
+                            .and_then(|value| i32::try_from(value).ok()),
+                        attempt.get("timed_out").and_then(JsonValue::as_bool) != Some(false),
+                    )?;
+                    report.no_result_reason.as_ref().unwrap()
+                }
                 Some(canonical_verdict::NoResultReason::NotRun) => {
                     return Err(format!(
-                        "attempt {} did not complete its first run",
+                        "attempt {} did not replace its pre-run stamp",
                         index + 1
                     ));
                 }
@@ -1784,7 +1859,7 @@ impl ResultRow {
     fn comparison_evidence_from(&self, input: ResultInput) -> Result<ValidateRowEvidence, String> {
         self.require_provenance()?;
         self.validate_recorded_classification()?;
-        let no_verdict_result = self.no_verdict_result();
+        let mut no_verdict_result = self.no_verdict_result();
         let mut left_info_messages = BTreeSet::new();
         let mut right_info_messages = BTreeSet::new();
         let mut divergence_positions = Vec::new();
@@ -2082,7 +2157,7 @@ impl ResultRow {
                             saw_not_run = true;
                             unavailable.get_or_insert_with(|| {
                                 format!(
-                                    "NO_RESULT: attempt {} did not complete its first run",
+                                    "NO_RESULT: attempt {} retained its pre-run stamp after timeout",
                                     index + 1
                                 )
                             });
@@ -2107,6 +2182,23 @@ impl ResultRow {
                         let reason = single
                             .typed_no_result_reason()?
                             .ok_or("FirstRunRejected did not classify as no_result")?;
+                        unavailable.get_or_insert(format!("NO_RESULT: {reason}"));
+                    }
+                    Some(canonical_verdict::NoResultReason::ContainerFailed(_)) => {
+                        saw_no_result = true;
+                        let mut single = self.clone();
+                        single.outcome = "FAIL".into();
+                        single.first_divergent_scheduler_turn = None;
+                        single.first_divergent_virtual_nanoseconds = None;
+                        single.first_divergent_record = None;
+                        single.first_divergent_syscall = None;
+                        single.attempts = vec![attempt.clone()];
+                        let reason = single
+                            .typed_no_result_reason()?
+                            .ok_or("ContainerFailed did not classify as no_result")?;
+                        // Preserve an already classified timeout/infrastructure
+                        // result from another attempt in this retained history.
+                        no_verdict_result.get_or_insert(ObservedResult::CrashError);
                         unavailable.get_or_insert(format!("NO_RESULT: {reason}"));
                     }
                     Some(canonical_verdict::NoResultReason::ComparisonRefused { detail }) => {
@@ -2301,6 +2393,48 @@ impl ResultRow {
     }
 }
 
+struct RetryFixture {
+    result_root: PathBuf,
+    fixture_root: String,
+}
+
+#[derive(Debug, PartialEq)]
+enum RetryGuestArgument<'a> {
+    Literal(&'a str),
+    FixtureRelative(&'a str),
+}
+
+fn normal_path_suffix(path: &str) -> bool {
+    !path.contains('\0')
+        && path
+            .split('/')
+            .all(|component| !matches!(component, "" | "." | ".."))
+}
+
+/// This key is only for comparing outer retries. Literal evidence and its
+/// digest remain unchanged; embedded shell strings and other paths stay literal.
+fn retry_guest_arguments<'a>(
+    argv: &'a [String],
+    fixture_root: &str,
+) -> Vec<RetryGuestArgument<'a>> {
+    argv.iter()
+        .map(|argument| {
+            if argument == fixture_root {
+                return RetryGuestArgument::FixtureRelative("");
+            }
+            match argument
+                .strip_prefix(fixture_root)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+            {
+                Some(suffix) if normal_path_suffix(suffix) => {
+                    RetryGuestArgument::FixtureRelative(suffix)
+                }
+                _ => RetryGuestArgument::Literal(argument),
+            }
+        })
+        .collect()
+}
+
 struct Derived {
     population: BTreeSet<CellId>,
     enabled: BTreeSet<CellId>,
@@ -2362,8 +2496,19 @@ fn bind_parity_history(
     }
     let mut attempts = BTreeMap::<u64, ResultCandidate>::new();
     for candidate in candidates {
+        // Validate before duplicate collapse. This path is redundant with the
+        // already-digested fixture env, so no historical receipt hash changes.
+        candidate.row.retry_fixture().map_err(|error| {
+            format!(
+                "invalid retry artifact for {} at {}, outer attempt {}: {error}",
+                display_id(id),
+                candidate.path.display(),
+                candidate.row.attempt
+            )
+        })?;
         if let Some(previous) = attempts.get(&candidate.row.attempt) {
             if previous.evidence_identity != candidate.evidence_identity
+                || previous.row.artifact_dir != candidate.row.artifact_dir
                 || previous.row.result != candidate.row.result
                 || previous.row.failure_class != candidate.row.failure_class
                 || previous.row.error_kind != candidate.row.error_kind
@@ -2407,7 +2552,7 @@ fn bind_parity_history(
             || row.run_id != anchor.run_id
             || row.binary_sha256 != anchor.binary_sha256
             || row.test_sha256 != anchor.test_sha256
-            || row.guest_argv != anchor.guest_argv
+            || !row.same_retry_guest_command(anchor)?
             || row.relaxations != anchor.relaxations
             || row.log_level != anchor.log_level
         {
@@ -6821,12 +6966,23 @@ fn series_evidence(row: &SeriesRow, id: &CellId) -> Option<SeriesEvidence> {
         return None;
     }
     if let Some(evidence) = &row.series.no_verdict_evidence {
-        return Some(SeriesEvidence {
-            result: evidence
+        // Callers validate the exact disposition/classification tuple before
+        // projection. Retain this typed product crash without treating any
+        // other no-result kind as a crash or granting comparison credit.
+        let result = if evidence.attempts.iter().any(|attempt| attempt.timed_out) {
+            Some(ObservedResult::Timeout)
+        } else if row.series.result == Some(ObservedResult::CrashError)
+            && evidence
                 .attempts
                 .iter()
-                .any(|attempt| attempt.timed_out)
-                .then_some(ObservedResult::Timeout),
+                .any(|attempt| attempt.kind == SeriesNoVerdictKind::ContainerFailed)
+        {
+            Some(ObservedResult::CrashError)
+        } else {
+            None
+        };
+        return Some(SeriesEvidence {
+            result,
             no_verdict: true,
         });
     }
@@ -8924,10 +9080,11 @@ fn retained_coordinate_decision(
         .get(&retained.id)
         .cloned()
         .unwrap_or_default();
-    let mut current_by_run: BTreeMap<
+    type CurrentResultsByRun = BTreeMap<
         (String, String, Option<u64>, String),
         BTreeMap<(ObservedResult, DivergenceCoordinates), CurrentPressureResult>,
-    > = BTreeMap::new();
+    >;
+    let mut current_by_run: CurrentResultsByRun = BTreeMap::new();
     for result in offered_current_results {
         let row = &result.summary.rows[0];
         let invocation = row
@@ -9616,6 +9773,9 @@ fn normalise_recorded_root(row: &mut ResultRow) {
     if root.is_empty() || root == RECORDED_ROOT || !root.starts_with('/') {
         return;
     }
+    if let Some(artifact_dir) = &mut row.artifact_dir {
+        rewrite_recorded_root(artifact_dir, &root);
+    }
     for argument in row
         .argv
         .iter_mut()
@@ -9637,6 +9797,9 @@ fn normalise_recorded_root(row: &mut ResultRow) {
 fn normalise_recorded_prefix(row: &mut ResultRow, prefix: &str) {
     if prefix.is_empty() || prefix == RECORDED_ROOT || !prefix.starts_with('/') {
         return;
+    }
+    if let Some(artifact_dir) = &mut row.artifact_dir {
+        rewrite_recorded_root(artifact_dir, prefix);
     }
     for argument in row
         .argv
@@ -9854,6 +10017,7 @@ fn self_test() -> Result<(), String> {
             effective_args: vec!["run".into()],
             argv: vec!["hermit".into(), "run".into()],
             guest_argv: vec!["fixture".into()],
+            artifact_dir: None,
             env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
             cwd: "/repo".into(),
             shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
@@ -11650,6 +11814,7 @@ red/`measured-and-passed` count is **0**.",
         effective_args: vec!["run".into()],
         argv: vec!["hermit".into(), "run".into()],
         guest_argv: vec!["fixture".into()],
+        artifact_dir: None,
         env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
         cwd: "/repo".into(),
         shell_command: "cd /repo && env LC_ALL=C hermit run".into(),
@@ -14728,13 +14893,66 @@ red/`measured-and-passed` count is **0**.",
             }
         }
     }
-    // A completed parity failure remains visible after either a matching retry
-    // or an incomplete retry. Exercise actual readers and both public writers.
-    for terminal in ["PASS", "ERROR"] {
+    // Keep the invocation internally exact when changing the test fixture's
+    // command. Reference and candidate retain their distinct backend flags.
+    let bind_retry_invocation = |row: &mut ResultRow| -> Result<(), String> {
+        for attempt in &mut row.attempts {
+            let mut argv: Vec<String> = serde_json::from_value(attempt["argv"].clone())
+                .map_err(|error| error.to_string())?;
+            if let Some(delimiter) = argv.iter().position(|arg| arg == "--") {
+                argv.truncate(delimiter);
+            }
+            argv.push("--".into());
+            argv.extend(row.guest_argv.clone());
+            attempt["argv"] = serde_json::to_value(&argv).unwrap();
+            attempt["guest_argv"] = serde_json::to_value(&row.guest_argv).unwrap();
+            attempt["env"] = serde_json::to_value(&row.env).unwrap();
+            attempt["cwd"] = row.cwd.clone().into();
+            attempt["shell_command"] = literal_shell_command(&row.cwd, &row.env, &argv).into();
+        }
+        row.argv = serde_json::from_value(row.attempts[0]["argv"].clone())
+            .map_err(|error| error.to_string())?;
+        row.effective_args = row.argv.iter().skip(1).cloned().collect();
+        row.shell_command = literal_shell_command(&row.cwd, &row.env, &row.argv);
+        Ok(())
+    };
+    let relocate_retry_fixture = |row: &mut ResultRow, result_root: &str| -> Result<(), String> {
+        let dir = hermit_manifest_plan::runner::cell_artifact_path(
+            Path::new(result_root),
+            &row.run_id,
+            &hermit_manifest_plan::runner::CellId {
+                test: row.test.clone(),
+                mode: row.mode.clone(),
+                backend: row.backend.clone(),
+            },
+            row.attempt,
+        );
+        row.artifact_dir = Some(dir.to_string_lossy().into_owned());
+        let fixture = dir.join("fixtures").to_string_lossy().into_owned();
+        row.env.insert("E2E_FIXTURE_DIR".into(), fixture.clone());
+        row.guest_argv = vec![
+            format!("{fixture}/program"),
+            "stable".into(),
+            "literal-attempt-2".into(),
+        ];
+        bind_retry_invocation(row)
+    };
+
+    // A completed parity failure remains visible after a matching, incomplete,
+    // or divergent retry, including the producer's real fixture relocation.
+    // Exercise actual readers and both public writers.
+    for terminal in ["PASS", "ERROR", "FAIL"] {
         let mut first = old_parity.clone();
         first.hermit_sha = fixture_head.clone();
         first.run_id = format!("parity-failure-then-{terminal}");
-        let mut second = parity_row(&import_parity_id, BackendParityVerdict::Matched)?;
+        let mut second = parity_row(
+            &import_parity_id,
+            if terminal == "FAIL" {
+                BackendParityVerdict::Diverged
+            } else {
+                BackendParityVerdict::Matched
+            },
+        )?;
         second.hermit_sha = fixture_head.clone();
         second.classification = "required".into();
         second.run_id = first.run_id.clone();
@@ -14751,10 +14969,36 @@ red/`measured-and-passed` count is **0**.",
             second.attempts[1]["status"] = 7.into();
             second.attempts[1]["error_kind"] = "incomplete-verification-evidence".into();
         }
+        if bind_parity_history(
+            &import_parity_id,
+            vec![
+                parity_candidate(first.clone())?,
+                parity_candidate(second.clone())?,
+            ],
+            ResultInput::Retained,
+        )?
+        .len()
+            != 2
+        {
+            return Err("literal retry history without artifact metadata was lost".into());
+        }
+        relocate_retry_fixture(&mut first, "/results")?;
+        relocate_retry_fixture(&mut second, "/results")?;
         first.comparison_evidence()?;
         second.comparison_evidence()?;
+        if first.guest_argv == second.guest_argv || !first.same_retry_guest_command(&second)? {
+            return Err(
+                "retry fixture did not exercise distinct authenticated physical paths".into(),
+            );
+        }
         let first_digest = first.evidence_identity()?;
         let second_digest = second.evidence_identity()?;
+        // Learning a redundant directory must not rewrite historical receipts.
+        let mut without_directory = first.clone();
+        without_directory.artifact_dir = None;
+        if without_directory.evidence_identity()? != first_digest {
+            return Err("retry directory changed the literal evidence digest".into());
+        }
         for command in ["import-results", "observe-results"] {
             restored_import_fixture()?;
             // File ordering and an identical repeated row must not change the
@@ -14768,7 +15012,7 @@ red/`measured-and-passed` count is **0**.",
             if retained.cells.len() != 1
                 || retained.cells[0].candidates.len() != 2
                 || retained.cells[0].hermit_sha != fixture_head
-                || retained.terminal_comparisons != if terminal == "PASS" { 2 } else { 1 }
+                || retained.terminal_comparisons != if terminal == "ERROR" { 1 } else { 2 }
                 || retained.cells[0]
                     .candidates
                     .iter()
@@ -14797,20 +15041,26 @@ red/`measured-and-passed` count is **0**.",
                     && !String::from_utf8_lossy(&output.stdout).contains(
                         "retained 1 incomplete parity attempt(s) without comparison credit",
                     ))
-                || receipts.len() != if terminal == "PASS" { 2 } else { 1 }
+                || receipts.len() != if terminal == "ERROR" { 1 } else { 2 }
                 || !receipts.iter().any(|receipt| {
                     receipt.evidence_sha256 == first_digest
                         && receipt.hermit_sha == fixture_head
                         && receipt.result == ObservedResult::ParityFailure
                 })
-                || (terminal == "PASS"
+                || (terminal != "ERROR"
                     && !receipts.iter().any(|receipt| {
                         receipt.evidence_sha256 == second_digest
                             && receipt.hermit_sha == fixture_head
-                            && receipt.result == ObservedResult::Pass
+                            && receipt.result
+                                == if terminal == "FAIL" {
+                                    ObservedResult::ParityFailure
+                                } else {
+                                    ObservedResult::Pass
+                                }
                     }))
                 || !latest_backend_parity(&cell).is_some_and(|receipt| {
-                    receipt.evidence_sha256 == first_digest
+                    (receipt.evidence_sha256 == first_digest
+                        || (terminal == "FAIL" && receipt.evidence_sha256 == second_digest))
                         && receipt.result == ObservedResult::ParityFailure
                 })
                 || cell
@@ -14849,24 +15099,205 @@ red/`measured-and-passed` count is **0**.",
             restored_import_fixture()?;
             let mut changed = second.clone();
             match invalid {
-                "missing-first" => write_import_rows(&[&changed])?,
-                "gap" => {
-                    changed.attempt = 3;
-                    write_import_rows(&[&first, &changed])?;
-                }
-                "conflicting-first" => {
-                    changed.attempt = 1;
-                    write_import_rows(&[&first, &changed])?;
-                }
+                "missing-first" => {}
+                "gap" => changed.attempt = 3,
+                "conflicting-first" => changed.attempt = 1,
                 _ => unreachable!(),
             }
+            // Reach the sequence/duplicate guard with valid producer metadata;
+            // a stale attempt-2 fixture must not mask the intended refusal.
+            relocate_retry_fixture(&mut changed, "/results")?;
+            if invalid == "conflicting-first" && terminal == "FAIL" {
+                // A second synthetic divergence at the same ordinal must be
+                // distinct evidence, not an identical replay of the first.
+                changed.first_divergent_record = Some(3);
+                changed
+                    .backend_parity
+                    .as_mut()
+                    .unwrap()
+                    .comparison
+                    .first_divergent_record = Some(3);
+            }
+            for row in [&first, &changed] {
+                row.require_literal_invocation()?;
+                row.comparison_evidence()?;
+                if row.retry_fixture()?.is_none() {
+                    return Err(format!("{invalid} fixture lacks retry metadata"));
+                }
+            }
+            if !first.same_retry_guest_command(&changed)? {
+                return Err(format!("{invalid} fixture changed the logical command"));
+            }
+            if invalid == "conflicting-first"
+                && first.evidence_identity()? == changed.evidence_identity()?
+            {
+                return Err("conflicting-first fixture has identical evidence".into());
+            }
+            if invalid == "missing-first" {
+                write_import_rows(&[&changed])?;
+            } else {
+                write_import_rows(&[&first, &changed])?;
+            }
             let refused = run_result_command("import-results", Some(&current_summary))?;
+            let expected_error = if invalid == "conflicting-first" {
+                "ambiguous parity evidence"
+            } else {
+                "invalid parity history"
+            };
             if refused.status.success()
+                || !String::from_utf8_lossy(&refused.stderr).contains(expected_error)
                 || read_generated_files(&result_command_root)? != result_command_before
             {
                 return Err(format!(
-                    "retained parity admitted invalid {invalid} sequence"
+                    "retained parity {terminal}/{invalid} did not refuse with {expected_error}: {refused:?}"
                 ));
+            }
+        }
+        if terminal == "FAIL" {
+            let mut normalized = first.clone();
+            normalized.cwd = "/original/checkout".into();
+            relocate_retry_fixture(&mut normalized, "/original/checkout/results")?;
+            normalise_recorded_root(&mut normalized);
+            normalized.require_literal_invocation()?;
+            normalized.retry_fixture()?;
+            let mut prefix_normalized = first.clone();
+            relocate_retry_fixture(&mut prefix_normalized, "/old-workspace/results")?;
+            normalise_recorded_prefix(&mut prefix_normalized, "/old-workspace");
+            prefix_normalized.require_literal_invocation()?;
+            prefix_normalized.retry_fixture()?;
+            for invalid in [
+                "missing-directory",
+                "wrong-run",
+                "wrong-cell",
+                "wrong-ordinal",
+                "wrong-root",
+                "wrong-env",
+                "relative-directory",
+                "traversing-directory",
+                "wrong-attempt-env",
+                "changed-program",
+                "added-argument",
+                "removed-argument",
+                "reordered-arguments",
+                "changed-literal",
+                "sibling-prefix",
+                "traversal",
+                "embedded-path",
+                "literal-placeholder",
+                "duplicate-directory",
+            ] {
+                restored_import_fixture()?;
+                let mut changed = second.clone();
+                match invalid {
+                    "missing-directory" => changed.artifact_dir = None,
+                    "wrong-run" | "wrong-cell" | "wrong-ordinal" => {
+                        let old = changed.artifact_dir.clone().unwrap();
+                        let wrong = match invalid {
+                            "wrong-run" => old.replace(&changed.run_id, "different-run"),
+                            "wrong-cell" => old.replace("-verify-", "-replay-"),
+                            _ => old.replace("-attempt-2", "-attempt-9"),
+                        };
+                        changed.artifact_dir = Some(wrong.clone());
+                        changed
+                            .env
+                            .insert("E2E_FIXTURE_DIR".into(), format!("{wrong}/fixtures"));
+                        changed.guest_argv[0] = format!("{wrong}/fixtures/program");
+                    }
+                    "wrong-root" => relocate_retry_fixture(&mut changed, "/different-results")?,
+                    "wrong-env" => {
+                        changed
+                            .env
+                            .insert("E2E_FIXTURE_DIR".into(), "/unrelated/fixtures".into());
+                    }
+                    "relative-directory" => {
+                        changed.artifact_dir = Some(
+                            changed
+                                .artifact_dir
+                                .as_ref()
+                                .unwrap()
+                                .trim_start_matches('/')
+                                .into(),
+                        );
+                    }
+                    "traversing-directory" => {
+                        changed.artifact_dir = Some(
+                            changed
+                                .artifact_dir
+                                .as_ref()
+                                .unwrap()
+                                .replace("/runs/", "/runs/../runs/"),
+                        );
+                    }
+                    "changed-program" => changed.guest_argv[0].push_str("-different"),
+                    "added-argument" => changed.guest_argv.push("extra".into()),
+                    "removed-argument" => {
+                        changed.guest_argv.pop();
+                    }
+                    "reordered-arguments" => changed.guest_argv.swap(1, 2),
+                    "changed-literal" => changed.guest_argv[1] = "different".into(),
+                    "sibling-prefix" => {
+                        changed.guest_argv[0] =
+                            changed.guest_argv[0].replace("/fixtures/", "/fixtures-other/")
+                    }
+                    "traversal" => {
+                        changed.guest_argv[0] =
+                            changed.guest_argv[0].replace("/fixtures/", "/fixtures/../fixtures/")
+                    }
+                    "embedded-path" => {
+                        changed.guest_argv[0] = format!("--file={}", changed.guest_argv[0])
+                    }
+                    "literal-placeholder" => changed.guest_argv[0] = "program".into(),
+                    "wrong-attempt-env" | "duplicate-directory" => {}
+                    _ => unreachable!(),
+                }
+                bind_retry_invocation(&mut changed)?;
+                if invalid == "wrong-attempt-env" {
+                    changed.attempts[1]["env"]["E2E_FIXTURE_DIR"] = "/other/fixtures".into();
+                    let env: BTreeMap<String, String> =
+                        serde_json::from_value(changed.attempts[1]["env"].clone()).unwrap();
+                    let argv: Vec<String> =
+                        serde_json::from_value(changed.attempts[1]["argv"].clone()).unwrap();
+                    changed.attempts[1]["shell_command"] =
+                        literal_shell_command(&changed.cwd, &env, &argv).into();
+                }
+                if invalid == "duplicate-directory" {
+                    changed.artifact_dir = None;
+                }
+                for reversed in [false, true] {
+                    let mut rows = vec![&first, &changed];
+                    if invalid == "duplicate-directory" {
+                        rows.push(&second);
+                    }
+                    if reversed {
+                        rows.reverse();
+                    }
+                    write_import_rows(&rows)?;
+                    if read_result_candidates(&result_root, &fixture_head).is_ok()
+                        || read_retained_results(
+                            &result_command_root,
+                            &result_root,
+                            &BTreeSet::from([import_parity_id.clone()]),
+                        )
+                        .is_ok()
+                    {
+                        return Err(format!(
+                            "retry identity admitted {invalid}, reversed={reversed}"
+                        ));
+                    }
+                }
+                for command in ["observe-results", "import-results"] {
+                    let refused = run_result_command(
+                        command,
+                        (command == "import-results").then_some(current_summary.as_path()),
+                    )?;
+                    if refused.status.success()
+                        || read_generated_files(&result_command_root)? != result_command_before
+                    {
+                        return Err(format!(
+                            "{command} admitted or wrote invalid retry identity {invalid}"
+                        ));
+                    }
+                }
             }
         }
     }
@@ -15631,6 +16062,70 @@ red/`measured-and-passed` count is **0**.",
     no_result_row.first_divergent_record = None;
     no_result_row.first_divergent_syscall = None;
     no_result_row.attempts = vec![no_result_attempt];
+
+    // A typed sandbox failure is a product crash, while the comparison
+    // denominator remains unchanged. No guest Output was returned.
+    for run in ["run1", "run2"] {
+        let mut container_row = no_result_row.clone();
+        let mut report =
+            serde_json::to_value(canonical_verdict::VerificationReport::no_result()).unwrap();
+        report["no_result_reason"] = serde_json::json!({"kind":"container_failed","run":run,"disposition":{"kind":"signaled","signal":14,"core_dumped":false}});
+        let raw = serde_json::to_string(&report).unwrap();
+        container_row.attempts[0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(raw.as_bytes())).into();
+        container_row.attempts[0]["verification_report"] = raw.into();
+        if !matches!(
+            container_row.comparison_evidence()?,
+            ValidateRowEvidence::Unavailable {
+                result: Some(ObservedResult::CrashError),
+                ..
+            }
+        ) {
+            return Err("container failure lost crash evidence or gained comparison credit".into());
+        }
+        let mut mixed = container_row.clone();
+        mixed.outcome = "ERROR".into();
+        mixed.result = Some(ObservedResult::Timeout);
+        mixed.failure_class = Some(FailureClass::NoResult);
+        mixed.error_kind = Some("wall-timeout".into());
+        let mut timeout_attempt = mixed.attempts[0].clone();
+        timeout_attempt["index"] = "2".into();
+        timeout_attempt["outcome"] = "ERROR".into();
+        timeout_attempt["status"] = JsonValue::Null;
+        timeout_attempt["signal"] = serde_json::json!(9);
+        timeout_attempt["timed_out"] = serde_json::json!(true);
+        timeout_attempt["error_kind"] = "wall-timeout".into();
+        let timeout_report =
+            serde_json::to_string(&canonical_verdict::VerificationReport::no_result()).unwrap();
+        timeout_attempt["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(timeout_report.as_bytes())).into();
+        timeout_attempt["verification_report"] = timeout_report.into();
+        mixed.attempts.push(timeout_attempt);
+        if !matches!(
+            mixed.comparison_evidence()?,
+            ValidateRowEvidence::NotRun {
+                result: Some(ObservedResult::Timeout),
+                ..
+            }
+        ) {
+            return Err("container failure erased a timeout from another retained attempt".into());
+        }
+        let mut zero = container_row.clone();
+        zero.attempts[0]["status"] = serde_json::json!(0);
+        if zero.comparison_evidence().is_ok() {
+            return Err("container failure accepted a zero-exit wrapper".into());
+        }
+        let mut contradiction = container_row;
+        report["guest_signal"] = serde_json::json!(14);
+        let raw = serde_json::to_string(&report).unwrap();
+        contradiction.attempts[0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(raw.as_bytes())).into();
+        contradiction.attempts[0]["verification_report"] = raw.into();
+        if contradiction.comparison_evidence().is_ok() {
+            return Err("container failure accepted an invented guest disposition".into());
+        }
+    }
+
     let no_result_identity = no_result_row.evidence_identity().unwrap();
 
     let mut unspecified_no_result = no_result_row.clone();
@@ -15651,6 +16146,18 @@ red/`measured-and-passed` count is **0**.",
         return Err(
             "an explicitly null no_result_reason was not retained as explicit absence".into(),
         );
+    }
+
+    let mut typed_not_run = unspecified_no_result.clone();
+    let report = serde_json::to_string(&canonical_verdict::VerificationReport::no_result())
+        .map_err(|error| error.to_string())?;
+    typed_not_run.attempts[0]["verification_report_sha256"] =
+        format!("{:x}", Sha256::digest(report.as_bytes())).into();
+    typed_not_run.attempts[0]["verification_report"] = report.into();
+    if typed_not_run.typed_no_result_reason()
+        != Err("attempt 1 did not replace its pre-run stamp".into())
+    {
+        return Err("typed NotRun did not retain its precise pre-run-stamp refusal".into());
     }
 
     let mut recovered_pass_row = validate_row.clone();
@@ -15957,7 +16464,8 @@ red/`measured-and-passed` count is **0**.",
             .map_err(|error| format!("recovered NotRun {label} was refused: {error}"))?;
         if fold.passed != 1
             || fold.errored.len() != 1
-            || !fold.errored[0].contains("did not complete its first run")
+            || !fold.errored[0]
+                .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
             || fold.reads_all_green()
             || tracked.cells[0].measurement != MeasurementState::MeasuredAndPassed
             || tracked.cells[0].last_tested.is_none()
@@ -15993,7 +16501,8 @@ red/`measured-and-passed` count is **0**.",
         .map_err(|error| format!("recovered pre-launch NotRun was refused: {error}"))?;
     if fold.passed != 1
         || fold.errored.len() != 1
-        || !fold.errored[0].contains("did not complete its first run")
+        || !fold.errored[0]
+            .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
         || fold.reads_all_green()
         || tracked.cells[0].measurement != MeasurementState::MeasuredAndPassed
         || tracked.cells[0].observations.len() != 1
@@ -16072,7 +16581,8 @@ red/`measured-and-passed` count is **0**.",
         let (tracked, fold) = fold_fixture_rows(rows)
             .map_err(|error| format!("{label} NotRun evidence was refused: {error}"))?;
         if fold.errored.len() != 1
-            || !fold.errored[0].contains("did not complete its first run")
+            || !fold.errored[0]
+                .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
             || tracked.cells[0].measurement != expected_measurement
             || tracked.cells[0].last_tested.is_none()
             || tracked.cells[0].observations.len() != 1
@@ -16091,7 +16601,8 @@ red/`measured-and-passed` count is **0**.",
         .push(no_result_row.attempts[0].clone());
     let (tracked, fold) = fold_fixture_rows(vec![mixed_terminal])?;
     if fold.errored.len() != 1
-        || !fold.errored[0].contains("did not complete its first run")
+        || !fold.errored[0]
+            .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
         || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
         || tracked.cells[0].observations[0].results != BTreeSet::from([ObservedResult::Timeout])
     {
@@ -16265,7 +16776,8 @@ red/`measured-and-passed` count is **0**.",
     bind_row_to_first_attempt(&mut all_not_run);
     let (tracked, fold) = fold_fixture_row(all_not_run)?;
     if fold.errored.len() != 1
-        || !fold.errored[0].contains("did not complete its first run")
+        || !fold.errored[0]
+            .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
         || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
         || tracked.cells[0].observations[0].results != BTreeSet::from([ObservedResult::Timeout])
     {
@@ -17174,6 +17686,7 @@ red/`measured-and-passed` count is **0**.",
         effective_args: Vec::new(),
         argv: vec!["fixture".into()],
         guest_argv: vec!["fixture".into()],
+        artifact_dir: None,
         env: BTreeMap::from([("LC_ALL".into(), "C".into())]),
         cwd: "/repo".into(),
         shell_command: "cd /repo && env LC_ALL=C fixture".into(),
@@ -18159,14 +18672,57 @@ red/`measured-and-passed` count is **0**.",
     series_unavailable.series.run_index = 2;
     series_unavailable.series.attempt = Some(2);
     series_unavailable.series.no_verdict_evidence = Some(no_verdict_evidence(false));
+    // Stored projected observations need the same complete source identity as
+    // the production writer. Commit the actual fixture rows and read them back
+    // through its immutable snapshot path before applying and encoding them.
+    let projection_source_fixture =
+        tempfile::tempdir().map_err(|e| format!("cannot create no-verdict series fixture: {e}"))?;
+    let projection_source_repo = projection_source_fixture.path();
+    git_ok(projection_source_repo, &["init", "--quiet"])?;
+    let projection_source_dir = projection_source_repo.join("series");
+    fs::create_dir(&projection_source_dir)
+        .map_err(|e| format!("cannot create no-verdict series directory: {e}"))?;
     let project_series_fixture =
         |rows: &[SeriesRow]| -> Result<(TrackedCells, ProjectObservationsOutcome), String> {
+            let mut shard = String::new();
+            for row in rows {
+                shard.push_str(&serde_json::to_string(row).map_err(|e| e.to_string())?);
+                shard.push('\n');
+            }
+            fs::write(projection_source_dir.join("fixture.jsonl"), shard)
+                .map_err(|e| format!("cannot write no-verdict series fixture: {e}"))?;
+            git_ok(projection_source_repo, &["add", "series"])?;
+            git_ok(
+                projection_source_repo,
+                &[
+                    "-c",
+                    "user.name=scorecard fixture",
+                    "-c",
+                    "user.email=scorecard@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "no-verdict series fixture",
+                ],
+            )?;
+            let snapshot = snapshot_series_source(&projection_source_dir)?;
+            let captured_rows = read_series_rows(&snapshot)?;
             let mut tracked = TrackedCells {
                 schema: SCHEMA,
                 projection: None,
                 cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
             };
-            let outcome = apply_series_rows(&root, &mut tracked, rows, None)?;
+            let outcome =
+                apply_series_rows(&root, &mut tracked, &captured_rows, Some(&snapshot.source))?;
+            tracked.projection = Some(ObservationProjection {
+                source: snapshot.source,
+                source_commit: Some(snapshot.source_commit),
+                source_tree: Some(snapshot.source_tree),
+                refreshed_at: "fixture-no-verdict".into(),
+                rows_read: captured_rows.len() as u64,
+                pre_series_corpus: outcome.pre_series_corpus,
+            });
             refresh_measurement(&mut tracked);
             Ok((tracked, outcome))
         };
@@ -18190,6 +18746,204 @@ red/`measured-and-passed` count is **0**.",
             != direct_unavailable.cells[0].observations[0].results
     {
         return Err("RUN1573-style KVM unavailable changed between direct and series paths".into());
+    }
+
+    // Exercise the actual direct and series folds for both typed run labels.
+    // The series retains report/attempt identities, not an invented guest exit
+    // or comparison. A later timed-out attempt must still take precedence.
+    for run in ["run1", "run2"] {
+        let mut direct_container = no_result_row.clone();
+        direct_container.run_id = format!("fixture-container-{run}");
+        let mut report =
+            serde_json::to_value(canonical_verdict::VerificationReport::no_result()).unwrap();
+        report["no_result_reason"] = serde_json::json!({
+            "kind": "container_failed", "run": run,
+            "disposition": {"kind": "signaled", "signal": 14, "core_dumped": false}
+        });
+        replace_embedded_report(&mut direct_container, report);
+        let mut container_series = series_row(
+            "fixture/boundary/verify/ptrace",
+            SeriesOutcome::Errored,
+            SeriesProducer::Validate,
+            1,
+            Some(fixture_detcore_tree.clone()),
+            None,
+        );
+        container_series.event_id = format!("fixture-container-{run}-attempt-1");
+        container_series.run_id = direct_container.run_id.clone();
+        container_series.series.attempt = Some(1);
+        container_series.series.no_verdict_evidence = Some(SeriesNoVerdictEvidence {
+            evidence_sha256: direct_container.evidence_identity()?,
+            attempts: vec![SeriesAttemptDisposition {
+                index: "1".into(),
+                kind: SeriesNoVerdictKind::ContainerFailed,
+                detail: None,
+                attempt_outcome: "FAIL".into(),
+                disposition: SeriesOutcome::NoResult,
+                error_kind: None,
+                status: Some(125),
+                signal: None,
+                timed_out: false,
+                verification_report_sha256: Some(
+                    direct_container.attempts[0]["verification_report_sha256"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                ),
+            }],
+        });
+        for timed_out in [false, true] {
+            let mut direct = direct_container.clone();
+            let mut series = container_series.clone();
+            if timed_out {
+                direct.outcome = "ERROR".into();
+                direct.result = Some(ObservedResult::Timeout);
+                direct.failure_class = Some(FailureClass::NoResult);
+                direct.error_kind = Some("wall-timeout".into());
+                let mut timeout_attempt = not_run_row.attempts[0].clone();
+                timeout_attempt["index"] = "2".into();
+                direct.attempts.push(timeout_attempt);
+                series.series.outcome = SeriesOutcome::Timeout;
+                series.series.result = Some(ObservedResult::Timeout);
+                series.series.failure_class = Some(FailureClass::NoResult);
+                let evidence = series.series.no_verdict_evidence.as_mut().unwrap();
+                let mut timeout = no_verdict_evidence(true).attempts.remove(0);
+                timeout.index = "2".into();
+                timeout.verification_report_sha256 = Some(
+                    direct.attempts[1]["verification_report_sha256"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                );
+                evidence.attempts.push(timeout);
+                evidence.evidence_sha256 = direct.evidence_identity()?;
+            }
+            series.validate_for_write()?;
+            let encoded = serde_json::to_vec(&series).map_err(|e| e.to_string())?;
+            let series: SeriesRow = serde_json::from_slice(&encoded).map_err(|e| e.to_string())?;
+            let (projected, projection) = project_series_fixture(std::slice::from_ref(&series))?;
+            let (direct, fold) = fold_fixture_row(direct)?;
+            let expected = if timed_out {
+                ObservedResult::Timeout
+            } else {
+                ObservedResult::CrashError
+            };
+            if series_evidence(&series, &projected.cells[0].id)
+                != Some(SeriesEvidence {
+                    result: Some(expected),
+                    no_verdict: true,
+                })
+                || projected.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+                || direct.cells[0].measurement != projected.cells[0].measurement
+                || direct.cells[0].observations[0].results != BTreeSet::from([expected])
+                || projected.cells[0].observations[0].results
+                    != direct.cells[0].observations[0].results
+                || projection.rows != 1
+                || projection.no_verdict_rows != 1
+                || projection.runs != 1
+                || !projection.skipped.is_empty()
+                || fold.passed != 0
+                || fold.located != 0
+                || fold.unlocated != 0
+                || fold.errored.len() != 1
+                || fold.reads_all_green()
+            {
+                return Err(format!(
+                    "{run} container failure changed between direct and series folds (timeout={timed_out})"
+                ));
+            }
+            let mut missing_projection = projected.clone();
+            missing_projection.projection = None;
+            if !encoded_cells(&missing_projection)
+                .expect_err("projected container failure without source identity was stored")
+                .contains("uses projected identity without scorecard schema 7 and complete source identity")
+            {
+                return Err("missing container projection metadata lost its exact refusal".into());
+            }
+            for tracked in [&direct, &projected] {
+                let observation = &tracked.cells[0].observations[0];
+                if !observation.canonical_comparisons.is_empty()
+                    || !observation.backend_parity_comparisons.is_empty()
+                {
+                    return Err("container failure manufactured comparison/count credit".into());
+                }
+                let encoded = encoded_cells(tracked)?;
+                let reloaded: TrackedCells =
+                    serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
+                if reloaded.schema != tracked.schema
+                    || reloaded.projection != tracked.projection
+                    || reloaded.cells != tracked.cells
+                {
+                    return Err("container failure changed across stored scorecard readback".into());
+                }
+            }
+            if projected.cells[0].observations[0].event_ids
+                != BTreeSet::from([series.event_id.clone()])
+                || direct.cells[0].observations[0].invocations.len() != 1
+            {
+                return Err(
+                    "container failure lost its exact projection/invocation identity".into(),
+                );
+            }
+        }
+        // Do not promote another well-formed historical no-result kind just
+        // because its enclosing series has the same product-failure tuple.
+        let mut historical = container_series.clone();
+        historical
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .kind = SeriesNoVerdictKind::FirstRunRejected;
+        let (projected, outcome) = project_series_fixture(&[historical])?;
+        if !projected.cells[0].observations[0].results.is_empty() || outcome.no_verdict_rows != 1 {
+            return Err("container projection broadened unrelated no-result observations".into());
+        }
+        // The real series admission gate must still reject malformed or
+        // contradictory tuples atomically, including alongside a valid row.
+        for mutation in [
+            "zero",
+            "signal",
+            "timeout",
+            "pass",
+            "comparison",
+            "missing-report",
+            "classification",
+            "duplicate-index",
+        ] {
+            let mut bad = container_series.clone();
+            bad.event_id = format!("fixture-bad-{run}-{mutation}");
+            let evidence = bad.series.no_verdict_evidence.as_mut().unwrap();
+            let disposition = &mut evidence.attempts[0];
+            match mutation {
+                "zero" => disposition.status = Some(0),
+                "signal" => {
+                    disposition.status = None;
+                    disposition.signal = Some(14);
+                }
+                "timeout" => disposition.timed_out = true,
+                "pass" => disposition.attempt_outcome = "PASS".into(),
+                "comparison" => disposition.disposition = SeriesOutcome::Diverged,
+                "missing-report" => disposition.verification_report_sha256 = None,
+                "classification" => bad.series.failure_class = Some(FailureClass::NoResult),
+                "duplicate-index" => evidence.attempts.push(evidence.attempts[0].clone()),
+                _ => unreachable!(),
+            }
+            let mut atomic = TrackedCells {
+                schema: SCHEMA,
+                projection: None,
+                cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+            };
+            let before = serde_json::to_vec(&atomic).map_err(|e| e.to_string())?;
+            if apply_series_rows(&root, &mut atomic, &[container_series.clone(), bad], None).is_ok()
+                || serde_json::to_vec(&atomic).map_err(|e| e.to_string())? != before
+            {
+                return Err(format!(
+                    "{run} container series accepted {mutation} or changed state on refusal"
+                ));
+            }
+        }
     }
 
     let mut series_noncanonical = series_unavailable.clone();

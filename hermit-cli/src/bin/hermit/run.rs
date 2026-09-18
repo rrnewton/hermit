@@ -72,11 +72,15 @@ use super::verify::ComparisonOptions;
 use super::verify::LogCompareStrictness;
 use super::verify::NoResultReason;
 use super::verify::VerificationReport;
+use super::verify::VerificationRun;
 use super::verify::VerificationRuntime;
 use super::verify::announce_verification_outcome;
 use super::verify::compare_two_runs;
 use super::verify::default_failed_verify_log_retention;
+use super::verify::retain_logs_after_verification_error;
+use super::verify::retain_verification_error;
 use super::verify::retain_verification_logs;
+use super::verify::run_verification_execution;
 use super::verify::temp_log_files_in;
 use super::verify::validate_log_level;
 use super::verify::verification_log_level;
@@ -611,6 +615,13 @@ pub struct RunOpts {
     /// "first_divergent_record":int|null,"first_divergent_syscall":int|null}`.
     /// `dbt_counted_branches` is present only when DBT completed a typed
     /// whole-process comparison; it is omitted for other backends and no-result.
+    /// If a sandbox exits before returning its guest Output, the report instead
+    /// records `verdict: "no_result"` and `no_result_reason.kind:
+    /// "container_failed"`, with `run: "run1"|"run2"` and the container's
+    /// `exited` (code) or `signaled` (signal, core_dumped) disposition. Guest
+    /// status, comparison, counts and divergence coordinates remain absent.
+    /// An unchanged `not_run` reason means only that the initial stamp was not
+    /// replaced; it does not prove that no execution was attempted.
     /// ALL FOUR divergence coordinates are emitted, and they are four
     /// DIFFERENT KEYSPACES that must never be compared across axes: one real
     /// divergence was record 7495, syscall 1074, scheduler turn 196 -- three
@@ -4083,11 +4094,27 @@ impl RunOpts {
         capture_output: bool,
         guest_capture: Option<&GuestRunCaptureSession>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
+        // main has reserved startup stdin before this can allocate a descriptor.
+        // Keep the unlinked output open through the real container fork; its
+        // controller-local proc-fd spelling is constructed only inside it.
+        let summary_output = if guest_capture.is_some() && self.summary_json.is_some() {
+            Some(super::staged_summary::private_output(
+                &private_summary_dir()?,
+            )?)
+        } else {
+            None
+        };
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
             return with_container(&mut process, || {
-                self.run_in_container(global, capture_output, guest_capture, None)
+                self.run_in_container(
+                    global,
+                    capture_output,
+                    guest_capture,
+                    summary_output.as_ref(),
+                    None,
+                )
             });
         }
 
@@ -4100,6 +4127,7 @@ impl RunOpts {
                 global,
                 capture_output,
                 guest_capture,
+                summary_output.as_ref(),
                 Some(&identity_sources),
             )
         })
@@ -4213,9 +4241,13 @@ impl RunOpts {
 
         eprintln!(":: {}", "Run1...".yellow().bold());
 
-        let (mut out1, skid_overshoots_run1) = match run1_options.run_verify(log1_file, global) {
+        let (mut out1, skid_overshoots_run1) = match run_verification_execution(
+            self.verify_json.as_deref(),
+            VerificationRun::Run1,
+            || run1_options.run_verify(log1_file, global),
+        ) {
             Ok(result) => result,
-            Err(error) => {
+            Err(mut error) => {
                 if let Some(overshoot) = error.downcast_ref::<SkidOvershootError>()
                     && let Some(path) = &self.verify_json
                 {
@@ -4228,15 +4260,15 @@ impl RunOpts {
                         // no guest ExitStatus to record.
                         None,
                     ) {
-                        eprintln!(
-                            "WARNING: could not record the skid overshoot in {}: {}",
-                            path.display(),
-                            report_error
+                        error = retain_verification_error(
+                            error,
+                            "publishing skid overshoot",
+                            report_error,
                         );
                     }
                 }
                 if self.keep_logs {
-                    retain_verification_logs([("run 1", log1_path)])?;
+                    error = retain_logs_after_verification_error(error, [("run 1", log1_path)]);
                 }
                 return Err(error);
             }
@@ -4370,9 +4402,13 @@ impl RunOpts {
         restore_standard_fd_status_flags(fd_flags_before_run1);
 
         eprintln!(":: {}", "Run2...".yellow().bold());
-        let (mut out2, skid_overshoots_run2) = match run2_options.run_verify(log2_file, global) {
+        let (mut out2, skid_overshoots_run2) = match run_verification_execution(
+            self.verify_json.as_deref(),
+            VerificationRun::Run2,
+            || run2_options.run_verify(log2_file, global),
+        ) {
             Ok(result) => result,
-            Err(error) => {
+            Err(mut error) => {
                 if let Some(overshoot) = error.downcast_ref::<SkidOvershootError>()
                     && let Some(path) = &self.verify_json
                 {
@@ -4384,15 +4420,18 @@ impl RunOpts {
                         verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref()),
                         Some(out1.status),
                     ) {
-                        eprintln!(
-                            "WARNING: could not record the skid overshoot in {}: {}",
-                            path.display(),
-                            report_error
+                        error = retain_verification_error(
+                            error,
+                            "publishing skid overshoot",
+                            report_error,
                         );
                     }
                 }
                 if self.keep_logs {
-                    retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+                    error = retain_logs_after_verification_error(
+                        error,
+                        [("run 1", log1_path), ("run 2", log2_path)],
+                    );
                 }
                 return Err(error);
             }
@@ -4888,6 +4927,7 @@ impl RunOpts {
         global: &GlobalOpts,
         capture_output: bool,
         guest_capture: Option<&GuestRunCaptureSession>,
+        summary_output: Option<&File>,
         identity_sources: Option<&IdentityGuard>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         let _guard = global.init_tracing();
@@ -4938,32 +4978,39 @@ impl RunOpts {
         self.save_config_to_disk()?;
 
         let timeout = self.run_timeout();
-        if capture_output || (guest_capture.is_some() && backend == Backend::Kvm) {
-            let out = hermit::run_with_output_backend_timeout(
-                command,
-                config,
-                self.summary,
-                &self.summary_json,
-                backend,
-                timeout,
-            )?;
-            if let Some(capture) = guest_capture {
-                capture.write_kvm_virtual_console(&out.stdout, &out.stderr)?;
-                Ok((out.status, None))
-            } else {
-                Ok((out.status, Some(out)))
-            }
-        } else {
-            let status = hermit::run_with_backend_timeout(
-                command,
-                config,
-                self.summary,
-                &self.summary_json,
-                backend,
-                timeout,
-            )?;
-            Ok((status, None))
-        }
+        super::staged_summary::with_published_summary(
+            summary_output,
+            self.summary_json.as_deref(),
+            guest_capture,
+            |summary_json| {
+                if capture_output || (guest_capture.is_some() && backend == Backend::Kvm) {
+                    let out = hermit::run_with_output_backend_timeout(
+                        command,
+                        config,
+                        self.summary,
+                        summary_json,
+                        backend,
+                        timeout,
+                    )?;
+                    if let Some(capture) = guest_capture {
+                        capture.write_kvm_virtual_console(&out.stdout, &out.stderr)?;
+                        Ok((out.status, None))
+                    } else {
+                        Ok((out.status, Some(out)))
+                    }
+                } else {
+                    let status = hermit::run_with_backend_timeout(
+                        command,
+                        config,
+                        self.summary,
+                        summary_json,
+                        backend,
+                        timeout,
+                    )?;
+                    Ok((status, None))
+                }
+            },
+        )
     }
 
     fn run_verify_in_container(
@@ -5045,6 +5092,37 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn real_returned_guest_disposition_still_uses_first_run_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verify.json");
+        write_pending_verification_json(&path).unwrap();
+        let output = run_verification_execution(Some(&path), VerificationRun::Run1, || {
+            super::super::container::classify_container_result(Container::new().run(|| {
+                Ok::<_, hermit::SerializableError>(Output {
+                    status: ExitStatus::Signaled(reverie::process::Signal::SIGALRM, false),
+                    stdout: b"returned guest output".to_vec(),
+                    stderr: Vec::new(),
+                })
+            }))
+        })
+        .unwrap();
+        let options = RunOpts::parse_from(["run", "--", "/bin/true"]);
+        assert!(!options.verify_allow.satisfies(output.status));
+        let report = first_run_rejected_report(&output, None);
+        write_report_json(&path, &report).unwrap();
+        let parsed = VerificationReport::from_current_json_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(matches!(
+            parsed.no_result_reason,
+            Some(NoResultReason::FirstRunRejected {
+                signal: Some(libc::SIGALRM),
+                ..
+            })
+        ));
+        assert_eq!(parsed.guest_signal, Some(libc::SIGALRM));
+        assert!(parsed.comparison.is_none());
+    }
 
     #[test]
     fn first_run_rejected_report_keeps_available_guest_exit_code() {

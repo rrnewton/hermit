@@ -190,7 +190,15 @@ const INTEGRATION_ARTIFACT_WRAPPER: &str =
 /// placeholder tag. The committed DAG contains the real `compat.*` population;
 /// this name is never a node and never triggers runtime graph generation.
 const STRICT_COMPAT_SELECTION_ALIAS: &str = "test.strict_compat";
-const NEXTEST_PORTABLE_PREPARE_COMMAND: &str = "./ci/nextest-binaries.rs prepare portable";
+// The FULL plan's workspace producer prepares the FULL profile. Each build
+// producer prepares the profile of the plan it serves -- full/full,
+// privileged/privileged, liteinst/liteinst, quick/quick, super/super -- and
+// ci/manifest-plan/src/validation_dag_static.rs, which generates the graph,
+// emits "prepare portable" for no step at all. The earlier spelling here named
+// a profile this producer had stopped preparing, so the bracket refused a graph
+// that was correct. Renamed as well as retargeted: a constant whose name says
+// portable while its value says full is the same defect one layer down.
+const NEXTEST_FULL_PREPARE_COMMAND: &str = "./ci/nextest-binaries.rs prepare full";
 const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str = "./ci/nextest-binaries.rs assert privileged";
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1"#;
 
@@ -329,7 +337,7 @@ fn prepared_nextest_commands_bracket(workspace: &Step, privileged: &Step) -> Res
         || !privileged_command.contains(NEXTEST_PRIVILEGED_ASSERT_COMMAND)
         || !privileged_command.contains(TESTS_MISC_EXECUTABLE_READ_COMMAND)
         || privileged_command.contains("cargo ")
-        || !workspace_command.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND)
+        || !workspace_command.ends_with(NEXTEST_FULL_PREPARE_COMMAND)
     {
         return Err("full-plan bracket: prepared Nextest population must come from the workspace producer and the privileged barrier must verify it without Cargo compilation".into());
     }
@@ -1558,6 +1566,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     for relative in [
         ".config/nextest.toml",
         "Makefile",
+        "ci/compat/corpus-strict.json",
         "ci/dag/validate.json",
         "ci/manifest-plan/src/runner.rs",
         "ci/manifest-plan/src/service_result.rs",
@@ -1592,6 +1601,7 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "--",
                 ".config/nextest.toml",
                 "Makefile",
+                "ci/compat/corpus-strict.json",
                 "ci/dag/validate.json",
                 "ci/manifest-plan/src/runner.rs",
                 "ci/manifest-plan/src/service_result.rs",
@@ -1852,12 +1862,16 @@ fn self_test_runner_log_probe(logs: &Path, outer: &Path) -> Result<(), String> {
         10, 10, 64 * 1024 * 1024,
     );
     // Real production labels deliberately collide with the seeded outer files.
+    let mut skipped = step("post", "must_not_run", "exit 99");
+    skipped.deps = vec!["setup.manifest_plan".into()];
     let cfg = validate_plan::config_from(vec![
         step("pre", "submodules", "printf 'fixture pass\\n'"),
         step("setup", "manifest_plan", "printf 'fixture failure\\n'; exit 23"),
+        skipped,
     ], "runner log isolation fixture");
     let result = run_lane_once(&cfg, 1, true, 0, None, &logs.join("driver.log"), None, false);
-    if !result.complete || result.ok || result.run_timed_out || !result.skipped.is_empty()
+    if result.complete || result.ok || result.run_timed_out
+        || result.skipped != ["post.must_not_run".to_string()]
         || result.outcomes.len() != 2 || result.attempts.len() != 2
     {
         return Err(format!("runner log isolation: terminal result changed: complete={} ok={} outcomes={:?} skipped={:?}",
@@ -1881,14 +1895,46 @@ fn self_test_runner_log_probe(logs: &Path, outer: &Path) -> Result<(), String> {
         .map(serde_json::from_slice::<serde_json::Value>)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("runner log isolation: malformed private journal: {error}"))?;
-    for (tag, ok) in [("pre.submodules", "true"), ("setup.manifest_plan", "false")] {
+    if dagrun::require_step_end_ok(&serde_json::json!({
+        "event": "step_end",
+        "ok": "false",
+    }))
+    .is_ok()
+    {
+        return Err("runner log isolation: string `false` journal verdict was accepted".into());
+    }
+    let ends = rows.iter().filter(|row| row["event"] == "step_end").collect::<Vec<_>>();
+    let skips = rows.iter().filter(|row| row["event"] == "step_skip").collect::<Vec<_>>();
+    let terminal_steps = ends.iter().chain(&skips)
+        .filter_map(|row| row["step"].as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_terminal_steps = [
+        "pre.submodules",
+        "setup.manifest_plan",
+        "post.must_not_run",
+    ].into_iter().collect::<BTreeSet<_>>();
+    if ends.len() + skips.len() != expected_terminal_steps.len()
+        || terminal_steps != expected_terminal_steps
+    {
+        return Err(format!("runner log isolation: incomplete terminal accounting: {terminal_steps:?}"));
+    }
+    for (tag, ok) in [("pre.submodules", true), ("setup.manifest_plan", false)] {
         let starts = rows.iter().filter(|row| row["event"] == "step_start" && row["step"] == tag).count();
-        let ends = rows.iter().filter(|row| row["event"] == "step_end" && row["step"] == tag).collect::<Vec<_>>();
-        if starts != 1 || ends.len() != 1 || ends[0]["ok"] != ok
-            || ends[0]["timed_out"] != "false" || ends[0]["cpu_timed_out"] != "false"
+        let matching_ends = ends.iter().filter(|row| row["step"] == tag).collect::<Vec<_>>();
+        let observed_ok = matching_ends.first()
+            .ok_or_else(|| format!("runner log isolation: no terminal journal record for {tag}"))
+            .and_then(|row| dagrun::require_step_end_ok(row)
+                .map_err(|error| format!("runner log isolation: {tag}: {error}")))?;
+        if starts != 1 || matching_ends.len() != 1 || observed_ok != ok
+            || matching_ends[0]["timed_out"] != "false" || matching_ends[0]["cpu_timed_out"] != "false"
         {
             return Err(format!("runner log isolation: missing or changed start/end record for {tag}"));
         }
+    }
+    if skips.len() != 1 || skips[0]["step"] != "post.must_not_run"
+        || skips[0]["reason"] != "dependency_failed"
+    {
+        return Err(format!("runner log isolation: missing or changed skip record: {skips:?}"));
     }
     for name in ["journal.jsonl", "pre.submodules.log", "setup.manifest_plan.log"] {
         if read(&outer.join(name))? != RUNNER_LOG_SENTINEL {
@@ -2114,6 +2160,7 @@ fn self_test() -> Result<(), String> {
             filtered_tests: None,
             test_results: None,
             test_results_error: None,
+            test_results_error_kind: None,
             returncode: Some(if ok { 0 } else { 1 }),
             oomed: false,
             oom_kills: 0,
@@ -3440,15 +3487,15 @@ cleared-caps refusal names {} starved step(s)",
                     .into(),
             );
         }
-        let portable_build = full
+        let workspace_build = full
             .cfg
             .steps
             .iter()
             .find(|s| s.tag() == "build.workspace")
-            .ok_or("full-plan bracket: portable fat build disappeared")?;
-        if !portable_build.cmd.contains("cargo build --workspace --all-targets")
-            || !portable_build.cmd.contains("cargo build -p hermit")
-            || !portable_build.cmd.contains("--bin hermit")
+            .ok_or("full-plan bracket: workspace fat build disappeared")?;
+        if !workspace_build.cmd.contains("cargo build --workspace --all-targets")
+            || !workspace_build.cmd.contains("cargo build -p hermit")
+            || !workspace_build.cmd.contains("--bin hermit")
         {
             return Err("full-plan bracket: fat build does not finish the debug Hermit producer".into());
         }
@@ -3592,11 +3639,23 @@ cleared-caps refusal names {} starved step(s)",
             .find(|s| s.tag() == "privileged-build.privileged_tests")
             .ok_or("full-plan bracket: privileged focused build disappeared")?;
         privileged_artifact_barriers(privileged_build)?;
-        prepared_nextest_commands_bracket(portable_build, privileged_build)?;
-        let prepared = hermit_manifest_plan::nextest_binaries::profile_selections(&root, "portable")?;
+        prepared_nextest_commands_bracket(workspace_build, privileged_build)?;
+        // Ask about the profile the producer ACTUALLY prepares. build.workspace
+        // prepares "full" (see NEXTEST_FULL_PREPARE_COMMAND), so asking whether
+        // "portable" covers the privileged selections tested a set nobody
+        // prepares. MEASURED on the committed graph: portable holds 15
+        // selections, full 16, privileged 3; portable omits exactly one
+        // privileged selection and full omits none. The one it omits is
+        // privileged-only-test.cli_kvm's
+        // ["-p","hermit","--features","third-party-backends,kvm-execution-tests","--lib","--test","cli"],
+        // which the same commit created when it gave that node the
+        // kvm-execution-tests feature. The requirement is unchanged -- every
+        // privileged selection must already be prepared -- only the set it is
+        // asked of is now the one that exists.
+        let prepared = hermit_manifest_plan::nextest_binaries::profile_selections(&root, "full")?;
         for required in hermit_manifest_plan::nextest_binaries::profile_selections(&root, "privileged")?.keys() {
             if !prepared.contains_key(required) {
-                return Err(format!("full-plan bracket: portable preparation omits privileged Cargo selection {required}"));
+                return Err(format!("full-plan bracket: full preparation omits privileged Cargo selection {required}"));
             }
         }
         if ["test.cli", "test.hermit_modes"]
@@ -9129,6 +9188,334 @@ fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> dagrun::model::Step {
     prepare_fixtures_node_dep(_tag, fixtures, "compatprep.hermit_release")
 }
 
+/// Exercise both sides of the fixture-path boundary without a Hermit binary:
+/// the outer shell expands the run state, then env -i removes it before the
+/// unmodified guest argv executes. This is an argv/environment bracket, not a
+/// substitute for the real strict-verify comparator.
+fn compat_fixture_operand_bracket(root: &Path, committed: &[&Step]) -> Result<String, String> {
+    let fixture = tempfile::Builder::new()
+        .prefix("validate-compat-operand-")
+        .tempdir()
+        .map_err(|error| format!("compat fixture operand: cannot create fixture: {error}"))?;
+    let run_state = fixture.path().join("run state ' \" \\ $missing `false`");
+    let fixtures = run_state.join("strict-compat/real-compat-fixtures");
+    let guest_tmp = fixture.path().join("guest-tmp");
+    for path in [&fixtures, &guest_tmp] {
+        std::fs::create_dir_all(path)
+            .map_err(|error| format!("compat fixture operand: cannot create directory: {error}"))?;
+    }
+    let readme = fixtures.join("README.md");
+    std::fs::write(&readme, "the actual run-owned fixture\n")
+        .map_err(|error| format!("compat fixture operand: cannot write README: {error}"))?;
+    let metadata = std::fs::metadata(&readme)
+        .map_err(|error| format!("compat fixture operand: cannot stat README: {error}"))?;
+    let root_text = root.to_string_lossy();
+    let fixtures_text = fixtures.to_string_lossy();
+    let tmp_text = guest_tmp.to_string_lossy();
+    let paths = validate_corpus::CorpusPaths {
+        root_dir: &root_text,
+        real_compat_fixtures: &fixtures_text,
+        validation_tmp_dir: &tmp_text,
+        shell_build_dir: &tmp_text,
+    };
+    let only = BTreeSet::from(["chown".to_string(), "install".to_string()]);
+    let constructed = validate_plan::compat_nodes_for(
+        root,
+        validate_plan::CompatMode::PortableStrict,
+        "fixture-hermit",
+        "unused",
+        &paths,
+        None,
+        Some(&only),
+        None,
+    )?;
+    let mut commands = Vec::new();
+    for label in ["chown", "install"] {
+        for (kind, nodes) in [
+            ("constructed", constructed.iter().collect::<Vec<_>>()),
+            ("committed", committed.to_vec()),
+        ] {
+            let node = nodes
+                .iter()
+                .find(|node| node.job == label)
+                .ok_or_else(|| format!("compat fixture operand: missing {kind} {label}"))?;
+            let (_, guest) = node.cmd.split_once(" -- ").ok_or_else(|| {
+                format!(
+                    "compat fixture operand: missing guest boundary: {}",
+                    node.cmd
+                )
+            })?;
+            if !guest.contains("\"$1\"") || guest.contains("--env VALIDATE_RUN_STATE") {
+                return Err(format!(
+                    "compat fixture operand: {kind} {label} lost positional fixture"
+                ));
+            }
+            if kind == "committed"
+                && !guest.contains(
+                    "\"$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md\"",
+                )
+            {
+                return Err(format!(
+                    "compat fixture operand: {label} lost outer path quoting: {guest}"
+                ));
+            }
+            commands.push((kind, label, guest.to_string()));
+        }
+    }
+    let run = |guest: &str| -> Result<std::process::Output, String> {
+        Command::new("bash").args(["-eu", "-c", &format!(
+            "exec env -i PATH=/usr/bin:/bin HOME=/root TMPDIR=\"$COMPAT_GUEST_TMP\" bash -c 'test \"${{VALIDATE_RUN_STATE+x}}\" != x || exit 91; exec \"$@\"' compat-env {guest}",
+        )])
+            .env_clear().env("PATH", "/usr/bin:/bin")
+            .env("VALIDATE_RUN_STATE", &run_state).env("COMPAT_GUEST_TMP", &guest_tmp)
+            .current_dir(fixture.path()).output()
+            .map_err(|error| format!("compat fixture operand: cannot run clean guest: {error}"))
+    };
+    for (kind, label, guest) in &commands {
+        let output = run(guest)?;
+        let expected = if *label == "chown" {
+            format!("{}:{}\n", metadata.uid(), metadata.gid())
+        } else {
+            format!("640 {}\n", metadata.len())
+        };
+        if !output.status.success() || output.stdout != expected.as_bytes() {
+            return Err(format!(
+                "compat fixture operand: {kind} {label} failed: status={} stdout={:?} stderr={:?}, expected={expected:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ));
+        }
+        // Restore the old defect inside the single-quoted shell body. The
+        // parent still has the variable; only the guest is correctly stripped.
+        let old = guest.replace(
+            "\"$1\"",
+            "\"$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md\"",
+        );
+        let output = run(&old)?;
+        if output.status.success()
+            || !String::from_utf8_lossy(&output.stderr)
+                .contains("VALIDATE_RUN_STATE: unbound variable")
+        {
+            return Err(format!(
+                "compat fixture operand: {kind} {label} did not reject the old guest expansion"
+            ));
+        }
+    }
+    std::fs::remove_file(&readme).map_err(|error| {
+        format!("compat fixture operand: cannot remove negative fixture: {error}")
+    })?;
+    for (kind, label, guest) in &commands {
+        if run(guest)?.status.success() {
+            return Err(format!(
+                "compat fixture operand: {kind} {label} passed with its actual fixture missing"
+            ));
+        }
+    }
+    Ok("compat fixture operand: constructed + committed chown/install preserve clean guest environment, literal paths, owner/mode/size; old expansion and missing fixture fail".into())
+}
+
+/// A digest of empty input is a successful hash operation, not proof that its
+/// compressor succeeded. Run the actual generated guest argv under Minimal's
+/// cleared environment and compare against independently compressed real input.
+fn compat_compression_fixture_bracket(root: &Path, committed: &[&Step]) -> Result<String, String> {
+    use std::os::unix::process::CommandExt;
+
+    let fixture = tempfile::Builder::new()
+        .prefix("validate-compression-operand-")
+        .tempdir()
+        .map_err(|error| format!("compression fixture: create tempdir: {error}"))?;
+    let run_state = fixture.path().join("run state ' \" \\ $missing `false`");
+    let fixtures = run_state.join("strict-compat/real-compat-fixtures");
+    let failed_producers = fixture.path().join("failed-producers");
+    for path in [&fixtures, &failed_producers] {
+        std::fs::create_dir_all(path)
+            .map_err(|error| format!("compression fixture: create directory: {error}"))?;
+    }
+    let readme = fixtures.join("README.md");
+    let input = std::fs::read(root.join("README.md"))
+        .map_err(|error| format!("compression fixture: read real README: {error}"))?;
+    if input.is_empty() {
+        return Err("compression fixture: the positive input is empty".into());
+    }
+    std::fs::write(&readme, &input)
+        .map_err(|error| format!("compression fixture: write README: {error}"))?;
+    let root_text = root.to_string_lossy();
+    let fixtures_text = fixtures.to_string_lossy();
+    let tmp_text = fixture.path().to_string_lossy();
+    let paths = validate_corpus::CorpusPaths {
+        root_dir: &root_text,
+        real_compat_fixtures: &fixtures_text,
+        validation_tmp_dir: &tmp_text,
+        shell_build_dir: &tmp_text,
+    };
+    let compressors: [(&str, &[&str]); 4] = [
+        ("bzip2", &["-c"]),
+        ("gzip", &["-cn"]),
+        ("xz", &["-c"]),
+        ("zstd", &["-q", "-c"]),
+    ];
+    let only = compressors
+        .iter()
+        .map(|(label, _)| (*label).to_string())
+        .collect();
+    let constructed = validate_plan::compat_nodes_for(
+        root,
+        validate_plan::CompatMode::PortableStrict,
+        "fixture-hermit",
+        "unused",
+        &paths,
+        None,
+        Some(&only),
+        None,
+    )?;
+    let mut commands = Vec::new();
+    let empty_digest = format!("{:x}  -\n", Sha256::digest([]));
+    for (label, flags) in compressors {
+        let direct = Command::new(label)
+            .args(flags)
+            .arg(&readme)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .map_err(|error| format!("compression fixture: launch {label}: {error}"))?;
+        if !direct.status.success() || direct.stdout.is_empty() || !direct.stderr.is_empty() {
+            return Err(format!(
+                "compression fixture: real {label} control failed: {direct:?}"
+            ));
+        }
+        let expected = format!("{:x}  -\n", Sha256::digest(&direct.stdout));
+        // Retain the precise old false-pass mechanism as a negative control:
+        // the absent guest variable loses its prefix and sha256sum masks rc 1.
+        let old = Command::new("bash")
+            .args(["-c", &format!(
+                "{label} {} $VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md | sha256sum",
+                flags.join(" ")
+            )])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .map_err(|error| format!("compression fixture: old {label}: {error}"))?;
+        if !old.status.success() || old.stdout != empty_digest.as_bytes() || old.stderr.is_empty() {
+            return Err(format!(
+                "compression fixture: old {label} no longer reproduces the false pass: {old:?}"
+            ));
+        }
+        let stub = failed_producers.join(label);
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nprintf 'partial producer output\\n'\nexit 23\n",
+        )
+        .and_then(|()| std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)))
+        .map_err(|error| format!("compression fixture: failing producer: {error}"))?;
+        for (kind, nodes) in [
+            ("constructed", constructed.iter().collect::<Vec<_>>()),
+            ("committed", committed.to_vec()),
+        ] {
+            let node = nodes
+                .iter()
+                .find(|node| node.job == label)
+                .ok_or_else(|| format!("compression fixture: missing {kind} {label}"))?;
+            let (_, guest) = node.cmd.split_once(" -- ").ok_or_else(|| {
+                format!("compression fixture: missing guest boundary: {}", node.cmd)
+            })?;
+            // Observe actual outer-shell expansion, not substring presence in
+            // the whole command. A literal/comment mentioning a variable is not
+            // an environment dependency; a path hidden inside bash -c is not an
+            // expanded operand. NUL framing preserves spaces and metacharacters.
+            let expanded = Command::new("bash")
+                .args(["-eu", "-c", &format!("printf '%s\\0' {guest}")])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("VALIDATE_RUN_STATE", &run_state)
+                .output()
+                .map_err(|error| format!("compression fixture: expand {kind} {label}: {error}"))?;
+            let argv = expanded
+                .stdout
+                .strip_suffix(&[0])
+                .ok_or_else(|| {
+                    format!("compression fixture: {kind} {label} has no final argv delimiter")
+                })?
+                .split(|byte| *byte == 0)
+                .map(|bytes| std::ffi::OsString::from(OsStr::from_bytes(bytes)))
+                .collect::<Vec<_>>();
+            if !expanded.status.success()
+                || !expanded.stderr.is_empty()
+                || argv.len() != 5
+                || argv[0] != "bash"
+                || argv[1] != "-c"
+                || argv[4] != readme.as_os_str()
+            {
+                return Err(format!(
+                    "compression fixture: {kind} {label} did not pass the actual fixture at the guest argv boundary: {expanded:?}"
+                ));
+            }
+            commands.push((kind, label, argv, expected.clone()));
+        }
+    }
+    let run = |argv: &[std::ffi::OsString], failed: bool, unreadable: bool| {
+        let path = if failed {
+            format!("{}:/usr/bin:/bin", failed_producers.display())
+        } else {
+            "/usr/bin:/bin".into()
+        };
+        let mut command = Command::new("/bin/bash");
+        command
+            .args(&argv[1..])
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", "/root")
+            .env("TMPDIR", fixture.path())
+            .current_dir("/");
+        // Root can read mode-000 files. A privileged self-test must exercise
+        // genuine denied access too, rather than skip or falsely pass this case.
+        if unreadable && unsafe { libc::geteuid() } == 0 {
+            command.gid(65534).uid(65534);
+        }
+        command
+            .output()
+            .map_err(|error| format!("compression fixture: launch guest: {error}"))
+    };
+    for (kind, label, argv, expected) in &commands {
+        let output = run(argv, false, false)?;
+        if !output.status.success()
+            || output.stdout != expected.as_bytes()
+            || !output.stderr.is_empty()
+        {
+            return Err(format!(
+                "compression fixture: {kind} {label} did not hash real compression: {output:?}, expected {expected:?}"
+            ));
+        }
+        let output = run(argv, true, false)?;
+        if output.status.code() != Some(23) {
+            return Err(format!(
+                "compression fixture: {kind} {label} hid a failed producer behind sha256sum: {output:?}"
+            ));
+        }
+    }
+    std::fs::set_permissions(&readme, std::fs::Permissions::from_mode(0o000))
+        .map_err(|error| format!("compression fixture: make unreadable: {error}"))?;
+    for (kind, label, argv, _) in &commands {
+        let output = run(argv, false, true)?;
+        if output.status.success() || output.stderr.is_empty() {
+            return Err(format!(
+                "compression fixture: {kind} {label} passed unreadable input: {output:?}"
+            ));
+        }
+    }
+    std::fs::remove_file(&readme)
+        .map_err(|error| format!("compression fixture: remove negative input: {error}"))?;
+    for (kind, label, argv, _) in &commands {
+        let output = run(argv, false, false)?;
+        if output.status.success() || output.stderr.is_empty() {
+            return Err(format!(
+                "compression fixture: {kind} {label} passed missing input: {output:?}"
+            ));
+        }
+    }
+    Ok("compression fixture: 4 old false passes reproduced; 8 constructed/committed argv preserve real input; 24 failed-producer/unreadable/missing cases fail".into())
+}
+
 /// Exercise committed strict-compatibility nodes through the real outer
 /// scheduler without running the corpus.
 ///
@@ -9214,6 +9601,8 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
                 .into(),
         );
     }
+    println!("  {}", compat_fixture_operand_bracket(root, &probes)?);
+    println!("  {}", compat_compression_fixture_bracket(root, &probes)?);
     let fixture_readme = "$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md";
     let readme_labels = probes
         .iter()
@@ -10009,6 +10398,7 @@ fn summary_listing_bracket() -> Result<String, String> {
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,
@@ -11497,6 +11887,8 @@ struct NodeAttempt {
     test_results: Option<Vec<dagrun::TestResult>>,
     /// Required-result refusal retained independently of the outer failure reason.
     test_results_error: Option<String>,
+    /// Typed result-import observation; absent historical kinds stay unknown.
+    test_results_error_kind: Option<dagrun::TestResultsErrorKind>,
 }
 
 fn attempt_is_no_result(attempt: &NodeAttempt) -> bool {
@@ -11590,6 +11982,7 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
         failure_class,
         test_results: outcome.test_results.clone(),
         test_results_error: outcome.test_results_error.clone(),
+        test_results_error_kind: outcome.test_results_error_kind,
     }
 }
 
@@ -11620,6 +12013,7 @@ fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
         failure_detail: Some("no completion payload was reported for this node".into()),
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
     }
 }
 
@@ -13326,7 +13720,14 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .ok_or("retry bounds: privileged lane is absent")?;
     for (tag, expected) in [
         ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
-        ("privileged-only-test.cli_kvm", 24usize),
+        // 25, not 24, since hermit de6a9910e "Align KVM validation selections with
+        // measured inventories" added the kvm-native-test-support feature. That
+        // commit measured 694/698/25 and retained all 689/681/24 prior identities,
+        // so this is one ADDED selection rather than a changed one. It bumped
+        // ci/dag/validate.json and left this table behind, which is what made
+        // gate.manifest fail deterministically -- the guard was right and the
+        // copy was stale.
+        ("privileged-only-test.cli_kvm", 25usize),
     ] {
         let step = privileged
             .steps
@@ -16277,6 +16678,7 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         filtered_tests: Some(0),
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -16331,6 +16733,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         filtered_tests,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -16522,6 +16925,9 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
     if let Some(error) = &outcome.test_results_error {
         gate["test_results_error"] = serde_json::json!(error);
     }
+    if let Some(kind) = outcome.test_results_error_kind {
+        gate["test_results_error_kind"] = serde_json::json!(kind.value());
+    }
     if let Some(failure_class) = outcome_failure_class(outcome) {
         gate["failure_class"] = serde_json::json!(failure_class);
         if failure_class == FailureClass::NoResult && !outcome.reason.is_empty() {
@@ -16583,6 +16989,9 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
             if let Some(error) = &a.test_results_error {
                 attempt["test_results_error"] = serde_json::json!(error);
             }
+            if let Some(kind) = a.test_results_error_kind {
+                attempt["test_results_error_kind"] = serde_json::json!(kind.value());
+            }
             if let Some(failure_class) = a.failure_class {
                 attempt["failure_class"] = serde_json::json!(failure_class);
             }
@@ -16616,6 +17025,13 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
             gate.as_object_mut()
                 .expect("ledger gate must remain a JSON object")
                 .remove("test_results_error");
+        }
+        if let Some(kind) = attempt.test_results_error_kind {
+            gate["test_results_error_kind"] = serde_json::json!(kind.value());
+        } else {
+            gate.as_object_mut()
+                .expect("ledger gate must remain a JSON object")
+                .remove("test_results_error_kind");
         }
         gate["aborted"] = serde_json::json!(attempt.aborted);
         gate["real_seconds"] = serde_json::json!(attempt.reported.then_some(attempt.duration_s));
@@ -16708,13 +17124,25 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
         );
         if bits & 8 != 0 {
             outcome.test_results_error = Some(format!("typed results refused in fixture {bits}"));
+            outcome.test_results_error_kind = Some(
+                [
+                    dagrun::TestResultsErrorKind::Missing,
+                    dagrun::TestResultsErrorKind::ReadIo,
+                    dagrun::TestResultsErrorKind::InvalidReport,
+                ][usize::from(bits) % 3],
+            );
         }
         let expected_error = outcome
             .test_results_error
             .as_ref()
             .map(|error| serde_json::json!(error));
+        let expected_kind = outcome
+            .test_results_error_kind
+            .map(|kind| serde_json::json!(kind.value()));
         let first = reported_attempt(&outcome, 1);
-        if first.test_results_error != outcome.test_results_error || first.reason != outcome.reason
+        if first.test_results_error != outcome.test_results_error
+            || first.test_results_error_kind != outcome.test_results_error_kind
+            || first.reason != outcome.reason
         {
             return Err(format!(
                 "typed gate {bits}: attempt conflated primary and result refusal"
@@ -16737,6 +17165,7 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
         }
         for row in [&fallback, &reported, &reported["attempts"][0]] {
             if row.get("test_results_error") != expected_error.as_ref()
+                || row.get("test_results_error_kind") != expected_kind.as_ref()
                 || row["reason"] != serde_json::json!(outcome.reason)
             {
                 return Err(format!(
@@ -16773,6 +17202,9 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
             if row.get("test_results_error").is_some()
                 || row["attempts"][1].get("test_results_error").is_some()
                 || row["attempts"][0].get("test_results_error") != expected_error.as_ref()
+                || row.get("test_results_error_kind").is_some()
+                || row["attempts"][1].get("test_results_error_kind").is_some()
+                || row["attempts"][0].get("test_results_error_kind") != expected_kind.as_ref()
             {
                 return Err(format!(
                     "typed gate {bits}: absent latest diagnostic inherited stale data: {row}"
@@ -16794,6 +17226,7 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
         let mut retry = outcome.clone();
         retry.reason = format!("independent outer retry reason {bits}");
         retry.test_results_error = Some(format!("distinct result refusal on retry {bits}"));
+        retry.test_results_error_kind = Some(dagrun::TestResultsErrorKind::ReadIo);
         let mut foreign = retry.clone();
         foreign.tag = "test.unrelated-diagnostic".into();
         foreign.test_results_error =
@@ -16811,6 +17244,9 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
             || retained["attempts"][0].get("test_results_error") != expected_error.as_ref()
             || retained["attempts"][1].get("test_results_error") != Some(&retry_error)
             || retained.get("test_results_error") != Some(&retry_error)
+            || retained["test_results_error_kind"] != "read_io"
+            || retained["attempts"][1]["test_results_error_kind"] != "read_io"
+            || retained["attempts"][0].get("test_results_error_kind") != expected_kind.as_ref()
             || retained["reason"] != serde_json::json!(retry.reason)
             || retained["attempts"][0]["reason"] != serde_json::json!(outcome.reason)
         {
@@ -16826,7 +17262,11 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
                     .map_err(|error| format!("typed gate reader refused emitted row: {error}"))?;
             let restored = serde_json::to_value(parsed)
                 .map_err(|error| format!("typed gate reader could not serialize row: {error}"))?;
-            for field in fields.into_iter().chain(["attempts", "test_results_error"]) {
+            for field in fields.into_iter().chain([
+                "attempts",
+                "test_results_error",
+                "test_results_error_kind",
+            ]) {
                 if row.get(field) != restored.get(field) {
                     return Err(format!(
                         "typed gate shared reader lost {field}: before={row} after={restored}"
@@ -16849,6 +17289,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         filtered_tests: Some(0),
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(1),
         oomed: false,
         oom_kills: 0,
@@ -17803,6 +18244,7 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode,
         oomed: false,
         oom_kills: 0,
@@ -17843,6 +18285,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(returncode),
         oomed: false,
         oom_kills: 0,
@@ -21932,6 +22375,7 @@ fn stop_test_seam(
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,
@@ -22477,8 +22921,8 @@ mod fused_privileged_build_tests {
         let repository = Path::new(file!()).parent().and_then(Path::parent).unwrap();
         let committed = validate_plan::validation_config(repository).unwrap();
         let workspace = committed.steps.iter().find(|step| step.tag() == "build.workspace").unwrap();
-        assert!(workspace.cmd.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND));
-        let preparation = &workspace.cmd[workspace.cmd.len() - NEXTEST_PORTABLE_PREPARE_COMMAND.len()..];
+        assert!(workspace.cmd.ends_with(NEXTEST_FULL_PREPARE_COMMAND));
+        let preparation = &workspace.cmd[workspace.cmd.len() - NEXTEST_FULL_PREPARE_COMMAND.len()..];
         let mut consumer = committed.steps.iter().find(|step| step.tag() == "privileged-build.privileged_tests").unwrap().clone();
         // This fixture supplies a fake Cargo executable and an empty target.
         // Preserve its full cold/prepared contract against the exact authored
@@ -22513,7 +22957,14 @@ mod fused_privileged_build_tests {
         let prepared = run_build(preparation, root.path(), &bin, &log, "current");
         assert!(prepared.status.success(), "{}", String::from_utf8_lossy(&prepared.stderr));
         let before = std::fs::read_to_string(&log).unwrap();
-        let expected = hermit_manifest_plan::nextest_binaries::profile_selections(repository, "portable").unwrap();
+        // The FULL profile, because `preparation` above is the full plan's own
+        // producer (NEXTEST_FULL_PREPARE_COMMAND) run against a fixture holding
+        // the real ci/dag/validate.json. Asking for "portable" compared this
+        // producer's output against a set it does not prepare: 16 observed
+        // builds against 15 expected. That is not a widening -- the loop below
+        // requires every expected selection to appear exactly once, so this
+        // now checks 16 selections where it checked 15.
+        let expected = hermit_manifest_plan::nextest_binaries::profile_selections(repository, "full").unwrap();
         let calls = before.lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
         let builds = calls.iter().filter(|args| args.first().map(String::as_str) == Some("nextest") && !args.iter().any(|arg| arg == "--binaries-metadata")).collect::<Vec<_>>();
         assert_eq!(builds.len(), expected.len(), "each distinct selection is prepared once");
@@ -23100,8 +23551,8 @@ mod prepared_command_tests {
         let payload = guarded_command_source(&pinned.tag(), &pinned.cmd).unwrap();
         let changed = outer_decoy(
             pinned,
-            &payload.replacen(NEXTEST_PORTABLE_PREPARE_COMMAND, "missing-preparation", 1),
-            NEXTEST_PORTABLE_PREPARE_COMMAND,
+            &payload.replacen(NEXTEST_FULL_PREPARE_COMMAND, "missing-preparation", 1),
+            NEXTEST_FULL_PREPARE_COMMAND,
         );
         assert!(prepared_nextest_commands_bracket(&changed, barrier).is_err());
 

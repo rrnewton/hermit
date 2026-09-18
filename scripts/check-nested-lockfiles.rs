@@ -350,7 +350,7 @@ mod tests {
             FetchMutation::OmitPreparation => {
                 split = replace_exactly_once(
                     &split,
-                    "        CARGO_HOME=\"$cargo_home\" ./ci/prepare-rust-scripts.sh --fetch-only\n",
+                    "        CARGO_HOME=\"$cargo_home\" host_fetch ./ci/prepare-rust-scripts.sh --fetch-only\n",
                     "        : # mutation control: generated workspace preparation omitted\n",
                 );
             }
@@ -432,6 +432,9 @@ printf 'network-probe\n' >>"${FIXTURE_JOURNAL:?}"
             &root.join("ci/hermetic/run-in-pinned-root.sh"),
             r#"#!/usr/bin/env bash
 set -euo pipefail
+if [[ -n ${FIXTURE_PROXY_JOURNAL:-} ]]; then
+    printf 'offline:%s:%s\n' "${CARGO_HTTP_PROXY+x}" "${CARGO_HTTP_PROXY:-}" >>"$FIXTURE_PROXY_JOURNAL"
+fi
 cargo_home=
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -488,8 +491,13 @@ printf 'rustc 1.90.0 (fixture)\nbinary: rustc\ncommit-hash: fixture\n'
             &fake_bin.join("cargo"),
             r#"#!/usr/bin/env bash
 set -euo pipefail
+[[ ${1:-} != -Zunstable-options ]] || shift
 command_name=${1:-}
 shift || true
+if [[ $command_name == --version ]]; then
+    printf '%s\n' "${FIXTURE_CARGO_VERSION:-cargo 1.100.0-nightly (fixture)}"
+    exit 0
+fi
 manifest=
 locked=0
 while [[ $# -gt 0 ]]; do
@@ -499,7 +507,25 @@ while [[ $# -gt 0 ]]; do
         *) shift ;;
     esac
 done
+if [[ -n ${FIXTURE_PROXY_JOURNAL:-} && $command_name != config ]]; then
+    printf '%s:%s:%s:%s:%s:%s\n' "$command_name" "$manifest" \
+        "${CARGO_HTTP_PROXY+x}" "${CARGO_HTTP_PROXY:-}" \
+        "${no_proxy:-}" "${NO_PROXY:-}" >>"$FIXTURE_PROXY_JOURNAL"
+fi
 case $command_name in
+    config)
+        if [[ ${FIXTURE_CONFIG_QUERY_FAIL:-0} == 1 ]]; then
+            echo 'private configuration error detail' >&2
+            exit 1
+        fi
+        if [[ $PWD == / ]]; then
+            [[ -z ${CARGO_BUILD_TARGET+x} && -z ${CARGO_TARGET_DIR+x} ]]
+            config=${FIXTURE_NEUTRAL_CARGO_CONFIG:-}
+        else
+            config=${FIXTURE_ROOT_CARGO_CONFIG:-}
+        fi
+        if [[ -n $config ]]; then printf '%s\n' "$config"; else printf '{}\n'; fi
+        ;;
     metadata)
         printf 'generated-metadata\n' >>"${FIXTURE_JOURNAL:?}"
         printf '{"packages":[{}]}\n'
@@ -573,14 +599,14 @@ esac
         }
     }
 
-    fn run_production_fixture(mutation: FetchMutation) -> (Output, String) {
-        let fixture = production_fixture(mutation);
+    fn production_fixture_command(fixture: &ProductionFixture) -> Command {
         let path = env::join_paths(
             std::iter::once(fixture.fake_bin.clone())
                 .chain(env::split_paths(&env::var_os("PATH").expect("test PATH"))),
         )
         .expect("join fixture PATH");
-        let output = Command::new(fixture.root.join("ci/hermetic/run-split-validate.sh"))
+        let mut command = Command::new(fixture.root.join("ci/hermetic/run-split-validate.sh"));
+        command
             .args(["--out", "phase-output", "--shards", "unit"])
             .current_dir(&fixture.root)
             .env("PATH", path)
@@ -590,7 +616,31 @@ esac
             )
             .env("FIXTURE_JOURNAL", &fixture.journal)
             .env("CARGO_BUILD_TARGET", "fixture-consumer-target")
-            .env("CARGO_TARGET_DIR", "fixture-consumer-output")
+            .env("CARGO_TARGET_DIR", "fixture-consumer-output");
+        for key in [
+            "CARGO_HTTP_PROXY",
+            "https_proxy",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "HTTP_PROXY",
+            "no_proxy",
+            "NO_PROXY",
+            "FIXTURE_PROXY_JOURNAL",
+            "FIXTURE_ROOT_CARGO_CONFIG",
+            "FIXTURE_NEUTRAL_CARGO_CONFIG",
+            "FIXTURE_CONFIG_QUERY_FAIL",
+            "FIXTURE_CARGO_VERSION",
+            "FIXTURE_EXPLICIT_STABLE",
+            "FIXTURE_TOOLCHAIN_JOURNAL",
+        ] {
+            command.env_remove(key);
+        }
+        command
+    }
+
+    fn run_production_fixture(mutation: FetchMutation) -> (Output, String) {
+        let fixture = production_fixture(mutation);
+        let output = production_fixture_command(&fixture)
             .output()
             .expect("run production split validator fixture");
         let journal = fs::read_to_string(&fixture.journal).unwrap_or_default();
@@ -770,6 +820,533 @@ esac
                 "{mutation:?} reached offline consumption: {journal}"
             );
         }
+    }
+
+    #[test]
+    fn production_host_fetch_preserves_proxy_choices_and_offline_environment() {
+        // Exercise the real split script and generated-workspace preparation,
+        // observing their child environments rather than a copied selector.
+        type ProxyVariables<'a> = &'a [(&'a str, &'a str)];
+        let cases: &[(ProxyVariables<'_>, Option<&str>)] = &[
+            (&[], None),
+            (
+                &[("https_proxy", "https://lower.invalid")],
+                Some("https://lower.invalid"),
+            ),
+            (
+                &[("HTTPS_PROXY", "https://upper.invalid")],
+                Some("https://upper.invalid"),
+            ),
+            (
+                &[
+                    ("https_proxy", "https://lower.invalid"),
+                    ("HTTPS_PROXY", "https://upper.invalid"),
+                ],
+                Some("https://lower.invalid"),
+            ),
+            (
+                &[
+                    ("https_proxy", ""),
+                    ("HTTPS_PROXY", "https://upper.invalid"),
+                ],
+                Some("https://upper.invalid"),
+            ),
+            (&[("https_proxy", "")], None),
+            (&[("http_proxy", "http://http-only.invalid")], None),
+            (&[("HTTP_PROXY", "http://uppercase-http.invalid")], None),
+            (
+                &[
+                    ("CARGO_HTTP_PROXY", "https://cargo.invalid"),
+                    ("https_proxy", "https://lower.invalid"),
+                ],
+                Some("https://cargo.invalid"),
+            ),
+            (
+                &[
+                    ("CARGO_HTTP_PROXY", ""),
+                    ("https_proxy", "https://lower.invalid"),
+                ],
+                Some(""),
+            ),
+        ];
+        for (environment, expected) in cases {
+            let fixture = production_fixture(FetchMutation::None);
+            let proxy_journal = fixture.base.join("proxy-journal");
+            let mut command = production_fixture_command(&fixture);
+            command
+                .env("FIXTURE_PROXY_JOURNAL", &proxy_journal)
+                .env("no_proxy", "localhost,.lower.invalid")
+                .env("NO_PROXY", ".upper.invalid");
+            for (key, value) in *environment {
+                command.env(key, value);
+            }
+            let output = command.output().unwrap();
+            let journal = fs::read_to_string(&proxy_journal).unwrap_or_default();
+            assert!(
+                output.status.success(),
+                "{environment:?}: {output:?}\n{journal}"
+            );
+            let rows = journal.lines().collect::<Vec<_>>();
+            assert_eq!(
+                rows.len(),
+                7,
+                "all six Cargo operations plus offline: {journal}"
+            );
+            for (row, prefix) in rows[..6].iter().zip([
+                "fetch:Cargo.toml:",
+                "fetch:liteinst-runtime-build/Cargo.toml:",
+                "fetch:",
+                "metadata:",
+                "generate-lockfile:",
+                "fetch:",
+            ]) {
+                assert!(row.starts_with(prefix), "{journal}");
+                let suffix = format!(
+                    ":{}:{}:localhost,.lower.invalid:.upper.invalid",
+                    if expected.is_some() { "x" } else { "" },
+                    expected.unwrap_or("")
+                );
+                assert!(row.ends_with(&suffix), "{environment:?}: {journal}");
+            }
+            assert!(rows[2].contains("/agent-utils/rs/Cargo.toml:"), "{journal}");
+            assert!(
+                rows[5].contains("/hermit-rust-script-packages."),
+                "{journal}"
+            );
+            let original = environment
+                .iter()
+                .find(|(key, _)| *key == "CARGO_HTTP_PROXY");
+            assert_eq!(
+                rows[6],
+                format!(
+                    "offline:{}:{}",
+                    if original.is_some() { "x" } else { "" },
+                    original.map_or("", |(_, value)| *value)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn production_host_fetch_preserves_file_proxy_in_each_cargo_cwd() {
+        for config in [
+            r#"{"http":{"proxy":"https://configured.invalid"}}"#,
+            r#"{"http":{"proxy":""}}"#,
+        ] {
+            for configured_cwd in ["FIXTURE_ROOT_CARGO_CONFIG", "FIXTURE_NEUTRAL_CARGO_CONFIG"] {
+                let fixture = production_fixture(FetchMutation::None);
+                let proxy_journal = fixture.base.join("proxy-journal");
+                let output = production_fixture_command(&fixture)
+                    .env("FIXTURE_PROXY_JOURNAL", &proxy_journal)
+                    .env("https_proxy", "https://environment.invalid")
+                    .env(configured_cwd, config)
+                    .output()
+                    .unwrap();
+                let journal = fs::read_to_string(&proxy_journal).unwrap_or_default();
+                assert!(
+                    output.status.success(),
+                    "{config:?} {configured_cwd}: {output:?}\n{journal}"
+                );
+                let rows = journal.lines().collect::<Vec<_>>();
+                assert_eq!(rows.len(), 7, "{journal}");
+                for (index, row) in rows[..6].iter().enumerate() {
+                    let explicit_config =
+                        (index == 2) == (configured_cwd == "FIXTURE_NEUTRAL_CARGO_CONFIG");
+                    let suffix = if explicit_config {
+                        "::::"
+                    } else {
+                        ":x:https://environment.invalid::"
+                    };
+                    assert!(
+                        row.ends_with(suffix),
+                        "{configured_cwd} row {index}: {journal}"
+                    );
+                }
+                assert_eq!(rows[6], "offline::");
+            }
+        }
+    }
+
+    #[test]
+    fn production_host_fetch_refuses_unknown_proxy_configuration() {
+        for (key, value) in [
+            ("FIXTURE_CONFIG_QUERY_FAIL", "1"),
+            ("FIXTURE_ROOT_CARGO_CONFIG", "not json"),
+        ] {
+            let fixture = production_fixture(FetchMutation::None);
+            let proxy_journal = fixture.base.join("proxy-journal");
+            let output = production_fixture_command(&fixture)
+                .env("FIXTURE_PROXY_JOURNAL", &proxy_journal)
+                .env("https_proxy", "https://environment.invalid")
+                .env(key, value)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("cannot inspect Cargo proxy configuration"),
+                "{stderr}"
+            );
+            assert!(
+                !stderr.contains("private configuration error detail"),
+                "{stderr}"
+            );
+            assert!(
+                !proxy_journal.exists(),
+                "no fetch or offline execution after failed lookup"
+            );
+            // An already-fetched offline-only invocation must not inspect or
+            // synthesize host proxy configuration at all.
+            let cargo_home = fixture.root.join("phase-output/cargo");
+            fs::create_dir_all(cargo_home.join("registry")).unwrap();
+            for marker in [
+                "generated-workspace-resolved",
+                "generated-workspace-fetched",
+                "agent-utils-workspace-fetched",
+            ] {
+                fs::write(cargo_home.join(marker), "").unwrap();
+            }
+            let offline = production_fixture_command(&fixture)
+                .arg("--offline-only")
+                .env("FIXTURE_PROXY_JOURNAL", &proxy_journal)
+                .env("https_proxy", "https://environment.invalid")
+                .env(key, value)
+                .output()
+                .unwrap();
+            assert!(offline.status.success(), "{offline:?}");
+            assert_eq!(fs::read_to_string(&proxy_journal).unwrap(), "offline::\n");
+        }
+    }
+
+    #[test]
+    fn production_host_fetch_keeps_selected_cargo_with_relative_path_entry() {
+        let fixture = production_fixture(FetchMutation::None);
+        let proxy_journal = fixture.base.join("proxy-journal");
+        let path = env::join_paths(
+            std::iter::once(PathBuf::from("../bin"))
+                .chain(env::split_paths(&env::var_os("PATH").expect("test PATH"))),
+        )
+        .unwrap();
+        let output = production_fixture_command(&fixture)
+            .env("PATH", path)
+            .env("FIXTURE_PROXY_JOURNAL", &proxy_journal)
+            .env("https_proxy", "https://environment.invalid")
+            .output()
+            .unwrap();
+        let journal = fs::read_to_string(&proxy_journal).unwrap_or_default();
+        assert!(output.status.success(), "{output:?}\n{journal}");
+        let rows = journal.lines().collect::<Vec<_>>();
+        assert_eq!(rows.len(), 7, "{journal}");
+        for row in &rows[..6] {
+            assert!(
+                row.ends_with(":x:https://environment.invalid::"),
+                "{journal}"
+            );
+        }
+        assert!(rows[2].contains("/agent-utils/rs/Cargo.toml:"), "{journal}");
+        assert_eq!(rows[6], "offline::");
+    }
+
+    fn install_rustup_fixture(fixture: &ProductionFixture, hardlink: bool) {
+        let cargo = fs::read_to_string(fixture.fake_bin.join("cargo")).unwrap();
+        for name in ["nightly", "stable"] {
+            let marker = format!(
+                "set -euo pipefail\nprintf '{name}:%s:%s\\n' \"$PWD\" \"$*\" >>\"${{FIXTURE_TOOLCHAIN_JOURNAL:?}}\"\n"
+            );
+            let mut implementation = replace_exactly_once(&cargo, "set -euo pipefail\n", &marker);
+            if name == "stable" {
+                implementation = replace_exactly_once(
+                    &implementation,
+                    "[[ ${1:-} != -Zunstable-options ]] || shift\n",
+                    "FIXTURE_CARGO_VERSION='cargo 1.99.0 (fixture)'\n[[ ${1:-} != -Zunstable-options ]] || exit 66\n",
+                );
+            }
+            write_executable(
+                &fixture.fake_bin.join(format!("{name}-cargo")),
+                &implementation,
+            );
+        }
+        write_executable(
+            &fixture.fake_bin.join("rustup"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+bin=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [[ ${0##*/} == rustup ]]; then
+    [[ $1 == which && $2 == cargo && $PWD != / ]]
+    if [[ ${FIXTURE_EXPLICIT_STABLE:-0} == 1 ]]; then
+        printf '%s/stable-cargo\n' "$bin"
+    else
+        printf '%s/nightly-cargo\n' "$bin"
+    fi
+elif [[ $PWD == / || ${FIXTURE_EXPLICIT_STABLE:-0} == 1 ]]; then
+    exec "$bin/stable-cargo" "$@"
+else
+    exec "$bin/nightly-cargo" "$@"
+fi
+"#,
+        );
+        fs::remove_file(fixture.fake_bin.join("cargo")).unwrap();
+        if hardlink {
+            fs::hard_link(
+                fixture.fake_bin.join("rustup"),
+                fixture.fake_bin.join("cargo"),
+            )
+            .unwrap();
+        } else {
+            std::os::unix::fs::symlink("rustup", fixture.fake_bin.join("cargo")).unwrap();
+        }
+    }
+
+    #[test]
+    fn production_host_fetch_preserves_neutral_and_explicit_rustup_toolchains() {
+        for (explicit_stable, hardlink) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            for config in [
+                "{}",
+                r#"{"http":{"proxy":"https://configured.invalid"}}"#,
+                r#"{"http":{"proxy":""}}"#,
+            ] {
+                let fixture = production_fixture(FetchMutation::None);
+                install_rustup_fixture(&fixture, hardlink);
+                let toolchains = fixture.base.join("toolchain-journal");
+                let proxies = fixture.base.join("proxy-journal");
+                let output = production_fixture_command(&fixture)
+                    .env("https_proxy", "https://environment.invalid")
+                    .env("FIXTURE_TOOLCHAIN_JOURNAL", &toolchains)
+                    .env("FIXTURE_PROXY_JOURNAL", &proxies)
+                    .env("FIXTURE_NEUTRAL_CARGO_CONFIG", config)
+                    .env(
+                        "FIXTURE_EXPLICIT_STABLE",
+                        if explicit_stable { "1" } else { "0" },
+                    )
+                    .output()
+                    .unwrap();
+                let journal = fs::read_to_string(&toolchains).unwrap_or_default();
+                assert!(output.status.success(), "{output:?}\n{journal}");
+                let proxy_journal = fs::read_to_string(&proxies).unwrap();
+                let rows = proxy_journal.lines().collect::<Vec<_>>();
+                assert_eq!(rows.len(), 7, "{proxy_journal}");
+                if explicit_stable {
+                    assert!(!journal.contains("nightly:"), "{journal}");
+                    assert!(!journal.contains("-Zunstable-options"), "{journal}");
+                    assert!(
+                        String::from_utf8_lossy(&output.stderr)
+                            .contains("applying no proxy default")
+                    );
+                    for row in &rows[..6] {
+                        assert!(row.ends_with("::::"), "{proxy_journal}");
+                    }
+                } else {
+                    assert!(
+                        journal
+                            .lines()
+                            .any(|row| row.starts_with("nightly:/:-Zunstable-options config get")),
+                        "neutral config query must use the project reader: {journal}"
+                    );
+                    let stable = journal
+                        .lines()
+                        .filter(|row| row.starts_with("stable:"))
+                        .collect::<Vec<_>>();
+                    assert_eq!(stable.len(), 1, "{journal}");
+                    assert!(
+                        stable[0].starts_with("stable:/:fetch --locked --manifest-path "),
+                        "{journal}"
+                    );
+                    assert!(
+                        stable[0].ends_with("/agent-utils/rs/Cargo.toml"),
+                        "{journal}"
+                    );
+                    let expected = if config == "{}" {
+                        ":x:https://environment.invalid::"
+                    } else {
+                        "::::"
+                    };
+                    assert!(rows[2].ends_with(expected), "{proxy_journal}");
+                }
+                assert_eq!(rows[6], "offline::");
+            }
+        }
+    }
+
+    #[test]
+    fn production_host_fetch_preserves_direct_stable_configuration() {
+        for explicit_proxy in [None, Some("https://explicit.invalid"), Some("")] {
+            let fixture = production_fixture(FetchMutation::None);
+            let proxies = fixture.base.join("proxy-journal");
+            let mut command = production_fixture_command(&fixture);
+            command
+                .env("https_proxy", "https://environment.invalid")
+                .env("FIXTURE_CARGO_VERSION", "cargo 1.99.0 (fixture)")
+                // If an unsupported lookup is attempted, it must fail this test.
+                .env("FIXTURE_CONFIG_QUERY_FAIL", "1")
+                .env("FIXTURE_PROXY_JOURNAL", &proxies);
+            if let Some(value) = explicit_proxy {
+                command.env("CARGO_HTTP_PROXY", value);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr).contains("applying no proxy default"),
+                explicit_proxy.is_none()
+            );
+            let journal = fs::read_to_string(&proxies).unwrap();
+            let rows = journal.lines().collect::<Vec<_>>();
+            assert_eq!(rows.len(), 7, "{journal}");
+            let present = if explicit_proxy.is_some() { "x" } else { "" };
+            let value = explicit_proxy.unwrap_or("");
+            for row in &rows[..6] {
+                assert!(row.ends_with(&format!(":{present}:{value}::")), "{journal}");
+            }
+            assert_eq!(rows[6], format!("offline:{present}:{value}"));
+        }
+    }
+
+    fn check_unresolved_rustup_fetch(mismatched: bool) {
+        for explicit_proxy in [None, Some("https://explicit.invalid"), Some("")] {
+            for config in [
+                "{}",
+                r#"{"http":{"proxy":"https://configured.invalid"}}"#,
+                r#"{"http":{"proxy":""}}"#,
+            ] {
+                let fixture = production_fixture(FetchMutation::None);
+                install_rustup_fixture(&fixture, true);
+                // Retain the hardlinked Cargo proxy without a matching rustup
+                // name. Do not accidentally discover the host's real rustup.
+                fs::remove_file(fixture.fake_bin.join("rustup")).unwrap();
+                let utilities = fixture.base.join("utilities");
+                fs::create_dir(&utilities).unwrap();
+                for name in [
+                    "awk",
+                    "bash",
+                    "cat",
+                    "cut",
+                    "dirname",
+                    "flock",
+                    "git",
+                    "grep",
+                    "jq",
+                    "mkdir",
+                    "mktemp",
+                    "realpath",
+                    "rm",
+                    "sh",
+                    "sha256sum",
+                    "sort",
+                    "tr",
+                    "wc",
+                ] {
+                    let executable = env::split_paths(&env::var_os("PATH").expect("test PATH"))
+                        .map(|directory| directory.join(name))
+                        .find(|path| {
+                            path.is_file()
+                                && fs::metadata(path).unwrap().permissions().mode() & 0o111 != 0
+                        })
+                        .unwrap_or_else(|| panic!("required fixture utility: {name}"))
+                        .canonicalize()
+                        .unwrap();
+                    std::os::unix::fs::symlink(executable, utilities.join(name)).unwrap();
+                }
+                if mismatched {
+                    write_executable(
+                        &utilities.join("rustup"),
+                        "#!/usr/bin/env bash\nprintf 'foreign-rustup-invoked\\n' >>\"${FIXTURE_JOURNAL:?}\"\nexit 67\n",
+                    );
+                }
+                let path = env::join_paths([&fixture.fake_bin, &utilities]).unwrap();
+                let discovered = Command::new(utilities.join("bash"))
+                    .args(["-c", "command -v rustup"])
+                    .env("PATH", &path)
+                    .output()
+                    .unwrap();
+                assert_eq!(discovered.status.success(), mismatched, "{discovered:?}");
+                if mismatched {
+                    assert_eq!(
+                        String::from_utf8(discovered.stdout).unwrap().trim(),
+                        utilities.join("rustup").to_str().unwrap()
+                    );
+                }
+
+                let toolchains = fixture.base.join("toolchain-journal");
+                let proxies = fixture.base.join("proxy-journal");
+                let mut command = production_fixture_command(&fixture);
+                command
+                    .env("PATH", path)
+                    .env("https_proxy", "https://environment.invalid")
+                    .env("no_proxy", "localhost")
+                    .env("NO_PROXY", "bypass.invalid")
+                    .env("FIXTURE_TOOLCHAIN_JOURNAL", &toolchains)
+                    .env("FIXTURE_PROXY_JOURNAL", &proxies)
+                    .env("FIXTURE_ROOT_CARGO_CONFIG", config)
+                    .env("FIXTURE_NEUTRAL_CARGO_CONFIG", config);
+                if let Some(value) = explicit_proxy {
+                    command.env("CARGO_HTTP_PROXY", value);
+                }
+                let output = command.output().unwrap();
+                let journal = fs::read_to_string(&toolchains).unwrap_or_default();
+                assert!(output.status.success(), "{output:?}\n{journal}");
+                assert!(!journal.lines().any(|row| row.starts_with("stable:")
+                    && row.contains("-Zunstable-options")), "{journal}");
+                assert_eq!(
+                    journal
+                        .lines()
+                        .filter(|row| *row == "stable:/:--version")
+                        .count(),
+                    usize::from(explicit_proxy.is_none()),
+                    "{journal}"
+                );
+                let neutral_fetches = journal
+                    .lines()
+                    .filter(|row| row.starts_with("stable:/:fetch --locked --manifest-path "))
+                    .collect::<Vec<_>>();
+                assert_eq!(neutral_fetches.len(), 1, "{journal}");
+                assert!(neutral_fetches[0].ends_with("/agent-utils/rs/Cargo.toml"));
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stderr).contains("applying no proxy default"),
+                    explicit_proxy.is_none()
+                );
+                if explicit_proxy.is_some() {
+                    assert!(!journal.contains("-Zunstable-options"), "{journal}");
+                }
+                let proxy_journal = fs::read_to_string(&proxies).unwrap();
+                let rows = proxy_journal.lines().collect::<Vec<_>>();
+                assert_eq!(rows.len(), 7, "{proxy_journal}");
+                for (index, row) in rows[..6].iter().enumerate() {
+                    let expected = explicit_proxy.or_else(|| {
+                        (index != 2 && config == "{}").then_some("https://environment.invalid")
+                    });
+                    let present = if expected.is_some() { "x" } else { "" };
+                    assert!(
+                        row.ends_with(&format!(
+                            ":{present}:{}:localhost:bypass.invalid",
+                            expected.unwrap_or("")
+                        )),
+                        "{proxy_journal}"
+                    );
+                }
+                let present = if explicit_proxy.is_some() { "x" } else { "" };
+                assert_eq!(
+                    rows[6],
+                    format!("offline:{present}:{}", explicit_proxy.unwrap_or(""))
+                );
+                let operations = fs::read_to_string(&fixture.journal).unwrap();
+                assert!(operations.contains("offline-consumer"), "{operations}");
+                assert!(
+                    !operations.contains("foreign-rustup-invoked"),
+                    "{operations}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_host_fetch_with_missing_rustup_keeps_original_neutral_fetch() {
+        check_unresolved_rustup_fetch(false);
+    }
+
+    #[test]
+    fn production_host_fetch_with_mismatched_rustup_keeps_original_neutral_fetch() {
+        check_unresolved_rustup_fetch(true);
     }
 
     #[test]
