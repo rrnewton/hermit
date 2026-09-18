@@ -1332,6 +1332,25 @@ jobs:
         env:
           RUSTFLAGS: ""
         run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      # The folded reducer executes scorecard.compatibility_on_host through
+      # run-node.sh. That committed node requires the same immutable prepared
+      # rust-script manifest as every other consumer; installing the interpreter
+      # alone cannot supply those binaries (run 35354614446).
+      - name: Download reducer manifest plan tools and rust-script binaries
+        if: needs.select.outputs.run_e2e != 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MANIFEST_PLAN_ARTIFACT }}
+          path: .
+      - name: Unpack reducer manifest plan tools and rust-script binaries
+        if: needs.select.outputs.run_e2e != 'false'
+        run: |
+          set -euo pipefail
+          tar -xzf "$MANIFEST_PLAN_TARBALL"
+          rm -f "$MANIFEST_PLAN_TARBALL"
+          test -x target/debug/test-harness
+          test -x target/debug/hermit-manifest-plan
+          ./ci/prepare-rust-scripts.sh --check
       # Folded in from the former standalone `reduce-e2e` job so the portable
       # gate critical path is one queued stage shorter (select -> build -> e2e
       # -> reduce-e2e -> regular  becomes  select -> build -> e2e -> regular).
