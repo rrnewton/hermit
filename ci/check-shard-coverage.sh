@@ -171,11 +171,15 @@ workflow_step_body() {
 debug_artifact_contract() {
     local workflow_text=$1 pack_step unpack_step
     local archive_member='            target/debug/verification-report \'
+    local nextest_member='            target/ci/nextest-binaries \'
     pack_step=$(workflow_step_body "Pack debug prebuilt tree" "$workflow_text")
     unpack_step=$(workflow_step_body "Unpack debug tree" "$workflow_text")
     grep -Fqx '          test -x target/debug/verification-report' <<<"$pack_step" &&
         grep -Fqx "$archive_member" <<<"$pack_step" &&
-        grep -Fqx '          test -x target/debug/verification-report' <<<"$unpack_step"
+        grep -Fqx '          test -x target/debug/verification-report' <<<"$unpack_step" &&
+        grep -Fqx '          test -f target/ci/nextest-binaries/current.json' <<<"$pack_step" &&
+        grep -Fqx "$nextest_member" <<<"$pack_step" &&
+        grep -Fqx '          test -f target/ci/nextest-binaries/current.json' <<<"$unpack_step"
 }
 
 workflow_job_body() {
@@ -258,6 +262,12 @@ workflow_job_prepares_isolated_workdir() {
     grep -Fqx '          sudo install -d -o "$(id -u)" -g "$(id -g)" /test' <<<"$body"
 }
 
+workflow_job_uses_hosted_namespace_wrapper() {
+    local job=$1 workflow_text=$2 body
+    body=$(workflow_job_body "$job" "$workflow_text") || return 1
+    grep -Fq './ci/run-hosted-node.sh portable ' <<<"$body"
+}
+
 workflow_e2e_uses_pinned_result_root() {
     local workflow_text=$1 body
     body=$(workflow_job_body e2e "$workflow_text") || return 1
@@ -306,6 +316,10 @@ workflow_wiring_contract() {
         workflow_job_prepares_isolated_workdir test-release "$workflow_text" &&
         workflow_job_prepares_isolated_workdir e2e "$workflow_text" &&
         workflow_job_prepares_isolated_workdir sabre_non_gated_parity "$workflow_text" &&
+        workflow_job_uses_hosted_namespace_wrapper test-debug "$workflow_text" &&
+        workflow_job_uses_hosted_namespace_wrapper strict-compat "$workflow_text" &&
+        workflow_job_uses_hosted_namespace_wrapper test-release "$workflow_text" &&
+        workflow_job_uses_hosted_namespace_wrapper e2e "$workflow_text" &&
         workflow_e2e_uses_pinned_result_root "$workflow_text" &&
         workflow_e2e_prepares_btrfs "$workflow_text" &&
         workflow_job_needs_exactly preflight 'select' "$workflow_text" &&
@@ -363,6 +377,14 @@ elif debug_artifact_contract "$omitted_artifact"; then
     echo "check-shard-coverage.sh: FAIL — artifact guard accepted a planted missing verification-report member" >&2
     status=1
 fi
+omitted_nextest=${workflow_text/$'            target/ci/nextest-binaries \\\n'/}
+if [[ $omitted_nextest == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — prepared-nextest artifact omission fixture did not change the workflow" >&2
+    status=1
+elif debug_artifact_contract "$omitted_nextest"; then
+    echo "check-shard-coverage.sh: FAIL — artifact guard accepted a planted missing prepared-nextest identity" >&2
+    status=1
+fi
 if ! workflow_wiring_contract "$workflow_text"; then
     echo "check-shard-coverage.sh: FAIL — workflow job needs/artifact transfers do not match the constructed dependency supply contract" >&2
     status=1
@@ -404,6 +426,15 @@ if [[ $missing_workdir_setup == "$workflow_text" ]]; then
     status=1
 elif workflow_wiring_contract "$missing_workdir_setup"; then
     echo "check-shard-coverage.sh: FAIL — workflow guard accepted a test job without the hosted isolated-workdir setup" >&2
+    status=1
+fi
+hosted_wrapper='./ci/run-hosted-node.sh portable '
+missing_hosted_wrapper=${workflow_text/"$hosted_wrapper"/'./ci/run-node.sh portable '}
+if [[ $missing_hosted_wrapper == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — hosted namespace-wrapper mutation did not change the workflow fixture" >&2
+    status=1
+elif workflow_wiring_contract "$missing_hosted_wrapper"; then
+    echo "check-shard-coverage.sh: FAIL — workflow guard accepted a hosted test job outside its user namespace" >&2
     status=1
 fi
 result_root=$'      E2E_RESULT_ROOT: /results/${{ matrix.slug }}'

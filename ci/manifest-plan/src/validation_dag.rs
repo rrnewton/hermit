@@ -1491,6 +1491,28 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
             ));
         }
     }
+    for hosted in cfg.steps.iter().filter(|step| {
+        step.labels
+            .iter()
+            .any(|label| label == HOSTED_PORTABLE_LABEL)
+            && step.hint.preferred_inner_jobs.unwrap_or(1) > 1
+    }) {
+        let has_width_channel = hosted
+            .jobs_env
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())
+            || hosted
+                .jobs_flag
+                .as_deref()
+                .is_some_and(|flag| !flag.is_empty());
+        if !has_width_channel {
+            return Err(format!(
+                "{} has preferred_inner_jobs={} but no non-empty jobs_env or jobs_flag through which a smaller hosted runner can enforce its admitted width",
+                hosted.tag(),
+                hosted.hint.preferred_inner_jobs.unwrap()
+            ));
+        }
+    }
     for tag in crate::validation_dag_static::PMU_MEMORY_FAILURE_FAMILY_MEMBERS {
         if step(tag)?.fail_fast_family.as_deref()
             != Some(crate::validation_dag_static::PMU_MEMORY_FAILURE_FAMILY)
@@ -2578,7 +2600,9 @@ sys.exit(37)
         );
         for step in parity {
             assert_eq!(step.cmd.matches("--parity-reference ptrace").count(), 1);
-            assert!(step.cmd.contains("--category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --jobs 8"));
+            assert!(step.cmd.contains("--category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --results"));
+            assert_eq!(step.jobs_flag.as_deref(), Some("--jobs"));
+            assert_eq!(step.hint.preferred_inner_jobs, Some(8));
             let selector = step.manifest.as_ref().unwrap();
             assert_eq!(selector.lane, "portable");
             assert_eq!(selector.category, "backend-parity-c");
@@ -2586,7 +2610,6 @@ sys.exit(37)
             assert_eq!(selector.mode, None);
             assert_eq!(selector.backend, None);
             assert_eq!(step.hint.resources.get("manifest_guest"), Some(&8));
-            assert_eq!(step.hint.preferred_inner_jobs, Some(8));
             assert!(!step.cmd.contains("--probe-disabled"));
         }
     }
