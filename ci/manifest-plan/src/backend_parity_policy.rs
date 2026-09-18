@@ -39,12 +39,23 @@ pub(crate) fn selects_ptrace_parity(step: &Step) -> Result<bool, String> {
         }
         return Ok(false);
     };
-    if step.cmd != parity && step.cmd != ordinary {
-        return Err(format!(
-            "{} differs from its declared backend parity command",
-            step.tag()
-        ));
-    }
+    let legacy_parity = parity.replacen(" --results ", " --jobs 8 --results ", 1);
+    let legacy_ordinary = ordinary.replacen(" --results ", " --jobs 8 --results ", 1);
+    let selects_parity = match step.cmd.as_str() {
+        command if command == parity => true,
+        command if command == ordinary => false,
+        // Schema-10 artifacts written before scheduler-owned width retain the
+        // literal worker count. They remain readable as evidence, but an
+        // unrecognized command still cannot pass this exact-command check.
+        command if command == legacy_parity => true,
+        command if command == legacy_ordinary => false,
+        _ => {
+            return Err(format!(
+                "{} differs from its declared backend parity command",
+                step.tag()
+            ));
+        }
+    };
     let selector = step
         .manifest
         .as_ref()
@@ -60,5 +71,5 @@ pub(crate) fn selects_ptrace_parity(step: &Step) -> Result<bool, String> {
             step.tag()
         ));
     }
-    Ok(step.cmd == parity)
+    Ok(selects_parity)
 }
