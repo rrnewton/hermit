@@ -139,6 +139,7 @@ fn fixture_with_path(
         mode: id.mode.clone(),
         backend: id.backend.clone(),
         cell_verdict: parity.candidate_verdict(&id).unwrap(),
+        selected_attempt: parity.candidate_attempt_number(&id).unwrap(),
         backend_parity: RequiredNullable::Value(parity),
     };
     let mut cell_row = serde_json::to_value(&cell).unwrap();
@@ -164,7 +165,7 @@ fn fixture_with_path(
         },
         selected,
         selected_backend_parity: vec![BackendParityRelation::ptrace(id)],
-        cells: vec![cell.summary().unwrap()],
+        cells: vec![cell.summary(&run_id, &hermit_sha).unwrap()],
     };
     let test_row = TestResultArtifactRow {
         run_id: run_id.clone(),
@@ -946,4 +947,136 @@ fn focused_artifacts_require_the_same_profile_at_every_identity_boundary() {
             "wrong refusal for {boundary} profile"
         );
     }
+}
+
+/// The binding guard must actually RUN on a real row, and its attempt arm must
+/// actually be able to fire.
+///
+/// ⚠️ THE FIVE-ORDINAL PROBE BELOW IS THE REVIEWER'S, REPRODUCED. At
+/// `c4b692ada` the guard passed the binding's own ordinal in as the value it
+/// checked against, so attempts 1, 2, 7, 999 and `u64::MAX` all returned `Ok`
+/// while producing five distinct bindings. Every one of them must now be
+/// REFUSED, because the ledger row records the ordinal independently and the
+/// guard compares against that instead of against the binding itself.
+#[test]
+fn the_live_row_decode_refuses_a_compared_verdict_whose_binding_is_inconsistent() {
+    let (row, _plan, _cells, _tests) =
+        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+
+    // Control: the untouched fixture decodes and really does carry a compared
+    // verdict with a binding and a recorded ordinal.
+    let evidence = row
+        .schema10_cell_results()
+        .expect("the untouched fixture must decode")
+        .expect("schema 10 row carries cell results");
+    assert!(matches!(
+        evidence.cells[0].cell_verdict,
+        CellVerdict::ComparedAndMatched { .. }
+    ));
+    assert_eq!(evidence.cells[0].selected_attempt, Some(1));
+    assert_eq!(
+        evidence.cells[0]
+            .evidence_binding
+            .as_ref()
+            .expect("the producer bound the compared verdict")
+            .selected_attempt,
+        1
+    );
+    assert_eq!(evidence.bound_attempts().unwrap().len(), 1);
+
+    let decode = |mutate: &dyn Fn(&mut Value)| -> String {
+        let mut row = row.clone();
+        let mut cells = serde_json::to_value(row.cell_results.as_ref().unwrap()).unwrap();
+        mutate(&mut cells["cells"][0]);
+        row.cell_results = Some(serde_json::from_value(cells).unwrap());
+        row.schema10_cell_results()
+            .expect_err("the live decode must refuse this row")
+    };
+
+    // THE REVIEWER'S PROBE. Each of these was accepted at c4b692ada.
+    for ordinal in [2_u64, 7, 999, u64::MAX] {
+        let error = decode(&|cell| {
+            cell["evidence_binding"]["selected_attempt"] = Value::from(ordinal);
+        });
+        assert!(
+            error.contains(&format!("binds attempt {ordinal} while the row records 1")),
+            "attempt {ordinal} was not refused: {error}"
+        );
+    }
+    // And the same ordinal on the ROW rather than the binding is refused too,
+    // so the check cannot be satisfied by moving the lie to the other operand.
+    for ordinal in [2_u64, 7, 999, u64::MAX] {
+        let error = decode(&|cell| {
+            cell["selected_attempt"] = Value::from(ordinal);
+        });
+        assert!(
+            error.contains(&format!("binds attempt 1 while the row records {ordinal}")),
+            "row ordinal {ordinal} was not refused: {error}"
+        );
+    }
+
+    // MISSING: the producer stopped writing the binding.
+    let error = decode(&|cell| {
+        cell.as_object_mut().unwrap().remove("evidence_binding");
+    });
+    assert!(error.contains("carries no evidence binding"), "{error}");
+
+    // MISSING the row's own operand, which would otherwise let the attempt arm
+    // quietly stop checking anything again.
+    let error = decode(&|cell| {
+        cell.as_object_mut().unwrap().remove("selected_attempt");
+    });
+    assert!(error.contains("no selected_attempt"), "{error}");
+
+    // WRONG CELL: internally well-formed, evidence for another cell.
+    let foreign = CellEvidenceBinding::for_validate_compared(
+        &evidence.run_id,
+        &CellIdentity {
+            test: "somewhere/else".into(),
+            ..identity()
+        },
+        &evidence.hermit_sha,
+        1,
+    );
+    let error = decode(&|cell| {
+        cell["evidence_binding"] = serde_json::to_value(&foreign).unwrap();
+    });
+    assert!(error.contains("is for cell"), "{error}");
+
+    // FOREIGN RUN.
+    let other_run = CellEvidenceBinding::for_validate_compared(
+        "some-other-run",
+        &identity(),
+        &evidence.hermit_sha,
+        1,
+    );
+    let error = decode(&|cell| {
+        cell["evidence_binding"] = serde_json::to_value(&other_run).unwrap();
+    });
+    assert!(error.contains("is for run"), "{error}");
+
+    // A VERDICT THAT COMPARED NOTHING MUST NOT CARRY ONE.
+    let error = decode(&|cell| {
+        cell["cell_verdict"] = serde_json::json!({
+            "state": "unavailable-with-reason",
+            "comparison_tier": "canonical-bitwise",
+            "reason": "synthetic",
+        });
+    });
+    assert!(
+        error.contains("states no comparison yet carries an evidence binding"),
+        "{error}"
+    );
+
+    // Positive control, so none of the above is passing because every mutation
+    // is refused: moving BOTH operands together to the same new ordinal still
+    // decodes. That is also the honest statement of the guard's limit -- it
+    // establishes consistency, not that the ordinal is the right one.
+    let mut good = row.clone();
+    let mut cells = serde_json::to_value(good.cell_results.as_ref().unwrap()).unwrap();
+    cells["cells"][0]["selected_attempt"] = Value::from(4);
+    cells["cells"][0]["evidence_binding"]["selected_attempt"] = Value::from(4);
+    good.cell_results = Some(serde_json::from_value(cells).unwrap());
+    good.schema10_cell_results()
+        .expect("a consistently rebound row must still decode");
 }

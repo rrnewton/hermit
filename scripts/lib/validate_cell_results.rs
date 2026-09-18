@@ -692,6 +692,12 @@ pub fn retain(
                 mode: identity.mode,
                 backend: identity.backend,
                 cell_verdict: cell_verdict(row)?,
+                // The schema-7 shape predates the evidence binding and stays
+                // UNBOUND. Binding is forward-only: `retain_v10` writes it on
+                // the current cumulative evidence, and adding it here would
+                // put a new field in an old schema without the artifact-side
+                // attempt that makes it independently checkable.
+                evidence_binding: None,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -822,9 +828,14 @@ pub fn retain_v10(
     let mut full_cells = Vec::new();
     for (id, mut rows) in rows {
         rows.sort_by_key(|(attempt, _)| *attempt);
-        let (cell_verdict, backend_parity) = if parity_candidates.contains(&id) {
+        let (cell_verdict, backend_parity, selected_attempt) = if parity_candidates.contains(&id) {
             let parity = CellBackendParity::from_result_rows(&id, &rows)?;
-            (parity.candidate_verdict(&id)?, RequiredNullable::Value(parity))
+            let selected_attempt = parity.candidate_attempt_number(&id)?;
+            (
+                parity.candidate_verdict(&id)?,
+                RequiredNullable::Value(parity),
+                selected_attempt,
+            )
         } else {
             if rows.iter().any(|(_, row)| row.get("backend_parity").is_some_and(|value| !value.is_null())
                 || row.get("attempts").and_then(Value::as_array).is_some_and(|attempts| {
@@ -835,17 +846,26 @@ pub fn retain_v10(
             }
             let outcome = outcome_after_retries(rows.iter().map(|(attempt, row)| Ok((*attempt, string(row, "outcome")?)))
                 .collect::<Result<Vec<_>, String>>()?)?;
-            let row = rows.iter().rev().find(|(_, row)| row.get("outcome").and_then(Value::as_str) == Some(outcome))
-                .map(|(_, row)| row).ok_or("ordinary cell has no selected terminal result")?;
-            (cell_verdict(row)?, RequiredNullable::Null)
+            // The attempt comes from the SAME row the verdict does. Taking it
+            // from anywhere else -- the last attempt, the highest ordinal, the
+            // count -- would name a real published event that is not the one
+            // this verdict was computed from, which is the failure the binding
+            // exists to make impossible.
+            let (selected_attempt, row) = rows
+                .iter()
+                .rev()
+                .find(|(_, row)| row.get("outcome").and_then(Value::as_str) == Some(outcome))
+                .map(|(attempt, row)| (*attempt, row))
+                .ok_or("ordinary cell has no selected terminal result")?;
+            (cell_verdict(row)?, RequiredNullable::Null, selected_attempt)
         };
         full_cells.push(CellArtifactResultV10 { lane: id.lane, category: id.category, test: id.test,
-            mode: id.mode, backend: id.backend, cell_verdict, backend_parity });
+            mode: id.mode, backend: id.backend, cell_verdict, backend_parity, selected_attempt });
     }
     let mut bytes = Vec::new();
     let mut cells = Vec::new();
     for cell in &full_cells {
-        cells.push(cell.summary()?);
+        cells.push(cell.summary(&plan.run_id, &plan.hermit_sha)?);
         let mut row = serde_json::to_value(cell).map_err(|error| error.to_string())?;
         let object = row.as_object_mut().ok_or("schema 10 full cell is not an object")?;
         object.insert("run_id".into(), Value::String(plan.run_id.clone()));
@@ -1068,6 +1088,44 @@ mod tests {
             assert_eq!(result.schema_version, 10);
             let cell = &result.evidence["cells"][0];
             assert_eq!(cell["cell_verdict"]["state"], "compared-and-matched", "{case}");
+            // THE VERDICT NAMES THE ATTEMPT IT WAS COMPUTED FROM. Without this
+            // the row states a comparison and nothing records which of the
+            // run's events produced it, which is the whole defect: a verdict
+            // that can be counted and never resolved.
+            let binding = &cell["evidence_binding"];
+            assert!(!binding.is_null(), "{case}: compared verdict left unbound");
+            assert_eq!(binding["run_id"], Value::String(plan.run_id.clone()), "{case}");
+            assert_eq!(binding["tree"], Value::String(plan.hermit_sha.clone()), "{case}");
+            assert_eq!(binding["producer"], "validate", "{case}");
+            assert_eq!(
+                binding["series_cell"],
+                Value::String(format!("{}/verify/kvm", retained["test"].as_str().unwrap())),
+                "{case}"
+            );
+            // The bound ordinal, and the row's own independent copy of it.
+            // Recording it twice is what gives the decode-time guard a second
+            // operand; without it the guard compared the binding against
+            // itself and accepted every ordinal.
+            assert_eq!(binding["selected_attempt"], Value::from(1), "{case}");
+            assert_eq!(cell["selected_attempt"], Value::from(1), "{case}");
+            // It must NOT carry a predicted published identity. Predicting one
+            // is unsound for a compared verdict, which is always collapsible.
+            assert!(binding.get("event_id").is_none(), "{case}: {binding}");
+            let typed: hermit_manifest_plan::ledger::CellEvidenceBinding =
+                serde_json::from_value(binding.clone()).unwrap();
+            typed
+                .verify_against(
+                    &plan.run_id,
+                    &plan.hermit_sha,
+                    &CellIdentity {
+                        lane: cell["lane"].as_str().unwrap().into(),
+                        category: cell["category"].as_str().unwrap().into(),
+                        test: cell["test"].as_str().unwrap().into(),
+                        mode: cell["mode"].as_str().unwrap().into(),
+                        backend: cell["backend"].as_str().unwrap().into(),
+                    },
+                )
+                .unwrap_or_else(|error| panic!("{case}: {error}"));
             let attempt = &cell["backend_parity"]["attempts"][0];
             assert_eq!(attempt["candidate"]["state"], "compared-and-matched");
             match case {
