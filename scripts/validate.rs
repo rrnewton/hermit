@@ -22550,6 +22550,7 @@ mod committed_selection_preservation_tests {
         for path in [
             "ci/hermetic/run-split-validate.sh",
             "ci/check-shard-coverage.sh",
+            "ci/run-hosted-node.sh",
             "ci/expected-e2e-plan.json",
             ".github/workflows/ci-portable.yml",
         ] {
