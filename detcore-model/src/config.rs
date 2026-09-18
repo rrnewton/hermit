@@ -162,6 +162,16 @@ pub struct Config {
     #[clap(skip)]
     pub backend_requires_thread_directed_process_signals: bool,
 
+    /// The backend uses virtual tasks; host process signal delivery is forbidden.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_is_kvm: bool,
+
+    /// Startup-only real-timer policy using acknowledged shared signal dequeues.
+    #[serde(default)]
+    #[clap(skip)]
+    pub kvm_shared_dequeue_timers: bool,
+
     /// The backend can wake a scheduler-managed pipe write for a cross-task signal while
     /// preserving Linux signal-mask, disposition, and syscall-restart behavior.
     #[serde(default = "default_true")]

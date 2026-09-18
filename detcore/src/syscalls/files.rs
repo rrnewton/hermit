@@ -1997,7 +1997,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             ) {
                 request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
             }
-            resource_request(guest, request).await;
+            if !physically_nonblocking
+                || !matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd)
+            {
+                captured_write_request(guest, request, call).await;
+            } else {
+                resource_request(guest, request).await;
+            }
         }
 
         // Only route writes through the nonblockable-fd path when the fd is actually

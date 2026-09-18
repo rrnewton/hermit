@@ -2414,6 +2414,8 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // none of those backends can safely defer Detcore's modeled transition.
     config.backend_runs_exit_robust_list = backend == Backend::Ptrace;
     config.backend_requires_thread_directed_process_signals = backend == Backend::Dbt;
+    config.backend_is_kvm = backend == Backend::Kvm;
+    config.kvm_shared_dequeue_timers = config.backend_is_kvm && config.sequentialize_threads;
     // E9patch preprocesses the guest and then uses the ptrace builder. LiteInst,
     // DBT, KVM, and SaBRe re-invoke the Tool callback on ERESTARTSYS instead of
     // resuming through the kernel's ptrace syscall-restart frame.

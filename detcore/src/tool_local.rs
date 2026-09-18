@@ -227,6 +227,26 @@ impl PosixTimers {
         Some(old)
     }
 
+    /// Validate signal-delivery capability before replacing any arming state.
+    /// An unsupported backend can still query, disarm, or arm SIGEV_NONE timers.
+    pub(crate) fn settime_with_signal_delivery(
+        &mut self,
+        id: i32,
+        interval_ns: u64,
+        deadline: Option<LogicalTime>,
+        now: LogicalTime,
+        signal_delivery_supported: bool,
+    ) -> Result<(u64, u64, Option<i32>), reverie::Errno> {
+        let signal = self.signal(id).ok_or(reverie::Errno::EINVAL)?;
+        if !signal_delivery_supported && deadline.is_some() && signal.is_some() {
+            return Err(reverie::Errno::ENOSYS);
+        }
+        let (remaining, interval) = self
+            .settime(id, interval_ns, deadline, now)
+            .ok_or(reverie::Errno::EINVAL)?;
+        Ok((remaining, interval, signal))
+    }
+
     /// Report the current `(remaining_ns, interval_ns)` for `timer_gettime`, or
     /// `None` if the id is unknown.
     pub(crate) fn gettime(&self, id: i32, now: LogicalTime) -> Option<(u64, u64)> {
@@ -921,6 +941,48 @@ mod posix_timers_tests {
         assert_eq!(timers.settime(99, 0, Some(t(1)), t(0)), None);
         assert_eq!(timers.gettime(99, t(0)), None);
         assert!(!timers.contains(99));
+    }
+
+    #[test]
+    fn unsupported_signal_arm_preserves_timer_and_validates_id() {
+        let mut timers = PosixTimers::default();
+        let id = timers.create(Some(libc::SIGALRM));
+        timers.settime(id, 50, Some(t(100)), t(0));
+        let before = serde_json::to_value(&timers).unwrap();
+        assert_eq!(
+            timers.settime_with_signal_delivery(id, 99, Some(t(200)), t(30), false),
+            Err(reverie::Errno::ENOSYS)
+        );
+        assert_eq!(serde_json::to_value(&timers).unwrap(), before);
+        assert_eq!(
+            timers.settime_with_signal_delivery(99, 99, Some(t(200)), t(30), false),
+            Err(reverie::Errno::EINVAL)
+        );
+        assert_eq!(serde_json::to_value(&timers).unwrap(), before);
+        assert_eq!(timers.gettime(id, t(30)), Some((70, 50)));
+        assert_eq!(
+            timers.settime_with_signal_delivery(id, 0, None, t(30), false),
+            Ok((70, 50, Some(libc::SIGALRM)))
+        );
+        assert_eq!(timers.gettime(id, t(30)), Some((0, 0)));
+    }
+
+    #[test]
+    fn no_notification_arm_and_supported_signal_arm_remain_available() {
+        let mut timers = PosixTimers::default();
+        let silent = timers.create(None);
+        assert_eq!(
+            timers.settime_with_signal_delivery(silent, 50, Some(t(100)), t(0), false),
+            Ok((0, 0, None)),
+            "SIGEV_NONE must not request scheduler signal registration"
+        );
+        assert_eq!(timers.gettime(silent, t(150)), Some((50, 50)));
+        let signal = timers.create(Some(libc::SIGALRM));
+        assert_eq!(
+            timers.settime_with_signal_delivery(signal, 50, Some(t(100)), t(0), true),
+            Ok((0, 0, Some(libc::SIGALRM)))
+        );
+        assert_eq!(timers.gettime(signal, t(150)), Some((50, 50)));
     }
 
     #[test]
@@ -1724,6 +1786,10 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub physical_tid: Option<i32>,
 
+    /// Startup identity retained for committed signal effects after retirement.
+    #[serde(default)]
+    pub(crate) signal_task_identity: Option<reverie::SignalTaskIdentity>,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1063): Review backend-supplied open-file creator identity.
     /// Stable identity used when allocating deterministic open-file descriptions.
@@ -2166,6 +2232,7 @@ impl<T> ThreadState<T> {
             detpid: None, // Initialized later.
             thread_start_entered: false,
             physical_tid: None,
+            signal_task_identity: None,
             open_file_creator: None,
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
