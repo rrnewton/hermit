@@ -205,8 +205,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Prepared inventories retain all prior identities and add four reporting
     // tests to regular crates and nine to Hermit's library/binary selection.
     // Nine admission-context/nested-ID controls extend the measured 533-test set.
-    // Six portable-context controls extend the measured 542-test set.
-    ("test.regular_crates", 548),
+    // Six portable-context controls extend the measured 542-test set; the two
+    // hosted-policy controls added with the portable lane extend it to 550.
+    ("test.regular_crates", 550),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     ("test.hermit_unit", 710),
     ("test.detcore_unit", 704),
@@ -241,7 +242,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 22),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 548),
+    ("test.regular_crates_on_host", 550),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 2),
 ];
