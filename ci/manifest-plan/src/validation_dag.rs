@@ -661,6 +661,29 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn materialize_hosted_completion_budgets(cfg: &mut DagConfig) -> Result<(), String> {
+    let step = cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == "e2e.manifest_backend_parity_c_on_host")
+        .ok_or("hosted backend-parity node is absent")?;
+    if step.timeout != 600 {
+        return Err(format!(
+            "hosted backend-parity budget expected the inherited 600s bound, got {}s",
+            step.timeout
+        ));
+    }
+    // Run 35335623037 used all 600 seconds on this 276-cell bucket: 94
+    // classified product failures legitimately consumed their one retained
+    // retry, and the timeout cut the final identities before their result
+    // stream could be published. This 20% measured headroom is specific to the
+    // hosted variant. It does not make a product verdict pass; the workflow
+    // still records every FAIL/ERROR while requiring all 276 identities.
+    step.timeout = 720;
+    step.description = "Hosted backend-parity-c contains 276 selected cells. Run 35335623037 reached the inherited 600-second boundary after 94 classified product retries and before it could publish the complete identity set. The hosted variant therefore carries 720 seconds of measured completion headroom; product FAIL/ERROR rows remain non-gating only in the supplemental portable workflow, while missing identities and other evidence failures remain blocking.".into();
+    Ok(())
+}
+
 /// Materialize the pinned-root execution split as ordinary committed nodes.
 ///
 /// This transform belongs to maintenance-time generation. Runtime validation
@@ -1983,6 +2006,7 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     let mut refreshed = refresh_generated_partitions(static_source, generated)?;
     materialize_hosted_portable_selection(&mut refreshed);
     materialize_hosted_test_variants(&mut refreshed)?;
+    materialize_hosted_completion_budgets(&mut refreshed)?;
     materialize_pinned_root(&mut refreshed)?;
     materialize_focused_preflight(&mut refreshed)?;
     materialize_quick_super_budgets(&mut refreshed);
@@ -2611,6 +2635,10 @@ sys.exit(37)
             assert_eq!(selector.backend, None);
             assert_eq!(step.hint.resources.get("manifest_guest"), Some(&8));
             assert!(!step.cmd.contains("--probe-disabled"));
+            if step.tag() == "e2e.manifest_backend_parity_c_on_host" {
+                assert_eq!(step.timeout, 720);
+                assert!(step.description.contains("276 selected cells"));
+            }
         }
     }
 
