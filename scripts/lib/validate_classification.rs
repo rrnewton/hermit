@@ -941,12 +941,19 @@ mod tests {
                 );
             } else if name == "refused" {
                 let refusal = outcome.test_results_error.as_deref().unwrap();
+                let (cause, diagnostic_tail) = refusal
+                    .split_once("; last output: ")
+                    .expect("refusal must retain the step's diagnostic");
                 assert!(
-                    refusal.starts_with("malformed structured test results ")
-                        && refusal.ends_with(
+                    cause.starts_with("malformed structured test results ")
+                        && cause.ends_with(
                             ": structured-test-results-results has 0 terminal row(s), expected exactly 1 executed test(s)"
                         ),
                     "{refusal}"
+                );
+                assert_eq!(
+                    diagnostic_tail,
+                    "An action was blocked on this server based on a security policy! | Enforcer: FS, Reason: FILE_OPEN"
                 );
                 assert_eq!(outcome.reason, "exit 1");
                 assert_eq!(attempts[0].test_results_error, outcome.test_results_error);
