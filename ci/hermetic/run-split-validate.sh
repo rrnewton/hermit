@@ -293,9 +293,9 @@ if [[ $dry -eq 1 ]]; then
             fi
         done
         echo "   CARGO_HOME=$cargo_home ./ci/prepare-rust-scripts.sh --fetch-only"
-        echo "   # each of the above is retried up to $HERMETIC_FETCH_ATTEMPTS time(s),"
-        echo "   # linear ${HERMETIC_FETCH_BACKOFF_SECONDS}s backoff, no new attempt after"
-        echo "   # ${HERMETIC_FETCH_RETRY_DEADLINE_SECONDS}s; the failing command's own error is what surfaces"
+        echo "   # each operation allows at most $HERMETIC_FETCH_ATTEMPTS attempt(s),"
+        echo "   # linear ${HERMETIC_FETCH_BACKOFF_SECONDS}s backoff; the per-call retry-start cutoff is"
+        echo "   # ${HERMETIC_FETCH_RETRY_DEADLINE_SECONDS}s, rechecked after backoff; the node timeout is unchanged"
     fi
     if [[ $do_offline -eq 1 ]]; then
         echo
@@ -343,30 +343,77 @@ if [[ $do_fetch -eq 1 ]]; then
     # the root lock does not include every member of either workspace.
     (
         cd "$ROOT"
+        # Keep Cargo's executable name (possibly a rustup proxy) while making
+        # a relative PATH entry independent of the neutral Agent Utils cwd.
+        cargo_bin=$(command -v cargo)
+        [[ "$cargo_bin" == /* ]] || cargo_bin="$PWD/$cargo_bin"
+        # Config inspection needs the project's nightly Cargo. A rustup shim
+        # may select a different default at /; preserve that choice for the
+        # actual Agent Utils fetch, but resolve the inspection tool here.
+        cargo_config_bin=""
+        proxy=${https_proxy:-${HTTPS_PROXY:-}}
+        if [[ -z ${CARGO_HTTP_PROXY+x} && -n $proxy ]]; then
+            cargo_config_bin=$cargo_bin
+            if rustup_bin=$(command -v rustup) &&
+                [[ "$cargo_bin" -ef "$rustup_bin" ]]; then
+                cargo_config_bin=$("$rustup_bin" which cargo 2>/dev/null) || cargo_config_bin=""
+            fi
+        fi
+        # Cargo falls back to Git's proxy before consulting the operational
+        # environment. A private Cargo home can expose a different Git route.
+        # Preserve explicit Cargo settings (including empty values), then use
+        # libcurl's HTTPS environment order. HTTP-only settings stay HTTP-only.
+        # Query in each child's actual cwd: Agent Utils intentionally uses /.
+        host_fetch() (
+            proxy=${https_proxy:-${HTTPS_PROXY:-}}
+            if [[ -z ${CARGO_HTTP_PROXY+x} && -n $proxy ]]; then
+                # An unresolved proxy can select a different toolchain here.
+                # Establish capability at the query cwd, before inspecting
+                # config; unsupported inspection keeps the original fetch.
+                if [[ -z $cargo_config_bin ]] ||
+                    ! cargo_version=$("$cargo_config_bin" --version 2>/dev/null) ||
+                    [[ $cargo_version != "cargo "*"-nightly "* && $cargo_version != "cargo "*"-dev "* ]]; then
+                    echo 'run-split-validate: nightly Cargo configuration inspection unavailable; applying no proxy default, using the original fetch configuration.' >&2
+                    "$@"
+                    exit $?
+                fi
+                if ! configured=$("$cargo_config_bin" -Zunstable-options config get --format json 2>/dev/null |
+                    jq -r 'if type != "object" then error("invalid Cargo config")
+                           else (.http // {}) | if type != "object" then error("invalid http config")
+                           else has("proxy") end end'); then
+                    echo 'run-split-validate: cannot inspect Cargo proxy configuration; refusing host fetch.' >&2
+                    exit 2
+                fi
+                case $configured in
+                    true) ;; # Cargo's own setting takes precedence, even "".
+                    false) export CARGO_HTTP_PROXY="$proxy" ;;
+                    *) echo 'run-split-validate: invalid Cargo proxy configuration query result.' >&2; exit 2 ;;
+                esac
+            fi
+            "$@"
+        )
         for manifest in "${FETCH_MANIFESTS[@]}"; do
             if [[ "$manifest" == agent-utils/rs/Cargo.toml ]]; then
                 # Match rs/bin/cargo-runner's Cargo configuration scope. Cargo
                 # discovers config from its process cwd, not --manifest-path;
                 # Hermit's target/toolchain config must not redirect this fetch.
-                # Resolve paths before leaving the repository, retaining cargo's
-                # executable name (it may be a rustup symlink).
+                # Resolve the Cargo home before leaving the repository. The
+                # config query and fetch share both cwd and target environment.
                 (
-                    cargo_bin=$(command -v cargo)
-                    [[ "$cargo_bin" == /* ]] || cargo_bin="$PWD/$cargo_bin"
                     absolute_cargo_home=$(realpath -- "$cargo_home")
                     cd /
-                    retry_fetch "cargo fetch $manifest" \
-                        env -u CARGO_BUILD_TARGET -u CARGO_TARGET_DIR \
-                        CARGO_HOME="$absolute_cargo_home" "$cargo_bin" fetch --locked \
+                    unset CARGO_BUILD_TARGET CARGO_TARGET_DIR
+                    CARGO_HOME="$absolute_cargo_home" retry_fetch "cargo fetch $manifest" \
+                        host_fetch "$cargo_bin" fetch --locked \
                         --manifest-path "$ROOT/$manifest"
                 )
             else
-                retry_fetch "cargo fetch $manifest" \
-                    env CARGO_HOME="$cargo_home" cargo fetch --locked --manifest-path "$manifest"
+                CARGO_HOME="$cargo_home" retry_fetch "cargo fetch $manifest" \
+                    host_fetch cargo fetch --locked --manifest-path "$manifest"
             fi
         done
-        retry_fetch "prepare-rust-scripts --fetch-only" \
-            env CARGO_HOME="$cargo_home" ./ci/prepare-rust-scripts.sh --fetch-only
+        CARGO_HOME="$cargo_home" retry_fetch "prepare-rust-scripts --fetch-only" \
+            host_fetch ./ci/prepare-rust-scripts.sh --fetch-only
     )
     echo ":::: FETCH PHASE complete -- every byte checked against its Cargo.lock"
 fi

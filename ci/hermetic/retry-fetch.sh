@@ -30,10 +30,9 @@
 : "${HERMETIC_FETCH_ATTEMPTS:=3}"
 # Linear backoff: attempt N waits N * this many seconds before attempt N+1.
 : "${HERMETIC_FETCH_BACKOFF_SECONDS:=5}"
-# Do not START another attempt once this much wall time has been spent retrying.
-# This exists so a retry can never convert a diagnosable exit into a TIMEOUT
-# KILL, which would mask the cause completely -- a strictly worse outcome than
-# the failure it is trying to survive.
+# Per-call wall-clock cutoff for starting another attempt, rechecked after
+# backoff. This does not bound a running child or the complete fetch phase:
+# the existing validation-node timeout remains the unchanged outer backstop.
 : "${HERMETIC_FETCH_RETRY_DEADLINE_SECONDS:=300}"
 
 # retry_fetch <label> <command> [args...]
@@ -73,6 +72,12 @@ retry_fetch() {
         fi
         echo "run-split-validate: $label attempt $attempt of $HERMETIC_FETCH_ATTEMPTS failed (exit $rc); retrying in ${sleep_for}s. Its output is above." >&2
         sleep "$sleep_for"
+        elapsed=$(( SECONDS - started ))
+        if (( elapsed >= HERMETIC_FETCH_RETRY_DEADLINE_SECONDS )); then
+            echo "run-split-validate: $label FAILED on attempt $attempt (exit $rc); not retrying -- ${elapsed}s spent against a ${HERMETIC_FETCH_RETRY_DEADLINE_SECONDS}s retry deadline." >&2
+            echo "  The last completed command's own output is ABOVE; the retry deadline expired during backoff." >&2
+            return "$rc"
+        fi
         attempt=$(( attempt + 1 ))
     done
 }

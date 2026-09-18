@@ -66,8 +66,8 @@ check "  and the final line says the cause is above rather than claiming to be i
       "$(grep -q 'is the cause; this line only says the bound was reached' <<<"$out" && echo 0 || echo 1)"
 
 # ----------------------------------------------------------------- deadline --
-# The deadline must stop a retry that would risk a timeout kill, and must still
-# surface the cause.
+# An exhausted per-call cutoff must stop a new retry and retain the cause.
+# The unchanged outer node timeout still bounds running commands.
 out=$(HERMETIC_FETCH_RETRY_DEADLINE_SECONDS=0 STATE="$work/state3" \
       retry_fetch "deadline probe" "$work/persistent" 2>&1); rc=$?
 check "an exhausted retry deadline stops early" \
@@ -75,6 +75,42 @@ check "an exhausted retry deadline stops early" \
 check "  still returning the command's own status" "$([[ $rc -eq 101 ]] && echo 0 || echo 1)"
 check "  and still surfacing the cause" \
       "$(grep -q '\[60\] SSL peer certificate' <<<"$out" && echo 0 || echo 1)"
+
+# -------------------------------------------------------------- late wakeup --
+# Drive the real helper past its positive cutoff during backoff. The sleep
+# replacement and SECONDS adjustment exist only in this captured subshell.
+# Without the post-backoff check the fail-once child would falsely recover.
+out=$(
+    {
+        sleep() { printf '%s\n' "$1" >> "$work/sleep-late"; SECONDS=$((SECONDS + 301)); }
+        HERMETIC_FETCH_BACKOFF_SECONDS=1 HERMETIC_FETCH_RETRY_DEADLINE_SECONDS=300 \
+            STATE="$work/state-late" retry_fetch "late wakeup probe" "$work/transient"
+    } 2>&1
+); rc=$?
+check "an overslept backoff returns the last completed child's status" \
+      "$([[ $rc -eq 101 ]] && echo 0 || echo 1)"
+check "  and cannot start a second invocation after the deadline" \
+      "$([[ $(cat "$work/state-late") == 1 ]] && echo 0 || echo 1)"
+check "  and really reached the requested positive backoff" \
+      "$([[ $(cat "$work/sleep-late") == 1 ]] && echo 0 || echo 1)"
+check "  and retains both the child cause and the deadline refusal" \
+      "$(grep -q '\[60\] SSL peer certificate' <<<"$out" && \
+         grep -q 'retry deadline expired during backoff' <<<"$out" && echo 0 || echo 1)"
+
+# The opposing control rejects a helper that refuses every post-sleep retry.
+out=$(
+    {
+        sleep() { printf '%s\n' "$1" >> "$work/sleep-within"; SECONDS=$((SECONDS + 1)); }
+        HERMETIC_FETCH_BACKOFF_SECONDS=1 HERMETIC_FETCH_RETRY_DEADLINE_SECONDS=300 \
+            STATE="$work/state-within" retry_fetch "within deadline probe" "$work/transient"
+    } 2>&1
+); rc=$?
+check "a within-deadline backoff can recover successfully" "$([[ $rc -eq 0 ]] && echo 0 || echo 1)"
+check "  and invokes the child exactly twice" \
+      "$([[ $(cat "$work/state-within") == 2 ]] && echo 0 || echo 1)"
+check "  and requests one positive backoff and reports actual recovery" \
+      "$([[ $(cat "$work/sleep-within") == 1 ]] && \
+         grep -q 'succeeded on attempt 2' <<<"$out" && echo 0 || echo 1)"
 
 # ------------------------------------------------------ control: no retry on ok --
 # So none of the above passes merely because everything retries.
@@ -87,7 +123,7 @@ out=$(STATE="$work/state4" retry_fetch "control" "$work/good" 2>&1); rc=$?
 check "a succeeding command runs EXACTLY once and is not retried" \
       "$([[ $rc -eq 0 && $(cat "$work/state4") == 1 ]] && echo 0 || echo 1)"
 check "  and prints no attempt chatter on the happy path" \
-      "$(grep -qv 'attempt' <<<"$out" && ! grep -q 'succeeded on attempt' <<<"$out" && echo 0 || echo 1)"
+      "$([[ $out == ok ]] && echo 0 || echo 1)"
 
 echo
 if (( failures )); then echo "test-retry-fetch: $failures FAILED"; exit 1; fi

@@ -60,6 +60,74 @@ impl NodeClassification {
     }
 }
 
+/// dagrun funnels three distinct conditions into one refusal, and they do not
+/// carry the same evidence. `cannot read structured test results {path}: ...`
+/// and `malformed structured test results {path}: ...` each describe a report
+/// the run actually produced, so the suite is a fair suspect -- a duplicate
+/// test identity is a malformed suite. Only the constant below says no report
+/// exists, which is an absence of evidence in either direction.
+const RESULTS_NEVER_WRITTEN: &str = "required structured test results were not written";
+const REFUSAL_REASON_PREFIX: &str = "STRUCTURED TEST RESULTS REFUSED: ";
+
+/// The refusal the producer recorded, if any. `test_results_error` is the
+/// current typed field; the reason prefix is the older contract, retained
+/// because attempts recorded under it are still read back.
+fn refusal_cause(attempt: &NodeAttempt) -> Option<&str> {
+    attempt
+        .test_results_error
+        .as_deref()
+        .or_else(|| attempt.reason.strip_prefix(REFUSAL_REASON_PREFIX))
+}
+
+/// Matched as a PREFIX rather than a substring deliberately. The other two
+/// causes interpolate a path, so a path that happens to contain this phrase
+/// must not be mistaken for a report that was never written.
+fn refused_without_writing_any_report(attempt: &NodeAttempt) -> bool {
+    refusal_cause(attempt).is_some_and(|cause| cause.starts_with(RESULTS_NEVER_WRITTEN))
+}
+
+/// The one case with no evidence in either direction: the node's own command
+/// succeeded, and the only thing marking it not-ok is a report that was never
+/// written. Nothing failed that anybody measured.
+///
+/// The command's own status is tested here rather than inferred from where
+/// this is called. A node that exited nonzero DID fail a condition; a missing
+/// report means that failure cannot be NAMED, and naming it is not the same as
+/// it existing. Collected wall/CPU/OOM breaches are likewise real failed
+/// conditions and are excluded for the same reason.
+fn absent_report_is_the_only_failure(attempt: &NodeAttempt) -> bool {
+    attempt.ok == Some(false)
+        && attempt.returncode == Some(0)
+        // An authoritative invalid/read-I/O kind must not be excused by a
+        // contradictory legacy string that happens to begin with this phrase.
+        && matches!(
+            attempt.test_results_error_kind,
+            None | Some(dagrun::TestResultsErrorKind::Missing)
+        )
+        && attempt.timed_out != Some(true)
+        && attempt.cpu_timed_out != Some(true)
+        && attempt.oomed != Some(true)
+        && !attempt.oom_kills.is_some_and(|kills| kills > 0)
+        && refused_without_writing_any_report(attempt)
+}
+
+/// A controlled producer uses the existing temporary-failure status only after
+/// valid test evidence could not be written/published. The runner independently
+/// observed absence/read I/O; prose and a generic exit 2 cannot grant this class.
+fn publication_report_is_unavailable(attempt: &NodeAttempt) -> bool {
+    attempt.ok == Some(false)
+        && attempt.returncode == Some(super::NO_RESULT_EXIT_CODE)
+        && attempt.test_results_error.is_some()
+        && matches!(
+            attempt.test_results_error_kind,
+            Some(dagrun::TestResultsErrorKind::Missing | dagrun::TestResultsErrorKind::ReadIo)
+        )
+        && attempt.timed_out != Some(true)
+        && attempt.cpu_timed_out != Some(true)
+        && attempt.oomed != Some(true)
+        && !attempt.oom_kills.is_some_and(|kills| kills > 0)
+}
+
 /// Evidence of a failed condition remains authoritative alongside a diagnostic.
 ///
 /// Test results were parsed from the controlled runner's structured report.
@@ -67,18 +135,20 @@ impl NodeClassification {
 /// separately from the exit reason. The legacy reason prefix is also retained.
 /// A refusal alone cannot turn an uncollected or aborted attempt into a result.
 pub(super) fn has_product_failure_evidence(attempt: &NodeAttempt) -> bool {
-    attempt
+    if attempt
         .test_results
         .as_ref()
         .is_some_and(|results| results.iter().any(|result| !result.passed))
-        || (attempt.reported
-            && attempt.execution == AttemptExecution::Completed
-            && attempt.ok.is_some()
-            && !attempt.aborted
-            && (attempt.test_results_error.is_some()
-                || attempt
-                    .reason
-                    .starts_with("STRUCTURED TEST RESULTS REFUSED: ")))
+    {
+        return true;
+    }
+    attempt.reported
+        && attempt.execution == AttemptExecution::Completed
+        && attempt.ok.is_some()
+        && !attempt.aborted
+        && (refusal_cause(attempt).is_some() || attempt.test_results_error_kind.is_some())
+        && !absent_report_is_the_only_failure(attempt)
+        && !publication_report_is_unavailable(attempt)
 }
 
 pub(super) fn attempt_classification(attempt: &NodeAttempt) -> NodeClassification {
@@ -113,6 +183,16 @@ pub(super) fn attempt_classification(attempt: &NodeAttempt) -> NodeClassificatio
     }
     if attempt.understood_infrastructure_class.is_some() {
         return NodeClassification::UnderstoodInfrastructureFailure;
+    }
+    // Last, so that every measured condition above still wins: a node whose
+    // command succeeded and whose required report was never written produced
+    // no evidence either way. `no_result` keeps it out of the failure count
+    // and equally out of any green evidence for landing, which is both halves
+    // of the ruling. It is deliberately NOT UnderstoodInfrastructureFailure:
+    // nothing here diagnosed a cause, and that bucket is projected with a
+    // named cause it would have to leave empty.
+    if absent_report_is_the_only_failure(attempt) {
+        return NodeClassification::NoResult;
     }
     NodeClassification::ProductFailure
 }
@@ -389,6 +469,149 @@ fn fold_bracket() -> Result<(), String> {
     Ok(())
 }
 
+/// A report that was never written is an absence of evidence, not a failure --
+/// and every other measured condition still outranks that absence.
+///
+/// The fixture deliberately starts from a plain failing outcome with NO
+/// infrastructure diagnosis, so the only thing that can satisfy the
+/// never-written expectations is this reclassification. Cloning the `infra`
+/// fixture instead would reach `no_result` through
+/// `understood_infrastructure_class` and the assertions could not fail.
+fn absent_report_bracket() -> Result<(), String> {
+    let clean = fixture_outcome("test.absent", 0);
+    // The producer marks any refusal not-ok while leaving the command's own
+    // zero exit status in place. That pairing is the whole subject here.
+    let refused_only = |cause: &str| {
+        let mut attempt = reported_attempt(&clean, 1);
+        attempt.ok = Some(false);
+        attempt.test_results_error = Some(cause.into());
+        attempt
+    };
+    let never_written =
+        "required structured test results were not written to /src/.dagrun-test-counts-x.json";
+    let malformed = "malformed structured test results /src/counts.json: \
+                     structured-test-results-results has 0 terminal row(s), expected exactly 1 \
+                     executed test(s)";
+    let unreadable = "cannot read structured test results /src/counts.json: \
+                      No such file or directory (os error 2)";
+
+    if attempt_classification(&refused_only(never_written)) != NodeClassification::NoResult {
+        return Err(
+            "classification: a report that was never written was reported as a product failure"
+                .into(),
+        );
+    }
+    for (label, cause) in [("malformed", malformed), ("unreadable", unreadable)] {
+        if attempt_classification(&refused_only(cause)) != NodeClassification::ProductFailure {
+            return Err(format!(
+                "classification: a {label} report stopped being product evidence"
+            ));
+        }
+    }
+    // The phrase inside an interpolated PATH must not be mistaken for absence.
+    // This is why the match is a prefix and not a substring.
+    let phrase_in_path = format!(
+        "malformed structured test results \
+         /src/{RESULTS_NEVER_WRITTEN}/counts.json: trailing characters at line 1"
+    );
+    if attempt_classification(&refused_only(&phrase_in_path)) != NodeClassification::ProductFailure
+    {
+        return Err(
+            "classification: a malformed report whose path contains the absence phrase was \
+             excused"
+                .into(),
+        );
+    }
+    // The legacy reason contract, which older attempts are still read back with.
+    for (label, cause, want) in [
+        ("never written", never_written, NodeClassification::NoResult),
+        ("malformed", malformed, NodeClassification::ProductFailure),
+    ] {
+        let mut legacy = reported_attempt(&clean, 1);
+        legacy.ok = Some(false);
+        legacy.reason = format!("{REFUSAL_REASON_PREFIX}{cause}");
+        if attempt_classification(&legacy) != want {
+            return Err(format!(
+                "classification: legacy reason form of a {label} report changed meaning"
+            ));
+        }
+    }
+    // A measured failing test outranks the absence of the report it came in.
+    let mut with_failed_test = refused_only(never_written);
+    with_failed_test.test_results = Some(vec![dagrun::TestResult::new(
+        "fixture::fails".into(),
+        false,
+        1,
+    )?]);
+    if attempt_classification(&with_failed_test) != NodeClassification::ProductFailure {
+        return Err(
+            "classification: an absent report erased the same node's measured failed test".into(),
+        );
+    }
+    // A command that failed on its own DID fail a condition; only the naming
+    // is lost. Every nonzero status stays a product failure.
+    for code in [1_i64, 2, 101, -15] {
+        let mut failed_command = refused_only(never_written);
+        failed_command.returncode = Some(code);
+        failed_command.reason = "exit 1".into();
+        if attempt_classification(&failed_command) != NodeClassification::ProductFailure {
+            return Err(format!(
+                "classification: an absent report excused a command that exited {code}"
+            ));
+        }
+    }
+    // Collected node-limit breaches are measured failed conditions and keep
+    // their precedence even when the report is missing.
+    for bits in 1_u8..8 {
+        let mut limited = refused_only(never_written);
+        limited.timed_out = Some(bits & 1 != 0);
+        limited.cpu_timed_out = Some(bits & 2 != 0);
+        limited.oomed = Some(bits & 4 != 0);
+        limited.oom_kills = Some(if bits & 4 != 0 { 2 } else { 0 });
+        limited.failure_class = Some(super::FailureClass::NoResult);
+        if attempt_classification(&limited) != NodeClassification::ProductFailure {
+            return Err(format!(
+                "classification: an absent report excused collected node limit {bits}"
+            ));
+        }
+    }
+    // An attempt that never completed was already unknown and stays unknown;
+    // the absence must not upgrade it into a diagnosed infrastructure cause.
+    for bits in 1_u8..16 {
+        let mut incomplete = refused_only(never_written);
+        incomplete.reported = bits & 1 == 0;
+        if bits & 2 != 0 {
+            incomplete.execution = AttemptExecution::Unknown;
+        }
+        incomplete.aborted = bits & 4 != 0;
+        if bits & 8 != 0 {
+            incomplete.ok = None;
+        }
+        if attempt_classification(&incomplete) != NodeClassification::NoResult {
+            return Err(format!(
+                "classification: incomplete attempt {bits} with an absent report left no_result"
+            ));
+        }
+    }
+    // A real infrastructure diagnosis is more informative than "cannot tell",
+    // so it keeps its own bucket rather than being flattened into no_result.
+    let mut diagnosed = refused_only(never_written);
+    diagnosed.understood_infrastructure_class = Some("PMU RCB overshoot".into());
+    if attempt_classification(&diagnosed) != NodeClassification::UnderstoodInfrastructureFailure {
+        return Err(
+            "classification: an absent report erased a real infrastructure diagnosis".into(),
+        );
+    }
+    // The projection a consumer actually reads, and it must not invent a cause.
+    let gate = super::ledger_gate_with_attempts(&clean, &[refused_only(never_written)]);
+    if gate["result"] != "no_result" || gate["failure_class"] != "no_result" {
+        return Err(format!(
+            "classification: absent-report projection did not read as no_result; gate={gate}"
+        ));
+    }
+    Ok(())
+}
+
 fn product_evidence_bracket() -> Result<(), String> {
     let mut outcome = fixture_outcome("test.mixed", 1);
     let mut infra = reported_attempt(&outcome, 1);
@@ -614,8 +837,9 @@ fn populations_bracket() -> Result<(), String> {
 pub(super) fn self_test() -> Result<String, String> {
     fold_bracket()?;
     product_evidence_bracket()?;
+    absent_report_bracket()?;
     populations_bracket()?;
-    Ok("classification: exact selected populations; stale/raw fold agreement; failed tests and node limits outrank infrastructure; missing super repetitions remain unmeasured".into())
+    Ok("classification: exact selected populations; stale/raw fold agreement; failed tests and node limits outrank infrastructure; an unwritten required report is undetermined rather than failed; missing super repetitions remain unmeasured".into())
 }
 
 #[cfg(test)]
@@ -629,6 +853,10 @@ mod tests {
     #[test]
     fn measured_product_evidence_outranks_infrastructure() {
         product_evidence_bracket().unwrap();
+    }
+    #[test]
+    fn an_unwritten_report_is_undetermined_and_never_outranks_a_measured_condition() {
+        absent_report_bracket().unwrap();
     }
     #[test]
     fn selected_populations_and_super_denominators_are_exact() {
@@ -738,12 +966,19 @@ mod tests {
                 );
             } else if name == "refused" {
                 let refusal = outcome.test_results_error.as_deref().unwrap();
+                let (cause, diagnostic_tail) = refusal
+                    .split_once("; last output: ")
+                    .expect("refusal must retain the step's diagnostic");
                 assert!(
-                    refusal.starts_with("malformed structured test results ")
-                        && refusal.ends_with(
+                    cause.starts_with("malformed structured test results ")
+                        && cause.ends_with(
                             ": structured-test-results-results has 0 terminal row(s), expected exactly 1 executed test(s)"
                         ),
                     "{refusal}"
+                );
+                assert_eq!(
+                    diagnostic_tail,
+                    "An action was blocked on this server based on a security policy! | Enforcer: FS, Reason: FILE_OPEN"
                 );
                 assert_eq!(outcome.reason, "exit 1");
                 assert_eq!(attempts[0].test_results_error, outcome.test_results_error);
@@ -753,6 +988,112 @@ mod tests {
             assert_eq!(gate["result"], wanted.result());
             assert_eq!(gate["failure_class"], wanted.as_str());
             println!("actual classification {name}: {gate}");
+        }
+    }
+
+    /// The same condition through the REAL producer rather than a hand-built
+    /// attempt, because the reclassification keys on the exact wording dagrun
+    /// emits and reading that wording out of its source is not the same as
+    /// observing it. This runs a genuine lane that declares a required report
+    /// and then does not write one.
+    ///
+    /// The `wrote` case is the control that makes the other one mean something:
+    /// the identical step, differing only in whether the report is produced,
+    /// passes. So the absence is the single variable.
+    #[test]
+    fn a_real_lane_that_writes_no_required_report_is_undetermined_not_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, write_report, wanted) in [
+            ("absent", false, NodeClassification::NoResult),
+            ("wrote", true, NodeClassification::Pass),
+        ] {
+            // Exits 0 either way. A command that failed on its own would be a
+            // product failure regardless, which is a different question.
+            let command = if write_report {
+                "printf '%s\\n' '{\"schema\":2,\"executed_tests\":1,\"filtered_tests\":0,\
+                 \"results\":[{\"id\":\"fixture::passes\",\"result\":\"pass\",\"attempts\":1}]}' \
+                 > \"$DAGRUN_TEST_COUNTS_PATH\"; exit 0"
+                    .to_string()
+            } else {
+                "exit 0".to_string()
+            };
+            let mut step = super::super::step_with_caps(
+                "classification",
+                name,
+                "actual absent-required-report fixture",
+                command,
+                Vec::new(),
+                10,
+                10,
+                128 * 1024 * 1024,
+            );
+            step.result_manifests =
+                Some(vec![dagrun::model::ResultManifest::StructuredTestResults(
+                    dagrun::model::StructuredTestResultsManifest::current(step.tag()),
+                )]);
+            let cfg = super::super::DagConfig {
+                steps: vec![step],
+                ..Default::default()
+            };
+            let result = super::super::run_lane_once(
+                &cfg,
+                1,
+                true,
+                0,
+                None,
+                &dir.path().join(format!("{name}.log")),
+                None,
+                false,
+            );
+            assert_eq!(result.outcomes.len(), 1, "{name}: exact collected result");
+            let outcome = &result.outcomes[0];
+            let attempts = result.attempts;
+            assert_eq!(outcome.returncode, Some(0), "{name}: command exited 0");
+            assert!(
+                !outcome.aborted && !outcome.timed_out && !outcome.cpu_timed_out && !outcome.oomed,
+                "{name}: no collected limit breach"
+            );
+            if write_report {
+                // The control has to prove the lane really produced and parsed
+                // a report, otherwise "it passed" says nothing about whether
+                // the absence in the other case was the variable.
+                assert!(outcome.ok && outcome.test_results_error.is_none());
+                assert_eq!(outcome.executed_tests, Some(1), "{name}: report parsed");
+                assert_eq!(
+                    outcome.test_results.as_ref().unwrap(),
+                    &vec![dagrun::TestResult::new("fixture::passes".into(), true, 1).unwrap()],
+                    "{name}: the written row was read back"
+                );
+            } else {
+                // The exact producer wording the classifier keys on, observed
+                // rather than quoted from the producer's source.
+                let refusal = outcome.test_results_error.as_deref().unwrap();
+                assert!(
+                    refusal.starts_with(RESULTS_NEVER_WRITTEN),
+                    "producer wording moved out from under the classifier: {refusal}"
+                );
+                assert!(!outcome.ok, "{name}: a refusal still marks the node not-ok");
+                assert!(outcome.test_results.is_none());
+            }
+            assert_eq!(
+                node_classification(outcome, &attempts),
+                wanted,
+                "{name}: absent required report"
+            );
+            // The projection a consumer reads. A passing lane records no
+            // attempt, so `ledger_gate_with_attempts` leaves the per-attempt
+            // fields unset there; the refusal is the case that must project.
+            if !write_report {
+                let gate = super::super::ledger_gate_with_attempts(outcome, &attempts);
+                assert_eq!(gate["result"], wanted.result());
+                assert_eq!(gate["failure_class"], wanted.as_str());
+                // The raw observation is preserved beside the verdict rather
+                // than rewritten by it.
+                assert_eq!(gate["raw_result"], "fail");
+                assert_eq!(gate["raw_failure_class"], "product_failure");
+                assert_eq!(gate["exit_code"], 0);
+                println!("actual absent-report classification {name}: {gate}");
+            }
         }
     }
 }
@@ -1189,5 +1530,231 @@ mod timeout_tests {
                 assert_eq!(result.skipped, vec![format!("classification.{name}")]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[path = "validate_nextest_fixture.rs"]
+mod real_nextest_tests;
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    fn refused(kind: Option<dagrun::TestResultsErrorKind>) -> NodeAttempt {
+        let mut attempt = reported_attempt(&fixture_outcome("test.publication", 75), 1);
+        attempt.test_results_error = Some("real import refusal; prose is not authority".into());
+        attempt.test_results_error_kind = kind;
+        attempt
+    }
+
+    #[test]
+    fn typed_publication_inability_stays_unknown_but_never_hides_failed_evidence() {
+        use dagrun::TestResultsErrorKind::InvalidReport;
+        use dagrun::TestResultsErrorKind::Missing;
+        use dagrun::TestResultsErrorKind::ReadIo;
+        for kind in [Missing, ReadIo] {
+            let attempt = refused(Some(kind));
+            assert_eq!(
+                attempt_classification(&attempt),
+                NodeClassification::NoResult
+            );
+            for exit in [-15, 0, 1, 2, 101] {
+                let mut command_failure = attempt.clone();
+                command_failure.returncode = Some(exit);
+                assert_eq!(
+                    attempt_classification(&command_failure),
+                    NodeClassification::ProductFailure
+                );
+            }
+            for mask in 1..16 {
+                let mut limited = attempt.clone();
+                limited.timed_out = Some(mask & 1 != 0);
+                limited.cpu_timed_out = Some(mask & 2 != 0);
+                limited.oomed = Some(mask & 4 != 0);
+                limited.oom_kills = Some(if mask & 8 != 0 { 1 } else { 0 });
+                assert_eq!(
+                    attempt_classification(&limited),
+                    NodeClassification::ProductFailure
+                );
+            }
+            let mut measured_failure = attempt.clone();
+            measured_failure.test_results = Some(vec![
+                dagrun::TestResult::new("real::failed".into(), false, 1).unwrap(),
+            ]);
+            assert_eq!(
+                attempt_classification(&measured_failure),
+                NodeClassification::ProductFailure
+            );
+            let outcome = fixture_outcome("test.publication", 75);
+            let earlier = reported_attempt(&fixture_outcome("test.publication", 1), 1);
+            let mut later = attempt.clone();
+            later.attempt = 2;
+            assert_eq!(
+                node_classification(&outcome, &[earlier, later]),
+                NodeClassification::ProductFailure
+            );
+
+            // A publication exit collected while cancellation drains is not a
+            // completed child result or a measured child-budget breach. Keep
+            // the scheduler's first cause separate from the import diagnostic.
+            for (cut_by_run_budget, cause) in [
+                (false, dagrun::model::ABORTED_BY_PEER_FAILURE_REASON),
+                (true, dagrun::model::ABORTED_BY_RUN_BUDGET_REASON),
+                (
+                    false,
+                    "ABORTED (required whole-run CPU accounting was lost; CPU budget exhaustion was not established)",
+                ),
+            ] {
+                let mut aborted = StepOutcome::aborted_outcome(
+                    "test.publication".into(),
+                    0.25,
+                    String::new(),
+                    Some(super::super::NO_RESULT_EXIT_CODE),
+                    None,
+                    None,
+                    cut_by_run_budget,
+                );
+                // The scheduler records accounting loss after constructing the
+                // cancellation outcome; its public constructor takes the two
+                // ordinary peer/run-budget causes directly.
+                if cut_by_run_budget || cause == dagrun::model::ABORTED_BY_PEER_FAILURE_REASON {
+                    assert_eq!(aborted.reason, cause);
+                } else {
+                    aborted.reason = cause.into();
+                }
+                aborted.test_results_error = Some("publication import unavailable".into());
+                aborted.test_results_error_kind = Some(kind);
+                let unknown = reported_attempt(&aborted, 1);
+                assert!(unknown.reported && unknown.aborted);
+                assert_eq!(unknown.ok, Some(false));
+                assert_eq!(unknown.execution, AttemptExecution::Unknown);
+                assert_eq!(unknown.returncode, Some(super::super::NO_RESULT_EXIT_CODE));
+                assert_eq!(unknown.reason, cause);
+                assert_eq!(unknown.test_results_error, aborted.test_results_error);
+                assert_eq!(unknown.test_results_error_kind, Some(kind));
+                assert_eq!(unknown.timed_out, Some(false));
+                assert_eq!(unknown.cpu_timed_out, Some(false));
+                assert_eq!(unknown.oomed, Some(false));
+                assert_eq!(unknown.oom_kills, Some(0));
+                assert!(!attempt_is_no_result(&unknown));
+                assert_eq!(super::super::attempt_result(&unknown), None);
+                assert_eq!(
+                    super::super::completed_node_count(
+                        std::slice::from_ref(&aborted),
+                        std::slice::from_ref(&unknown),
+                    ),
+                    0
+                );
+                assert_eq!(attempt_classification(&unknown), NodeClassification::NoResult);
+
+                let mut with_failed_row = unknown.clone();
+                with_failed_row.test_results = Some(vec![
+                    dagrun::TestResult::new("real::failed".into(), false, 1).unwrap(),
+                ]);
+                let mut latest = unknown.clone();
+                latest.attempt = 2;
+                for (name, attempts, wanted) in [
+                    ("aborted_import", vec![unknown], NodeClassification::NoResult),
+                    (
+                        "retained_failed_row",
+                        vec![with_failed_row],
+                        NodeClassification::ProductFailure,
+                    ),
+                    (
+                        "earlier_failure",
+                        vec![
+                            reported_attempt(&fixture_outcome("test.publication", 1), 1),
+                            latest,
+                        ],
+                        NodeClassification::ProductFailure,
+                    ),
+                ] {
+                    assert_eq!(node_classification(&aborted, &attempts), wanted, "{name}");
+                    let gate = super::super::ledger_gate_with_attempts(&aborted, &attempts);
+                    assert_eq!(gate["result"], wanted.result(), "{name}");
+                    assert_eq!(gate["failure_class"], wanted.as_str(), "{name}");
+                    assert_eq!(gate["aborted"], wanted == NodeClassification::NoResult);
+                    assert_eq!(gate["raw_aborted"], true);
+                    assert!(gate["raw_result"].is_null());
+                    if wanted == NodeClassification::ProductFailure {
+                        assert_eq!(gate["failure_origin"], "outer_gate");
+                    }
+                    let raw = gate["attempts"].as_array().unwrap().last().unwrap();
+                    assert!(raw["result"].is_null());
+                    assert_eq!(raw["aborted"], true);
+                    for observation in [&gate, raw] {
+                        assert_eq!(observation["reported"], true);
+                        assert_eq!(observation["execution"], "unknown");
+                        assert_eq!(observation["exit_code"], super::super::NO_RESULT_EXIT_CODE);
+                        assert_eq!(observation["reason"], cause);
+                        assert_eq!(
+                            observation["test_results_error"],
+                            "publication import unavailable"
+                        );
+                        assert_eq!(observation["test_results_error_kind"], kind.value());
+                        for field in ["timed_out", "cpu_timed_out", "oomed"] {
+                            assert_eq!(observation[field], false, "{name}: {field}");
+                        }
+                        assert_eq!(observation["oom_kills"], 0);
+                    }
+                    let typed: hermit_manifest_plan::ledger::GateHistoryRow =
+                        serde_json::from_value(gate.clone()).unwrap();
+                    let read_back = serde_json::to_value(typed).unwrap();
+                    for (field, expected) in gate.as_object().unwrap() {
+                        assert_eq!(&read_back[field], expected, "{name}: reader lost {field}");
+                    }
+                    println!("ABORTED_PUBLICATION_FIXTURE {name} {read_back}");
+                }
+            }
+        }
+        for kind in [None, Some(InvalidReport)] {
+            let attempt = refused(kind);
+            assert_eq!(
+                attempt_classification(&attempt),
+                NodeClassification::ProductFailure
+            );
+        }
+        assert_eq!(
+            dagrun::TestResultsErrorKind::from_value("future_kind"),
+            None
+        );
+        let mut invalid_without_text = refused(Some(InvalidReport));
+        invalid_without_text.test_results_error = None;
+        assert_eq!(
+            attempt_classification(&invalid_without_text),
+            NodeClassification::ProductFailure
+        );
+        for kind in [ReadIo, InvalidReport] {
+            let mut contradictory = refused(Some(kind));
+            contradictory.returncode = Some(0);
+            contradictory.test_results_error =
+                Some("required structured test results were not written to fixture".into());
+            assert_eq!(
+                attempt_classification(&contradictory),
+                NodeClassification::ProductFailure,
+                "legacy prose must not override {kind:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn contradictory_success_never_excuses_a_required_result_refusal() {
+        let mut attempt = refused(Some(dagrun::TestResultsErrorKind::Missing));
+        attempt.ok = Some(true);
+        attempt.returncode = Some(0);
+        attempt.test_results_error =
+            Some("required structured test results were not written to fixture".into());
+        assert_eq!(
+            attempt_classification(&attempt),
+            NodeClassification::ProductFailure
+        );
+        attempt.test_results_error = None;
+        attempt.test_results_error_kind = None;
+        attempt.reason = "STRUCTURED TEST RESULTS REFUSED: required structured test results were not written to fixture".into();
+        assert_eq!(
+            attempt_classification(&attempt),
+            NodeClassification::ProductFailure
+        );
     }
 }

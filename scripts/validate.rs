@@ -190,7 +190,15 @@ const INTEGRATION_ARTIFACT_WRAPPER: &str =
 /// placeholder tag. The committed DAG contains the real `compat.*` population;
 /// this name is never a node and never triggers runtime graph generation.
 const STRICT_COMPAT_SELECTION_ALIAS: &str = "test.strict_compat";
-const NEXTEST_PORTABLE_PREPARE_COMMAND: &str = "./ci/nextest-binaries.rs prepare portable";
+// The FULL plan's workspace producer prepares the FULL profile. Each build
+// producer prepares the profile of the plan it serves -- full/full,
+// privileged/privileged, liteinst/liteinst, quick/quick, super/super -- and
+// ci/manifest-plan/src/validation_dag_static.rs, which generates the graph,
+// emits "prepare portable" for no step at all. The earlier spelling here named
+// a profile this producer had stopped preparing, so the bracket refused a graph
+// that was correct. Renamed as well as retargeted: a constant whose name says
+// portable while its value says full is the same defect one layer down.
+const NEXTEST_FULL_PREPARE_COMMAND: &str = "./ci/nextest-binaries.rs prepare full";
 const NEXTEST_PRIVILEGED_ASSERT_COMMAND: &str = "./ci/nextest-binaries.rs assert privileged";
 const TESTS_MISC_EXECUTABLE_READ_COMMAND: &str = r#"tests_misc="$(./ci/nextest-binaries.rs executable hermit-detcore tests_misc)" || exit 1"#;
 
@@ -329,7 +337,7 @@ fn prepared_nextest_commands_bracket(workspace: &Step, privileged: &Step) -> Res
         || !privileged_command.contains(NEXTEST_PRIVILEGED_ASSERT_COMMAND)
         || !privileged_command.contains(TESTS_MISC_EXECUTABLE_READ_COMMAND)
         || privileged_command.contains("cargo ")
-        || !workspace_command.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND)
+        || !workspace_command.ends_with(NEXTEST_FULL_PREPARE_COMMAND)
     {
         return Err("full-plan bracket: prepared Nextest population must come from the workspace producer and the privileged barrier must verify it without Cargo compilation".into());
     }
@@ -1854,12 +1862,16 @@ fn self_test_runner_log_probe(logs: &Path, outer: &Path) -> Result<(), String> {
         10, 10, 64 * 1024 * 1024,
     );
     // Real production labels deliberately collide with the seeded outer files.
+    let mut skipped = step("post", "must_not_run", "exit 99");
+    skipped.deps = vec!["setup.manifest_plan".into()];
     let cfg = validate_plan::config_from(vec![
         step("pre", "submodules", "printf 'fixture pass\\n'"),
         step("setup", "manifest_plan", "printf 'fixture failure\\n'; exit 23"),
+        skipped,
     ], "runner log isolation fixture");
     let result = run_lane_once(&cfg, 1, true, 0, None, &logs.join("driver.log"), None, false);
-    if !result.complete || result.ok || result.run_timed_out || !result.skipped.is_empty()
+    if result.complete || result.ok || result.run_timed_out
+        || result.skipped != ["post.must_not_run".to_string()]
         || result.outcomes.len() != 2 || result.attempts.len() != 2
     {
         return Err(format!("runner log isolation: terminal result changed: complete={} ok={} outcomes={:?} skipped={:?}",
@@ -1883,14 +1895,46 @@ fn self_test_runner_log_probe(logs: &Path, outer: &Path) -> Result<(), String> {
         .map(serde_json::from_slice::<serde_json::Value>)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("runner log isolation: malformed private journal: {error}"))?;
-    for (tag, ok) in [("pre.submodules", "true"), ("setup.manifest_plan", "false")] {
+    if dagrun::require_step_end_ok(&serde_json::json!({
+        "event": "step_end",
+        "ok": "false",
+    }))
+    .is_ok()
+    {
+        return Err("runner log isolation: string `false` journal verdict was accepted".into());
+    }
+    let ends = rows.iter().filter(|row| row["event"] == "step_end").collect::<Vec<_>>();
+    let skips = rows.iter().filter(|row| row["event"] == "step_skip").collect::<Vec<_>>();
+    let terminal_steps = ends.iter().chain(&skips)
+        .filter_map(|row| row["step"].as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_terminal_steps = [
+        "pre.submodules",
+        "setup.manifest_plan",
+        "post.must_not_run",
+    ].into_iter().collect::<BTreeSet<_>>();
+    if ends.len() + skips.len() != expected_terminal_steps.len()
+        || terminal_steps != expected_terminal_steps
+    {
+        return Err(format!("runner log isolation: incomplete terminal accounting: {terminal_steps:?}"));
+    }
+    for (tag, ok) in [("pre.submodules", true), ("setup.manifest_plan", false)] {
         let starts = rows.iter().filter(|row| row["event"] == "step_start" && row["step"] == tag).count();
-        let ends = rows.iter().filter(|row| row["event"] == "step_end" && row["step"] == tag).collect::<Vec<_>>();
-        if starts != 1 || ends.len() != 1 || ends[0]["ok"] != ok
-            || ends[0]["timed_out"] != "false" || ends[0]["cpu_timed_out"] != "false"
+        let matching_ends = ends.iter().filter(|row| row["step"] == tag).collect::<Vec<_>>();
+        let observed_ok = matching_ends.first()
+            .ok_or_else(|| format!("runner log isolation: no terminal journal record for {tag}"))
+            .and_then(|row| dagrun::require_step_end_ok(row)
+                .map_err(|error| format!("runner log isolation: {tag}: {error}")))?;
+        if starts != 1 || matching_ends.len() != 1 || observed_ok != ok
+            || matching_ends[0]["timed_out"] != "false" || matching_ends[0]["cpu_timed_out"] != "false"
         {
             return Err(format!("runner log isolation: missing or changed start/end record for {tag}"));
         }
+    }
+    if skips.len() != 1 || skips[0]["step"] != "post.must_not_run"
+        || skips[0]["reason"] != "dependency_failed"
+    {
+        return Err(format!("runner log isolation: missing or changed skip record: {skips:?}"));
     }
     for name in ["journal.jsonl", "pre.submodules.log", "setup.manifest_plan.log"] {
         if read(&outer.join(name))? != RUNNER_LOG_SENTINEL {
@@ -2116,6 +2160,7 @@ fn self_test() -> Result<(), String> {
             filtered_tests: None,
             test_results: None,
             test_results_error: None,
+            test_results_error_kind: None,
             returncode: Some(if ok { 0 } else { 1 }),
             oomed: false,
             oom_kills: 0,
@@ -3442,15 +3487,15 @@ cleared-caps refusal names {} starved step(s)",
                     .into(),
             );
         }
-        let portable_build = full
+        let workspace_build = full
             .cfg
             .steps
             .iter()
             .find(|s| s.tag() == "build.workspace")
-            .ok_or("full-plan bracket: portable fat build disappeared")?;
-        if !portable_build.cmd.contains("cargo build --workspace --all-targets")
-            || !portable_build.cmd.contains("cargo build -p hermit")
-            || !portable_build.cmd.contains("--bin hermit")
+            .ok_or("full-plan bracket: workspace fat build disappeared")?;
+        if !workspace_build.cmd.contains("cargo build --workspace --all-targets")
+            || !workspace_build.cmd.contains("cargo build -p hermit")
+            || !workspace_build.cmd.contains("--bin hermit")
         {
             return Err("full-plan bracket: fat build does not finish the debug Hermit producer".into());
         }
@@ -3594,11 +3639,23 @@ cleared-caps refusal names {} starved step(s)",
             .find(|s| s.tag() == "privileged-build.privileged_tests")
             .ok_or("full-plan bracket: privileged focused build disappeared")?;
         privileged_artifact_barriers(privileged_build)?;
-        prepared_nextest_commands_bracket(portable_build, privileged_build)?;
-        let prepared = hermit_manifest_plan::nextest_binaries::profile_selections(&root, "portable")?;
+        prepared_nextest_commands_bracket(workspace_build, privileged_build)?;
+        // Ask about the profile the producer ACTUALLY prepares. build.workspace
+        // prepares "full" (see NEXTEST_FULL_PREPARE_COMMAND), so asking whether
+        // "portable" covers the privileged selections tested a set nobody
+        // prepares. MEASURED on the committed graph: portable holds 15
+        // selections, full 16, privileged 3; portable omits exactly one
+        // privileged selection and full omits none. The one it omits is
+        // privileged-only-test.cli_kvm's
+        // ["-p","hermit","--features","third-party-backends,kvm-execution-tests","--lib","--test","cli"],
+        // which the same commit created when it gave that node the
+        // kvm-execution-tests feature. The requirement is unchanged -- every
+        // privileged selection must already be prepared -- only the set it is
+        // asked of is now the one that exists.
+        let prepared = hermit_manifest_plan::nextest_binaries::profile_selections(&root, "full")?;
         for required in hermit_manifest_plan::nextest_binaries::profile_selections(&root, "privileged")?.keys() {
             if !prepared.contains_key(required) {
-                return Err(format!("full-plan bracket: portable preparation omits privileged Cargo selection {required}"));
+                return Err(format!("full-plan bracket: full preparation omits privileged Cargo selection {required}"));
             }
         }
         if ["test.cli", "test.hermit_modes"]
@@ -5676,13 +5733,84 @@ fn local_scorecard_writeback(
             .arg("--results")
             .arg(result_root)
             .current_dir(root)
-            .status()
+            .output()
             .map_err(|error| format!("cannot run {}: {error}", script.display()))
-            .and_then(|status| {
-                status.success().then_some(()).ok_or_else(|| {
-                    format!("{} observe-results refused with {status}", script.display())
-                })
+            .and_then(|output| {
+                // The child's streams used to be INHERITED, which is the only
+                // reason its explanation ever reached the run log. Capturing
+                // them must not take that away, so re-emit verbatim before
+                // deciding anything.
+                let _ = std::io::stdout().write_all(&output.stdout);
+                let _ = std::io::stderr().write_all(&output.stderr);
+                if output.status.success() {
+                    return Ok(());
+                }
+                Err(format!(
+                    "{} observe-results refused with {}: {}",
+                    script.display(),
+                    output.status,
+                    refusal_detail(&output.stderr, &output.stdout),
+                ))
             }),
+    )
+}
+
+/// The largest child explanation carried into the durable record.
+///
+/// Sized from measurement rather than taste: the refusal that stranded seven
+/// hours of validation on 2026-09-17 was a SINGLE 407-byte line. This is an
+/// order of magnitude above that, which is room for a multi-line refusal and
+/// still bounded, because the value lands in an append-only run handle.
+const REFUSAL_DETAIL_MAX_BYTES: usize = 4096;
+
+/// The child's own words, bounded, for a record that otherwise keeps only a
+/// number.
+///
+/// ⚠️ THE EXIT STATUS ALONE IS NOT A CAUSE, and recording only the status is
+/// what cost a day: a scorecard write-back refused with `exit status: 2`, the
+/// run handle kept exactly that, and a reader could not tell a data refusal
+/// from a usage error. The explanation existed the whole time, in a log nobody
+/// joins to the handle.
+///
+/// Truncation is STATED with the true byte count. A silently shortened cause is
+/// the same defect one size smaller, and the tail is kept rather than the head
+/// because a refusal is what a tool says last.
+fn refusal_detail(stderr: &[u8], stdout: &[u8]) -> String {
+    let collapse = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    // stderr first, because that is where a refusal belongs; stdout is the
+    // fallback for a tool that explains itself on the wrong stream rather than
+    // not at all.
+    let (stream, text) = match collapse(stderr) {
+        message if !message.is_empty() => ("stderr", message),
+        _ => ("stdout", collapse(stdout)),
+    };
+    if text.is_empty() {
+        // Not a cosmetic case. A tool that refuses and says nothing is a
+        // finding, and the record has to be able to report that rather than
+        // leave the field looking merely unset.
+        return "the tool refused without writing any explanation".into();
+    }
+    if text.len() <= REFUSAL_DETAIL_MAX_BYTES {
+        return format!("{stream}: {text}");
+    }
+    // The furthest-back byte offset that still fits, rounded UP to a character
+    // boundary. Walking back from the end instead returns the NEAREST offset
+    // that fits, which is a one-character tail -- the test caught exactly that,
+    // and a truncation that silently keeps the wrong end is the defect this
+    // function exists to remove, one size smaller.
+    let tail = (text.len() - REFUSAL_DETAIL_MAX_BYTES..text.len())
+        .find(|index| text.is_char_boundary(*index))
+        .unwrap_or(text.len());
+    format!(
+        "{stream} (last {} of {} bytes): {}",
+        text.len() - tail,
+        text.len(),
+        &text[tail..]
     )
 }
 
@@ -9187,6 +9315,207 @@ fn compat_fixture_operand_bracket(root: &Path, committed: &[&Step]) -> Result<St
     Ok("compat fixture operand: constructed + committed chown/install preserve clean guest environment, literal paths, owner/mode/size; old expansion and missing fixture fail".into())
 }
 
+/// A digest of empty input is a successful hash operation, not proof that its
+/// compressor succeeded. Run the actual generated guest argv under Minimal's
+/// cleared environment and compare against independently compressed real input.
+fn compat_compression_fixture_bracket(root: &Path, committed: &[&Step]) -> Result<String, String> {
+    use std::os::unix::process::CommandExt;
+
+    let fixture = tempfile::Builder::new()
+        .prefix("validate-compression-operand-")
+        .tempdir()
+        .map_err(|error| format!("compression fixture: create tempdir: {error}"))?;
+    let run_state = fixture.path().join("run state ' \" \\ $missing `false`");
+    let fixtures = run_state.join("strict-compat/real-compat-fixtures");
+    let failed_producers = fixture.path().join("failed-producers");
+    for path in [&fixtures, &failed_producers] {
+        std::fs::create_dir_all(path)
+            .map_err(|error| format!("compression fixture: create directory: {error}"))?;
+    }
+    let readme = fixtures.join("README.md");
+    let input = std::fs::read(root.join("README.md"))
+        .map_err(|error| format!("compression fixture: read real README: {error}"))?;
+    if input.is_empty() {
+        return Err("compression fixture: the positive input is empty".into());
+    }
+    std::fs::write(&readme, &input)
+        .map_err(|error| format!("compression fixture: write README: {error}"))?;
+    let root_text = root.to_string_lossy();
+    let fixtures_text = fixtures.to_string_lossy();
+    let tmp_text = fixture.path().to_string_lossy();
+    let paths = validate_corpus::CorpusPaths {
+        root_dir: &root_text,
+        real_compat_fixtures: &fixtures_text,
+        validation_tmp_dir: &tmp_text,
+        shell_build_dir: &tmp_text,
+    };
+    let compressors: [(&str, &[&str]); 4] = [
+        ("bzip2", &["-c"]),
+        ("gzip", &["-cn"]),
+        ("xz", &["-c"]),
+        ("zstd", &["-q", "-c"]),
+    ];
+    let only = compressors
+        .iter()
+        .map(|(label, _)| (*label).to_string())
+        .collect();
+    let constructed = validate_plan::compat_nodes_for(
+        root,
+        validate_plan::CompatMode::PortableStrict,
+        "fixture-hermit",
+        "unused",
+        &paths,
+        None,
+        Some(&only),
+        None,
+    )?;
+    let mut commands = Vec::new();
+    let empty_digest = format!("{:x}  -\n", Sha256::digest([]));
+    for (label, flags) in compressors {
+        let direct = Command::new(label)
+            .args(flags)
+            .arg(&readme)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .map_err(|error| format!("compression fixture: launch {label}: {error}"))?;
+        if !direct.status.success() || direct.stdout.is_empty() || !direct.stderr.is_empty() {
+            return Err(format!(
+                "compression fixture: real {label} control failed: {direct:?}"
+            ));
+        }
+        let expected = format!("{:x}  -\n", Sha256::digest(&direct.stdout));
+        // Retain the precise old false-pass mechanism as a negative control:
+        // the absent guest variable loses its prefix and sha256sum masks rc 1.
+        let old = Command::new("bash")
+            .args(["-c", &format!(
+                "{label} {} $VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md | sha256sum",
+                flags.join(" ")
+            )])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .map_err(|error| format!("compression fixture: old {label}: {error}"))?;
+        if !old.status.success() || old.stdout != empty_digest.as_bytes() || old.stderr.is_empty() {
+            return Err(format!(
+                "compression fixture: old {label} no longer reproduces the false pass: {old:?}"
+            ));
+        }
+        let stub = failed_producers.join(label);
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nprintf 'partial producer output\\n'\nexit 23\n",
+        )
+        .and_then(|()| std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)))
+        .map_err(|error| format!("compression fixture: failing producer: {error}"))?;
+        for (kind, nodes) in [
+            ("constructed", constructed.iter().collect::<Vec<_>>()),
+            ("committed", committed.to_vec()),
+        ] {
+            let node = nodes
+                .iter()
+                .find(|node| node.job == label)
+                .ok_or_else(|| format!("compression fixture: missing {kind} {label}"))?;
+            let (_, guest) = node.cmd.split_once(" -- ").ok_or_else(|| {
+                format!("compression fixture: missing guest boundary: {}", node.cmd)
+            })?;
+            // Observe actual outer-shell expansion, not substring presence in
+            // the whole command. A literal/comment mentioning a variable is not
+            // an environment dependency; a path hidden inside bash -c is not an
+            // expanded operand. NUL framing preserves spaces and metacharacters.
+            let expanded = Command::new("bash")
+                .args(["-eu", "-c", &format!("printf '%s\\0' {guest}")])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("VALIDATE_RUN_STATE", &run_state)
+                .output()
+                .map_err(|error| format!("compression fixture: expand {kind} {label}: {error}"))?;
+            let argv = expanded
+                .stdout
+                .strip_suffix(&[0])
+                .ok_or_else(|| {
+                    format!("compression fixture: {kind} {label} has no final argv delimiter")
+                })?
+                .split(|byte| *byte == 0)
+                .map(|bytes| std::ffi::OsString::from(OsStr::from_bytes(bytes)))
+                .collect::<Vec<_>>();
+            if !expanded.status.success()
+                || !expanded.stderr.is_empty()
+                || argv.len() != 5
+                || argv[0] != "bash"
+                || argv[1] != "-c"
+                || argv[4] != readme.as_os_str()
+            {
+                return Err(format!(
+                    "compression fixture: {kind} {label} did not pass the actual fixture at the guest argv boundary: {expanded:?}"
+                ));
+            }
+            commands.push((kind, label, argv, expected.clone()));
+        }
+    }
+    let run = |argv: &[std::ffi::OsString], failed: bool, unreadable: bool| {
+        let path = if failed {
+            format!("{}:/usr/bin:/bin", failed_producers.display())
+        } else {
+            "/usr/bin:/bin".into()
+        };
+        let mut command = Command::new("/bin/bash");
+        command
+            .args(&argv[1..])
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", "/root")
+            .env("TMPDIR", fixture.path())
+            .current_dir("/");
+        // Root can read mode-000 files. A privileged self-test must exercise
+        // genuine denied access too, rather than skip or falsely pass this case.
+        if unreadable && unsafe { libc::geteuid() } == 0 {
+            command.gid(65534).uid(65534);
+        }
+        command
+            .output()
+            .map_err(|error| format!("compression fixture: launch guest: {error}"))
+    };
+    for (kind, label, argv, expected) in &commands {
+        let output = run(argv, false, false)?;
+        if !output.status.success()
+            || output.stdout != expected.as_bytes()
+            || !output.stderr.is_empty()
+        {
+            return Err(format!(
+                "compression fixture: {kind} {label} did not hash real compression: {output:?}, expected {expected:?}"
+            ));
+        }
+        let output = run(argv, true, false)?;
+        if output.status.code() != Some(23) {
+            return Err(format!(
+                "compression fixture: {kind} {label} hid a failed producer behind sha256sum: {output:?}"
+            ));
+        }
+    }
+    std::fs::set_permissions(&readme, std::fs::Permissions::from_mode(0o000))
+        .map_err(|error| format!("compression fixture: make unreadable: {error}"))?;
+    for (kind, label, argv, _) in &commands {
+        let output = run(argv, false, true)?;
+        if output.status.success() || output.stderr.is_empty() {
+            return Err(format!(
+                "compression fixture: {kind} {label} passed unreadable input: {output:?}"
+            ));
+        }
+    }
+    std::fs::remove_file(&readme)
+        .map_err(|error| format!("compression fixture: remove negative input: {error}"))?;
+    for (kind, label, argv, _) in &commands {
+        let output = run(argv, false, false)?;
+        if output.status.success() || output.stderr.is_empty() {
+            return Err(format!(
+                "compression fixture: {kind} {label} passed missing input: {output:?}"
+            ));
+        }
+    }
+    Ok("compression fixture: 4 old false passes reproduced; 8 constructed/committed argv preserve real input; 24 failed-producer/unreadable/missing cases fail".into())
+}
+
 /// Exercise committed strict-compatibility nodes through the real outer
 /// scheduler without running the corpus.
 ///
@@ -9273,6 +9602,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         );
     }
     println!("  {}", compat_fixture_operand_bracket(root, &probes)?);
+    println!("  {}", compat_compression_fixture_bracket(root, &probes)?);
     let fixture_readme = "$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures/README.md";
     let readme_labels = probes
         .iter()
@@ -10068,6 +10398,7 @@ fn summary_listing_bracket() -> Result<String, String> {
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,
@@ -11556,6 +11887,8 @@ struct NodeAttempt {
     test_results: Option<Vec<dagrun::TestResult>>,
     /// Required-result refusal retained independently of the outer failure reason.
     test_results_error: Option<String>,
+    /// Typed result-import observation; absent historical kinds stay unknown.
+    test_results_error_kind: Option<dagrun::TestResultsErrorKind>,
 }
 
 fn attempt_is_no_result(attempt: &NodeAttempt) -> bool {
@@ -11649,6 +11982,7 @@ fn reported_attempt(outcome: &StepOutcome, attempt: usize) -> NodeAttempt {
         failure_class,
         test_results: outcome.test_results.clone(),
         test_results_error: outcome.test_results_error.clone(),
+        test_results_error_kind: outcome.test_results_error_kind,
     }
 }
 
@@ -11679,6 +12013,7 @@ fn unreported_attempt(tag: String, attempt: usize) -> NodeAttempt {
         failure_detail: Some("no completion payload was reported for this node".into()),
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
     }
 }
 
@@ -13385,7 +13720,14 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .ok_or("retry bounds: privileged lane is absent")?;
     for (tag, expected) in [
         ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
-        ("privileged-only-test.cli_kvm", 24usize),
+        // 25, not 24, since hermit de6a9910e "Align KVM validation selections with
+        // measured inventories" added the kvm-native-test-support feature. That
+        // commit measured 694/698/25 and retained all 689/681/24 prior identities,
+        // so this is one ADDED selection rather than a changed one. It bumped
+        // ci/dag/validate.json and left this table behind, which is what made
+        // gate.manifest fail deterministically -- the guard was right and the
+        // copy was stale.
+        ("privileged-only-test.cli_kvm", 25usize),
     ] {
         let step = privileged
             .steps
@@ -16336,6 +16678,7 @@ fn test_node_coverage_bracket() -> Result<(), String> {
         filtered_tests: Some(0),
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -16390,6 +16733,7 @@ fn typed_libtest_count_bracket() -> Result<(), String> {
         filtered_tests,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 100 }),
         oomed: false,
         oom_kills: 0,
@@ -16581,6 +16925,9 @@ fn ledger_gate(outcome: &StepOutcome) -> serde_json::Value {
     if let Some(error) = &outcome.test_results_error {
         gate["test_results_error"] = serde_json::json!(error);
     }
+    if let Some(kind) = outcome.test_results_error_kind {
+        gate["test_results_error_kind"] = serde_json::json!(kind.value());
+    }
     if let Some(failure_class) = outcome_failure_class(outcome) {
         gate["failure_class"] = serde_json::json!(failure_class);
         if failure_class == FailureClass::NoResult && !outcome.reason.is_empty() {
@@ -16642,6 +16989,9 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
             if let Some(error) = &a.test_results_error {
                 attempt["test_results_error"] = serde_json::json!(error);
             }
+            if let Some(kind) = a.test_results_error_kind {
+                attempt["test_results_error_kind"] = serde_json::json!(kind.value());
+            }
             if let Some(failure_class) = a.failure_class {
                 attempt["failure_class"] = serde_json::json!(failure_class);
             }
@@ -16675,6 +17025,13 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
             gate.as_object_mut()
                 .expect("ledger gate must remain a JSON object")
                 .remove("test_results_error");
+        }
+        if let Some(kind) = attempt.test_results_error_kind {
+            gate["test_results_error_kind"] = serde_json::json!(kind.value());
+        } else {
+            gate.as_object_mut()
+                .expect("ledger gate must remain a JSON object")
+                .remove("test_results_error_kind");
         }
         gate["aborted"] = serde_json::json!(attempt.aborted);
         gate["real_seconds"] = serde_json::json!(attempt.reported.then_some(attempt.duration_s));
@@ -16767,13 +17124,25 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
         );
         if bits & 8 != 0 {
             outcome.test_results_error = Some(format!("typed results refused in fixture {bits}"));
+            outcome.test_results_error_kind = Some(
+                [
+                    dagrun::TestResultsErrorKind::Missing,
+                    dagrun::TestResultsErrorKind::ReadIo,
+                    dagrun::TestResultsErrorKind::InvalidReport,
+                ][usize::from(bits) % 3],
+            );
         }
         let expected_error = outcome
             .test_results_error
             .as_ref()
             .map(|error| serde_json::json!(error));
+        let expected_kind = outcome
+            .test_results_error_kind
+            .map(|kind| serde_json::json!(kind.value()));
         let first = reported_attempt(&outcome, 1);
-        if first.test_results_error != outcome.test_results_error || first.reason != outcome.reason
+        if first.test_results_error != outcome.test_results_error
+            || first.test_results_error_kind != outcome.test_results_error_kind
+            || first.reason != outcome.reason
         {
             return Err(format!(
                 "typed gate {bits}: attempt conflated primary and result refusal"
@@ -16796,6 +17165,7 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
         }
         for row in [&fallback, &reported, &reported["attempts"][0]] {
             if row.get("test_results_error") != expected_error.as_ref()
+                || row.get("test_results_error_kind") != expected_kind.as_ref()
                 || row["reason"] != serde_json::json!(outcome.reason)
             {
                 return Err(format!(
@@ -16832,6 +17202,9 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
             if row.get("test_results_error").is_some()
                 || row["attempts"][1].get("test_results_error").is_some()
                 || row["attempts"][0].get("test_results_error") != expected_error.as_ref()
+                || row.get("test_results_error_kind").is_some()
+                || row["attempts"][1].get("test_results_error_kind").is_some()
+                || row["attempts"][0].get("test_results_error_kind") != expected_kind.as_ref()
             {
                 return Err(format!(
                     "typed gate {bits}: absent latest diagnostic inherited stale data: {row}"
@@ -16853,6 +17226,7 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
         let mut retry = outcome.clone();
         retry.reason = format!("independent outer retry reason {bits}");
         retry.test_results_error = Some(format!("distinct result refusal on retry {bits}"));
+        retry.test_results_error_kind = Some(dagrun::TestResultsErrorKind::ReadIo);
         let mut foreign = retry.clone();
         foreign.tag = "test.unrelated-diagnostic".into();
         foreign.test_results_error =
@@ -16870,6 +17244,9 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
             || retained["attempts"][0].get("test_results_error") != expected_error.as_ref()
             || retained["attempts"][1].get("test_results_error") != Some(&retry_error)
             || retained.get("test_results_error") != Some(&retry_error)
+            || retained["test_results_error_kind"] != "read_io"
+            || retained["attempts"][1]["test_results_error_kind"] != "read_io"
+            || retained["attempts"][0].get("test_results_error_kind") != expected_kind.as_ref()
             || retained["reason"] != serde_json::json!(retry.reason)
             || retained["attempts"][0]["reason"] != serde_json::json!(outcome.reason)
         {
@@ -16885,7 +17262,11 @@ fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
                     .map_err(|error| format!("typed gate reader refused emitted row: {error}"))?;
             let restored = serde_json::to_value(parsed)
                 .map_err(|error| format!("typed gate reader could not serialize row: {error}"))?;
-            for field in fields.into_iter().chain(["attempts", "test_results_error"]) {
+            for field in fields.into_iter().chain([
+                "attempts",
+                "test_results_error",
+                "test_results_error_kind",
+            ]) {
                 if row.get(field) != restored.get(field) {
                     return Err(format!(
                         "typed gate shared reader lost {field}: before={row} after={restored}"
@@ -16908,6 +17289,7 @@ fn ledger_gate_origin_bracket() -> Result<(), String> {
         filtered_tests: Some(0),
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(1),
         oomed: false,
         oom_kills: 0,
@@ -17862,6 +18244,7 @@ fn possible_missing_artifact_bracket() -> Result<(), String> {
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode,
         oomed: false,
         oom_kills: 0,
@@ -17902,6 +18285,7 @@ fn no_result_propagation_bracket() -> Result<(), String> {
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(returncode),
         oomed: false,
         oom_kills: 0,
@@ -21991,6 +22375,7 @@ fn stop_test_seam(
         filtered_tests: None,
         test_results: None,
         test_results_error: None,
+        test_results_error_kind: None,
         returncode: Some(if ok { 0 } else { 1 }),
         oomed: false,
         oom_kills: 0,
@@ -22536,8 +22921,8 @@ mod fused_privileged_build_tests {
         let repository = Path::new(file!()).parent().and_then(Path::parent).unwrap();
         let committed = validate_plan::validation_config(repository).unwrap();
         let workspace = committed.steps.iter().find(|step| step.tag() == "build.workspace").unwrap();
-        assert!(workspace.cmd.ends_with(NEXTEST_PORTABLE_PREPARE_COMMAND));
-        let preparation = &workspace.cmd[workspace.cmd.len() - NEXTEST_PORTABLE_PREPARE_COMMAND.len()..];
+        assert!(workspace.cmd.ends_with(NEXTEST_FULL_PREPARE_COMMAND));
+        let preparation = &workspace.cmd[workspace.cmd.len() - NEXTEST_FULL_PREPARE_COMMAND.len()..];
         let mut consumer = committed.steps.iter().find(|step| step.tag() == "privileged-build.privileged_tests").unwrap().clone();
         // This fixture supplies a fake Cargo executable and an empty target.
         // Preserve its full cold/prepared contract against the exact authored
@@ -22572,7 +22957,14 @@ mod fused_privileged_build_tests {
         let prepared = run_build(preparation, root.path(), &bin, &log, "current");
         assert!(prepared.status.success(), "{}", String::from_utf8_lossy(&prepared.stderr));
         let before = std::fs::read_to_string(&log).unwrap();
-        let expected = hermit_manifest_plan::nextest_binaries::profile_selections(repository, "portable").unwrap();
+        // The FULL profile, because `preparation` above is the full plan's own
+        // producer (NEXTEST_FULL_PREPARE_COMMAND) run against a fixture holding
+        // the real ci/dag/validate.json. Asking for "portable" compared this
+        // producer's output against a set it does not prepare: 16 observed
+        // builds against 15 expected. That is not a widening -- the loop below
+        // requires every expected selection to appear exactly once, so this
+        // now checks 16 selections where it checked 15.
+        let expected = hermit_manifest_plan::nextest_binaries::profile_selections(repository, "full").unwrap();
         let calls = before.lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
         let builds = calls.iter().filter(|args| args.first().map(String::as_str) == Some("nextest") && !args.iter().any(|arg| arg == "--binaries-metadata")).collect::<Vec<_>>();
         assert_eq!(builds.len(), expected.len(), "each distinct selection is prepared once");
@@ -23159,8 +23551,8 @@ mod prepared_command_tests {
         let payload = guarded_command_source(&pinned.tag(), &pinned.cmd).unwrap();
         let changed = outer_decoy(
             pinned,
-            &payload.replacen(NEXTEST_PORTABLE_PREPARE_COMMAND, "missing-preparation", 1),
-            NEXTEST_PORTABLE_PREPARE_COMMAND,
+            &payload.replacen(NEXTEST_FULL_PREPARE_COMMAND, "missing-preparation", 1),
+            NEXTEST_FULL_PREPARE_COMMAND,
         );
         assert!(prepared_nextest_commands_bracket(&changed, barrier).is_err());
 
@@ -23454,5 +23846,144 @@ mod submodule_service_tests {
         assert!(stdout.contains("1 passed; 0 failed;"), "{stdout}{stderr}");
         assert_eq!(std::fs::read(outer.join("sentinel")).unwrap(), SENTINEL);
         assert_eq!(std::fs::read_dir(&outer).unwrap().count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod refusal_detail_tests {
+    use super::*;
+
+    /// The real refusal that stranded seven hours of validation on 2026-09-17,
+    /// taken verbatim from run 1838's log rather than invented, so the bound
+    /// and the shape are sized against the thing they exist for.
+    const REAL: &str = include_str!("../tests/fixtures/scorecard-writeback/refusal.txt");
+
+    #[test]
+    fn the_real_refusal_survives_into_the_record_and_names_its_cell() {
+        let detail = refusal_detail(REAL.as_bytes(), b"");
+        assert!(detail.starts_with("stderr: "), "{detail}");
+        // The two facts a reader needs in order to act, and neither survives in
+        // an exit status: WHICH cell disagreed and WHAT kind of disagreement.
+        assert!(
+            detail.contains("backend-parity-c/aio-refusal/verify@kvm"),
+            "{detail}",
+        );
+        assert!(
+            detail.contains("parity history changes candidate identity"),
+            "{detail}",
+        );
+        // Well under the bound, so this case is carried whole.
+        assert!(!detail.contains("last "), "{detail}");
+        assert!(
+            REAL.len() < REFUSAL_DETAIL_MAX_BYTES,
+            "{} bytes",
+            REAL.len(),
+        );
+    }
+
+    #[test]
+    fn stdout_is_the_fallback_and_the_stream_is_named() {
+        // A tool that explains itself on the wrong stream is still explaining
+        // itself; losing that because it picked stdout would be the same defect.
+        let detail = refusal_detail(b"   \n\t ", b"refused: nothing to observe");
+        assert_eq!(detail, "stdout: refused: nothing to observe");
+        assert_eq!(
+            refusal_detail(b"on stderr", b"on stdout"),
+            "stderr: on stderr",
+            "stderr must win when both are present"
+        );
+    }
+
+    /// A tool that refuses and says nothing is a FINDING, not an empty field.
+    #[test]
+    fn a_silent_refusal_says_so_rather_than_leaving_the_field_looking_unset() {
+        let detail = refusal_detail(b"", b"");
+        assert_eq!(detail, "the tool refused without writing any explanation");
+        assert!(!detail.is_empty());
+        // Whitespace-only output is silence too.
+        assert_eq!(refusal_detail(b"\n \t\n", b"  "), detail);
+    }
+
+    #[test]
+    fn truncation_is_stated_with_the_true_size_and_keeps_the_tail() {
+        // The refusal is what a tool says LAST, so a head-truncated record
+        // would drop exactly the part worth keeping.
+        let noise = "x".repeat(REFUSAL_DETAIL_MAX_BYTES * 2);
+        let long = format!("{noise} THE-ACTUAL-CAUSE");
+        let detail = refusal_detail(long.as_bytes(), b"");
+        assert!(detail.contains("THE-ACTUAL-CAUSE"), "the tail was dropped");
+        assert!(
+            detail.contains(&format!("of {} bytes", long.len())),
+            "truncation must state the TRUE size: {}",
+            &detail[..detail.len().min(120)]
+        );
+        assert!(detail.starts_with("stderr (last "), "{}", &detail[..60]);
+        // Bounded, with room for the framing.
+        assert!(
+            detail.len() < REFUSAL_DETAIL_MAX_BYTES + 100,
+            "{}",
+            detail.len(),
+        );
+    }
+
+    /// ⚠️ THE CALL-SITE TEST, AND IT IS THE ONE THAT MATTERS.
+    ///
+    /// Every test above exercises `refusal_detail` directly. I removed the
+    /// `refusal_detail(...)` argument from `local_scorecard_writeback` as a
+    /// control and ALL FIVE STILL PASSED -- a helper proven correct and proven
+    /// nothing about whether it is wired in. That is the third time in one day
+    /// this shape has bitten, so this test runs the real function against a
+    /// real refusing child.
+    #[test]
+    fn the_writeback_error_carries_the_child_message_and_not_only_its_status() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("a temp root");
+        let script = root.path().join("ci/compat-envelope/scorecard.rs");
+        std::fs::create_dir_all(script.parent().expect("a parent")).expect("the tool dir");
+        // A stand-in for the real tool: refuses, and says why on stderr, which
+        // is exactly the shape that stranded seven hours of validation.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'parity history changes candidate identity for CELL-X' >&2\nexit 2\n",
+        )
+        .expect("write the stand-in tool");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make it executable");
+
+        let error = local_scorecard_writeback(root.path(), root.path(), false, false)
+            .expect("the writeback runs when not nested and on the record")
+            .expect_err("a refusing tool must produce an error");
+
+        // The status is still there...
+        assert!(error.contains("exit status: 2"), "{error}");
+        // ...and so is the cause, which is the whole point.
+        assert!(
+            error.contains("parity history changes candidate identity for CELL-X"),
+            "the child's explanation was dropped: {error}"
+        );
+
+        // Control in the other direction: a tool that succeeds produces no
+        // error at all, so the assertions above are not passing because every
+        // path errors.
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("rewrite the tool");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make it executable");
+        local_scorecard_writeback(root.path(), root.path(), false, false)
+            .expect("still runs")
+            .expect("a succeeding tool must not error");
+
+        // And the gate is still a gate: nested or off-the-record runs do not
+        // invoke the tool at all.
+        assert!(local_scorecard_writeback(root.path(), root.path(), true, false).is_none());
+        assert!(local_scorecard_writeback(root.path(), root.path(), false, true).is_none());
+    }
+
+    #[test]
+    fn newlines_are_collapsed_so_one_refusal_stays_one_record_line() {
+        assert_eq!(
+            refusal_detail(b"first line\n\n  second   line \n", b""),
+            "stderr: first line second line"
+        );
     }
 }
