@@ -145,7 +145,11 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	python3 ./scripts/test_check_outcome_adapter_authority.py
 	./scripts/test-authority-obtained-once.sh
 	bash ./tests/compat/real_compat_workload.sh --self-test-localhost-port
-	python3 ./scripts/test_validate_stop_paths.py
+	@if [ -n "$${GITHUB_ACTIONS:-}" ]; then \
+		echo 'HOST-INAPPLICABLE: test_validate_stop_paths.py needs the private parent ledger writer; hosted CI cannot exercise its successful canonical-write arm'; \
+	else \
+		python3 ./scripts/test_validate_stop_paths.py; \
+	fi
 	./scripts/check-merge-gate-policy.sh
 	./scripts/test-configure-merge-gate-ruleset.sh
 	python3 ./scripts/test_pr_status.py
