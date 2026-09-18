@@ -1203,7 +1203,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         timeout: 1200,
         cpu_timeout: 7200,
         jobs_flag: Some(r########""########),
-        jobs_env: None,
+        jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
     },
     StaticStepSpec {
         group: r########"build"########,
@@ -1236,7 +1236,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         timeout: 1200,
         cpu_timeout: 7200,
         jobs_flag: Some(r########""########),
-        jobs_env: None,
+        jobs_env: Some(r########"CARGO_BUILD_JOBS"########),
     },
     StaticStepSpec {
         group: r########"build"########,
