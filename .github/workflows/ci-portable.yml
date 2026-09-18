@@ -1062,8 +1062,14 @@ jobs:
           retention-days: 14
 
   # ------------------------------------------------------------- e2e steps
+  # Hosted E2E is an independent diagnostic, not the landing authority. The
+  # constructed step may report product differences without making Actions a
+  # second landing gate, but every shard must still finish far enough to
+  # publish a complete, SHA-bound result stream. The reducer below enforces
+  # that infrastructure/evidence boundary before tolerating the product
+  # verdict. Local `scripts/validate.rs full` remains blocking and canonical.
   e2e:
-    name: "e2e step: ${{ matrix.slug }}"
+    name: "e2e diagnostic: ${{ matrix.slug }}"
     needs: [select, build-debug, build-complete]
     if: needs.select.outputs.run_e2e != 'false'
     runs-on: ubuntu-latest
@@ -1131,10 +1137,16 @@ jobs:
           test -x target/debug/hermit
           test -x target/release/hermit
           ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
-      - name: Run constructed step (${{ matrix.node }})
+      - name: Run constructed E2E diagnostic (${{ matrix.node }})
+        id: product_diagnostic
+        continue-on-error: true
         env:
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
         run: ./ci/run-hosted-node.sh portable "${{ matrix.node }}"
+      - name: Report non-gating E2E product differences
+        if: always() && steps.product_diagnostic.outcome == 'failure'
+        run: |
+          echo "::warning::${{ matrix.node }} reported product differences. The exact results are transported below; local validate remains the blocking authority."
       - name: Pack deterministic parity transport archive
         if: always()
         env:
@@ -1315,6 +1327,7 @@ jobs:
         if: needs.select.outputs.run_e2e != 'false'
         env:
           EXPECTED: ${{ needs.build-debug.outputs.e2e_count }}
+          EXPECTED_CELLS: ${{ needs.plan.outputs.selected_cell_count }}
         run: |
           set -euo pipefail
           actual=$(find ignored/transport -maxdepth 1 -name '*.tar.zst' -type f | wc -l)
@@ -1336,7 +1349,12 @@ jobs:
             tar --zstd -xf "$archive" -C "ignored/reduced/expanded/$slug"
             stage="ignored/reduced/expanded/$slug/parity-v1"
             test -f "$stage/complete"
-            step=$(jq -er '.step | select(startswith("e2e.manifest_"))' "$stage/index.json")
+            step=$(jq -er \
+              --arg sha "$GITHUB_SHA" \
+              --arg run_key "${{ github.run_id }}-${{ github.run_attempt }}" \
+              'select(.schema == 1 and .repository_sha == $sha and .run_key == $run_key
+                and .lane == "portable") | .step | select(startswith("e2e.manifest_"))' \
+              "$stage/index.json")
             job=${step#e2e.}
             mkdir -p "ignored/reduced/results/portable/$job"
             cp "$stage/results.jsonl" "ignored/reduced/results/portable/$job/results.jsonl"
@@ -1345,6 +1363,25 @@ jobs:
 
           find ignored/reduced/expanded -path '*/parity-v1/results.jsonl' -type f -print0 |
             sort -z | xargs -0 cat > ignored/reduced/results.jsonl
+          [[ "$EXPECTED_CELLS" =~ ^[0-9]+$ ]]
+          jq -se --arg sha "$GITHUB_SHA" '
+            all(.[];
+              .schema == 4
+              and .hermit_sha == $sha
+              and .lane == "portable"
+              and .source_tree_dirty == false)
+          ' ignored/reduced/results.jsonl >/dev/null
+          jq -S --argjson expected "$EXPECTED_CELLS" '
+            [.cells[] | select(.lane == "portable")
+              | [.lane, .category, .test, .mode, .backend]]
+            | select(length == $expected) | sort
+          ' ci/expected-e2e-plan.json > ignored/reduced/expected-identities.json
+          jq -sS '[.[] | [.lane, .category, .test, .mode, .backend]] | unique | sort' \
+            ignored/reduced/results.jsonl > ignored/reduced/actual-identities.json
+          cmp -s ignored/reduced/expected-identities.json ignored/reduced/actual-identities.json || {
+            diff -u ignored/reduced/expected-identities.json ignored/reduced/actual-identities.json
+            exit 1
+          }
           jq -s '{schema:1, cells:length,
             passed:(map(select(.outcome=="PASS"))|length),
             failed:(map(select(.outcome=="FAIL"))|length),
@@ -1355,13 +1392,26 @@ jobs:
             cp "$junit" "ignored/reduced/$slug.junit.xml"
           done < <(find ignored/reduced/expanded -path '*/parity-v1/junit.xml' \
             -type f -print0 | sort -z)
-      - name: Run constructed final result step
+      - name: Run non-gating constructed E2E verdict
+        id: product_verdict
+        continue-on-error: true
         if: needs.select.outputs.run_e2e != 'false'
         env:
           E2E_RESULT_ROOT: ${{ github.workspace }}/ignored/reduced/results
           RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
           RUSTFLAGS: ""
         run: ./ci/run-node.sh portable "$(jq -r '.final_nodes|join(",")' ci/portable-shards.json)"
+      - name: Report non-gating aggregate E2E differences
+        if: always() && steps.product_verdict.outcome == 'failure'
+        run: |
+          echo "::warning::Portable E2E contains product differences; see the reduced result artifact. Local validate remains the blocking authority."
+          {
+            echo '### Portable E2E diagnostic (non-gating)'
+            echo
+            echo 'Local validate remains canonical. Hosted product differences are additional signal.'
+            echo
+            jq -r '"Rows: \(.cells); PASS: \(.passed); FAIL: \(.failed); ERROR: \(.errors)"' ignored/reduced/summary.json
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload reduced e2e diagnostics
         if: always() && needs.select.outputs.run_e2e != 'false'
         uses: actions/upload-artifact@v4
@@ -1381,11 +1431,12 @@ jobs:
           set -euo pipefail
           jq . <<< "$RESULTS"
           # A job is acceptable only if it SUCCEEDED or was intentionally
-          # deselected (skipped) by affected-test selection. A `failure` or
-          # `cancelled` in ANY selected job still fails closed — selection can
-          # remove a job from the run, never mask a real failure. `select` itself
-          # is in this set: if it dies it reports `failure`, not `skipped`, so a
-          # broken selection job reds the diagnostic instead of silently skipping tests.
+          # deselected (skipped) by affected-test selection. The E2E jobs become
+          # successful only after publishing complete evidence, and this job
+          # independently checks every archive, SHA, schema, and selected cell;
+          # only their explicitly named product-verdict steps are non-gating.
+          # Every other `failure` or `cancelled` still fails closed. `select`
+          # itself is in this set, so broken selection cannot silently skip tests.
           jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<< "$RESULTS"
 
   # ------------------------------------------------------------- cleanup
