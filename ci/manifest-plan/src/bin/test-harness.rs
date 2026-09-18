@@ -1356,6 +1356,36 @@ fn audit_portable_checks_budget(
     Ok(())
 }
 
+fn audit_portable_reducer_prepared_tools(workflow: &YamlValue) -> Result<(), String> {
+    let steps = workflow["jobs"]["regular"]["steps"]
+        .as_sequence()
+        .ok_or_else(|| "portable regular reducer has no steps sequence".to_string())?;
+    let download = steps.iter().position(|step| {
+        step["uses"]
+            .as_str()
+            .is_some_and(|uses| uses.starts_with("actions/download-artifact@"))
+            && step["with"]["name"].as_str() == Some("${{ env.MANIFEST_PLAN_ARTIFACT }}")
+            && step["if"].as_str() == Some("needs.select.outputs.run_e2e != 'false'")
+    });
+    let unpack = steps.iter().position(|step| {
+        step["run"].as_str().is_some_and(|run| {
+            run.contains("tar -xzf \"$MANIFEST_PLAN_TARBALL\"")
+                && run.contains("./ci/prepare-rust-scripts.sh --check")
+        }) && step["if"].as_str() == Some("needs.select.outputs.run_e2e != 'false'")
+    });
+    let verdict = steps.iter().position(|step| {
+        step["run"]
+            .as_str()
+            .is_some_and(|run| run.contains("./ci/run-node.sh portable"))
+    });
+    match (download, unpack, verdict) {
+        (Some(download), Some(unpack), Some(verdict)) if download < unpack && unpack < verdict => {
+            Ok(())
+        }
+        _ => Err("portable regular reducer must download and verify the prepared rust-script artifact before its constructed scorecard node".into()),
+    }
+}
+
 fn audit_privileged_workflow_overhead(workflow: &YamlValue) -> Result<(), String> {
     let job_bound = workflow_job_timeout(workflow, "privileged")? * 60;
     let declared_step_budgets = workflow_step_timeout_sum(workflow, "privileged")?;
@@ -1418,6 +1448,7 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
     .map_err(|e| format!("invalid portable shard map: {e}"))?;
     audit_portable_preflight_budget(&portable_workflow, &portable, &shards)?;
     audit_portable_checks_budget(&portable_workflow, &portable, &shards)?;
+    audit_portable_reducer_prepared_tools(&portable_workflow)?;
     let portable_steps = portable
         .steps
         .iter()
@@ -2854,6 +2885,7 @@ report.write_bytes((root/'verification.json').read_bytes())
                 .expect("portable workflow");
         super::audit_portable_preflight_budget(&portable_workflow, &portable, &shards).unwrap();
         super::audit_portable_checks_budget(&portable_workflow, &portable, &shards).unwrap();
+        super::audit_portable_reducer_prepared_tools(&portable_workflow).unwrap();
         portable_workflow["jobs"]["preflight"]["timeout-minutes"] =
             serde_yaml::to_value(10_u64).unwrap();
         let error = super::audit_portable_preflight_budget(&portable_workflow, &portable, &shards)
@@ -2874,6 +2906,18 @@ report.write_bytes((root/'verification.json').read_bytes())
             ),
             "{error}"
         );
+
+        let mut missing_reducer_tools = portable_workflow.clone();
+        missing_reducer_tools["jobs"]["regular"]["steps"]
+            .as_sequence_mut()
+            .unwrap()
+            .retain(|step| {
+                step["name"].as_str()
+                    != Some("Download reducer manifest plan tools and rust-script binaries")
+            });
+        let error =
+            super::audit_portable_reducer_prepared_tools(&missing_reducer_tools).unwrap_err();
+        assert!(error.contains("prepared rust-script artifact"), "{error}");
 
         let mut privileged_workflow =
             super::parse_yaml(&root.join(".github/workflows/ci-privileged.yml"))

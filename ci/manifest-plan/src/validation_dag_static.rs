@@ -202,9 +202,9 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.isolated_dbt_workdir", 2),
     ("test.isolated_detcore_workdir", 1),
-    // The current merged selection measures 534 regular-crate tests and 707
+    // The current merged selection measures 535 regular-crate tests and 707
     // Hermit library/binary tests; both counts are fail-closed below.
-    ("test.regular_crates", 534),
+    ("test.regular_crates", 535),
     ("test.hermit_unit", 707),
     ("test.detcore_unit", 704),
     ("test.detcore_misc", 27),
@@ -230,17 +230,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    ("test.detcore_misc_on_host", 27),
+    ("test.detcore_misc_on_host", 26),
     ("test.detcore_parallel_on_host", 5),
     ("test.detcore_unit_on_host", 704),
     ("test.hermit_integration_on_host", 153),
-    ("test.hermit_unit_on_host", 707),
+    ("test.hermit_unit_on_host", 706),
     ("test.ignored_syscall_regressions_on_host", 4),
-    ("test.liteinst_strict_on_host", 23),
+    ("test.liteinst_strict_on_host", 22),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 534),
+    ("test.regular_crates_on_host", 535),
     ("test.rr_suite_contract_on_host", 1),
-    ("test.sabre_examples_on_host", 6),
+    ("test.sabre_examples_on_host", 2),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
