@@ -35,9 +35,11 @@ exec unshare --user --map-root-user --uts --net --mount \
         # local client/server unit tests. A new network namespace starts with
         # lo down, which is a setup failure rather than product isolation.
         ip link set lo up
-        # Keep temporary files outside the checkout while retaining the
-        # runner-visible /tmp. Some compatibility fixtures are created before
-        # this namespace and must remain visible to the guest command.
+        # Give tempfile users a root-owned path inside the UID mapping. The
+        # runner checkout lives below host-owned /home, whose ancestors map to
+        # the overflow UID and correctly fail security-sensitive path checks.
+        # A fresh tmpfs also gives repeated strict runs the same inode baseline.
+        mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /tmp
         export TMPDIR=/tmp
         # Exercise the exact nested mount capability the per-physical-run /test
         # helper needs, without leaving the probe mount visible to validation.
