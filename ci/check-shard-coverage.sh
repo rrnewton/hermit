@@ -142,6 +142,22 @@ if [[ -n $extra ]]; then
     status=1
 fi
 
+# A one-node hosted validation that selects an empty manifest bucket is
+# correctly refused as a zero-test pass. Keep such constructed nodes assigned
+# exactly once, but require them to share a nonempty shard instead of becoming
+# standalone E2E matrix jobs.
+while IFS= read -r node; do
+    category=${node#e2e.manifest_}
+    category=${category%_on_host}
+    category=${category//_/-}
+    cells=$(jq --arg category "$category" '[.cells[] | select(.category == $category)] | length' \
+        ci/expected-e2e-plan.json)
+    if ((cells == 0)); then
+        echo "check-shard-coverage.sh: FAIL — standalone E2E node $node selects zero committed cells; co-schedule it with a nonempty shard" >&2
+        status=1
+    fi
+done < <(jq -r '.e2e_nodes[]' <<<"$shards_json")
+
 dependency_misses() {
     local selected_json=$1
     local supplied_json=$2
@@ -201,6 +217,24 @@ debug_artifact_contract() {
         grep -Fqx '          test -f target/ci/nextest-binaries/current.json' <<<"$pack_step" &&
         grep -Fqx "$nextest_member" <<<"$pack_step" &&
         grep -Fqx '          test -f target/ci/nextest-binaries/current.json' <<<"$unpack_step"
+}
+
+prepared_nextest_artifact_contract() {
+    local workflow_text=$1 pack_step job body
+    pack_step=$(workflow_step_body "Pack prepared Nextest inputs" "$workflow_text")
+    grep -Fq '.selections[].binaries[].executable.path' <<<"$pack_step" &&
+        grep -Fq '.selections[].runtime_files[].path' <<<"$pack_step" &&
+        grep -Fq '.guests[].path' <<<"$pack_step" &&
+        grep -Fqx '            target/debug/nextest-cpu-wrapper \' <<<"$pack_step" &&
+        grep -Fqx '            target/ci/nextest-binaries' <<<"$pack_step" || return 1
+
+    for job in test-debug strict-compat test-release; do
+        body=$(workflow_job_body "$job" "$workflow_text") || return 1
+        grep -Fqx '          name: ${{ env.NEXTEST_ARTIFACT }}' <<<"$body" &&
+            grep -Fqx '          tar --zstd -xf "$NEXTEST_TARBALL"' <<<"$body" &&
+            grep -Fqx '          test -x target/debug/nextest-cpu-wrapper' <<<"$body" &&
+            grep -Fqx '          test -f target/ci/nextest-binaries/current.json' <<<"$body" || return 1
+    done
 }
 
 workflow_job_body() {
@@ -294,7 +328,8 @@ workflow_e2e_uses_pinned_result_root() {
     body=$(workflow_job_body e2e "$workflow_text") || return 1
     grep -Fqx '      E2E_RESULT_ROOT: /results/${{ matrix.slug }}' <<<"$body" &&
         grep -Fqx '          sudo install -d -o "$(id -u)" -g "$(id -g)" /results' <<<"$body" &&
-        grep -Fqx '            sudo chmod a+rw /dev/kvm' <<<"$body"
+        grep -Fqx '            sudo chmod a+rw /dev/kvm' <<<"$body" &&
+        grep -Fqx '            sudo sysctl -w kernel.perf_event_paranoid=-1' <<<"$body"
 }
 
 workflow_e2e_prepares_btrfs() {
@@ -391,6 +426,10 @@ if ! debug_artifact_contract "$workflow_text"; then
     echo "check-shard-coverage.sh: FAIL — debug artifact must transport executable target/debug/verification-report" >&2
     status=1
 fi
+if ! prepared_nextest_artifact_contract "$workflow_text"; then
+    echo "check-shard-coverage.sh: FAIL — prepared Nextest artifact must transport every identity-bound input to all Nextest consumers" >&2
+    status=1
+fi
 omitted_artifact=${workflow_text/$'            target/debug/verification-report \\\n'/}
 if [[ $omitted_artifact == "$workflow_text" ]]; then
     echo "check-shard-coverage.sh: FAIL — artifact omission fixture did not remove verification-report" >&2
@@ -413,6 +452,14 @@ if [[ $omitted_nextest == "$workflow_text" ]]; then
     status=1
 elif debug_artifact_contract "$omitted_nextest"; then
     echo "check-shard-coverage.sh: FAIL — artifact guard accepted a planted missing prepared-nextest identity" >&2
+    status=1
+fi
+missing_prepared_download=${workflow_text/$'      - name: Download prepared Nextest inputs\n        uses: actions/download-artifact@v4\n        with:\n          name: ${{ env.NEXTEST_ARTIFACT }}\n          path: .\n'/}
+if [[ $missing_prepared_download == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — prepared-nextest download mutation did not change the workflow" >&2
+    status=1
+elif prepared_nextest_artifact_contract "$missing_prepared_download"; then
+    echo "check-shard-coverage.sh: FAIL — prepared-nextest guard accepted a consumer without its artifact download" >&2
     status=1
 fi
 if ! workflow_wiring_contract "$workflow_text"; then
@@ -483,6 +530,15 @@ if [[ $missing_kvm_access == "$workflow_text" ]]; then
     status=1
 elif workflow_wiring_contract "$missing_kvm_access"; then
     echo "check-shard-coverage.sh: FAIL — workflow guard accepted an E2E job that cannot open /dev/kvm" >&2
+    status=1
+fi
+kvm_perf_access='            sudo sysctl -w kernel.perf_event_paranoid=-1'
+missing_kvm_perf_access=${workflow_text/"$kvm_perf_access"/}
+if [[ $missing_kvm_perf_access == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — KVM-perf-access mutation did not change the workflow fixture" >&2
+    status=1
+elif workflow_wiring_contract "$missing_kvm_perf_access"; then
+    echo "check-shard-coverage.sh: FAIL — workflow guard accepted an E2E job whose KVM guests cannot open perf events" >&2
     status=1
 fi
 btrfs_setup_name="      - name: Provide Btrfs sysfs state for system-utils"
