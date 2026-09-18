@@ -22801,7 +22801,7 @@ mod fused_privileged_build_tests {
         let prepared = run_build(preparation, root.path(), &bin, &log, "current");
         assert!(prepared.status.success(), "{}", String::from_utf8_lossy(&prepared.stderr));
         let before = std::fs::read_to_string(&log).unwrap();
-        let expected = hermit_manifest_plan::nextest_binaries::profile_selections(repository, "portable").unwrap();
+        let expected = hermit_manifest_plan::nextest_binaries::profile_selections(repository, "full").unwrap();
         let calls = before.lines().map(|line| serde_json::from_str::<Vec<String>>(line).unwrap()).collect::<Vec<_>>();
         let builds = calls.iter().filter(|args| args.first().map(String::as_str) == Some("nextest") && !args.iter().any(|arg| arg == "--binaries-metadata")).collect::<Vec<_>>();
         assert_eq!(builds.len(), expected.len(), "each distinct selection is prepared once");
