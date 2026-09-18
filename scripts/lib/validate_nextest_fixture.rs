@@ -11,9 +11,10 @@ use super::super::DagConfig;
 use super::super::LedgerCtx;
 use super::super::Plan;
 use super::super::dag_to_json;
+use super::super::env_u64;
 use super::super::finish_committed_selection;
-use super::super::invocation_deadline_ns;
 use super::super::libtest_counts;
+use super::super::monotonic_now_ns;
 use super::super::run_lane_once;
 use super::super::step_with_caps;
 use super::super::utc_now;
@@ -38,6 +39,125 @@ fn json(path: &Path) -> serde_json::Value {
 
 fn quoted(path: &Path) -> String {
     super::super::validate_plan::shell_quote(path.to_str().unwrap())
+}
+
+const FIXTURE_WALL_SECONDS: u64 = 1200;
+
+/// This fixture owns a local clock, not a replacement scheduler epoch. A real
+/// enclosing absolute deadline can only shorten it. An epoch alone does not
+/// tell us the parent's allowance; the parent still enforces its own wall cap.
+fn fixture_deadline(
+    now_ns: u64,
+    claimed_nested: bool,
+    step_started_ns: Option<u64>,
+    inherited_deadline_ns: Option<u64>,
+) -> Result<u64, String> {
+    if claimed_nested && step_started_ns.is_none() {
+        return Err("nested fixture lacks its scheduler-owned start epoch".into());
+    }
+    if step_started_ns.is_some_and(|start| start > now_ns) {
+        return Err("fixture inherited a scheduler epoch in the future".into());
+    }
+    let local = now_ns
+        .checked_add(FIXTURE_WALL_SECONDS * 1_000_000_000)
+        .ok_or("fixture deadline overflows the monotonic clock")?;
+    Ok(inherited_deadline_ns.map_or(local, |inherited| local.min(inherited)))
+}
+
+#[test]
+fn fixture_clocks_preserve_standalone_and_inherited_bounds() {
+    let now = 2_000_000_000_000;
+    let local = now + FIXTURE_WALL_SECONDS * 1_000_000_000;
+    assert_eq!(fixture_deadline(now, false, None, None).unwrap(), local);
+    assert_eq!(fixture_deadline(now, true, Some(1), None).unwrap(), local);
+    for inherited in [now - 1, now, now + 1, local - 1, local, local + 1] {
+        assert_eq!(
+            fixture_deadline(now, false, None, Some(inherited)).unwrap(),
+            local.min(inherited),
+        );
+        assert_eq!(
+            fixture_deadline(now, true, Some(now - 1), Some(inherited)).unwrap(),
+            local.min(inherited),
+        );
+    }
+    assert!(fixture_deadline(now, true, None, Some(local)).is_err());
+    assert!(fixture_deadline(now, false, Some(now + 1), None).is_err());
+    assert!(fixture_deadline(u64::MAX, false, None, None).is_err());
+}
+
+/// Direct script-test entrypoints can start without a prepared manifest. Pay
+/// that cost through the unchanged producer, under its existing declaration.
+/// Official consumers only check their prerequisite; they never compile here.
+fn ensure_prepared_helpers(source: &Path, root: &Path, deadline: u64) {
+    let bootstrap = root.join("prepare");
+    fs::create_dir_all(bootstrap.join("tmp")).unwrap();
+    let prebuilt_required =
+        std::env::var("HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED").as_deref() == Ok("1");
+    let producer_command = if prebuilt_required {
+        "./ci/prepare-rust-scripts.sh --check"
+    } else {
+        "./ci/prepare-rust-scripts.sh && ./ci/prepare-rust-scripts.sh --check"
+    };
+    // This is a private fixture step, not a mutation of the product's producer
+    // declaration. Preserve its wall900/CPU7200/6GiB limits and writer flock.
+    let mut step = super::super::rust_script_producer_step();
+    step.cmd = format!(
+        "cd {} || exit $?; export TMPDIR={}; set +e; {{ {producer_command}; }} >{} 2>{}; \
+         prepare_status=$?; cat {}; cat {} >&2; exit \"$prepare_status\"",
+        quoted(source),
+        quoted(&bootstrap.join("tmp")),
+        quoted(&bootstrap.join("producer.stdout")),
+        quoted(&bootstrap.join("producer.stderr")),
+        quoted(&bootstrap.join("producer.stdout")),
+        quoted(&bootstrap.join("producer.stderr")),
+    );
+    let cfg = DagConfig {
+        steps: vec![step],
+        ..Default::default()
+    };
+    fs::write(bootstrap.join("dag.json"), dag_to_json(&cfg)).unwrap();
+    fs::write(
+        bootstrap.join("mode.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "prebuilt_required":prebuilt_required,"command":producer_command,
+            "deadline_monotonic_ns":deadline,"cargo_home_policy":"inherited/default",
+            "product_producer_changed":false,"per_step_cgroup_binding":null,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let result = run_lane_once(
+        &cfg,
+        1,
+        true,
+        0,
+        None,
+        &bootstrap.join("driver.log"),
+        Some(deadline),
+        false,
+    );
+    fs::write(
+        bootstrap.join("result.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "complete":result.complete,"ok":result.ok,"run_timed_out":result.run_timed_out,
+            "attempts":result.attempts.len(),
+            "outcomes":result.outcomes.iter().map(|outcome| serde_json::json!({
+                "tag":outcome.tag,"ok":outcome.ok,"returncode":outcome.returncode,
+                "duration_s":outcome.duration_s,"aborted":outcome.aborted,
+                "timed_out":outcome.timed_out,"cpu_timed_out":outcome.cpu_timed_out,
+                "oomed":outcome.oomed,"oom_kills":outcome.oom_kills,
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(result.complete && result.ok && !result.run_timed_out);
+    assert_eq!(result.outcomes.len(), 1);
+    assert_eq!(result.attempts.len(), 1, "no preparation retry");
+    let outcome = &result.outcomes[0];
+    assert!(outcome.ok && outcome.returncode == Some(0));
+    assert!(!outcome.aborted && !outcome.timed_out && !outcome.cpu_timed_out && !outcome.oomed);
+    assert_eq!(outcome.oom_kills, 0);
 }
 
 fn context(source: &Path, outcomes: &[StepOutcome]) -> LedgerCtx {
@@ -171,6 +291,19 @@ fn expected_ids(diagnostics: &Path, names: &BTreeSet<String>) -> BTreeMap<String
 
 #[test]
 fn actual_nextest_results_and_publication_failures() {
+    let started_ns = monotonic_now_ns().expect("fixture requires CLOCK_MONOTONIC");
+    let step_started_ns = env_u64(dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV).unwrap();
+    let inherited_deadline_ns = env_u64(super::super::OWN_SCOPE_DEADLINE_ENV).unwrap();
+    let claimed_nested = ["DAGRUN_OUTER_RUN", "DAGRUN_STEP"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+    let deadline = fixture_deadline(
+        started_ns,
+        claimed_nested,
+        step_started_ns,
+        inherited_deadline_ns,
+    )
+    .unwrap();
     let source = Path::new(file!())
         .parent()
         .unwrap()
@@ -210,26 +343,23 @@ fn actual_nextest_results_and_publication_failures() {
         "#[test]\nfn fails() { assert_eq!(2 + 2, 5, \"intentional structured-result fixture assertion\"); }\n",
     )).unwrap();
     let target = root.join("target");
-    // This nested fixture spends the enclosing scheduler step's clock. It must
-    // not start a fresh allowance after the harness has already consumed time.
-    let deadline = invocation_deadline_ns(Some(1200), true)
-        .expect("the fixture needs its enclosing scheduler's monotonic start")
-        .unwrap();
-    let cargo_home = PathBuf::from(
-        std::env::var_os("CARGO_HOME")
-            .expect("the bounded launcher must name its owned CARGO_HOME"),
-    )
-    .canonicalize()
-    .unwrap();
+    // Cargo's standard explicit/default home remains in force. Only the target
+    // and temp directories below are fixture-owned; a test must not silently
+    // copy or claim private ownership of the developer's registry/configuration.
+    let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
     fs::write(root.join("bounds.json"), serde_json::to_vec_pretty(&serde_json::json!({
-        "enclosing_step_allowance_seconds":1200,"deadline_monotonic_ns":deadline,
+        "fixture_wall_seconds":FIXTURE_WALL_SECONDS,"fixture_started_ns":started_ns,
+        "deadline_monotonic_ns":deadline,"inherited_step_started_ns":step_started_ns,
+        "inherited_deadline_ns":inherited_deadline_ns,"claimed_nested":claimed_nested,
         "per_case_wall_seconds":180,"per_case_cpu_seconds":300,
         "declared_memory_bytes":2_u64*1024*1024*1024,"dag_width":1,"cargo_jobs":1,"nextest_retries":0,
-        "per_case_cgroup_binding":null,"outer_scope_required":true,"cargo_home":cargo_home,
+        "per_case_cgroup_binding":null,"cargo_home_env":cargo_home,
+        "cargo_home_policy":"conventional explicit/default Cargo home; ownership not inferred",
         "source":source,"source_head":original_head,"private_target":target,
         "metadata_root":source.join("target/ci/nextest-binaries"),
         "evidence":root,"diagnostic_only":true,"admission":null,
     })).unwrap()).unwrap();
+    ensure_prepared_helpers(&source, &root, deadline);
     for (index, (name, failing, deny_publish, mismatch, expected_class)) in [
         (
             "writable-pass",
