@@ -10181,6 +10181,37 @@ fn recorded_shell_quote(value: &str) -> String {
 }
 
 fn self_test() -> Result<(), String> {
+    // Diagnostic-only CPU attribution; no outcome, input, or deadline changes.
+    fn profile_usage(who: libc::c_int) -> Option<[f64; 2]> {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: getrusage initializes this correctly sized writable value.
+        if unsafe { libc::getrusage(who, usage.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: the successful call above initialized the value.
+        let usage = unsafe { usage.assume_init() };
+        Some([
+            usage.ru_utime.tv_sec as f64 + usage.ru_utime.tv_usec as f64 / 1_000_000.0,
+            usage.ru_stime.tv_sec as f64 + usage.ru_stime.tv_usec as f64 / 1_000_000.0,
+        ])
+    }
+    fn profile_delta(before: Option<[f64; 2]>, after: Option<[f64; 2]>) -> Option<[f64; 2]> {
+        before.zip(after).map(|(a, b)| [b[0] - a[0], b[1] - a[1]])
+    }
+    let profile_epoch = Instant::now();
+    let profile_mark = |label: &str| {
+        eprintln!(
+            "SCORECARD_PROFILE {}",
+            serde_json::json!({
+                "kind": "stage", "label": label,
+                "wall_s": profile_epoch.elapsed().as_secs_f64(),
+                "self_user_system_s": profile_usage(libc::RUSAGE_SELF),
+                "children_user_system_s": profile_usage(libc::RUSAGE_CHILDREN),
+            })
+        );
+    };
+    profile_mark("self_test_enter");
+
     let (summary_paths, retained) = parse_update_observations_args(
         [
             "--summary",
@@ -13103,7 +13134,9 @@ red/`measured-and-passed` count is **0**.",
     // Establish the normal helper through its real producer before any clone
     // invocation. The comparison below checks retained bytes, not the identity
     // of every concurrently executing process.
+    profile_mark("before_root_derive");
     derive(&command_root)?;
+    profile_mark("after_root_derive");
     let command_helper = command_root.join("target/debug/hermit-manifest-plan");
     let helper_sha256 = |path: &Path| -> Result<String, String> {
         let bytes = fs::read(path)
@@ -13142,6 +13175,7 @@ red/`measured-and-passed` count is **0**.",
     let result_command_fixture =
         tempfile::tempdir().map_err(|e| format!("cannot create result-command fixture: {e}"))?;
     let result_command_root = result_command_fixture.path().join("repo");
+    profile_mark("before_result_clone");
     let clone = Command::new("git")
         .args(["clone", "--quiet", "--shared"])
         .arg(&command_root)
@@ -13157,6 +13191,7 @@ red/`measured-and-passed` count is **0**.",
     // The clone contains committed data, while the executable may contain an
     // uncommitted serialization change. Encode the fixture with this writer
     // before recording its baseline; the command must still require exact bytes.
+    profile_mark("after_result_clone");
     let fixture_cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
     fs::write(
         result_command_root.join(CELLS),
@@ -13233,6 +13268,7 @@ red/`measured-and-passed` count is **0**.",
     };
     commit("recorded")?;
     let result_command_before = read_generated_files(&result_command_root)?;
+    profile_mark("result_command_baseline_ready");
     let fixture_head = git_head(&result_command_root)?;
     let fixture_detcore_tree = git_rev_parse(&result_command_root, "HEAD:detcore")?;
     let replay_id = CellId {
@@ -16281,18 +16317,50 @@ red/`measured-and-passed` count is **0**.",
             .find(|cell| cell.id == verify_id)
             .ok_or_else(|| "current writer lost transition fixture cell".into())
     };
+    profile_mark("before_twenty_transition_calls");
     for combined in [false, true] {
         let command = if combined {
             "project-and-observe-results"
         } else {
             "observe-results"
         };
+        let profile_ordinal = std::cell::Cell::new(0usize);
         let invoke = || {
-            if combined {
+            let ordinal = profile_ordinal.get() + 1;
+            profile_ordinal.set(ordinal);
+            let started = Instant::now();
+            let self_before = profile_usage(libc::RUSAGE_SELF);
+            let children_before = profile_usage(libc::RUSAGE_CHILDREN);
+            let result = if combined {
                 run_snapshot_command(&empty_snapshot_path, &empty_snapshot_sha)
             } else {
                 run_result_command("observe-results", None)
-            }
+            };
+            let children_after = profile_usage(libc::RUSAGE_CHILDREN);
+            let self_after = profile_usage(libc::RUSAGE_SELF);
+            let case = [
+                "pass_unlocated", "divergence_unlocated", "recovery_unlocated",
+                "pass_located", "divergence_located", "recovery_located",
+                "history_pass", "history_no_comparison", "history_divergence",
+                "history_location_only",
+            ].get(ordinal - 1).copied();
+            eprintln!(
+                "SCORECARD_PROFILE {}",
+                serde_json::json!({
+                    "kind": "transition_cli", "frontdoor": command,
+                    "ordinal": ordinal, "case": case,
+                    "wall_s": started.elapsed().as_secs_f64(),
+                    "cumulative_wall_s": profile_epoch.elapsed().as_secs_f64(),
+                    "self_user_system_s": profile_delta(self_before, self_after),
+                    "children_user_system_s": profile_delta(children_before, children_after),
+                    "cumulative_self_user_system_s": self_after,
+                    "cumulative_children_user_system_s": children_after,
+                    "exit_code": result.as_ref().ok().and_then(|out| out.status.code()),
+                    "status": result.as_ref().ok().map(|out| out.status.to_string()),
+                    "error": result.as_ref().err(),
+                })
+            );
+            result
         };
         let require_output =
             |output: std::process::Output, regression: bool, baseline_refusal: bool| {
@@ -16399,6 +16467,7 @@ red/`measured-and-passed` count is **0**.",
             "scorecard self-test: {command} CLI no-comparison baseline refused; location-only transition not a regression"
         );
     }
+    profile_mark("after_twenty_transition_calls");
     fs::write(&result_path, result_before_transitions).map_err(|e| e.to_string())?;
     restore_generated()?;
 
@@ -19409,6 +19478,7 @@ red/`measured-and-passed` count is **0**.",
     // Stored projected observations need the same complete source identity as
     // the production writer. Commit the actual fixture rows and read them back
     // through its immutable snapshot path before applying and encoding them.
+    profile_mark("before_no_verdict_series_fixtures");
     let projection_source_fixture =
         tempfile::tempdir().map_err(|e| format!("cannot create no-verdict series fixture: {e}"))?;
     let projection_source_repo = projection_source_fixture.path();
@@ -20223,6 +20293,7 @@ red/`measured-and-passed` count is **0**.",
     // capture its bytes, prove the worktree matches, and never reread the
     // mutable worktree while parsing. The fixture also pins canonical event
     // identity, loud malformed-input refusal, and exact shard population.
+    profile_mark("before_series_snapshot_controls");
     let source_fixture =
         tempfile::tempdir().map_err(|e| format!("cannot create series snapshot fixture: {e}"))?;
     let source_repo = source_fixture.path();
@@ -20519,6 +20590,7 @@ red/`measured-and-passed` count is **0**.",
         ));
     }
 
+    profile_mark("after_series_snapshot_controls");
     // A legacy file with no `projection` key must still load -- the demotion is
     // additive, and a hard requirement would strand every checked-in scorecard.
     let legacy: TrackedCells = serde_json::from_str(r#"{"schema":6,"cells":[]}"#)
@@ -20845,6 +20917,7 @@ red/`measured-and-passed` count is **0**.",
     println!(
         "compatibility scorecard self-test: retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, disabled-parity-front-doors, empty-result command, source-identity, writer-boundary, projection, projection-schema, object-store-independence, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
     );
+    profile_mark("self_test_exit");
     Ok(())
 }
 
