@@ -2902,8 +2902,12 @@ report.write_bytes((root/'verification.json').read_bytes())
                 }
             }
         }
-        assert_eq!(physical_rows, 23);
-        assert_eq!(resolved.len(), 23);
+        // Two portable manifest nodes currently select zero cells on their own.
+        // They remain assigned exactly once, but share the integration shard so
+        // the hosted validator cannot mistake a standalone zero-test run for a
+        // pass.
+        assert_eq!(physical_rows, 25);
+        assert_eq!(resolved.len(), 25);
         assert_eq!(actual_aliases, expected_aliases);
         // Run the complete real budget audit too: all original workflow,
         // critical-path and exact inversion-baseline comparisons remain active.
