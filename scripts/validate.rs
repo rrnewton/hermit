@@ -13507,6 +13507,7 @@ exec env -u HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER -u HERMIT_TEST_WALL_TIMEOUT_MULTI
             "run-split-validate.sh",
             "retry-fetch.sh",
             "run-in-pinned-root.sh",
+            "retry-fetch.sh",
             "image.digest",
         ] {
             std::fs::copy(
