@@ -61856,7 +61856,7 @@
       "group": "test",
       "job": "hermit_unit_on_host",
       "desc": "Test Hermit unit and binary targets (-p hermit --lib --bins)",
-      "description": "HOSTED CAPABILITY DIFFERENCE: The GitHub wrapper intentionally maps only the runner UID to root. The host filesystem root is therefore overflow-owned inside that user namespace, so this exact cache-ancestor ownership fixture refuses before testing the private cache directory. It remains blocking in canonical local validate; the other 706 Hermit unit cases remain blocking here.",
+      "description": "HOSTED CAPABILITY DIFFERENCE: The GitHub wrapper intentionally maps only the runner UID to root. The host filesystem root is therefore overflow-owned inside that user namespace, so this exact cache-ancestor ownership fixture refuses before testing the private cache directory. It remains blocking in canonical local validate; the other 709 Hermit unit cases remain blocking here.",
       "labels": [
         "hosted-portable"
       ],
