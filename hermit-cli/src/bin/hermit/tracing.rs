@@ -703,3 +703,6 @@ mod tests {
         assert_eq!(writer.write(&[b'y'; 40]).unwrap(), 40);
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod capture_discriminator;
