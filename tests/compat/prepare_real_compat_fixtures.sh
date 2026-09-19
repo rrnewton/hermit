@@ -106,6 +106,17 @@ EOF
 # guest process boundary without exposing the host's mutable /tmp to the run.
 : >"$FIXTURE_ROOT/df/redirected"
 
+# Strict verify executes xz-roundtrip twice. Keep its run-owned directory and
+# files on stable inodes across those physical runs; the workload overwrites
+# their contents and the whole fixture root is discarded with the validation
+# run. Creating them here also keeps concurrent compatibility nodes from
+# perturbing their allocation order.
+mkdir -p "$FIXTURE_ROOT/.work/xz-roundtrip/source" \
+    "$FIXTURE_ROOT/.work/xz-roundtrip/output"
+: >"$FIXTURE_ROOT/.work/xz-roundtrip/source/payload.txt"
+: >"$FIXTURE_ROOT/.work/xz-roundtrip/output/payload.txt"
+: >"$FIXTURE_ROOT/.work/xz-roundtrip/archive.xz"
+
 # Prevent host build time from becoming guest-visible input.
 find "$FIXTURE_ROOT" -exec touch -h -d @1 {} +
 printf 'prepared real compatibility fixtures: %s\n' "$FIXTURE_ROOT"
