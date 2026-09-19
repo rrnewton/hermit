@@ -6302,7 +6302,9 @@ fn project_and_observe_results(
 // Diagnostic-only sidecar. It never supplies a verdict, changes the selected
 // command, or writes into stdout/stderr. Missing telemetry remains missing.
 fn snapshot_diagnostic(stage: &str, detail: JsonValue) {
-    let Some(directory) = env::var_os("HERMIT_SCORECARD_TIMEOUT_DIAGNOSTIC_DIR") else {
+    let Some(directory) = env::var_os("HERMIT_SCORECARD_TIMEOUT_DIAGNOSTIC_DIR")
+        .or_else(|| env::var_os("DAGRUN_LOG_DIR"))
+    else {
         return;
     };
     let directory = Path::new(&directory);
