@@ -35,7 +35,7 @@ const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SUPER_REPETITIONS: &str = "20";
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
-const PIN_GATE_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; with-proxy ./ci/run-reverie-pin-check.sh --repo "$PWD""#;
+const PIN_GATE_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; pin_check=(./ci/run-reverie-pin-check.sh --repo "$PWD"); if command -v with-proxy >/dev/null 2>&1; then with-proxy "${pin_check[@]}"; else "${pin_check[@]}"; fi"#;
 const OUTCOME_CONSUMERS_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/check-outcome-consumers-node.sh"#;
 const PINNED_ROOT_TWIN_SUFFIX: &str = "_in_pinned_root";
 pub const HOSTED_PORTABLE_LABEL: &str = "hosted-portable";
@@ -602,6 +602,13 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             split.len()
         ));
     }
+    // The hosted test consumers need a producer whose prepared population is
+    // limited to their committed selection. Sharing build.workspace with the
+    // local full profile made a no-KVM GitHub runner compile the local-only
+    // kvm-native-test-support selection before any hosted test could start.
+    // Split the producer before closing over its shared downstream consumers,
+    // so no hosted path retains a dependency on the local full producer.
+    split.insert("build.workspace".into());
     loop {
         let previous = split.len();
         for step in &cfg.steps {
@@ -625,9 +632,9 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             break;
         }
     }
-    if split.len() != 206 {
+    if split.len() != 213 {
         return Err(format!(
-            "hosted test dependency closure has {} nodes, expected 206",
+            "hosted test dependency closure has {} nodes, expected 213",
             split.len()
         ));
     }
@@ -657,6 +664,171 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
                 }
             }
         }
+    }
+    let hosted_workspace = cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == "build.workspace_on_host")
+        .ok_or("hosted workspace producer is absent")?;
+    let local_prepare = "./ci/nextest-binaries.rs prepare full";
+    if hosted_workspace.cmd.matches(local_prepare).count() != 1 {
+        return Err("hosted workspace producer lost the exact local preparation command".into());
+    }
+    hosted_workspace.cmd = hosted_workspace.cmd.replace(
+        local_prepare,
+        "./ci/nextest-binaries.rs prepare hosted-portable",
+    );
+    Ok(())
+}
+
+fn materialize_hosted_completion_budgets(cfg: &mut DagConfig) -> Result<(), String> {
+    let step = cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == "e2e.manifest_backend_parity_c_on_host")
+        .ok_or("hosted backend-parity node is absent")?;
+    if step.timeout != 600 {
+        return Err(format!(
+            "hosted backend-parity budget expected the inherited 600s bound, got {}s",
+            step.timeout
+        ));
+    }
+    // Run 35335623037 used all 600 seconds on this 276-cell bucket: 94
+    // classified product failures legitimately consumed their one retained
+    // retry, and the timeout cut the final identities before their result
+    // stream could be published. This 20% measured headroom is specific to the
+    // hosted variant. It does not make a product verdict pass; the workflow
+    // still records every FAIL/ERROR while requiring all 276 identities.
+    step.timeout = 720;
+    step.description = "Hosted backend-parity-c contains 276 selected cells. Run 35335623037 reached the inherited 600-second boundary after 94 classified product retries and before it could publish the complete identity set. The hosted variant therefore carries 720 seconds of measured completion headroom; product FAIL/ERROR rows remain non-gating only in the supplemental portable workflow, while missing identities and other evidence failures remain blocking.".into();
+    Ok(())
+}
+
+/// Keep host capability differences explicit without narrowing canonical local
+/// validation. These exact cases need host facilities or kernel behavior that
+/// GitHub's hosted runner does not provide. The supplemental lane records the
+/// difference in its committed command and description; local validate
+/// continues to execute every case.
+fn materialize_hosted_capability_exclusions(cfg: &mut DagConfig) -> Result<(), String> {
+    // GitHub's runner has no KVM device. The local Hermit unit selection uses
+    // reverie-kvm/native-test-support for three scheduler controls, and the
+    // current pinned Reverie revision does not support compiling that private
+    // test API on a no-KVM hosted build. Remove only that feature from the
+    // hosted twin's command and recorded Cargo identity. The local 710-test
+    // node and the full-profile producer remain unchanged.
+    let hosted_unit = cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == "test.hermit_unit_on_host")
+        .ok_or("hosted Hermit unit node is absent")?;
+    let local_features = "third-party-backends,kvm-native-test-support";
+    if hosted_unit.cmd.matches(local_features).count() != 1 {
+        return Err("hosted Hermit unit command lost the exact local KVM feature set".into());
+    }
+    hosted_unit.cmd = hosted_unit
+        .cmd
+        .replace(local_features, "third-party-backends");
+    let raw_selection = hosted_unit
+        .env
+        .get(crate::nextest_binaries::SELECTION_ENV)
+        .ok_or("hosted Hermit unit node has no prepared build selection")?;
+    let mut selection: Vec<String> =
+        serde_json::from_str(raw_selection).map_err(|error| error.to_string())?;
+    let feature = selection
+        .iter_mut()
+        .find(|argument| argument.as_str() == local_features)
+        .ok_or("hosted Hermit unit selection lost the exact local KVM feature set")?;
+    *feature = "third-party-backends".into();
+    hosted_unit.env.insert(
+        crate::nextest_binaries::SELECTION_ENV.into(),
+        serde_json::to_string(&selection).map_err(|error| error.to_string())?,
+    );
+
+    const EXCLUSIONS: &[(&str, u64, &[&str], &str)] = &[
+        (
+            "test.cli_on_host",
+            73,
+            &[
+                "namespace_only_applies_a_fresh_private_tmpfs_workdir",
+                "namespace_only_applies_minimal_and_explicit_environment",
+                "namespace_only_preserves_default_host_environment",
+                "namespace_only_propagates_guest_exit_status",
+                "skid_overshoot_and_guest_failure_have_different_exit_codes",
+            ],
+            "GitHub-hosted runners expose no usable PMU. Four namespace-only assertions otherwise receive the explicit PMU fallback warning on stderr, and the skid-injection assertion cannot create its required overshoot. These five exact tests remain blocking in canonical local validate.",
+        ),
+        (
+            "test.hermit_integration_on_host",
+            153,
+            &[
+                "chroot_mountinfo_subset_keeps_fdinfo_identity_consistent",
+                "private_evidence_does_not_reuse_the_public_log_file_or_add_a_worker",
+                "sidecar_does_not_replace_or_reopen_guest_standard_descriptors",
+                "sidecar_preserves_session_and_process_group_identity",
+                "sidecar_preserves_stdout_stderr_status_and_reports_nonzero_info",
+            ],
+            "GitHub-hosted runners expose neither a usable PMU nor the local host's CPUID-faulting behavior. The nested chroot case requires PMU support, while four byte-for-byte evidence comparisons otherwise include the hosted fallback diagnostics. These five exact tests remain blocking in canonical local validate.",
+        ),
+        (
+            "test.liteinst_strict_on_host",
+            22,
+            &[
+                "liteinst_strict_verify_shell_and_entropy_consumer",
+                "liteinst_strict_verify_semantic_file_and_sqlite_utilities",
+            ],
+            "Runs 35347497730 and 35354614446 reproduced matching semantic stdout but different LiteInst read-buffer chunk hashes on the GitHub-hosted kernel in these exact entropy/file-consumer cases. Both remain blocking in canonical local validate; the other 22 LiteInst strict cases remain blocking here.",
+        ),
+        (
+            "test.sabre_examples_on_host",
+            2,
+            &[
+                "sabre_libc_getrandom_is_deterministic",
+                "sabre_non_racy_examples_verify_current_envelope",
+                "sabre_root_pid_matches_ptrace",
+                "sabre_scheduler_empty_info_precedes_fallback_completed_info",
+            ],
+            "Run 35354614446 measured the GitHub-hosted vDSO containing RIP-relative instruction 0x80, which the pinned SaBRe rewriter refuses before any guest syscall reaches Detcore. These four exact backend-execution cases remain blocking in canonical local validate; the two SaBRe contract cases that do not hit this hosted vDSO remain blocking here.",
+        ),
+        (
+            "test.detcore_misc_on_host",
+            26,
+            &["vfork_parent_resumes_after_child_exec"],
+            "Runs 35347497730 and 35354614446 reproduced the same hosted-kernel ptrace state failure in this exact vfork lifecycle case, including after the outer PID namespace was removed. This case remains blocking in canonical local validate; the other 26 detcore-misc cases remain blocking here.",
+        ),
+        (
+            "test.hermit_unit_on_host",
+            706,
+            &["e9patch::tests::cache_directory_is_private_and_not_a_symlink"],
+            "GitHub's runner has no KVM device, so its committed Cargo selection omits kvm-native-test-support and the three native scheduler controls behind that feature. The GitHub wrapper also maps only the runner UID to root; the host filesystem root is therefore overflow-owned inside that user namespace, so the exact cache-ancestor ownership fixture is skipped. All four cases remain blocking in canonical local validate; the other 706 Hermit unit cases remain blocking here.",
+        ),
+    ];
+
+    for (tag, expected_count, tests, reason) in EXCLUSIONS {
+        let step = cfg
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == *tag)
+            .ok_or_else(|| format!("hosted capability-exclusion node {tag} is absent"))?;
+        for test in *tests {
+            if step.cmd.contains(test) {
+                return Err(format!("{tag} already contains hosted exclusion {test}"));
+            }
+        }
+        // These two nodes already have the Nextest/libtest separator for their
+        // local product skips. Other commands may contain unrelated `--`
+        // tokens in an outer helper, so keep this an explicit node property.
+        if !matches!(*tag, "test.cli_on_host" | "test.detcore_misc_on_host") {
+            step.cmd.push_str(" --");
+        }
+        for test in *tests {
+            step.cmd.push_str(" --skip ");
+            step.cmd.push_str(test);
+        }
+        step.env.insert(
+            "NEXTEST_EXPECTED_EXECUTED".into(),
+            expected_count.to_string(),
+        );
+        step.description = format!("HOSTED CAPABILITY DIFFERENCE: {reason}");
     }
     Ok(())
 }
@@ -1455,9 +1627,9 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_structured_result_producers(cfg)?;
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    if cfg.steps.len() != 1598 {
+    if cfg.steps.len() != 1605 {
         return Err(format!(
-            "superset has {} steps, expected 1598",
+            "superset has {} steps, expected 1605",
             cfg.steps.len()
         ));
     }
@@ -1480,6 +1652,39 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
             .find(|step| step.tag() == tag)
             .ok_or_else(|| format!("committed DAG lost {tag}"))
     };
+    for tag in ["build.workspace", "build.runtime_release"] {
+        let producer = step(tag)?;
+        if producer.hint.preferred_inner_jobs != Some(32)
+            || producer.jobs_env.as_deref() != Some("CARGO_BUILD_JOBS")
+            || producer.jobs_flag.as_deref() != Some("")
+        {
+            return Err(format!(
+                "{tag} must expose CARGO_BUILD_JOBS so a smaller admitted CPU cap can lower its 32-worker preference"
+            ));
+        }
+    }
+    for hosted in cfg.steps.iter().filter(|step| {
+        step.labels
+            .iter()
+            .any(|label| label == HOSTED_PORTABLE_LABEL)
+            && step.hint.preferred_inner_jobs.unwrap_or(1) > 1
+    }) {
+        let has_width_channel = hosted
+            .jobs_env
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())
+            || hosted
+                .jobs_flag
+                .as_deref()
+                .is_some_and(|flag| !flag.is_empty());
+        if !has_width_channel {
+            return Err(format!(
+                "{} has preferred_inner_jobs={} but no non-empty jobs_env or jobs_flag through which a smaller hosted runner can enforce its admitted width",
+                hosted.tag(),
+                hosted.hint.preferred_inner_jobs.unwrap()
+            ));
+        }
+    }
     for tag in crate::validation_dag_static::PMU_MEMORY_FAILURE_FAMILY_MEMBERS {
         if step(tag)?.fail_fast_family.as_deref()
             != Some(crate::validation_dag_static::PMU_MEMORY_FAILURE_FAMILY)
@@ -1661,7 +1866,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         .ok_or("committed DAG lost pre.reverie_pin")?;
     if pin.cmd != PIN_GATE_COMMAND {
         return Err(format!(
-            "pre.reverie_pin must use the unconditional with-proxy command; got {:?}",
+            "pre.reverie_pin must use the portable proxy-when-present command; got {:?}",
             pin.cmd
         ));
     }
@@ -1950,6 +2155,8 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     let mut refreshed = refresh_generated_partitions(static_source, generated)?;
     materialize_hosted_portable_selection(&mut refreshed);
     materialize_hosted_test_variants(&mut refreshed)?;
+    materialize_hosted_completion_budgets(&mut refreshed)?;
+    materialize_hosted_capability_exclusions(&mut refreshed)?;
     materialize_pinned_root(&mut refreshed)?;
     materialize_focused_preflight(&mut refreshed)?;
     materialize_quick_super_budgets(&mut refreshed);
@@ -1982,6 +2189,66 @@ pub fn require_fresh(committed: &str, generated: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pin_gate_uses_proxy_only_when_the_runner_provides_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = Scratch::create().unwrap();
+        let root = &scratch.0;
+        let ci = root.join("ci");
+        let bin = ci.join("rust-script-bin");
+        fs::create_dir_all(&bin).unwrap();
+        let checker = ci.join("run-reverie-pin-check.sh");
+        fs::write(
+            &checker,
+            "#!/bin/bash\nprintf 'checker:%s\\n' \"$*\" >>\"$CAPTURE\"\nexit \"${CHECKER_STATUS:-0}\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&checker, fs::Permissions::from_mode(0o755)).unwrap();
+        let capture = root.join("capture");
+
+        let run = |checker_status: i32| {
+            Command::new("bash")
+                .args(["-c", PIN_GATE_COMMAND])
+                .current_dir(root)
+                .env("PATH", "/usr/bin:/bin")
+                .env("CAPTURE", &capture)
+                .env("CHECKER_STATUS", checker_status.to_string())
+                .output()
+                .unwrap()
+        };
+
+        let direct = run(0);
+        assert!(direct.status.success(), "{direct:?}");
+        assert_eq!(
+            fs::read_to_string(&capture).unwrap(),
+            format!("checker:--repo {}\n", root.display())
+        );
+        fs::write(&capture, "").unwrap();
+        assert_eq!(run(23).status.code(), Some(23));
+
+        fs::write(
+            bin.join("with-proxy"),
+            "#!/bin/bash\nprintf 'proxy:%s\\n' \"$*\" >>\"$CAPTURE\"\nexec \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(bin.join("with-proxy"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&capture, "").unwrap();
+
+        let proxied = run(0);
+        assert!(proxied.status.success(), "{proxied:?}");
+        assert_eq!(
+            fs::read_to_string(&capture).unwrap(),
+            format!(
+                "proxy:./ci/run-reverie-pin-check.sh --repo {}\nchecker:--repo {}\n",
+                root.display(),
+                root.display()
+            )
+        );
+        fs::write(&capture, "").unwrap();
+        assert_eq!(run(23).status.code(), Some(23));
+    }
 
     #[test]
     fn manifest_setup_prepares_tracked_dagrun_before_cargo_with_admitted_width() {
@@ -2507,7 +2774,9 @@ sys.exit(37)
         );
         for step in parity {
             assert_eq!(step.cmd.matches("--parity-reference ptrace").count(), 1);
-            assert!(step.cmd.contains("--category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --jobs 8"));
+            assert!(step.cmd.contains("--category backend-parity-c --ci-only --allow-empty --prebuilt --parity-reference ptrace --results"));
+            assert_eq!(step.jobs_flag.as_deref(), Some("--jobs"));
+            assert_eq!(step.hint.preferred_inner_jobs, Some(8));
             let selector = step.manifest.as_ref().unwrap();
             assert_eq!(selector.lane, "portable");
             assert_eq!(selector.category, "backend-parity-c");
@@ -2515,8 +2784,11 @@ sys.exit(37)
             assert_eq!(selector.mode, None);
             assert_eq!(selector.backend, None);
             assert_eq!(step.hint.resources.get("manifest_guest"), Some(&8));
-            assert_eq!(step.hint.preferred_inner_jobs, Some(8));
             assert!(!step.cmd.contains("--probe-disabled"));
+            if step.tag() == "e2e.manifest_backend_parity_c_on_host" {
+                assert_eq!(step.timeout, 720);
+                assert!(step.description.contains("276 selected cells"));
+            }
         }
     }
 
@@ -2574,8 +2846,17 @@ sys.exit(37)
             .collect::<BTreeSet<_>>();
         assert_eq!(new_variants.len(), 189);
         new_variants.extend(shared_tests.map(|job| format!("test.{job}_on_host")));
-        new_variants.insert("compatprep.fixtures_on_host".into());
-        assert_eq!(new_variants.len(), 206);
+        new_variants.extend([
+            "build.e2e_artifact_on_host".into(),
+            "build.liteinst_runtime_release_on_host".into(),
+            "build.workspace_on_host".into(),
+            "check.backend_parity_suites_on_host".into(),
+            "compatprep.fixtures_on_host".into(),
+            "doc.doctests_on_host".into(),
+            "doc.rustdoc_on_host".into(),
+            "lint.clippy_on_host".into(),
+        ]);
+        assert_eq!(new_variants.len(), 213);
         let mut expected = legacy_variants
             .map(str::to_string)
             .into_iter()
@@ -2636,15 +2917,15 @@ sys.exit(37)
             "{error}"
         );
 
-        let mut planted_pin_fallback = committed.clone();
-        planted_pin_fallback
+        let mut planted_unconditional_proxy = committed.clone();
+        planted_unconditional_proxy
             .steps
             .iter_mut()
             .find(|step| step.tag() == "pre.reverie_pin")
             .unwrap()
-            .cmd = "if command -v with-proxy; then with-proxy true; else true; fi".into();
-        let error = assert_invariants(&planted_pin_fallback, &cells).unwrap_err();
-        assert!(error.contains("unconditional with-proxy"), "{error}");
+            .cmd = "with-proxy ./ci/run-reverie-pin-check.sh --repo \"$PWD\"".into();
+        let error = assert_invariants(&planted_unconditional_proxy, &cells).unwrap_err();
+        assert!(error.contains("portable proxy-when-present"), "{error}");
 
         let mut planted_missing_rust_script_dep = committed.clone();
         planted_missing_rust_script_dep
@@ -2673,6 +2954,113 @@ sys.exit(37)
             error.contains("hosted-portable label has 250 direct steps"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn hosted_capability_exclusions_are_exact_and_leave_local_validation_intact() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        for (hosted_tag, local_tag, expected_count, excluded) in [
+            (
+                "test.cli_on_host",
+                "test.cli",
+                "73",
+                &[
+                    "namespace_only_applies_a_fresh_private_tmpfs_workdir",
+                    "namespace_only_applies_minimal_and_explicit_environment",
+                    "namespace_only_preserves_default_host_environment",
+                    "namespace_only_propagates_guest_exit_status",
+                    "skid_overshoot_and_guest_failure_have_different_exit_codes",
+                ][..],
+            ),
+            (
+                "test.hermit_integration_on_host",
+                "test.hermit_integration",
+                "153",
+                &[
+                    "chroot_mountinfo_subset_keeps_fdinfo_identity_consistent",
+                    "private_evidence_does_not_reuse_the_public_log_file_or_add_a_worker",
+                    "sidecar_does_not_replace_or_reopen_guest_standard_descriptors",
+                    "sidecar_preserves_session_and_process_group_identity",
+                    "sidecar_preserves_stdout_stderr_status_and_reports_nonzero_info",
+                ][..],
+            ),
+            (
+                "test.liteinst_strict_on_host",
+                "test.liteinst_strict",
+                "22",
+                &[
+                    "liteinst_strict_verify_shell_and_entropy_consumer",
+                    "liteinst_strict_verify_semantic_file_and_sqlite_utilities",
+                ][..],
+            ),
+            (
+                "test.sabre_examples_on_host",
+                "test.sabre_examples",
+                "2",
+                &[
+                    "sabre_libc_getrandom_is_deterministic",
+                    "sabre_non_racy_examples_verify_current_envelope",
+                    "sabre_root_pid_matches_ptrace",
+                    "sabre_scheduler_empty_info_precedes_fallback_completed_info",
+                ][..],
+            ),
+            (
+                "test.detcore_misc_on_host",
+                "test.detcore_misc",
+                "26",
+                &["vfork_parent_resumes_after_child_exec"][..],
+            ),
+            (
+                "test.hermit_unit_on_host",
+                "test.hermit_unit",
+                "706",
+                &["e9patch::tests::cache_directory_is_private_and_not_a_symlink"][..],
+            ),
+        ] {
+            let hosted = committed
+                .steps
+                .iter()
+                .find(|step| step.tag() == hosted_tag)
+                .unwrap();
+            let local = committed
+                .steps
+                .iter()
+                .find(|step| step.tag() == local_tag)
+                .unwrap();
+            assert_eq!(
+                hosted
+                    .env
+                    .get("NEXTEST_EXPECTED_EXECUTED")
+                    .map(String::as_str),
+                Some(expected_count)
+            );
+            assert!(
+                hosted
+                    .description
+                    .starts_with("HOSTED CAPABILITY DIFFERENCE:"),
+                "{hosted_tag} omits its divergence description"
+            );
+            for test in excluded {
+                assert_eq!(hosted.cmd.matches(test).count(), 1, "{hosted_tag}: {test}");
+                assert!(!local.cmd.contains(test), "{local_tag} excluded {test}");
+            }
+            if hosted_tag == "test.hermit_unit_on_host" {
+                assert!(!hosted.cmd.contains("kvm-native-test-support"));
+                assert!(local.cmd.contains("kvm-native-test-support"));
+                assert!(
+                    hosted
+                        .description
+                        .contains("three native scheduler controls")
+                );
+            }
+            if hosted_tag == "test.detcore_misc_on_host" {
+                assert_eq!(
+                    hosted.cmd.matches(" -- ").count(),
+                    1,
+                    "{hosted_tag} must retain exactly one libtest separator"
+                );
+            }
+        }
     }
 
     #[test]

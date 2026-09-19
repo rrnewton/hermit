@@ -844,6 +844,7 @@ def check_signal_refusal_does_not_skip_incomplete_exit() -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = sys.argv[1:] if argv is None else argv
+    hosted_without_parent = args == ["--hosted-without-parent-adapter"]
     if args == ["--final-status-self-test"]:
         run_final_validate_status_contract()
         print(
@@ -851,9 +852,9 @@ def main(argv: list[str] | None = None) -> None:
             "and re-entrancy reason are classified together"
         )
         return
-    if args:
+    if args and not hosted_without_parent:
         raise SystemExit(
-            "usage: test_validate_stop_paths.py [--final-status-self-test]"
+            "usage: test_validate_stop_paths.py [--final-status-self-test|--hosted-without-parent-adapter]"
         )
 
     # Every child this file spawns is a fixture, not a nested validation. The
@@ -880,10 +881,16 @@ def main(argv: list[str] | None = None) -> None:
     # refuse=True arm plants its own adapter and never needed a parent. Claiming
     # they ran was false, and abandoning them cost real coverage for a precondition
     # that affects exactly one arm of one case.
-    try:
-        run_canonical_adapter_contract(refuse=False)
-    except NoParentAdapter as exc:
-        unevaluated.append(f"canonical adapter contract, accept arm: {exc}")
+    if hosted_without_parent:
+        print(
+            "HOST-INAPPLICABLE: canonical adapter accept arm requires the private "
+            "dev-hermit ledger writer; local validation exercises it"
+        )
+    else:
+        try:
+            run_canonical_adapter_contract(refuse=False)
+        except NoParentAdapter as exc:
+            unevaluated.append(f"canonical adapter contract, accept arm: {exc}")
     run_canonical_adapter_contract(refuse=True)
     run_cleanup_signal_race()
     leaked = [path for path in TEST_ROOTS if path.exists()]
@@ -918,7 +925,7 @@ def main(argv: list[str] | None = None) -> None:
             file=sys.stderr,
         )
     signals_ran = not any(item.startswith("signal stop paths") for item in unevaluated)
-    adapter_unevaluated = any(
+    adapter_unevaluated = hosted_without_parent or any(
         item.startswith("canonical adapter") for item in unevaluated
     )
     print(

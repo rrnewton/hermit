@@ -101,6 +101,10 @@ EOF
 cat >"$FIXTURE_ROOT/df/mountinfo" <<'EOF'
 1 0 0:1 / / rw,relatime - rootfs rootfs rw
 EOF
+# The preload helper writes through this stable, run-owned inode. Keeping the
+# marker beside the fixture (rather than in /tmp) makes it visible across the
+# guest process boundary without exposing the host's mutable /tmp to the run.
+: >"$FIXTURE_ROOT/df/redirected"
 
 # Prevent host build time from becoming guest-visible input.
 find "$FIXTURE_ROOT" -exec touch -h -d @1 {} +

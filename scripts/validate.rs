@@ -13507,6 +13507,7 @@ exec env -u HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER -u HERMIT_TEST_WALL_TIMEOUT_MULTI
             "run-split-validate.sh",
             "retry-fetch.sh",
             "run-in-pinned-root.sh",
+            "retry-fetch.sh",
             "image.digest",
         ] {
             std::fs::copy(
@@ -22549,6 +22550,7 @@ mod committed_selection_preservation_tests {
             "ci/hermetic/run-split-validate.sh",
             "ci/hermetic/retry-fetch.sh",
             "ci/check-shard-coverage.sh",
+            "ci/run-hosted-node.sh",
             "ci/expected-e2e-plan.json",
             ".github/workflows/ci-portable.yml",
         ] {

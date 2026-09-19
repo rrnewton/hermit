@@ -411,7 +411,8 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
         if !command.contains(marker) {
             continue;
         }
-        let parsed = split_arguments(&command_arguments(&command, marker)?)?;
+        let parsed = split_arguments(&command_arguments(&command, marker)?)
+            .map_err(|error| format!("{tag}: {error}"))?;
         if parsed.build != expected {
             return Err(format!(
                 "{tag} command has Cargo selection {:?}, declared {expected:?}",
@@ -538,7 +539,14 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "158");
+            assert_eq!(
+                step.env["NEXTEST_EXPECTED_EXECUTED"],
+                if tag.ends_with("_on_host") {
+                    "153"
+                } else {
+                    "158"
+                }
+            );
 
             let mut omitted_execution = step.clone();
             omitted_execution.cmd = omitted_execution.cmd.replace("--test child_time_rpc ", "");
@@ -564,6 +572,11 @@ mod tests {
             .iter()
             .find(|step| step.tag() == "build.workspace")
             .unwrap();
+        let hosted = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace_on_host")
+            .unwrap();
         let image = graph
             .steps
             .iter()
@@ -572,7 +585,11 @@ mod tests {
         assert_eq!(execution_command(image).unwrap(), host.cmd);
         for (consumer, producer, wrong_command) in [
             ("test.regular_crates", image.tag(), host.cmd.clone()),
-            ("test.regular_crates_on_host", host.tag(), image.cmd.clone()),
+            (
+                "test.regular_crates_on_host",
+                hosted.tag(),
+                image.cmd.clone(),
+            ),
         ] {
             let mut wrong_root = graph.clone();
             wrong_root
@@ -612,16 +629,61 @@ mod tests {
         for (key, selection) in &portable {
             assert_eq!(full.get(key), Some(selection));
         }
-        for tag in ["test.hermit_unit", "test.hermit_unit_on_host"] {
-            let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
-            let selection: Vec<String> = serde_json::from_str(&step.env[SELECTION_ENV]).unwrap();
-            assert!(selection.contains(&"third-party-backends,kvm-native-test-support".into()));
+        let local_unit = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.hermit_unit")
+            .unwrap();
+        let local_selection: Vec<String> =
+            serde_json::from_str(&local_unit.env[SELECTION_ENV]).unwrap();
+        assert!(local_selection.contains(&"third-party-backends,kvm-native-test-support".into()));
+        let hosted_unit = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.hermit_unit_on_host")
+            .unwrap();
+        let hosted_selection: Vec<String> =
+            serde_json::from_str(&hosted_unit.env[SELECTION_ENV]).unwrap();
+        assert!(hosted_selection.contains(&"third-party-backends".into()));
+        assert!(
+            !hosted_selection
+                .iter()
+                .any(|arg| arg.contains("kvm-native-test-support"))
+        );
+        for selection in [&local_selection, &hosted_selection] {
             assert!(
                 !selection
                     .iter()
                     .any(|arg| arg.contains("kvm-execution-tests"))
             );
         }
+        let hosted_producer = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace_on_host")
+            .unwrap();
+        assert!(
+            hosted_producer
+                .cmd
+                .ends_with("./ci/nextest-binaries.rs prepare hosted-portable")
+        );
+        let hosted_artifact = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.e2e_artifact_on_host")
+            .unwrap();
+        assert!(
+            hosted_unit
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.e2e_artifact_on_host")
+        );
+        assert!(
+            hosted_artifact
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.workspace_on_host")
+        );
         let mut missing_hardware = graph.clone();
         let producer = missing_hardware
             .steps
