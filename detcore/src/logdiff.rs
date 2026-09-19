@@ -1523,6 +1523,58 @@ pub fn try_log_diff_detailed(
     try_log_diff_detailed_with_filter(file_a, file_b, opts, |_| true)
 }
 
+/// Compare two current Hermit logs under the canonical `BitwiseInfoV1` policy.
+///
+/// This is the fixed-policy entrypoint for callers whose verdict depends on
+/// canonical parity. Callers provide only the two inputs and their reader-facing
+/// labels; they cannot weaken the comparison with [`LogDiffOpts`]. The bound
+/// policy compares every INFO record in the all-record envelope, requires
+/// current structured DETLOG events, canonicalizes only explicitly marked host
+/// addresses to first-appearance ordinals, and otherwise compares the selected
+/// messages exactly. It applies no line, message-class, or record filter and
+/// never delegates the verdict to `git diff`.
+///
+/// The returned [`LogDiffSummary`] carries the existing compared counts,
+/// first-divergence fields, and truncation-refusal flag. Missing, unreadable, or
+/// malformed inputs remain an [`std::io::Error`]; a bounded-writer truncation is
+/// an `Ok` summary with [`LogDiffSummary::refused`] set so callers cannot mistake
+/// either case for a match.
+pub fn try_compare_bitwise_info_v1(
+    file_a: &Path,
+    file_b: &Path,
+    side_labels: ComparisonSideLabels,
+) -> std::io::Result<LogDiffSummary> {
+    let opts = bitwise_info_v1_options(side_labels);
+    try_log_diff_detailed(file_a, file_b, &opts)
+}
+
+/// Construct the complete fixed policy used by
+/// [`try_compare_bitwise_info_v1`]. Keep every field explicit: relying on
+/// `LogDiffOpts::default()` here would let a future diagnostic default silently
+/// change the canonical comparison.
+fn bitwise_info_v1_options(side_labels: ComparisonSideLabels) -> LogDiffOpts {
+    LogDiffOpts {
+        strip_lines: false,
+        canonicalize_addresses: true,
+        comparison: LogComparisonMode::Info,
+        side_labels,
+        require_structured_events: true,
+        print_logs: false,
+        limit: 20,
+        ignore_lines: Vec::new(),
+        syscall_history: 5,
+        no_color: false,
+        skip_commit: false,
+        skip_detlog: false,
+        git_diff: false,
+        include_detlogs: vec![
+            DetLogFilter::Syscall,
+            DetLogFilter::SyscallResult,
+            DetLogFilter::Other,
+        ],
+    }
+}
+
 /// Fallible log comparison with a caller-supplied record filter.
 ///
 /// Existing callers keep the unfiltered behavior through
@@ -2014,6 +2066,195 @@ mod test {
     fn compare(left: &str, right: &str) -> super::PrefixComparison {
         super::compare_complete_prefix(left, right, &info_opts(), &mut Vec::new())
             .expect("comparing in-memory strings cannot fail on I/O")
+    }
+
+    fn temp_log(contents: &str) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().expect("create temporary log");
+        std::fs::write(file.path(), contents).expect("write temporary log");
+        file
+    }
+
+    #[test]
+    fn bitwise_info_v1_entrypoint_binds_the_complete_policy() {
+        let labels = super::ComparisonSideLabels::new("ptrace reference", "candidate run");
+        let options = super::bitwise_info_v1_options(labels.clone());
+
+        assert!(!options.strip_lines);
+        assert!(options.canonicalize_addresses);
+        assert_eq!(options.comparison, super::LogComparisonMode::Info);
+        assert_eq!(options.side_labels, labels);
+        assert!(options.require_structured_events);
+        assert!(!options.print_logs);
+        assert_eq!(options.limit, 20);
+        assert!(options.ignore_lines.is_empty());
+        assert_eq!(options.syscall_history, 5);
+        assert!(!options.no_color);
+        assert!(!options.skip_commit);
+        assert!(!options.skip_detlog);
+        assert!(!options.git_diff);
+        assert_eq!(
+            options.include_detlogs,
+            [
+                DetLogFilter::Syscall,
+                DetLogFilter::SyscallResult,
+                DetLogFilter::Other,
+            ]
+        );
+        assert_eq!(
+            super::LogComparisonPolicy::from_options(&options),
+            super::LogComparisonPolicy {
+                comparison: super::LogComparisonMode::Info,
+                normalization: super::LogNormalization::Canonical,
+            }
+        );
+    }
+
+    #[test]
+    fn bitwise_info_v1_entrypoint_matches_nonempty_structured_info() -> std::io::Result<()> {
+        let left = temp_log(&structured_record(
+            1,
+            &format!("DETLOG allocation={}", super::host_addr(0x1000)),
+            DetLogEvent::Other,
+        ));
+        let right = temp_log(&structured_record(
+            1,
+            &format!("DETLOG allocation={}", super::host_addr(0x9000)),
+            DetLogEvent::Other,
+        ));
+
+        let summary = super::try_compare_bitwise_info_v1(
+            left.path(),
+            right.path(),
+            super::ComparisonSideLabels::new("ptrace reference", "candidate run"),
+        )?;
+
+        assert!(summary.matched_with_evidence());
+        assert_eq!((summary.compared_left, summary.compared_right), (1, 1));
+        assert!(!summary.refused);
+        Ok(())
+    }
+
+    #[test]
+    fn bitwise_info_v1_entrypoint_reports_first_all_record_info_difference() -> std::io::Result<()>
+    {
+        let common = structured_record(1, "DETLOG stable", DetLogEvent::Other);
+        let left = temp_log(&format!(
+            "{common}Apr 09 06:08:02.100  INFO guest_observer: payload=A\n"
+        ));
+        let right = temp_log(&format!(
+            "{common}Apr 09 06:08:02.100  INFO guest_observer: payload=B\n"
+        ));
+
+        for (left_path, right_path, expected_left, expected_right) in [
+            (
+                left.path(),
+                right.path(),
+                "INFO guest_observer: payload=A",
+                "INFO guest_observer: payload=B",
+            ),
+            (
+                right.path(),
+                left.path(),
+                "INFO guest_observer: payload=B",
+                "INFO guest_observer: payload=A",
+            ),
+        ] {
+            let summary = super::try_compare_bitwise_info_v1(
+                left_path,
+                right_path,
+                super::ComparisonSideLabels::new("left input", "right input"),
+            )?;
+
+            assert!(summary.diff_found);
+            assert!(!summary.refused);
+            assert_eq!((summary.compared_left, summary.compared_right), (2, 2));
+            assert_eq!(summary.first_divergent_record, Some(2));
+            assert_eq!(
+                summary.first_divergent_left_message.as_deref(),
+                Some(expected_left)
+            );
+            assert_eq!(
+                summary.first_divergent_right_message.as_deref(),
+                Some(expected_right)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bitwise_info_v1_entrypoint_cannot_match_empty_missing_or_unreadable_inputs()
+    -> std::io::Result<()> {
+        let empty_left = temp_log("");
+        let empty_right = temp_log("");
+        let empty = super::try_compare_bitwise_info_v1(
+            empty_left.path(),
+            empty_right.path(),
+            super::ComparisonSideLabels::default(),
+        )?;
+        assert!(!empty.matched_with_evidence());
+        assert_eq!((empty.compared_left, empty.compared_right), (0, 0));
+
+        let missing_parent = tempfile::tempdir()?;
+        let missing = missing_parent.path().join("missing.log");
+        assert!(
+            super::try_compare_bitwise_info_v1(
+                &missing,
+                empty_right.path(),
+                super::ComparisonSideLabels::default(),
+            )
+            .is_err(),
+            "a missing input must be an error, never a match"
+        );
+
+        let directory = tempfile::tempdir()?;
+        assert!(
+            super::try_compare_bitwise_info_v1(
+                directory.path(),
+                empty_right.path(),
+                super::ComparisonSideLabels::default(),
+            )
+            .is_err(),
+            "an unreadable non-file input must be an error, never a match"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bitwise_info_v1_entrypoint_refuses_truncation() -> std::io::Result<()> {
+        let body = structured_record(1, "DETLOG stable", DetLogEvent::Other);
+        let truncated = temp_log(&format!("{body}{}\n", super::TRUNCATION_MARKER));
+        let complete = temp_log(&body);
+
+        let summary = super::try_compare_bitwise_info_v1(
+            truncated.path(),
+            complete.path(),
+            super::ComparisonSideLabels::default(),
+        )?;
+
+        assert!(summary.diff_found);
+        assert!(summary.refused);
+        assert!(!summary.matched_with_evidence());
+        assert_eq!((summary.compared_left, summary.compared_right), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn bitwise_info_v1_entrypoint_requires_current_structured_events() {
+        let historical = temp_log(&record(1, "DETLOG stable"));
+        let error = super::try_compare_bitwise_info_v1(
+            historical.path(),
+            historical.path(),
+            super::ComparisonSideLabels::new("ptrace reference", "candidate run"),
+        )
+        .expect_err("a current comparison must refuse a prose-only DETLOG record");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("ptrace reference log record 1"));
+        assert!(
+            error
+                .to_string()
+                .contains("missing its structured DETLOG result")
+        );
     }
 
     #[test]
