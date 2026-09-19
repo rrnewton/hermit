@@ -166,7 +166,9 @@ pub(super) const APPLICATION_RESULT_PRODUCERS: &[&str] = &["test.applications_e2
 /// independent of Nextest's output parser and make an empty or narrowed run
 /// refuse rather than minting a smaller successful population.
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
-    ("test.regular_crates", 392),
+    // 396 existing tests, including the four generate-test-footprints binary tests, plus the 19
+    // test-harness regressions introduced with the retained-DAG runner integration.
+    ("test.regular_crates", 415),
     ("test.hermit_unit", 490),
     ("test.detcore_unit", 652),
     ("test.detcore_misc", 27),

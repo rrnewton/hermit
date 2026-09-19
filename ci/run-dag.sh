@@ -8,15 +8,13 @@
 # run-dag.sh — run a Hermit CI validation lane as a dagrun DAG.
 #
 # This entrypoint is the shared local/GitHub execution path for the centralized
-# validation profiles. Each gate is an independently boxed node with explicit
-# dependencies and resource limits (see ci/dag/README.md). Every standard
-# profile selects a labelled subset of the same committed DAG; launch never
-# rewrites commands, dependencies, or resource policy.
+# validation profiles. It asks scripts/validate.rs for the selected graph from
+# the committed validation DAG, retains that exact input and its run state, and
+# hands the graph to the tracked Rust dagrun runner on stdin.
 #
 # Usage:
 #   ci/run-dag.sh <label> [runner-args...]
 #     <label>           quick | portable | full | super | privileged
-#                       (selects labelled steps from ci/dag/validate.json)
 #     runner-args       allowlisted non-selection controls forwarded to `dagrun run`
 #                       (e.g. -j 8, --max-mem 32G, --perf-dir ./perf,
 #                        -k/--keep-going, -v, -q)
@@ -26,41 +24,131 @@
 # Examples:
 #   ci/run-dag.sh portable --max-mem 32G
 #   ci/run-dag.sh privileged -j 1 --perf-dir ./perf
-#   agent-utils/py/bin/dagrun ascii --dag ci/dag/validate.json
+#   ci/run-dag.sh portable json
 #
-# Environment:
-#   DAGRUN_BIN     override the runner executable to use.
+# Runner:
+#   run-dag.sh always constructs the selected graph with
+#   scripts/validate.rs --write-constructed-dag into a unique retained
+#   target/validation/run-dag.* directory, then execs the tracked Rust runner at
+#   agent-utils/rs/bin/dagrun with --dag -. Runtime runner, graph, and label
+#   overrides are refused.
 
 set -uo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR" || exit 2
 
-# shellcheck source=ci/configure-build-jobs.sh
-source "$ROOT_DIR/ci/configure-build-jobs.sh" launcher || exit $?
+print_help() {
+    cat <<'EOF'
+run-dag.sh — run a Hermit CI validation profile as a dagrun DAG.
+
+Usage:
+  ci/run-dag.sh <label> [runner-args...]
+    <label>            quick | portable | full | super | privileged
+    runner-args       either a leading inspection verb, then that verb's flags,
+                      or allowlisted run-mode controls for the default `run` verb
+
+Runner verbs:
+  run                 default; executes the DAG
+  list | ascii | dot | json
+                      consumed as the dagrun verb before --dag -
+
+Examples:
+  ci/run-dag.sh portable --max-mem 32G
+  ci/run-dag.sh privileged -j 1 --perf-dir ./perf
+  ci/run-dag.sh portable json
+
+Runner and DAG:
+  run-dag.sh constructs the selected graph with
+  scripts/validate.rs --write-constructed-dag into a unique retained
+  target/validation/run-dag.* directory. It then execs the tracked Rust
+  scheduler at agent-utils/rs/bin/dagrun with --dag - and feeds the constructed
+  DAG on stdin. Runtime overrides that would select a different scheduler,
+  graph, or label are refused: DAGRUN_BIN, DAGRUN_ENGINE,
+  RUN_DAG_FILE_OVERRIDE, RUN_DAG_LABEL_OVERRIDE, and forwarded selection flags
+  are not supported.
+
+Retention:
+  After a generated DAG directory has been allocated, it is intentionally
+  retained for construction and runner outcomes. Pre-allocation refusals have
+  no retained path. When a retained path is printed, inspect that exact path
+  after failures. Validation checkout lifecycle cleanup may remove it later only
+  after no validation run is active; for persistent local runs, remove it
+  manually after confirming no active process still needs it.
+
+Containment:
+  dagrun's normal run mode uses its configured boxing policy. Explicit unboxed
+  flags such as --unsafe-no-cgroups, or --allow-cgroup-failure fallback, are not
+  containment guarantees.
+
+Environment:
+  CI_DAG_BUILD_JOBS   optional build-job count consumed by
+                      ci/configure-build-jobs.sh for execution. Invalid values
+                      are refused for execution, but -h/--help is available
+                      before configuration validation.
+
+Options:
+  -h, --help       Print this help
+EOF
+}
+
+is_help_arg() {
+    [[ ${1:-} == -h || ${1:-} == --help ]]
+}
+
+is_supported_label() {
+    [[ ${1:-} =~ ^(quick|portable|full|super|privileged)$ ]]
+}
+
+is_inspection_verb() {
+    [[ ${1:-} == list || ${1:-} == ascii || ${1:-} == dot || ${1:-} == json ]]
+}
+
+if (($# == 1)) && is_help_arg "$1"; then
+    print_help
+    exit 0
+fi
+
+if (($# == 2)) && is_supported_label "$1" && is_help_arg "$2"; then
+    print_help
+    exit 0
+fi
+
+if (($# == 3)) && is_supported_label "$1" && is_inspection_verb "$2" && is_help_arg "$3"; then
+    print_help
+    exit 0
+fi
 
 if (($# < 1)); then
     echo "usage: ci/run-dag.sh <quick|portable|full|super|privileged> [runner-args...]" >&2
     exit 2
 fi
 
+# shellcheck source=ci/configure-build-jobs.sh
+source "$ROOT_DIR/ci/configure-build-jobs.sh" launcher || exit $?
+
 lane=$1
 shift
 
-if [[ -n ${RUN_DAG_FILE_OVERRIDE:-} ]]; then
-    echo "run-dag.sh: RUN_DAG_FILE_OVERRIDE was removed; runtime validation accepts only ci/dag/validate.json" >&2
-    exit 2
-fi
-dag="$ROOT_DIR/ci/dag/validate.json"
-if [[ ! $lane =~ ^(quick|portable|full|super|privileged)$ ]]; then
+for name in DAGRUN_BIN DAGRUN_ENGINE RUN_DAG_FILE_OVERRIDE RUN_DAG_LABEL_OVERRIDE; do
+    if [[ -n ${!name:-} ]]; then
+        echo "run-dag.sh: $name is not supported for CI DAG execution." >&2
+        echo "            Use ci/run-dag.sh <quick|portable|full|super|privileged>; it constructs the selected DAG and runs agent-utils/rs/bin/dagrun." >&2
+        exit 2
+    fi
+done
+
+if ! is_supported_label "$lane"; then
     echo "run-dag.sh: unknown validation label '$lane'" >&2
     echo "            known labels: quick, portable, full, super, privileged" >&2
     exit 2
 fi
 case $lane in
-    portable) selection_label=hosted-portable ;;
-    privileged) selection_label=hosted-privileged ;;
-    *) selection_label=$lane ;;
+    quick) validate_selector=quick ;;
+    portable) validate_selector=--hosted-portable-only ;;
+    full) validate_selector=full ;;
+    super) validate_selector=super ;;
+    privileged) validate_selector=--hosted-privileged-only ;;
 esac
 
 # The wrapper, not its caller, owns both graph identity and label selection.
@@ -117,53 +205,6 @@ validate_runner_args() {
     done
 }
 
-validate_runner_args "$@" || exit $?
-
-# Locate the runner. Prefer an explicit override, then the TRACKED, source-invoked
-# engine resolver (agent-utils/common/bin/dagrun -> engine-resolver),
-# then the tracked, source-invoked Python entrypoint. NEVER auto-select the
-# untracked prebuilt Rust binary (rs/bin): a compiled artifact can silently drift
-# from its source, which is exactly how a runner missing an enforcement guard (the
-# historical cpu_timeout gap) can run while we believe we are boxed.
-#
-# The staleness axis is SOURCE-INVOKED vs PREBUILT-BINARY, not Rust vs Python. The
-# resolver enforces that: it defaults to the source-invoked Python entrypoint,
-# selects the Rust engine ONLY on explicit DAGRUN_ENGINE=rust (never a
-# silent fallback), and LOGS the winning engine + its exact path on every run. So
-# invoking it here keeps hermit's execution path deterministic, tracked, and
-# self-describing in the logs. Rust is reached the same way through the resolver
-# once it is invoked source-first (rust-script), not via a prebuilt-binary shortcut.
-find_runner() {
-    if [[ -n ${DAGRUN_BIN:-} ]]; then
-        printf '%s\n' "$DAGRUN_BIN"
-        return 0
-    fi
-    local base="$ROOT_DIR/agent-utils"
-    # Tracked, source-invoked resolver: deterministic engine selection that logs
-    # which engine won. Preferred over any prebuilt binary.
-    if [[ -x "$base/common/bin/dagrun" ]]; then
-        printf '%s\n' "$base/common/bin/dagrun"
-        return 0
-    fi
-    # Fallback: the tracked, source-invoked Python entrypoint directly.
-    if [[ -x "$base/py/bin/dagrun" ]]; then
-        printf '%s\n' "$base/py/bin/dagrun"
-        return 0
-    fi
-    # Last resort: a resolver/runner already on PATH.
-    if command -v dagrun >/dev/null 2>&1; then
-        command -v dagrun
-        return 0
-    fi
-    return 1
-}
-
-runner=$(find_runner) || {
-    echo "run-dag.sh: dagrun not found." >&2
-    echo "            Build it with: (cd agent-utils && ./setup) or set DAGRUN_BIN." >&2
-    exit 2
-}
-
 # A leading non-`run` verb (list/ascii/dot/json) is passed straight through; the
 # common case is `run` with scheduling flags.
 verb=run
@@ -172,33 +213,89 @@ if (($# > 0)) && [[ $1 == list || $1 == ascii || $1 == dot || $1 == json ]]; the
     shift
 fi
 
-if [[ $verb != run ]]; then
-    echo "run-dag.sh: '$verb' cannot represent the '$lane' label selection." >&2
-    echo "            Inspect the committed superset directly: $runner $verb --dag $dag" >&2
+validate_runner_args "$@" || exit $?
+
+runner="$ROOT_DIR/agent-utils/rs/bin/dagrun"
+echo "run-dag.sh: label=$lane runner=$runner verb=$verb cargo-jobs=$CARGO_BUILD_JOBS reverie-dbt-budget=portable-build-child-only" >&2
+if [[ ! -e $runner ]]; then
+    echo "run-dag.sh: fixed Rust dagrun runner is missing: $runner" >&2
+    echo "            Build or repair the tracked agent-utils checkout so agent-utils/rs/bin/dagrun exists." >&2
+    exit 127
+fi
+if [[ ! -f $runner || ! -x $runner ]]; then
+    echo "run-dag.sh: fixed Rust dagrun runner is not an executable file: $runner" >&2
+    echo "            Build or repair the tracked agent-utils checkout so agent-utils/rs/bin/dagrun is executable." >&2
+    exit 126
+fi
+
+if [[ -n ${VALIDATE_RUN_STATE:-} ]]; then
+    echo "run-dag.sh: refusing inherited VALIDATE_RUN_STATE; every top-level run owns a unique retained state directory" >&2
     exit 2
 fi
 
-echo "run-dag.sh: lane=$lane selection-label=$selection_label runner=$runner verb=$verb cargo-jobs=$CARGO_BUILD_JOBS reverie-dbt-budget=portable-build-child-only" >&2
+export HERMIT_REAL_RUST_SCRIPT
+HERMIT_REAL_RUST_SCRIPT=$(command -v rust-script) || {
+    echo "run-dag.sh: rust-script is required" >&2
+    exit 2
+}
+HERMIT_REAL_RUST_SCRIPT=$(realpath -- "$HERMIT_REAL_RUST_SCRIPT") || exit 2
+prebuilt_rust_script=$(realpath -m -- "$ROOT_DIR/ci/rust-script-bin/rust-script") || exit 2
+if [[ $HERMIT_REAL_RUST_SCRIPT == "$prebuilt_rust_script" ]]; then
+    echo "run-dag.sh: construction requires the real rust-script executable before the prebuilt shim in PATH" >&2
+    exit 2
+fi
+rust_script_bootstrap_path=$(dirname -- "$HERMIT_REAL_RUST_SCRIPT"):$PATH
+
+dag_parent="$ROOT_DIR/target/validation"
+mkdir -p "$dag_parent" || exit 2
+dag_dir=$(mktemp -d "$dag_parent/run-dag.XXXXXXXXXX") || exit 2
+dag_file="$dag_dir/$lane.json"
+
+env -u HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED \
+    -u HERMIT_RUST_SCRIPT_ARTIFACT_ROOT \
+    PATH="$rust_script_bootstrap_path" \
+    "$ROOT_DIR/scripts/validate.rs" \
+    "$validate_selector" --write-constructed-dag "$dag_file" 1>&2
+rc=$?
+if ((rc != 0)); then
+    echo "run-dag.sh: DAG construction failed; retained generated DAG directory: $dag_dir" >&2
+    echo "            Inspect that path, then remove it only after confirming no validation run is active." >&2
+    exit "$rc"
+fi
+
 if [[ $verb == run ]]; then
-    export HERMIT_REAL_RUST_SCRIPT
-    HERMIT_REAL_RUST_SCRIPT=$(command -v rust-script) || {
-        echo "run-dag.sh: rust-script is required" >&2
-        exit 2
-    }
     export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$ROOT_DIR/target/ci/rust-scripts"
     export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1
     export PATH="$ROOT_DIR/ci/rust-script-bin:$PATH"
 fi
+
+echo "run-dag.sh: retained generated DAG directory: $dag_dir" >&2
+echo "            Validation checkout lifecycle cleanup may remove it after no validation run is active." >&2
+
 if [[ $verb == run ]]; then
-    if [[ -n ${VALIDATE_RUN_STATE:-} ]]; then
-        echo "run-dag.sh: refusing inherited VALIDATE_RUN_STATE; every top-level run owns a unique state directory" >&2
-        exit 2
-    fi
-    VALIDATE_RUN_STATE="$ROOT_DIR/target/validation/run-dag-${lane}-$$-$(date +%s%N)"
+    VALIDATE_RUN_STATE="$dag_dir/run-state"
     export VALIDATE_RUN_STATE
     export E2E_RESULT_ROOT=${E2E_RESULT_ROOT:-"$VALIDATE_RUN_STATE/results"}
     export E2E_BUILD_ROOT=${E2E_BUILD_ROOT:-"$VALIDATE_RUN_STATE/build"}
     mkdir -p "$VALIDATE_RUN_STATE" "$E2E_RESULT_ROOT" "$E2E_BUILD_ROOT" || exit 2
-    exec "$runner" "$verb" --dag "$dag" --labels "$selection_label" "$@"
 fi
-exec "$runner" "$verb" --dag "$dag" "$@"
+
+if ! exec {dag_fd}<"$dag_file"; then
+    echo "run-dag.sh: constructed DAG is not readable: $dag_file" >&2
+    echo "            Retained generated DAG directory: $dag_dir" >&2
+    echo "            Inspect that path, then remove it only after confirming no validation run is active." >&2
+    exit 2
+fi
+if ! exec <&"$dag_fd"; then
+    echo "run-dag.sh: could not attach constructed DAG to runner stdin: $dag_file" >&2
+    echo "            Retained generated DAG directory: $dag_dir" >&2
+    echo "            Inspect that path, then remove it only after confirming no validation run is active." >&2
+    exit 2
+fi
+if ! exec {dag_fd}<&-; then
+    echo "run-dag.sh: could not close constructed DAG descriptor after stdin handoff: $dag_file" >&2
+    echo "            Retained generated DAG directory: $dag_dir" >&2
+    echo "            Inspect that path, then remove it only after confirming no validation run is active." >&2
+    exit 2
+fi
+exec "$runner" "$verb" --dag - "$@"
