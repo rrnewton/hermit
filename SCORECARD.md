@@ -87,10 +87,10 @@ The cross-tab includes all **5744** tracked cells; no row is omitted. The curren
 
 | Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `green` | 0 | 665 | 0 | 6 | 6 | 677 |
+| `green` | 0 | 665 | 0 | 5 | 7 | 677 |
 | `red` | 60 | 91 | 0 | 0 | 31 | 182 |
 | `not-applicable` | 4884 | 0 | 0 | 0 | 1 | 4885 |
-| **Total** | **4944** | **756** | **0** | **6** | **38** | **5744** |
+| **Total** | **4944** | **756** | **0** | **5** | **39** | **5744** |
 
 Cells whose stored `measurement` is not `never-measured` are shown individually so status and measurement remain visible together.
 
@@ -99,7 +99,7 @@ Cells whose stored `measurement` is not `never-measured` are shown individually 
 | `applications/c-toolchain-workflow` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `applications/example-timed-progress-bar` | `verify` | `dbt` | `red` | `measured-and-passed` |
 | `applications/example-timed-progress-bar` | `verify` | `ptrace` | `red` | `measured-and-passed` |
-| `applications/git-repository-workflow` | `verify` | `ptrace` | `green` | `diverged-unlocated` |
+| `applications/git-repository-workflow` | `verify` | `ptrace` | `green` | `diverged` |
 | `applications/timed-progress-bar` | `verify` | `kvm` | `green` | `measured-and-passed` |
 | `applications/timed-progress-bar` | `verify` | `ptrace` | `green` | `measured-and-passed` |
 | `backend-parity-c/aio-refusal` | `verify` | `kvm` | `green` | `measured-and-passed` |
