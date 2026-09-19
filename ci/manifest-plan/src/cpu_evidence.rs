@@ -226,6 +226,15 @@ pub enum FinalWaitObservation {
         at: Elapsed,
         cpu: WaitCpuObservation,
     },
+    /// A wait helper receipt without a terminal status. Its CPU observation is
+    /// not an exhaustive lifetime measurement or proof that the leader died.
+    NonterminalReturn {
+        source: FinalCpuSource,
+        pid: u32,
+        raw_status: i32,
+        at: Elapsed,
+        cpu: WaitCpuObservation,
+    },
     Unavailable {
         operation: WaitOperation,
         errno: RequiredNullable<i32>,
@@ -250,6 +259,11 @@ pub enum TerminationPath {
     NotStarted,
     SpawnFailed,
     CompletedWait4,
+    /// The helper returned without a timeout, but did not observe a reap.
+    NonterminalWait4Return,
+    /// The initial wait returned CPU >= the budget, before any stop branch.
+    /// This may occur before the first live poll, even if registration failed.
+    FinalWaitCpuBudgetReturn,
     CpuBudgetStop,
     WallBudgetStop,
     AccountingUnavailableStop,
@@ -411,6 +425,29 @@ impl LiveCpuEnabled {
 }
 
 impl InvocationCpuObservation {
+    fn returned_without_timeout(&self) -> bool {
+        matches!(
+            self.termination,
+            TerminationPath::CompletedWait4 | TerminationPath::NonterminalWait4Return
+        )
+    }
+
+    fn returned_timeout(&self) -> Option<bool> {
+        match self.termination {
+            TerminationPath::CompletedWait4 | TerminationPath::NonterminalWait4Return => {
+                Some(false)
+            }
+            TerminationPath::NotStarted | TerminationPath::FinalWaitCpuBudgetReturn => Some(true),
+            TerminationPath::CpuBudgetStop | TerminationPath::WallBudgetStop
+                if matches!(self.returned_cpu_charge, ReturnedCpuCharge::Value { .. }) =>
+            {
+                Some(true)
+            }
+            // These error bridges do not return a semantic timeout flag.
+            _ => None,
+        }
+    }
+
     fn completed_successfully(&self) -> bool {
         self.termination == TerminationPath::CompletedWait4
             && matches!(
@@ -431,10 +468,15 @@ impl InvocationCpuObservation {
                 require(*pid > 0, "zero launched pid")?;
                 Some(*pid)
             }
-            LaunchObservation::NotStarted { .. } => {
+            LaunchObservation::NotStarted { reason } => {
                 require(
                     self.termination == TerminationPath::NotStarted,
                     "not-started termination differs",
+                )?;
+                require(
+                    *reason != NotStartedReason::CpuBudgetAlreadyExhausted
+                        || matches!(self.live, LiveCpuObservation::Enabled(_)),
+                    "prelaunch CPU exhaustion requires enabled CPU accounting",
                 )?;
                 None
             }
@@ -452,10 +494,24 @@ impl InvocationCpuObservation {
                 require(pid.is_none(), "launched child has no final disposition")?;
                 None
             }
-            FinalWaitObservation::Unavailable { reason, .. } => {
+            FinalWaitObservation::Unavailable {
+                operation, reason, ..
+            } => {
                 require(
                     pid.is_some() && nonempty(reason),
                     "unavailable wait without a child/reason",
+                )?;
+                require(
+                    match operation {
+                        WaitOperation::Poll => self.termination == TerminationPath::WaitError,
+                        WaitOperation::StopGrace | WaitOperation::BlockingStop => matches!(
+                            self.termination,
+                            TerminationPath::CpuBudgetStop
+                                | TerminationPath::WallBudgetStop
+                                | TerminationPath::AccountingUnavailableStop
+                        ),
+                    },
+                    "wait operation differs from initiating branch",
                 )?;
                 None
             }
@@ -465,12 +521,23 @@ impl InvocationCpuObservation {
                 at,
                 cpu,
                 ..
+            }
+            | FinalWaitObservation::NonterminalReturn {
+                pid: waited,
+                raw_status,
+                at,
+                cpu,
+                ..
             } => {
                 require(pid == Some(*waited), "waited pid differs from launched pid")?;
                 require(
-                    (0..=u16::MAX as i32).contains(raw_status)
-                        && (libc::WIFEXITED(*raw_status) || libc::WIFSIGNALED(*raw_status)),
-                    "reaped wait status is not terminal",
+                    (0..=u16::MAX as i32).contains(raw_status),
+                    "raw wait status out of range",
+                )?;
+                require(
+                    (libc::WIFEXITED(*raw_status) || libc::WIFSIGNALED(*raw_status))
+                        == matches!(self.final_wait, FinalWaitObservation::Reaped { .. }),
+                    "wait receipt terminal state differs from raw status",
                 )?;
                 valid_elapsed(at)?;
                 final_at = Some(at);
@@ -535,8 +602,28 @@ impl InvocationCpuObservation {
                 "accounting stop without an unavailable poll",
             )?;
         }
+        match self.termination {
+            TerminationPath::CompletedWait4 => require(
+                matches!(self.final_wait, FinalWaitObservation::Reaped { .. }),
+                "completed wait did not reap the leader",
+            )?,
+            TerminationPath::NonterminalWait4Return => require(
+                matches!(
+                    self.final_wait,
+                    FinalWaitObservation::NonterminalReturn { .. }
+                ),
+                "nonterminal helper return carries a different wait receipt",
+            )?,
+            TerminationPath::FinalWaitCpuBudgetReturn => require(
+                matches!(self.live, LiveCpuObservation::Enabled(_)),
+                "final wait CPU budget return requires enabled CPU accounting",
+            )?,
+            _ => {}
+        }
         let expected = match self.termination {
-            TerminationPath::CompletedWait4 => Some((
+            TerminationPath::CompletedWait4
+            | TerminationPath::NonterminalWait4Return
+            | TerminationPath::FinalWaitCpuBudgetReturn => Some((
                 final_cpu.ok_or("completed wait has no valid CPU receipt")?,
                 ChargeBasis::FinalWait4,
             )),
@@ -645,7 +732,7 @@ impl CellCpuObservationsV1 {
             invocation.validate()?;
             if let Some(previous) = index.checked_sub(1).map(|i| &self.invocations[i]) {
                 require(
-                    previous.termination == TerminationPath::CompletedWait4
+                    previous.returned_without_timeout()
                         && !matches!(previous.role, InvocationRole::ParityComparison { .. })
                         && (!matches!(previous.role, InvocationRole::Preparation)
                             || previous.completed_successfully()),
@@ -706,11 +793,11 @@ impl CellCpuObservationsV1 {
                     let prior = execution(*execution_ordinal)?;
                     require(
                         b.mode == "verify"
-                            && prior.termination == TerminationPath::CompletedWait4
+                            && prior.returned_without_timeout()
                             && invocation.ordinal.checked_sub(1) == Some(*execution_ordinal)
                             && matches!(&prior.role, InvocationRole::Execution { backend, .. }
                                 if nullable(backend).map(String::as_str) == Some("ptrace")),
-                        "normalization does not reference a completed verify ptrace execution",
+                        "normalization does not reference a verify ptrace return without timeout",
                     )?;
                     require(
                         normalizations.insert(*execution_ordinal),
@@ -772,17 +859,30 @@ impl CellCpuObservationsV1 {
         )
     }
 
-    /// These roles require retained semantic PASS, not merely a zero wait status.
-    /// Failure records with no dependent role do not acquire a PASS requirement.
+    /// Bind available semantic timeout flags and the roles requiring semantic
+    /// PASS. Failure records alone do not acquire a PASS requirement. Missing
+    /// flags remain unknown, and cannot establish a no-timeout predecessor.
     pub fn require_passing_prerequisites<'a>(
         &self,
-        attempts: impl IntoIterator<Item = (&'a str, bool)>,
+        attempts: impl IntoIterator<Item = (&'a str, bool, Option<bool>)>,
     ) -> Result<(), String> {
         self.validate()?;
         let mut passed = BTreeSet::new();
-        let mut seen = BTreeSet::new();
-        for (index, is_pass) in attempts {
-            require(seen.insert(index), "repeated retained semantic attempt")?;
+        let mut seen = BTreeMap::new();
+        for (index, is_pass, timed_out) in attempts {
+            require(
+                seen.insert(index, timed_out).is_none(),
+                "repeated retained semantic attempt",
+            )?;
+            let invocation = self.invocations.iter().find(|item| {
+                matches!(&item.role, InvocationRole::Execution { attempt_index, .. } if attempt_index == index)
+            }).ok_or("CPU observations omit a retained semantic attempt")?;
+            if let (Some(actual), Some(expected)) = (timed_out, invocation.returned_timeout()) {
+                require(
+                    actual == expected,
+                    "retained timed_out differs from CPU return branch",
+                )?;
+            }
             if is_pass {
                 passed.insert(index);
             }
@@ -829,7 +929,20 @@ impl CellCpuObservationsV1 {
         require(
             required.is_subset(&passed),
             "CPU role lacks a retained passing semantic prerequisite",
-        )
+        )?;
+        for invocation in self
+            .invocations
+            .iter()
+            .take(self.invocations.len().saturating_sub(1))
+        {
+            if let InvocationRole::Execution { attempt_index, .. } = &invocation.role {
+                require(
+                    seen.get(attempt_index.as_str()) == Some(&Some(false)),
+                    "execution successor lacks a retained no-timeout prerequisite",
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -871,12 +984,21 @@ pub fn validate_cpu_observations_in_source_row(
         )
         .map_err(|e| e.to_string())?;
         observations.validate_attempt(index, &argv, cwd, &env)?;
+        let timed_out = attempt
+            .get("timed_out")
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or("CPU source attempt timed_out is not a boolean")
+            })
+            .transpose()?;
         prerequisites.push((
             index,
             attempt.get("outcome").and_then(Value::as_str) == Some("PASS")
                 && attempt.get("status").and_then(Value::as_i64) == Some(0)
                 && matches!(attempt.get("signal"), Some(Value::Null))
-                && attempt.get("timed_out").and_then(Value::as_bool) == Some(false),
+                && timed_out == Some(false),
+            timed_out,
         ));
     }
     observations.require_passing_prerequisites(prerequisites)?;
@@ -1032,6 +1154,10 @@ pub(crate) mod tests {
             "high_water":{"poll":1,"at":{"seconds":0,"nanoseconds":100},"cpu_usec":9},"timeout_trigger":null,"last_error":null})
     }
 
+    fn refused_before_poll() -> Value {
+        json!({"state":"enabled","source":"agent_utils_paired_pidfd_stat_v1","registration":{"state":"unavailable","reason":"fixture refusal"},"polls":0,"source_sample_calls":0,"valid_polls":0,"unavailable_polls":0,"first":null,"last":null,"high_water":null,"timeout_trigger":null,"last_error":null})
+    }
+
     #[test]
     fn historical_absence_and_strict_present_source_binding() {
         assert!(valid(&source_row()));
@@ -1174,6 +1300,179 @@ pub(crate) mod tests {
         invalid["cpu_observations"]["invocations"][0]["final_wait"]["cpu"]["user"]["seconds"] =
             json!(0);
         assert!(!valid(&invalid));
+
+        // Complete helper-return/error matrix. These are decoder fixtures, not
+        // evidence that a traced child returned a nonterminal status here.
+        // In particular, a nonterminal receipt never establishes final lifetime
+        // CPU, reaping, or process-group quiescence.
+        for (state, status, completed) in [
+            ("reaped", 0, "completed_wait4"),
+            (
+                "nonterminal_return",
+                (libc::SIGSTOP << 8) | 127,
+                "nonterminal_wait4_return",
+            ),
+            ("nonterminal_return", 65535, "nonterminal_wait4_return"),
+        ] {
+            for termination in [
+                completed,
+                "final_wait_cpu_budget_return",
+                "wall_budget_stop",
+                "cpu_budget_stop",
+                "accounting_unavailable_stop",
+                "wait_error",
+            ] {
+                for invalid_cpu in [false, true] {
+                    let mut record = executed_row();
+                    let i = &mut record["cpu_observations"]["invocations"][0];
+                    i["final_wait"]["state"] = json!(state);
+                    i["final_wait"]["raw_status"] = json!(status);
+                    i["termination"] = json!(termination);
+                    match termination {
+                        "final_wait_cpu_budget_return" => i["live"] = refused_before_poll(),
+                        "cpu_budget_stop" => {
+                            i["live"] = enabled();
+                            i["live"]["timeout_trigger"] = i["live"]["last"].clone();
+                            i["returned_cpu_charge"] = json!({"state":"value","cpu_usec":7,"basis":"max_trigger_and_final_wait4"});
+                        }
+                        "accounting_unavailable_stop" => {
+                            i["live"] = row["cpu_observations"]["invocations"][0]["live"].clone();
+                            i["returned_cpu_charge"] = json!({"state":"unavailable"});
+                        }
+                        "wait_error" => i["returned_cpu_charge"] = json!({"state":"unavailable"}),
+                        _ => {}
+                    }
+                    if invalid_cpu {
+                        i["final_wait"]["cpu"] = json!({"state":"invalid","user":{"seconds":i64::MAX,"microseconds":0},"system":{"seconds":0,"microseconds":0},"reason":"overflowing CPU"});
+                        i["returned_cpu_charge"] = json!({"state":"unavailable"});
+                    }
+                    let expected = if termination == "wait_error" {
+                        invalid_cpu
+                    } else {
+                        !(invalid_cpu
+                            && [completed, "final_wait_cpu_budget_return"].contains(&termination))
+                    };
+                    assert_eq!(
+                        valid(&record),
+                        expected,
+                        "{state}/{status}/{termination}/invalid={invalid_cpu}"
+                    );
+                    if !expected {
+                        continue;
+                    }
+                    if !invalid_cpu && termination != "accounting_unavailable_stop" {
+                        let timeout = termination != completed;
+                        record["attempts"][0]["timed_out"] = json!(timeout);
+                        assert!(valid(&record), "matching flag {termination}");
+                        record["attempts"][0]["timed_out"] = json!(!timeout);
+                        assert!(!valid(&record), "contradictory flag {termination}");
+                    }
+                }
+            }
+            let mut crossed = executed_row();
+            crossed["cpu_observations"]["invocations"][0]["final_wait"]["state"] = json!(state);
+            crossed["cpu_observations"]["invocations"][0]["final_wait"]["raw_status"] =
+                json!(status);
+            crossed["cpu_observations"]["invocations"][0]["termination"] =
+                json!(if state == "reaped" {
+                    "nonterminal_wait4_return"
+                } else {
+                    "completed_wait4"
+                });
+            assert!(!valid(&crossed));
+        }
+        for status in [0, 256, libc::SIGTERM, -1, 65536] {
+            let mut bad = executed_row();
+            let i = &mut bad["cpu_observations"]["invocations"][0];
+            i["final_wait"]["state"] = json!("nonterminal_return");
+            i["final_wait"]["raw_status"] = json!(status);
+            i["termination"] = json!("nonterminal_wait4_return");
+            assert!(!valid(&bad), "false nonterminal receipt {status}");
+        }
+        let mut budget = fast.clone();
+        budget["cpu_observations"]["invocations"][0]["termination"] =
+            json!("final_wait_cpu_budget_return");
+        budget["attempts"][0]["timed_out"] = json!(true);
+        assert!(valid(&budget)); // zero polls, refused registration, actual wait charge
+        let mut disabled = budget.clone();
+        disabled["cpu_observations"]["invocations"][0]["live"] = json!({"state":"disabled"});
+        assert!(!valid(&disabled));
+        let mut triggered = budget.clone();
+        triggered["cpu_observations"]["invocations"][0]["live"] = enabled();
+        triggered["cpu_observations"]["invocations"][0]["live"]["timeout_trigger"] =
+            triggered["cpu_observations"]["invocations"][0]["live"]["last"].clone();
+        assert!(!valid(&triggered)); // no fabricated live trigger/stop
+        for termination in [
+            "wait_error",
+            "wall_budget_stop",
+            "cpu_budget_stop",
+            "accounting_unavailable_stop",
+        ] {
+            for operation in ["poll", "stop_grace", "blocking_stop"] {
+                let mut record = executed_row();
+                let i = &mut record["cpu_observations"]["invocations"][0];
+                i["termination"] = json!(termination);
+                i["final_wait"] = json!({"state":"unavailable","operation":operation,"errno":libc::ECHILD,"reason":"fixture wait refusal"});
+                i["returned_cpu_charge"] = json!({"state":"unavailable"});
+                if termination == "cpu_budget_stop" {
+                    i["live"] = enabled();
+                    i["live"]["timeout_trigger"] = i["live"]["last"].clone();
+                } else if termination == "accounting_unavailable_stop" {
+                    i["live"] = row["cpu_observations"]["invocations"][0]["live"].clone();
+                }
+                assert_eq!(
+                    valid(&record),
+                    (termination == "wait_error") == (operation == "poll"),
+                    "{termination}/{operation}"
+                );
+            }
+        }
+        for flag in [Value::Null, json!(0), json!("false")] {
+            let mut bad = fast.clone();
+            bad["attempts"][0]["timed_out"] = flag;
+            assert!(!valid(&bad));
+        }
+        for (launch, termination) in [
+            (
+                json!({"state":"not_started","reason":"cpu_budget_already_exhausted"}),
+                "not_started",
+            ),
+            (
+                json!({"state":"not_started","reason":"wall_budget_already_exhausted"}),
+                "not_started",
+            ),
+            (
+                json!({"state":"spawn_failed","stage":"stdout_capture","reason":"fixture refusal"}),
+                "spawn_failed",
+            ),
+            (
+                json!({"state":"spawn_failed","stage":"stderr_capture","reason":"fixture refusal"}),
+                "spawn_failed",
+            ),
+            (
+                json!({"state":"spawn_failed","stage":"spawn","reason":"fixture refusal"}),
+                "spawn_failed",
+            ),
+        ] {
+            let mut record = executed_row();
+            let i = &mut record["cpu_observations"]["invocations"][0];
+            let cpu_exhausted = launch["reason"] == "cpu_budget_already_exhausted";
+            i["launch"] = launch;
+            i["termination"] = json!(termination);
+            i["final_wait"] = json!({"state":"not_applicable"});
+            i["returned_cpu_charge"] = json!({"state":"unavailable"});
+            assert_eq!(valid(&record), !cpu_exhausted);
+            record["cpu_observations"]["invocations"][0]["live"] = refused_before_poll();
+            record["cpu_observations"]["invocations"][0]["live"]["registration"] =
+                json!({"state":"not_attempted"});
+            assert!(valid(&record));
+            if termination == "not_started" {
+                record["attempts"][0]["timed_out"] = json!(true);
+                assert!(valid(&record));
+                record["attempts"][0]["timed_out"] = json!(false);
+                assert!(!valid(&record));
+            }
+        }
     }
 
     #[test]
@@ -1231,6 +1530,8 @@ pub(crate) mod tests {
         assert!(valid(&nonzero_exit)); // a nonzero exit still has no timeout
         for termination in ["wall_budget_stop", "cpu_budget_stop"] {
             let mut timed_out_parent = normalized.clone();
+            timed_out_parent["attempts"][1]["timed_out"] = json!(true);
+            timed_out_parent["attempts"][1]["outcome"] = json!("FAIL");
             let prior = &mut timed_out_parent["cpu_observations"]["invocations"][1];
             prior["termination"] = json!(termination);
             if termination == "cpu_budget_stop" {
@@ -1256,6 +1557,15 @@ pub(crate) mod tests {
             match kind {
                 "nonzero" => invocation["final_wait"]["raw_status"] = json!(256),
                 "signal" => invocation["final_wait"]["raw_status"] = json!(libc::SIGTERM),
+                "nonterminal" => {
+                    invocation["termination"] = json!("nonterminal_wait4_return");
+                    invocation["final_wait"]["state"] = json!("nonterminal_return");
+                    invocation["final_wait"]["raw_status"] = json!((libc::SIGSTOP << 8) | 127);
+                }
+                "final_cpu" => {
+                    invocation["termination"] = json!("final_wait_cpu_budget_return");
+                    invocation["live"] = refused_before_poll();
+                }
                 "wall" => invocation["termination"] = json!("wall_budget_stop"),
                 "cpu" => {
                     invocation["termination"] = json!("cpu_budget_stop");
@@ -1280,10 +1590,19 @@ pub(crate) mod tests {
                 admitted.push(label);
             }
         };
-        for kind in ["nonzero", "signal", "wall", "cpu"] {
+        for kind in [
+            "nonzero",
+            "signal",
+            "nonterminal",
+            "wall",
+            "cpu",
+            "final_cpu",
+        ] {
             for operand in [0, 1] {
                 let mut bad = row.clone();
                 fail(&mut bad["cpu_observations"]["invocations"][operand], kind);
+                bad["attempts"][operand]["timed_out"] =
+                    json!(["wall", "cpu", "final_cpu"].contains(&kind));
                 let mut alone = bad.clone();
                 keep_prefix(&mut alone, operand + 1, operand + 1);
                 assert!(valid(&alone), "failed operand alone {operand}/{kind}");
@@ -1350,7 +1669,7 @@ pub(crate) mod tests {
             .insert(0, prep);
         prepared["cpu_observations"]["invocations"][1]["ordinal"] = json!(2);
         assert!(valid(&prepared));
-        for kind in ["nonzero", "signal", "wall"] {
+        for kind in ["nonzero", "signal", "nonterminal", "wall", "final_cpu"] {
             let mut bad = prepared.clone();
             fail(&mut bad["cpu_observations"]["invocations"][0], kind);
             let mut alone = bad.clone();
@@ -1361,11 +1680,12 @@ pub(crate) mod tests {
 
         let mut ordinary = executed_row();
         ordinary["mode"] = json!("naked");
+        ordinary["attempts"][0]["timed_out"] = json!(false);
         let second = ordinary["attempts"][0].clone();
         ordinary["attempts"].as_array_mut().unwrap().push(second);
         ordinary["attempts"][1]["index"] = json!("2");
         ordinary["cpu_observations"] = envelope(&ordinary);
-        for kind in ["nonzero", "signal"] {
+        for kind in ["nonzero", "signal", "nonterminal"] {
             let mut continued = ordinary.clone();
             fail(&mut continued["cpu_observations"]["invocations"][0], kind);
             assert!(
@@ -1373,9 +1693,10 @@ pub(crate) mod tests {
                 "ordinary completed failure may continue {kind}"
             );
         }
-        for kind in ["wall", "cpu"] {
+        for kind in ["wall", "cpu", "final_cpu"] {
             let mut bad = ordinary.clone();
             fail(&mut bad["cpu_observations"]["invocations"][0], kind);
+            bad["attempts"][0]["timed_out"] = json!(true);
             let mut alone = bad.clone();
             keep_prefix(&mut alone, 1, 1);
             assert!(valid(&alone));
@@ -1388,7 +1709,7 @@ pub(crate) mod tests {
             .insert(2, normalized["cpu_observations"]["invocations"][2].clone());
         four_roles["cpu_observations"]["invocations"][3]["ordinal"] = json!(4);
         assert!(valid(&four_roles));
-        for kind in ["nonzero", "signal"] {
+        for kind in ["nonzero", "signal", "nonterminal"] {
             let mut continued = four_roles.clone();
             fail(&mut continued["cpu_observations"]["invocations"][2], kind);
             assert!(
@@ -1399,7 +1720,7 @@ pub(crate) mod tests {
             fail(&mut parent["cpu_observations"]["invocations"][1], kind);
             assert!(valid(&parent), "normalization parent need not exit0 {kind}");
         }
-        for kind in ["wall", "cpu"] {
+        for kind in ["wall", "cpu", "final_cpu"] {
             let mut bad = four_roles.clone();
             fail(&mut bad["cpu_observations"]["invocations"][2], kind);
             let mut alone = bad.clone();
@@ -1410,6 +1731,38 @@ pub(crate) mod tests {
                 &bad,
             );
         }
+        // A retained semantic timeout cannot be erased by relabeling the CPU
+        // path CompletedWait4 to manufacture a later normalization/execution.
+        for mut successor in [normalized.clone(), ordinary.clone()] {
+            let operand = if successor["mode"] == "verify" { 1 } else { 0 };
+            successor["attempts"][operand]["timed_out"] = json!(true);
+            reject("relabelled timeout with successor".into(), &successor);
+            successor["attempts"][operand]
+                .as_object_mut()
+                .unwrap()
+                .remove("timed_out");
+            reject("unknown timeout with successor".into(), &successor);
+        }
+        // A nonterminal helper return permits normalization without becoming a
+        // successful reference prerequisite for a subsequent comparison.
+        let mut nonterminal_reference = normalized.clone();
+        fail(
+            &mut nonterminal_reference["cpu_observations"]["invocations"][1],
+            "nonterminal",
+        );
+        nonterminal_reference["attempts"][1]["outcome"] = json!("FAIL");
+        nonterminal_reference["attempts"][1]["status"] = Value::Null;
+        assert!(valid(&nonterminal_reference));
+        let mut extra = row["cpu_observations"]["invocations"][2].clone();
+        extra["ordinal"] = json!(4);
+        nonterminal_reference["cpu_observations"]["invocations"]
+            .as_array_mut()
+            .unwrap()
+            .push(extra);
+        reject(
+            "comparison after nonterminal reference and normalization".into(),
+            &nonterminal_reference,
+        );
         let mut after_comparison = row.clone();
         let mut extra = execution.clone();
         extra["ordinal"] = json!(4);

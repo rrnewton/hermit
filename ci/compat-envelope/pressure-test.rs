@@ -15007,6 +15007,37 @@ mod cpu_observation_reader_tests {
             "../../scripts/lib/fixtures/schema10-matched-cell.json"
         ))
         .unwrap();
+        let mut ordinary = supplied.clone();
+        ordinary["attempts"] =
+            json!([retained["backend_parity"]["attempts"][0]["candidate_attempt"]]);
+        ordinary["attempts"][0]["index"] = json!("1");
+        ordinary["attempts"][0]["argv"] = json!(["synthetic"]);
+        ordinary["attempts"][0]["cwd"] = json!("/synthetic");
+        ordinary["attempts"][0]["env"] = json!({});
+        write(&ordinary);
+        assert!(read_result_rows(&file).is_ok());
+        ordinary["attempts"][0]["timed_out"] = json!(true);
+        write(&ordinary);
+        assert!(
+            read_result_rows(&file)
+                .unwrap_err()
+                .contains("retained timed_out")
+        );
+        ordinary["cpu_observations"]["invocations"][0]["termination"] =
+            json!("final_wait_cpu_budget_return");
+        ordinary["cpu_observations"]["invocations"][0]["live"] = json!({"state":"enabled","source":"agent_utils_paired_pidfd_stat_v1","registration":{"state":"unavailable","reason":"synthetic refusal"},"polls":0,"source_sample_calls":0,"valid_polls":0,"unavailable_polls":0,"first":null,"last":null,"high_water":null,"timeout_trigger":null,"last_error":null});
+        write(&ordinary);
+        assert!(read_result_rows(&file).is_ok());
+        ordinary["attempts"][0]["timed_out"] = json!(false);
+        write(&ordinary);
+        assert!(
+            read_result_rows(&file)
+                .unwrap_err()
+                .contains("retained timed_out")
+        );
+        ordinary.as_object_mut().unwrap().remove("cpu_observations");
+        write(&ordinary);
+        assert!(read_result_rows(&file).is_ok());
         let mut parity = supplied.clone();
         parity["backend"] = json!("kvm");
         parity["cpu_observations"]["binding"]["backend"] = json!("kvm");

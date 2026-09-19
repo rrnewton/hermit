@@ -2068,6 +2068,7 @@ impl CellResultsEvidenceV10 {
                                                 && operand.status == Some(0)
                                                 && operand.signal.is_none()
                                                 && !operand.timed_out,
+                                            Some(operand.timed_out),
                                         )
                                     }),
                             )?;

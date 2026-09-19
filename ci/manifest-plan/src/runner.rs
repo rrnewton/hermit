@@ -1377,6 +1377,7 @@ impl CellResult {
                     && attempt.status == Some(0)
                     && attempt.signal.is_none()
                     && !attempt.timed_out,
+                Some(attempt.timed_out),
             )
         }))?;
         Ok(())

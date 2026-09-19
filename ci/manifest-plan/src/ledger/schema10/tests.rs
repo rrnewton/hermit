@@ -1612,6 +1612,28 @@ fn cpu_history_is_authenticated_without_changing_compact_verdicts() {
     let mut unknown = supplied.clone();
     unknown["cpu_observation_history"]["future"] = Value::Bool(true);
     assert!(check(&unknown).is_err());
+    // The authenticated artifact retains typed parity attempts. Intrinsically
+    // valid CPU evidence must still agree with their actual timeout flags.
+    let mut contradicted = supplied.clone();
+    let reference = &mut contradicted["cpu_observation_history"]["attempts"][0]["observations"]["invocations"]
+        [1];
+    reference["termination"] = serde_json::json!("final_wait_cpu_budget_return");
+    reference["live"] = serde_json::json!({"state":"enabled","source":"agent_utils_paired_pidfd_stat_v1","registration":{"state":"unavailable","reason":"synthetic refusal"},"polls":0,"source_sample_calls":0,"valid_polls":0,"unavailable_polls":0,"first":null,"last":null,"high_water":null,"timeout_trigger":null,"last_error":null});
+    let intrinsic: crate::cpu_evidence::CellCpuObservationsV1 = serde_json::from_value(
+        contradicted["cpu_observation_history"]["attempts"][0]["observations"].clone(),
+    )
+    .unwrap();
+    intrinsic.validate().unwrap();
+    assert!(
+        check(&contradicted)
+            .unwrap_err()
+            .contains("retained timed_out")
+    );
+    contradicted
+        .as_object_mut()
+        .unwrap()
+        .remove("cpu_observation_history");
+    assert!(check(&contradicted).is_ok());
     // Legacy absence stays exact; removing its binding contract cannot admit a new field.
     let mut legacy = original_value.clone();
     legacy.as_object_mut().unwrap().remove("selected_attempt");
