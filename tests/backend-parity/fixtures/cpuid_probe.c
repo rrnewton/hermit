@@ -48,12 +48,6 @@ int main(void) {
   uint32_t sig_ecx;
   __cpuid_count(1, 0, sig_eax, ebx, sig_ecx, edx);
 
-  uint32_t subleaf_eax;
-  uint32_t subleaf_ebx;
-  uint32_t subleaf_ecx;
-  uint32_t subleaf_edx;
-  __cpuid_count(7, 1, subleaf_eax, subleaf_ebx, subleaf_ecx, subleaf_edx);
-
   if (max_leaf != UINT32_C(0x0000000d) || strcmp(vendor, "GenuineIntel") != 0) {
     /* stdout, not just stderr: the cell observes stdout and status only. */
     printf("CPUID-MISMATCH max=%08x vendor=%s signature=%08x rdrand=%u\n",
@@ -71,14 +65,27 @@ int main(void) {
     return 2;
   }
 
-  if (subleaf_eax != 0 || subleaf_ebx != 0 || subleaf_ecx != 0 || subleaf_edx != 0) {
-    printf("CPUID-MISMATCH max=%08x vendor=%s signature=%08x rdrand=%u\n",
-           max_leaf, vendor, sig_eax, (unsigned)((sig_ecx >> 30) & 1u));
-    fprintf(stderr,
-            "unexpected CPUID leaf 7 subleaf 1: eax=%08x ebx=%08x ecx=%08x "
-            "edx=%08x\n",
-            subleaf_eax, subleaf_ebx, subleaf_ecx, subleaf_edx);
-    return 3;
+  const uint32_t indexed_leaves[] = {UINT32_C(0x04), UINT32_C(0x07),
+                                     UINT32_C(0x0b), UINT32_C(0x0d)};
+  for (unsigned int i = 0; i < sizeof(indexed_leaves) / sizeof(indexed_leaves[0]);
+       ++i) {
+    uint32_t subleaf_eax;
+    uint32_t subleaf_ebx;
+    uint32_t subleaf_ecx;
+    uint32_t subleaf_edx;
+    __cpuid_count(indexed_leaves[i], 1, subleaf_eax, subleaf_ebx, subleaf_ecx,
+                  subleaf_edx);
+    if (subleaf_eax != 0 || subleaf_ebx != 0 || subleaf_ecx != 0 ||
+        subleaf_edx != 0) {
+      printf("CPUID-MISMATCH max=%08x vendor=%s signature=%08x rdrand=%u\n",
+             max_leaf, vendor, sig_eax, (unsigned)((sig_ecx >> 30) & 1u));
+      fprintf(stderr,
+              "unexpected CPUID leaf %x subleaf 1: eax=%08x ebx=%08x "
+              "ecx=%08x edx=%08x\n",
+              indexed_leaves[i], subleaf_eax, subleaf_ebx, subleaf_ecx,
+              subleaf_edx);
+      return 3;
+    }
   }
 
   /* Success line held byte-identical for cli.rs and run_matrix.py. */
