@@ -680,12 +680,14 @@ final_json=$(jq -c '.final_nodes // []' <<<"$shards_json")
 all_supplied_json=$(printf '%s\n' "${assigned[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
 check_dependencies "final job" "$final_json" "$all_supplied_json"
 
+# shards_json has already resolved public aliases to the exact hosted twins.
+# Keep the completed-build contraction bound to that committed hosted edge.
 if ! jq -e '
     (.build_aux_nodes // []) as $completed_build
-    | ($completed_build | index("build.e2e_artifact") != null)
-      and ($completed_build | index("build.liteinst_runtime_release") != null)
+    | ($completed_build | index("build.e2e_artifact_on_host") != null)
+      and ($completed_build | index("build.liteinst_runtime_release_on_host") != null)
 ' <<<"$shards_json" >/dev/null; then
-    echo "check-shard-coverage.sh: FAIL — completed build job must preserve build.e2e_artifact -> build.liteinst_runtime_release" >&2
+    echo "check-shard-coverage.sh: FAIL — completed build job must preserve build.e2e_artifact_on_host -> build.liteinst_runtime_release_on_host" >&2
     status=1
 fi
 

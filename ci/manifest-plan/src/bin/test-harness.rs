@@ -2948,6 +2948,10 @@ report.write_bytes((root/'verification.json').read_bytes())
         let shards: serde_json::Value =
             serde_json::from_str(include_str!("../../../portable-shards.json")).unwrap();
         let expected_aliases = [
+            "check.backend_parity_suites",
+            "doc.doctests",
+            "doc.rustdoc",
+            "lint.clippy",
             "test.hermit_unit",
             "test.detcore_unit",
             "test.detcore_misc",
