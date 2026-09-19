@@ -25,12 +25,28 @@ an independent container resource policy.
 
 ```
 ci/hermetic/build-image.sh                     # build from the lock, load, record the digest
+ci/hermetic/run-in-pinned-root.sh --check-image # read-only exact local image check
 ci/hermetic/run-in-pinned-root.sh --src DIR --out DIR -- CMD...
 ci/hermetic/run-split-validate.sh --fetch-only # canonical driver's locked fetch node
 ci/hermetic/run-split-validate.sh              # explicit whole-split diagnostic path
 ci/hermetic/assert-no-network.sh               # the boundary check, with a negative control
 ci/hermetic/assert-build-dependencies.sh       # the executable build-dependency check
 ```
+
+Before executing a selected plan that consumes the pinned root, the driver
+checks the committed exact image reference in the caller's Podman store. This
+happens after cache selection: plan-only, cache-hit and host-only selections do
+not inspect images. A missing image or unavailable inspection refuses admission
+as `COULD_NOT_RUN`, with zero executed nodes/tests and no passing receipt. The
+raw probe status and stderr remain visible; store errors are distinct from
+Podman's absent-image status 1. Inspection has a 10-second bound and a 2-second
+forced-stop grace. Admission neither builds nor loads an image.
+
+`setup.pinned_root_fetch` fetches Cargo dependencies; it does not prepare the OCI
+image. Prepare that image explicitly with `build-image.sh` when needed. Each
+node retains the same exact-image guard immediately before execution: an early
+presence observation does not reserve the image or explain later image loss.
+Failures after graph execution begins remain ordinary recorded failures.
 
 Before each canonical pinned-root DAG node starts, the wrapper checks the
 network boundary and four different dependency populations rather than folding
