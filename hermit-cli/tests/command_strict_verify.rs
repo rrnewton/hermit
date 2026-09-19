@@ -12,8 +12,11 @@
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io::Write;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Output;
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -24,6 +27,140 @@ const HERMIT_VERIFY_TIMEOUT: &str = "60s";
 const HERMIT_VERIFY_KILL_AFTER: &str = "10s";
 const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 const HERMETIC_TEST_WORKDIR: &str = "/test";
+const VERIFY_RESULT_ROOT_ENV: &str = "E2E_RESULT_ROOT";
+const VERIFY_FILE_LIMIT: &str = "--fsize=67108864:67108864";
+const VERIFY_FILE_LIMIT_BYTES: u64 = 67108864;
+
+/// The caller owns this explicit artifact root beyond the test and checkout
+/// lifetime. Official validation bind-mounts its durable E2E_RESULT_ROOT here;
+/// a standalone caller must provide a durable root, with no temporary fallback.
+fn retained_verify_directory(
+    requested: Option<&OsStr>,
+    temporary_roots: &[&Path],
+) -> Result<PathBuf, String> {
+    let requested = requested.filter(|value| !value.is_empty()).ok_or_else(|| {
+        format!("{VERIFY_RESULT_ROOT_ENV} must name an explicit durable artifact directory")
+    })?;
+    let requested = Path::new(requested);
+    if !requested.is_absolute() {
+        return Err(format!(
+            "{VERIFY_RESULT_ROOT_ENV} must be absolute: {requested:?}"
+        ));
+    }
+    let root = requested.canonicalize().map_err(|error| {
+        format!("cannot resolve {VERIFY_RESULT_ROOT_ENV} {requested:?}: {error}")
+    })?;
+    if !root.is_dir() {
+        return Err(format!(
+            "{VERIFY_RESULT_ROOT_ENV} is not a directory: {root:?}"
+        ));
+    }
+    for temporary in temporary_roots {
+        let temporary = temporary.canonicalize().map_err(|error| {
+            format!("cannot resolve temporary test directory {temporary:?}: {error}")
+        })?;
+        if root.starts_with(&temporary) {
+            return Err(format!(
+                "{VERIFY_RESULT_ROOT_ENV} is inside temporary test storage: {root:?}"
+            ));
+        }
+    }
+    let group = root.join("command-strict-verify");
+    match std::fs::DirBuilder::new().mode(0o700).create(&group) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(&group).map_err(|error| {
+                format!("cannot inspect retained log directory {group:?}: {error}")
+            })?;
+            if !metadata.file_type().is_dir() {
+                return Err(format!(
+                    "retained log directory is not a real directory: {group:?}"
+                ));
+            }
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot create retained log directory {group:?}: {error}"
+            ));
+        }
+    }
+    // Keep only the artifact directory. HOME and workdir still have their normal
+    // TempDir cleanup, including assertion unwinding after a failed comparison.
+    tempfile::Builder::new()
+        .prefix("comparison-")
+        .tempdir_in(&group)
+        .map(tempfile::TempDir::keep)
+        .map_err(|error| {
+            format!("cannot allocate retained verification logs in {group:?}: {error}")
+        })
+}
+
+/// The kernel file bound can precede the logger's own truncation marker. Even
+/// an exit-zero comparison must not qualify a capped or missing retained pair.
+fn check_retained_log_pair(directory: &Path) -> Result<(), String> {
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("cannot scan retained logs {directory:?}: {error}"))?;
+    let mut sides = [0, 0];
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("cannot read retained log entry in {directory:?}: {error}"))?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect retained log {path:?}: {error}"))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!("retained log is not a regular file: {path:?}"));
+        }
+        if metadata.len() == 0 {
+            return Err(format!("retained log is empty: {path:?}"));
+        }
+        if metadata.len() >= VERIFY_FILE_LIMIT_BYTES {
+            return Err(format!(
+                "retained log reached the file-size limit; completeness is unknown: {path:?}"
+            ));
+        }
+        let name = entry.file_name();
+        if name.as_encoded_bytes().starts_with(b"run1_log_") {
+            sides[0] += 1;
+        } else if name.as_encoded_bytes().starts_with(b"run2_log_") {
+            sides[1] += 1;
+        } else {
+            return Err(format!("unexpected retained log entry: {path:?}"));
+        }
+    }
+    if sides != [1, 1] {
+        return Err(format!(
+            "expected both retained verification logs in {directory:?}, found {sides:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn strict_verify_command(hermit: &OsStr, directory: &Path) -> Command {
+    // The same per-file bound used by the isolated-workdir validation controls.
+    // It covers explicit log files as well as other regular files. A cap hit is
+    // a failed command and must pass through the unchanged status assertion.
+    let mut command = Command::new("prlimit");
+    command
+        .args([
+            VERIFY_FILE_LIMIT,
+            "--",
+            "timeout",
+            "--kill-after",
+            HERMIT_VERIFY_KILL_AFTER,
+            HERMIT_VERIFY_TIMEOUT,
+        ])
+        .arg(hermit)
+        .args([
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--keep-logs",
+            "--verify-log-dir",
+        ])
+        .arg(directory);
+    command
+}
 
 struct StrictCommandCase {
     name: &'static str,
@@ -81,15 +218,19 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
         .prefix("command-working-directory-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create isolated command working directory");
-    let mut command = Command::new("timeout");
+    let requested = std::env::var_os(VERIFY_RESULT_ROOT_ENV);
+    let retained = retained_verify_directory(
+        requested.as_deref(),
+        &[
+            home.path(),
+            working_directory.path(),
+            Path::new(env!("CARGO_TARGET_TMPDIR")),
+        ],
+    )
+    .unwrap_or_else(|error| panic!("VERIFY-LOG-RETENTION: {error}"));
+    eprintln!("{} verification logs: {}", case.name, retained.display());
+    let mut command = strict_verify_command(OsStr::new(env!("CARGO_BIN_EXE_hermit")), &retained);
     command
-        .args([
-            "--kill-after",
-            HERMIT_VERIFY_KILL_AFTER,
-            HERMIT_VERIFY_TIMEOUT,
-        ])
-        .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=info", "run", "--strict", "--verify"])
         .arg(format!("--env=HOME={}", home.path().display()))
         .arg(format!(
             "--env=XDG_CONFIG_HOME={}",
@@ -125,6 +266,12 @@ fn assert_l2_under_strict_verify(case: &StrictCommandCase) {
     let output = child
         .wait_with_output()
         .unwrap_or_else(|error| panic!("failed to collect {rendered}: {error}"));
+    assert_strict_verify_output(case, &rendered, &output);
+    check_retained_log_pair(&retained)
+        .unwrap_or_else(|error| panic!("VERIFY-LOG-RETENTION: {error}"));
+}
+
+fn assert_strict_verify_output(case: &StrictCommandCase, rendered: &str, output: &Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -685,4 +832,276 @@ fn python_getrandom_is_deterministic_under_strict_verify() {
         stdin: None,
     };
     assert_l2_under_strict_verify(&case);
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn case() -> StrictCommandCase {
+        StrictCommandCase {
+            name: "retention plumbing control",
+            candidates: &[],
+            args: &[],
+            stdin: None,
+        }
+    }
+
+    fn fake_verifier(root: &Path, body: &str) -> PathBuf {
+        let executable = root.join("fake-verifier");
+        let script = format!(
+            "#!/bin/sh\nset -eu\nlogs=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --verify-log-dir ]; then shift; logs=$1; fi\n  shift\ndone\ntest -n \"$logs\"\n{body}\n"
+        );
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        executable
+    }
+
+    #[test]
+    fn missing_relative_or_unavailable_root_refuses_without_fallback() {
+        for root in [None, Some(OsStr::new("")), Some(OsStr::new("relative"))] {
+            assert!(retained_verify_directory(root, &[]).is_err());
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let missing = fixture.path().join("missing");
+        assert!(retained_verify_directory(Some(missing.as_os_str()), &[]).is_err());
+        assert!(!missing.exists());
+        let regular_file = fixture.path().join("file");
+        std::fs::write(&regular_file, b"keep me").unwrap();
+        assert!(retained_verify_directory(Some(regular_file.as_os_str()), &[]).is_err());
+        assert_eq!(std::fs::read(regular_file).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn temporary_roots_and_aliases_refuse_retention() {
+        let fixture = tempfile::tempdir().unwrap();
+        for name in ["home", "workdir", "target-tmp"] {
+            let temporary = fixture.path().join(name);
+            let root = temporary.join("nested");
+            std::fs::create_dir_all(&root).unwrap();
+            let alias = fixture.path().join(format!("{name}-alias"));
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            for requested in [&root, &alias] {
+                let error = retained_verify_directory(Some(requested.as_os_str()), &[&temporary])
+                    .unwrap_err();
+                assert!(error.contains("inside temporary test storage"));
+            }
+            assert!(!root.join("command-strict-verify").exists());
+        }
+    }
+
+    #[test]
+    fn explicit_persistent_checkout_artifacts_are_allowed_and_unique() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("persistent-checkout/ignored/artifacts");
+        let home = tempfile::tempdir_in(fixture.path()).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let first = retained_verify_directory(Some(root.as_os_str()), &[home.path()]).unwrap();
+        let second = retained_verify_directory(Some(root.as_os_str()), &[home.path()]).unwrap();
+        assert_ne!(first, second);
+        assert!(first.starts_with(&root) && second.starts_with(&root));
+        assert!(first.is_dir() && second.is_dir());
+    }
+
+    #[test]
+    fn retained_group_cannot_redirect_back_into_temporary_home() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(home.path(), root.path().join("command-strict-verify")).unwrap();
+        let error =
+            retained_verify_directory(Some(root.path().as_os_str()), &[home.path()]).unwrap_err();
+        assert!(error.contains("not a real directory"));
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn failed_verifier_pair_survives_home_and_workdir_unwinding() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("durable-artifacts");
+        std::fs::create_dir(&root).unwrap();
+        let home = tempfile::tempdir_in(fixture.path()).unwrap();
+        let workdir = tempfile::tempdir_in(fixture.path()).unwrap();
+        let home_path = home.path().to_owned();
+        let workdir_path = workdir.path().to_owned();
+        let logs =
+            retained_verify_directory(Some(root.as_os_str()), &[home.path(), workdir.path()])
+                .unwrap();
+        let executable = fake_verifier(
+            fixture.path(),
+            "printf 'left evidence' >\"$logs/run1_log_control\"\nprintf 'right evidence' >\"$logs/run2_log_control\"\nprintf 'Determinism verified\\n'\nexit 17",
+        );
+        let mut command = strict_verify_command(executable.as_os_str(), &logs);
+        let output = command
+            .current_dir(workdir.path())
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(17));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Determinism verified"));
+        let refusal = std::panic::catch_unwind(move || {
+            let _home = home;
+            let _workdir = workdir;
+            assert_strict_verify_output(&case(), "fake verifier: explicit failure", &output);
+        });
+        assert!(
+            refusal.is_err(),
+            "a success marker must not hide failed status"
+        );
+        assert!(!home_path.exists() && !workdir_path.exists());
+        assert_eq!(
+            std::fs::read(logs.join("run1_log_control")).unwrap(),
+            b"left evidence"
+        );
+        assert_eq!(
+            std::fs::read(logs.join("run2_log_control")).unwrap(),
+            b"right evidence"
+        );
+    }
+
+    #[test]
+    fn retention_keeps_exact_verification_timeout_and_comparator_arguments() {
+        let command =
+            strict_verify_command(OsStr::new("/prepared/hermit"), Path::new("/durable/logs"));
+        assert_eq!(command.get_program(), "prlimit");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "--fsize=67108864:67108864",
+                "--",
+                "timeout",
+                "--kill-after",
+                "10s",
+                "60s",
+                "/prepared/hermit",
+                "--log=info",
+                "run",
+                "--strict",
+                "--verify",
+                "--keep-logs",
+                "--verify-log-dir",
+                "/durable/logs",
+            ]
+        );
+    }
+
+    #[test]
+    fn successful_marker_cannot_hide_a_capped_retained_pair() {
+        let fixture = tempfile::tempdir().unwrap();
+        let logs = retained_verify_directory(Some(fixture.path().as_os_str()), &[]).unwrap();
+        let executable = fake_verifier(
+            fixture.path(),
+            "truncate -s 67108864 -- \"$logs/run1_log_control\"\nprintf 'right evidence' >\"$logs/run2_log_control\"\nprintf 'Determinism verified\\n'",
+        );
+        let output = strict_verify_command(executable.as_os_str(), &logs)
+            .output()
+            .unwrap();
+        assert_strict_verify_output(&case(), "fake verifier: capped success marker", &output);
+        let error = check_retained_log_pair(&logs).unwrap_err();
+        assert!(error.contains("reached the file-size limit"));
+        assert!(logs.is_dir());
+        let left = logs.join("run1_log_control");
+        let right = logs.join("run2_log_control");
+        assert_eq!(
+            std::fs::metadata(&left).unwrap().len(),
+            VERIFY_FILE_LIMIT_BYTES
+        );
+        assert_eq!(std::fs::read(&right).unwrap(), b"right evidence");
+        // The same real pair below the bound qualifies; reaching the boundary,
+        // not a permanent failure fixture, discriminates the opposing control.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&left)
+            .unwrap()
+            .set_len(VERIFY_FILE_LIMIT_BYTES - 1)
+            .unwrap();
+        check_retained_log_pair(&logs).unwrap();
+    }
+
+    #[test]
+    fn successful_marker_cannot_hide_an_empty_retained_pair() {
+        let fixture = tempfile::tempdir().unwrap();
+        let logs = retained_verify_directory(Some(fixture.path().as_os_str()), &[]).unwrap();
+        let executable = fake_verifier(
+            fixture.path(),
+            ": >\"$logs/run1_log_control\"\n: >\"$logs/run2_log_control\"\nprintf 'Determinism verified\\n'",
+        );
+        let output = strict_verify_command(executable.as_os_str(), &logs)
+            .output()
+            .unwrap();
+        assert_strict_verify_output(&case(), "fake verifier: empty success marker", &output);
+        let error = check_retained_log_pair(&logs).unwrap_err();
+        assert!(error.contains("retained log is empty"));
+        let left = logs.join("run1_log_control");
+        let right = logs.join("run2_log_control");
+        assert_eq!(std::fs::metadata(&left).unwrap().len(), 0);
+        assert_eq!(std::fs::metadata(&right).unwrap().len(), 0);
+        std::fs::write(&left, b"left evidence").unwrap();
+        std::fs::write(&right, b"right evidence").unwrap();
+        check_retained_log_pair(&logs).unwrap();
+    }
+
+    #[test]
+    fn retained_pair_scan_errors_or_missing_side_cannot_qualify() {
+        let fixture = tempfile::tempdir().unwrap();
+        let missing = fixture.path().join("missing");
+        assert!(
+            check_retained_log_pair(&missing)
+                .unwrap_err()
+                .contains("cannot scan")
+        );
+        let logs = retained_verify_directory(Some(fixture.path().as_os_str()), &[]).unwrap();
+        assert!(
+            check_retained_log_pair(&logs)
+                .unwrap_err()
+                .contains("expected both")
+        );
+        let left = logs.join("run1_log_control");
+        let right = logs.join("run2_log_control");
+        std::fs::write(&left, b"left evidence").unwrap();
+        assert!(
+            check_retained_log_pair(&logs)
+                .unwrap_err()
+                .contains("expected both")
+        );
+        std::os::unix::fs::symlink(&left, &right).unwrap();
+        assert!(
+            check_retained_log_pair(&logs)
+                .unwrap_err()
+                .contains("not a regular file")
+        );
+        assert_eq!(std::fs::read(&left).unwrap(), b"left evidence");
+        assert!(
+            std::fs::symlink_metadata(&right)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn file_limit_refusal_cannot_become_verified_success() {
+        let fixture = tempfile::tempdir().unwrap();
+        let logs = retained_verify_directory(Some(fixture.path().as_os_str()), &[]).unwrap();
+        let executable = fake_verifier(
+            fixture.path(),
+            "trap '' XFSZ\ntruncate -s 67108865 -- \"$logs/oversize\"\nprintf 'Determinism verified\\n'",
+        );
+        let output = strict_verify_command(executable.as_os_str(), &logs)
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("File too large"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("Determinism verified"));
+        assert!(std::fs::metadata(logs.join("oversize")).unwrap().len() <= 67108864);
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_strict_verify_output(&case(), "fake verifier: file-size limit", &output);
+            })
+            .is_err()
+        );
+    }
 }
