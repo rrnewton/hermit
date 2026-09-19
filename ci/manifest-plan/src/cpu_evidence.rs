@@ -676,9 +676,10 @@ impl CellCpuObservationsV1 {
                     let prior = execution(*execution_ordinal)?;
                     require(
                         b.mode == "verify"
+                            && prior.termination == TerminationPath::CompletedWait4
                             && matches!(&prior.role, InvocationRole::Execution { backend, .. }
                                 if nullable(backend).map(String::as_str) == Some("ptrace")),
-                        "normalization does not reference a verify ptrace execution",
+                        "normalization does not reference a completed verify ptrace execution",
                     )?;
                     require(
                         normalizations.insert(*execution_ordinal),
@@ -1113,6 +1114,30 @@ pub(crate) mod tests {
         normalized["cpu_observations"]["invocations"][2]["role"] =
             json!({"kind":"ptrace_normalization","execution_ordinal":2});
         assert!(valid(&normalized));
+        let mut nonzero_exit = normalized.clone();
+        nonzero_exit["cpu_observations"]["invocations"][1]["final_wait"]["raw_status"] = json!(256);
+        assert!(valid(&nonzero_exit)); // a nonzero exit still has no timeout
+        for termination in ["wall_budget_stop", "cpu_budget_stop"] {
+            let mut timed_out_parent = normalized.clone();
+            let prior = &mut timed_out_parent["cpu_observations"]["invocations"][1];
+            prior["termination"] = json!(termination);
+            if termination == "cpu_budget_stop" {
+                prior["live"] = enabled();
+                prior["live"]["timeout_trigger"] = prior["live"]["last"].clone();
+                prior["returned_cpu_charge"] =
+                    json!({"state":"value","cpu_usec":7,"basis":"max_trigger_and_final_wait4"});
+            }
+            let mut without_normalization = timed_out_parent.clone();
+            without_normalization["cpu_observations"]["invocations"]
+                .as_array_mut()
+                .unwrap()
+                .pop();
+            assert!(valid(&without_normalization), "valid {termination} parent");
+            assert!(
+                !valid(&timed_out_parent),
+                "normalization admitted after {termination}"
+            );
+        }
         let mut wrong_backend = normalized.clone();
         wrong_backend["cpu_observations"]["invocations"][2]["role"]["execution_ordinal"] = json!(1);
         assert!(!valid(&wrong_backend));
