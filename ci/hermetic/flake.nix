@@ -102,6 +102,68 @@
         auditable = false;
       };
 
+      # Keep the existing coreutils output unchanged. Nixpkgs omits arch from
+      # that output; enable its real GNU implementation in a separate output
+      # and expose only arch below.
+      # coreutils-full uses the normal pinned stdenv; overriding coreutils
+      # directly would pull its earlier compiler-bootstrap inputs into this build.
+      archCoreutils = (pkgs.coreutils-full.override { minimal = true; }).overrideAttrs (previous: {
+        configureFlags = previous.configureFlags
+          ++ [ "--enable-install-program=arch,kill,uptime" ];
+      });
+      guestPathLines = pkgs.lib.splitString "\n" (builtins.readFile ./guest-paths.txt);
+      guestPaths = if pkgs.lib.last guestPathLines == ""
+        then pkgs.lib.init guestPathLines else guestPathLines;
+      requiredGuestPaths =
+        assert pkgs.lib.assertMsg (guestPaths != []
+          && builtins.length guestPaths == builtins.length (pkgs.lib.unique guestPaths)
+          && builtins.all (path:
+            builtins.match "^/(bin|usr/(bin|sbin))/([A-Za-z0-9_][A-Za-z0-9_+-]*|\\[)$" path != null
+          ) guestPaths) "guest-paths.txt must contain unique, nonempty executable paths";
+        guestPaths;
+
+      # Expose only the missing commands, not entire compiler outputs. Merging
+      # clang or unwrapped GCC into contents could replace the existing cc,
+      # c++, gcc or binutils providers. Their store closures remain available
+      # through these exact references without changing those /bin entries.
+      compatGuestTools = {
+        bc = "${pkgs.bc}/bin/bc";
+        dc = "${pkgs.bc}/bin/dc";
+        clang = "${pkgs.clang}/bin/clang";
+        cpio = "${pkgs.cpio}/bin/cpio";
+        curl = "${pkgs.lib.getBin pkgs.curl}/bin/curl";
+        gcov = "${pkgs.gcc.cc}/bin/gcov";
+        ip = "${pkgs.iproute2}/bin/ip";
+        ss = "${pkgs.iproute2}/bin/ss";
+        lsmod = "${pkgs.kmod}/bin/lsmod";
+        lsof = "${pkgs.lsof}/bin/lsof";
+        iostat = "${pkgs.sysstat}/bin/iostat";
+        mpstat = "${pkgs.sysstat}/bin/mpstat";
+        pidstat = "${pkgs.sysstat}/bin/pidstat";
+        sar = "${pkgs.sysstat}/bin/sar";
+        numactl = "${pkgs.numactl}/bin/numactl";
+        numastat = "${pkgs.numactl}/bin/numastat";
+        time = "${pkgs.time}/bin/time";
+        wget = "${pkgs.wget}/bin/wget";
+        xmllint = "${pkgs.lib.getBin pkgs.libxml2}/bin/xmllint";
+      };
+      compatGuestLinks = pkgs.lib.concatStringsSep "\n" (pkgs.lib.mapAttrsToList
+        (name: provider:
+          assert pkgs.lib.assertMsg (
+            builtins.match "^[A-Za-z0-9_][A-Za-z0-9_+-]*$" name != null
+            && builtins.hasContext provider
+            && pkgs.lib.hasPrefix "${builtins.storeDir}/" provider
+            && builtins.match "^${builtins.storeDir}/[a-z0-9]{32}-[^/]+/bin/[A-Za-z0-9_][A-Za-z0-9_+-]*$" provider != null
+          ) "compatibility providers must be named pinned store executables";
+          ''
+            if [ ! -f ${pkgs.lib.escapeShellArg provider} ] || [ ! -x ${pkgs.lib.escapeShellArg provider} ]; then
+              echo ${pkgs.lib.escapeShellArg "missing executable pinned provider for ${name}: ${provider}"} >&2
+              exit 1
+            fi
+            ln -s ${pkgs.lib.escapeShellArg provider} ${pkgs.lib.escapeShellArg "bin/${name}"}
+          ''
+        ) compatGuestTools);
+
       # Executables that the selected portable population runs as hermit guests.
       # This was re-audited mechanically from ci/expected-e2e-plan.json, each
       # selected manifest entry's requirements/program, and commands invoked by
@@ -111,6 +173,8 @@
         bash coreutils diffutils findutils gnugrep gnused gawk
         openssl zstd gnutar gzip xz jq sqlite git perl python3 redis
         lua5_4 gnum4 nodejs openssh ruby tcl util-linux procps
+        # These outputs are not implied by their runtime libraries.
+        bzip2.bin glibc.bin hostname
       ];
 
       # The CLI replay tests run GDB outside Hermit and execute Python commands.
@@ -165,10 +229,30 @@
             # Selected portable cells name these FHS paths literally. Nix
             # places their providers in /bin, while usrBinEnv creates only
             # /usr/bin/env; add exactly the audited compatibility paths.
-            for command in bash date df du find git node nproc python3 sort stat tr; do
-              ln -s "/bin/$command" "usr/bin/$command"
+            mkdir -p bin
+            ln -s "${archCoreutils}/bin/arch" bin/arch
+            ${compatGuestLinks}
+            for path in ${pkgs.lib.escapeShellArgs requiredGuestPaths}; do
+              command="''${path##*/}"
+              if [ "$command" = nodejs ]; then command=node; fi
+              found=
+              for provider in ${pkgs.lib.escapeShellArgs (guestTools ++ buildTools ++ testTools ++ [ archCoreutils ])}; do
+                if [ -f "$provider/bin/$command" ] && [ -x "$provider/bin/$command" ]; then
+                  found=1
+                  break
+                fi
+              done
+              case "$command" in ${pkgs.lib.concatStringsSep "|" (builtins.attrNames compatGuestTools)}) found=1 ;; esac
+              if [ -z "$found" ]; then
+                echo "missing pinned store provider for $path" >&2
+                exit 1
+              fi
+              # Validate every declared provider above, including existing
+              # /bin entries, but preserve those entries rather than relink them.
+              case "$path" in /bin/*|/usr/bin/env) continue ;; esac
+              mkdir -p ".$(dirname -- "$path")"
+              ln -s "/bin/$command" ".''${path}"
             done
-            ln -s /bin/node usr/bin/nodejs
           '';
           config = {
             Env = [
