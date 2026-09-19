@@ -325,7 +325,38 @@ fi
 # That Cargo failure remains a failure; only its completed cold SDK work is
 # calibration evidence. The normal Hermit workspace/all-target check remains
 # independently required. No DBT guest correctness or new replay claim follows.
-expected_pin=99d1e4827cce2404442d7c27ab447886a5839326
+# CARRY TO b5e2ab49 (2026-09-18): the KVM repairs through
+# https://github.com/rrnewton/reverie/pull/587 preserve the entire reverie-dbt
+# subtree from f97b7be1, including build.rs and the DynamoRIO gitlink. Root
+# Cargo.toml, rust-toolchain.toml, third-party and .gitmodules also match.
+# No CMAKE or CMAKE_GENERATOR selection changes here. Carry the existing
+# b0247764df7f recipe, 1050 effective-job-second threshold and 16-job clamp.
+# This is source identity evidence, not a new timing or Hermit guest result;
+# the original single-sample and failed-enclosing-check limitations remain.
+# CARRY TO e21e13c7 (2026-09-18): the ptrace clock-origin repair changes
+# only reverie-ptrace source/tests. The complete reverie-dbt tree, build.rs,
+# DynamoRIO Gitlink and root recipe/toolchain inputs are identical to b5e2ab49.
+# Retain the 1050 effective-job-second budget and 16-job clamp with the same
+# CMAKE selection. This source-identity carry is not a new timing measurement
+# and does not transfer an earlier pin's runtime validation.
+# CARRY TO bd398149 (2026-09-19): the landed native feature-build repair
+# https://github.com/rrnewton/reverie/pull/590 changes only a KVM constructor
+# call and equivalent test byte-array syntax. The complete reverie-dbt tree
+# ad0ef5e0d8bd, build.rs, DynamoRIO tree, root Cargo.toml, toolchain,
+# .gitmodules and third-party inputs are identical to e21e13c7.
+# Keep default CMAKE, unset CMAKE_GENERATOR, the 1050 effective-job-second
+# budget and 16-job clamp. This source-identity carry is not a new timing or
+# guest measurement; all prior calibration and validation limitations remain.
+# CARRY TO d3ababc9c1ac5704322c0feca3658fee11f20155: reviewed timer source preserves the exact
+# DynamoRIO SDK build.rs/vendor and root manifest/toolchain recipe inputs.
+# Keep the same CMAKE/CMAKE_GENERATOR selection, 1050 effective-job-seconds
+# and 16-job clamp. This is source identity carry, not new calibration.
+# CARRY TO 429962666ad7e9ef05877b74b585a571f57ef0c4: the landed capture/startup and memory
+# ownership changes preserve the exact DynamoRIO SDK build.rs/vendor and root
+# manifest/toolchain recipe inputs. Keep the same CMAKE/CMAKE_GENERATOR selection,
+# 1050 effective-job-seconds and 16-job clamp. Source identity carry only;
+# no new calibration.
+expected_pin=429962666ad7e9ef05877b74b585a571f57ef0c4
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

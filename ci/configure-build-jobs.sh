@@ -354,8 +354,51 @@ fi
 # failed enclosing Cargo check, and conservative 1050 effective-job-second
 # threshold with a 16-job clamp. The single local sample does not replace
 # the original hosted calibration.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 99d1e4827cce2404442d7c27ab447886a5839326 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 99d1e4827cce2404442d7c27ab447886a5839326 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO f97b7be1 (2026-09-18): the budget carries UNCHANGED, on the
+# strongest form of the recipe-identity argument rather than an input-by-input
+# one: `git diff 99d1e482..f97b7be1 -- reverie-dbt` is EMPTY, and the whole
+# reverie-dbt subtree is one object, ad0ef5e0d8bd at both revisions. The two
+# repository inputs to the DynamoRIO content-key miss this wrapper bounds are
+# therefore identical by construction, and confirmed directly:
+#
+#   reverie-dbt/build.rs          0ff8ae24b974 -> 0ff8ae24b974  IDENTICAL
+#   reverie-dbt/vendor/dynamorio  117d54d744df -> 117d54d744df  IDENTICAL
+#
+# Both resolved at both revisions, so this is measured identity and not the
+# absent-reads-as-unchanged case the DBI->DBT path move can produce. The root
+# Cargo.toml 4168dea2771f, rust-toolchain.toml fdd319e308cd and the
+# third-party gitlink fb49c0ba7a9a are identical too. CMAKE and
+# CMAKE_GENERATOR are host inputs rather than pin contents, so the measured
+# SDK recipe, the 16-job clamp and the 1050 effective-job-second threshold all
+# carry. Reverie f97b7be1 "Add process-pending alarm publication for KVM"
+# touches only reverie-kvm/ and reverie/src/guest.rs; that runtime change is
+# build-relevant and still requires fresh validation. This carry is source
+# evidence for the build budget, not a new timing or Hermit guest measurement,
+# and it does not reuse an earlier pin's receipt.
+# CARRY TO b5e2ab49 (2026-09-18): the KVM repairs through
+# https://github.com/rrnewton/reverie/pull/587 preserve the entire reverie-dbt
+# subtree from f97b7be1, including build.rs and the DynamoRIO gitlink. Root
+# Cargo.toml, rust-toolchain.toml, third-party and .gitmodules also match.
+# No CMAKE or CMAKE_GENERATOR selection changes here. Carry the existing
+# b0247764df7f recipe, 1050 effective-job-second threshold and 16-job clamp.
+# This is source identity evidence, not a new timing or Hermit guest result;
+# the original single-sample and failed-enclosing-check limitations remain.
+# CARRY TO e21e13c7 (2026-09-18): the ptrace clock-origin repair changes
+# only reverie-ptrace source/tests. The complete reverie-dbt tree, build.rs,
+# DynamoRIO Gitlink and root recipe/toolchain inputs are identical to b5e2ab49.
+# Retain the 1050 effective-job-second budget and 16-job clamp with the same
+# CMAKE selection. This source-identity carry is not a new timing measurement
+# and does not transfer an earlier pin's runtime validation.
+# CARRY TO bd398149 (2026-09-19): the landed native feature-build repair
+# https://github.com/rrnewton/reverie/pull/590 changes only a KVM constructor
+# call and equivalent test byte-array syntax. The complete reverie-dbt tree
+# ad0ef5e0d8bd, build.rs, DynamoRIO tree, root Cargo.toml, toolchain,
+# .gitmodules and third-party inputs are identical to e21e13c7.
+# Keep default CMAKE, unset CMAKE_GENERATOR, the 1050 effective-job-second
+# budget and 16-job clamp. This source-identity carry is not a new timing or
+# guest measurement; all prior calibration and validation limitations remain.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 429962666ad7e9ef05877b74b585a571f57ef0c4 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 429962666ad7e9ef05877b74b585a571f57ef0c4 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

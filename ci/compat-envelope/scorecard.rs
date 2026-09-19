@@ -127,9 +127,9 @@ Commands:
   --help
       Show this text.
 
-Green means that the cell is selected by full in ci/expected-e2e-plan.json.
-Red means that the cell is in the manifest but is not selected by full; red
-does not mean failed. Manifest-disabled combinations are Not applicable.
+Selected by full means that the cell appears in ci/expected-e2e-plan.json.
+Not selected by full means that the cell is in the manifest but absent from
+that plan; selection is not a test result. Other combinations are Not applicable.
 Cross-backend parity is reported separately and only from strict measured
 ptrace-vs-candidate evidence.
 "#;
@@ -159,11 +159,10 @@ struct ManifestRow {
     ci: bool,
     #[serde(default)]
     ci_disabled_reason: Option<CiDisabledReasonData>,
-    enabled: bool,
     lane: String,
     mode: String,
-    /// Why this backend is not enabled for this mode, verbatim from the
-    /// manifest. Present exactly when `enabled` is false. See
+    /// Why this backend is not applicable for this mode, verbatim from the
+    /// manifest. Its presence is the explicit applicability boundary. See
     /// [`CellStatus::NotApplicable`].
     #[serde(default)]
     not_applicable_reason: Option<String>,
@@ -256,10 +255,9 @@ struct ObservationProjection {
 struct TrackedCell {
     #[serde(flatten)]
     id: CellId,
-    #[serde(default)]
-    enabled: bool,
     status: CellStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "not_selected_by_full_reason", alias = "ci_disabled_reason")]
     ci_disabled_reason: Option<CiDisabledReasonData>,
     /// Why the green-removal ratchet was OVERRIDDEN for this cell, verbatim from
     /// `update --allow-green-removal <reason>`.
@@ -333,16 +331,17 @@ struct CiDisabledReasonData {
 enum CellStatus {
     Green,
     Red,
-    /// The backend is not enabled for this test and mode, so the cell was never
+    /// The backend is not applicable to this test and mode, so the cell was never
     /// asked to do anything and cannot have failed.
     ///
     /// ⚠️ THIS EXISTS BECAUSE `Red` WAS CARRYING THREE MEANINGS AT ONCE: it
     /// failed, it was never measured, and it does not apply. Measured
     /// 2026-08-25: of 5,317 red cells, exactly TWO carried any observation, and
-    /// 4,940 were cells whose backend is not enabled for their mode. A reader
+    /// 4,940 were cells whose backend is not applicable to their mode. A reader
     /// seeing 5,317 reds was reading 93% not-applicable as failure.
     ///
-    /// It is DERIVED FROM `enabled`, never asserted independently, and it always
+    /// It is derived from the manifest's applicability reason, never asserted
+    /// independently, and it always
     /// carries the manifest's own reason string -- so it cannot drift from the
     /// manifest and it cannot be set without saying why.
     #[serde(rename = "not-applicable")]
@@ -350,11 +349,11 @@ enum CellStatus {
 }
 
 impl CellStatus {
-    fn as_str(self) -> &'static str {
+    fn selection_label(self) -> &'static str {
         match self {
-            Self::Green => "green",
-            Self::Red => "red",
-            Self::NotApplicable => "not-applicable",
+            Self::Green => "Selected by full",
+            Self::Red => "Not selected by full",
+            Self::NotApplicable => "Not applicable",
         }
     }
 }
@@ -696,7 +695,7 @@ struct ObservedAttemptInvocation {
 /// instead of being read as evidence.
 ///
 /// This is recorded for EVERY tested cell, including passing ones, and names
-/// the latest admitted comparison directly rather than asking readers to infer
+/// the latest admitted result directly rather than asking readers to infer
 /// recency from an aggregate observation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LastTested {
@@ -710,6 +709,151 @@ struct LastTested {
     /// keyspaces and a bare number would be read against the wrong one.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     depth: BTreeMap<String, SourceDepth>,
+    /// WHICH CHECK produced this result, alongside WHEN it was produced.
+    ///
+    /// ⚠️ THIS EXISTS BECAUSE `hermit_sha` ANSWERS THE WRONG QUESTION. Measured
+    /// 2026-09-17: five `backend-parity-c` cells read green at shas that
+    /// PREDATE the backend-parity mechanism, one by five hours on the same
+    /// calendar day. Comparing today's red against that green says "regression"
+    /// when the truth is "this check has never run here" -- a BAR RAISE. The
+    /// consequence is not a wrong number, it is a wrong investigation: the next
+    /// lane bisects a ~99 commit window for a commit that does not exist.
+    ///
+    /// ⚠️ `None` MEANS THE ROW CANNOT SAY, AND MUST BE REPORTED THAT WAY.
+    /// It is never inferred, and specifically never inferred from a date --
+    /// dates are the thing already shown to be actively misleading here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    check: Option<CheckIdentity>,
+    /// Whether the cell was applicable when this stamp was written. A result from a
+    /// period when the cell was not applicable is not a baseline, and applicability today
+    /// does not say what was true then. `None` means unrecorded, not `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "enabled_when_tested")]
+    applicable_when_tested: Option<bool>,
+    /// Verdict of this exact stamp, not the cell's aggregate history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comparison_verdict: Option<StampComparisonVerdict>,
+}
+
+/// The identity of the check that produced a result.
+///
+/// Recorded from what the producer actually applied, never reconstructed.
+/// Different complete policies are not interchangeable regression baselines.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct CheckIdentity {
+    /// The comparison policy's own name, e.g. `BitwiseInfoV1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comparison: Option<String>,
+    /// The reference backend of a cross-backend parity comparison, e.g.
+    /// `ptrace`. Present EXACTLY when parity was applied, so `None` here is the
+    /// discriminator that catches the case this type exists for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parity_reference: Option<String>,
+    /// Actual admitted policies: one for ordinary comparison, reference then
+    /// candidate for parity. Counts, output hashes and verdicts are not policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ordinary: Vec<canonical_verdict::ComparisonReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cross_backend: Option<LogDiffComparison>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StampComparisonVerdict {
+    Matched,
+    Diverged,
+}
+
+impl CheckIdentity {
+    fn ordinary(policies: Vec<canonical_verdict::ComparisonReport>) -> Self {
+        Self {
+            comparison: Some("BitwiseInfoV1".into()),
+            parity_reference: None,
+            ordinary: policies,
+            cross_backend: None,
+        }
+    }
+
+    fn parity(report: &BackendParityReport) -> Self {
+        Self {
+            comparison: Some("BitwiseInfoV1".into()),
+            parity_reference: Some(report.reference.backend.clone()),
+            ordinary: [
+                report.reference.verification.comparison.clone(),
+                report.candidate.verification.comparison.clone(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            cross_backend: Some(report.comparison.comparison.clone()),
+        }
+    }
+
+    fn complete(&self) -> bool {
+        let ordinary_complete = |policy: &canonical_verdict::ComparisonReport| {
+            policy.display_name.as_deref() == Some("BitwiseInfoV1")
+                && policy.strictness == canonical_verdict::LogCompareStrictness::Canonical
+                && policy.compare_logs
+                && policy.compare_io_buffers == Some(true)
+                && policy.log_scope == Some(canonical_verdict::ComparedLogScope::Info)
+                && policy.record_envelope.is_canonical()
+                && policy.virtualize_time.is_some()
+                && policy.strip_lines == Some(false)
+                && policy.canonicalize_addresses == Some(true)
+                && policy.full_trace == Some(true)
+                && policy.exact_remainder == Some(true)
+                && policy.ignore_lines == Some(false)
+                && policy.skip_commit == Some(false)
+                && policy.skip_detlog == Some(false)
+                && policy.stripped_prefixes.as_deref()
+                    == Some(&["real-wall-clock-prefix/v1".into()])
+                && policy.canonicalizations.as_deref()
+                    == Some(&["host-address-to-first-appearance-ordinal/v1".into()])
+        };
+        if self.comparison.as_deref() != Some("BitwiseInfoV1")
+            || !self.ordinary.iter().all(ordinary_complete)
+        {
+            return false;
+        }
+        match (&self.parity_reference, &self.cross_backend) {
+            (None, None) => self.ordinary.len() == 1,
+            (Some(reference), Some(policy)) => {
+                reference == "ptrace"
+                    && self.ordinary.len() == 2
+                    && policy.stream == "info"
+                    && policy.record_envelope == RecordEnvelopePolicy::CrossBackendDetcoreV1
+                    && !policy.unsafe_strip_lines
+                    && policy.canonicalize_host_addresses
+                    && policy.require_structured_events
+                    && policy.ignored_line_substrings.is_empty()
+                    && !policy.skip_commit
+                    && !policy.skip_detlog
+                    && !policy.git_diff
+                    && policy.included_detlog_kinds == ["syscall", "syscall_result", "other"]
+            }
+            _ => false,
+        }
+    }
+
+    fn adds_parity_to(&self, old: &Self) -> bool {
+        self.parity_reference.as_deref() == Some("ptrace")
+            && old.parity_reference.is_none()
+            && self.ordinary.get(1) == old.ordinary.first()
+    }
+
+    /// Whether two identities describe the same check. Deliberately exact: a
+    /// near-match is the failure mode being prevented.
+    fn matches(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    fn describe(&self) -> String {
+        let comparison = self.comparison.as_deref().unwrap_or("unnamed comparison");
+        match &self.parity_reference {
+            Some(reference) => format!("{comparison} with parity against {reference}"),
+            None => format!("{comparison} without a parity comparison"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1059,10 +1203,12 @@ enum ValidateRowEvidence {
     Matched {
         left_info_messages: BTreeSet<u64>,
         right_info_messages: BTreeSet<u64>,
+        check: CheckIdentity,
     },
     Diverged {
         left_info_messages: BTreeSet<u64>,
         right_info_messages: BTreeSet<u64>,
+        check: CheckIdentity,
     },
     ParityMatched {
         report: BackendParityReport,
@@ -1078,6 +1224,25 @@ enum ValidateRowEvidence {
         reason: String,
         result: Option<ObservedResult>,
     },
+}
+
+impl ValidateRowEvidence {
+    fn stamp_comparison(&self) -> (Option<CheckIdentity>, Option<StampComparisonVerdict>) {
+        let (check, verdict) = match self {
+            Self::Matched { check, .. } => (check.clone(), StampComparisonVerdict::Matched),
+            Self::Diverged { check, .. } => (check.clone(), StampComparisonVerdict::Diverged),
+            Self::ParityMatched { report } => (
+                CheckIdentity::parity(report),
+                StampComparisonVerdict::Matched,
+            ),
+            Self::ParityDiverged { report } => (
+                CheckIdentity::parity(report),
+                StampComparisonVerdict::Diverged,
+            ),
+            Self::NotRun { .. } | Self::Unavailable { .. } => return (None, None),
+        };
+        (check.complete().then_some(check), Some(verdict))
+    }
 }
 
 fn default_attempt() -> u64 {
@@ -1393,10 +1558,8 @@ impl ResultRow {
             .then_some(ObservedResult::Timeout)
     }
 
-    /// Return the typed reason when this FAIL records only completed first
-    /// runs rejected before comparison. Such a row is execution evidence, but
-    /// not product-behavior evidence: it must be named and retained as a
-    /// measured no-verdict rather than forced through the comparison path.
+    /// Retain a rejected guest or a typed container failure without crediting
+    /// either as a completed comparison.
     fn typed_no_result_reason(&self) -> Result<Option<String>, String> {
         if self.outcome != "FAIL" || !matches!(self.mode.as_str(), "verify" | "replay" | "chaos") {
             return Ok(None);
@@ -1551,9 +1714,23 @@ impl ResultRow {
                     }
                     report.no_result_reason.as_ref().unwrap()
                 }
+                Some(canonical_verdict::NoResultReason::ContainerFailed(failure)) => {
+                    failure.require_reporter_exit(
+                        attempt
+                            .get("status")
+                            .and_then(JsonValue::as_i64)
+                            .and_then(|value| i32::try_from(value).ok()),
+                        attempt
+                            .get("signal")
+                            .and_then(JsonValue::as_i64)
+                            .and_then(|value| i32::try_from(value).ok()),
+                        attempt.get("timed_out").and_then(JsonValue::as_bool) != Some(false),
+                    )?;
+                    report.no_result_reason.as_ref().unwrap()
+                }
                 Some(canonical_verdict::NoResultReason::NotRun) => {
                     return Err(format!(
-                        "attempt {} did not complete its first run",
+                        "attempt {} did not replace its pre-run stamp",
                         index + 1
                     ));
                 }
@@ -1847,7 +2024,7 @@ impl ResultRow {
     fn comparison_evidence_from(&self, input: ResultInput) -> Result<ValidateRowEvidence, String> {
         self.require_provenance()?;
         self.validate_recorded_classification()?;
-        let no_verdict_result = self.no_verdict_result();
+        let mut no_verdict_result = self.no_verdict_result();
         let mut left_info_messages = BTreeSet::new();
         let mut right_info_messages = BTreeSet::new();
         let mut divergence_positions = Vec::new();
@@ -1856,6 +2033,7 @@ impl ResultRow {
         let mut saw_not_run = false;
         let mut unavailable = None;
         let mut operand_verifications = Vec::new();
+        let mut admitted_policies = Vec::new();
 
         for (index, attempt) in self.attempts.iter().enumerate() {
             let Some(report_text) = attempt
@@ -2066,6 +2244,11 @@ impl ResultRow {
                     single.first_divergent_syscall = report.first_divergent_syscall;
                     match single.bitwise_info_comparison_from(input) {
                         Ok((left, right)) => {
+                            if let Some(policy) = &report.comparison {
+                                if !admitted_policies.contains(policy) {
+                                    admitted_policies.push(policy.clone());
+                                }
+                            }
                             left_info_messages.extend(left);
                             right_info_messages.extend(right);
                             if report.verdict == canonical_verdict::Verdict::Matched {
@@ -2145,7 +2328,7 @@ impl ResultRow {
                             saw_not_run = true;
                             unavailable.get_or_insert_with(|| {
                                 format!(
-                                    "NO_RESULT: attempt {} did not complete its first run",
+                                    "NO_RESULT: attempt {} retained its pre-run stamp after timeout",
                                     index + 1
                                 )
                             });
@@ -2170,6 +2353,23 @@ impl ResultRow {
                         let reason = single
                             .typed_no_result_reason()?
                             .ok_or("FirstRunRejected did not classify as no_result")?;
+                        unavailable.get_or_insert(format!("NO_RESULT: {reason}"));
+                    }
+                    Some(canonical_verdict::NoResultReason::ContainerFailed(_)) => {
+                        saw_no_result = true;
+                        let mut single = self.clone();
+                        single.outcome = "FAIL".into();
+                        single.first_divergent_scheduler_turn = None;
+                        single.first_divergent_virtual_nanoseconds = None;
+                        single.first_divergent_record = None;
+                        single.first_divergent_syscall = None;
+                        single.attempts = vec![attempt.clone()];
+                        let reason = single
+                            .typed_no_result_reason()?
+                            .ok_or("ContainerFailed did not classify as no_result")?;
+                        // Preserve an already classified timeout/infrastructure
+                        // result from another attempt in this retained history.
+                        no_verdict_result.get_or_insert(ObservedResult::CrashError);
                         unavailable.get_or_insert(format!("NO_RESULT: {reason}"));
                     }
                     Some(canonical_verdict::NoResultReason::ComparisonRefused { detail }) => {
@@ -2320,6 +2520,7 @@ impl ResultRow {
             return Ok(ValidateRowEvidence::Diverged {
                 left_info_messages,
                 right_info_messages,
+                check: CheckIdentity::ordinary(admitted_policies),
             });
         }
         if saw_no_result && !DivergenceCoordinates::from_row(self).is_empty() {
@@ -2360,6 +2561,7 @@ impl ResultRow {
         Ok(ValidateRowEvidence::Matched {
             left_info_messages,
             right_info_messages,
+            check: CheckIdentity::ordinary(admitted_policies),
         })
     }
 }
@@ -2408,7 +2610,7 @@ fn retry_guest_arguments<'a>(
 
 struct Derived {
     population: BTreeSet<CellId>,
-    enabled: BTreeSet<CellId>,
+    applicable: BTreeSet<CellId>,
     ci_disabled_reasons: BTreeMap<CellId, CiDisabledReasonData>,
     not_applicable_reasons: BTreeMap<CellId, String>,
     selected: BTreeSet<CellId>,
@@ -2417,7 +2619,7 @@ struct Derived {
 }
 
 fn retained_import_cells(derived: &Derived) -> BTreeSet<CellId> {
-    let mut eligible = derived.enabled.clone();
+    let mut eligible = derived.applicable.clone();
     eligible.extend(
         derived
             .population
@@ -2992,7 +3194,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
 
     let mut manifest_cells = BTreeSet::new();
     let mut population = BTreeSet::new();
-    let mut enabled = BTreeSet::new();
+    let mut applicable = BTreeSet::new();
     let mut ci_enabled = BTreeSet::new();
     let mut ci_disabled_reasons = BTreeMap::new();
     let mut not_applicable_reasons = BTreeMap::new();
@@ -3018,14 +3220,14 @@ fn derive(root: &Path) -> Result<Derived, String> {
         if comparable {
             population.insert(id.clone());
         }
-        if row.enabled {
+        if row.not_applicable_reason.is_none() {
             if comparable {
-                enabled.insert(id.clone());
+                applicable.insert(id.clone());
             }
             if row.ci {
                 if row.ci_disabled_reason.is_some() {
                     return Err(format!(
-                        "CI-enabled cell carries ci_disabled_reason: {}",
+                        "cell selected by full carries a not-selected reason: {}",
                         display_id(&id)
                     ));
                 }
@@ -3033,14 +3235,14 @@ fn derive(root: &Path) -> Result<Derived, String> {
             } else {
                 let reason = row.ci_disabled_reason.ok_or_else(|| {
                     format!(
-                        "enabled cell omitted from ordinary CI has no reason: {}",
+                        "applicable cell not selected by full has no reason: {}",
                         display_id(&id)
                     )
                 })?;
                 ci_disabled_reasons.insert(id, reason);
             }
         } else {
-            // A cell whose backend is not enabled for this mode is NOT
+            // A cell whose backend is not applicable for this mode is NOT
             // APPLICABLE, not failing. It must say why, and the manifest already
             // requires a reason for every disabled backend -- so an absent one
             // here means the plan emitter dropped it, which is worth refusing
@@ -3073,7 +3275,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
         }
         if !ci_enabled.contains(id) {
             return Err(format!(
-                "expected plan names a cell not enabled for ordinary CI: {}",
+                "expected plan names a cell that is not applicable: {}",
                 display_id(id)
             ));
         }
@@ -3081,7 +3283,7 @@ fn derive(root: &Path) -> Result<Derived, String> {
     let (green, selected_custom) = selected_partition(&selected, &population)?;
     Ok(Derived {
         population,
-        enabled,
+        applicable,
         ci_disabled_reasons,
         not_applicable_reasons,
         selected,
@@ -3181,27 +3383,27 @@ fn render_scorecard(derived: &Derived) -> String {
 
     // This is the same derived count printed in the summary table below. Keep
     // the prose on the value rather than restating a hand-maintained snapshot:
-    // the old literal still said manifest-disabled cells were red after
+    // the old literal still counted not-applicable cells as not selected after
     // `NotApplicable` became a separate status.
     let na_total = derived
         .population
         .iter()
-        .filter(|id| !derived.enabled.contains(*id))
+        .filter(|id| !derived.applicable.contains(*id))
         .count();
-    let status_green_total = derived.green.len();
-    let status_red_total = derived.enabled.difference(&derived.green).count();
+    let selected_by_full_total = derived.green.len();
+    let not_selected_by_full_total = derived.applicable.difference(&derived.green).count();
 
     let mut out = format!(
         "# Compatibility scorecard\n\n\
 This table is derived from the manifest, not from a separately maintained parent-workspace CSV. \
 `./ci/compat-envelope/scorecard.rs check` verifies it.\n\n\
-**Green** means this manifest cell is selected by full in `ci/expected-e2e-plan.json`; ordinary \
-validation therefore requires it to pass. **Red** means the cell is in the manifest but is not \
-selected by full. **Red does not mean failed:** a red cell may have passed, failed, produced no \
-verdict, or never run. Manifest-disabled combinations are **Not applicable**; they are neither red \
-nor omitted. The current generated data counts Green as **{status_green_total}** and Red as \
-**{status_red_total}**. The generator classifies the current **{na_total}** manifest-disabled \
-combinations as **Not applicable**.\n\n\
+The count table includes all **{}** cells in the manifest; no row is omitted. A cell is \
+**Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`. A cell is \
+**Not selected by full** when it is in the manifest but absent from that plan. Selection is not a \
+test result: a cell not selected by full may have passed, failed, produced no verdict, or never run. \
+Of these cells, **{selected_by_full_total}** are selected by full, \
+**{not_selected_by_full_total}** are not selected by full, and **{na_total}** are \
+**Not applicable**.\n\n\
 Every selected `verify` cell, and every seed in a selected `chaos` cell, runs the same backend \
 twice. The manifest runner adds `--verify-strict` when the selected Hermit binary supports it, and \
 accepts a result only when the typed report says `verified=true`, `verdict=matched`, \
@@ -3209,10 +3411,11 @@ accepts a result only when the typed report says `verified=true`, `verdict=match
 `record_envelope`, and both INFO-message counts are nonzero. Bare `--verify` remains a Stripped \
 comparison when invoked directly and does not satisfy \
 this regression plan. These same-backend results do not establish cross-backend parity.\n\n\
-| Backend | Green | Red | Not applicable | Total |\n\
+| Backend | Selected by full | Not selected by full | Not applicable | In the manifest |\n\
 | --- | ---: | ---: | ---: | ---: |\n",
+        derived.population.len()
     );
-    let mut green_total = 0usize;
+    let mut selected_total = 0usize;
     let mut total = 0usize;
     for backend in &ordered {
         let backend_total = derived
@@ -3220,29 +3423,29 @@ this regression plan. These same-backend results do not establish cross-backend 
             .iter()
             .filter(|id| id.backend == *backend)
             .count();
-        let backend_green = derived
+        let backend_selected = derived
             .green
             .iter()
             .filter(|id| id.backend == *backend)
             .count();
-        // NOT APPLICABLE IS SUBTRACTED FROM RED, NOT ADDED TO THE TOTAL. The
+        // NOT APPLICABLE IS SUBTRACTED FROM NOT SELECTED, NOT ADDED TO THE TOTAL. The
         // population is unchanged; what changes is that a cell whose backend is
-        // not enabled for this mode stops being counted as a failure.
+        // not applicable for this mode stops being counted as not selected.
         let backend_na = derived
             .population
             .iter()
-            .filter(|id| id.backend == *backend && !derived.enabled.contains(*id))
+            .filter(|id| id.backend == *backend && !derived.applicable.contains(*id))
             .count();
-        green_total += backend_green;
+        selected_total += backend_selected;
         total += backend_total;
         out.push_str(&format!(
-            "| `{backend}` | {backend_green} | {} | {backend_na} | {backend_total} |\n",
-            backend_total - backend_green - backend_na
+            "| `{backend}` | {backend_selected} | {} | {backend_na} | {backend_total} |\n",
+            backend_total - backend_selected - backend_na
         ));
     }
     out.push_str(&format!(
-        "| **Total** | **{green_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
-        total - green_total - na_total
+        "| **Total** | **{selected_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
+        total - selected_total - na_total
     ));
     // DENOMINATOR PROVENANCE. Emitted from the derived population, never
     // hand-written, so it cannot go stale and cannot be forgotten.
@@ -3252,8 +3455,8 @@ this regression plan. These same-backend results do not establish cross-backend 
     // a mode to the manifest grows it, removing one shrinks it. Both move the
     // percentage while nothing about the product moves. Worked example with
     // real numbers at the time of writing: dropping `dbt` would remove 1035
-    // cells, ALL OF THEM RED, taking the total from 5520 to 4485 and RAISING
-    // reported green from 5.07% to 6.24% -- a 23% relative improvement with
+    // cells, ALL OF THEM NOT SELECTED, taking the total from 5520 to 4485 and RAISING
+    // the reported selection from 5.07% to 6.24% -- a 23% relative improvement with
     // nothing improved. Restoring it later would move the number back DOWN,
     // which reads as a regression when it is a restoration of honesty.
     //
@@ -3263,7 +3466,7 @@ this regression plan. These same-backend results do not establish cross-backend 
     let percent = if total == 0 {
         0.0
     } else {
-        100.0 * green_total as f64 / total as f64
+        100.0 * selected_total as f64 / total as f64
     };
     let modes: BTreeSet<&str> = derived
         .population
@@ -3272,20 +3475,20 @@ this regression plan. These same-backend results do not establish cross-backend 
         .collect();
     out.push_str(&format!(
         "## Denominator, and why the percentage is not comparable across changes to it\n\n\
-Green is **{green_total} of {total}**, which is **{percent:.2}%** — over THIS population and no \
+Selected by full is **{selected_total} of {total}**, which is **{percent:.2}%** — over THIS population and no \
 other. The population is every combination the manifest declares, and it is composed of:\n\n\
 - backends: {}\n\
 - modes: {}\n\n\
-⚠️ **{na} of those {total} cells are NOT APPLICABLE** — their backend is not enabled for their \
+⚠️ **{na} of those {total} cells are NOT APPLICABLE** — their backend is not applicable for their \
 mode, so they were never asked to run and cannot pass or fail. Over the {applicable} cells that \
-CAN run, green is **{applicable_percent:.2}%**.\n\n\
-⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same {green_total} green cells \
+CAN run, selected by full is **{applicable_percent:.2}%**.\n\n\
+⚠️ **DO NOT QUOTE THAT SECOND FIGURE AS PROGRESS.** It is the same {selected_total} cells selected by full \
 measured against a smaller denominator. Nothing was fixed to produce it; it is what the first \
 figure always meant once the cells that cannot run are excluded. Quote both or neither, and never \
 compare one against the other as though something moved.\n\n\
 ⚠️ **Adding or removing a backend or mode changes this denominator and therefore the percentage, \
-without anything about the product changing.** Removing a backend whose cells are mostly red \
-RAISES the reported figure; adding honest red cells LOWERS it. Neither is progress. Before \
+without anything about the product changing.** Removing a backend whose cells are mostly not selected \
+RAISES the reported figure; adding manifest cells that are not selected LOWERS it. Neither is progress. Before \
 comparing this percentage against an earlier one, diff the two lists above: if they differ, the \
 numbers are not comparable and the difference is not a result.\n\n",
         ordered
@@ -3303,19 +3506,21 @@ numbers are not comparable and the difference is not a result.\n\n",
         applicable_percent = if total == na_total {
             0.0
         } else {
-            100.0 * green_total as f64 / (total - na_total) as f64
+            100.0 * selected_total as f64 / (total - na_total) as f64
         },
     ));
     out.push_str(
         "The mode view makes the current order of work explicit: expand `verify` first, then \
-`replay`, then `chaos`. Each backend cell is `green / total`; an em dash means that mode does \
-not exist for that backend. The summary columns use the same Green, Red, and Not applicable \
-statuses as the table above.\n\n| Mode",
+`replay`, then `chaos`. Each backend cell is `selected by full / in the manifest`; an em dash means \
+that mode does not exist for that backend. The summary columns use the same selection and \
+applicability facts as the table above.\n\n| Mode",
     );
     for backend in &ordered {
         out.push_str(&format!(" | `{backend}`"));
     }
-    out.push_str(" | Green | Red | Not applicable | Total |\n| ---");
+    out.push_str(
+        " | Selected by full | Not selected by full | Not applicable | In the manifest |\n| ---",
+    );
     for _ in &ordered {
         out.push_str(" | ---:");
     }
@@ -3330,7 +3535,7 @@ statuses as the table above.\n\n| Mode",
         let mode_na = derived
             .population
             .iter()
-            .filter(|id| id.mode == mode && !derived.enabled.contains(*id))
+            .filter(|id| id.mode == mode && !derived.applicable.contains(*id))
             .count();
         out.push_str(&format!("| `{mode}`"));
         for backend in &ordered {
@@ -3356,15 +3561,15 @@ statuses as the table above.\n\n| Mode",
         ));
     }
     out.push_str(&format!(
-        "| **Total** | | | | | | | **{green_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
-        total - green_total - na_total
+        "| **Total** | | | | | | | **{selected_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
+        total - selected_total - na_total
     ));
     out.push_str(
         "## Ptrace by manifest category\n\n\
 This view uses the same Basic Sanity Milestone 1 contracts as the tables above, but makes the ptrace \
-workload mix visible. Each entry is `green / total`; `custom` commands are not part of this \
+workload mix visible. Each entry is `selected by full / in the manifest`; `custom` commands are not part of this \
 denominator.\n\n\
-| Manifest category | Verify | Replay | Chaos | Green | Total |\n\
+| Manifest category | Verify | Replay | Chaos | Selected by full | In the manifest |\n\
 | --- | ---: | ---: | ---: | ---: | ---: |\n",
     );
     let categories: BTreeSet<&str> = derived
@@ -3405,10 +3610,10 @@ denominator.\n\n\
         .count();
     let custom = derived.selected_custom.len();
     out.push_str(&format!(
-        "Ordinary full validation executes {} selected regression cells: the {green_total} green \
-compatibility cells above (including {chaos} chaos-mode race-exposure checks), and {custom} \
+        "Ordinary full validation executes {} cells: the {selected_total} comparable compatibility \
+cells selected by full above (including {chaos} chaos-mode race-exposure checks), and {custom} \
 explicit custom commands outside the comparable denominator. A passing validate must produce a fresh result for \
-all of them; a failing green cell is a regression, not permission to move it to red.\n",
+all of them; a failing selected cell is a regression, not permission to remove it from the plan.\n",
         derived.selected.len()
     ));
     if !derived.selected_custom.is_empty() {
@@ -3456,14 +3661,13 @@ fn latest_backend_parity(cell: &TrackedCell) -> Option<&RecordedBackendParityCom
 }
 
 fn render_backend_parity_section(tracked: &TrackedCells) -> String {
-    let ptrace_is_green = |candidate: &TrackedCell| {
+    let ptrace_is_selected_by_full = |candidate: &TrackedCell| {
         tracked.cells.iter().any(|reference| {
             reference.id.lane == candidate.id.lane
                 && reference.id.category == candidate.id.category
                 && reference.id.test == candidate.id.test
                 && reference.id.mode == candidate.id.mode
                 && reference.id.backend == "ptrace"
-                && reference.enabled
                 && reference.status == CellStatus::Green
         })
     };
@@ -3474,7 +3678,7 @@ fn render_backend_parity_section(tracked: &TrackedCells) -> String {
             cell.id.mode == "verify"
                 && cell.id.backend != "ptrace"
                 && cell.id.backend != "native"
-                && ptrace_is_green(cell)
+                && ptrace_is_selected_by_full(cell)
         })
         .collect::<Vec<_>>();
     let mut backends = tracked
@@ -3495,11 +3699,11 @@ fn render_backend_parity_section(tracked: &TrackedCells) -> String {
 
     let mut out = "\n## Cross-backend parity\n\n\
 This is measured ptrace-reference parity, not CI plan membership and not same-backend repeatability. \
-A cell is eligible when the corresponding ptrace `verify` coordinate is Green. The CLI can explicitly \
-select eligible manifest-disabled candidates with `--probe-disabled`; the committed selectors do not include that option. `Never measured` \
+A cell is eligible when the corresponding ptrace `verify` coordinate is selected by full. The CLI can explicitly \
+select eligible not-applicable candidates with `--probe-disabled`; the committed selectors do not include that option. `Never measured` \
 means no strict typed ptrace-vs-candidate report exists. \
 At the latest recorded Hermit source depth, any divergence outranks a match. The portable and hosted-portable `backend-parity-c` nodes perform ptrace-reference parity comparisons for eligible selected verify cells. These selectors cover a subset of the eligible cells; eligibility does not mean every cell was selected or measured.\n\n\
-| Candidate backend | Eligible ptrace-green cells | Disabled probe candidates | Measured match | Parity failure | Never measured |\n\
+| Candidate backend | Ptrace cells selected by full | Not-applicable probe candidates | Measured match | Parity failure | Never measured |\n\
 | --- | ---: | ---: | ---: | ---: | ---: |\n"
         .to_owned();
     for backend in ordered {
@@ -3522,7 +3726,10 @@ At the latest recorded Hermit source depth, any divergence outranks a match. The
                     .is_some_and(|evidence| evidence.result == ObservedResult::ParityFailure)
             })
             .count();
-        let disabled = cells.iter().filter(|cell| !cell.enabled).count();
+        let disabled = cells
+            .iter()
+            .filter(|cell| cell.status == CellStatus::NotApplicable)
+            .count();
         out.push_str(&format!(
             "| `{backend}` | {} | {disabled} | {matched} | {diverged} | {} |\n",
             cells.len(),
@@ -3582,44 +3789,33 @@ fn render_measurement_section(tracked: &TrackedCells) -> String {
     // table. An import changed one count to zero while leaving the prose saying
     // both combinations were present. Derive the claims through the table's
     // own count so another import changes both together.
-    let green_never_measured = count(CellStatus::Green, MeasurementState::NeverMeasured);
-    let red_measured_and_passed = count(CellStatus::Red, MeasurementState::MeasuredAndPassed);
-    let green_never_measured_claim = match green_never_measured {
-        0 => "zero Green cells are `never-measured`".to_owned(),
-        1 => "1 Green cell is `never-measured`".to_owned(),
-        count => format!("{count} Green cells are `never-measured`"),
-    };
-    let red_measured_and_passed_claim = match red_measured_and_passed {
-        1 => "1 Red cell that is `measured-and-passed`".to_owned(),
-        count => format!("{count} Red cells that are `measured-and-passed`"),
-    };
+    let selected_never_measured = count(CellStatus::Green, MeasurementState::NeverMeasured);
+    let not_selected_measured_and_passed =
+        count(CellStatus::Red, MeasurementState::MeasuredAndPassed);
 
     let mut out = render_backend_parity_section(tracked);
     out.push_str(&format!(
-        "\n## Status and measurement\n\n\
-Selection and observation answer different questions. The Green/Red table says what full validation \
-selects. The per-cell `measurement` value says what retained evidence observed: `never-measured`, \
-`measured-and-passed`, `measured-no-verdict`, `diverged-unlocated`, or `diverged`. In the current \
-generated data, **{green_never_measured_claim}**. Read the generated Status and measurement section \
-for the complete current cross-tab; do not use Red as a failed-test count.\n\n\
-The current green/`never-measured` count is **{green_never_measured}**, and the current \
-red/`measured-and-passed` count is **{red_measured_and_passed}**.\n\n\
+        "\n## Selection and measurement\n\n\
+Selection and observation answer different questions. The first column says whether full validation \
+selects a cell. The per-cell `measurement` value says what retained evidence observed: \
+`never-measured`, `measured-and-passed`, `measured-no-verdict`, `diverged-unlocated`, or `diverged`. \
+Of the cells selected by full, **{selected_never_measured}** have `never-measured`; of the cells not \
+selected by full, **{not_selected_measured_and_passed}** have `measured-and-passed`.\n\n\
 Retained history that has not been imported is not counted here. A stored measurement does not \
 establish that it describes current code; `show` reports whether the recorded last test still \
 matches `HEAD:detcore`.\n\n",
     ));
     out.push_str(&format!(
-        "The cross-tab includes all **{}** tracked cells; no row is omitted. The current generated \
-data contains **{red_measured_and_passed_claim}**. These claims \
+        "The count table includes all **{}** cells in the manifest; no row is omitted. These claims \
 use the same counts printed in the table below.\n\n",
         tracked.cells.len(),
     ));
     out.push_str(
-        "| Status | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | Total |\n\
+        "| Selection by full | `never-measured` | `measured-and-passed` | `measured-no-verdict` | `diverged-unlocated` | `diverged` | In the manifest |\n\
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for status in statuses {
-        out.push_str(&format!("| `{}`", status.as_str()));
+        out.push_str(&format!("| {}", status.selection_label()));
         for measurement in measurements {
             out.push_str(&format!(" | {}", count(status, measurement)));
         }
@@ -3642,9 +3838,9 @@ use the same counts printed in the table below.\n\n",
     out.push_str(&format!(" | **{}** |\n\n", tracked.cells.len()));
 
     out.push_str(
-        "Cells whose stored `measurement` is not `never-measured` are shown individually so status \
+        "Cells whose stored `measurement` is not `never-measured` are shown individually so selection \
 and measurement remain visible together.\n\n\
-| Test | Mode | Backend | Status | Measurement |\n\
+| Test | Mode | Backend | Selection by full | Measurement |\n\
 | --- | --- | --- | --- | --- |\n",
     );
     let mut displayed = 0usize;
@@ -3658,7 +3854,7 @@ and measurement remain visible together.\n\n\
             cell.id.test,
             cell.id.mode,
             cell.id.backend,
-            cell.status.as_str(),
+            cell.status.selection_label(),
             cell.measurement.as_str()
         ));
     }
@@ -3741,8 +3937,8 @@ fn tracked_from(
             // derivation recomputes STATUS from the manifest and the plan, and
             // must not discard measured evidence while doing so.
             let last_tested = previous.get(&id).and_then(|cell| cell.last_tested.clone());
-            let enabled = derived.enabled.contains(&id);
-            let status = if !enabled {
+            let applicable = derived.applicable.contains(&id);
+            let status = if !applicable {
                 CellStatus::NotApplicable
             } else if derived.green.contains(&id) {
                 CellStatus::Green
@@ -3766,7 +3962,6 @@ fn tracked_from(
             };
             let mut cell = TrackedCell {
                 id,
-                enabled,
                 status,
                 ci_disabled_reason,
                 not_applicable_reason,
@@ -3821,13 +4016,9 @@ fn enforce_writer_boundary(
     after: &TrackedCells,
     writer: Writer,
 ) -> Result<(), String> {
-    let index = |cells: &TrackedCells| -> BTreeMap<CellId, TrackedCell> {
-        cells
-            .cells
-            .iter()
-            .map(|cell| (cell.id.clone(), cell.clone()))
-            .collect()
-    };
+    fn index(cells: &TrackedCells) -> BTreeMap<&CellId, &TrackedCell> {
+        cells.cells.iter().map(|cell| (&cell.id, cell)).collect()
+    }
     let (old, new) = (index(before), index(after));
 
     // ⚠️ THE PROJECTION BLOCK IS OBSERVATION-AUTHORITY STATE, so `update` may
@@ -3919,9 +4110,6 @@ fn enforce_writer_boundary(
                         id.test, id.mode, id.backend
                     )
                 };
-                if old_cell.enabled != new_cell.enabled {
-                    return Err(changed("enabled"));
-                }
                 if old_cell.status != new_cell.status {
                     return Err(changed("status"));
                 }
@@ -4201,7 +4389,7 @@ fn update_tracked(
     let not_applicable = derived
         .population
         .iter()
-        .filter(|id| !derived.enabled.contains(*id))
+        .filter(|id| !derived.applicable.contains(*id))
         .count();
     println!(
         "compatibility scorecard: wrote {} green / {} red / {} not-applicable / {} total",
@@ -4773,6 +4961,11 @@ fn apply_pressure_summary(
             hermit_sha: summary.hermit_sha.clone(),
             detcore_tree: summary.detcore_tree.clone(),
             depth: depth.clone(),
+            // A summary does not authenticate its source-era configuration or
+            // comparison identity. Stamping it today cannot supply either.
+            check: None,
+            applicable_when_tested: None,
+            comparison_verdict: None,
         });
         let observations = &mut tracked.cells[index].observations;
         // Keyed by tree AND provenance. Keying by tree alone would let a
@@ -4856,9 +5049,10 @@ fn apply_pressure_summary(
     })
 }
 
-/// What a validate fold recorded, SPLIT BY WHETHER THE ROW LOCATED ANYTHING.
+/// What a validate fold recorded, separating comparison outcomes from rows
+/// without a canonical comparison.
 ///
-/// Two counts rather than one because the caller's summary line is the only
+/// Separate counts because the caller's summary line is the only
 /// thing most readers see. A single "merged N divergence position(s)" makes
 /// N=0 read as "the run was all green", which is wrong precisely when a cell
 /// diverged and the comparator could not say where -- the case that needs
@@ -4871,19 +5065,14 @@ struct ValidateFold {
     located: usize,
     /// Rows that diverged and carried none of them.
     unlocated: usize,
-    /// Rows that determined no product result: an infrastructure `ERROR`, a
-    /// completed FAIL/no_result before comparison, or another non-PASS/non-FAIL
-    /// outcome. Counted separately because no canonical product result was
-    /// established. Its exact invocation is still measured evidence and is
-    /// retained with no product result; counting it separately is what keeps
-    /// the run from reading all-green.
+    /// Rows without an admitted canonical comparison. These may retain a typed
+    /// crash-error/product failure, an infrastructure error, or another
+    /// pre-comparison outcome. The exact invocation and any established product
+    /// result remain measured evidence; missing comparison does not erase them.
+    /// Counting these rows separately keeps the run from reading all-green.
     ///
-    /// ⚠️ NAMED, NOT JUST COUNTED, following `apply_pressure_summary` -- the sibling
-    /// writer already prints every row it drops with its cell and reason, on the
-    /// grounds that "a fold that drops rows silently is worse than one that refuses
-    /// everything, because the caller cannot then tell a thin batch from a broken
-    /// one". A bare count says something did not run without saying WHAT, which
-    /// leaves the reader unable to re-run it -- a weaker version of the same defect.
+    /// Named, not just counted, so each missing comparison identifies the cell
+    /// and retained reason for follow-up.
     errored: Vec<String>,
 }
 
@@ -4930,6 +5119,7 @@ fn apply_validate_results(
         detcore_tree,
         depth,
         ValidateInput {
+            applicability: None,
             reports: ResultInput::Current,
             store_invocation,
             store_positions,
@@ -4943,7 +5133,13 @@ enum ResultInput {
     Retained,
 }
 
-struct ValidateInput {
+struct SourceApplicability<'a> {
+    hermit_sha: &'a str,
+    applicable: &'a BTreeSet<CellId>,
+}
+
+struct ValidateInput<'a> {
+    applicability: Option<SourceApplicability<'a>>,
     reports: ResultInput,
     store_invocation: bool,
     store_positions: bool,
@@ -4955,9 +5151,10 @@ fn apply_validate_results_from(
     hermit_sha: &str,
     detcore_tree: &str,
     depth: &BTreeMap<String, SourceDepth>,
-    input: ValidateInput,
+    input: ValidateInput<'_>,
 ) -> Result<ValidateFold, String> {
     let ValidateInput {
+        applicability,
         reports,
         store_invocation,
         store_positions,
@@ -5027,6 +5224,7 @@ fn apply_validate_results_from(
             distinct.push((candidate, evidence));
         }
         for (candidate, evidence) in distinct {
+            let (check, comparison_verdict) = evidence.stamp_comparison();
             let row = &candidate.row;
             let located_nothing = row.first_divergent_scheduler_turn.is_none()
                 && row.first_divergent_virtual_nanoseconds.is_none()
@@ -5036,6 +5234,7 @@ fn apply_validate_results_from(
                 ValidateRowEvidence::Matched {
                     left_info_messages,
                     right_info_messages,
+                    ..
                 } => (
                     Some(ObservedResult::Pass),
                     Some((left_info_messages, right_info_messages)),
@@ -5045,6 +5244,7 @@ fn apply_validate_results_from(
                 ValidateRowEvidence::Diverged {
                     left_info_messages,
                     right_info_messages,
+                    ..
                 } => (
                     Some(if row.mode == "replay" {
                         ObservedResult::ReplayFailure
@@ -5083,6 +5283,12 @@ fn apply_validate_results_from(
                 hermit_sha: hermit_sha.to_string(),
                 detcore_tree: detcore_tree.to_string(),
                 depth: depth.clone(),
+                check,
+                comparison_verdict,
+                applicable_when_tested: applicability
+                    .as_ref()
+                    .filter(|source| source.hermit_sha == hermit_sha)
+                    .map(|source| source.applicable.contains(id)),
             });
             if result == Some(ObservedResult::Pass) && !located_nothing {
                 return Err(format!(
@@ -5324,17 +5530,25 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     let mut tracked: TrackedCells = serde_json::from_slice(&original.cells)
         .map_err(|e| format!("cannot parse tracked {CELLS}: {e}"))?;
     let before = tracked.clone();
-    let fold = apply_validate_results(
+    let fold = apply_validate_results_from(
         &mut tracked,
         &rows,
         &head,
         &detcore_tree,
         &depth,
-        true,
-        true,
+        ValidateInput {
+            reports: ResultInput::Current,
+            store_invocation: true,
+            store_positions: true,
+            applicability: Some(SourceApplicability {
+                hermit_sha: &head,
+                applicable: &derived.applicable,
+            }),
+        },
     )?;
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
+    let transitions = measurement_transitions(root, &before, &tracked, &head)?;
     let updated = generated_files(&derived, &tracked)?;
     let changed = replace_generated_files_with(
         root,
@@ -5367,28 +5581,31 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
         "compatibility scorecard: generated files {}",
         if changed { "changed" } else { "unchanged" }
     );
+    for transition in transitions {
+        println!("{transition}");
+    }
     // FOUR OUTCOMES, NOT TWO. This used to print the all-green sentence
     // whenever the located count was zero, which said "expected result for an
     // all-green run" over a batch whose cells had diverged without a locatable
     // position -- the one outcome that most needs to be read as a finding.
     //
     // ⚠️ AND `errored` MUST BE IN THE ALL-GREEN CONDITION BELOW. Without it a batch
-    // in which EVERY row was an infrastructure failure folds to zero located and
+    // in which EVERY row lacked a canonical comparison folds to zero located and
     // zero unlocated and prints the all-green sentence -- the identical collapse,
     // one outcome over, in the line a human actually acts on. An all-green summary
     // is what stops anyone looking, so this is the worst place for it to happen.
     if !fold.errored.is_empty() {
         println!(
-            "  ⚠️ {} row(s) DETERMINED NOTHING -- an infrastructure ERROR, a completed \
-             FAIL/no_result before comparison, or another non-PASS non-FAIL outcome. \
-             NO CANONICAL PRODUCT RESULT WAS ADMITTED for them, so this run is NOT \
-             all-green -- and it is NOT a product failure either. Their exact run and \
-             attempt were stored as measured no-verdict; no pass, divergence, or crash \
-             was invented. Re-run these cells; do not read this as a product result.",
+            "  ⚠️ {} row(s) DETERMINED NOTHING about canonical comparison. They may \
+             still retain a typed crash-error/product failure, an infrastructure \
+             error, or another pre-comparison outcome. This run is NOT all-green. \
+             Their exact run and attempt evidence and any established product result \
+             were retained; no pass or divergence was invented. Inspect the retained \
+             evidence before re-running these cells.",
             fold.errored.len()
         );
         for cell in &fold.errored {
-            println!("    determined nothing: {cell}");
+            println!("    no canonical comparison: {cell}");
         }
     }
     if fold.reads_all_green() {
@@ -5528,6 +5745,7 @@ fn import_results(
                 &retained.detcore_tree,
                 &retained.depth,
                 ValidateInput {
+                    applicability: None,
                     reports: ResultInput::Retained,
                     store_invocation: false,
                     store_positions: true,
@@ -5559,6 +5777,7 @@ fn import_results(
                     &retained.detcore_tree,
                     &retained.depth,
                     ValidateInput {
+                        applicability: None,
                         reports: ResultInput::Retained,
                         store_invocation: false,
                         store_positions,
@@ -5586,7 +5805,7 @@ fn import_results(
     }
     if !fold.errored.is_empty() {
         return Err(format!(
-            "retained import selected {} rows that determined nothing; first is {}",
+            "retained import selected {} rows without an admitted canonical comparison; first is {}",
             fold.errored.len(),
             fold.errored[0]
         ));
@@ -5603,14 +5822,8 @@ fn import_results(
     };
     let before_counts = measurement_counts(&before);
     let after_counts = measurement_counts(&tracked);
-    let changed = before
-        .cells
-        .iter()
-        .filter_map(|old| {
-            let new = tracked.cells.iter().find(|cell| cell.id == old.id)?;
-            (old.measurement != new.measurement).then_some((old, new))
-        })
-        .collect::<Vec<_>>();
+    let resolution_head = git_head(root)?;
+    let transitions = measurement_transitions(root, &before, &tracked, &resolution_head)?;
 
     let scorecard = format!(
         "{}{}",
@@ -5695,19 +5908,76 @@ fn import_results(
         tracked.cells.len(),
         after_counts
     );
-    for (old, new) in changed {
-        println!(
-            "  {}: {} -> {} at {}",
-            display_id(&new.id),
-            old.measurement.as_str(),
-            new.measurement.as_str(),
-            new.last_tested
-                .as_ref()
-                .map(|last| last.hermit_sha.as_str())
-                .unwrap_or("no recorded SHA")
-        );
+    for transition in transitions {
+        println!("{transition}");
     }
     Ok(())
+}
+
+/// Prepare transition diagnostics before a writer publishes its generated pair.
+fn measurement_transitions(
+    root: &Path,
+    before: &TrackedCells,
+    after: &TrackedCells,
+    head: &str,
+) -> Result<Vec<String>, String> {
+    before
+        .cells
+        .iter()
+        .filter_map(|old| {
+            let new = after.cells.iter().find(|cell| cell.id == old.id)?;
+            (old.measurement != new.measurement).then_some((old, new))
+        })
+        .map(|(old, new)| measurement_transition(root, old, new, head))
+        .collect()
+}
+
+/// Render an admitted observation transition. An aggregate pass is not a claim
+/// that the latest stamp passed, and an improvement is not a regression.
+fn measurement_transition(
+    root: &Path,
+    old: &TrackedCell,
+    new: &TrackedCell,
+    head: &str,
+) -> Result<String, String> {
+    let prefix = format!(
+        "  {}: {} -> {}",
+        display_id(&new.id),
+        old.measurement.as_str(),
+        new.measurement.as_str()
+    );
+    if old.measurement != MeasurementState::MeasuredAndPassed
+        || !matches!(
+            new.measurement,
+            MeasurementState::Diverged | MeasurementState::DivergedUnlocated
+        )
+    {
+        return Ok(prefix);
+    }
+    let current = new.last_tested.as_ref();
+    let resolution = if current.is_none_or(|last| {
+        last.comparison_verdict != Some(StampComparisonVerdict::Diverged)
+            || last.applicable_when_tested != Some(true)
+    }) {
+        BaselineResolution::Refused {
+            reason: "the current stamp does not establish a canonical divergence with source-era applicability".into(),
+        }
+    } else {
+        resolve_last_tested_baseline(
+            root,
+            old.last_tested.as_ref(),
+            current.and_then(|last| last.check.as_ref()),
+            head,
+        )?
+    };
+    Ok(match resolution {
+        BaselineResolution::Regression { baseline_sha } => {
+            format!("{prefix} — REGRESSION since {baseline_sha}")
+        }
+        BaselineResolution::Refused { reason } => {
+            format!("{prefix} — NO USABLE BASELINE\n      {reason}")
+        }
+    })
 }
 
 fn git_is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
@@ -5723,6 +5993,75 @@ fn git_is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool
             "git merge-base could not compare Hermit revisions {ancestor} and {descendant} (exit {code:?})"
         )),
     }
+}
+
+/// Whether a recorded green may be used as a baseline for today's failure.
+///
+/// ⚠️ THE POINT OF THIS TYPE IS THAT `Refused` IS A FIRST-CLASS ANSWER.
+/// Returning a sha that cannot serve as a baseline is worse than returning
+/// nothing, because the caller spends real time bisecting against it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BaselineResolution {
+    /// The recorded green was produced by the same check, with the cell
+    /// applicable, at a revision reachable from HEAD. A genuine REGRESSION window.
+    Regression { baseline_sha: String },
+    /// The recorded green exists but cannot bound today's failure. Carries the
+    /// reason so the caller reports it instead of guessing.
+    Refused { reason: String },
+}
+
+/// Require the exact old passing stamp, both complete policies, affirmative
+/// source-era applicability and real ancestry. Legacy absence stays unknown.
+fn resolve_last_tested_baseline(
+    root: &Path,
+    last_tested: Option<&LastTested>,
+    current_check: Option<&CheckIdentity>,
+    head: &str,
+) -> Result<BaselineResolution, String> {
+    let refuse = |reason| Ok(BaselineResolution::Refused { reason });
+    let Some(last) = last_tested else {
+        return refuse("no writer recorded a last_tested stamp for this cell".into());
+    };
+    let Some(recorded_check) = last.check.as_ref().filter(|check| check.complete()) else {
+        return refuse(format!(
+            "the stamp at {} does not record WHICH CHECK with complete policy; not inferred from dates or defaults",
+            last.hermit_sha
+        ));
+    };
+    let Some(current_check) = current_check.filter(|check| check.complete()) else {
+        return refuse("the CURRENT stamp does not record a complete comparison identity".into());
+    };
+    if last.comparison_verdict != Some(StampComparisonVerdict::Matched) {
+        return refuse("the recorded stamp does not establish a passing comparison; aggregate history is not a last-good stamp".into());
+    }
+    match last.applicable_when_tested {
+        Some(true) => {}
+        Some(false) => {
+            return refuse("the recorded comparison was made while the cell was DISABLED".into());
+        }
+        None => return refuse("the recorded stamp has UNKNOWN source-era applicability".into()),
+    }
+    if !recorded_check.matches(current_check) {
+        let relationship = if current_check.adds_parity_to(recorded_check) {
+            "BAR RAISE: the same ordinary policy now also requires cross-backend parity"
+        } else {
+            "DIFFERENT CHECK: no stricter/weaker relationship is established"
+        };
+        return refuse(format!(
+            "{relationship}; {} versus {}. This stamp does not establish a pass under today's check and cannot bound a regression",
+            recorded_check.describe(),
+            current_check.describe()
+        ));
+    }
+    if !git_is_ancestor(root, &last.hermit_sha, head)? {
+        return refuse(format!(
+            "the recorded baseline {} is NOT REACHABLE from HEAD {head} and cannot bound a bisect",
+            last.hermit_sha
+        ));
+    }
+    Ok(BaselineResolution::Regression {
+        baseline_sha: last.hermit_sha.clone(),
+    })
 }
 
 fn update_observations(
@@ -6011,14 +6350,21 @@ where
     // first; only exactly represented events may be suppressed. Existing
     // projected events still undergo their full-source ownership check.
     let mut preview = tracked.clone();
-    apply_validate_results(
+    apply_validate_results_from(
         &mut preview,
         &result_rows,
         &head,
         &detcore_tree,
         &depth,
-        true,
-        true,
+        ValidateInput {
+            reports: ResultInput::Current,
+            store_invocation: true,
+            store_positions: true,
+            applicability: Some(SourceApplicability {
+                hermit_sha: &head,
+                applicable: &derived.applicable,
+            }),
+        },
     )?;
     let current_attempts = current_result_attempts(&preview, &result_rows, &detcore_tree)?;
     let preview_representation =
@@ -6055,14 +6401,21 @@ where
         pre_series_corpus: true,
     });
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
-    let fold = apply_validate_results(
+    let fold = apply_validate_results_from(
         &mut tracked,
         &result_rows,
         &head,
         &detcore_tree,
         &depth,
-        true,
-        true,
+        ValidateInput {
+            reports: ResultInput::Current,
+            store_invocation: true,
+            store_positions: true,
+            applicability: Some(SourceApplicability {
+                hermit_sha: &head,
+                applicable: &derived.applicable,
+            }),
+        },
     )?;
     // A normal validate publishes its series row before this local write-back.
     // Match the final direct evidence to the complete snapshot before choosing
@@ -6101,6 +6454,7 @@ where
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
     refresh_measurement(&mut tracked);
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
+    let transitions = measurement_transitions(root, &before, &tracked, &head)?;
     let updated = generated_files(&derived, &tracked)?;
     let partial_scorecard = updated.scorecard.clone();
 
@@ -6136,13 +6490,16 @@ where
         "compatibility scorecard: generated files {}",
         if changed { "changed" } else { "unchanged" }
     );
+    for transition in transitions {
+        println!("{transition}");
+    }
     if !fold.errored.is_empty() {
         println!(
-            "  {} current result row(s) determined no canonical product result; their exact invocation evidence was retained",
+            "  {} current result row(s) lack an admitted canonical comparison; their exact invocation evidence and any established product result were retained",
             fold.errored.len()
         );
         for row in &fold.errored {
-            println!("    determined nothing: {row}");
+            println!("    no canonical comparison: {row}");
         }
     }
     for skipped in &projection.skipped {
@@ -6937,12 +7294,23 @@ fn series_evidence(row: &SeriesRow, id: &CellId) -> Option<SeriesEvidence> {
         return None;
     }
     if let Some(evidence) = &row.series.no_verdict_evidence {
-        return Some(SeriesEvidence {
-            result: evidence
+        // Callers validate the exact disposition/classification tuple before
+        // projection. Retain this typed product crash without treating any
+        // other no-result kind as a crash or granting comparison credit.
+        let result = if evidence.attempts.iter().any(|attempt| attempt.timed_out) {
+            Some(ObservedResult::Timeout)
+        } else if row.series.result == Some(ObservedResult::CrashError)
+            && evidence
                 .attempts
                 .iter()
-                .any(|attempt| attempt.timed_out)
-                .then_some(ObservedResult::Timeout),
+                .any(|attempt| attempt.kind == SeriesNoVerdictKind::ContainerFailed)
+        {
+            Some(ObservedResult::CrashError)
+        } else {
+            None
+        };
+        return Some(SeriesEvidence {
+            result,
             no_verdict: true,
         });
     }
@@ -7219,7 +7587,7 @@ fn apply_series_rows_inner(
 
     if !rows.is_empty() && prepared.is_empty() {
         return Err(format!(
-            "every one of the {} readable series row(s) determined nothing, so the projection was not written:\n{}",
+            "every one of the {} readable series row(s) determined nothing for the legacy projection, so the projection was not written:\n{}",
             rows.len(),
             skipped
                 .iter()
@@ -7412,6 +7780,13 @@ fn apply_series_rows_inner(
                 hermit_sha: row.hermit_sha.clone(),
                 detcore_tree: detcore_tree.to_string(),
                 depth: row.depth.clone(),
+                // Projected from historical series rows. Neither the check
+                // identity nor the applicability AT THAT TIME survives in the
+                // row, and today's applicability is not evidence about then, so
+                // both stay unrecorded. This is the case the type exists for.
+                check: None,
+                applicable_when_tested: None,
+                comparison_verdict: None,
             });
         }
     }
@@ -8520,7 +8895,7 @@ struct RetainedImport {
 
 /// Read retained validate rows without pretending they belong to the current
 /// checkout. Each row keeps its own Hermit SHA, and only clean canonical
-/// comparisons on HEAD's history are eligible. For each enabled cell or
+/// comparisons on HEAD's history are eligible. For each applicable cell or
 /// disabled ptrace-referenced parity candidate, import ordinary terminal
 /// comparisons and complete measured parity attempt histories at the newest
 /// eligible SHA independently for each comparison relation, so disagreement at one revision remains visible instead of being
@@ -9823,6 +10198,9 @@ fn self_test() -> Result<(), String> {
     let current_last_tested = LastTested {
         hermit_sha: "current-sha".into(),
         detcore_tree: "current-tree".into(),
+        check: None,
+        applicable_when_tested: None,
+        comparison_verdict: None,
         depth: BTreeMap::from([(
             "hermit".into(),
             SourceDepth {
@@ -10449,7 +10827,7 @@ fn self_test() -> Result<(), String> {
     }
     let selected_fixture = Derived {
         population: population.clone(),
-        enabled: population.clone(),
+        applicable: population.clone(),
         ci_disabled_reasons: BTreeMap::new(),
         not_applicable_reasons: BTreeMap::new(),
         selected,
@@ -10462,10 +10840,11 @@ fn self_test() -> Result<(), String> {
         .next()
         .ok_or("scorecard omitted its status explanation")?;
     for required in [
-        "**Green** means this manifest cell is selected by full in `ci/expected-e2e-plan.json`; ordinary validation therefore requires it to pass.",
-        "**Red** means the cell is in the manifest but is not selected by full.",
-        "**Red does not mean failed:**",
-        "Manifest-disabled combinations are **Not applicable**; they are neither red nor omitted.",
+        "cells in the manifest; no row is omitted.",
+        "**Selected by full** exactly when it appears in `ci/expected-e2e-plan.json`.",
+        "**Not selected by full** when it is in the manifest but absent from that plan.",
+        "Selection is not a test result:",
+        "**Not applicable**",
     ] {
         if !status_prose.contains(required) {
             return Err(format!(
@@ -10480,15 +10859,15 @@ fn self_test() -> Result<(), String> {
             ));
         }
     }
-    if !status_prose.contains("counts Green as **1** and Red as **0**")
-        || !status_prose
-            .contains("the current **0** manifest-disabled combinations as **Not applicable**")
+    if !status_prose.contains("are selected by full")
+        || !status_prose.contains("are not selected by full")
+        || !status_prose.contains("are **Not applicable**")
     {
         return Err("scorecard status prose did not derive its three status counts".into());
     }
-    if !USAGE.contains("selected by full in ci/expected-e2e-plan.json")
+    if !USAGE.contains("Selected by full means that the cell appears in ci/expected-e2e-plan.json")
         || !USAGE.contains(
-            "Red means that the cell is in the manifest but is not selected by full; red\ndoes not mean failed",
+            "Not selected by full means that the cell is in the manifest but absent from\nthat plan; selection is not a test result",
         )
         || USAGE.contains("until it is measured, promoted")
     {
@@ -10534,45 +10913,41 @@ fn self_test() -> Result<(), String> {
     };
     let visible_red = Derived {
         population: BTreeSet::from([id.clone()]),
-        enabled: BTreeSet::from([id.clone()]),
+        applicable: BTreeSet::from([id.clone()]),
         ci_disabled_reasons: BTreeMap::from([(id.clone(), visible_reason.clone())]),
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
     };
-    if !render_scorecard(&visible_red).contains("counts Green as **0** and Red as **1**") {
-        return Err("scorecard status prose did not derive its Red count".into());
+    if !render_scorecard(&visible_red).contains("**1** are not selected by full") {
+        return Err("scorecard prose did not derive its not-selected-by-full count".into());
     }
     let visible_tracked = tracked_from(&visible_red, None, Some("self-test"), false)?;
     if visible_tracked.cells[0].ci_disabled_reason.as_ref() != Some(&visible_reason)
-        || !encoded_cells(&visible_tracked)?.contains("ci_disabled_reason")
+        || !encoded_cells(&visible_tracked)?.contains("not_selected_by_full_reason")
     {
         return Err("per-backend CI reason was not emitted into tracked scorecard data".into());
     }
     let mut measured_red = visible_tracked.clone();
     measured_red.cells[0].measurement = MeasurementState::MeasuredAndPassed;
     let measured_section = render_measurement_section(&measured_red);
-    let current_counts = "In the current generated data, **zero Green cells are \
-`never-measured`**.";
-    let parser_counts = "The current green/`never-measured` count is **0**, and the current \
-red/`measured-and-passed` count is **1**.";
-    if !measured_section.contains(current_counts)
-        || !measured_section.contains(parser_counts)
-        || !measured_section.contains("**1 Red cell that is `measured-and-passed`**")
-        || !measured_section.contains("| `red` | 0 | 1 | 0 | 0 | 0 | 1 |")
+    if !measured_section.contains("Of the cells selected by full, **0** have `never-measured`")
+        || !measured_section
+            .contains("of the cells not selected by full, **1** have `measured-and-passed`")
+        || !measured_section.contains("| Not selected by full | 0 | 1 | 0 | 0 | 0 | 1 |")
     {
         return Err(
-            "measurement prose did not use the same green/never-measured and red/measured-and-passed counts as its table"
+            "measurement prose did not use the same selection and measurement counts as its table"
                 .into(),
         );
     }
     let measured_row = format!(
-        "| `{}` | `{}` | `{}` | `red` | `measured-and-passed` |",
+        "| `{}` | `{}` | `{}` | `Not selected by full` | `measured-and-passed` |",
         id.test, id.mode, id.backend
     );
     if !measured_section.contains(&measured_row) {
-        return Err("measurement display did not show red and measured-and-passed together".into());
+        return Err("measurement display did not show selection and measurement together".into());
     }
     let unmeasured_section = render_measurement_section(&visible_tracked);
     if unmeasured_section.contains(&measured_row) {
@@ -10580,25 +10955,21 @@ red/`measured-and-passed` count is **1**.";
             "measurement display showed measured-and-passed without that measurement".into(),
         );
     }
-    if !unmeasured_section.contains("**zero Green cells are `never-measured`**")
-        || !unmeasured_section.contains(
-            "The current green/`never-measured` count is **0**, and the current \
-red/`measured-and-passed` count is **0**.",
-        )
-        || !unmeasured_section.contains("**0 Red cells that are `measured-and-passed`**")
+    if !unmeasured_section.contains("Of the cells selected by full, **0** have `never-measured`")
+        || !unmeasured_section
+            .contains("of the cells not selected by full, **0** have `measured-and-passed`")
     {
         return Err("measurement prose kept a stale cross-combination count".into());
     }
     let mut unmeasured_green = visible_tracked.clone();
     unmeasured_green.cells[0].status = CellStatus::Green;
     let unmeasured_green_section = render_measurement_section(&unmeasured_green);
-    if !unmeasured_green_section.contains("**1 Green cell is `never-measured`**")
-        || !unmeasured_green_section.contains(
-            "The current green/`never-measured` count is **1**, and the current \
-red/`measured-and-passed` count is **0**.",
-        )
+    if !unmeasured_green_section
+        .contains("Of the cells selected by full, **1** have `never-measured`")
+        || !unmeasured_green_section
+            .contains("of the cells not selected by full, **0** have `measured-and-passed`")
     {
-        return Err("measurement prose hard-coded the current zero Green count".into());
+        return Err("measurement prose hard-coded the current selected count".into());
     }
 
     let cross_tab_cells = [
@@ -10638,9 +11009,9 @@ red/`measured-and-passed` count is **0**.",
         }
     }
     for row in [
-        "| `green` | 0 | 0 | 1 | 1 | 0 | 2 |",
-        "| `red` | 1 | 1 | 0 | 0 | 0 | 2 |",
-        "| `not-applicable` | 0 | 0 | 0 | 0 | 1 | 1 |",
+        "| Selected by full | 0 | 0 | 1 | 1 | 0 | 2 |",
+        "| Not selected by full | 1 | 1 | 0 | 0 | 0 | 2 |",
+        "| Not applicable | 0 | 0 | 0 | 0 | 1 | 1 |",
         "| **Total** | **1** | **1** | **1** | **1** | **1** | **5** |",
     ] {
         if !cross_tab.contains(row) {
@@ -10651,7 +11022,7 @@ red/`measured-and-passed` count is **0**.",
     }
     let not_applicable = Derived {
         population: BTreeSet::from([id.clone()]),
-        enabled: BTreeSet::new(),
+        applicable: BTreeSet::new(),
         ci_disabled_reasons: BTreeMap::new(),
         not_applicable_reasons: BTreeMap::from([(
             id.clone(),
@@ -10662,19 +11033,17 @@ red/`measured-and-passed` count is **0**.",
         selected_custom: BTreeSet::new(),
     };
     let status_section = render_scorecard(&not_applicable);
-    if !status_section
-        .contains("the current **1** manifest-disabled combinations as **Not applicable**")
+    if !status_section.contains("**1** are **Not applicable**")
         || !status_section.contains("| `ptrace` | 0 | 0 | 1 | 1 |")
         || !status_section.contains("| `verify` | 0 / 1 | 0 | 0 | 1 | 1 |")
     {
-        return Err("status prose and tables did not use the same manifest-disabled count".into());
+        return Err("selection prose and tables did not use the same not-applicable count".into());
     }
     let old_green = TrackedCells {
         schema: SCHEMA,
         projection: None,
         cells: vec![TrackedCell {
             id: id.clone(),
-            enabled: true,
             status: CellStatus::Green,
             ci_disabled_reason: None,
             not_applicable_reason: None,
@@ -10686,7 +11055,7 @@ red/`measured-and-passed` count is **0**.",
     };
     let regressed = Derived {
         population: BTreeSet::from([id.clone()]),
-        enabled: BTreeSet::from([id.clone()]),
+        applicable: BTreeSet::from([id.clone()]),
         ci_disabled_reasons: BTreeMap::new(),
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
@@ -10701,7 +11070,6 @@ red/`measured-and-passed` count is **0**.",
         projection: None,
         cells: vec![TrackedCell {
             id: id.clone(),
-            enabled: true,
             status: CellStatus::Green,
             ci_disabled_reason: None,
             not_applicable_reason: None,
@@ -10737,7 +11105,7 @@ red/`measured-and-passed` count is **0**.",
     // stale justifications that read as live ones.
     let back_to_green = Derived {
         population: BTreeSet::from([id.clone()]),
-        enabled: BTreeSet::from([id.clone()]),
+        applicable: BTreeSet::from([id.clone()]),
         ci_disabled_reasons: BTreeMap::new(),
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
@@ -10760,7 +11128,6 @@ red/`measured-and-passed` count is **0**.",
         projection: None,
         cells: vec![TrackedCell {
             id: id.clone(),
-            enabled: false,
             status: CellStatus::Red,
             ci_disabled_reason: None,
             not_applicable_reason: None,
@@ -10900,13 +11267,13 @@ red/`measured-and-passed` count is **0**.",
         ..parity_id.clone()
     };
     let empty_tracked_cell = |id: CellId, status: CellStatus| {
-        let enabled = status != CellStatus::NotApplicable;
+        let applicable = status != CellStatus::NotApplicable;
         TrackedCell {
             id,
-            enabled,
             status,
             ci_disabled_reason: None,
-            not_applicable_reason: (!enabled).then(|| "fixture candidate disabled".into()),
+            not_applicable_reason: (!applicable)
+                .then(|| "fixture candidate is not applicable".into()),
             last_tested: None,
             observations: Vec::new(),
             measurement: MeasurementState::NeverMeasured,
@@ -10923,7 +11290,7 @@ red/`measured-and-passed` count is **0**.",
     };
     let retained_fixture = Derived {
         population: BTreeSet::from([ptrace_id.clone(), parity_id.clone()]),
-        enabled: BTreeSet::from([ptrace_id.clone()]),
+        applicable: BTreeSet::from([ptrace_id.clone()]),
         ci_disabled_reasons: BTreeMap::new(),
         not_applicable_reasons: BTreeMap::from([(
             parity_id.clone(),
@@ -11106,6 +11473,135 @@ red/`measured-and-passed` count is **0**.",
         })
     };
 
+    // Check provenance travels through the real admitted-report writer. The
+    // current source context is explicit; retained import never borrows today's
+    // applicable set. Resolve transitions against real Git objects, not fake SHAs.
+    let provenance_root = repo_root()?;
+    let provenance_head = git_head(&provenance_root)?;
+    let provenance_old = git_rev_parse(&provenance_root, "HEAD^")?;
+    let provenance_enabled = BTreeSet::from([id.clone()]);
+    let provenance_fold = |mut row: ResultRow, sha: &str, source_sha: Option<&str>, reports| {
+        row.hermit_sha = sha.into();
+        row.attempts[0]["index"] = "1".into();
+        row.attempts[0]["outcome"] = row.outcome.clone().into();
+        row.attempts[0]["status"] = serde_json::json!(if row.outcome == "PASS" { 0 } else { 1 });
+        row.attempts[0]["signal"] = JsonValue::Null;
+        row.attempts[0]["timed_out"] = false.into();
+        let rows = BTreeMap::from([(id.clone(), vec![parity_candidate(row)?])]);
+        let mut tracked = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![empty_tracked_cell(id.clone(), CellStatus::Green)],
+        };
+        apply_validate_results_from(
+            &mut tracked,
+            &rows,
+            sha,
+            "provenance-tree",
+            &depth_fixture,
+            ValidateInput {
+                reports,
+                store_invocation: true,
+                store_positions: true,
+                applicability: source_sha.map(|hermit_sha| SourceApplicability {
+                    hermit_sha,
+                    applicable: &provenance_enabled,
+                }),
+            },
+        )?;
+        refresh_measurement(&mut tracked);
+        Ok::<_, String>(tracked.cells.remove(0))
+    };
+    let provenance_pass = provenance_fold(
+        candidate("PASS").row,
+        &provenance_old,
+        Some(&provenance_old),
+        ResultInput::Current,
+    )?;
+    let pass_stamp = provenance_pass.last_tested.as_ref().unwrap();
+    if pass_stamp.applicable_when_tested != Some(true)
+        || pass_stamp.comparison_verdict != Some(StampComparisonVerdict::Matched)
+        || pass_stamp.check.as_ref().is_none_or(|check| {
+            !check.complete() || check.ordinary.len() != 1 || check.cross_backend.is_some()
+        })
+    {
+        return Err("admitted ordinary match lost its source-qualified check identity".into());
+    }
+    let encoded_stamp = serde_json::to_string(pass_stamp).map_err(|e| e.to_string())?;
+    if serde_json::from_str::<LastTested>(&encoded_stamp).map_err(|e| e.to_string())? != *pass_stamp
+    {
+        return Err("comparison provenance changed during the scorecard JSON round trip".into());
+    }
+    for (source, reports) in [
+        (None, ResultInput::Retained),
+        (Some(provenance_head.as_str()), ResultInput::Current),
+    ] {
+        let historical = provenance_fold(candidate("PASS").row, &provenance_old, source, reports)?;
+        let last = historical.last_tested.as_ref().unwrap();
+        if last.applicable_when_tested.is_some()
+            || last.check != pass_stamp.check
+            || !matches!(
+                resolve_last_tested_baseline(
+                    &provenance_root,
+                    Some(last),
+                    pass_stamp.check.as_ref(),
+                    &provenance_head
+                )?,
+                BaselineResolution::Refused { .. }
+            )
+        {
+            return Err("historical comparison borrowed applicability from today's source".into());
+        }
+    }
+    for located in [false, true] {
+        let mut row = candidate("FAIL").row;
+        let position = located.then_some(2);
+        let report = pressure_verification("determinism-failure", None, None, position, None);
+        let raw = serde_json::to_string(&report).map_err(|e| e.to_string())?;
+        row.attempts[0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(raw.as_bytes())).into();
+        row.attempts[0]["verification_report"] = raw.into();
+        row.first_divergent_record = position;
+        let diverged = provenance_fold(
+            row,
+            &provenance_head,
+            Some(&provenance_head),
+            ResultInput::Current,
+        )?;
+        let last = diverged.last_tested.as_ref().unwrap();
+        if last.check != pass_stamp.check
+            || last.comparison_verdict != Some(StampComparisonVerdict::Diverged)
+        {
+            return Err("canonical divergence lost the actual ordinary policy or verdict".into());
+        }
+        let transition = measurement_transition(
+            &provenance_root,
+            &provenance_pass,
+            &diverged,
+            &provenance_head,
+        )?;
+        if !transition.contains(&format!("REGRESSION since {provenance_old}")) {
+            return Err(format!(
+                "real pass-to-divergence transition lost its comparable baseline: {transition}"
+            ));
+        }
+        let never = empty_tracked_cell(id.clone(), CellStatus::Green);
+        for (before, after) in [
+            (&diverged, &provenance_pass),
+            (&never, &provenance_pass),
+            (&diverged, &diverged),
+            (&never, &diverged),
+        ] {
+            let transition =
+                measurement_transition(&provenance_root, before, after, &provenance_head)?;
+            if transition.contains("REGRESSION") || transition.contains("NO USABLE BASELINE") {
+                return Err(format!(
+                    "non-regression transition invoked baseline resolution: {transition}"
+                ));
+            }
+        }
+    }
+
     let mut matching_parity = parity_tracked();
     let matching_row = parity_row(&parity_id, BackendParityVerdict::Matched)?;
     let mut unequal_raw_populations = matching_row.clone();
@@ -11178,6 +11674,30 @@ red/`measured-and-passed` count is **0**.",
         .iter()
         .find(|cell| cell.id == parity_id)
         .expect("matching parity cell remains tracked");
+    let matching_stamp = matching_cell.last_tested.as_ref().unwrap();
+    let matching_check = matching_stamp
+        .check
+        .as_ref()
+        .ok_or("parity match lost check identity")?;
+    if !matching_check.complete()
+        || matching_check.ordinary.len() != 2
+        || matching_check.cross_backend.is_none()
+        || matching_stamp.comparison_verdict != Some(StampComparisonVerdict::Matched)
+        || matching_stamp.applicable_when_tested.is_some()
+        || !matches!(
+            resolve_last_tested_baseline(
+                &provenance_root,
+                Some(pass_stamp),
+                Some(matching_check),
+                &provenance_head
+            )?,
+            BaselineResolution::Refused { .. }
+        )
+    {
+        return Err(
+            "parity stamp lost cross-backend policy or borrowed ordinary pass credit".into(),
+        );
+    }
     let matching_markdown = render_backend_parity_section(&matching_parity);
     let plan = hermit_manifest_plan::validation_dag::generate(&repo_root()?)?;
     let selectors = plan
@@ -11350,6 +11870,12 @@ red/`measured-and-passed` count is **0**.",
         .iter()
         .find(|cell| cell.id == parity_id)
         .expect("divergent parity cell remains tracked");
+    let divergent_stamp = divergent_cell.last_tested.as_ref().unwrap();
+    if divergent_stamp.check != matching_stamp.check
+        || divergent_stamp.comparison_verdict != Some(StampComparisonVerdict::Diverged)
+    {
+        return Err("parity divergence lost its admitted cross-backend policy or verdict".into());
+    }
     let divergent_markdown = render_backend_parity_section(&divergent_parity);
     if divergent_cell.measurement != MeasurementState::Diverged
         || divergent_cell.observations[0].results != BTreeSet::from([ObservedResult::ParityFailure])
@@ -12255,7 +12781,6 @@ red/`measured-and-passed` count is **0**.",
             projection: None,
             cells: vec![TrackedCell {
                 id: validate_id.clone(),
-                enabled: true,
                 status: CellStatus::Red,
                 ci_disabled_reason: None,
                 not_applicable_reason: None,
@@ -12283,7 +12808,6 @@ red/`measured-and-passed` count is **0**.",
         projection: None,
         cells: vec![TrackedCell {
             id: dbt_id.clone(),
-            enabled: true,
             status: CellStatus::Red,
             ci_disabled_reason: None,
             not_applicable_reason: None,
@@ -12370,7 +12894,6 @@ red/`measured-and-passed` count is **0**.",
         projection: None,
         cells: vec![TrackedCell {
             id: validate_id.clone(),
-            enabled: true,
             status: CellStatus::Red,
             ci_disabled_reason: None,
             not_applicable_reason: None,
@@ -12425,7 +12948,6 @@ red/`measured-and-passed` count is **0**.",
             projection: None,
             cells: vec![TrackedCell {
                 id: validate_id.clone(),
-                enabled: true,
                 status: CellStatus::Red,
                 ci_disabled_reason: None,
                 not_applicable_reason: None,
@@ -12445,7 +12967,7 @@ red/`measured-and-passed` count is **0**.",
 
     let red_import_fixture = Derived {
         population: BTreeSet::from([validate_id.clone()]),
-        enabled: BTreeSet::from([validate_id.clone()]),
+        applicable: BTreeSet::from([validate_id.clone()]),
         ci_disabled_reasons: BTreeMap::new(),
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::new(),
@@ -12453,7 +12975,9 @@ red/`measured-and-passed` count is **0**.",
         selected_custom: BTreeSet::new(),
     };
     if retained_import_cells(&red_import_fixture) != BTreeSet::from([validate_id.clone()]) {
-        return Err("an enabled red cell was excluded from retained import".into());
+        return Err(
+            "an applicable cell not selected by full was excluded from retained import".into(),
+        );
     }
 
     let rows = BTreeMap::from([(
@@ -14122,7 +14646,7 @@ red/`measured-and-passed` count is **0**.",
         .cells
         .iter()
         .find(|candidate| {
-            !candidate.enabled
+            candidate.status == CellStatus::NotApplicable
                 && candidate.id.mode == "verify"
                 && candidate.id.backend == "kvm"
                 && command_tracked.cells.iter().any(|reference| {
@@ -14131,7 +14655,6 @@ red/`measured-and-passed` count is **0**.",
                         && reference.id.test == candidate.id.test
                         && reference.id.mode == candidate.id.mode
                         && reference.id.backend == "ptrace"
-                        && reference.enabled
                         && reference.status == CellStatus::Green
                 })
         })
@@ -14229,9 +14752,9 @@ red/`measured-and-passed` count is **0**.",
     if !command_tracked
         .cells
         .iter()
-        .any(|cell| cell.id == import_parity_id && cell.enabled)
+        .any(|cell| cell.id == import_parity_id && cell.status != CellStatus::NotApplicable)
     {
-        return Err("parity retirement fixture requires the existing enabled KVM cell".into());
+        return Err("parity retirement fixture requires the existing applicable KVM cell".into());
     }
 
     // The combined writer must bind each parity receipt to its current result
@@ -15520,6 +16043,24 @@ red/`measured-and-passed` count is **0**.",
             String::from_utf8_lossy(&imported.stderr)
         ));
     }
+    let imported_cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    let imported_stamp = imported_cells
+        .cells
+        .iter()
+        .find(|cell| cell.id == replay_id)
+        .and_then(|cell| cell.last_tested.as_ref())
+        .ok_or("retained import lost its stamp")?;
+    if imported_stamp.applicable_when_tested.is_some()
+        || imported_stamp.comparison_verdict != Some(StampComparisonVerdict::Matched)
+        || imported_stamp
+            .check
+            .as_ref()
+            .is_none_or(|check| !check.complete())
+    {
+        return Err(
+            "import-results backfilled source-era applicability or lost admitted policy".into(),
+        );
+    }
     restore_generated()?;
 
     let mut malformed_retained = replay_row.clone();
@@ -15591,6 +16132,23 @@ red/`measured-and-passed` count is **0**.",
     {
         return Err("observe-results did not retain the seeded same-tree verify PASS".into());
     }
+    let seeded_stamp = seeded_cell
+        .last_tested
+        .as_ref()
+        .ok_or("observer omitted its current stamp")?;
+    if seeded_stamp.hermit_sha != fixture_head
+        || seeded_stamp.applicable_when_tested
+            != Some(seeded_cell.status != CellStatus::NotApplicable)
+        || seeded_stamp.comparison_verdict != Some(StampComparisonVerdict::Matched)
+        || seeded_stamp
+            .check
+            .as_ref()
+            .is_none_or(|check| !check.complete())
+    {
+        return Err(
+            "observe-results failed to stamp actual current source/check provenance".into(),
+        );
+    }
     let prior_results = seeded_observation.results.clone();
     let prior_comparisons = seeded_observation.canonical_comparisons.clone();
 
@@ -15616,6 +16174,12 @@ red/`measured-and-passed` count is **0**.",
         .cells
         .iter()
         .find(|cell| cell.id == verify_id);
+    let unavailable_stamp = observed_cell
+        .and_then(|cell| cell.last_tested.as_ref())
+        .ok_or("no-comparison observer lost recency")?;
+    if unavailable_stamp.check.is_some() || unavailable_stamp.comparison_verdict.is_some() {
+        return Err("current no-comparison observer borrowed an earlier passing policy".into());
+    }
     let final_observation = observed_cell.and_then(|cell| {
         cell.observations.iter().find(|observation| {
             observation.detcore_tree.as_deref() == Some(&fixture_detcore_tree)
@@ -15651,6 +16215,164 @@ red/`measured-and-passed` count is **0**.",
             "observe-results did not retain exact verify no-verdict evidence without changing the prior same-tree result".into(),
         );
     }
+    // Exercise BOTH real current-writer CLIs. Helper-only positive controls
+    // cannot establish that an authenticated comparison reaches its diagnostic.
+    let result_before_transitions = fs::read(&result_path).map_err(|e| e.to_string())?;
+    let transition_row = |label: &str, divergence: Option<Option<u64>>, unavailable: bool| {
+        let mut row = verify_row.clone();
+        row.run_id = label.into();
+        let mut report = canonical_verdict::VerificationReport::from_json_slice(
+            row.attempts[0]["verification_report"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+        )?;
+        report.comparison.as_mut().unwrap().virtualize_time = Some(!unavailable);
+        if let Some(position) = divergence {
+            report.verified = false;
+            report.bitwise_parity = false;
+            report.verdict = canonical_verdict::Verdict::Diverged;
+            report.first_divergent_record = position;
+            row.first_divergent_record = position;
+            row.outcome = "FAIL".into();
+            row.result = Some(ObservedResult::DeterminismFailure);
+            row.failure_class = Some(FailureClass::ProductFailure);
+            row.attempts[0]["outcome"] = "FAIL".into();
+            row.attempts[0]["status"] = serde_json::json!(1);
+        }
+        let raw = serde_json::to_string(&report).map_err(|e| e.to_string())?;
+        row.attempts[0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(raw.as_bytes())).into();
+        row.attempts[0]["verification_report"] = raw.into();
+        Ok::<_, String>(row)
+    };
+    let read_transition_cell = || -> Result<TrackedCell, String> {
+        let cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+        cells
+            .cells
+            .into_iter()
+            .find(|cell| cell.id == verify_id)
+            .ok_or_else(|| "current writer lost transition fixture cell".into())
+    };
+    for combined in [false, true] {
+        let command = if combined {
+            "project-and-observe-results"
+        } else {
+            "observe-results"
+        };
+        let invoke = || {
+            if combined {
+                run_snapshot_command(&empty_snapshot_path, &empty_snapshot_sha)
+            } else {
+                run_result_command("observe-results", None)
+            }
+        };
+        let require_output =
+            |output: std::process::Output, regression: bool, baseline_refusal: bool| {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if !output.status.success()
+                    || stdout.contains("REGRESSION since") != regression
+                    || stdout.contains("NO USABLE BASELINE") != baseline_refusal
+                    || (regression && !stdout.contains(&format!("REGRESSION since {fixture_head}")))
+                {
+                    return Err(format!(
+                        "{command} transition control: status={} stdout={stdout:?} stderr={:?}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                Ok::<_, String>(())
+            };
+        for position in [None, Some(2)] {
+            restore_combined_baseline()?;
+            write_result_row(&transition_row("cli-provenance-pass", None, false)?)?;
+            require_output(invoke()?, false, false)?;
+            let old = read_transition_cell()?;
+            let last = old.last_tested.as_ref().ok_or("CLI pass omitted stamp")?;
+            if old.measurement != MeasurementState::MeasuredAndPassed
+                || last.applicable_when_tested != Some(true)
+                || last.comparison_verdict != Some(StampComparisonVerdict::Matched)
+                || last.check.as_ref().is_none_or(|check| !check.complete())
+            {
+                return Err(format!(
+                    "{command} CLI positive did not establish an actual comparable pass"
+                ));
+            }
+            write_result_row(&transition_row(
+                "cli-provenance-divergence",
+                Some(position),
+                false,
+            )?)?;
+            require_output(invoke()?, true, false)?;
+            let diverged = read_transition_cell()?;
+            if diverged.measurement
+                != if position.is_some() {
+                    MeasurementState::Diverged
+                } else {
+                    MeasurementState::DivergedUnlocated
+                }
+            {
+                return Err(format!(
+                    "{command} CLI divergence lost its location semantics"
+                ));
+            }
+            // A later pass remains real evidence without erasing failure history
+            // or printing a new regression for the recovery attempt.
+            write_result_row(&transition_row("cli-provenance-recovery", None, false)?)?;
+            require_output(invoke()?, false, false)?;
+            let recovered = read_transition_cell()?;
+            if recovered.last_tested.as_ref().unwrap().comparison_verdict
+                != Some(StampComparisonVerdict::Matched)
+                || !recovered.observations.iter().any(|observation| {
+                    observation
+                        .results
+                        .contains(&ObservedResult::DeterminismFailure)
+                })
+            {
+                return Err(format!(
+                    "{command} recovery lost its pass or erased actual failure history"
+                ));
+            }
+            println!(
+                "scorecard self-test: {command} CLI comparable-pass -> divergence {position:?}, recovery opposing control passed"
+            );
+        }
+        restore_combined_baseline()?;
+        write_result_row(&transition_row("cli-history-pass", None, false)?)?;
+        require_output(invoke()?, false, false)?;
+        write_result_row(&transition_row("cli-history-no-comparison", None, true)?)?;
+        require_output(invoke()?, false, false)?;
+        let unknown = read_transition_cell()?;
+        if unknown.measurement != MeasurementState::MeasuredAndPassed
+            || unknown.last_tested.as_ref().unwrap().check.is_some()
+            || unknown
+                .last_tested
+                .as_ref()
+                .unwrap()
+                .comparison_verdict
+                .is_some()
+        {
+            return Err(format!(
+                "{command} latest no-comparison stamp borrowed the aggregate pass"
+            ));
+        }
+        write_result_row(&transition_row(
+            "cli-history-divergence",
+            Some(None),
+            false,
+        )?)?;
+        require_output(invoke()?, false, true)?;
+        write_result_row(&transition_row(
+            "cli-history-located",
+            Some(Some(2)),
+            false,
+        )?)?;
+        require_output(invoke()?, false, false)?;
+        println!(
+            "scorecard self-test: {command} CLI no-comparison baseline refused; location-only transition not a regression"
+        );
+    }
+    fs::write(&result_path, result_before_transitions).map_err(|e| e.to_string())?;
     restore_generated()?;
 
     for (staged_clean, unrelated_clean, allowed) in [
@@ -15837,7 +16559,6 @@ red/`measured-and-passed` count is **0**.",
     };
     let bare_cell = |id: &CellId| TrackedCell {
         id: id.clone(),
-        enabled: true,
         status: CellStatus::Red,
         ci_disabled_reason: None,
         not_applicable_reason: None,
@@ -16022,6 +16743,70 @@ red/`measured-and-passed` count is **0**.",
     no_result_row.first_divergent_record = None;
     no_result_row.first_divergent_syscall = None;
     no_result_row.attempts = vec![no_result_attempt];
+
+    // A typed sandbox failure is a product crash, while the comparison
+    // denominator remains unchanged. No guest Output was returned.
+    for run in ["run1", "run2"] {
+        let mut container_row = no_result_row.clone();
+        let mut report =
+            serde_json::to_value(canonical_verdict::VerificationReport::no_result()).unwrap();
+        report["no_result_reason"] = serde_json::json!({"kind":"container_failed","run":run,"disposition":{"kind":"signaled","signal":14,"core_dumped":false}});
+        let raw = serde_json::to_string(&report).unwrap();
+        container_row.attempts[0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(raw.as_bytes())).into();
+        container_row.attempts[0]["verification_report"] = raw.into();
+        if !matches!(
+            container_row.comparison_evidence()?,
+            ValidateRowEvidence::Unavailable {
+                result: Some(ObservedResult::CrashError),
+                ..
+            }
+        ) {
+            return Err("container failure lost crash evidence or gained comparison credit".into());
+        }
+        let mut mixed = container_row.clone();
+        mixed.outcome = "ERROR".into();
+        mixed.result = Some(ObservedResult::Timeout);
+        mixed.failure_class = Some(FailureClass::NoResult);
+        mixed.error_kind = Some("wall-timeout".into());
+        let mut timeout_attempt = mixed.attempts[0].clone();
+        timeout_attempt["index"] = "2".into();
+        timeout_attempt["outcome"] = "ERROR".into();
+        timeout_attempt["status"] = JsonValue::Null;
+        timeout_attempt["signal"] = serde_json::json!(9);
+        timeout_attempt["timed_out"] = serde_json::json!(true);
+        timeout_attempt["error_kind"] = "wall-timeout".into();
+        let timeout_report =
+            serde_json::to_string(&canonical_verdict::VerificationReport::no_result()).unwrap();
+        timeout_attempt["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(timeout_report.as_bytes())).into();
+        timeout_attempt["verification_report"] = timeout_report.into();
+        mixed.attempts.push(timeout_attempt);
+        if !matches!(
+            mixed.comparison_evidence()?,
+            ValidateRowEvidence::NotRun {
+                result: Some(ObservedResult::Timeout),
+                ..
+            }
+        ) {
+            return Err("container failure erased a timeout from another retained attempt".into());
+        }
+        let mut zero = container_row.clone();
+        zero.attempts[0]["status"] = serde_json::json!(0);
+        if zero.comparison_evidence().is_ok() {
+            return Err("container failure accepted a zero-exit wrapper".into());
+        }
+        let mut contradiction = container_row;
+        report["guest_signal"] = serde_json::json!(14);
+        let raw = serde_json::to_string(&report).unwrap();
+        contradiction.attempts[0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(raw.as_bytes())).into();
+        contradiction.attempts[0]["verification_report"] = raw.into();
+        if contradiction.comparison_evidence().is_ok() {
+            return Err("container failure accepted an invented guest disposition".into());
+        }
+    }
+
     let no_result_identity = no_result_row.evidence_identity().unwrap();
 
     let mut unspecified_no_result = no_result_row.clone();
@@ -16042,6 +16827,18 @@ red/`measured-and-passed` count is **0**.",
         return Err(
             "an explicitly null no_result_reason was not retained as explicit absence".into(),
         );
+    }
+
+    let mut typed_not_run = unspecified_no_result.clone();
+    let report = serde_json::to_string(&canonical_verdict::VerificationReport::no_result())
+        .map_err(|error| error.to_string())?;
+    typed_not_run.attempts[0]["verification_report_sha256"] =
+        format!("{:x}", Sha256::digest(report.as_bytes())).into();
+    typed_not_run.attempts[0]["verification_report"] = report.into();
+    if typed_not_run.typed_no_result_reason()
+        != Err("attempt 1 did not replace its pre-run stamp".into())
+    {
+        return Err("typed NotRun did not retain its precise pre-run-stamp refusal".into());
     }
 
     let mut recovered_pass_row = validate_row.clone();
@@ -16348,7 +17145,8 @@ red/`measured-and-passed` count is **0**.",
             .map_err(|error| format!("recovered NotRun {label} was refused: {error}"))?;
         if fold.passed != 1
             || fold.errored.len() != 1
-            || !fold.errored[0].contains("did not complete its first run")
+            || !fold.errored[0]
+                .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
             || fold.reads_all_green()
             || tracked.cells[0].measurement != MeasurementState::MeasuredAndPassed
             || tracked.cells[0].last_tested.is_none()
@@ -16384,7 +17182,8 @@ red/`measured-and-passed` count is **0**.",
         .map_err(|error| format!("recovered pre-launch NotRun was refused: {error}"))?;
     if fold.passed != 1
         || fold.errored.len() != 1
-        || !fold.errored[0].contains("did not complete its first run")
+        || !fold.errored[0]
+            .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
         || fold.reads_all_green()
         || tracked.cells[0].measurement != MeasurementState::MeasuredAndPassed
         || tracked.cells[0].observations.len() != 1
@@ -16462,8 +17261,31 @@ red/`measured-and-passed` count is **0**.",
     }) {
         let (tracked, fold) = fold_fixture_rows(rows)
             .map_err(|error| format!("{label} NotRun evidence was refused: {error}"))?;
+        if label == "after-match" {
+            let last = tracked.cells[0]
+                .last_tested
+                .as_ref()
+                .ok_or("latest NotRun lost its stamp")?;
+            if last.check.is_some()
+                || last.comparison_verdict.is_some()
+                || !matches!(
+                    resolve_last_tested_baseline(
+                        &provenance_root,
+                        Some(last),
+                        pass_stamp.check.as_ref(),
+                        &provenance_head
+                    )?,
+                    BaselineResolution::Refused { .. }
+                )
+            {
+                return Err(
+                    "latest no-comparison stamp borrowed the aggregate historical pass".into(),
+                );
+            }
+        }
         if fold.errored.len() != 1
-            || !fold.errored[0].contains("did not complete its first run")
+            || !fold.errored[0]
+                .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
             || tracked.cells[0].measurement != expected_measurement
             || tracked.cells[0].last_tested.is_none()
             || tracked.cells[0].observations.len() != 1
@@ -16482,7 +17304,8 @@ red/`measured-and-passed` count is **0**.",
         .push(no_result_row.attempts[0].clone());
     let (tracked, fold) = fold_fixture_rows(vec![mixed_terminal])?;
     if fold.errored.len() != 1
-        || !fold.errored[0].contains("did not complete its first run")
+        || !fold.errored[0]
+            .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
         || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
         || tracked.cells[0].observations[0].results != BTreeSet::from([ObservedResult::Timeout])
     {
@@ -16656,7 +17479,8 @@ red/`measured-and-passed` count is **0**.",
     bind_row_to_first_attempt(&mut all_not_run);
     let (tracked, fold) = fold_fixture_row(all_not_run)?;
     if fold.errored.len() != 1
-        || !fold.errored[0].contains("did not complete its first run")
+        || !fold.errored[0]
+            .contains("NO_RESULT: attempt 1 retained its pre-run stamp after timeout")
         || tracked.cells[0].measurement != MeasurementState::MeasuredNoVerdict
         || tracked.cells[0].observations[0].results != BTreeSet::from([ObservedResult::Timeout])
     {
@@ -17604,7 +18428,6 @@ red/`measured-and-passed` count is **0**.",
                 mode: "verify".into(),
                 backend: "ptrace".into(),
             },
-            enabled: true,
             status,
             ci_disabled_reason: None,
             not_applicable_reason: None,
@@ -17897,7 +18720,6 @@ red/`measured-and-passed` count is **0**.",
                     mode: "verify".into(),
                     backend: "ptrace".into(),
                 },
-                enabled: true,
                 status: CellStatus::Red,
                 ci_disabled_reason: None,
                 not_applicable_reason: None,
@@ -18268,6 +19090,9 @@ red/`measured-and-passed` count is **0**.",
     let current_last_tested = LastTested {
         hermit_sha: fixture_hermit_tree.clone(),
         detcore_tree: fixture_detcore_tree.clone(),
+        check: None,
+        applicable_when_tested: None,
+        comparison_verdict: None,
         depth: BTreeMap::from([(
             "hermit".into(),
             SourceDepth {
@@ -18551,14 +19376,57 @@ red/`measured-and-passed` count is **0**.",
     series_unavailable.series.run_index = 2;
     series_unavailable.series.attempt = Some(2);
     series_unavailable.series.no_verdict_evidence = Some(no_verdict_evidence(false));
+    // Stored projected observations need the same complete source identity as
+    // the production writer. Commit the actual fixture rows and read them back
+    // through its immutable snapshot path before applying and encoding them.
+    let projection_source_fixture =
+        tempfile::tempdir().map_err(|e| format!("cannot create no-verdict series fixture: {e}"))?;
+    let projection_source_repo = projection_source_fixture.path();
+    git_ok(projection_source_repo, &["init", "--quiet"])?;
+    let projection_source_dir = projection_source_repo.join("series");
+    fs::create_dir(&projection_source_dir)
+        .map_err(|e| format!("cannot create no-verdict series directory: {e}"))?;
     let project_series_fixture =
         |rows: &[SeriesRow]| -> Result<(TrackedCells, ProjectObservationsOutcome), String> {
+            let mut shard = String::new();
+            for row in rows {
+                shard.push_str(&serde_json::to_string(row).map_err(|e| e.to_string())?);
+                shard.push('\n');
+            }
+            fs::write(projection_source_dir.join("fixture.jsonl"), shard)
+                .map_err(|e| format!("cannot write no-verdict series fixture: {e}"))?;
+            git_ok(projection_source_repo, &["add", "series"])?;
+            git_ok(
+                projection_source_repo,
+                &[
+                    "-c",
+                    "user.name=scorecard fixture",
+                    "-c",
+                    "user.email=scorecard@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "no-verdict series fixture",
+                ],
+            )?;
+            let snapshot = snapshot_series_source(&projection_source_dir)?;
+            let captured_rows = read_series_rows(&snapshot)?;
             let mut tracked = TrackedCells {
                 schema: SCHEMA,
                 projection: None,
                 cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
             };
-            let outcome = apply_series_rows(&root, &mut tracked, rows, None)?;
+            let outcome =
+                apply_series_rows(&root, &mut tracked, &captured_rows, Some(&snapshot.source))?;
+            tracked.projection = Some(ObservationProjection {
+                source: snapshot.source,
+                source_commit: Some(snapshot.source_commit),
+                source_tree: Some(snapshot.source_tree),
+                refreshed_at: "fixture-no-verdict".into(),
+                rows_read: captured_rows.len() as u64,
+                pre_series_corpus: outcome.pre_series_corpus,
+            });
             refresh_measurement(&mut tracked);
             Ok((tracked, outcome))
         };
@@ -18582,6 +19450,204 @@ red/`measured-and-passed` count is **0**.",
             != direct_unavailable.cells[0].observations[0].results
     {
         return Err("RUN1573-style KVM unavailable changed between direct and series paths".into());
+    }
+
+    // Exercise the actual direct and series folds for both typed run labels.
+    // The series retains report/attempt identities, not an invented guest exit
+    // or comparison. A later timed-out attempt must still take precedence.
+    for run in ["run1", "run2"] {
+        let mut direct_container = no_result_row.clone();
+        direct_container.run_id = format!("fixture-container-{run}");
+        let mut report =
+            serde_json::to_value(canonical_verdict::VerificationReport::no_result()).unwrap();
+        report["no_result_reason"] = serde_json::json!({
+            "kind": "container_failed", "run": run,
+            "disposition": {"kind": "signaled", "signal": 14, "core_dumped": false}
+        });
+        replace_embedded_report(&mut direct_container, report);
+        let mut container_series = series_row(
+            "fixture/boundary/verify/ptrace",
+            SeriesOutcome::Errored,
+            SeriesProducer::Validate,
+            1,
+            Some(fixture_detcore_tree.clone()),
+            None,
+        );
+        container_series.event_id = format!("fixture-container-{run}-attempt-1");
+        container_series.run_id = direct_container.run_id.clone();
+        container_series.series.attempt = Some(1);
+        container_series.series.no_verdict_evidence = Some(SeriesNoVerdictEvidence {
+            evidence_sha256: direct_container.evidence_identity()?,
+            attempts: vec![SeriesAttemptDisposition {
+                index: "1".into(),
+                kind: SeriesNoVerdictKind::ContainerFailed,
+                detail: None,
+                attempt_outcome: "FAIL".into(),
+                disposition: SeriesOutcome::NoResult,
+                error_kind: None,
+                status: Some(125),
+                signal: None,
+                timed_out: false,
+                verification_report_sha256: Some(
+                    direct_container.attempts[0]["verification_report_sha256"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                ),
+            }],
+        });
+        for timed_out in [false, true] {
+            let mut direct = direct_container.clone();
+            let mut series = container_series.clone();
+            if timed_out {
+                direct.outcome = "ERROR".into();
+                direct.result = Some(ObservedResult::Timeout);
+                direct.failure_class = Some(FailureClass::NoResult);
+                direct.error_kind = Some("wall-timeout".into());
+                let mut timeout_attempt = not_run_row.attempts[0].clone();
+                timeout_attempt["index"] = "2".into();
+                direct.attempts.push(timeout_attempt);
+                series.series.outcome = SeriesOutcome::Timeout;
+                series.series.result = Some(ObservedResult::Timeout);
+                series.series.failure_class = Some(FailureClass::NoResult);
+                let evidence = series.series.no_verdict_evidence.as_mut().unwrap();
+                let mut timeout = no_verdict_evidence(true).attempts.remove(0);
+                timeout.index = "2".into();
+                timeout.verification_report_sha256 = Some(
+                    direct.attempts[1]["verification_report_sha256"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                );
+                evidence.attempts.push(timeout);
+                evidence.evidence_sha256 = direct.evidence_identity()?;
+            }
+            series.validate_for_write()?;
+            let encoded = serde_json::to_vec(&series).map_err(|e| e.to_string())?;
+            let series: SeriesRow = serde_json::from_slice(&encoded).map_err(|e| e.to_string())?;
+            let (projected, projection) = project_series_fixture(std::slice::from_ref(&series))?;
+            let (direct, fold) = fold_fixture_row(direct)?;
+            let expected = if timed_out {
+                ObservedResult::Timeout
+            } else {
+                ObservedResult::CrashError
+            };
+            if series_evidence(&series, &projected.cells[0].id)
+                != Some(SeriesEvidence {
+                    result: Some(expected),
+                    no_verdict: true,
+                })
+                || projected.cells[0].measurement != MeasurementState::MeasuredNoVerdict
+                || direct.cells[0].measurement != projected.cells[0].measurement
+                || direct.cells[0].observations[0].results != BTreeSet::from([expected])
+                || projected.cells[0].observations[0].results
+                    != direct.cells[0].observations[0].results
+                || projection.rows != 1
+                || projection.no_verdict_rows != 1
+                || projection.runs != 1
+                || !projection.skipped.is_empty()
+                || fold.passed != 0
+                || fold.located != 0
+                || fold.unlocated != 0
+                || fold.errored.len() != 1
+                || fold.reads_all_green()
+            {
+                return Err(format!(
+                    "{run} container failure changed between direct and series folds (timeout={timed_out})"
+                ));
+            }
+            let mut missing_projection = projected.clone();
+            missing_projection.projection = None;
+            if !encoded_cells(&missing_projection)
+                .expect_err("projected container failure without source identity was stored")
+                .contains("uses projected identity without scorecard schema 7 and complete source identity")
+            {
+                return Err("missing container projection metadata lost its exact refusal".into());
+            }
+            for tracked in [&direct, &projected] {
+                let observation = &tracked.cells[0].observations[0];
+                if !observation.canonical_comparisons.is_empty()
+                    || !observation.backend_parity_comparisons.is_empty()
+                {
+                    return Err("container failure manufactured comparison/count credit".into());
+                }
+                let encoded = encoded_cells(tracked)?;
+                let reloaded: TrackedCells =
+                    serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
+                if reloaded.schema != tracked.schema
+                    || reloaded.projection != tracked.projection
+                    || reloaded.cells != tracked.cells
+                {
+                    return Err("container failure changed across stored scorecard readback".into());
+                }
+            }
+            if projected.cells[0].observations[0].event_ids
+                != BTreeSet::from([series.event_id.clone()])
+                || direct.cells[0].observations[0].invocations.len() != 1
+            {
+                return Err(
+                    "container failure lost its exact projection/invocation identity".into(),
+                );
+            }
+        }
+        // Do not promote another well-formed historical no-result kind just
+        // because its enclosing series has the same product-failure tuple.
+        let mut historical = container_series.clone();
+        historical
+            .series
+            .no_verdict_evidence
+            .as_mut()
+            .unwrap()
+            .attempts[0]
+            .kind = SeriesNoVerdictKind::FirstRunRejected;
+        let (projected, outcome) = project_series_fixture(&[historical])?;
+        if !projected.cells[0].observations[0].results.is_empty() || outcome.no_verdict_rows != 1 {
+            return Err("container projection broadened unrelated no-result observations".into());
+        }
+        // The real series admission gate must still reject malformed or
+        // contradictory tuples atomically, including alongside a valid row.
+        for mutation in [
+            "zero",
+            "signal",
+            "timeout",
+            "pass",
+            "comparison",
+            "missing-report",
+            "classification",
+            "duplicate-index",
+        ] {
+            let mut bad = container_series.clone();
+            bad.event_id = format!("fixture-bad-{run}-{mutation}");
+            let evidence = bad.series.no_verdict_evidence.as_mut().unwrap();
+            let disposition = &mut evidence.attempts[0];
+            match mutation {
+                "zero" => disposition.status = Some(0),
+                "signal" => {
+                    disposition.status = None;
+                    disposition.signal = Some(14);
+                }
+                "timeout" => disposition.timed_out = true,
+                "pass" => disposition.attempt_outcome = "PASS".into(),
+                "comparison" => disposition.disposition = SeriesOutcome::Diverged,
+                "missing-report" => disposition.verification_report_sha256 = None,
+                "classification" => bad.series.failure_class = Some(FailureClass::NoResult),
+                "duplicate-index" => evidence.attempts.push(evidence.attempts[0].clone()),
+                _ => unreachable!(),
+            }
+            let mut atomic = TrackedCells {
+                schema: SCHEMA,
+                projection: None,
+                cells: vec![boundary_cell(Vec::new(), CellStatus::Green)],
+            };
+            let before = serde_json::to_vec(&atomic).map_err(|e| e.to_string())?;
+            if apply_series_rows(&root, &mut atomic, &[container_series.clone(), bad], None).is_ok()
+                || serde_json::to_vec(&atomic).map_err(|e| e.to_string())? != before
+            {
+                return Err(format!(
+                    "{run} container series accepted {mutation} or changed state on refusal"
+                ));
+            }
+        }
     }
 
     let mut series_noncanonical = series_unavailable.clone();
@@ -19102,7 +20168,7 @@ red/`measured-and-passed` count is **0**.",
     let boundary_id = stamped.cells[0].id.clone();
     let derived_fixture = Derived {
         population: BTreeSet::from([boundary_id.clone()]),
-        enabled: BTreeSet::from([boundary_id.clone()]),
+        applicable: BTreeSet::from([boundary_id.clone()]),
         ci_disabled_reasons: BTreeMap::new(),
         not_applicable_reasons: BTreeMap::new(),
         selected: BTreeSet::from([boundary_id.clone()]),
@@ -19750,4 +20816,333 @@ red/`measured-and-passed` count is **0**.",
         "compatibility scorecard self-test: retained-comparison FRESH/DRIFTED/WRONG/UNCHECKABLE, provenance, distinct-evidence, result, selected-chaos, status-measurement-display, ratchet, observation-range, storage-round-trip, coordinate-less-divergence, recovered-no-result, determined-nothing-third-state, non-error-outcome-class, batch-equivalence, green-admission, validate-observation, disabled-parity-front-doors, empty-result command, source-identity, writer-boundary, projection, projection-schema, object-store-independence, path-independence, infrastructure-refusal, and divergence-without-a-comparison brackets pass"
     );
     Ok(())
+}
+
+/// Tests for baseline resolution.
+///
+/// ⚠️ THE POSITIVE CONTROL IS LOAD-BEARING. Three of these assert a REFUSAL, and
+/// a resolver that refuses everything would pass all three while being useless.
+/// `a_matching_check_at_a_reachable_revision_is_a_regression` is what makes the
+/// refusals mean something.
+#[cfg(test)]
+mod baseline_resolution_tests {
+    use super::*;
+
+    fn ordinary_policy() -> canonical_verdict::ComparisonReport {
+        canonical_verdict::ComparisonReport {
+            strictness: canonical_verdict::LogCompareStrictness::Canonical,
+            display_name: Some("BitwiseInfoV1".into()),
+            compare_logs: true,
+            compare_io_buffers: Some(true),
+            log_scope: Some(canonical_verdict::ComparedLogScope::Info),
+            record_envelope: canonical_verdict::RecordEnvelopeReport::AllRecordsV1,
+            virtualize_time: Some(true),
+            strip_lines: Some(false),
+            canonicalize_addresses: Some(true),
+            full_trace: Some(true),
+            exact_remainder: Some(true),
+            stripped_prefixes: Some(vec!["real-wall-clock-prefix/v1".into()]),
+            canonicalizations: Some(vec!["host-address-to-first-appearance-ordinal/v1".into()]),
+            ignore_lines: Some(false),
+            skip_commit: Some(false),
+            skip_detlog: Some(false),
+        }
+    }
+
+    fn cross_policy() -> LogDiffComparison {
+        LogDiffComparison {
+            stream: "info".into(),
+            record_envelope: RecordEnvelopePolicy::CrossBackendDetcoreV1,
+            unsafe_strip_lines: false,
+            canonicalize_host_addresses: true,
+            require_structured_events: true,
+            ignored_line_substrings: Vec::new(),
+            skip_commit: false,
+            skip_detlog: false,
+            included_detlog_kinds: vec!["syscall".into(), "syscall_result".into(), "other".into()],
+            git_diff: false,
+        }
+    }
+
+    fn identity(comparison: &str, parity: Option<&str>) -> CheckIdentity {
+        let policy = ordinary_policy();
+        CheckIdentity {
+            comparison: Some(comparison.to_string()),
+            parity_reference: parity.map(str::to_string),
+            ordinary: if parity.is_some() {
+                vec![policy.clone(), policy]
+            } else {
+                vec![policy]
+            },
+            cross_backend: parity.map(|_| cross_policy()),
+        }
+    }
+
+    fn stamp(sha: &str, check: Option<CheckIdentity>) -> LastTested {
+        LastTested {
+            hermit_sha: sha.to_string(),
+            detcore_tree: "tree".into(),
+            depth: BTreeMap::new(),
+            check,
+            applicable_when_tested: Some(true),
+            comparison_verdict: Some(StampComparisonVerdict::Matched),
+        }
+    }
+
+    /// A repository with two commits on `main` and one on an abandoned branch,
+    /// so a non-ancestor revision is a real object rather than a bad sha. That
+    /// distinction matters: the failure being prevented is a revision that
+    /// resolves perfectly and still cannot bound a bisect.
+    fn repository() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        fs::write(root.join("a"), "1").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "first"]);
+        let reachable = git(&["rev-parse", "HEAD"]);
+        // An abandoned line of development: committed, then left behind. This
+        // is what a rebased-away `last_tested` sha looks like on disk.
+        git(&["checkout", "-q", "-b", "abandoned"]);
+        fs::write(root.join("b"), "2").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "abandoned work"]);
+        let orphan = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "main"]);
+        fs::write(root.join("c"), "3").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "second"]);
+        (dir, reachable, orphan)
+    }
+
+    #[test]
+    fn a_matching_check_at_a_reachable_revision_is_a_regression() {
+        let (dir, reachable, _) = repository();
+        let head = "main";
+        let check = identity("BitwiseInfoV1", None);
+        let resolved = resolve_last_tested_baseline(
+            dir.path(),
+            Some(&stamp(&reachable, Some(check.clone()))),
+            Some(&check),
+            head,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved,
+            BaselineResolution::Regression {
+                baseline_sha: reachable.clone()
+            },
+            "same check, cell applicable, revision reachable: this IS a regression and must resolve"
+        );
+        // The enum is the protection: a caller cannot reach a sha without
+        // having matched the Regression arm, so a refusal cannot be unwrapped
+        // into a revision by accident.
+        let BaselineResolution::Regression { baseline_sha } = &resolved else {
+            unreachable!()
+        };
+        assert_eq!(baseline_sha, &reachable);
+    }
+
+    /// The 2026-09-17 case: five backend-parity cells read green at revisions
+    /// that predate the parity mechanism by as little as five hours.
+    #[test]
+    fn a_green_predating_a_stricter_check_is_a_bar_raise_not_a_regression() {
+        let (dir, reachable, _) = repository();
+        // Green recorded before parity existed: no parity reference.
+        let recorded = identity("BitwiseInfoV1", None);
+        // Today's failure comes from the cross-backend parity comparison.
+        let today = identity("BitwiseInfoV1", Some("ptrace"));
+        let resolved = resolve_last_tested_baseline(
+            dir.path(),
+            Some(&stamp(&reachable, Some(recorded))),
+            Some(&today),
+            "main",
+        )
+        .unwrap();
+        let BaselineResolution::Refused { reason } = &resolved else {
+            panic!(
+                "a green produced by a different check must not bound today's failure: {resolved:?}"
+            );
+        };
+        assert!(reason.contains("BAR RAISE"), "{reason}");
+        assert!(
+            reason.contains("does not establish a pass under today's check"),
+            "the refusal must say why there is nothing to bisect: {reason}"
+        );
+        assert!(
+            !matches!(resolved, BaselineResolution::Regression { .. }),
+            "a bar raise must not hand back a revision; that is what sends a lane bisecting"
+        );
+    }
+
+    #[test]
+    fn a_baseline_that_is_not_reachable_from_head_is_refused() {
+        let (dir, _, orphan) = repository();
+        let check = identity("BitwiseInfoV1", None);
+        let resolved = resolve_last_tested_baseline(
+            dir.path(),
+            Some(&stamp(&orphan, Some(check.clone()))),
+            Some(&check),
+            "main",
+        )
+        .unwrap();
+        let BaselineResolution::Refused { reason } = &resolved else {
+            panic!("an unreachable revision must be refused, not returned: {resolved:?}");
+        };
+        assert!(reason.contains("NOT REACHABLE"), "{reason}");
+        // The revision is a real, resolvable object. Being resolvable is
+        // exactly why returning it would be believed.
+        let exists = Command::new("git")
+            .args(["cat-file", "-e", &format!("{orphan}^{{commit}}")])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(
+            exists.success(),
+            "the fixture's orphan revision must really exist"
+        );
+    }
+
+    #[test]
+    fn a_row_that_cannot_say_which_check_ran_is_refused_rather_than_inferred() {
+        let (dir, reachable, _) = repository();
+        let resolved = resolve_last_tested_baseline(
+            dir.path(),
+            Some(&stamp(&reachable, None)),
+            Some(&identity("BitwiseInfoV1", Some("ptrace"))),
+            "main",
+        )
+        .unwrap();
+        let BaselineResolution::Refused { reason } = &resolved else {
+            panic!("a historical row cannot be assumed comparable: {resolved:?}");
+        };
+        assert!(reason.contains("does not record WHICH CHECK"), "{reason}");
+        assert!(
+            reason.contains("not inferred"),
+            "the refusal must state that the identity was not reconstructed: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_green_recorded_while_the_cell_was_disabled_bounds_nothing() {
+        let (dir, reachable, _) = repository();
+        let check = identity("BitwiseInfoV1", None);
+        let mut last = stamp(&reachable, Some(check.clone()));
+        last.applicable_when_tested = Some(false);
+        let resolved =
+            resolve_last_tested_baseline(dir.path(), Some(&last), Some(&check), "main").unwrap();
+        assert!(
+            matches!(resolved, BaselineResolution::Refused { .. }),
+            "{resolved:?}"
+        );
+    }
+
+    #[test]
+    fn an_absent_stamp_is_refused_and_says_no_writer_recorded_one() {
+        let (dir, _, _) = repository();
+        let resolved = resolve_last_tested_baseline(
+            dir.path(),
+            None,
+            Some(&identity("BitwiseInfoV1", None)),
+            "main",
+        )
+        .unwrap();
+        let BaselineResolution::Refused { reason } = &resolved else {
+            panic!("absence is not a baseline: {resolved:?}");
+        };
+        assert!(reason.contains("no writer recorded"), "{reason}");
+    }
+    #[test]
+    fn both_stamp_identities_require_complete_admitted_policies() {
+        let check = identity("BitwiseInfoV1", None);
+        let mut incomplete = vec![
+            None,
+            Some(CheckIdentity::default()),
+            Some(identity("", None)),
+            Some(identity("BitwiseInfoV1", Some(""))),
+        ];
+        let mut missing_flag = check.clone();
+        missing_flag.ordinary[0].virtualize_time = None;
+        incomplete.push(Some(missing_flag));
+        let mut mixed_policy = check.clone();
+        mixed_policy.cross_backend = Some(cross_policy());
+        incomplete.push(Some(mixed_policy));
+        for partial in incomplete {
+            for (old, current) in [
+                (partial.as_ref(), Some(&check)),
+                (Some(&check), partial.as_ref()),
+            ] {
+                let last = stamp("does-not-exist", old.cloned());
+                // Refusal must precede ancestry: no Git repository is needed.
+                assert!(matches!(
+                    resolve_last_tested_baseline(Path::new("/"), Some(&last), current, "HEAD")
+                        .unwrap(),
+                    BaselineResolution::Refused { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_applicability_and_unproven_stamp_verdicts_remain_readable_and_refused() {
+        let check = identity("BitwiseInfoV1", None);
+        let full = serde_json::to_value(stamp("does-not-exist", Some(check.clone()))).unwrap();
+        for field in ["applicable_when_tested", "comparison_verdict"] {
+            assert!(
+                full.get(field).is_some(),
+                "serialized fixture is missing {field}"
+            );
+            for explicit_null in [false, true] {
+                let mut legacy = full.clone();
+                if explicit_null {
+                    legacy[field] = JsonValue::Null;
+                } else {
+                    legacy.as_object_mut().unwrap().remove(field);
+                }
+                let last: LastTested = serde_json::from_value(legacy).unwrap();
+                assert!(matches!(
+                    resolve_last_tested_baseline(Path::new("/"), Some(&last), Some(&check), "HEAD")
+                        .unwrap(),
+                    BaselineResolution::Refused { .. }
+                ));
+            }
+        }
+        let mut divergent = stamp("does-not-exist", Some(check.clone()));
+        divergent.comparison_verdict = Some(StampComparisonVerdict::Diverged);
+        assert!(matches!(
+            resolve_last_tested_baseline(Path::new("/"), Some(&divergent), Some(&check), "HEAD")
+                .unwrap(),
+            BaselineResolution::Refused { .. }
+        ));
+        let mut changed = check.clone();
+        changed.ordinary[0].virtualize_time = Some(false);
+        let refused = resolve_last_tested_baseline(
+            Path::new("/"),
+            Some(&stamp("old", Some(check))),
+            Some(&changed),
+            "HEAD",
+        )
+        .unwrap();
+        let BaselineResolution::Refused { reason } = refused else {
+            panic!("different policies were equated")
+        };
+        assert!(reason.contains("DIFFERENT CHECK"));
+        assert!(!reason.contains("BAR RAISE"));
+        assert!(!reason.contains("never passed"));
+    }
 }
