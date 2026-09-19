@@ -305,10 +305,9 @@ fn valid_elapsed(value: &Elapsed) -> Result<(), String> {
     )
 }
 fn raw_usec(value: &RawTimeval) -> Option<u64> {
-    u64::try_from(value.seconds)
-        .ok()?
-        .checked_mul(1_000_000)?
-        .checked_add(u64::try_from(value.microseconds).ok()?)
+    let seconds = u64::try_from(value.seconds).ok()?;
+    let microseconds = u64::try_from(value.microseconds).ok()?;
+    (microseconds < 1_000_000).then_some(seconds.checked_mul(1_000_000)?.checked_add(microseconds)?)
 }
 
 impl LiveCpuEnabled {
@@ -598,8 +597,10 @@ impl InvocationCpuObservation {
         )?;
         if self.termination == TerminationPath::AccountingUnavailableStop {
             require(
-                matches!(&self.live, LiveCpuObservation::Enabled(live) if live.unavailable_polls > 0),
-                "accounting stop without an unavailable poll",
+                matches!(&self.live, LiveCpuObservation::Enabled(live)
+                    if live.unavailable_polls > 0
+                        && nullable(&live.last).is_none_or(|last| last.poll < live.polls)),
+                "accounting stop does not end on an unavailable poll",
             )?;
         }
         match self.termination {
@@ -1300,6 +1301,77 @@ pub(crate) mod tests {
         invalid["cpu_observations"]["invocations"][0]["final_wait"]["cpu"]["user"]["seconds"] =
             json!(0);
         assert!(!valid(&invalid));
+
+        // The Invalid variant must retain exactly the conversions refused by
+        // the real wait4 helper. Raw tv_usec is bounded; converted CPU totals
+        // are not limited to a single second.
+        for (state, status) in [
+            ("reaped", 0),
+            ("nonterminal_return", (libc::SIGSTOP << 8) | 127),
+        ] {
+            for component in ["user", "system"] {
+                for microseconds in [999_999, 1_000_000] {
+                    let mut record = executed_row();
+                    let i = &mut record["cpu_observations"]["invocations"][0];
+                    i["termination"] = json!("wait_error");
+                    i["returned_cpu_charge"] = json!({"state":"unavailable"});
+                    i["final_wait"]["state"] = json!(state);
+                    i["final_wait"]["raw_status"] = json!(status);
+                    i["final_wait"]["cpu"] = json!({"state":"invalid","user":{"seconds":0,"microseconds":0},"system":{"seconds":0,"microseconds":0},"reason":"invalid raw timeval"});
+                    i["final_wait"]["cpu"][component]["microseconds"] = json!(microseconds);
+                    assert_eq!(
+                        valid(&record),
+                        microseconds == 1_000_000,
+                        "raw timeval {state}/{component}/{microseconds}"
+                    );
+                }
+            }
+        }
+        let mut measured_second = executed_row();
+        measured_second["cpu_observations"]["invocations"][0]["final_wait"]["cpu"] = json!({"state":"measured","user_usec":1_000_000,"system_usec":999_999,"total_usec":1_999_999});
+        measured_second["cpu_observations"]["invocations"][0]["returned_cpu_charge"]["cpu_usec"] =
+            json!(1_999_999);
+        assert!(valid(&measured_second));
+
+        // A prior error cannot authorize a grace stop after a newer valid poll:
+        // the monitor clears missing_since on Ok and samples no more after stop.
+        let mut latest_valid = executed_row();
+        let i = &mut latest_valid["cpu_observations"]["invocations"][0];
+        i["termination"] = json!("accounting_unavailable_stop");
+        i["returned_cpu_charge"] = json!({"state":"unavailable"});
+        i["live"] = enabled();
+        let point = i["live"]["last"].clone();
+        i["live"]["first"] = point.clone();
+        i["live"]["high_water"] = point;
+        i["live"]["valid_polls"] = json!(1);
+        i["live"]["unavailable_polls"] = json!(1);
+        i["live"]["last_error"] = json!({"stage":"sampling","reason":"earlier unavailable poll"});
+        assert!(!valid(&latest_valid));
+        for termination in ["completed_wait4", "wall_budget_stop"] {
+            let mut completed = latest_valid.clone();
+            completed["cpu_observations"]["invocations"][0]["termination"] = json!(termination);
+            completed["cpu_observations"]["invocations"][0]["returned_cpu_charge"] =
+                json!({"state":"value","cpu_usec":5,"basis":"final_wait4"});
+            assert!(
+                valid(&completed),
+                "mixed history with latest valid: {termination}"
+            );
+        }
+        let mut latest_unavailable = latest_valid.clone();
+        let live = &mut latest_unavailable["cpu_observations"]["invocations"][0]["live"];
+        for field in ["first", "last", "high_water"] {
+            live[field]["poll"] = json!(1);
+        }
+        live["last_error"]["reason"] = json!("latest unavailable poll");
+        assert!(valid(&latest_unavailable));
+        let mut all_unavailable = latest_unavailable.clone();
+        let live = &mut all_unavailable["cpu_observations"]["invocations"][0]["live"];
+        live["valid_polls"] = json!(0);
+        live["unavailable_polls"] = json!(2);
+        for field in ["first", "last", "high_water"] {
+            live[field] = Value::Null;
+        }
+        assert!(valid(&all_unavailable));
 
         // Complete helper-return/error matrix. These are decoder fixtures, not
         // evidence that a traced child returned a nonterminal status here.
