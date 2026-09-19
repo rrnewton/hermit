@@ -596,11 +596,19 @@ impl InvocationCpuObservation {
             "started child marked unstarted",
         )?;
         if self.termination == TerminationPath::AccountingUnavailableStop {
+            // The first Err starts the monitor's nonzero grace at the same
+            // instant used for its comparison, so stopping requires a later
+            // consecutive Err. Counts cannot establish the grace duration.
+            let trailing_unavailable = match &self.live {
+                LiveCpuObservation::Enabled(live) => match nullable(&live.last) {
+                    Some(last) => live.polls.checked_sub(last.poll),
+                    None => Some(live.unavailable_polls),
+                },
+                LiveCpuObservation::Disabled => None,
+            };
             require(
-                matches!(&self.live, LiveCpuObservation::Enabled(live)
-                    if live.unavailable_polls > 0
-                        && nullable(&live.last).is_none_or(|last| last.poll < live.polls)),
-                "accounting stop does not end on an unavailable poll",
+                trailing_unavailable.is_some_and(|polls| polls >= 2),
+                "accounting stop lacks two trailing unavailable polls",
             )?;
         }
         match self.termination {
@@ -1273,6 +1281,19 @@ pub(crate) mod tests {
         i["live"] = json!({"state":"enabled","source":"agent_utils_paired_pidfd_stat_v1","registration":{"state":"unavailable","reason":"fixture refusal"},"polls":1,"source_sample_calls":0,"valid_polls":0,"unavailable_polls":1,"first":null,"last":null,"high_water":null,"timeout_trigger":null,"last_error":{"stage":"registration","reason":"fixture refusal"}});
         i["termination"] = json!("accounting_unavailable_stop");
         i["returned_cpu_charge"] = json!({"state":"unavailable"});
+        assert!(
+            !valid(&row),
+            "first registration error only starts the grace"
+        );
+        for termination in ["completed_wait4", "wall_budget_stop"] {
+            let mut partial = row.clone();
+            partial["cpu_observations"]["invocations"][0]["termination"] = json!(termination);
+            partial["cpu_observations"]["invocations"][0]["returned_cpu_charge"] =
+                json!({"state":"value","cpu_usec":5,"basis":"final_wait4"});
+            assert!(valid(&partial), "one unavailable poll before {termination}");
+        }
+        row["cpu_observations"]["invocations"][0]["live"]["polls"] = json!(2);
+        row["cpu_observations"]["invocations"][0]["live"]["unavailable_polls"] = json!(2);
         assert!(valid(&row));
         // A real-shaped final receipt must survive the unavailable return charge.
         let mut bad = row.clone();
@@ -1363,7 +1384,29 @@ pub(crate) mod tests {
             live[field]["poll"] = json!(1);
         }
         live["last_error"]["reason"] = json!("latest unavailable poll");
-        assert!(valid(&latest_unavailable));
+        assert!(
+            !valid(&latest_unavailable),
+            "one trailing error starts grace"
+        );
+        for termination in ["completed_wait4", "wall_budget_stop"] {
+            let mut partial = latest_unavailable.clone();
+            partial["cpu_observations"]["invocations"][0]["termination"] = json!(termination);
+            partial["cpu_observations"]["invocations"][0]["returned_cpu_charge"] =
+                json!({"state":"value","cpu_usec":5,"basis":"final_wait4"});
+            assert!(valid(&partial), "one trailing error before {termination}");
+        }
+        let mut two_trailing_unavailable = latest_unavailable.clone();
+        let live = &mut two_trailing_unavailable["cpu_observations"]["invocations"][0]["live"];
+        live["polls"] = json!(3);
+        live["source_sample_calls"] = json!(3);
+        live["unavailable_polls"] = json!(2);
+        assert!(valid(&two_trailing_unavailable));
+        let mut separated_errors = two_trailing_unavailable.clone();
+        let live = &mut separated_errors["cpu_observations"]["invocations"][0]["live"];
+        for field in ["first", "last", "high_water"] {
+            live[field]["poll"] = json!(2);
+        }
+        assert!(!valid(&separated_errors), "a valid poll restarts the grace");
         let mut all_unavailable = latest_unavailable.clone();
         let live = &mut all_unavailable["cpu_observations"]["invocations"][0]["live"];
         live["valid_polls"] = json!(0);
@@ -1372,6 +1415,15 @@ pub(crate) mod tests {
             live[field] = Value::Null;
         }
         assert!(valid(&all_unavailable));
+        let mut one_unavailable = all_unavailable.clone();
+        let live = &mut one_unavailable["cpu_observations"]["invocations"][0]["live"];
+        live["polls"] = json!(1);
+        live["source_sample_calls"] = json!(1);
+        live["unavailable_polls"] = json!(1);
+        assert!(
+            !valid(&one_unavailable),
+            "first sampling error starts grace"
+        );
 
         // Complete helper-return/error matrix. These are decoder fixtures, not
         // evidence that a traced child returned a nonterminal status here.

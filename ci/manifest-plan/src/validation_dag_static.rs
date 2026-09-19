@@ -207,6 +207,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Nine admission-context/nested-ID controls extend the measured 533-test set.
     // Six portable-context controls extend the measured 542-test set.
     // Five owned CPU-reader controls retain all 548 prior selected identities.
+    // Five CPU-evidence tests plus one schema-ingress test retain all 553 prior IDs.
     ("test.regular_crates", 559),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     ("test.hermit_unit", 710),
