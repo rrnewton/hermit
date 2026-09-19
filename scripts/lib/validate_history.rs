@@ -94,6 +94,15 @@ pub fn canonical_ledger_adapter(ledger: &Path, tool_root: Option<&Path>) -> Opti
     )
 }
 
+pub(crate) fn canonical_ledger_reader(adapter: &Path) -> Command {
+    let mut command = Command::new("python3");
+    // Preserve original claims through the event union and corrections, before
+    // admission_cache_row checks them. The legacy adapter view is deliberately
+    // lossy and can hide a contradictory duplicate behind its last value.
+    command.arg(adapter).args(["rows", "--preserve-admission"]);
+    command
+}
+
 /// Read the one logical ledger into rows, skipping unparseable lines.
 ///
 /// In an admitted dev-hermit run, `ledger` is the parent's logical `ledger/`
@@ -113,7 +122,7 @@ pub fn read_rows(ledger: &Path) -> Vec<serde_json::Value> {
         let Some(adapter) = canonical_ledger_adapter(ledger, configured_tool_root.as_deref()) else {
             return Vec::new();
         };
-        let Ok(output) = Command::new("python3").arg(&adapter).arg("rows").output() else {
+        let Ok(output) = canonical_ledger_reader(&adapter).output() else {
             eprintln!(
                 "validate: warning: cannot launch canonical ledger reader {}",
                 adapter.display()

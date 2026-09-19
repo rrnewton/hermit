@@ -1235,6 +1235,48 @@ mod tests {
             .unwrap()["value"],
             2
         );
+        // Exercise the production command builder across a real subprocess.
+        // This fixture models the parent's two transport modes, not its event
+        // authority. Without the preserving option it visibly loses duplicate
+        // claims. The complete real parent adapter is qualified separately.
+        let adapter = f.0.join("ignored/adapter.py");
+        let adapter_input = f.0.join("ignored/rows.jsonl");
+        std::fs::write(
+            &adapter,
+            concat!(
+                "import json,sys\nfrom pathlib import Path\n",
+                "raw=Path(__file__).with_name('rows.jsonl').read_text()\n",
+                "if sys.argv[1:] == ['rows','--preserve-admission']:\n",
+                "    sys.stdout.write(raw)\n",
+                "elif sys.argv[1:] == ['rows']:\n",
+                "    print('\\n'.join(json.dumps(json.loads(line)) for line in raw.splitlines()))\n",
+                "else:\n",
+                "    sys.exit(2)\n",
+            ),
+        )
+        .unwrap();
+        for (name, input, keep) in [
+            ("valid", raw.as_str(), true),
+            ("duplicate nested identity", duplicate.as_str(), false),
+            ("duplicate claim", repeated_claim.as_str(), false),
+            ("recorded failure", failure.as_str(), true),
+            ("legacy", r#"{"result":"pass","value":1,"value":2}"#, true),
+        ] {
+            std::fs::write(&adapter_input, format!("{input}\n")).unwrap();
+            let output = crate::validate_history::canonical_ledger_reader(&adapter)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{name}: {output:?}");
+            assert_eq!(output.stdout, format!("{input}\n").as_bytes(), "{name}");
+            assert_eq!(
+                crate::validate_history::admission_cache_row(
+                    std::str::from_utf8(&output.stdout).unwrap()
+                )
+                .is_some(),
+                keep,
+                "{name}"
+            );
+        }
         let unsafe_root = f.0.join("not-ignored");
         assert!(state.locator(&unsafe_root.join("driver.log")).is_err());
         assert!(!unsafe_root.exists());
