@@ -6299,6 +6299,95 @@ fn project_and_observe_results(
     )
 }
 
+// Diagnostic-only sidecar. It never supplies a verdict, changes the selected
+// command, or writes into stdout/stderr. Missing telemetry remains missing.
+fn snapshot_diagnostic(stage: &str, detail: JsonValue) {
+    let Some(directory) = env::var_os("HERMIT_SCORECARD_TIMEOUT_DIAGNOSTIC_DIR") else {
+        return;
+    };
+    let directory = Path::new(&directory);
+    if !directory.is_absolute() {
+        return;
+    }
+    let pid = std::process::id();
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+    // SAFETY: clock_gettime writes exactly one live timespec.
+    let mut clock = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let clock_status = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut clock) };
+    let record = serde_json::json!({
+        "stage": stage, "pid": pid, "proc_stat": stat,
+        "monotonic_seconds": clock.tv_sec, "monotonic_nanoseconds": clock.tv_nsec,
+        "clock_status": clock_status, "detail": detail,
+    });
+    if let Ok(mut file) = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join(format!("process-{pid}.jsonl")))
+    {
+        let _ = writeln!(file, "{record}");
+    }
+}
+
+fn snapshot_command_stage(stage: &str) {
+    if env::args().nth(1).as_deref() == Some("project-and-observe-results") {
+        snapshot_diagnostic(stage, JsonValue::Null);
+    }
+}
+
+fn snapshot_pipe_bytes(pipe: Option<&impl std::os::fd::AsRawFd>) -> JsonValue {
+    let Some(pipe) = pipe else {
+        return JsonValue::Null;
+    };
+    let mut bytes: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one live integer and does not consume pipe bytes.
+    let status = unsafe { libc::ioctl(pipe.as_raw_fd(), libc::FIONREAD, &mut bytes) };
+    serde_json::json!({"status": status, "bytes": bytes})
+}
+
+// Called only AFTER the original kill/wait. Never drain a live child's pipes
+// while the unchanged five-second observation is in progress. Reads are bounded
+// and nonblocking, including when an inherited writer still holds a pipe open.
+fn snapshot_retained_pipe<T: std::io::Read + std::os::fd::AsRawFd>(
+    pipe: Option<&mut T>,
+) -> JsonValue {
+    let Some(pipe) = pipe else {
+        return JsonValue::Null;
+    };
+    let fd = pipe.as_raw_fd();
+    // SAFETY: fcntl only reads/updates this still-owned descriptor's flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return serde_json::json!({"error": std::io::Error::last_os_error().to_string()});
+    }
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let end;
+    loop {
+        if bytes.len() >= 1_048_576 {
+            end = "limit".to_string();
+            break;
+        }
+        match pipe.read(&mut buffer) {
+            Ok(0) => {
+                end = "eof".to_string();
+                break;
+            }
+            Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+            Err(error) => {
+                end = error.to_string();
+                break;
+            }
+        }
+    }
+    // Exact bytes, including non-UTF8, are retained as a JSON byte array.
+    serde_json::json!({"bytes": bytes, "end": end, "max_bytes": 1_048_576})
+}
+
 #[allow(clippy::too_many_arguments)]
 fn project_and_observe_results_with<BeforeGuard, BeforeReplace>(
     root: &Path,
@@ -6327,7 +6416,9 @@ where
         ));
     }
 
+    snapshot_command_stage("before_writer_lock");
     let _lock = acquire_scorecard_write_lock(root)?;
+    snapshot_command_stage("after_writer_lock");
     let head = git_head(root)?;
     if head != expected_head {
         return Err(format!(
@@ -6335,9 +6426,15 @@ where
         ));
     }
     check_observation_worktree(root)?;
+    snapshot_command_stage("before_read_generated");
     let original = read_generated_files(root)?;
+    snapshot_command_stage("after_read_generated");
+    snapshot_command_stage("before_check_tracked");
     let derived = check_tracked(root)?;
+    snapshot_command_stage("after_check_tracked");
+    snapshot_command_stage("before_snapshot_open");
     let snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
+    snapshot_command_stage("after_snapshot_open");
     let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
     let depth = source_depths(root, &head)?;
     let result_rows = read_result_candidates(results, &head)?;
@@ -6458,6 +6555,7 @@ where
     let updated = generated_files(&derived, &tracked)?;
     let partial_scorecard = updated.scorecard.clone();
 
+    snapshot_command_stage("before_replace_generated");
     let changed = replace_generated_files_with(
         root,
         &original,
@@ -6482,6 +6580,7 @@ where
             verify_combined_write_state(root, &head, expected_scorecard, &original.cells, &snapshot)
         },
     )?;
+    snapshot_command_stage("after_replace_generated");
     println!(
         "compatibility scorecard: projected {} cell(s) from {} canonical series row(s), then merged {} pass, {} located divergence, and {} unlocated divergence validate observation(s) at {head}",
         projection.cells, rows_read, fold.passed, fold.located, fold.unlocated,
@@ -13393,6 +13492,14 @@ fn self_test() -> Result<(), String> {
             .spawn()
             .map_err(|error| format!("cannot start snapshot command control: {error}"))?;
         let deadline = Instant::now() + Duration::from_secs(5);
+        snapshot_diagnostic(
+            "child_spawned",
+            serde_json::json!({
+                "child_pid": child.id(), "snapshot_path": path,
+                "snapshot_sha256": sha, "cutoff_seconds": 5,
+                "child_proc_stat": fs::read_to_string(format!("/proc/{}/stat", child.id())).ok(),
+            }),
+        );
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,
@@ -13400,17 +13507,44 @@ fn self_test() -> Result<(), String> {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 status => {
+                    // Read only the two immediate pipe counters before the
+                    // original kill. Descendant sampling runs outside this step.
+                    let stdout_unread = snapshot_pipe_bytes(child.stdout.as_ref());
+                    let stderr_unread = snapshot_pipe_bytes(child.stderr.as_ref());
                     let killed = child.kill();
                     let reaped = child.wait();
+                    let stdout = snapshot_retained_pipe(child.stdout.as_mut());
+                    let stderr = snapshot_retained_pipe(child.stderr.as_mut());
+                    snapshot_diagnostic(
+                        "child_cutoff",
+                        serde_json::json!({
+                            "child_pid": child.id(), "snapshot_path": path,
+                            "status": format!("{status:?}"), "kill": format!("{killed:?}"),
+                            "reap": format!("{reaped:?}"),
+                            "stdout_unread_before_kill": stdout_unread,
+                            "stderr_unread_before_kill": stderr_unread,
+                            "stdout_after_reap": stdout, "stderr_after_reap": stderr,
+                        }),
+                    );
                     return Err(format!(
                         "snapshot command control did not complete: {status:?}; kill={killed:?}; reap={reaped:?}"
                     ));
                 }
             }
         }
-        child
+        let output = child
             .wait_with_output()
-            .map_err(|error| format!("cannot read snapshot command control output: {error}"))
+            .map_err(|error| format!("cannot read snapshot command control output: {error}"));
+        if let Ok(output) = &output {
+            snapshot_diagnostic(
+                "child_completed",
+                serde_json::json!({
+                    "snapshot_path": path, "status": output.status.to_string(),
+                    "stdout": output.stdout, "stderr": output.stderr,
+                }),
+            );
+        }
+        output
     };
     let fifo_snapshot_path = snapshot_root.join("snapshot.fifo");
     let fifo_name = std::ffi::CString::new(fifo_snapshot_path.as_os_str().as_encoded_bytes())
