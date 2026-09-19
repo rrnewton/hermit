@@ -44,9 +44,13 @@ forced-stop grace. Admission neither builds nor loads an image.
 
 `setup.pinned_root_fetch` fetches Cargo dependencies; it does not prepare the OCI
 image. Prepare that image explicitly with `build-image.sh` when needed. Each
-node retains the same exact-image guard immediately before execution: an early
-presence observation does not reserve the image or explain later image loss.
-Failures after graph execution begins remain ordinary recorded failures.
+node repeats that exact-image check immediately before execution, including the
+10-second query bound and 2-second forced-stop grace. Both checks require GNU
+`timeout` with `--verbose` support. A timed-out query returns status 124 (or 137
+when forced to stop); an unavailable inspection tool retains its raw status,
+such as 127 for a missing command. These late failures remain ordinary recorded
+node failures. An early presence observation does not reserve the image or
+explain later image loss.
 
 Before each canonical pinned-root DAG node starts, the wrapper checks the
 network boundary and four different dependency populations rather than folding

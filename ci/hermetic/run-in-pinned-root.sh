@@ -106,8 +106,9 @@ if "$check_image"; then
         echo "run-in-pinned-root: --check-image accepts only optional --digest." >&2
         exit 2
     }
-    check_pinned_image
-    exit 0
+    status=0
+    check_pinned_image || status=$?
+    exit "$status"
 fi
 
 [[ -n "$src" ]] || { echo "run-in-pinned-root: --src is required" >&2; exit 2; }
@@ -128,7 +129,7 @@ fi
 # silently produce a run that is not hermetic while still reporting success --
 # which is worse than not running at all, because the receipt would claim a
 # pinned root it did not use.
-check_pinned_image
+check_pinned_image || exit $?
 
 pinned_home="$out/home"
 mkdir -p "$out/target" "$pinned_home"

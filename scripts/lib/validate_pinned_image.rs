@@ -144,6 +144,7 @@ pub(crate) fn admit(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Output;
@@ -198,6 +199,7 @@ if [[ $# == 3 && $1 == image && $2 == exists ]]; then
     case ${PROBE_MODE:-present} in
         error) printf 'exact inspection error\n' >&2; exit "${PROBE_ERROR:-125}" ;;
         hang) cat "/proc/$$/stat" > "$PROBE_GENERATION"; exec sleep 300 ;;
+        ignore-term) trap '' TERM; cat "/proc/$$/stat" > "$PROBE_GENERATION"; exec sleep 300 ;;
     esac
     [[ $3 == "$(cat "$PROBE_AVAILABLE")" ]] && exit 0
     exit 1
@@ -378,11 +380,13 @@ exit 91
             .unwrap();
         let output = observed("hanging-query", output);
         assert_eq!(output.status.code(), Some(124), "{output:?}");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(30),
-            "{:?}",
-            started.elapsed()
+        let elapsed = started.elapsed();
+        eprintln!(
+            "PINNED_IMAGE_HANG_ELAPSED_SECONDS {}",
+            elapsed.as_secs_f64()
         );
+        assert!(elapsed >= std::time::Duration::from_secs(10), "{elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(20), "{elapsed:?}");
         assert!(String::from_utf8_lossy(&output.stderr).contains("inspection unavailable"));
         let saved = std::fs::read_to_string(f.dir.path().join("generation")).unwrap();
         eprintln!("PINNED_IMAGE_HANG_GENERATION {}", saved.trim());
@@ -414,6 +418,106 @@ exit 91
         }
         assert!(!f.dir.path().join("payload").exists());
         assert!(!f.dir.path().join("out").exists());
+    }
+
+    #[test]
+    fn term_ignoring_inspection_is_forced_to_stop_without_payload() {
+        let f = Fixture::new();
+        let started = std::time::Instant::now();
+        // Exercise the late caller too: even a forced-stop inspection error
+        // must not proceed to the payload or create its output directory.
+        let output = f
+            .command()
+            .args(["--src", ".", "--out", "out", "--", "true"])
+            .env("PROBE_MODE", "ignore-term")
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        let elapsed = started.elapsed();
+        let output = observed("term-ignoring-late-query", output);
+        eprintln!(
+            "PINNED_IMAGE_FORCED_STOP_ELAPSED_SECONDS {}",
+            elapsed.as_secs_f64()
+        );
+        assert_eq!(output.status.code(), Some(137), "{output:?}");
+        assert!(elapsed >= std::time::Duration::from_secs(12), "{elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(20), "{elapsed:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("sending signal TERM"), "{stderr}");
+        assert!(stderr.contains("sending signal KILL"), "{stderr}");
+        assert!(stderr.contains("inspection unavailable"), "{stderr}");
+        assert!(!f.dir.path().join("payload").exists());
+        assert!(!f.dir.path().join("out").exists());
+        assert_eq!(f.calls(), format!("image exists {}\n", f.reference));
+
+        let saved = std::fs::read_to_string(f.dir.path().join("generation")).unwrap();
+        eprintln!("PINNED_IMAGE_FORCED_STOP_GENERATION {}", saved.trim());
+        let pid = saved.split_once(' ').unwrap().0;
+        let saved_start = saved
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(19)
+            .unwrap();
+        // timeout and its direct command receive KILL together. Allow only a
+        // bounded observation interval for the original command to be reaped
+        // after adoption; a zombie of that generation is still not gone.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(current) => {
+                    let current_start = current
+                        .rsplit_once(") ")
+                        .unwrap()
+                        .1
+                        .split_whitespace()
+                        .nth(19)
+                        .unwrap();
+                    if current_start != saved_start {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "original forced-stop probe generation still present: {current}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(libc::ESRCH) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("cannot verify forced-stop probe generation: {error}"),
+            }
+        }
+        eprintln!("PINNED_IMAGE_FORCED_STOP_ORIGINAL_GENERATION_GONE");
+    }
+
+    #[test]
+    fn committed_pinned_consumer_ids_are_all_recognized() {
+        let (canonical, _, _) = crate::load_committed_validation_dag(root()).unwrap();
+        // This conservative census is a test of the committed generator's
+        // direct-invocation contract, not a wider production trigger. A future
+        // prefix or text-only mention in that DAG requires explicit review.
+        let expected: BTreeSet<_> = canonical
+            .steps
+            .iter()
+            .filter(|step| step.skip_reason.is_none() && step.cmd.contains(WRAPPER))
+            .map(|step| step.tag())
+            .collect();
+        let probes = selected_probes(&canonical, None).unwrap();
+        let recognized: BTreeSet<_> = probes
+            .iter()
+            .flat_map(|probe| probe.consumers.iter().cloned())
+            .collect();
+        assert!(!expected.is_empty());
+        assert_eq!(recognized, expected);
+        eprintln!(
+            "PINNED_IMAGE_COMMITTED_CONSUMERS {}",
+            serde_json::json!({"expected":expected,"recognized":recognized})
+        );
     }
 
     #[test]
