@@ -1370,6 +1370,15 @@ impl CellResult {
                 &attempt.env,
             )?;
         }
+        observations.require_passing_prerequisites(self.attempts.iter().map(|attempt| {
+            (
+                attempt.index.as_str(),
+                attempt.outcome == "PASS"
+                    && attempt.status == Some(0)
+                    && attempt.signal.is_none()
+                    && !attempt.timed_out,
+            )
+        }))?;
         Ok(())
     }
 

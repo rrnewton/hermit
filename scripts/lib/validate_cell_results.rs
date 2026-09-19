@@ -2454,6 +2454,8 @@ mod tests {
                 "/cpu_observations/invocations/3/role/reference_execution",
                 serde_json::json!(1),
             ),
+            ("/attempts/0/outcome", serde_json::json!("FAIL")),
+            ("/attempts/1/outcome", serde_json::json!("ERROR")),
         ] {
             let mut bad = supplied.clone();
             *bad.pointer_mut(pointer).unwrap() = value;

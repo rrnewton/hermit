@@ -15003,6 +15003,60 @@ mod cpu_observation_reader_tests {
             write(&bad);
             assert!(read_result_rows(&file).is_err());
         }
+        let retained: JsonValue = serde_json::from_str(include_str!(
+            "../../scripts/lib/fixtures/schema10-matched-cell.json"
+        ))
+        .unwrap();
+        let mut parity = supplied.clone();
+        parity["backend"] = json!("kvm");
+        parity["cpu_observations"]["binding"]["backend"] = json!("kvm");
+        parity["cpu_observations"]["invocations"][0]["role"]["backend"] = json!("kvm");
+        let mut reference = supplied["cpu_observations"]["invocations"][0].clone();
+        reference["ordinal"] = json!(2);
+        reference["role"] =
+            json!({"kind":"execution","attempt_index":"parity-reference","backend":"ptrace"});
+        let mut comparison = reference.clone();
+        comparison["ordinal"] = json!(3);
+        comparison["role"] =
+            json!({"kind":"parity_comparison","candidate_execution":1,"reference_execution":2});
+        parity["cpu_observations"]["invocations"]
+            .as_array_mut()
+            .unwrap()
+            .extend([reference, comparison]);
+        parity["attempts"] = json!([
+            retained["backend_parity"]["attempts"][0]["candidate_attempt"],
+            retained["backend_parity"]["attempts"][0]["reference_attempt"]
+        ]);
+        for (position, index) in ["1", "parity-reference"].into_iter().enumerate() {
+            let attempt = &mut parity["attempts"][position];
+            attempt["index"] = json!(index);
+            attempt["argv"] = json!(["synthetic"]);
+            attempt["cwd"] = json!("/synthetic");
+            attempt["env"] = json!({});
+        }
+        write(&parity);
+        assert!(read_result_rows(&file).is_ok());
+        for position in [0, 1] {
+            let mut bad = parity.clone();
+            bad["attempts"][position]["outcome"] = json!("FAIL");
+            write(&bad);
+            assert!(
+                read_result_rows(&file)
+                    .unwrap_err()
+                    .contains("passing semantic prerequisite")
+            );
+            bad.as_object_mut().unwrap().remove("cpu_observations");
+            write(&bad);
+            assert!(read_result_rows(&file).is_ok()); // historical absence is unchanged
+            let mut missing = parity.clone();
+            missing["attempts"].as_array_mut().unwrap().remove(position);
+            write(&missing);
+            assert!(
+                read_result_rows(&file)
+                    .unwrap_err()
+                    .contains("passing semantic prerequisite")
+            );
+        }
         write(&base);
         assert!(
             read_result_rows(&file).unwrap()[0]

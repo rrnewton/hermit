@@ -2057,6 +2057,20 @@ impl CellResultsEvidenceV10 {
                                     &operand.env,
                                 )?;
                             }
+                            observations.require_passing_prerequisites(
+                                std::iter::once(attempt.candidate_attempt())
+                                    .chain(attempt.reference_attempt())
+                                    .map(|operand| {
+                                        let operand = &operand.0;
+                                        (
+                                            operand.index.as_str(),
+                                            operand.outcome == "PASS"
+                                                && operand.status == Some(0)
+                                                && operand.signal.is_none()
+                                                && !operand.timed_out,
+                                        )
+                                    }),
+                            )?;
                         }
                     }
                 }
