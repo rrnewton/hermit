@@ -1282,6 +1282,9 @@ fn read_result_rows(path: &Path) -> Result<Vec<CellResult>, String> {
         }
         let row: CellResult = serde_json::from_str(line)
             .map_err(|e| format!("invalid {}:{}: {e}", path.display(), index + 1))?;
+        row.require_cpu_observations().map_err(|error| {
+            format!("invalid {}:{} CPU observations: {error}", path.display(), index + 1)
+        })?;
         row.validate_recorded_classification().map_err(|error| {
             format!(
                 "invalid {}:{} result classification: {error}",
@@ -11934,6 +11937,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .join(&sample_slug)
         .join("sample-a-verify-ptrace");
     let mut result_row = CellResult {
+        cpu_observations: None,
         first_divergent_record: None,
         first_divergent_syscall: None,
         first_divergent_scheduler_turn: None,
@@ -13224,6 +13228,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     let first_repetition_slug = cell_run_slug(&green_id, Some(1));
     let second_repetition_slug = cell_run_slug(&green_id, Some(2));
     let repeated_result_row = CellResult {
+        cpu_observations: None,
         first_divergent_record: None,
         first_divergent_syscall: None,
         first_divergent_scheduler_turn: None,
@@ -14944,5 +14949,66 @@ mod pressure_planning_tests {
         validate_selection_shape(&selection).unwrap();
         validate_guest_caps_against_selected_demand(std::slice::from_ref(&cell), &selection).unwrap();
         assert!(USAGE.contains("identities of executable cells not selected by full"));
+    }
+}
+
+#[cfg(test)]
+mod cpu_observation_reader_tests {
+    use super::*;
+
+    #[test]
+    fn present_cpu_evidence_is_bound_at_the_real_pressure_reader() {
+        let path = std::env::temp_dir().join(format!(
+            "hermit-pressure-cpu-reader-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        let cleanup = SelfTestDirectory::new(path.clone());
+        let file = path.join("results.jsonl");
+        let base = json!({"schema":4,"run_id":"sample","hermit_sha":"a","source_tree_dirty":false,"test":"fixture/cell","category":"fixture","lane":"portable","mode":"verify","backend":"ptrace","classification":"required","outcome":"ERROR","result":null,"failure_class":"no_result","attempt":1,"argv":[],"guest_argv":[],"env":{},"cwd":"/synthetic","shell_command":"synthetic","attempts":[],"artifact_dir":"/synthetic/artifact"});
+        let write = |row: &JsonValue| {
+            fs::write(&file, format!("{}\n", serde_json::to_string(row).unwrap())).unwrap()
+        };
+        write(&base);
+        let historical = read_result_rows(&file).unwrap();
+        assert!(historical[0].cpu_observations.is_none());
+        let mut supplied = base.clone();
+        supplied["cpu_observations"] = json!({"version":1,"binding":{"run_id":"sample","hermit_sha":"a","lane":"portable","category":"fixture","test":"fixture/cell","mode":"verify","backend":"ptrace","outer_attempt":1,"run_index":null},"invocations":[{"ordinal":1,"role":{"kind":"execution","attempt_index":"1","backend":"ptrace"},"command":{"argv":["synthetic"],"cwd":"/synthetic","env_overrides":{}},"launch":{"state":"spawned","pid":17},"live":{"state":"disabled"},"final_wait":{"state":"reaped","source":"wait4","pid":17,"raw_status":0,"at":{"seconds":1,"nanoseconds":0},"cpu":{"state":"measured","user_usec":1,"system_usec":0,"total_usec":1}},"termination":"completed_wait4","returned_cpu_charge":{"state":"value","cpu_usec":1,"basis":"final_wait4"}}]});
+        write(&supplied);
+        assert!(
+            read_result_rows(&file).unwrap()[0]
+                .cpu_observations
+                .is_some()
+        );
+        let mut bad = supplied.clone();
+        bad["cpu_observations"]["binding"]["test"] = json!("foreign");
+        write(&bad);
+        assert!(read_result_rows(&file).unwrap_err().contains("source row"));
+        let mut bad = supplied.clone();
+        bad["cpu_observations"]["invocations"][0]["role"] =
+            json!({"kind":"ptrace_normalization","execution_ordinal":1});
+        write(&bad);
+        assert!(
+            read_result_rows(&file)
+                .unwrap_err()
+                .contains("earlier invocation")
+        );
+        for present in [JsonValue::Null, json!({"version":99})] {
+            let mut bad = base.clone();
+            bad["cpu_observations"] = present;
+            write(&bad);
+            assert!(read_result_rows(&file).is_err());
+        }
+        write(&base);
+        assert!(
+            read_result_rows(&file).unwrap()[0]
+                .cpu_observations
+                .is_none()
+        );
+        cleanup.remove().unwrap();
     }
 }
