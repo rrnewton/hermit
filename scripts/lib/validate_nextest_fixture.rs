@@ -174,6 +174,12 @@ fn context(source: &Path, outcomes: &[StepOutcome]) -> LedgerCtx {
         .is_empty()
     );
     LedgerCtx {
+        run_id: std::env::var("E2E_RUN_ID").ok(),
+        admission_floor_evidence: None,
+        admission_provenance_error: None,
+        log_identity: None,
+        base_observation: serde_json::Value::Null,
+        main_observation: serde_json::Value::Null,
         started_at: utc_now(),
         host: "real-nextest-fixture".into(),
         toolchain: "fixture; actual tool versions retained separately".into(),
@@ -185,8 +191,8 @@ fn context(source: &Path, outcomes: &[StepOutcome]) -> LedgerCtx {
         commit: git_text(source, &["rev-parse", "HEAD"]),
         tree: git_text(source, &["rev-parse", "HEAD^{tree}"]),
         git_depth: 0,
-        git_ahead: 0,
-        git_behind: 0,
+        git_ahead: Some(0),
+        git_behind: Some(0),
         commit_anchored: false,
         tree_dirty: false,
         dag_jobs: 1,
