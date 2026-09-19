@@ -16,22 +16,42 @@ fi
 
 readonly PROGRAM=$1
 readonly FIXTURE_ROOT=${REAL_COMPAT_FIXTURES:-/tmp/hermit-real-compat-fixtures}
-# A real allocation, not a name derived from the program. The old
-# "/tmp/hermit-real-compat-$PROGRAM" was the same directory for every concurrent
-# run of one program, and the two lines below made that MUTUALLY DESTRUCTIVE
-# rather than merely shared: the second run's `rm -rf` deleted the first run's
-# tree mid-flight, and whichever finished first deleted it again from its EXIT
-# trap. Measured over ten concurrent pairs of `curl-localhost`: seven pairs had
-# at least one side fail. `mktemp -d` creates the directory itself, so the
-# `rm -rf`/`mkdir` that opened the window are gone with it, and the trap now
-# only ever removes this run's own tree.
-WORK_DIR="$(mktemp -d "/tmp/hermit-real-compat-$PROGRAM.XXXXXXXX")"
+# xz reads /proc/self/maps and its cleanup recursively enumerates WORK_DIR.
+# Strict verification runs the workload twice, so removing and recreating the
+# directory between the two physical runs exposes fresh tmpfs inode numbers in
+# both buffers. A concurrent -j2 peer makes that allocation observably differ.
+# REAL_COMPAT_FIXTURES is unique to one validation run, and there is exactly one
+# xz-roundtrip node in each compatibility partition, so retain its prepared
+# workspace until the run-owned fixture tree is discarded. Overwriting the
+# files preserves the inode identity which strict verification is measuring.
+if [[ $PROGRAM == xz-roundtrip && -n ${REAL_COMPAT_FIXTURES:-} ]]; then
+    WORK_DIR="$FIXTURE_ROOT/.work/xz-roundtrip"
+    if [[ ! -d $WORK_DIR/source || ! -d $WORK_DIR/output || \
+        ! -f $WORK_DIR/source/payload.txt || \
+        ! -f $WORK_DIR/output/payload.txt || \
+        ! -f $WORK_DIR/archive.xz ]]; then
+        printf '%s\n' \
+            'xz-roundtrip: prepared stable workspace is missing; run prepare_real_compat_fixtures.sh first' \
+            >&2
+        exit 2
+    fi
+else
+    # A real allocation, not a name derived from the program. The old
+    # "/tmp/hermit-real-compat-$PROGRAM" was the same directory for every concurrent
+    # run of one program, and the two lines below made that MUTUALLY DESTRUCTIVE
+    # rather than merely shared: the second run's `rm -rf` deleted the first run's
+    # tree mid-flight, and whichever finished first deleted it again from its EXIT
+    # trap. Measured over ten concurrent pairs of `curl-localhost`: seven pairs had
+    # at least one side fail. `mktemp -d` creates the directory itself, so the
+    # `rm -rf`/`mkdir` that opened the window are gone with it, and the trap now
+    # only ever removes this run's own tree.
+    WORK_DIR="$(mktemp -d "/tmp/hermit-real-compat-$PROGRAM.XXXXXXXX")"
+    trap 'rm -rf "$WORK_DIR"' EXIT
+fi
 readonly WORK_DIR
 export LC_ALL=C
 export TZ=UTC
 umask 022
-
-trap 'rm -rf "$WORK_DIR"' EXIT
 
 function write_assembly_fixture {
     cat >"$WORK_DIR/add.s" <<'EOF'
