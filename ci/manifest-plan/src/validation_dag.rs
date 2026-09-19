@@ -602,6 +602,13 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             split.len()
         ));
     }
+    // The hosted test consumers need a producer whose prepared population is
+    // limited to their committed selection. Sharing build.workspace with the
+    // local full profile made a no-KVM GitHub runner compile the local-only
+    // kvm-native-test-support selection before any hosted test could start.
+    // Split the producer before closing over its shared downstream consumers,
+    // so no hosted path retains a dependency on the local full producer.
+    split.insert("build.workspace".into());
     loop {
         let previous = split.len();
         for step in &cfg.steps {
@@ -625,9 +632,9 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             break;
         }
     }
-    if split.len() != 206 {
+    if split.len() != 213 {
         return Err(format!(
-            "hosted test dependency closure has {} nodes, expected 206",
+            "hosted test dependency closure has {} nodes, expected 213",
             split.len()
         ));
     }
@@ -658,6 +665,19 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             }
         }
     }
+    let hosted_workspace = cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == "build.workspace_on_host")
+        .ok_or("hosted workspace producer is absent")?;
+    let local_prepare = "./ci/nextest-binaries.rs prepare full";
+    if hosted_workspace.cmd.matches(local_prepare).count() != 1 {
+        return Err("hosted workspace producer lost the exact local preparation command".into());
+    }
+    hosted_workspace.cmd = hosted_workspace.cmd.replace(
+        local_prepare,
+        "./ci/nextest-binaries.rs prepare hosted-portable",
+    );
     Ok(())
 }
 
@@ -690,6 +710,40 @@ fn materialize_hosted_completion_budgets(cfg: &mut DagConfig) -> Result<(), Stri
 /// difference in its committed command and description; local validate
 /// continues to execute every case.
 fn materialize_hosted_capability_exclusions(cfg: &mut DagConfig) -> Result<(), String> {
+    // GitHub's runner has no KVM device. The local Hermit unit selection uses
+    // reverie-kvm/native-test-support for three scheduler controls, and the
+    // current pinned Reverie revision does not support compiling that private
+    // test API on a no-KVM hosted build. Remove only that feature from the
+    // hosted twin's command and recorded Cargo identity. The local 710-test
+    // node and the full-profile producer remain unchanged.
+    let hosted_unit = cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == "test.hermit_unit_on_host")
+        .ok_or("hosted Hermit unit node is absent")?;
+    let local_features = "third-party-backends,kvm-native-test-support";
+    if hosted_unit.cmd.matches(local_features).count() != 1 {
+        return Err("hosted Hermit unit command lost the exact local KVM feature set".into());
+    }
+    hosted_unit.cmd = hosted_unit
+        .cmd
+        .replace(local_features, "third-party-backends");
+    let raw_selection = hosted_unit
+        .env
+        .get(crate::nextest_binaries::SELECTION_ENV)
+        .ok_or("hosted Hermit unit node has no prepared build selection")?;
+    let mut selection: Vec<String> =
+        serde_json::from_str(raw_selection).map_err(|error| error.to_string())?;
+    let feature = selection
+        .iter_mut()
+        .find(|argument| argument.as_str() == local_features)
+        .ok_or("hosted Hermit unit selection lost the exact local KVM feature set")?;
+    *feature = "third-party-backends".into();
+    hosted_unit.env.insert(
+        crate::nextest_binaries::SELECTION_ENV.into(),
+        serde_json::to_string(&selection).map_err(|error| error.to_string())?,
+    );
+
     const EXCLUSIONS: &[(&str, u64, &[&str], &str)] = &[
         (
             "test.cli_on_host",
@@ -743,9 +797,9 @@ fn materialize_hosted_capability_exclusions(cfg: &mut DagConfig) -> Result<(), S
         ),
         (
             "test.hermit_unit_on_host",
-            709,
+            706,
             &["e9patch::tests::cache_directory_is_private_and_not_a_symlink"],
-            "The GitHub wrapper intentionally maps only the runner UID to root. The host filesystem root is therefore overflow-owned inside that user namespace, so this exact cache-ancestor ownership fixture refuses before testing the private cache directory. It remains blocking in canonical local validate; the other 709 Hermit unit cases remain blocking here.",
+            "GitHub's runner has no KVM device, so its committed Cargo selection omits kvm-native-test-support and the three native scheduler controls behind that feature. The GitHub wrapper also maps only the runner UID to root; the host filesystem root is therefore overflow-owned inside that user namespace, so the exact cache-ancestor ownership fixture is skipped. All four cases remain blocking in canonical local validate; the other 706 Hermit unit cases remain blocking here.",
         ),
     ];
 
@@ -1573,9 +1627,9 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
     assert_structured_result_producers(cfg)?;
     crate::nextest_build_selections::assert_preparation_dependencies(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
-    if cfg.steps.len() != 1598 {
+    if cfg.steps.len() != 1605 {
         return Err(format!(
-            "superset has {} steps, expected 1598",
+            "superset has {} steps, expected 1605",
             cfg.steps.len()
         ));
     }
@@ -2792,8 +2846,17 @@ sys.exit(37)
             .collect::<BTreeSet<_>>();
         assert_eq!(new_variants.len(), 189);
         new_variants.extend(shared_tests.map(|job| format!("test.{job}_on_host")));
-        new_variants.insert("compatprep.fixtures_on_host".into());
-        assert_eq!(new_variants.len(), 206);
+        new_variants.extend([
+            "build.e2e_artifact_on_host".into(),
+            "build.liteinst_runtime_release_on_host".into(),
+            "build.workspace_on_host".into(),
+            "check.backend_parity_suites_on_host".into(),
+            "compatprep.fixtures_on_host".into(),
+            "doc.doctests_on_host".into(),
+            "doc.rustdoc_on_host".into(),
+            "lint.clippy_on_host".into(),
+        ]);
+        assert_eq!(new_variants.len(), 213);
         let mut expected = legacy_variants
             .map(str::to_string)
             .into_iter()
@@ -2950,7 +3013,7 @@ sys.exit(37)
             (
                 "test.hermit_unit_on_host",
                 "test.hermit_unit",
-                "709",
+                "706",
                 &["e9patch::tests::cache_directory_is_private_and_not_a_symlink"][..],
             ),
         ] {
@@ -2980,6 +3043,15 @@ sys.exit(37)
             for test in excluded {
                 assert_eq!(hosted.cmd.matches(test).count(), 1, "{hosted_tag}: {test}");
                 assert!(!local.cmd.contains(test), "{local_tag} excluded {test}");
+            }
+            if hosted_tag == "test.hermit_unit_on_host" {
+                assert!(!hosted.cmd.contains("kvm-native-test-support"));
+                assert!(local.cmd.contains("kvm-native-test-support"));
+                assert!(
+                    hosted
+                        .description
+                        .contains("three native scheduler controls")
+                );
             }
             if hosted_tag == "test.detcore_misc_on_host" {
                 assert_eq!(

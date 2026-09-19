@@ -238,7 +238,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.detcore_parallel_on_host", 5),
     ("test.detcore_unit_on_host", 704),
     ("test.hermit_integration_on_host", 153),
-    ("test.hermit_unit_on_host", 709),
+    // The no-KVM hosted selection omits three native scheduler controls, then
+    // skips the one user-namespace ownership fixture documented in its node.
+    // Canonical local test.hermit_unit retains all 710 tests above.
+    ("test.hermit_unit_on_host", 706),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 22),
     // The host node carries the identical selection.
