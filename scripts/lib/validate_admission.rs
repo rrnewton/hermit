@@ -293,6 +293,7 @@ fn graph_hash(cfg: &DagConfig, second: Option<&DagConfig>) -> String {
             default_step_cpu_timeout,
             cpu_timeout_multiplier,
             cpu_timeout_platform,
+            // dag_to_json below already includes both write-domain policy members.
             write_domain_policy: _,
         } = cfg;
         serde_json::json!({
@@ -1083,6 +1084,89 @@ mod tests {
         let changed = f.admit(&f.authority(&target, &target), &target).unwrap();
         assert!(changed.check_witness(&f.0, &state).is_err());
         assert!(proof.check_witness(&f.0, &f.0).is_err());
+    }
+
+    fn require_write_domain_hash_and_cache_binding(mutate: fn(&mut DagConfig)) {
+        let f = Fixture::new();
+        std::fs::write(f.0.join(".gitignore"), "ignored/\n").unwrap();
+        f.command(&["add", ".gitignore"]);
+        let base = f.commit("base");
+        let target = f.commit("target");
+        let proof = f.admit(&f.authority(&target, &base), &target).unwrap();
+        let canonical = crate::validate_plan::validation_config(&source_root()).unwrap();
+        let mut second = canonical.clone();
+        second.steps.clear();
+        let state = VerifiedStateRoot::fixture(&f.0);
+        let mut missed = Vec::new();
+        for (label, has_second, mutate_second) in [
+            ("only-graph", false, false),
+            ("first-of-two", true, false),
+            ("second-graph", true, true),
+        ] {
+            let second_ref = has_second.then_some(&second);
+            let original = BoundExecutionPlan::bind(&canonical, second_ref, Some(&proof)).unwrap();
+            original
+                .verify(&canonical, second_ref, Some(&proof))
+                .unwrap();
+            let log_path = f.0.join(format!("ignored/validate/{label}.log"));
+            let log = state.create(&state.locator(&log_path).unwrap()).unwrap();
+            log.write_exact(b"write-domain binding control\n").unwrap();
+            let retained = original
+                .retain(&proof, &f.0, &state, label, "2026-09-18T15:00:00Z", &log)
+                .unwrap();
+            assert!(original.cache_matches(&proof, &retained.evidence));
+            let mut changed = canonical.clone();
+            let mut changed_second = second.clone();
+            mutate(if mutate_second {
+                &mut changed_second
+            } else {
+                &mut changed
+            });
+            let current = BoundExecutionPlan::bind(
+                &changed,
+                has_second.then_some(&changed_second),
+                Some(&proof),
+            )
+            .unwrap();
+            let canonical_changed = original.canonical_sha256 != current.canonical_sha256;
+            let execution_changed = original.execution_sha256 != current.execution_sha256;
+            let cache_rejected = !current.cache_matches(&proof, &retained.evidence);
+            // The existing in-process carry check must continue to refuse even
+            // when the separate durable digest/cache assertions expose a gap.
+            assert!(
+                current
+                    .verify(&canonical, second_ref, Some(&proof))
+                    .is_err()
+            );
+            eprintln!(
+                "{label}: canonical_changed={canonical_changed} execution_changed={execution_changed} cache_rejected={cache_rejected}"
+            );
+            if !canonical_changed || !execution_changed || !cache_rejected {
+                missed.push((label, canonical_changed, execution_changed, cache_rejected));
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "write-domain member was not bound: {missed:?}"
+        );
+    }
+
+    #[test]
+    fn admission_write_domain_require_explicit_changes_hash_and_cache() {
+        require_write_domain_hash_and_cache_binding(|cfg| {
+            cfg.write_domain_policy.require_explicit = !cfg.write_domain_policy.require_explicit;
+        });
+    }
+
+    #[test]
+    fn admission_write_domain_allowed_domains_changes_hash_and_cache() {
+        require_write_domain_hash_and_cache_binding(|cfg| {
+            assert!(
+                cfg.write_domain_policy
+                    .allowed_domains
+                    .insert("opposing-domain".into())
+            );
+        });
     }
 
     #[test]
