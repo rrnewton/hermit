@@ -209,8 +209,9 @@ pub fn executable(path: &Path, directory: &Path) -> Result<(), String> {
 }
 
 /// A generation witness supplements the official producer's SHA256 checks.
-/// The official caller holds its shared preparation lock through the child;
-/// this consumer refuses replacement or modification between verification and use.
+/// Checked once when WORKLOADS initializes. The official caller holds its shared
+/// preparation lock through child exit, excluding cooperative producers. This
+/// does not provide a per-guest check or exclude uncoordinated path mutations.
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Generation {
