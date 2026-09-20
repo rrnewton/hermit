@@ -321,29 +321,9 @@ const BASELINE_RECORD_WORKLOADS: [&str; 10] = [
     "rs_clock_gettime",
 ];
 
-const CARGO_RECORD_GUESTS: [&str; 15] = [
-    "rustbin_clock_total_order",
-    "rustbin_exit_group",
-    "rustbin_sched_yield",
-    "rustbin_futex_timeout",
-    "rustbin_futex_wait_child",
-    "rustbin_futex_wake_some",
-    "rustbin_heap_ptrs",
-    "rustbin_print_nanosleep_race",
-    "rustbin_nanosleep",
-    "rustbin_pipe_basics",
-    "rustbin_poll",
-    "rustbin_poll_spin",
-    "rustbin_rdtsc",
-    "rustbin_stack_ptr",
-    "rustbin_thread_random",
-];
-
-#[derive(Debug)]
-struct Workload {
-    name: &'static str,
-    path: PathBuf,
-}
+#[path = "../../ci/record-replay-workloads.rs"]
+pub mod record_workloads;
+use record_workloads::Workload;
 
 fn command_output(mut command: Command, label: &str) -> Output {
     let rendered = format!("{command:?}");
@@ -460,6 +440,7 @@ fn first_mountinfo_row_difference(left: &[u8], right: &[u8]) -> String {
 }
 
 fn compile_c(source: &Path, output: &Path) {
+    record_workloads::require_standalone().expect("unprepared standalone C fixture");
     let mut command = Command::new("cc");
     command
         .args(["-O0", "-g", "-pthread"])
@@ -469,175 +450,37 @@ fn compile_c(source: &Path, output: &Path) {
     command_output(command, "C record workload compilation");
 }
 
-// Reuse Cargo's Nix artifact so this test can compile the existing Rust guest
-// without a generated manifest edit or a recursive Cargo invocation.
-fn nix_rlibs() -> Vec<PathBuf> {
-    let dependency_dir = std::env::current_exe()
-        .expect("failed to locate the record/replay test binary")
-        .parent()
-        .expect("integration test binary should be inside Cargo's deps directory")
-        .to_path_buf();
-    let mut candidates = fs::read_dir(&dependency_dir)
-        .expect("failed to read Cargo's dependency directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("libnix-") && name.ends_with(".rlib"))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort();
-    assert!(
-        !candidates.is_empty(),
-        "Cargo did not build a Nix rlib in {}",
-        dependency_dir.display()
-    );
-    candidates
-}
-
-fn compile_rust_clock(source: &Path, output: &Path) {
-    let dependency_dir = std::env::current_exe()
-        .expect("failed to locate the record/replay test binary")
-        .parent()
-        .expect("integration test binary should be inside Cargo's deps directory")
-        .to_path_buf();
-    let mut failures = Vec::new();
-
-    for nix_rlib in nix_rlibs() {
-        let mut command = Command::new("rustc");
-        command
-            .args(["--edition=2024", "-C", "debuginfo=1", "-L"])
-            .arg(format!("dependency={}", dependency_dir.display()))
-            .arg("--extern")
-            .arg(format!("nix={}", nix_rlib.display()))
-            .arg(source)
-            .arg("-o")
-            .arg(output);
-        let rendered = format!("{command:?}");
-        let result = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
-        if result.status.success() {
-            return;
-        }
-        failures.push(format!(
-            "{rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-            result.status,
-            String::from_utf8_lossy(&result.stdout),
-            String::from_utf8_lossy(&result.stderr),
-        ));
-    }
-
-    panic!(
-        "failed to compile the Rust clock_gettime workload with any Cargo-built Nix rlib:\n{}",
-        failures.join("\n\n")
-    );
-}
-
-fn cargo_record_workloads(repository: &Path) -> Vec<Workload> {
-    let binary_directory = Path::new(env!("CARGO_BIN_EXE_hermit"))
-        .parent()
-        .expect("Hermit binary should have a parent directory");
-    if CARGO_RECORD_GUESTS
-        .iter()
-        .any(|name| !binary_directory.join(name).is_file())
-    {
-        let mut command = Command::new(env!("CARGO"));
-        command.current_dir(repository).args([
-            "build",
-            "-p",
-            "hermetic_infra_hermit_tests",
-            "--bins",
-        ]);
-        command_output(command, "Cargo record workload compilation");
-    }
-
-    CARGO_RECORD_GUESTS
-        .iter()
-        .map(|&name| {
-            let path = binary_directory.join(name);
-            assert!(
-                path.is_file(),
-                "missing Cargo record workload: {}",
-                path.display()
-            );
-            Workload { name, path }
-        })
-        .collect()
-}
-
 fn workloads() -> &'static [Workload] {
     WORKLOADS.get_or_init(|| {
+        let prepared = std::env::var(record_workloads::PREPARED_ENV);
+        let raw = match &prepared {
+            Ok(raw) => Some(raw.as_str()),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => panic!("invalid prepared record workload environment: {error}"),
+        };
+        if let Some(workloads) = record_workloads::consume_prepared(
+            std::env::var_os(record_workloads::REQUIRED_ENV).is_some(),
+            raw,
+        )
+        .expect("record/replay prepared workload verification failed")
+        {
+            return workloads;
+        }
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
         let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("record-replay-workloads");
         fs::create_dir_all(&build_root).expect("failed to create workload build directory");
-
-        let c_sources = [
-            ("c_getpid", "getpid.c"),
-            ("c_getsockopt_null", "getsockopt_null.c"),
-            ("c_setsockopt_replay", "record_replay_setsockopt.c"),
-            ("c_ioctl_fioclex", "ioctl_fioclex.c"),
-            ("c_ioctl_siocethtool", "ioctl_siocethtool.c"),
-            ("c_record_replay_fd_close", "record_replay_fd_close.c"),
-            ("c_pidfd_open_self", "pidfd_open_self.c"),
-            ("c_pidfd_poll_self", "pidfd_poll_self.c"),
-            ("c_recvmsg_scm_rights_mmap", "recvmsg_scm_rights_mmap.c"),
-            ("c_record_replay_file_state", "record_replay_file_state.c"),
-            (
-                "c_record_replay_poll_partial_copyout",
-                "record_replay_poll_partial_copyout.c",
-            ),
-            (
-                "c_record_replay_execveat_paths",
-                "record_replay_execveat_paths.c",
-            ),
-            (
-                "c_record_replay_mkdir_eexist",
-                "record_replay_mkdir_eexist.c",
-            ),
-            ("c_clock_exec_continuity", "clock_exec_continuity.c"),
-            ("c_lseek_seek_cur", "record_replay_lseek_seek_cur.c"),
-            (
-                "c_timerslack_proc_record_replay",
-                "timerslack_proc_record_replay.c",
-            ),
-            ("c_sigpipe_siginfo", "sigpipe_siginfo.c"),
-            ("c_ppoll_readv", "ppoll_readv.c"),
-            ("c_uname", "uname.c"),
-            ("c_sysinfo", "sysinfo.c"),
-            ("c_proc_fdinfo_mount_classes", "proc_fdinfo_mount_classes.c"),
-            ("c_wait_on_child", "wait_on_child.c"),
-            ("c_nanosleep_parallel", "nanosleep-par.c"),
-            (
-                "c_ftruncate_ignore_output_error",
-                "ftruncate_ignore_output_error.c",
-            ),
-            ("c_write_ignore_output_error", "write_ignore_output_error.c"),
-            ("c_unsupported_syscall", "dbt_unsupported_syscall.c"),
-        ];
-        let mut workloads = c_sources
-            .into_iter()
-            .map(|(name, source_name)| {
-                let path = build_root.join(name);
-                compile_c(&repository.join("tests/c").join(source_name), &path);
-                Workload { name, path }
-            })
-            .collect::<Vec<_>>();
-
-        let clock_gettime = Workload {
-            name: "rs_clock_gettime",
-            path: build_root.join("rs_clock_gettime"),
-        };
-        compile_rust_clock(
-            &repository.join("tests/rust/clock_gettime.rs"),
-            &clock_gettime.path,
-        );
-        workloads.push(clock_gettime);
-        workloads.extend(cargo_record_workloads(repository));
-        workloads
+        let generation = build_root.join(format!(
+            "generation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time precedes Unix epoch")
+                .as_nanos()
+        ));
+        record_workloads::standalone(repository, &generation, env!("CARGO"))
+            .unwrap_or_else(|error| panic!("record/replay standalone preparation failed: {error}"))
     })
 }
 
