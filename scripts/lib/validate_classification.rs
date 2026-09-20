@@ -1199,6 +1199,7 @@ mod ledger_tests {
             ),
         ] {
             let ctx = super::super::LedgerCtx {
+                raw_result_inputs: None,
                 run_id: std::env::var("E2E_RUN_ID").ok(),
                 admission_floor_evidence: None,
                 admission_provenance_error: None,

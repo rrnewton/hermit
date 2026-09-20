@@ -5731,24 +5731,212 @@ fn should_write_scorecard(nested: bool, off_the_record: bool) -> bool {
     !nested && !off_the_record
 }
 
+/// Frozen after child execution and checked again before the durable ledger
+/// append. The original bytes remain in the durable per-run result directory.
+struct ScorecardRawInputs {
+    root: PathBuf,
+    census: hermit_manifest_plan::ledger::RawResultInputCensusV1,
+}
+
+fn read_scorecard_raw_inputs(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fn visit(
+        root: &Path,
+        path: &Path,
+        inputs: &mut BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), String> {
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err("raw result census requires real directories".into());
+        }
+        for entry in std::fs::read_dir(path).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            if kind.is_symlink() {
+                return Err("raw result census refuses symlinks".into());
+            }
+            if kind.is_dir() {
+                visit(root, &entry.path(), inputs)?;
+            } else if entry.file_name() == "results.jsonl" {
+                use std::io::Read;
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(entry.path())
+                    .map_err(|error| error.to_string())?;
+                if !file
+                    .metadata()
+                    .map_err(|error| error.to_string())?
+                    .is_file()
+                {
+                    return Err("raw result census input is not a regular file".into());
+                }
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)
+                    .map_err(|error| error.to_string())?;
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|error| error.to_string())?
+                    .to_str()
+                    .ok_or("raw result path is not UTF-8")?
+                    .to_string();
+                if inputs.insert(relative, bytes).is_some() {
+                    return Err("raw result census repeated a path".into());
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut first = BTreeMap::new();
+    visit(root, root, &mut first)?;
+    let mut second = BTreeMap::new();
+    visit(root, root, &mut second)?;
+    if first != second {
+        return Err("raw result population changed during capture".into());
+    }
+    Ok(first)
+}
+
+impl ScorecardRawInputs {
+    fn capture(root: &Path, run_id: &str, commit: &str) -> Result<Self, String> {
+        let inputs = read_scorecard_raw_inputs(root)?;
+        let census = hermit_manifest_plan::ledger::RawResultInputCensusV1::from_inputs(
+            run_id, commit, &inputs,
+        )?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            census,
+        })
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        let current = hermit_manifest_plan::ledger::RawResultInputCensusV1::from_inputs(
+            &self.census.run_id,
+            &self.census.hermit_sha,
+            &read_scorecard_raw_inputs(&self.root)?,
+        )?;
+        if current != self.census {
+            return Err("raw result inputs changed before durable finalization".into());
+        }
+        Ok(())
+    }
+}
+
+struct ScorecardPublication<'a> {
+    parent: Option<&'a Path>,
+    tool_root: Option<&'a Path>,
+    expected_head: &'a str,
+    finalized_row: Option<&'a serde_json::Value>,
+    delegated: bool,
+}
+
 fn local_scorecard_writeback(
     root: &Path,
     result_root: &Path,
     nested: bool,
     off_the_record: bool,
+    publication: &ScorecardPublication<'_>,
 ) -> Option<Result<(), String>> {
-    if !should_write_scorecard(nested, off_the_record) {
+    if !should_write_scorecard(nested, off_the_record) || publication.delegated {
         return None;
     }
+    Some(project_local_scorecard(root, result_root, publication))
+}
+
+fn project_local_scorecard(
+    root: &Path,
+    result_root: &Path,
+    publication: &ScorecardPublication<'_>,
+) -> Result<(), String> {
+    use sha2::Digest;
+    let finalized_row = publication
+        .finalized_row
+        .ok_or("no durable finalized ledger row; scorecard writeback did not run")?;
+    let parent = publication
+        .parent
+        .ok_or("no parent state root for the scorecard snapshot")?;
+    let tool_root = publication
+        .tool_root
+        .ok_or("no executable snapshot-provider root")?;
     let script = root.join("ci/compat-envelope/scorecard.rs");
     if !script.is_file() {
-        return Some(Err(format!("{} does not exist", script.display())));
+        return Err(format!("{} does not exist", script.display()));
     }
-    Some(
-        Command::new(&script)
-            .arg("observe-results")
+    // The direct validator already holds the invocation lock. Do not acquire
+    // it again here; the parent uses its own lock before this same transaction.
+    let provider = tool_root.join("ci-hub/series/series.py");
+    let captures = parent.join("ignored/validate/scorecard-snapshots");
+    std::fs::create_dir_all(&captures)
+        .map_err(|error| format!("cannot create scorecard snapshot directory: {error}"))?;
+    let directory = tempfile::Builder::new()
+        .prefix("writeback-")
+        .tempdir_in(&captures)
+        .map_err(|error| format!("cannot allocate scorecard snapshot: {error}"))?
+        .keep();
+    let row_path = directory.join("finalized-row.json");
+    let row_bytes = serde_json::to_vec(finalized_row)
+        .map_err(|error| format!("cannot encode finalized ledger row: {error}"))?;
+    let mut row_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&row_path)
+        .map_err(|error| format!("cannot retain finalized ledger row: {error}"))?;
+    row_file
+        .write_all(&row_bytes)
+        .and_then(|()| row_file.sync_all())
+        .map_err(|error| format!("cannot publish finalized ledger row: {error}"))?;
+    std::fs::File::open(&directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("cannot sync finalized ledger row directory: {error}"))?;
+    let snapshot = directory.join("snapshot.json");
+    let captured = Command::new("python3")
+        .arg(&provider)
+        .arg("snapshot")
+        .arg("--parent")
+        .arg(parent)
+        .arg("--output")
+        .arg(&snapshot)
+        .output()
+        .map_err(|error| format!("cannot run {}: {error}", provider.display()))?;
+    if !captured.status.success() {
+        return Err(format!(
+            "scorecard snapshot refused with {}: {}",
+            captured.status,
+            refusal_detail(&captured.stderr, &captured.stdout)
+        ));
+    }
+    let receipt: serde_json::Value = serde_json::from_slice(&captured.stdout)
+        .map_err(|error| format!("snapshot provider returned invalid JSON: {error}"))?;
+    let metadata = std::fs::symlink_metadata(&snapshot)
+        .map_err(|error| format!("snapshot provider omitted its capture: {error}"))?;
+    let snapshot_bytes = std::fs::read(&snapshot)
+        .map_err(|error| format!("cannot read captured scorecard snapshot: {error}"))?;
+    let snapshot_sha = format!("{:x}", sha2::Sha256::digest(&snapshot_bytes));
+    if !metadata.is_file()
+        || receipt.get("state").and_then(serde_json::Value::as_str) != Some("available")
+        || receipt.get("path").and_then(serde_json::Value::as_str) != snapshot.to_str()
+        || receipt.get("sha256").and_then(serde_json::Value::as_str) != Some(snapshot_sha.as_str())
+    {
+        return Err("snapshot provider returned an unavailable or unbound capture".into());
+    }
+    let refreshed_at = finalized_row
+        .get("started_at")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("finalized row has no start time")?;
+    Command::new(&script)
+            .arg("project-and-observe-results")
+            .arg("--snapshot").arg(&snapshot)
+            .arg("--snapshot-sha256").arg(&snapshot_sha)
             .arg("--results")
             .arg(result_root)
+            .arg("--expected-head").arg(publication.expected_head)
+            .arg("--results-head").arg(publication.expected_head)
+            .arg("--refreshed-at").arg(refreshed_at)
+            .arg("--finalized-row").arg(&row_path)
+            .arg("--finalized-row-sha256").arg(format!("{:x}", sha2::Sha256::digest(&row_bytes)))
+            .arg("--state-root").arg(parent)
             .current_dir(root)
             .output()
             .map_err(|error| format!("cannot run {}: {error}", script.display()))
@@ -5763,13 +5951,12 @@ fn local_scorecard_writeback(
                     return Ok(());
                 }
                 Err(format!(
-                    "{} observe-results refused with {}: {}",
+                    "{} project-and-observe-results refused with {}: {}",
                     script.display(),
                     output.status,
                     refusal_detail(&output.stderr, &output.stdout),
                 ))
-            }),
-    )
+            })
 }
 
 /// The largest child explanation carried into the durable record.
@@ -7377,6 +7564,18 @@ struct Plan {
     /// deliberately separate from `suite_complete`: it may satisfy one open
     /// cell obligation but can never authorize a whole-run landing receipt.
     cell_evidence_expected: Option<Vec<serde_json::Value>>,
+}
+
+/// Selected package runs still need the exact constructed population: an empty
+/// result directory alone cannot distinguish zero selected cells from lost data.
+fn should_capture_cumulative_evidence(plan: &Plan, nested: bool, off_record: bool) -> bool {
+    validate_evidence::ENABLED
+        && !nested
+        && !off_record
+        && (plan.suite_complete
+            || plan.cell_evidence_expected.is_some()
+            || (plan.committed_selection.is_some()
+                && matches!(plan.profile.as_str(), "full" | "quick" | "super")))
 }
 
 struct EnvelopePlan {
@@ -15637,6 +15836,7 @@ fn timed_out_nodes(outcomes: &[StepOutcome]) -> Vec<String> {
 
 struct LedgerCtx {
     run_id: Option<String>,
+    raw_result_inputs: Option<Result<ScorecardRawInputs, String>>,
     admission_floor_evidence: Option<hermit_manifest_plan::ledger::AdmissionEvidence>,
     admission_provenance_error: Option<String>,
     log_identity: Option<hermit_manifest_plan::ledger::WorkspaceLocatorV2>,
@@ -18590,7 +18790,7 @@ fn write_ledger(
     coverage: serde_json::Value,
     cell_results: Option<&validate_cell_results::RetainedCellResults>,
     cumulative_evidence: Option<&validate_evidence::RetainedEvidence>,
-) {
+) -> Option<serde_json::Value> {
     let (coverage_schema, coverage) = ledger_schema_and_coverage(coverage);
     let ledger_schema = ledger_schema_version(coverage_schema, cell_results);
     // `gate_records` counts typed scheduler outcomes, including an explicit
@@ -18806,11 +19006,23 @@ fn write_ledger(
     if let Some(evidence) = cumulative_evidence {
         if let Err(error) = evidence.add_to_record(&mut record) {
             eprintln!("validate: ERROR: refusing malformed cumulative ledger row: {error}");
-            return;
+            return None;
         }
     } else if ledger_schema == 10 {
         eprintln!("validate: ERROR: schema 10 requires all cumulative evidence components");
-        return;
+        return None;
+    }
+    if let Some(capture) = &ctx.raw_result_inputs {
+        match capture.as_ref().map_err(Clone::clone).and_then(|capture| {
+            capture.verify()?;
+            serde_json::to_value(&capture.census).map_err(|error| error.to_string())
+        }) {
+            Ok(proof) => record["raw_result_input_census_v1"] = proof,
+            Err(error) => {
+                eprintln!("validate: scorecard input proof unavailable: {error}");
+                record["raw_result_input_census_error"] = serde_json::Value::String(error);
+            }
+        }
     }
     if let Some(identity) = &ctx.log_identity {
         record["log_identity"] =
@@ -18826,30 +19038,30 @@ fn write_ledger(
             eprintln!(
                 "validate: warning: generated ledger row does not match the shared HistoryRow: {error}"
             );
-            return;
+            return None;
         }
     };
     if let Some(evidence) = cumulative_evidence {
         if let Err(error) = evidence.verify_record(&typed) {
             eprintln!("validate: ERROR: refusing unbound cumulative ledger row: {error}");
-            return;
+            return None;
         }
     }
     if let Err(error) = typed.admission_evidence() {
         eprintln!("validate: ERROR: refusing mismatched admission ledger row: {error}");
-        return;
+        return None;
     }
     if typed.retry_rounds() != Ok(Some(ctx.retry_rounds)) {
         eprintln!(
             "validate: warning: generated ledger row has malformed HistoryRow retry_rounds"
         );
-        return;
+        return None;
     }
     if typed.executed_nodes() != Ok(Some(executed_nodes)) {
         eprintln!(
             "validate: warning: generated ledger row has malformed HistoryRow executed_nodes"
         );
-        return;
+        return None;
     }
     let line = format!("{}\n", serde_json::to_string(&record).unwrap());
     let explicit = std::env::var(LEDGER_ENV)
@@ -18865,7 +19077,7 @@ fn write_ledger(
             configured_tool_root.as_deref(),
         ) else {
             eprintln!("validate: warning: canonical ledger root has no parent: {}", ledger.display());
-            return;
+            return None;
         };
         let mut child = match Command::new("python3")
             .arg(&adapter)
@@ -18881,7 +19093,7 @@ fn write_ledger(
                     "validate: warning: cannot launch canonical ledger writer {}: {e}",
                     adapter.display()
                 );
-                return;
+                return None;
             }
         };
         use std::io::Write;
@@ -18892,14 +19104,17 @@ fn write_ledger(
         let output = child.wait_with_output();
         if let Some(error) = write_error {
             eprintln!("validate: warning: cannot send row to canonical ledger writer: {error}");
-            return;
+            return None;
         }
         match output {
-            Ok(output) if output.status.success() => eprintln!(
-                "validate: canonical ledger record appended via {}: {}",
-                adapter.display(),
-                String::from_utf8_lossy(&output.stdout).trim()
-            ),
+            Ok(output) if output.status.success() => {
+                eprintln!(
+                    "validate: canonical ledger record appended via {}: {}",
+                    adapter.display(),
+                    String::from_utf8_lossy(&output.stdout).trim()
+                );
+                return Some(record);
+            },
             Ok(output) => eprintln!(
                 "validate: warning: canonical ledger writer {} refused: {}",
                 adapter.display(),
@@ -18910,30 +19125,42 @@ fn write_ledger(
                 adapter.display()
             ),
         }
-        return;
+        return None;
     }
 
     if let Some(dir) = ledger.parent() {
         if !dir.as_os_str().is_empty() {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 eprintln!("validate: warning: cannot create ledger dir {}: {e}", dir.display());
-                return;
+                return None;
             }
         }
     }
     use std::io::Write;
     match std::fs::OpenOptions::new().create(true).append(true).open(ledger) {
-        Ok(mut f) => match f.write_all(line.as_bytes()) {
+        Ok(mut f) => match f.write_all(line.as_bytes()).and_then(|()| f.sync_all()).and_then(|()| {
+            // The first append can create the file. Its directory entry must
+            // survive with its bytes before it authorizes scorecard publication.
+            std::fs::File::open(ledger.parent().filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")))?.sync_all()
+        }) {
             Ok(()) => {
                 eprintln!(
                     "validate: fixture/standalone ledger record appended to {}",
                     ledger.display()
                 );
                 warn_if_unreadable_ledger(ledger);
+                Some(record)
             }
-            Err(e) => eprintln!("validate: warning: cannot append ledger {}: {e}", ledger.display()),
+            Err(e) => {
+                eprintln!("validate: warning: cannot append ledger {}: {e}", ledger.display());
+                None
+            },
         },
-        Err(e) => eprintln!("validate: warning: cannot open ledger {}: {e}", ledger.display()),
+        Err(e) => {
+            eprintln!("validate: warning: cannot open ledger {}: {e}", ledger.display());
+            None
+        },
     }
 }
 
@@ -19094,6 +19321,12 @@ enum Verdict {
 const FINAL_VALIDATE_STATUS_PREFIX: &str = "FINAL_VALIDATE_STATUS: ";
 const COULD_NOT_RUN_EXIT_CODE: u8 = NO_RESULT_EXIT_CODE as u8;
 const VALIDATE_SERVICE_RESULT_PATH_ENV: &str = "VALIDATE_SERVICE_RESULT_PATH";
+const SCORECARD_WRITEBACK_OWNER_ENV: &str = "HERMIT_SCORECARD_WRITEBACK_OWNER";
+const SCORECARD_WRITEBACK_OWNER: &str = "ci-hub-invoker-v1";
+
+fn parent_owns_scorecard_writeback(owner: Option<&str>, managed: bool) -> bool {
+    managed && owner == Some(SCORECARD_WRITEBACK_OWNER)
+}
 
 fn final_validate_status(verdict: Verdict) -> Option<FinalValidateStatus> {
     match verdict {
@@ -20289,12 +20522,22 @@ fn main() -> ExitCode {
     // invocations must not inherit authority to publish a competing result.
     let service_result_path = std::env::var_os(VALIDATE_SERVICE_RESULT_PATH_ENV).map(PathBuf::from);
     std::env::remove_var(VALIDATE_SERVICE_RESULT_PATH_ENV);
+    let scorecard_delegated = parent_owns_scorecard_writeback(
+        std::env::var(SCORECARD_WRITEBACK_OWNER_ENV).ok().as_deref(),
+        service_result_path.is_some(),
+    );
+    // A nested validator cannot inherit the parent's post-verdict ownership.
+    std::env::remove_var(SCORECARD_WRITEBACK_OWNER_ENV);
     install_stop_handlers();
     let started = std::time::Instant::now();
 
     // The durable log outlives `run` so the summary lands INSIDE it.
     let mut durable: Option<DurableLog> = None;
-    let mut summary = run(&mut durable, service_result_path.as_deref());
+    let mut summary = run(
+        &mut durable,
+        service_result_path.as_deref(),
+        scorecard_delegated,
+    );
     if let Err(error) =
         publish_validation_service_result_or_refuse(service_result_path.as_deref(), &mut summary)
     {
@@ -20475,7 +20718,11 @@ fn verified_run_state_scope_reexec(root: &Path, inherited: Option<&OsStr>) -> bo
     !unit.is_empty() && observe_own_containment(Some(&unit)).proof().is_some()
 }
 
-fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>) -> RunSummary {
+fn run(
+    durable_slot: &mut Option<DurableLog>,
+    service_result_path: Option<&Path>,
+    scorecard_delegated: bool,
+) -> RunSummary {
     let args = match parse_args() {
         Ok(a) => a,
         // `parse_args` returns 0 only for `--help`, whose usage text is the
@@ -21191,9 +21438,9 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         }
     };
 
-    let cumulative_selection = if validate_evidence::ENABLED
-        && !nesting.nested && !args.allow_local_off_the_record_run
-        && (plan.suite_complete || plan.cell_evidence_expected.is_some())
+    let cumulative_selection = if should_capture_cumulative_evidence(
+        &plan, nesting.nested, args.allow_local_off_the_record_run,
+    )
     {
         match validate_evidence::SelectedEvidence::capture(&root, &plan) {
             Ok(selected) => Some(selected),
@@ -22043,6 +22290,9 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         );
     }
     let ctx = LedgerCtx {
+        raw_result_inputs: if nesting.nested || args.allow_local_off_the_record_run { None } else {
+            Some(ScorecardRawInputs::capture(&e2e_result_root, &run_id, &commit))
+        },
         run_id: Some(run_id),
         admission_floor_evidence,
         admission_provenance_error,
@@ -22110,7 +22360,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // no_result verdict. Collected node limits remain failed conditions; a
     // whole-run deadline is incomplete and falls through to the normal fold below.
     if let Some(sig) = &interruption {
-        if !nesting.nested && !args.allow_local_off_the_record_run {
+        let finalized_row = if !nesting.nested && !args.allow_local_off_the_record_run {
             write_ledger(
                 &ledger,
                 &ctx,
@@ -22126,8 +22376,8 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
                 coverage.clone(),
                 None,
                 None,
-            );
-        }
+            )
+        } else { None };
         // This is below the interrupted run's ledger write. Keep the checkout
         // lock held while the generated files are replaced, so a second local
         // validate cannot begin against the tree between those two operations.
@@ -22136,6 +22386,11 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             &e2e_result_root,
             nesting.nested,
             args.allow_local_off_the_record_run,
+            &ScorecardPublication {
+                parent: parent.as_deref(), tool_root: tool_root.as_deref(),
+                expected_head: &ctx.commit, finalized_row: finalized_row.as_ref(),
+                delegated: scorecard_delegated,
+            },
         );
         drop(run_record);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -22507,7 +22762,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // A NESTED payload writes nothing: the outer run owns the ledger and the
     // receipt, and a second row for one logical run is exactly the duplication
     // the re-entrancy guard exists to prevent.
-    if !nesting.nested && !args.allow_local_off_the_record_run {
+    let finalized_row = if !nesting.nested && !args.allow_local_off_the_record_run {
         write_ledger(
             &ledger,
             &ctx,
@@ -22523,8 +22778,10 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             coverage,
             retained_cell_results,
             retained_evidence.as_ref(),
-        );
-    }
+        )
+    } else {
+        None
+    };
 
     // Receipt publication, strictly AFTER the ledger append: `ci-hub
     // apply-local-label` re-derives the receipt FROM the ledger, so publishing
@@ -22560,6 +22817,11 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         &e2e_result_root,
         nesting.nested,
         args.allow_local_off_the_record_run,
+        &ScorecardPublication {
+            parent: parent.as_deref(), tool_root: tool_root.as_deref(),
+            expected_head: &ctx.commit, finalized_row: finalized_row.as_ref(),
+            delegated: scorecard_delegated,
+        },
     );
 
     // Read the individual results before removing the disposable build root: a
@@ -22824,6 +23086,7 @@ fn stop_test_seam(
     let host = short_hostname();
     let lock_admitted = validate_lock_fixture_admission(tool_root, &commit, &host).is_ok();
     let ctx = LedgerCtx {
+        raw_result_inputs: None,
         run_id: std::env::var("E2E_RUN_ID").ok(),
         admission_floor_evidence: None,
         admission_provenance_error: None,
@@ -22871,7 +23134,7 @@ fn stop_test_seam(
     // and leaves nothing unaccounted.
     let planned_tags: BTreeSet<String> = outcomes.iter().map(|o| o.tag.clone()).collect();
     if !off_the_record {
-        write_ledger(
+        let _ = write_ledger(
             &ledger,
             &ctx,
             &outcomes,
@@ -24359,7 +24622,23 @@ mod refusal_detail_tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
             .expect("make it executable");
 
-        let error = local_scorecard_writeback(root.path(), root.path(), false, false)
+        let provider = root.path().join("ci-hub/series/series.py");
+        std::fs::create_dir_all(provider.parent().unwrap()).unwrap();
+        std::fs::write(&provider, r#"import hashlib, json, pathlib, sys
+path = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])
+path.write_text('{}\n')
+print(json.dumps({'state': 'available', 'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}))
+"#).unwrap();
+        let row = serde_json::json!({"started_at": "2026-09-20T00:00:00Z"});
+        let publication = ScorecardPublication {
+            parent: Some(root.path()),
+            tool_root: Some(root.path()),
+            expected_head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            finalized_row: Some(&row),
+            delegated: false,
+        };
+
+        let error = local_scorecard_writeback(root.path(), root.path(), false, false, &publication)
             .expect("the writeback runs when not nested and on the record")
             .expect_err("a refusing tool must produce an error");
 
@@ -24377,14 +24656,20 @@ mod refusal_detail_tests {
         std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("rewrite the tool");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
             .expect("make it executable");
-        local_scorecard_writeback(root.path(), root.path(), false, false)
+        local_scorecard_writeback(root.path(), root.path(), false, false, &publication)
             .expect("still runs")
             .expect("a succeeding tool must not error");
 
         // And the gate is still a gate: nested or off-the-record runs do not
         // invoke the tool at all.
-        assert!(local_scorecard_writeback(root.path(), root.path(), true, false).is_none());
-        assert!(local_scorecard_writeback(root.path(), root.path(), false, true).is_none());
+        assert!(
+            local_scorecard_writeback(root.path(), root.path(), true, false, &publication)
+                .is_none()
+        );
+        assert!(
+            local_scorecard_writeback(root.path(), root.path(), false, true, &publication)
+                .is_none()
+        );
     }
 
     #[test]
@@ -24393,5 +24678,456 @@ mod refusal_detail_tests {
             refusal_detail(b"first line\n\n  second   line \n", b""),
             "stderr: first line second line"
         );
+    }
+}
+
+#[cfg(test)]
+mod scorecard_cutover_tests {
+    use sha2::Digest;
+
+    use super::*;
+
+    const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn provider(root: &Path) {
+        let path = root.join("ci-hub/series/series.py");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, r#"import hashlib, json, pathlib, sys
+path = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])
+path.write_text('{}\n')
+print(json.dumps({'state':'available','path':str(path),'sha256':hashlib.sha256(path.read_bytes()).hexdigest()}))
+"#).unwrap();
+    }
+
+    #[test]
+    fn versioned_parent_delegation_preserves_old_callers_and_the_held_local_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        provider(root);
+        let script = root.join("ci/compat-envelope/scorecard.rs");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, r#"#!/usr/bin/env python3
+import fcntl, hashlib, json, pathlib, sys
+root = pathlib.Path.cwd()
+with (root/'target/validation/validate-invocation.lock').open('a') as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise AssertionError('writeback ran without the existing invocation lock')
+args = sys.argv[1:]
+assert args[0] == 'project-and-observe-results'
+assert args[args.index('--expected-head')+1] == args[args.index('--results-head')+1] == 'a'*40
+for prefix in ['snapshot', 'finalized-row']:
+    path = pathlib.Path(args[args.index('--'+prefix)+1])
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == args[args.index('--'+prefix+'-sha256')+1]
+with (root/'calls.jsonl').open('a') as out:
+    out.write(json.dumps(args)+'\n')
+"#).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _lock = match validate_runtime::acquire_invocation_lock(root, "full", HEAD) {
+            validate_runtime::LockOutcome::Acquired(lock) => lock,
+            _ => panic!("the private invocation lock must be available"),
+        };
+        let row = serde_json::json!({"started_at":"2026-09-20T00:00:00Z"});
+        let cases = [
+            (None, true, false),
+            (Some("unknown-owner"), true, false),
+            (Some("ci-hub-invoker-v1"), true, true),
+            (Some("ci-hub-invoker-v1"), false, false),
+        ];
+        let mut local_calls = 0;
+        for (owner, managed, delegated) in cases {
+            let publication = ScorecardPublication {
+                parent: Some(root),
+                tool_root: Some(root),
+                expected_head: HEAD,
+                finalized_row: Some(&row),
+                delegated: parent_owns_scorecard_writeback(owner, managed),
+            };
+            assert_eq!(publication.delegated, delegated);
+            let result = local_scorecard_writeback(root, root, false, false, &publication);
+            if delegated {
+                assert!(
+                    result.is_none(),
+                    "delegation must never claim child completion"
+                );
+            } else {
+                result.unwrap().unwrap();
+                local_calls += 1;
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.join("calls.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                local_calls
+            );
+            assert!(local_scorecard_writeback(root, root, true, false, &publication).is_none());
+            assert!(local_scorecard_writeback(root, root, false, true, &publication).is_none());
+        }
+        let publication = ScorecardPublication {
+            parent: Some(root),
+            tool_root: Some(root),
+            expected_head: HEAD,
+            finalized_row: None,
+            delegated: false,
+        };
+        let error = local_scorecard_writeback(root, root, false, false, &publication)
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("no durable finalized ledger row"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("calls.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("ignored/validate/scorecard-snapshots"))
+                .unwrap()
+                .count(),
+            3,
+            "pre-receipt refusal must not invoke the provider or writer"
+        );
+    }
+
+    fn context(
+        root: &Path,
+        profile: &str,
+        run_id: &str,
+        commit: String,
+        tree: String,
+    ) -> LedgerCtx {
+        LedgerCtx {
+            run_id: Some(run_id.into()),
+            raw_result_inputs: None,
+            admission_floor_evidence: None,
+            admission_provenance_error: None,
+            log_identity: None,
+            base_observation: serde_json::Value::Null,
+            main_observation: serde_json::Value::Null,
+            started_at: "2026-09-20T00:00:00Z".into(),
+            host: "scorecard-fixture".into(),
+            toolchain: "fixture-python-unittest".into(),
+            slot: "fixture".into(),
+            cwd: root.display().to_string(),
+            profile: profile.into(),
+            selection_mode: "selected".into(),
+            cache_state: "cold".into(),
+            commit,
+            tree,
+            git_depth: 1,
+            git_ahead: Some(0),
+            git_behind: Some(0),
+            commit_anchored: true,
+            tree_dirty: false,
+            dag_jobs: 1,
+            admission: None,
+            base_sha: serde_json::Value::Null,
+            base_tree: serde_json::Value::Null,
+            reverie_base_sha: serde_json::Value::Null,
+            reverie_base_tree: serde_json::Value::Null,
+            concurrent_validates: None,
+            concurrency_proof: None,
+            interruption: None,
+            cpu_user: 0.0,
+            cpu_sys: 0.0,
+            retry_rounds: 0,
+            reverie_pin_current: false,
+            executed_tests: Some(1),
+            passed_tests: Some(1),
+            filtered_tests: Some(0),
+        }
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("--no-replace-objects")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().into()
+    }
+
+    #[test]
+    fn selected_package_runs_retain_verified_zero_cells_and_actual_test_rows() {
+        let source = Path::new(file!()).parent().unwrap().parent().unwrap();
+        for (profile, fails) in [
+            ("full", false),
+            ("quick", false),
+            ("super", false),
+            ("full", true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            std::fs::create_dir_all(root.join("ci/dag")).unwrap();
+            // Keep the real, nonempty manifest population. This selected plan
+            // runs a package test and deliberately selects none of its cells.
+            std::fs::copy(
+                source.join("ci/expected-e2e-plan.json"),
+                root.join("ci/expected-e2e-plan.json"),
+            )
+            .unwrap();
+            let producer = root.join("package_test.py");
+            std::fs::write(&producer, r#"import io, json, os, pathlib, unittest
+class SelectedPackage(unittest.TestCase):
+    def test_roundtrip(self):
+        self.assertEqual(json.loads(json.dumps({'value':[1,2,3]})), {'value':[1,2,3]})
+        self.assertNotEqual(os.environ.get('SCORECARD_FIXTURE_FAIL'), '1', 'controlled actual package failure')
+result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.defaultTestLoader.loadTestsFromTestCase(SelectedPackage))
+assert result.testsRun == 1
+pathlib.Path(os.environ['DAGRUN_TEST_COUNTS_PATH']).write_text(json.dumps({'schema':2,'executed_tests':result.testsRun,'filtered_tests':0,'results':[{'id':'SelectedPackage.test_roundtrip','result':'pass' if result.wasSuccessful() else 'fail','attempts':1}]}))
+raise SystemExit(0 if result.wasSuccessful() else 1)
+"#).unwrap();
+            let cfg = dag_from_json(&serde_json::json!({"steps":[{
+                "group":"test", "job":"package", "cmd":format!("python3 {}", shell_words::quote(&producer.display().to_string())),
+                "jobs_flag":"", "timeout":10,
+                "env":{"SCORECARD_FIXTURE_FAIL":if fails {"1"} else {"0"}},
+                "result_manifests":[{"kind":"structured-test-results","schema":2,
+                    "path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.package"}]
+            }]}).to_string()).unwrap();
+            let dag = dag_to_json(&cfg);
+            let dag_path = root.join("ci/dag/validate.json");
+            std::fs::write(&dag_path, &dag).unwrap();
+            // A real measured commit has a distinct Detcore tree. The later
+            // composed writer test imports this object, never relabels it as
+            // the invocation checkout's source.
+            std::fs::create_dir(root.join("detcore")).unwrap();
+            std::fs::write(
+                root.join("detcore/source"),
+                "package-only infrastructure fixture\n",
+            )
+            .unwrap();
+            git(root, &["init", "-q"]);
+            git(
+                root,
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "add",
+                    "ci",
+                    "package_test.py",
+                    "detcore",
+                ],
+            );
+            git(
+                root,
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-qm",
+                    "selected package fixture",
+                ],
+            );
+            let commit = git(root, &["rev-parse", "HEAD"]);
+            let tree = git(root, &["rev-parse", "HEAD^{tree}"]);
+            let plan = finish_committed_selection(
+                Plan {
+                    cfg,
+                    profile: profile.into(),
+                    selection_mode: "selected",
+                    ..Plan::default()
+                },
+                dag_path,
+                dag.into_bytes(),
+            );
+            assert!(!plan.suite_complete);
+            assert!(should_capture_cumulative_evidence(&plan, false, false));
+            assert!(!should_capture_cumulative_evidence(&plan, true, false));
+            assert!(!should_capture_cumulative_evidence(&plan, false, true));
+            let run_id = format!(
+                "selected-package-{profile}-{}",
+                if fails { "failed" } else { "passed" }
+            );
+            let prepared = validate_evidence::SelectedEvidence::capture(root, &plan)
+                .unwrap()
+                .publish(root, &plan, &run_id, &commit)
+                .unwrap();
+            assert!(prepared.plan.planned_cells().unwrap().is_empty());
+            assert_eq!(prepared.plan.path.as_str(), profile);
+            let run = run_dag_boxed_deadline(&plan.cfg, 1, true, 0, None, None, Some(1), Some(30));
+            assert_eq!(run.ok, !fails, "{:#?}", run.outcomes);
+            assert_eq!(run.outcomes.len(), 1);
+            assert_eq!(run.outcomes[0].executed_tests, Some(1));
+            assert_eq!(run.outcomes[0].test_results.as_ref().unwrap().len(), 1);
+            let attempts: Vec<_> = run
+                .outcomes
+                .iter()
+                .map(|outcome| reported_attempt(outcome, 1))
+                .collect();
+            let results = root.join("results");
+            std::fs::create_dir(&results).unwrap();
+            let mut ctx = context(root, profile, &run_id, commit, tree);
+            ctx.passed_tests = Some(i64::from(!fails));
+            ctx.raw_result_inputs =
+                Some(ScorecardRawInputs::capture(&results, &run_id, &ctx.commit));
+            let evidence = prepared
+                .retain(root, &results, &ctx, &run.outcomes, &attempts, None)
+                .unwrap();
+            let tags = plan.cfg.steps.iter().map(Step::tag).collect();
+            let ledger = root.join("rows.jsonl");
+            let row = write_ledger(
+                &ledger,
+                &ctx,
+                &run.outcomes,
+                &attempts,
+                &[],
+                &[],
+                &tags,
+                0.0,
+                u8::from(fails),
+                "",
+                true,
+                serde_json::json!({}),
+                Some(&evidence.cells),
+                Some(&evidence),
+            )
+            .unwrap();
+            assert_eq!(row["profile"], profile);
+            assert_eq!(row["selection_mode"], "selected");
+            assert_eq!(row["schema_version"], 10);
+            assert_eq!(row["executed_tests"], 1);
+            assert_eq!(row["result"], if fails { "fail" } else { "pass" });
+            assert_eq!(row["passed_tests"], u64::from(!fails));
+            assert_eq!(row["cell_results"]["selected_count"], 0);
+            assert_eq!(row["cell_results"]["recorded_count"], 0);
+            assert!(
+                row["cell_results"]["selected"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(std::fs::read_dir(&results).unwrap().count(), 0);
+            let typed: HistoryRow = serde_json::from_value(row.clone()).unwrap();
+            evidence.verify_record(&typed).unwrap();
+            typed
+                .raw_result_input_census_v1()
+                .unwrap()
+                .unwrap()
+                .verify_inputs(&typed, &read_scorecard_raw_inputs(&results).unwrap())
+                .unwrap();
+            let reopened: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+            assert_eq!(
+                reopened, row,
+                "the actual durable row is the writeback authority"
+            );
+            let missing = root.join("absent-parent");
+            std::fs::write(&missing, "not a directory").unwrap();
+            assert!(
+                write_ledger(
+                    &missing.join("rows.jsonl"),
+                    &ctx,
+                    &run.outcomes,
+                    &attempts,
+                    &[],
+                    &[],
+                    &tags,
+                    0.0,
+                    0,
+                    "",
+                    true,
+                    serde_json::json!({}),
+                    Some(&evidence.cells),
+                    Some(&evidence)
+                )
+                .is_none(),
+                "failed durable publication must not yield writeback authority"
+            );
+            if fails {
+                // A real failed framework case remains a canonical failure
+                // even when its raw-input proof cannot be captured. Evidence
+                // publication and execution verdict are separate outcomes.
+                ctx.raw_result_inputs = Some(ScorecardRawInputs::capture(
+                    &root.join("missing-results"),
+                    &run_id,
+                    &ctx.commit,
+                ));
+                let refused_capture = write_ledger(
+                    &root.join("proof-error-row.jsonl"),
+                    &ctx,
+                    &run.outcomes,
+                    &attempts,
+                    &[],
+                    &[],
+                    &tags,
+                    0.0,
+                    1,
+                    "",
+                    true,
+                    serde_json::json!({}),
+                    Some(&evidence.cells),
+                    Some(&evidence),
+                )
+                .unwrap();
+                assert_eq!(refused_capture["result"], "fail");
+                assert_eq!(refused_capture["raw_result"], "fail");
+                assert_eq!(refused_capture["executed_tests"], 1);
+                assert_eq!(refused_capture["passed_tests"], 0);
+                assert!(refused_capture.get("raw_result_input_census_v1").is_none());
+                assert!(
+                    !refused_capture["raw_result_input_census_error"]
+                        .as_str()
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(refused_capture["cell_results"], row["cell_results"]);
+                assert_eq!(refused_capture["test_results"], row["test_results"]);
+                // Mutation after a successful producer capture has the same
+                // explicit unavailable disposition before append, without
+                // creating a replacement proof from the already-lost inputs.
+                ctx.raw_result_inputs =
+                    Some(ScorecardRawInputs::capture(&results, &run_id, &ctx.commit));
+                std::fs::write(results.join("results.jsonl"), "truncated").unwrap();
+                let moved = write_ledger(
+                    &root.join("proof-moved-row.jsonl"),
+                    &ctx,
+                    &run.outcomes,
+                    &attempts,
+                    &[],
+                    &[],
+                    &tags,
+                    0.0,
+                    1,
+                    "",
+                    true,
+                    serde_json::json!({}),
+                    Some(&evidence.cells),
+                    Some(&evidence),
+                )
+                .unwrap();
+                assert_eq!(moved["result"], "fail");
+                assert!(moved.get("raw_result_input_census_v1").is_none());
+                assert!(
+                    moved["raw_result_input_census_error"]
+                        .as_str()
+                        .is_some_and(|error| !error.is_empty())
+                );
+                std::fs::remove_file(results.join("results.jsonl")).unwrap();
+            }
+            if let Some(destination) = std::env::var_os("HERMIT_SCORECARD_ZERO_TEST_EXPORT") {
+                let fixture = temp.keep();
+                let destination = PathBuf::from(destination);
+                std::fs::create_dir_all(&destination).unwrap();
+                std::fs::write(destination.join(format!("{profile}-{}.json", if fails {"failed"} else {"passed"})), serde_json::to_vec_pretty(&serde_json::json!({
+                    "root":fixture,"profile":profile,"row":row,"row_sha256":format!("{:x}",sha2::Sha256::digest(std::fs::read(&ledger).unwrap()))
+                })).unwrap()).unwrap();
+            }
+        }
     }
 }

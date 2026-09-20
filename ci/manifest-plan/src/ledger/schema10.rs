@@ -17,6 +17,191 @@ use crate::runner::AttemptResult;
 
 pub const VALIDATION_EVIDENCE_SCHEMA_VERSION: u32 = 10;
 
+/// Optional producer proof of the original raw input population. This is an
+/// independent versioned extension, not a reinterpretation of historical v10
+/// reduced cell artifacts. Absence never acquires authority from current files.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawResultInputCensusV1 {
+    pub schema: u32,
+    pub run_id: String,
+    pub hermit_sha: String,
+    pub files: Vec<RawResultInputFileV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawResultInputFileV1 {
+    pub path: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub rows: Vec<RawResultInputRowV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawResultInputRowV1 {
+    pub line: u64,
+    pub cell: CellIdentity,
+    pub attempt: u64,
+}
+
+impl RawResultInputCensusV1 {
+    /// Freeze exactly the bytes observed by the producer before finalization.
+    /// Comparison semantics remain the existing cell/comparison readers' job.
+    pub fn from_inputs(
+        run_id: &str,
+        hermit_sha: &str,
+        inputs: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<Self, String> {
+        if !nonblank_component(run_id) || !is_lower_hex(hermit_sha, 40) {
+            return Err("raw result census requires a run identity and full measured SHA".into());
+        }
+        let mut files = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (path, bytes) in inputs {
+            if path
+                .split('/')
+                .any(|part| part.is_empty() || matches!(part, "." | "..") || part.contains('\0'))
+                || path.rsplit('/').next() != Some("results.jsonl")
+            {
+                return Err("raw result census path is not a relative results.jsonl path".into());
+            }
+            let text = std::str::from_utf8(bytes)
+                .map_err(|error| format!("raw result census input is not UTF-8: {error}"))?;
+            let mut rows = Vec::new();
+            for (number, line) in text.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let row = read_schema10_source_result(line.as_bytes())?;
+                if row.get("schema").and_then(Value::as_u64) != Some(4)
+                    || row.get("run_id").and_then(Value::as_str) != Some(run_id)
+                    || row.get("hermit_sha").and_then(Value::as_str) != Some(hermit_sha)
+                    || row.get("source_tree_dirty").and_then(Value::as_bool) != Some(false)
+                {
+                    return Err(
+                        "raw result census input has a different run or clean source identity"
+                            .into(),
+                    );
+                }
+                let field = |name: &str| {
+                    row.get(name)
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("raw result census input omitted {name}"))
+                };
+                let cell = CellIdentity {
+                    lane: field("lane")?,
+                    category: field("category")?,
+                    test: field("test")?,
+                    mode: field("mode")?,
+                    backend: field("backend")?,
+                };
+                validate_identity(&cell)?;
+                let attempt = row
+                    .get("attempt")
+                    .and_then(Value::as_u64)
+                    .filter(|value| *value > 0)
+                    .ok_or("raw result census input omitted a positive attempt")?;
+                if !seen.insert((cell.clone(), attempt)) {
+                    return Err("raw result census repeats a cell attempt".into());
+                }
+                rows.push(RawResultInputRowV1 {
+                    line: number as u64 + 1,
+                    cell,
+                    attempt,
+                });
+            }
+            files.push(RawResultInputFileV1 {
+                path: path.clone(),
+                bytes: bytes.len() as u64,
+                sha256: hex_digest(bytes),
+                rows,
+            });
+        }
+        Ok(Self {
+            schema: 1,
+            run_id: run_id.into(),
+            hermit_sha: hermit_sha.into(),
+            files,
+        })
+    }
+
+    pub fn validate_for_row(&self, row: &HistoryRow) -> Result<(), String> {
+        if self.schema != 1
+            || !matches!(row.schema_version, Some(5..=10))
+            || !nonblank_component(&self.run_id)
+            || !is_lower_hex(&self.hermit_sha, 40)
+            || row.run_id.as_deref() != Some(&self.run_id)
+            || row.commit.as_deref() != Some(&self.hermit_sha)
+            || row.tree_dirty != Some(false)
+        {
+            return Err("raw result census has an unsupported version or row identity".into());
+        }
+        let mut previous: Option<&str> = None;
+        let mut seen = BTreeSet::new();
+        for file in &self.files {
+            if file
+                .path
+                .split('/')
+                .any(|part| part.is_empty() || matches!(part, "." | "..") || part.contains('\0'))
+                || file.path.rsplit('/').next() != Some("results.jsonl")
+                || previous.is_some_and(|path| path >= file.path.as_str())
+                || !is_lower_hex(&file.sha256, 64)
+            {
+                return Err("raw result census has an invalid or repeated file identity".into());
+            }
+            previous = Some(&file.path);
+            let mut line = 0;
+            for input in &file.rows {
+                validate_identity(&input.cell)?;
+                if input.line <= line
+                    || input.attempt == 0
+                    || !seen.insert((&input.cell, input.attempt))
+                {
+                    return Err("raw result census has an invalid or repeated row identity".into());
+                }
+                line = input.line;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn verify_inputs(
+        &self,
+        row: &HistoryRow,
+        inputs: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), String> {
+        self.validate_for_row(row)?;
+        let actual = Self::from_inputs(&self.run_id, &self.hermit_sha, inputs)?;
+        if *self != actual {
+            return Err(
+                "current result population or bytes differ from the producer-finalized raw census"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl HistoryRow {
+    /// Preserve absence and the outer extension map's historical serialization.
+    /// A present unknown/malformed version refuses, rather than becoming absent.
+    pub fn raw_result_input_census_v1(&self) -> Result<Option<RawResultInputCensusV1>, String> {
+        let Some(value) = self.extra.get("raw_result_input_census_v1") else {
+            return Ok(None);
+        };
+        if self.extra.get("raw_result_input_census_error").is_some() {
+            return Err("raw result census cannot carry both proof and publication error".into());
+        }
+        let census: RawResultInputCensusV1 = serde_json::from_value(value.clone())
+            .map_err(|error| format!("invalid raw result census: {error}"))?;
+        census.validate_for_row(self)?;
+        Ok(Some(census))
+    }
+}
+
 /// The comparison-linkage contract, separate from the outer evidence schema.
 /// Legacy rows remain authenticated observations, never inferred bindings.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2091,5 +2276,186 @@ impl CellResultsEvidenceV10 {
             return Err("schema 10 cell artifact differs from its compact ledger summary".into());
         }
         Ok(cells)
+    }
+}
+
+#[cfg(test)]
+mod raw_input_census_tests {
+    use super::*;
+
+    fn input(attempt: u64, payload: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema":4,"run_id":"partial-run","hermit_sha":"a".repeat(40),
+            "source_tree_dirty":false,"lane":"portable","category":"fixture",
+            "test":"fixture/failed","mode":"verify","backend":"ptrace",
+            "attempt":attempt,"outcome":"FAIL","payload":payload,
+        }))
+        .unwrap()
+    }
+
+    fn history(schema: u32) -> HistoryRow {
+        serde_json::from_value(serde_json::json!({
+            "schema_version":schema,"run_id":"partial-run","commit":"a".repeat(40),
+            "tree_dirty":false,"result":"fail","executed_tests":null,
+            "gates_expected":3,"gates_run":1,"unaccounted_nodes":["test.not-run"],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn producer_census_retains_partial_failure_and_refuses_missing_attempts_or_changed_bytes() {
+        let mut attempts = input(1, "first failure");
+        attempts.push(b'\n');
+        attempts.extend(input(2, "second failure"));
+        attempts.push(b'\n');
+        let inputs = BTreeMap::from([
+            ("one/results.jsonl".into(), attempts),
+            ("empty/results.jsonl".into(), Vec::new()),
+        ]);
+        let row = history(5);
+        let census =
+            RawResultInputCensusV1::from_inputs("partial-run", &"a".repeat(40), &inputs).unwrap();
+        census.verify_inputs(&row, &inputs).unwrap();
+        assert_eq!(row.result.as_deref(), Some("fail"));
+        assert_eq!(row.executed_tests, None);
+        assert_eq!(row.gates_expected, Some(3));
+        assert_eq!(row.gates_run, Some(1));
+        assert_eq!(
+            census.files[1]
+                .rows
+                .iter()
+                .map(|row| row.attempt)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        for change in [
+            "missing-file",
+            "missing-empty-file",
+            "superseded-attempt",
+            "truncated",
+            "changed-payload",
+            "extra-file",
+            "renamed-file",
+        ] {
+            let mut changed = inputs.clone();
+            match change {
+                "missing-file" => {
+                    changed.remove("one/results.jsonl");
+                }
+                "missing-empty-file" => {
+                    changed.remove("empty/results.jsonl");
+                }
+                "superseded-attempt" => {
+                    changed.insert("one/results.jsonl".into(), input(2, "second failure"));
+                }
+                "truncated" => {
+                    changed.get_mut("one/results.jsonl").unwrap().pop();
+                }
+                "changed-payload" => {
+                    let bytes = changed.get_mut("one/results.jsonl").unwrap();
+                    *bytes = String::from_utf8(bytes.clone())
+                        .unwrap()
+                        .replace("first failure", "FIRST FAILURE")
+                        .into_bytes();
+                }
+                "extra-file" => {
+                    changed.insert("extra/results.jsonl".into(), Vec::new());
+                }
+                "renamed-file" => {
+                    let bytes = changed.remove("one/results.jsonl").unwrap();
+                    changed.insert("other/results.jsonl".into(), bytes);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                census.verify_inputs(&row, &changed).is_err(),
+                "admitted {change}"
+            );
+        }
+        let mut repeated = inputs.clone();
+        repeated.insert("duplicate/results.jsonl".into(), input(1, "first failure"));
+        assert!(
+            RawResultInputCensusV1::from_inputs("partial-run", &"a".repeat(40), &repeated).is_err()
+        );
+        let mut duplicate_field = input(1, "first failure");
+        duplicate_field.pop();
+        duplicate_field.extend(b",\"attempt\":2}");
+        assert!(
+            RawResultInputCensusV1::from_inputs(
+                "partial-run",
+                &"a".repeat(40),
+                &BTreeMap::from([("results.jsonl".into(), duplicate_field)])
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn census_extension_preserves_historical_absence_and_refuses_unknown_present_shapes() {
+        for schema in [5, 10] {
+            let row = history(schema);
+            let encoded = serde_json::to_vec(&row).unwrap();
+            assert!(row.raw_result_input_census_v1().unwrap().is_none());
+            assert_eq!(serde_json::to_vec(&row).unwrap(), encoded);
+            let inputs = BTreeMap::from([("results.jsonl".into(), input(1, "failure"))]);
+            let census =
+                RawResultInputCensusV1::from_inputs("partial-run", &"a".repeat(40), &inputs)
+                    .unwrap();
+            let mut value = serde_json::to_value(&row).unwrap();
+            value["raw_result_input_census_v1"] = serde_json::to_value(&census).unwrap();
+            let current: HistoryRow = serde_json::from_value(value.clone()).unwrap();
+            current
+                .raw_result_input_census_v1()
+                .unwrap()
+                .unwrap()
+                .verify_inputs(&current, &inputs)
+                .unwrap();
+            for mutation in [
+                "null",
+                "version",
+                "unknown-field",
+                "wrong-run",
+                "wrong-source",
+                "unsafe-path",
+                "repeated-file",
+                "zero-attempt",
+                "error-and-proof",
+            ] {
+                let mut changed = value.clone();
+                let proof = &mut changed["raw_result_input_census_v1"];
+                match mutation {
+                    "null" => *proof = Value::Null,
+                    "version" => proof["schema"] = Value::from(2),
+                    "unknown-field" => proof["accept_partial"] = Value::Bool(true),
+                    "wrong-run" => proof["run_id"] = Value::String("another-run".into()),
+                    "wrong-source" => proof["hermit_sha"] = Value::String("b".repeat(40)),
+                    "unsafe-path" => {
+                        proof["files"][0]["path"] = Value::String("../results.jsonl".into())
+                    }
+                    "repeated-file" => {
+                        let file = proof["files"][0].clone();
+                        proof["files"].as_array_mut().unwrap().push(file);
+                    }
+                    "zero-attempt" => proof["files"][0]["rows"][0]["attempt"] = Value::from(0),
+                    "error-and-proof" => {
+                        changed["raw_result_input_census_error"] =
+                            Value::String("unreadable".into())
+                    }
+                    _ => unreachable!(),
+                }
+                let changed: HistoryRow = serde_json::from_value(changed).unwrap();
+                assert!(
+                    changed.raw_result_input_census_v1().is_err(),
+                    "admitted {schema}/{mutation}"
+                );
+            }
+        }
+        let empty =
+            RawResultInputCensusV1::from_inputs("partial-run", &"a".repeat(40), &BTreeMap::new())
+                .unwrap();
+        empty.verify_inputs(&history(5), &BTreeMap::new()).unwrap();
+        // This authenticates an empty raw census only. Schema 5 supplies no
+        // selected-zero evidence and cannot authorize zero-current completion.
+        assert!(history(5).constructed_plan_artifact().unwrap().is_none());
     }
 }

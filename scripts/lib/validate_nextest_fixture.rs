@@ -174,6 +174,7 @@ fn context(source: &Path, outcomes: &[StepOutcome], run_id: &str) -> LedgerCtx {
         .is_empty()
     );
     LedgerCtx {
+        raw_result_inputs: None,
         run_id: Some(run_id.to_string()),
         admission_floor_evidence: None,
         admission_provenance_error: None,
