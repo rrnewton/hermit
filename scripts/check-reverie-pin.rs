@@ -167,8 +167,10 @@ fn usage() -> &'static str {
        --staged-pin-advisory               Pre-commit advisory on a STAGED pin edit\n\
        -h, --help                          Show this help\n\
      \n\
-     Scope: every tracked Cargo.toml and Cargo.lock from git ls-files.\n\
-     Excludes non-Cargo files, untracked/generated files, and nested submodule contents."
+     Canonical-pin scope: every tracked Cargo.toml and Cargo.lock from git ls-files.\n\
+     Derived local bindings checked separately: LiteInst cache keys, DBT budget sites,\n\
+     and hermit-cli/BUCK. Excludes other non-Cargo files, untracked/generated files,\n\
+     and nested submodule contents."
 }
 
 fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
@@ -2190,6 +2192,158 @@ fn check_dbt_budget_bindings(root: &Path, pin: &str) -> Result<i32, String> {
     Ok(0)
 }
 
+/// The Buck build bypasses `hermit-cli/build.rs`, so it must restate the
+/// canonical Reverie pin in its explicit compile-time environment.
+const BUCK_BUILD_PIN_SITE: &str = "hermit-cli/BUCK";
+
+/// Bind Buck-built Hermit's reported Reverie provenance to the canonical pin.
+///
+/// Cargo builds obtain `HERMIT_REVERIE_PIN` from `hermit-cli/build.rs`, which
+/// reads Cargo metadata. Buck does not run that build script: both its library
+/// and binary targets consume `hermit_build_env` from [`BUCK_BUILD_PIN_SITE`].
+/// A stale value therefore produces a working binary that reports the wrong
+/// backend revision, even while every Cargo entry and the submodule gitlink are
+/// uniform. The ordinary pin gate must cover that active non-Cargo binding.
+fn parse_buck_build_pin_binding(line: &str) -> Result<Option<String>, String> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return Ok(None);
+    }
+
+    const KEY: &str = "\"HERMIT_REVERIE_PIN\"";
+    let Some(after_key) = trimmed.strip_prefix(KEY) else {
+        return Ok(None);
+    };
+    let after_colon = after_key
+        .trim_start()
+        .strip_prefix(':')
+        .ok_or_else(|| "key is not followed by ':'".to_string())?
+        .trim_start();
+    let quoted = after_colon
+        .strip_prefix('"')
+        .ok_or_else(|| "value is not double-quoted".to_string())?;
+    let closing_quote = quoted
+        .find('"')
+        .ok_or_else(|| "value has no closing double quote".to_string())?;
+    let value = &quoted[..closing_quote];
+    if !is_full_sha(value) {
+        return Err(format!(
+            "quoted value is not an exact 40-hex revision: {value:?}"
+        ));
+    }
+
+    let mut tail = quoted[closing_quote + 1..].trim_start();
+    if let Some(after_comma) = tail.strip_prefix(',') {
+        tail = after_comma.trim_start();
+    }
+    if !tail.is_empty() && !tail.starts_with('#') {
+        return Err(format!("unexpected text after quoted revision: {tail:?}"));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
+    let path = root.join(BUCK_BUILD_PIN_SITE);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("Buck build pin binding: NOT PRESENT in this tree: {BUCK_BUILD_PIN_SITE}.");
+            return Ok(0);
+        }
+        Err(error) => {
+            return Err(format!("could not read {}: {error}", path.display()));
+        }
+    };
+
+    let lines: Vec<&str> = contents.lines().collect();
+    let mut build_env_starts = Vec::new();
+    let mut build_env_consumers = 0usize;
+    let mut invalid_mentions = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let code = line.split('#').next().unwrap_or("").trim();
+        if !code.contains("hermit_build_env") {
+            continue;
+        }
+        match code {
+            "hermit_build_env = {" => build_env_starts.push(index),
+            "env = hermit_build_env," => build_env_consumers += 1,
+            _ => invalid_mentions.push((index + 1, code)),
+        }
+    }
+    if build_env_starts.len() != 1 || build_env_consumers != 2 || !invalid_mentions.is_empty() {
+        loud_header("BUCK BUILD ENV MISSING OR AMBIGUOUS - BLOCKED");
+        eprintln!("Canonical Reverie pin: {pin}");
+        eprintln!(
+            "Expected exactly one canonical `hermit_build_env = {{` block, two `env = hermit_build_env,` consumers, and no reassignment or mutation in {BUCK_BUILD_PIN_SITE}; found {} block opener(s), {} consumer(s), and {} unsupported active mention(s).",
+            build_env_starts.len(),
+            build_env_consumers,
+            invalid_mentions.len()
+        );
+        for (line, code) in &invalid_mentions {
+            eprintln!("  {BUCK_BUILD_PIN_SITE}:{line}: {code}");
+        }
+        return Ok(1);
+    }
+    let build_env_start = build_env_starts[0];
+    let Some(build_env_end) = lines[build_env_start + 1..]
+        .iter()
+        .position(|line| line.trim() == "}")
+        .map(|offset| build_env_start + 1 + offset)
+    else {
+        loud_header("BUCK BUILD ENV UNTERMINATED - BLOCKED");
+        eprintln!("Canonical Reverie pin: {pin}");
+        eprintln!(
+            "The `hermit_build_env = {{` block in {BUCK_BUILD_PIN_SITE} has no closing `}}` line."
+        );
+        return Ok(1);
+    };
+
+    let mut bindings = Vec::new();
+    let mut malformed = Vec::new();
+    for (index, line) in lines[build_env_start + 1..build_env_end].iter().enumerate() {
+        let source_line = build_env_start + index + 2;
+        match parse_buck_build_pin_binding(line) {
+            Ok(None) => {}
+            Ok(Some(value)) => bindings.push((source_line, value)),
+            Err(reason) => malformed.push((source_line, reason)),
+        }
+    }
+
+    if bindings.len() != 1 || !malformed.is_empty() {
+        loud_header("BUCK BUILD REVERIE PIN MISSING OR AMBIGUOUS - BLOCKED");
+        eprintln!("Canonical Reverie pin: {pin}");
+        eprintln!(
+            "Expected exactly one active \"HERMIT_REVERIE_PIN\": \"<40-hex>\" dictionary entry in {BUCK_BUILD_PIN_SITE}; found {} valid binding(s) and {} malformed candidate(s).",
+            bindings.len(),
+            malformed.len()
+        );
+        for (line, value) in &bindings {
+            eprintln!("  {BUCK_BUILD_PIN_SITE}:{line}: duplicate binding {value}");
+        }
+        for (line, reason) in &malformed {
+            eprintln!("  {BUCK_BUILD_PIN_SITE}:{line}: {reason}");
+        }
+        return Ok(1);
+    }
+
+    let (line, bound) = &bindings[0];
+    if bound != pin {
+        loud_header("BUCK BUILD REVERIE PIN DRIFT - BLOCKED");
+        eprintln!("Canonical Reverie pin: {pin}");
+        eprintln!("  {BUCK_BUILD_PIN_SITE}:{line}: {bound}");
+        eprintln!(
+            "Buck bypasses hermit-cli/build.rs, so this stale compile-time value makes Buck-built Hermit report the wrong Reverie revision."
+        );
+        return Ok(1);
+    }
+
+    eprintln!(
+        "Buck build pin binding: 1 binding equals the pin ({}).",
+        &pin[..7.min(pin.len())]
+    );
+    Ok(0)
+}
+
 fn run_with_config(config: Config) -> Result<i32, String> {
     let root = config.repo.clone().map_or_else(git_root, Ok)?;
     let scan = read_pins(&root)?;
@@ -2223,7 +2377,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         pins.len()
     );
     eprintln!(
-        "Scope exclusions: non-Cargo tracked files, untracked/generated files, and nested submodule contents; tracked vendored Cargo metadata is included."
+        "Canonical-pin scan exclusions: non-Cargo tracked files, untracked/generated files, and nested submodule contents; tracked vendored Cargo metadata is included. Derived non-Cargo bindings are checked separately below."
     );
     report_provenance(provenance.as_ref());
 
@@ -2281,6 +2435,10 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         if budget_code != 0 {
             return Ok(budget_code);
         }
+        let buck_code = check_buck_build_pin_binding(&root, updated_pin)?;
+        if buck_code != 0 {
+            return Ok(buck_code);
+        }
         return Ok(0);
     }
 
@@ -2293,17 +2451,21 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     if budget_code != 0 {
         return Ok(budget_code);
     }
+    let buck_code = check_buck_build_pin_binding(&root, pin)?;
+    if buck_code != 0 {
+        return Ok(buck_code);
+    }
 
     let entries = pins.len();
     let pin_files = pinned_file_count.len();
 
     // OFFLINE STOPS HERE, having decided everything that does not need the
-    // network: the manifests agree with each other (checked above via
-    // unique_pin) and the LiteInst cache keys track the pin. Those are real,
-    // offline-decidable defects that no amount of waiting fixes, so they stay
-    // BLOCKING for every caller. What offline deliberately does NOT judge is
-    // remote-policy compliance -- see the pre-commit hook for why that must not
-    // block.
+    // network: manifests agree with each other, LiteInst cache keys track the
+    // pin, DBT budget bindings equal it, and Buck-built Hermit's compile-time
+    // provenance does too. Those are real, offline-decidable defects that no
+    // amount of waiting fixes, so they stay BLOCKING for every caller. What
+    // offline deliberately does NOT judge is remote-policy compliance -- see
+    // the pre-commit hook for why that must not block.
     if config.offline {
         println!(
             "Reverie pin is locally consistent: {pin} ({entries} revision entries across \
@@ -2708,7 +2870,8 @@ mod tests {
     fn help_states_the_checker_scope() {
         let help = usage();
         assert!(help.contains("every tracked Cargo.toml and Cargo.lock"));
-        assert!(help.contains("Excludes non-Cargo files"));
+        assert!(help.contains("Excludes other non-Cargo files"));
+        assert!(help.contains("hermit-cli/BUCK"));
         assert!(help.contains("--no-verify-build"));
         assert!(help.contains("UNSAFE"));
     }
@@ -3951,6 +4114,156 @@ mod tests {
     #[test]
     fn exact_40_hex_ignores_short_tokens() {
         assert!(exact_40_hex_tokens("liteinst-runtime-build-7951770 abc123").is_empty());
+    }
+
+    #[test]
+    fn buck_build_pin_binding_accepts_exact_pin_and_refuses_drift_or_erasure() {
+        let root = temp_path("buck-build-pin");
+        let buck_dir = root.join("hermit-cli");
+        fs::create_dir_all(&buck_dir).expect("create Buck fixture directory");
+        let pin = "0123456789abcdef0123456789abcdef01234567";
+        let stale = "89abcdef0123456789abcdef0123456789abcdef";
+        let buck = buck_dir.join("BUCK");
+        let consumed = |body: String| {
+            format!(
+                "{body}rust_library(\n    env = hermit_build_env,\n)\nrust_binary(\n    env = hermit_build_env,\n)\n"
+            )
+        };
+
+        fs::write(
+            &buck,
+            consumed(format!(
+                "# HERMIT_REVERIE_PIN = {stale}\nhermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\", # previously {stale}\n}}\nnote = \"HERMIT_REVERIE_PIN {stale}\"\n"
+            )),
+        )
+        .expect("write matching Buck binding");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check matching Buck binding"),
+            0
+        );
+
+        fs::write(
+            &buck,
+            consumed(format!(
+                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{stale}\",\n}}\n"
+            )),
+        )
+        .expect("write stale Buck binding");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check stale Buck binding"),
+            1,
+            "a stale Buck compile-time provenance value must fail closed"
+        );
+
+        fs::write(
+            &buck,
+            consumed(format!("note = \"HERMIT_REVERIE_PIN {pin}\"\n")),
+        )
+        .expect("write non-binding spoof");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check non-binding spoof"),
+            1,
+            "a note containing the key and pin must not impersonate the dictionary binding"
+        );
+
+        fs::write(
+            &buck,
+            consumed(format!(
+                "hermit_build_env = {{\n}}\nunused_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n"
+            )),
+        )
+        .expect("write binding in an unused dictionary");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check unused dictionary spoof"),
+            1,
+            "a binding outside hermit_build_env must not satisfy the build provenance gate"
+        );
+
+        fs::write(
+            &buck,
+            consumed(format!(
+                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nhermit_build_env = {{ # later shadow\n    \"HERMIT_REVERIE_PIN\": \"{stale}\",\n}}\n"
+            )),
+        )
+        .expect("write shadowing build environment");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check shadowing assignment"),
+            1,
+            "a later assignment must not shadow the checked build environment"
+        );
+
+        fs::write(
+            &buck,
+            consumed(format!(
+                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nhermit_build_env.update({{\"OTHER\": \"value\"}})\n"
+            )),
+        )
+        .expect("write build environment mutation");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check build environment mutation"),
+            1,
+            "post-definition mutation of hermit_build_env must fail closed"
+        );
+
+        fs::write(
+            &buck,
+            consumed(format!(
+                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"unknown\", # expected {pin}\n}}\n"
+            )),
+        )
+        .expect("write malformed binding with a pin in its comment");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check malformed binding"),
+            1,
+            "a pin in a trailing comment must not rescue a malformed active value"
+        );
+
+        fs::write(
+            &buck,
+            consumed(format!(
+                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n"
+            )),
+        )
+        .expect("write duplicate bindings");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check duplicate bindings"),
+            1,
+            "duplicate active bindings are ambiguous and must fail closed"
+        );
+
+        fs::write(&buck, consumed("hermit_build_env = {}\n".to_string()))
+            .expect("erase Buck binding");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check erased Buck binding"),
+            1,
+            "a present Buck file whose pin binding disappeared must fail closed"
+        );
+
+        fs::write(
+            &buck,
+            format!("hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n"),
+        )
+        .expect("write build environment with zero consumers");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check zero consumers"),
+            1,
+            "an unconsumed build environment must not satisfy the provenance gate"
+        );
+
+        fs::write(
+            &buck,
+            format!(
+                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nrust_library(\n    env = hermit_build_env,\n)\n"
+            ),
+        )
+        .expect("write build environment with one consumer");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check one consumer"),
+            1,
+            "both current Buck targets must consume the checked build environment"
+        );
+
+        fs::remove_dir_all(root).expect("remove Buck fixture");
     }
 
     #[test]

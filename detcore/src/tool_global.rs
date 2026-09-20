@@ -933,6 +933,19 @@ impl GlobalTool for GlobalState {
             .expect("GlobalState owns the failure sender until publication");
     }
 
+    async fn on_backend_child_wait_event(
+        &self,
+        event: reverie::BackendChildWaitEvent,
+    ) -> Result<(), reverie::Error> {
+        // KVM polls this future through its first suspension before exposing
+        // waitability. The helper's first poll performs the complete
+        // generation-bound publication under the scheduler mutex, then
+        // self-wakes and returns Pending; its second poll consumes the typed
+        // result and releases the stage-2 control barrier.
+        crate::scheduler::signal_control::ChildExitPublicationFuture::new(self.sched.clone(), event)
+            .await
+    }
+
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
         type R = GlobalResponse;
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME

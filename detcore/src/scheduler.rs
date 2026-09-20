@@ -14,7 +14,7 @@ mod parked_tests;
 pub(crate) mod real_timer;
 mod replayer;
 pub mod runqueue;
-mod signal_control;
+pub(crate) mod signal_control;
 pub mod timed_waiters;
 
 use std::collections::BTreeMap;
@@ -4199,8 +4199,19 @@ impl Scheduler {
             // that pidfd would make the application observe both CLD_EXITED and
             // SI_TKILL for one child, so only the scheduler wait readiness is
             // synthesized on that path.
-            ResourceID::Exit { group, process, .. } => {
-                if *group
+            ResourceID::Exit { group, process, mm } => {
+                let reserve_mode = match self.reserve_exit_boundary(dettid, *process, *mm, *group) {
+                    Ok(mode) => mode,
+                    Err(failure) => {
+                        self.fail_parked(dettid, failure);
+                        // fail_parked linearizes terminal failure and closes
+                        // the tentative selection. Do not undo it a second
+                        // time through skip_turn_blocked.
+                        return Err(SkipTurn);
+                    }
+                };
+                if reserve_mode == signal_control::ExitReserveMode::Uncontrolled
+                    && *group
                     && let Some(parent) = self.thread_tree.parent_process(process)
                     && self.should_synthesize_child_exit_signal(parent)
                 {
