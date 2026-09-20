@@ -384,7 +384,14 @@ fi
 # f676d5d8dcfb266e92e2e656661ff5e08f73f787. Preserve CMAKE/CMAKE_GENERATOR,
 # the 16-job clamp, and the 1050 effective-job-second threshold. This is
 # source-identity carry, not new calibration or runtime qualification.
-expected_pin=cf1e993517c94d05200ec2d4bd840a42fd2bd62c
+# CARRY TO 123df7c4c0169006fbfe1f11a1553fe333eac937 (2026-09-20): relative to
+# cf1e993517c94d05200ec2d4bd840a42fd2bd62c, build.rs remains blob
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 and the DynamoRIO vendor tree
+# remains 117d54d744df23921c531d0fe08537249f5a510a. PR607 changes only
+# reverie-kvm address-publication paths. Preserve CMAKE/CMAKE_GENERATOR, the
+# 16-job clamp, and the 1050 effective-job-second threshold. This is
+# source-identity carry, not new calibration or runtime qualification.
+expected_pin=123df7c4c0169006fbfe1f11a1553fe333eac937
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
