@@ -7,15 +7,23 @@
  */
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t sigchld_count;
+
+enum sigkill_spelling {
+  USE_KILL,
+  USE_TKILL,
+  USE_TGKILL,
+};
 
 struct blocked_child {
   pid_t pid;
@@ -99,7 +107,77 @@ static void require_empty_nonblocking_waits(pid_t child) {
     exit(2);
 }
 
-int main(void) {
+static void *send_self_sigkill(void *opaque) {
+  enum sigkill_spelling spelling = *(const enum sigkill_spelling *)opaque;
+  pid_t pid = getpid();
+  pid_t tid = (pid_t)syscall(SYS_gettid);
+  long result;
+
+  switch (spelling) {
+  case USE_KILL:
+    result = kill(pid, SIGKILL);
+    break;
+  case USE_TKILL:
+    result = syscall(SYS_tkill, tid, SIGKILL);
+    break;
+  case USE_TGKILL:
+    result = syscall(SYS_tgkill, pid, tid, SIGKILL);
+    break;
+  default:
+    _exit(121);
+  }
+
+  /* A successful SIGKILL never returns. Preserve errno if a backend does. */
+  _exit(result == -1 ? 80 + (errno & 31) : 79);
+}
+
+static int run_self_sigkill_case(const char *name,
+                                 enum sigkill_spelling spelling) {
+  pid_t child = fork();
+  if (child == -1) {
+    printf("%s: fork-failed errno=%d\n", name, errno);
+    return 1;
+  }
+  if (child == 0) {
+    pthread_t worker;
+    int error = pthread_create(&worker, NULL, send_self_sigkill, &spelling);
+    if (error != 0)
+      _exit(120);
+    error = pthread_join(worker, NULL);
+    _exit(error == 0 ? 122 : 123);
+  }
+
+  int status;
+  while (waitpid(child, &status, 0) == -1) {
+    if (errno != EINTR) {
+      printf("%s: waitpid-failed errno=%d\n", name, errno);
+      return 1;
+    }
+  }
+  if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGKILL) {
+    printf("%s: wrong-status raw=%d\n", name, status);
+    return 1;
+  }
+  printf("%s: signalled sig=%d core=%d\n", name, WTERMSIG(status),
+         WCOREDUMP(status) != 0);
+  return 0;
+}
+
+static int run_self_sigkill_mode(void) {
+  int failures = 0;
+  failures += run_self_sigkill_case("thread-kill", USE_KILL);
+  failures += run_self_sigkill_case("thread-tkill", USE_TKILL);
+  failures += run_self_sigkill_case("thread-tgkill", USE_TGKILL);
+  printf("failures=%d\n", failures);
+  return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "self-sigkill") == 0)
+    return run_self_sigkill_mode();
+  if (argc != 1)
+    return 64;
+
   install_sigchld(on_sigchld);
 
   struct blocked_child wait4_child = spawn_blocked_child(7);
