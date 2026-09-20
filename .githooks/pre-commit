@@ -16,8 +16,9 @@
 # readable instead of decaying into a reflex flag. Do not widen it.
 #
 # What DOES still block here is offline-decidable local incoherence: manifests
-# disagreeing with each other, and LiteInst cache keys not tracking the pin.
-# Those are never fixed by waiting and never involve the network.
+# disagreeing, LiteInst cache keys drifting, DBT budget bindings mismatching,
+# or Buck-built Hermit's compile-time provenance naming another pin. Those are
+# never fixed by waiting and never involve the network.
 
 set -u
 root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 1
