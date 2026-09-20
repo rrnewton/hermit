@@ -12,11 +12,15 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 
 use reverie::CallbackSignalSite;
+use reverie::ChildExitCompletion;
+use reverie::ChildExitPublicationResult;
+use reverie::ExitStatus;
 use reverie::ParkedObservationLease;
 use reverie::PreparedSignalToken;
 use reverie::ProcessSignalPublicationResult;
 use reverie::SignalDeliveryPermit;
 use reverie::SignalEvent;
+use reverie::SignalProcessId;
 use reverie::SignalTarget;
 use serde::Deserialize;
 use serde::Serialize;
@@ -244,10 +248,95 @@ pub(super) struct ParkedRequests {
     pub failure: Option<ProtocolFailure>,
     pub control: Option<reverie::BackendSignalControl>,
     pub permits: BTreeMap<DetTid, SignalDeliveryPermit>,
+    pub exit_fences: BTreeMap<DetTid, ExitBoundaryFence>,
+    pub child_exit_reservations: BTreeMap<ProcessGeneration, ChildExitReservation>,
+    pub completed_child_exits: BTreeMap<ProcessGeneration, CompletedChildExit>,
+    pub terminal_processes: BTreeMap<ProcessGeneration, TerminalProcess>,
     pub completed: BTreeMap<DetTid, reverie::SignalBoundaryReceipt>,
     pub running: Option<DetTid>,
     pub failures: Vec<reverie::SignalProcessId>,
     pub failure_wakes: Vec<futures::channel::oneshot::Sender<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ExitBoundaryFence {
+    pub permit: SignalDeliveryPermit,
+    pub process: DetPid,
+    pub mm: MmId,
+    pub group: bool,
+}
+
+/// Exact backend process lifetime used as a deterministic map key.
+///
+/// `SignalProcessId` deliberately does not promise ordering.  The scheduler
+/// needs ordered iteration for diagnostics and duplicate handling, so retain
+/// the same identity in an orderable representation rather than keying on the
+/// reusable numeric pid alone.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) struct ProcessGeneration {
+    pub pid: DetPid,
+    pub generation: u64,
+}
+
+impl ProcessGeneration {
+    pub(super) fn from_backend(process: SignalProcessId) -> Self {
+        Self {
+            pid: DetPid::from_raw(process.tgid.as_raw()),
+            generation: process.generation,
+        }
+    }
+}
+
+/// Scheduler classification at the final logical process transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FinalProcessClass {
+    Root,
+    DirectParentTerminal { parent: SignalProcessId },
+    LiveParent { parent: SignalProcessId },
+}
+
+/// Exact terminal process record retained after timer/task retirement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct TerminalProcess {
+    pub process: SignalProcessId,
+    pub class: FinalProcessClass,
+    pub status: ExitStatus,
+}
+
+/// State of the distinct stage-2 child-publication transaction.
+///
+/// The exit-boundary permit above is stage 1.  This state survives its
+/// consumption and keeps the daemon fenced until the exact-generation child
+/// status has either committed (with a typed receipt), failed after commit
+/// (with that same receipt and errno), or been rejected before mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ChildExitReservationPhase {
+    AwaitingTerminalStatus,
+    AwaitingPublication {
+        status: ExitStatus,
+    },
+    Published {
+        completion: ChildExitCompletion,
+        result: ChildExitPublicationResult,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ChildExitReservation {
+    pub child: SignalProcessId,
+    pub parent: SignalProcessId,
+    pub phase: ChildExitReservationPhase,
+}
+
+/// Terminal stage-2 outcome for one exact child generation.
+///
+/// Retaining rejected errors as well as committed receipts makes every exact
+/// duplicate terminal: it can be acknowledged without publishing again, and a
+/// failed-after-commit operation can never be forwarded twice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CompletedChildExit {
+    pub completion: ChildExitCompletion,
+    pub result: ChildExitPublicationResult,
 }
 
 /// Preserve the owner of an operation before a recipient has been selected.
@@ -505,11 +594,18 @@ impl Scheduler {
         self.parked.wake.clone()
     }
 
+    pub(super) fn wake_control_waiter(&mut self) {
+        self.parked.wake.try_put(());
+    }
+
     pub(super) fn control_barrier(&self) -> bool {
-        self.parked
-            .requests
-            .values()
-            .any(|r| matches!(r.phase, ContinuationPhase::AwaitingResumeRegistration(_)))
+        !self.parked.exit_fences.is_empty()
+            || !self.parked.child_exit_reservations.is_empty()
+            || self
+                .parked
+                .requests
+                .values()
+                .any(|r| matches!(r.phase, ContinuationPhase::AwaitingResumeRegistration(_)))
     }
 
     /// Both timed pop sites dispatch before any host-capable signal operation.

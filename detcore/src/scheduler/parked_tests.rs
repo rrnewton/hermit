@@ -5,10 +5,21 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::task::Context;
+use std::task::Poll;
 
+use reverie::BackendChildWaitEvent;
+use reverie::BackendChildWaitState;
 use reverie::BackendSignalControl;
+use reverie::ChildExitCompletion;
+use reverie::ChildExitPublication;
+use reverie::ChildExitPublicationEffect;
+use reverie::ChildExitPublicationResult;
+use reverie::ExitStatus;
 use reverie::ProcessSignalControl;
 use reverie::ProcessSignalPublication;
 use reverie::ProcessSignalPublicationResult;
@@ -24,12 +35,19 @@ use super::*;
 
 #[derive(Default)]
 struct Backend {
+    child_effect: Mutex<Option<ChildExitPublicationEffect>>,
+    child_failures: Mutex<Vec<ChildExitPublication>>,
+    child_publication_probe: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    child_publications: Mutex<Vec<ChildExitCompletion>>,
+    fail_child_publication: std::sync::atomic::AtomicBool,
     fail_publication: std::sync::atomic::AtomicBool,
     fail_recipients: Mutex<Option<SignalProcessId>>,
     fail_reservation: std::sync::atomic::AtomicBool,
+    failure_processes: Mutex<Vec<SignalProcessId>>,
     failure_probe: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     recipients: Mutex<Vec<SignalRecipient>>,
     publications: Mutex<Vec<(SignalProcessId, reverie::SignalEvent)>>,
+    reject_child_publication: std::sync::atomic::AtomicBool,
     permits: Mutex<Vec<SignalDeliveryPermit>>,
 }
 impl std::fmt::Debug for Backend {
@@ -62,6 +80,55 @@ impl ProcessSignalControl for Backend {
             ProcessSignalPublicationResult::Committed(receipt)
         }
     }
+    fn publish_child_exit(&self, completion: ChildExitCompletion) -> ChildExitPublicationResult {
+        if let Some(probe) = self.child_publication_probe.lock().unwrap().as_ref() {
+            probe();
+        }
+        self.child_publications.lock().unwrap().push(completion);
+        if self
+            .reject_child_publication
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return ChildExitPublicationResult::RejectedBeforeCommit(reverie::Errno::EBADF);
+        }
+        let receipt = ChildExitPublication {
+            completion,
+            pending_generation: 11,
+            effect: self
+                .child_effect
+                .lock()
+                .unwrap()
+                .unwrap_or(ChildExitPublicationEffect::Queued),
+        };
+        if self
+            .fail_child_publication
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            ChildExitPublicationResult::FailedAfterCommit {
+                receipt,
+                errno: reverie::Errno::EBADF,
+            }
+        } else {
+            ChildExitPublicationResult::Committed(receipt)
+        }
+    }
+    fn signal_recipients(
+        &self,
+        process: SignalProcessId,
+        _: i32,
+    ) -> Result<Vec<SignalRecipient>, reverie::Errno> {
+        if *self.fail_recipients.lock().unwrap() == Some(process) {
+            return Err(reverie::Errno::EBADF);
+        }
+        Ok(self
+            .recipients
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.task.process == process)
+            .copied()
+            .collect())
+    }
     fn alarm_recipients(
         &self,
         process: SignalProcessId,
@@ -92,7 +159,18 @@ impl ProcessSignalControl for Backend {
         self.permits.lock().unwrap().retain(|p| *p != permit);
         Ok(())
     }
-    fn finish_publication_failure(&self, _: SignalProcessId) -> Result<(), reverie::Errno> {
+    fn finish_publication_failure(&self, process: SignalProcessId) -> Result<(), reverie::Errno> {
+        self.failure_processes.lock().unwrap().push(process);
+        if let Some(probe) = self.failure_probe.lock().unwrap().as_ref() {
+            probe();
+        }
+        Ok(())
+    }
+    fn finish_child_exit_publication_failure(
+        &self,
+        receipt: ChildExitPublication,
+    ) -> Result<(), reverie::Errno> {
+        self.child_failures.lock().unwrap().push(receipt);
         if let Some(probe) = self.failure_probe.lock().unwrap().as_ref() {
             probe();
         }
@@ -161,6 +239,68 @@ fn add_with_mm(
             boundary_nonce: 1,
         },
     )
+}
+
+fn add_process_child(
+    s: &mut Scheduler,
+    parent: i32,
+    child: i32,
+) -> (DetTid, MmId, reverie::CallbackSignalSite) {
+    let parent = DetTid::from_raw(parent);
+    let child = DetTid::from_raw(child);
+    let mm = MmId::initial(child);
+    s.thread_tree.add_child(parent, child, true);
+    s.priorities.insert(child, DEFAULT_PRIORITY);
+    s.next_turns.insert(
+        child,
+        ThreadNextTurn {
+            dettid: child,
+            child_tid_addr: 0,
+            req: Ivar::new(),
+            resp: Ivar::new(),
+            protocol: Default::default(),
+        },
+    );
+    let identity = task(child.as_raw(), child.as_raw());
+    s.real_timers.bind(child, child, mm, identity).unwrap();
+    (
+        child,
+        mm,
+        reverie::CallbackSignalSite {
+            process: identity.process,
+            tid: identity.tid,
+            task_generation: identity.task_generation,
+            callback_nonce: 1,
+            boundary_nonce: 1,
+        },
+    )
+}
+
+fn child_exit_event(
+    parent: SignalProcessId,
+    child: SignalProcessId,
+    status: ExitStatus,
+    waitable: bool,
+) -> BackendChildWaitEvent {
+    BackendChildWaitEvent {
+        parent,
+        child,
+        state: BackendChildWaitState::Exited {
+            status,
+            waitable,
+            uid: 1000,
+            user_ticks: 13,
+            system_ticks: 17,
+        },
+    }
+}
+
+fn poll_child_exit(
+    future: &mut Pin<Box<super::signal_control::ChildExitPublicationFuture>>,
+) -> Poll<Result<(), reverie::Error>> {
+    let waker = futures::task::noop_waker();
+    let mut context = Context::from_waker(&waker);
+    Future::poll(future.as_mut(), &mut context)
 }
 fn sleep(
     s: &mut Scheduler,
@@ -765,6 +905,771 @@ fn terminal_boundary_retires_exact_scope_before_pending_rpc_and_preserves_duplic
         assert!(s.run_queue.tentative_pop_in_progress());
         s.run_queue.undo_tentative_pop();
     }
+}
+
+#[test]
+fn committed_exit_boundary_fences_later_turns_until_exact_terminal_receipt() {
+    for group in [false, true] {
+        let (mut s, backend) = fixture();
+        let (leader, mm, _) = add(&mut s, 100, 100);
+        let (peer, _, _) = add(&mut s, 100, 101);
+        s.run_queue.push_back(leader, DEFAULT_PRIORITY);
+        s.run_queue.push_back(peer, DEFAULT_PRIORITY);
+
+        s.reserve_exit_boundary(leader, DetPid::from_raw(100), mm, group)
+            .unwrap();
+        let fence = s.parked.exit_fences[&leader];
+        assert_eq!(s.parked.permits[&leader], fence.permit);
+        assert_eq!(backend.permits.lock().unwrap().as_slice(), &[fence.permit]);
+        assert!(s.control_barrier());
+
+        let wrong = SignalBoundaryReceipt {
+            permit: fence.permit,
+            outcome: SignalBoundaryOutcome::Terminated {
+                group: !group,
+                wait_status: 7 << 8,
+            },
+        };
+        assert!(s.consume_signal_boundary(wrong).is_err());
+        assert_eq!(s.parked.exit_fences[&leader], fence);
+        assert!(s.control_barrier());
+
+        let receipt = SignalBoundaryReceipt {
+            outcome: SignalBoundaryOutcome::Terminated {
+                group,
+                wait_status: 7 << 8,
+            },
+            ..wrong
+        };
+        s.consume_signal_boundary(receipt).unwrap();
+        assert!(!s.parked.exit_fences.contains_key(&leader));
+        assert!(!s.parked.permits.contains_key(&leader));
+        assert!(!s.control_barrier());
+        assert!(!s.next_turns.contains_key(&leader));
+        assert_eq!(s.next_turns.contains_key(&peer), !group);
+        assert!(s.control_waiter().try_read().is_some());
+        s.consume_signal_boundary(receipt).unwrap();
+    }
+}
+
+#[test]
+fn child_exit_publication_is_two_poll_and_retains_shadow_for_wnowait() {
+    let (mut s, backend) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+
+    assert_eq!(
+        s.reserve_exit_boundary(child, DetPid::from_raw(200), child_mm, true),
+        Ok(super::signal_control::ExitReserveMode::Controlled)
+    );
+    let fence = s.parked.exit_fences[&child];
+    let child_key = ProcessGeneration::from_backend(task(200, 200).process);
+    assert!(s.parked.child_exit_reservations.contains_key(&child_key));
+    assert!(s.control_barrier(), "stages 1 and 2 form one barrier");
+
+    let receipt = SignalBoundaryReceipt {
+        permit: fence.permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 7 << 8,
+        },
+    };
+    s.consume_signal_boundary(receipt).unwrap();
+    assert!(!s.parked.exit_fences.contains_key(&child));
+    assert!(matches!(
+        s.parked.child_exit_reservations[&child_key].phase,
+        ChildExitReservationPhase::AwaitingPublication {
+            status: ExitStatus::Exited(7)
+        }
+    ));
+    assert!(s.control_barrier(), "stage 2 survives stage-1 receipt");
+
+    let event = child_exit_event(
+        task(100, 100).process,
+        task(200, 200).process,
+        ExitStatus::Exited(7),
+        true,
+    );
+    let scheduler = Arc::new(Mutex::new(s));
+    let admission_locked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe_scheduler = Arc::downgrade(&scheduler);
+    let probe_admission_locked = admission_locked.clone();
+    *backend.child_publication_probe.lock().unwrap() = Some(Box::new(move || {
+        let scheduler = probe_scheduler.upgrade().unwrap();
+        assert!(
+            scheduler.try_lock().is_err(),
+            "publication must remain inside scheduler admission"
+        );
+        probe_admission_locked.store(true, std::sync::atomic::Ordering::Relaxed);
+    }));
+    let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler.clone(),
+        event,
+    ));
+    assert!(matches!(poll_child_exit(&mut publication), Poll::Pending));
+    assert!(admission_locked.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(backend.child_publications.lock().unwrap().len(), 1);
+    {
+        let s = scheduler.lock().unwrap();
+        assert!(matches!(
+            s.parked.child_exit_reservations[&child_key].phase,
+            ChildExitReservationPhase::Published { .. }
+        ));
+        assert!(s.control_barrier());
+    }
+    assert!(matches!(
+        poll_child_exit(&mut publication),
+        Poll::Ready(Ok(()))
+    ));
+    {
+        let mut s = scheduler.lock().unwrap();
+        assert!(!s.control_barrier());
+        assert_eq!(
+            s.parked.completed_child_exits[&child_key].completion,
+            event.child_exit_completion().unwrap()
+        );
+
+        let spec = crate::types::ChildWaitSpec {
+            selector: crate::types::ChildWaitSelector::Exact(DetPid::from_raw(200)),
+            owner: None,
+            exit_class: crate::types::ChildWaitExitClass::Sigchld,
+        };
+        assert_eq!(
+            s.ready_child_wait(DetPid::from_raw(100), spec),
+            Some(DetPid::from_raw(200))
+        );
+        assert_eq!(
+            s.ready_child_wait(DetPid::from_raw(100), spec),
+            Some(DetPid::from_raw(200)),
+            "WNOWAIT requires the scheduler shadow to remain repeatedly observable"
+        );
+        assert!(s.consume_child_wait(DetPid::from_raw(100), DetPid::from_raw(200)));
+        assert_eq!(s.ready_child_wait(DetPid::from_raw(100), spec), None);
+    }
+
+    // The exact duplicate is terminal and does not republish.
+    let mut duplicate = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler.clone(),
+        event,
+    ));
+    assert!(matches!(poll_child_exit(&mut duplicate), Poll::Pending));
+    assert!(matches!(
+        poll_child_exit(&mut duplicate),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(backend.child_publications.lock().unwrap().len(), 1);
+
+    // Neither a reused generation nor contradictory status can inherit the
+    // terminal receipt.
+    for stale in [
+        BackendChildWaitEvent {
+            child: SignalProcessId {
+                generation: event.child.generation + 1,
+                ..event.child
+            },
+            ..event
+        },
+        child_exit_event(event.parent, event.child, ExitStatus::Exited(8), true),
+    ] {
+        let mut stale = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+            scheduler.clone(),
+            stale,
+        ));
+        assert!(matches!(poll_child_exit(&mut stale), Poll::Ready(Err(_))));
+    }
+    assert_eq!(backend.child_publications.lock().unwrap().len(), 1);
+    assert!(scheduler.lock().unwrap().backend_failed());
+}
+
+#[test]
+fn nonwaitable_child_auto_reaps_shadow_regardless_of_signal_effect() {
+    let (mut s, backend) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    *backend.child_effect.lock().unwrap() = Some(ChildExitPublicationEffect::Queued);
+    s.reserve_exit_boundary(child, DetPid::from_raw(200), child_mm, true)
+        .unwrap();
+    let permit = s.parked.exit_fences[&child].permit;
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 9 << 8,
+        },
+    })
+    .unwrap();
+
+    let event = child_exit_event(
+        task(100, 100).process,
+        task(200, 200).process,
+        ExitStatus::Exited(9),
+        false,
+    );
+    let scheduler = Arc::new(Mutex::new(s));
+    let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler.clone(),
+        event,
+    ));
+    assert!(matches!(poll_child_exit(&mut publication), Poll::Pending));
+    assert!(matches!(
+        poll_child_exit(&mut publication),
+        Poll::Ready(Ok(()))
+    ));
+    let s = scheduler.lock().unwrap();
+    assert!(!s.control_barrier());
+    assert!(
+        !s.logically_exited_processes
+            .contains(&DetPid::from_raw(200))
+    );
+    assert_eq!(s.thread_tree.parent_process(&DetPid::from_raw(200)), None);
+    assert_eq!(
+        backend.child_publications.lock().unwrap()[0],
+        event.child_exit_completion().unwrap()
+    );
+}
+
+#[test]
+fn post_commit_shadow_cleanup_failure_is_terminal_before_barrier_release() {
+    let (mut s, _) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    s.reserve_exit_boundary(child, DetPid::from_raw(200), child_mm, true)
+        .unwrap();
+    let permit = s.parked.exit_fences[&child].permit;
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 11 << 8,
+        },
+    })
+    .unwrap();
+    s.thread_tree.process_parent.remove(&DetPid::from_raw(200));
+
+    let event = child_exit_event(
+        task(100, 100).process,
+        task(200, 200).process,
+        ExitStatus::Exited(11),
+        false,
+    );
+    let scheduler = Arc::new(Mutex::new(s));
+    let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler.clone(),
+        event,
+    ));
+    assert!(matches!(poll_child_exit(&mut publication), Poll::Pending));
+    assert!(matches!(
+        poll_child_exit(&mut publication),
+        Poll::Ready(Err(_))
+    ));
+    let s = scheduler.lock().unwrap();
+    assert!(s.backend_failed());
+    assert!(!s.control_barrier());
+}
+
+#[test]
+fn final_process_classification_uses_live_direct_parent_not_transitive_root() {
+    let (mut s, _) = fixture();
+    let (root, root_mm, _) = add(&mut s, 100, 100);
+    let _ = add_process_child(&mut s, 100, 200);
+    let (grandchild, grandchild_mm, _) = add_process_child(&mut s, 200, 300);
+
+    s.reserve_exit_boundary(root, DetPid::from_raw(100), root_mm, true)
+        .unwrap();
+    let root_permit = s.parked.exit_fences[&root].permit;
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit: root_permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 0,
+        },
+    })
+    .unwrap();
+    assert!(matches!(
+        s.parked.terminal_processes[&ProcessGeneration::from_backend(task(100, 100).process)].class,
+        FinalProcessClass::Root
+    ));
+
+    s.reserve_exit_boundary(grandchild, DetPid::from_raw(300), grandchild_mm, true)
+        .unwrap();
+    let reservation =
+        s.parked.child_exit_reservations[&ProcessGeneration::from_backend(task(300, 300).process)];
+    assert_eq!(reservation.parent, task(200, 200).process);
+    assert!(matches!(
+        reservation.phase,
+        ChildExitReservationPhase::AwaitingTerminalStatus
+    ));
+}
+
+#[test]
+fn direct_parent_terminal_child_is_classified_and_auto_reaped_without_callback() {
+    let (mut s, _) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (parent, parent_mm, _) = add_process_child(&mut s, 100, 200);
+    let (child, child_mm, _) = add_process_child(&mut s, 200, 300);
+
+    s.reserve_exit_boundary(parent, DetPid::from_raw(200), parent_mm, true)
+        .unwrap();
+    let parent_permit = s.parked.exit_fences[&parent].permit;
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit: parent_permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 4 << 8,
+        },
+    })
+    .unwrap();
+    let parent_event = child_exit_event(
+        task(100, 100).process,
+        task(200, 200).process,
+        ExitStatus::Exited(4),
+        true,
+    );
+    let scheduler = Arc::new(Mutex::new(s));
+    let mut parent_publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler.clone(),
+        parent_event,
+    ));
+    assert!(matches!(
+        poll_child_exit(&mut parent_publication),
+        Poll::Pending
+    ));
+    assert!(matches!(
+        poll_child_exit(&mut parent_publication),
+        Poll::Ready(Ok(()))
+    ));
+    drop(parent_publication);
+
+    let mut s = Arc::try_unwrap(scheduler).unwrap().into_inner().unwrap();
+    s.reserve_exit_boundary(child, DetPid::from_raw(300), child_mm, true)
+        .unwrap();
+    let child_key = ProcessGeneration::from_backend(task(300, 300).process);
+    assert!(
+        !s.parked.child_exit_reservations.contains_key(&child_key),
+        "a terminal direct parent causes backend teardown auto-reap"
+    );
+    let child_permit = s.parked.exit_fences[&child].permit;
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit: child_permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 5 << 8,
+        },
+    })
+    .unwrap();
+    assert!(matches!(
+        s.parked.terminal_processes[&child_key].class,
+        FinalProcessClass::DirectParentTerminal { parent }
+            if parent == task(200, 200).process
+    ));
+    assert!(
+        !s.logically_exited_processes
+            .contains(&DetPid::from_raw(300))
+    );
+    assert_eq!(s.thread_tree.parent_process(&DetPid::from_raw(300)), None);
+    assert!(!s.control_barrier());
+}
+
+#[test]
+fn fatal_signal_final_transition_installs_stage_two_before_stage_one_retires() {
+    let (mut s, _) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, _, _) = add_process_child(&mut s, 100, 200);
+    s.parked.running = Some(child);
+    let permit = s
+        .authorize_signal_boundary(task(200, 200))
+        .unwrap()
+        .unwrap();
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: libc::SIGKILL,
+        },
+    })
+    .unwrap();
+
+    let child_key = ProcessGeneration::from_backend(task(200, 200).process);
+    assert!(!s.parked.permits.contains_key(&child));
+    assert!(matches!(
+        s.parked.child_exit_reservations[&child_key].phase,
+        ChildExitReservationPhase::AwaitingPublication { status }
+            if status == ExitStatus::from_raw(libc::SIGKILL)
+    ));
+    assert!(s.control_barrier());
+}
+
+#[test]
+fn failed_after_commit_is_forwarded_unlocked_exactly_once_and_is_terminal() {
+    let (mut s, backend) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    s.reserve_exit_boundary(child, DetPid::from_raw(200), child_mm, true)
+        .unwrap();
+    let permit = s.parked.exit_fences[&child].permit;
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 6 << 8,
+        },
+    })
+    .unwrap();
+    backend
+        .fail_child_publication
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let scheduler = Arc::new(Mutex::new(s));
+    let unlocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probe_scheduler = Arc::downgrade(&scheduler);
+    let probe_unlocked = unlocked.clone();
+    *backend.failure_probe.lock().unwrap() = Some(Box::new(move || {
+        let scheduler = probe_scheduler.upgrade().unwrap();
+        let mut scheduler = scheduler
+            .try_lock()
+            .expect("failure forwarding must run outside the scheduler lock");
+        assert!(
+            scheduler.backend_failed(),
+            "terminal state must precede outside-lock failure forwarding"
+        );
+        probe_unlocked.store(true, std::sync::atomic::Ordering::Relaxed);
+        let wake = scheduler.report_backend_failure(reverie::BackendFailure {
+            pid: reverie::Pid::from_raw(200),
+            tid: reverie::Pid::from_raw(200),
+            phase: "test child publication failure",
+        });
+        assert!(wake.is_none(), "failure must already be linearized");
+        drop(scheduler);
+        if let Some(wake) = wake {
+            let _ = wake.send(());
+        }
+    }));
+
+    let event = child_exit_event(
+        task(100, 100).process,
+        task(200, 200).process,
+        ExitStatus::Exited(6),
+        true,
+    );
+    let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler.clone(),
+        event,
+    ));
+    assert!(matches!(poll_child_exit(&mut publication), Poll::Pending));
+    assert!(matches!(
+        poll_child_exit(&mut publication),
+        Poll::Ready(Ok(()))
+    ));
+    assert!(unlocked.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(scheduler.lock().unwrap().backend_failed());
+    assert_eq!(backend.child_publications.lock().unwrap().len(), 1);
+    assert_eq!(backend.child_failures.lock().unwrap().len(), 1);
+
+    let mut duplicate = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler.clone(),
+        event,
+    ));
+    assert!(matches!(poll_child_exit(&mut duplicate), Poll::Pending));
+    assert!(matches!(
+        poll_child_exit(&mut duplicate),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(backend.child_publications.lock().unwrap().len(), 1);
+    assert_eq!(backend.child_failures.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn rejected_child_publication_is_terminal_before_stage_two_wakes() {
+    let (mut s, backend) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    s.reserve_exit_boundary(child, DetPid::from_raw(200), child_mm, true)
+        .unwrap();
+    let permit = s.parked.exit_fences[&child].permit;
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 10 << 8,
+        },
+    })
+    .unwrap();
+    backend
+        .reject_child_publication
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let event = child_exit_event(
+        task(100, 100).process,
+        task(200, 200).process,
+        ExitStatus::Exited(10),
+        true,
+    );
+    let scheduler = Arc::new(Mutex::new(s));
+    let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler.clone(),
+        event,
+    ));
+    assert!(matches!(poll_child_exit(&mut publication), Poll::Pending));
+    {
+        let s = scheduler.lock().unwrap();
+        assert!(!s.backend_failed());
+        assert!(s.control_barrier());
+    }
+    assert!(matches!(
+        poll_child_exit(&mut publication),
+        Poll::Ready(Err(_))
+    ));
+    let s = scheduler.lock().unwrap();
+    assert!(s.backend_failed());
+    assert!(!s.control_barrier());
+    assert!(matches!(
+        s.parked.completed_child_exits[&ProcessGeneration::from_backend(task(200, 200).process)]
+            .result,
+        ChildExitPublicationResult::RejectedBeforeCommit(reverie::Errno::EBADF)
+    ));
+    assert_eq!(backend.child_publications.lock().unwrap().len(), 1);
+    assert!(backend.child_failures.lock().unwrap().is_empty());
+}
+
+#[test]
+fn child_failure_does_not_steal_pending_alarm_failure_wake() {
+    use futures::FutureExt;
+
+    let (mut s, backend) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    s.reserve_exit_boundary(child, DetPid::from_raw(200), child_mm, true)
+        .unwrap();
+    let permit = s.parked.exit_fences[&child].permit;
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 12 << 8,
+        },
+    })
+    .unwrap();
+
+    let alarm_process = task(100, 100).process;
+    let alarm_waiter = s.backend_failure_waiter();
+    let alarm_wake = s
+        .report_backend_failure(reverie::BackendFailure {
+            pid: alarm_process.tgid,
+            tid: reverie::Pid::from_raw(100),
+            phase: "retained alarm publication failure",
+        })
+        .unwrap();
+    s.parked.failures.push(alarm_process);
+    s.parked.failure_wakes.push(alarm_wake);
+    backend
+        .reject_child_publication
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let event = child_exit_event(
+        alarm_process,
+        task(200, 200).process,
+        ExitStatus::Exited(12),
+        true,
+    );
+    let scheduler = Arc::new(Mutex::new(s));
+    let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler.clone(),
+        event,
+    ));
+    assert!(matches!(poll_child_exit(&mut publication), Poll::Pending));
+    assert!(matches!(
+        poll_child_exit(&mut publication),
+        Poll::Ready(Err(_))
+    ));
+    assert!(alarm_waiter.clone().now_or_never().is_none());
+    assert!(backend.failure_processes.lock().unwrap().is_empty());
+
+    super::signal_control::flush_signal_failures(&scheduler);
+    assert!(matches!(alarm_waiter.now_or_never(), Some(Ok(()))));
+    assert_eq!(
+        backend.failure_processes.lock().unwrap().as_slice(),
+        &[alarm_process]
+    );
+}
+
+#[test]
+fn child_callback_drop_does_not_steal_pending_alarm_failure_wake() {
+    use futures::FutureExt;
+
+    let (mut s, backend) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    s.reserve_exit_boundary(child, DetPid::from_raw(200), child_mm, true)
+        .unwrap();
+    let permit = s.parked.exit_fences[&child].permit;
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 13 << 8,
+        },
+    })
+    .unwrap();
+    let event = child_exit_event(
+        task(100, 100).process,
+        task(200, 200).process,
+        ExitStatus::Exited(13),
+        true,
+    );
+    let scheduler = Arc::new(Mutex::new(s));
+    let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler.clone(),
+        event,
+    ));
+    assert!(matches!(poll_child_exit(&mut publication), Poll::Pending));
+
+    let alarm_process = task(100, 100).process;
+    let alarm_waiter = {
+        let mut s = scheduler.lock().unwrap();
+        let alarm_waiter = s.backend_failure_waiter();
+        let alarm_wake = s
+            .report_backend_failure(reverie::BackendFailure {
+                pid: alarm_process.tgid,
+                tid: reverie::Pid::from_raw(100),
+                phase: "retained alarm publication failure",
+            })
+            .unwrap();
+        s.parked.failures.push(alarm_process);
+        s.parked.failure_wakes.push(alarm_wake);
+        alarm_waiter
+    };
+
+    drop(publication);
+    assert!(alarm_waiter.clone().now_or_never().is_none());
+    assert!(backend.failure_processes.lock().unwrap().is_empty());
+    assert!(!scheduler.lock().unwrap().control_barrier());
+
+    super::signal_control::flush_signal_failures(&scheduler);
+    assert!(matches!(alarm_waiter.now_or_never(), Some(Ok(()))));
+    assert_eq!(
+        backend.failure_processes.lock().unwrap().as_slice(),
+        &[alarm_process]
+    );
+}
+
+#[test]
+fn dropping_admitted_child_publication_cleans_barrier_and_fails_run() {
+    let (mut s, backend) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    s.reserve_exit_boundary(child, DetPid::from_raw(200), child_mm, true)
+        .unwrap();
+    let permit = s.parked.exit_fences[&child].permit;
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 3 << 8,
+        },
+    })
+    .unwrap();
+    let event = child_exit_event(
+        task(100, 100).process,
+        task(200, 200).process,
+        ExitStatus::Exited(3),
+        true,
+    );
+    let scheduler = Arc::new(Mutex::new(s));
+    let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        scheduler.clone(),
+        event,
+    ));
+    assert!(matches!(poll_child_exit(&mut publication), Poll::Pending));
+    assert!(scheduler.lock().unwrap().control_barrier());
+    drop(publication);
+    let s = scheduler.lock().unwrap();
+    assert!(!s.control_barrier());
+    assert!(s.backend_failed());
+    assert_eq!(backend.child_publications.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn controlled_exit_mode_never_enqueues_legacy_timed_sigchld() {
+    let (mut s, _) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    let response = Ivar::new();
+    assert!(
+        s.block_for_one_resource(
+            child,
+            &ResourceID::Exit {
+                group: true,
+                process: DetPid::from_raw(200),
+                mm: child_mm,
+            },
+            &Permission::RW,
+            None,
+            &response,
+        )
+        .is_ok()
+    );
+    assert!(s.parked.exit_fences.contains_key(&child));
+    assert!(s.blocked.timed_waiters.is_empty());
+
+    let mut uncontrolled = Scheduler::new(&Config::default());
+    assert_eq!(
+        uncontrolled.reserve_exit_boundary(
+            DetTid::from_raw(1),
+            DetPid::from_raw(1),
+            MmId::initial(DetTid::from_raw(1)),
+            true,
+        ),
+        Ok(super::signal_control::ExitReserveMode::Uncontrolled)
+    );
+}
+
+#[test]
+fn exit_boundary_reservation_failure_has_no_local_effect() {
+    let (mut s, backend) = fixture();
+    let (tid, mm, _) = add(&mut s, 100, 100);
+    backend
+        .fail_reservation
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        s.reserve_exit_boundary(tid, DetPid::from_raw(100), mm, true),
+        Err(ProtocolFailure::Identity)
+    );
+    assert!(s.parked.permits.is_empty());
+    assert!(s.parked.exit_fences.is_empty());
+    assert!(!s.control_barrier());
+}
+
+#[test]
+fn selected_exit_reservation_failure_closes_tentative_pop_exactly_once() {
+    let (mut s, backend) = fixture();
+    let _ = add(&mut s, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    s.run_queue.push_back(child, DEFAULT_PRIORITY);
+    assert_eq!(s.run_queue.tentative_pop_next(), Some(child));
+    backend
+        .fail_reservation
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let response = Ivar::new();
+    assert!(
+        s.block_for_one_resource(
+            child,
+            &ResourceID::Exit {
+                group: true,
+                process: DetPid::from_raw(200),
+                mm: child_mm,
+            },
+            &Permission::RW,
+            None,
+            &response,
+        )
+        .is_err()
+    );
+    assert!(s.backend_failed());
+    assert!(!s.run_queue.tentative_pop_in_progress());
+    assert!(s.run_queue.contains_tid(child));
+    assert!(s.parked.exit_fences.is_empty());
+    assert!(s.parked.child_exit_reservations.is_empty());
 }
 
 #[test]
