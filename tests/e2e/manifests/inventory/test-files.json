@@ -1222,7 +1222,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/kvm_exact_child_waits.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/kvm_exact_child_waits.c is owned by hermit-cli/tests/cli.rs: The CLI integration suite compiles this child-wait workload and exercises the KVM-specific completion contract with exact process ordering; it remains coupled to that dedicated driver rather than a generic manifest cell."
+      "why": "tests/c/kvm_exact_child_waits.c is owned by hermit-cli/tests/cli.rs: The CLI integration suite compiles this workload and exercises KVM-specific child completion for exact wait ordering plus exact-self SIGKILL through kill, tkill, and tgkill; it remains coupled to that dedicated driver rather than a generic manifest cell."
     },
     {
       "disposition": "manifest-test",

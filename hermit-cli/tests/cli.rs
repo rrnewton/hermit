@@ -627,7 +627,7 @@ fn kvm_exact_child_waits_guest() -> &'static Path {
             .expect("failed to create KVM exact-child wait guest directory");
         let guest = build_root.join("kvm_exact_child_waits");
         let output = Command::new("cc")
-            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
             .arg(repository.join("tests/c/kvm_exact_child_waits.c"))
             .arg("-o")
             .arg(&guest)
@@ -2414,6 +2414,51 @@ fn run_kvm_exact_child_waits_have_stable_scheduler_turns() {
             "iteration {iteration} changed the scheduler child-wait turn population:\n{log}"
         );
     }
+}
+
+#[test]
+fn run_kvm_self_sigkill_from_nonleader_is_group_fatal() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping KVM self-SIGKILL regression: /dev/kvm is unavailable");
+        return;
+    }
+
+    let _guard = hermit_run_guard();
+    let program = kvm_exact_child_waits_guest()
+        .to_str()
+        .expect("self-SIGKILL guest path should be UTF-8");
+    let args = [
+        "run",
+        "--backend=kvm",
+        "--verify",
+        "--verify-strict",
+        "--",
+        program,
+        "self-sigkill",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "thread-kill: signalled sig=9 core=0\n\
+         thread-tkill: signalled sig=9 core=0\n\
+         thread-tgkill: signalled sig=9 core=0\n\
+         failures=0\n"
+    );
+    let log = stderr(&output);
+    assert!(
+        log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+        "KVM self-SIGKILL comparison was not canonical:\n{log}"
+    );
+    assert!(
+        log.contains(":: Success: deterministic. Determinism verified."),
+        "KVM self-SIGKILL verification failed:\n{log}"
+    );
+    assert!(
+        log.contains(":: Backend: KVM (reverie-kvm KvmGuest<Detcore>)"),
+        "KVM self-SIGKILL regression did not use the KVM backend:\n{log}"
+    );
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
