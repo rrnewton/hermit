@@ -1287,6 +1287,48 @@ fn fatal_signal_final_transition_installs_stage_two_before_stage_one_retires() {
             if status == ExitStatus::from_raw(libc::SIGKILL)
     ));
     assert!(s.control_barrier());
+
+    // A nonreturning self-SIGKILL has no ordinary signal-delivery boundary.
+    // Its syscall handler therefore pre-reserves the same controlled Exit
+    // fence as exit_group. Exercise that distinct producer path through the
+    // real two-poll child publication rather than fabricating a callback pass.
+    let (mut reserved, backend) = fixture();
+    let _ = add(&mut reserved, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut reserved, 100, 200);
+    reserved
+        .reserve_exit_boundary(child, DetPid::from_raw(200), child_mm, true)
+        .unwrap();
+    let permit = reserved.parked.exit_fences[&child].permit;
+    reserved
+        .consume_signal_boundary(SignalBoundaryReceipt {
+            permit,
+            outcome: SignalBoundaryOutcome::Terminated {
+                group: true,
+                wait_status: libc::SIGKILL,
+            },
+        })
+        .unwrap();
+    let event = child_exit_event(
+        task(100, 100).process,
+        task(200, 200).process,
+        ExitStatus::from_raw(libc::SIGKILL),
+        true,
+    );
+    let reserved = Arc::new(Mutex::new(reserved));
+    let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+        reserved.clone(),
+        event,
+    ));
+    assert!(matches!(poll_child_exit(&mut publication), Poll::Pending));
+    assert!(matches!(
+        poll_child_exit(&mut publication),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(
+        backend.child_publications.lock().unwrap().as_slice(),
+        &[event.child_exit_completion().unwrap()]
+    );
+    assert!(!reserved.lock().unwrap().control_barrier());
 }
 
 #[test]

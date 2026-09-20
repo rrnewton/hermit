@@ -37,6 +37,7 @@ use crate::tool_global::alarm_remaining;
 use crate::tool_global::notify_signal_pending;
 use crate::tool_global::register_alarm;
 use crate::tool_global::resolve_kill_targets;
+use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::types::DetPid;
 use crate::types::DetTid;
@@ -235,6 +236,26 @@ fn can_forward_process_group_signal(
     backend_requires_pid_translation: bool,
 ) -> bool {
     pid < -1 && sig == libc::SIGKILL && !backend_requires_pid_translation
+}
+
+/// Whether one of Linux's three ordinary signal syscalls names the calling
+/// task exactly and asks for the one signal that cannot return successfully.
+///
+/// Keep process-group and broadcast spellings out of this predicate. Even when
+/// the caller belongs to the named group, KVM can refuse a group containing a
+/// second process; reserving an exit before that refusal would strand the
+/// scheduler's terminal barrier.
+fn self_sigkill_targets_current_task(
+    signal: libc::c_int,
+    target_process: Option<DetPid>,
+    target_thread: Option<DetTid>,
+    current_process: DetPid,
+    current_thread: DetTid,
+) -> bool {
+    signal == libc::SIGKILL
+        && (target_process.is_some() || target_thread.is_some())
+        && target_process.is_none_or(|target| target == current_process)
+        && target_thread.is_none_or(|target| target == current_thread)
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -538,6 +559,49 @@ impl<T: RecordOrReplay> Detcore<T> {
         retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout).await
     }
 
+    /// Fence an exact self-SIGKILL at the scheduler-selected syscall turn.
+    ///
+    /// KVM commits this syscall as an immediate, nonreturning process exit. It
+    /// therefore has no later return boundary at which the ordinary pending
+    /// signal path could acquire a delivery permit. Without this preflight, the
+    /// backend's terminal child callback arrives with no generation-bound
+    /// reservation and must fail closed. `ResourceID::Exit` is the same fence
+    /// used by `exit_group`; the KVM-only configuration guard avoids changing
+    /// ptrace, DBT, or non-sequential execution.
+    async fn reserve_kvm_self_sigkill_exit<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: libc::c_int,
+        target_process: Option<DetPid>,
+        target_thread: Option<DetTid>,
+    ) {
+        if !self.cfg.kvm_shared_dequeue_timers {
+            return;
+        }
+        let (current_thread, mm) = {
+            let state = guest.thread_state();
+            (state.dettid, state.mm_id)
+        };
+        if !self_sigkill_targets_current_task(
+            signal,
+            target_process,
+            target_thread,
+            self.detpid,
+            current_thread,
+        ) {
+            return;
+        }
+        let request = guest.thread_state().mk_request(
+            ResourceID::Exit {
+                group: true,
+                process: self.detpid,
+                mm,
+            },
+            Permission::RW,
+        );
+        resource_request(guest, request).await;
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     // TODO-HUMAN-REVIEW(PR-1058): Review process-pending signal preservation.
@@ -577,6 +641,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
         let tid = deterministic_kill_target(&targets, call.sig())?;
+        self.reserve_kvm_self_sigkill_exit(guest, call.sig(), Some(DetPid::from_raw(tgid)), None)
+            .await;
         let value = if !guest
             .config()
             .backend_requires_thread_directed_process_signals
@@ -603,6 +669,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tgkill,
     ) -> Result<i64, Error> {
+        self.reserve_kvm_self_sigkill_exit(
+            guest,
+            call.sig(),
+            Some(DetPid::from_raw(call.tgid())),
+            Some(DetTid::from_raw(call.tid())),
+        )
+        .await;
         let value = self.record_or_replay(guest, call).await?;
         // `pthread_kill` lowers to `tgkill`, so this is the ordinary way one
         // guest THREAD signals a sibling. Like `kill`, a successful cross-task
@@ -624,6 +697,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tkill,
     ) -> Result<i64, Error> {
+        self.reserve_kvm_self_sigkill_exit(
+            guest,
+            call.sig(),
+            None,
+            Some(DetTid::from_raw(call.tid())),
+        )
+        .await;
         let value = self.record_or_replay(guest, call).await?;
         // Same wakeup obligation as `tgkill`; `tkill` is the older two-argument
         // spelling of the same thread-directed send.
@@ -844,6 +924,43 @@ mod tests {
             Err(Errno::ENOSYS)
         );
         assert_eq!(deterministic_kill_target(&[first, second], 0), Ok(first));
+
+        let process = DetPid::from_raw(41);
+        assert!(self_sigkill_targets_current_task(
+            libc::SIGKILL,
+            Some(process),
+            None,
+            process,
+            first,
+        ));
+        assert!(self_sigkill_targets_current_task(
+            libc::SIGKILL,
+            None,
+            Some(first),
+            process,
+            first,
+        ));
+        assert!(self_sigkill_targets_current_task(
+            libc::SIGKILL,
+            Some(process),
+            Some(first),
+            process,
+            first,
+        ));
+        for (signal, target_process, target_thread) in [
+            (libc::SIGTERM, Some(process), Some(first)),
+            (libc::SIGKILL, Some(DetPid::from_raw(40)), Some(first)),
+            (libc::SIGKILL, Some(process), Some(second)),
+            (libc::SIGKILL, None, None),
+        ] {
+            assert!(!self_sigkill_targets_current_task(
+                signal,
+                target_process,
+                target_thread,
+                process,
+                first,
+            ));
+        }
     }
 
     #[test]
