@@ -57,6 +57,9 @@ const CONTROL_CAUSE_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_CAUSE_FILE";
 const CONTROL_CGROUP_PATH_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_CGROUP_PATH_FILE";
 const CONTROL_CLEANUP_ERROR_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_CLEANUP_ERROR";
 const CONTROL_ENROLLMENT_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_ENROLLMENT_FILE";
+const CONTROL_ENTRY_DEADLINE_NS_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_ENTRY_DEADLINE_NS";
+const CONTROL_ENTRY_REACHED_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_ENTRY_REACHED_FILE";
+const CONTROL_ENTRY_RESUME_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_ENTRY_RESUME_FILE";
 const CONTROL_FINAL_CPU_FILE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_FINAL_CPU_FILE";
 const CONTROL_FINAL_READ_FAILURE_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_FINAL_READ_FAILURE";
 const CONTROL_FINAL_REGRESSION_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_FINAL_REGRESSION";
@@ -71,9 +74,6 @@ const CONTROL_SENTINEL_ENV: &str = "HERMIT_NEXTEST_CPU_CONTROL_SENTINEL";
 const INFRASTRUCTURE_EXIT: u8 = 70;
 const CPU_TIMEOUT_EXIT: u8 = 124;
 const NON_SIGNAL_CAUSE_RESERVED: i32 = -1;
-// A wrapper owns one attempt cgroup. Sampling twice per second retains the
-// original sub-second enforcement boundary without scanning unrelated tasks.
-const CPU_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CHILD_REAP_DEADLINE: Duration = Duration::from_secs(5);
 
 static RECEIVED_SIGNAL: AtomicI32 = AtomicI32::new(0);
@@ -750,6 +750,198 @@ impl PidFd {
             ))
         }
     }
+
+    fn terminal_ready_for_control(&self) -> Result<bool, String> {
+        let mut descriptor = libc::pollfd {
+            fd: self.file.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut descriptor, 1, 0) } < 0 {
+            return Err(format!(
+                "cannot observe control pidfd {}: {}",
+                self.pid,
+                io::Error::last_os_error()
+            ));
+        }
+        if descriptor.revents & !libc::POLLIN != 0 {
+            return Err(format!(
+                "control pidfd {} returned unexpected poll events {}",
+                self.pid, descriptor.revents
+            ));
+        }
+        // POLLIN witnesses termination without consuming the child's status.
+        Ok(descriptor.revents & libc::POLLIN != 0)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EntryControlDeadline(u64);
+
+impl EntryControlDeadline {
+    fn now_ns() -> Result<u64, String> {
+        let mut now = unsafe { std::mem::zeroed::<libc::timespec>() };
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+            return Err(format!(
+                "cannot read entry-control monotonic clock: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let seconds = u64::try_from(now.tv_sec)
+            .map_err(|_| "entry-control monotonic seconds were negative".to_string())?;
+        let nanos = u64::try_from(now.tv_nsec)
+            .ok()
+            .filter(|value| *value < 1_000_000_000)
+            .ok_or_else(|| "entry-control monotonic nanoseconds were invalid".to_string())?;
+        seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|value| value.checked_add(nanos))
+            .ok_or_else(|| "entry-control monotonic clock overflowed".to_string())
+    }
+
+    fn start() -> Result<Self, String> {
+        Self::now_ns()?
+            .checked_add(15_000_000_000)
+            .map(Self)
+            .ok_or_else(|| "entry-control deadline overflowed".to_string())
+    }
+
+    fn from_env() -> Result<Self, String> {
+        let deadline = Self(
+            required_env(CONTROL_ENTRY_DEADLINE_NS_ENV)?
+                .parse::<u64>()
+                .map_err(|error| format!("invalid entry-control deadline: {error}"))?,
+        );
+        if deadline.remaining()? > Duration::from_secs(15) {
+            return Err("entry-control deadline is more than 15s away".into());
+        }
+        Ok(deadline)
+    }
+
+    fn remaining(self) -> Result<Duration, String> {
+        self.0
+            .checked_sub(Self::now_ns()?)
+            .filter(|remaining| *remaining > 0)
+            .map(Duration::from_nanos)
+            .ok_or_else(|| "entry control exceeded its shared 15s deadline".to_string())
+    }
+
+    fn sleep(self) -> Result<(), String> {
+        thread::sleep(self.remaining()?.min(Duration::from_millis(2)));
+        Ok(())
+    }
+}
+
+struct ReapEntryControl {
+    reached: PathBuf,
+    resume: PathBuf,
+    child_pid: PathBuf,
+    child_resume: PathBuf,
+    deadline: EntryControlDeadline,
+}
+
+impl ReapEntryControl {
+    fn from_env() -> Result<Option<Self>, String> {
+        if env::var_os(CONTROL_ARM_ENV).is_none()
+            || [
+                CONTROL_ENTRY_REACHED_FILE_ENV,
+                CONTROL_ENTRY_RESUME_FILE_ENV,
+                CONTROL_ENTRY_DEADLINE_NS_ENV,
+            ]
+            .iter()
+            .all(|name| env::var_os(name).is_none())
+        {
+            return Ok(None);
+        }
+        let control = Self {
+            reached: PathBuf::from(required_env(CONTROL_ENTRY_REACHED_FILE_ENV)?),
+            resume: PathBuf::from(required_env(CONTROL_ENTRY_RESUME_FILE_ENV)?),
+            child_pid: PathBuf::from(required_env(CONTROL_PID_FILE_ENV)?),
+            child_resume: PathBuf::from(required_env(CONTROL_ENROLLMENT_FILE_ENV)?),
+            deadline: EntryControlDeadline::from_env()?,
+        };
+        let paths = [
+            &control.reached,
+            &control.resume,
+            &control.child_pid,
+            &control.child_resume,
+        ];
+        if paths.into_iter().collect::<BTreeSet<_>>().len() != 4 {
+            return Err("entry control requires four distinct rendezvous paths".into());
+        }
+        Ok(Some(control))
+    }
+
+    fn pause_before_first_reap(&self, child_pid: u32) -> Result<(), String> {
+        self.deadline.remaining()?;
+        publish_entry_control(&self.reached, format!("{child_pid}\n").as_bytes())?;
+        let release = wait_for_entry_control_file(&self.resume, self.deadline, None)?;
+        if release != b"release\n" {
+            return Err("entry control received an invalid wrapper release".into());
+        }
+        Ok(())
+    }
+}
+
+fn publish_entry_control(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let mut pending = path.as_os_str().to_os_string();
+    pending.push(".pending");
+    let pending = PathBuf::from(pending);
+    fs::write(&pending, contents)
+        .and_then(|()| fs::rename(&pending, path))
+        .map_err(|error| format!("cannot publish entry control {}: {error}", path.display()))
+}
+
+fn wait_for_entry_control_file(
+    path: &Path,
+    deadline: EntryControlDeadline,
+    wrapper: Option<&PidFd>,
+) -> Result<Vec<u8>, String> {
+    loop {
+        deadline.remaining()?;
+        if let Some(signal) = received_external_signal() {
+            return Err(format!("entry control interrupted by signal {signal}"));
+        }
+        if let Some(wrapper) = wrapper {
+            if wrapper.terminal_ready_for_control()? {
+                return Err("entry-control wrapper terminated before its release".into());
+            }
+        }
+        match fs::read(path) {
+            Ok(contents) => {
+                deadline.remaining()?;
+                return Ok(contents);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot read entry control {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+        deadline.sleep()?;
+    }
+}
+
+fn wait_for_entry_control_terminal(
+    process: &PidFd,
+    deadline: EntryControlDeadline,
+    wrapper: Option<&PidFd>,
+) -> Result<(), String> {
+    loop {
+        deadline.remaining()?;
+        if let Some(wrapper) = wrapper {
+            if wrapper.terminal_ready_for_control()? {
+                return Err("entry-control wrapper terminated before its release".into());
+            }
+        }
+        if process.terminal_ready_for_control()? {
+            deadline.remaining()?;
+            return Ok(());
+        }
+        deadline.sleep()?;
+    }
 }
 
 fn install_subreaper() -> Result<(), String> {
@@ -1168,6 +1360,10 @@ fn wait_for_direct_child(
 
 fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     let invocation = parse_wrapper_invocation(args)?;
+    let entry_control = ReapEntryControl::from_env()?;
+    if entry_control.is_some() && invocation.cpu_budget_usec.is_none() {
+        return Err("entry control requires the budgeted self-test wrapper".into());
+    }
     let (program, child_args) = invocation
         .command
         .split_first()
@@ -1222,6 +1418,9 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     command.env_remove(CONTROL_ACCOUNTING_FAILURE_FILE_ENV);
     command.env_remove(CONTROL_CGROUP_PATH_FILE_ENV);
     command.env_remove(CONTROL_CLEANUP_ERROR_ENV);
+    command.env_remove(CONTROL_ENTRY_DEADLINE_NS_ENV);
+    command.env_remove(CONTROL_ENTRY_REACHED_FILE_ENV);
+    command.env_remove(CONTROL_ENTRY_RESUME_FILE_ENV);
     command.env_remove(CONTROL_FINAL_CPU_FILE_ENV);
     command.env_remove(CONTROL_FINAL_READ_FAILURE_ENV);
     command.env_remove(CONTROL_FINAL_REGRESSION_ENV);
@@ -1230,6 +1429,12 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     command.env_remove(CONTROL_RESUME_FILE_ENV);
     command.env_remove(CONTROL_WAIT4_RESUME_FILE_ENV);
     command.env_remove(CONTROL_WAIT4_STORED_FILE_ENV);
+    if let Some(control) = &entry_control {
+        command.env(
+            CONTROL_ENTRY_DEADLINE_NS_ENV,
+            control.deadline.0.to_string(),
+        );
+    }
     if invocation.cpu_budget_usec.is_some() {
         command.process_group(0);
         let enrollment_fd = attempt_cgroup
@@ -1309,11 +1514,18 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     let mut reaped_cpu_usec = 0u64;
     let mut wait4 = Vec::new();
     let mut max_cpu_usec = 0u64;
-    let cause = if let Some(cpu_budget_usec) = invocation.cpu_budget_usec {
+    // This explicitly armed self-test seam runs once, after spawn and pidfd
+    // acquisition, before any wait4 or CPU decision. Ordinary attempts omit it.
+    let entry_result = entry_control
+        .as_ref()
+        .map(|control| control.pause_before_first_reap(child_pid))
+        .transpose();
+    let cause = if let Err(error) = entry_result {
+        reserve_or_external(FirstCause::AccountingUnavailable { error })
+    } else if let Some(cpu_budget_usec) = invocation.cpu_budget_usec {
         let cgroup = attempt_cgroup
             .as_ref()
             .expect("budgeted path created an attempt cgroup");
-        let mut next_cpu_poll = Instant::now();
         loop {
             if let Some(supervisor_signal) = received_external_signal() {
                 break FirstCause::ExternalSignal {
@@ -1336,7 +1548,6 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
                     signal: supervisor_signal,
                 };
             }
-            let now = Instant::now();
             if let Some(status) = direct_status.filter(|status| !status.success()) {
                 match reserve_non_signal_cause() {
                     Ok(()) => {
@@ -1371,51 +1582,49 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
             } else {
                 false
             };
-            if now >= next_cpu_poll || completed_success {
-                if let Some(error) = controlled_accounting_failure() {
+            // Sample only the owned attempt on every lifecycle iteration. The
+            // 10ms sleep, host scheduling and accounting refresh do not impose
+            // a hard CPU-overshoot bound, especially with parallel descendants.
+            if let Some(error) = controlled_accounting_failure() {
+                break reserved_or_external(
+                    FirstCause::AccountingUnavailable { error },
+                    already_reserved,
+                );
+            }
+            let observed = match cgroup.cpu_usage_usec() {
+                Ok(observed) => observed,
+                Err(error) => {
                     break reserved_or_external(
                         FirstCause::AccountingUnavailable { error },
                         already_reserved,
                     );
                 }
-                let observed = match cgroup.cpu_usage_usec() {
-                    Ok(observed) => observed,
-                    Err(error) => {
-                        break reserved_or_external(
-                            FirstCause::AccountingUnavailable { error },
-                            already_reserved,
-                        );
-                    }
-                };
-                if observed < max_cpu_usec {
-                    break reserved_or_external(
-                        FirstCause::AccountingUnavailable {
-                            error: format!(
-                                "owned attempt cpu.stat regressed from {max_cpu_usec}us to {observed}us"
-                            ),
-                        },
-                        already_reserved,
-                    );
-                }
-                max_cpu_usec = observed;
-                if observed >= cpu_budget_usec {
-                    let cause = reserved_or_external(
-                        FirstCause::CpuTimeout {
-                            observed_cpu_usec: observed,
-                        },
-                        already_reserved,
-                    );
-                    if !matches!(cause, FirstCause::CpuTimeout { .. }) {
-                        break cause;
-                    }
-                    if let Ok(path) = env::var(CONTROL_CAUSE_FILE_ENV) {
-                        let _ = fs::write(path, b"cpu_timeout\n");
-                    }
+            };
+            if observed < max_cpu_usec {
+                break reserved_or_external(
+                    FirstCause::AccountingUnavailable {
+                        error: format!(
+                            "owned attempt cpu.stat regressed from {max_cpu_usec}us to {observed}us"
+                        ),
+                    },
+                    already_reserved,
+                );
+            }
+            max_cpu_usec = observed;
+            if observed >= cpu_budget_usec {
+                let cause = reserved_or_external(
+                    FirstCause::CpuTimeout {
+                        observed_cpu_usec: observed,
+                    },
+                    already_reserved,
+                );
+                if !matches!(cause, FirstCause::CpuTimeout { .. }) {
                     break cause;
                 }
-                if now >= next_cpu_poll {
-                    next_cpu_poll = now + CPU_POLL_INTERVAL;
+                if let Ok(path) = env::var(CONTROL_CAUSE_FILE_ENV) {
+                    let _ = fs::write(path, b"cpu_timeout\n");
                 }
+                break cause;
             }
             if completed_success {
                 break FirstCause::Exit(
@@ -1739,6 +1948,15 @@ fn control_child(mode: &str, args: &[OsString]) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         "failure-after-burn" => {
+            if env::var_os(CONTROL_ENTRY_DEADLINE_NS_ENV).is_some() {
+                let deadline = EntryControlDeadline::from_env()?;
+                let pid_file = PathBuf::from(required_env(CONTROL_PID_FILE_ENV)?);
+                let resume_file = PathBuf::from(required_env(CONTROL_ENROLLMENT_FILE_ENV)?);
+                publish_entry_control(&pid_file, format!("{}\n", std::process::id()).as_bytes())?;
+                if wait_for_entry_control_file(&resume_file, deadline, None)? != b"release\n" {
+                    return Err("entry control received an invalid child release".into());
+                }
+            }
             burn_cpu(150);
             Ok(ExitCode::from(23))
         }
@@ -1970,6 +2188,9 @@ fn control_command_with_limits(
         .env(PACKAGE_ENV, "fixture")
         .env(ATTEMPT_ENV, attempt.to_string())
         .env(CONTROL_ARM_ENV, "1")
+        .env_remove(CONTROL_ENTRY_DEADLINE_NS_ENV)
+        .env_remove(CONTROL_ENTRY_REACHED_FILE_ENV)
+        .env_remove(CONTROL_ENTRY_RESUME_FILE_ENV)
         .env(CONTROL_CWD_ENV, scratch)
         .env(CONTROL_SENTINEL_ENV, "preserved")
         .env(CONTROL_PROC_ROOT_ENV, "/proc")
@@ -1999,6 +2220,9 @@ fn measurement_control_command(
         .env(PACKAGE_ENV, "fixture")
         .env(ATTEMPT_ENV, attempt.to_string())
         .env(CONTROL_ARM_ENV, "1")
+        .env_remove(CONTROL_ENTRY_DEADLINE_NS_ENV)
+        .env_remove(CONTROL_ENTRY_REACHED_FILE_ENV)
+        .env_remove(CONTROL_ENTRY_RESUME_FILE_ENV)
         .env(CONTROL_CWD_ENV, scratch)
         .env(CONTROL_SENTINEL_ENV, "preserved")
         .env(TEST_CPU_TIMEOUT_MULTIPLIER_ENV, "99")
@@ -2186,6 +2410,99 @@ fn catching_signal_control(
         ));
     }
     fs::read(signal_file).map_err(|e| e.to_string())
+}
+
+fn exit_before_first_reap_control(
+    mut command: Command,
+    scratch: &Path,
+) -> Result<(std::process::Output, u32), String> {
+    // The one deadline includes startup, both releases, terminal observation,
+    // and wrapper completion. No rendezvous helper starts another allowance.
+    let deadline = EntryControlDeadline::start()?;
+    let entry_file = scratch.join("nonzero-exit-entry-reached");
+    let resume_file = scratch.join("nonzero-exit-entry-resume");
+    let pid_file = scratch.join("nonzero-exit-child-pid");
+    let burn_file = scratch.join("nonzero-exit-child-resume");
+    command
+        .env(CONTROL_ENTRY_DEADLINE_NS_ENV, deadline.0.to_string())
+        .env(CONTROL_ENTRY_REACHED_FILE_ENV, &entry_file)
+        .env(CONTROL_ENTRY_RESUME_FILE_ENV, &resume_file)
+        .env(CONTROL_PID_FILE_ENV, &pid_file)
+        .env(CONTROL_ENROLLMENT_FILE_ENV, &burn_file);
+    let child = command
+        .spawn()
+        .map_err(|error| format!("cannot run nonzero-exit CPU race control: {error}"))?;
+    let wrapper_pidfd = PidFd::open(child.id()).map_err(|error| {
+        format!(
+            "{error}; entry-control wrapper cleanup is unconfirmed and requires outer cgroup containment"
+        )
+    })?;
+    let mut wrapper = Some(child);
+    let result = (|| {
+        let entry_pid = wait_for_entry_control_file(&entry_file, deadline, Some(&wrapper_pidfd))?;
+        let child_pid = wait_for_entry_control_file(&pid_file, deadline, Some(&wrapper_pidfd))?;
+        if entry_pid != child_pid {
+            return Err("entry-control wrapper and waiting child identities disagree".into());
+        }
+        let child_pid = std::str::from_utf8(&child_pid)
+            .map_err(|error| format!("entry-control child PID is not UTF-8: {error}"))?
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| "entry-control child PID is not positive".to_string())?;
+        let child_pidfd = PidFd::open(child_pid)?;
+        if child_pidfd.terminal_ready_for_control()? {
+            return Err("entry-control child terminated before its burn was released".into());
+        }
+        if wrapper_pidfd.terminal_ready_for_control()? {
+            return Err("entry-control wrapper terminated before its release".into());
+        }
+        deadline.remaining()?;
+        publish_entry_control(&burn_file, b"release\n")?;
+        wait_for_entry_control_terminal(&child_pidfd, deadline, Some(&wrapper_pidfd))?;
+
+        // The wrapper is still at its entry seam; its next loop must perform
+        // actual wait4. The observer never consumes the child's terminal status.
+        deadline.remaining()?;
+        publish_entry_control(&resume_file, b"release\n")?;
+        wait_for_entry_control_terminal(&wrapper_pidfd, deadline, None)?;
+        let output = wrapper
+            .take()
+            .expect("entry control still owns its wrapper")
+            .wait_with_output()
+            .map_err(|error| format!("cannot collect entry-control wrapper output: {error}"))?;
+        deadline.remaining()?;
+        Ok((output, child_pid))
+    })();
+    match result {
+        Ok(output) => Ok(output),
+        Err(error) => {
+            let mut errors = vec![error];
+            if let Some(mut wrapper) = wrapper {
+                // Never rescue through a numeric PID or turn emergency cleanup
+                // into a successful control. The owned wrapper performs its
+                // ordinary cgroup cleanup; the outer owner handles any timeout.
+                if let Err(error) = wrapper_pidfd.signal(libc::SIGTERM) {
+                    errors.push(format!("entry-control cleanup signal failed: {error}"));
+                }
+                match wait_for_entry_control_terminal(&wrapper_pidfd, deadline, None) {
+                    Ok(()) => match wrapper.wait() {
+                        Ok(status) => errors.push(format!(
+                            "entry-control wrapper reaped after failure: {status}"
+                        )),
+                        Err(error) => errors.push(format!(
+                            "cannot reap entry-control wrapper after failure: {error}"
+                        )),
+                    },
+                    Err(error) => errors.push(format!(
+                        "{error}; wrapper/attempt cleanup is unconfirmed and requires outer cgroup containment"
+                    )),
+                }
+            }
+            Err(errors.join("; "))
+        }
+    }
 }
 
 fn self_test() -> Result<(), String> {
@@ -2450,17 +2767,18 @@ fn self_test() -> Result<(), String> {
         }
     }
 
-    let exit_over_budget = control_command_with_limits(
-        &executable,
-        &test_binary,
+    let (exit_over_budget, exit_over_budget_pid) = exit_before_first_reap_control(
+        control_command_with_limits(
+            &executable,
+            &test_binary,
+            &scratch.0,
+            "failure-after-burn",
+            1,
+            50_000,
+            100,
+        ),
         &scratch.0,
-        "failure-after-burn",
-        1,
-        50_000,
-        100,
-    )
-    .output()
-    .map_err(|error| format!("cannot run nonzero-exit CPU race control: {error}"))?;
+    )?;
     if exit_over_budget.status.code() != Some(23) {
         return Err(format!(
             "a later budget check replaced an observed nonzero exit: {exit_over_budget:?}"
@@ -2960,6 +3278,14 @@ fn self_test() -> Result<(), String> {
     {
         return Err(format!(
             "nonzero exit was not retained ahead of a later budget result: {exit_over_budget_record:?}"
+        ));
+    }
+    if !exit_over_budget_record.wait4.iter().any(|receipt| {
+        receipt.pid == exit_over_budget_pid
+            && ExitStatus::from_raw(receipt.status).code() == Some(23)
+    }) {
+        return Err(format!(
+            "entry control lost the witnessed child's actual exit-23 wait4 receipt: {exit_over_budget_record:?}"
         ));
     }
     for mode in ["auto-reap-ignored", "auto-reap-nocldwait"] {
