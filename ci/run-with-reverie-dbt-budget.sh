@@ -368,14 +368,14 @@ fi
 # threshold and 16-job clamp. The native KVM repair requires its own
 # qualification; this is source-identity carry, not a new timing sample,
 # SDK cache-key measurement, guest result or earlier receipt reuse.
-# CARRY TO be09e5100bca6dad77aede0349de9a5c92990854 (2026-09-20): relative to
+# CARRY TO 1fdadb7940dc232d07c1e36494f0f102b74f3140 (2026-09-20): relative to
 # f7bd85e11dd258112148ed2cba6531501a1a00d9, reverie-dbt/build.rs has no
 # diff and the DynamoRIO vendor tree remains
 # 117d54d744df23921c531d0fe08537249f5a510a. Preserve the existing CMAKE and
 # CMAKE_GENERATOR selection, 16-job clamp, and 1050 effective-job-second
 # threshold. This source-identity carry adds no timing sample, guest result,
 # or runtime qualification; all prior calibration limitations remain.
-expected_pin=be09e5100bca6dad77aede0349de9a5c92990854
+expected_pin=1fdadb7940dc232d07c1e36494f0f102b74f3140
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
