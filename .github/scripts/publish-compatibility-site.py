@@ -343,8 +343,8 @@ if MODE == "extract":
     FILE_BYTES = PIN["file_bytes"]
     DIRECTORIES = tuple(PIN["directories"])
     EXPECTED_COUNTS = PIN["counts"]
-elif MODE not in ("finalize", "validate"):
-    refuse("expected validate, extract, or finalize mode")
+elif MODE not in ("finalize", "validate", "describe", "validate-update"):
+    refuse("expected validate, validate-update, describe, extract, or finalize mode")
 
 
 def canonical(value: object) -> bytes:
@@ -532,6 +532,42 @@ def finalize_publication(registry: dict, publication_root: Path) -> None:
         [*identities, "latest"]
     ):
         refuse("final publication path inventory is not exact")
+    # Nightly publication extends the same immutable registry. Retain it beside
+    # the trees so the next rebuild cannot erase an earlier nightly identity.
+    registry_path = publication_root / "releases.json"
+    registry_path.write_bytes(canonical(registry) + b"\n")
+    registry_path.chmod(0o444)
+
+
+if MODE == "describe":
+    if len(sys.argv) != 3:
+        refuse("describe mode requires one validated website directory")
+    root = Path(sys.argv[2])
+    build_bytes = (root / "build.json").read_bytes()
+    build = json.loads(build_bytes, object_pairs_hook=reject_duplicate_object)
+    result = tree_measurements(root)
+    result.update(
+        identity=build["freshness_sha256"],
+        build_sha256=hashlib.sha256(build_bytes).hexdigest(),
+        artifacts_sha256=build["artifacts_sha256"],
+        manifest_tree_sha256=build["tree_sha256"],
+        counts=build["counts"],
+        directories=sorted(directory["path"] for directory in build["directories"] if directory["path"] != "."),
+    )
+    print(json.dumps(result, sort_keys=True))
+    raise SystemExit(0)
+
+
+if MODE == "validate-update":
+    if len(sys.argv) != 6:
+        refuse("validate-update requires proposed, checked-in, repository and published registries")
+    proposed, checked_in, repository, published = map(Path, sys.argv[2:])
+    current = load_registry(proposed)
+    baseline = load_registry(checked_in)
+    previous = load_registry(published)
+    require_append_only(current, [baseline, previous, *load_historical_registries(checked_in, repository)])
+    print("verified nightly registry preserves checked-in and previously published identities")
+    raise SystemExit(0)
 
 
 if MODE == "validate":
