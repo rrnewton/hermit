@@ -2844,7 +2844,7 @@ impl RunOpts {
     /// guest launch. Both halves of `--verify` and every backend then receive the
     /// same concrete `DateTime`; Detcore never reads the host clock itself.
     pub(crate) fn capture_default_epoch(&mut self, capture_now: impl FnOnce() -> SystemTime) {
-        if self.det_opts.det_config.virtualize_time {
+        if self.uses_virtual_time_determinization() {
             self.det_opts
                 .det_config
                 .capture_epoch_from_host_time(capture_now());
@@ -2858,6 +2858,21 @@ impl RunOpts {
             self.det_opts.det_config.epoch.to_rfc3339(),
             self.epoch_captured_from_host,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reports_virtual_epoch_for_test(&self) -> bool {
+        self.uses_virtual_time_determinization()
+    }
+
+    /// Whether this execution path actually feeds virtual time to a guest.
+    /// Namespace-only bypasses Detcore, while strace-only deliberately turns
+    /// all determinization off during validation; neither owns an epoch input.
+    fn uses_virtual_time_determinization(&self) -> bool {
+        self.det_opts.det_config.virtualize_time
+            && !self.namespace_only
+            && !self.strace_only
+            && !self.hb_list_events
     }
 
     fn epoch_rfc3339(&self) -> String {
@@ -3092,7 +3107,7 @@ impl RunOpts {
         // subsequent tracing_subscriber::fmt::init() call.
         // tracing::subscriber::with_default(super::tracing::stderr_subscriber(global.log), || {
         self.validate_args()?;
-        if self.det_opts.det_config.virtualize_time {
+        if self.uses_virtual_time_determinization() {
             let epoch = self.epoch_rfc3339();
             let source = if self.epoch_captured_from_host {
                 "host-now"

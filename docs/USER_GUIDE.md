@@ -475,7 +475,7 @@ the default equal-priority policy.
 | --- | --- |
 | `--seed=N` | Sets the fallback random seed. |
 | `--rng-seed=N` | Sets only guest random-data generation. |
-| `--epoch=TIMESTAMP` | Sets the virtual clock's RFC 3339 starting time. When omitted, `hermit run` captures the host wall clock once at invocation start, prints the resolved value, and uses it as an immutable input for the whole run (including both `--verify` executions). Pass that printed value explicitly to reproduce the same virtual-time trajectory. |
+| `--epoch=TIMESTAMP` | Sets the virtual clock's RFC 3339 starting time. When omitted, `hermit run` and `hermit oci run` capture the host wall clock once at invocation start, print the resolved value, and use it as an immutable input for the whole run (including both `--verify` executions). Bypass modes such as `--namespace-only` and `--strace-only` neither capture nor report a virtual epoch. Pass a printed value explicitly to reproduce the same virtual-time trajectory. |
 | `--clock-multiplier=F` | Changes the rate of virtual time. |
 | `--no-virtualize-time` | Uses host time; also requires `--no-virtualize-metadata`. |
 | `--no-virtualize-cpuid` | Exposes host CPUID behavior. |

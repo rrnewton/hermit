@@ -228,12 +228,19 @@ fn args_from_matches_with_clock(
 ) -> Result<Args, clap::Error> {
     let run_epoch_source = matches
         .subcommand_matches("run")
+        .or_else(|| {
+            matches
+                .subcommand_matches("oci")
+                .and_then(|oci| oci.subcommand_matches("run"))
+        })
         .and_then(|run| run.value_source("epoch"));
     let mut args = Args::from_arg_matches(matches)?;
-    if run_epoch_source == Some(ValueSource::DefaultValue)
-        && let Subcommand::Run(run) = &mut args.command
-    {
-        run.capture_default_epoch(capture_now);
+    if run_epoch_source == Some(ValueSource::DefaultValue) {
+        match &mut args.command {
+            Subcommand::Run(run) => run.capture_default_epoch(capture_now),
+            Subcommand::Oci(oci) => oci.capture_default_run_epoch(capture_now),
+            _ => unreachable!("only run subcommands carry an epoch"),
+        }
     }
     Ok(args)
 }
@@ -738,6 +745,87 @@ mod tests {
             panic!("expected run")
         };
         assert!(!run.epoch_capture_for_test().1);
+    }
+
+    #[test]
+    fn namespace_only_run_epoch_is_neither_captured_nor_reported() {
+        let matches = Args::command()
+            .try_get_matches_from(["hermit", "run", "--namespace-only", "/bin/true"])
+            .unwrap();
+        let args = args_from_matches_with_clock(&matches, || {
+            panic!("namespace-only bypasses Detcore and must not capture host time")
+        })
+        .unwrap();
+        let Subcommand::Run(run) = args.command else {
+            panic!("expected run")
+        };
+        assert!(!run.epoch_capture_for_test().1);
+        assert!(!run.reports_virtual_epoch_for_test());
+    }
+
+    #[test]
+    fn strace_only_run_epoch_is_neither_captured_nor_reported() {
+        let matches = Args::command()
+            .try_get_matches_from(["hermit", "run", "--strace-only", "/bin/true"])
+            .unwrap();
+        let args = args_from_matches_with_clock(&matches, || {
+            panic!("strace-only disables virtual time and must not sample the host clock")
+        })
+        .unwrap();
+        let Subcommand::Run(run) = args.command else {
+            panic!("expected run")
+        };
+        assert!(!run.epoch_capture_for_test().1);
+        assert!(!run.reports_virtual_epoch_for_test());
+    }
+
+    #[test]
+    fn omitted_oci_run_epoch_is_captured_once_with_host_provenance() {
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_933_135_628);
+        let args = parse_at(
+            [
+                "hermit",
+                "oci",
+                "run",
+                "example.invalid/image:tag",
+                "--",
+                "/bin/true",
+            ],
+            now,
+        );
+        let Subcommand::Oci(oci) = args.command else {
+            panic!("expected oci")
+        };
+        assert_eq!(
+            oci.run_epoch_capture_for_test(),
+            ("2031-04-05T06:07:08+00:00".to_owned(), true, true)
+        );
+    }
+
+    #[test]
+    fn explicit_oci_run_epoch_preserves_explicit_provenance() {
+        let matches = Args::command()
+            .try_get_matches_from([
+                "hermit",
+                "oci",
+                "run",
+                "example.invalid/image:tag",
+                "--epoch=2000-12-31T23:59:59Z",
+                "--",
+                "/bin/true",
+            ])
+            .unwrap();
+        let args = args_from_matches_with_clock(&matches, || {
+            panic!("an explicit OCI epoch must not read the host clock")
+        })
+        .unwrap();
+        let Subcommand::Oci(oci) = args.command else {
+            panic!("expected oci")
+        };
+        assert_eq!(
+            oci.run_epoch_capture_for_test(),
+            ("2000-12-31T23:59:59+00:00".to_owned(), false, true)
+        );
     }
 
     #[test]

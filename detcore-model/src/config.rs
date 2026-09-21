@@ -204,8 +204,8 @@ pub struct Config {
     /// This is the datetime from which all time and date modtimes begin and
     /// monotonically increase. It is in RFC3339 format such as `2026-01-01T00:00:00Z`.
     /// The stable default here is for library callers and wire-format fixtures;
-    /// the `hermit run` command replaces an omitted CLI default with one host
-    /// wall-clock sample taken before backend dispatch.
+    /// the `hermit run` and `hermit oci run` commands replace an omitted CLI
+    /// default with one host wall-clock sample taken before backend dispatch.
     #[clap(
         long,
         env = "HERMIT_EPOCH",
