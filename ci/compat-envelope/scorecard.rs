@@ -1872,7 +1872,7 @@ impl ResultRow {
     }
 
     fn evidence_identity(&self) -> Result<String, String> {
-        let evidence = serde_json::json!({
+        let mut evidence = serde_json::json!({
             "run_id": self.run_id,
             "attempt": self.attempt,
             "hermit_sha": self.hermit_sha,
@@ -1895,8 +1895,12 @@ impl ResultRow {
             "shell_command": self.shell_command,
             "relaxations": self.relaxations,
             "attempts": self.attempts,
-            "backend_parity": self.backend_parity,
         });
+        // Ordinary evidence predates backend parity. Keep its original hash;
+        // a present typed parity witness remains part of the exact identity.
+        if let Some(parity) = &self.backend_parity {
+            evidence["backend_parity"] = serde_json::json!(parity);
+        }
         let encoded = serde_json::to_vec(&evidence)
             .map_err(|error| format!("cannot encode result evidence: {error}"))?;
         Ok(format!("{:x}", Sha256::digest(encoded)))
@@ -23245,5 +23249,133 @@ mod post_verdict_transaction_tests {
             read_generated_files(&fixture.root).unwrap() == source_before,
             "ledger publication must not mutate Hermit's catalogue or page"
         );
+    }
+}
+
+#[cfg(test)]
+mod evidence_identity_tests {
+    use super::*;
+
+    const ORDINARY: &str = "9bf1be90807ed0c84ae4592759239ad264779bd962a220542cca372d2151f032";
+    const NULL_ERA: &str = "2d5035f82310e8774916d85ebf59afb89634c1e4ba789835166a33b396a8874e";
+
+    // Fixed synthetic failed/no-result input from the real parent transaction
+    // regression. The golden is the parent's immutable ordinary-row identity.
+    fn ordinary() -> ResultRow {
+        serde_json::from_str(r#"{"argv":["hermit","run","--verify","fixture"],"attempt":1,"attempts":[{"argv":["hermit","run","--verify","fixture"],"cwd":"/repo","env":{"LC_ALL":"C"},"error_kind":"incomplete-verification-evidence","guest_argv":["fixture"],"index":"1","outcome":"ERROR","shell_command":"cd /repo && env LC_ALL=C hermit run --verify fixture","signal":null,"status":75,"timed_out":false,"verification_report":"{\"bitwise_parity\":false,\"compared_log_messages\":null,\"comparison\":null,\"first_divergent_left_message\":null,\"first_divergent_record\":null,\"first_divergent_right_message\":null,\"first_divergent_scheduler_turn\":null,\"first_divergent_syscall\":null,\"first_divergent_virtual_nanoseconds\":null,\"guest_exit_code\":null,\"guest_signal\":null,\"infrastructure_error\":null,\"no_result_reason\":{\"kind\":\"not_run\"},\"runtime\":null,\"verdict\":\"no_result\",\"verified\":false}","verification_report_sha256":"0cf756d63a02c73f989586d9f6572c428ce52d55a510ffa4659baab4bdcef405"}],"backend":"ptrace","binary_sha256":"0f533a26257a88f0550ddbabdb318a47f029991cfcf743714ce7f6ee3243105b","category":"fixture","classification":"required","cwd":"/repo","effective_args":["run","--verify","fixture"],"env":{"LC_ALL":"C"},"execution_cpu_timeout_seconds":10,"execution_wall_timeout_seconds":15,"failure_class":"no_result","guest_argv":["fixture"],"hermit_sha":"e6a1657c5cbe966d24f70ae88151471ca3fbd362","lane":"portable","log_level":"info","mode":"verify","outcome":"ERROR","relaxations":[],"result":null,"run_id":"finalized-a","schema":4,"shell_command":"cd /repo && env LC_ALL=C hermit run --verify fixture","source_tree_dirty":false,"test":"fixture/no-result","test_sha256":"f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d","timeout_seconds":15}"#).unwrap()
+    }
+
+    fn parity() -> ResultRow {
+        let mut row: JsonValue = serde_json::from_str(r#"{"argv":["hermit","run","--backend","sabre"],"attempt":1,"attempts":[],"backend":"sabre","binary_sha256":"0f533a26257a88f0550ddbabdb318a47f029991cfcf743714ce7f6ee3243105b","category":"fixture","classification":"required","cwd":"/repo","effective_args":["run","--backend","sabre"],"env":{"LC_ALL":"C"},"execution_cpu_timeout_seconds":10,"execution_wall_timeout_seconds":15,"failure_class":null,"guest_argv":["fixture"],"hermit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","lane":"portable","log_level":"info","mode":"verify","outcome":"PASS","relaxations":[],"result":"pass","run_id":"typed-parity-identity-fixture","schema":4,"shell_command":"cd /repo && env LC_ALL=C hermit run --backend sabre","source_tree_dirty":false,"test":"fixture/no-result","test_sha256":"f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d","timeout_seconds":15}"#).unwrap();
+        let verification: JsonValue = serde_json::from_str(r#"{"bitwise_parity":true,"compared_log_messages":{"left":1,"right":1},"compared_outputs":{"left":{"exit_code":0,"signal":null,"stderr_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stdout_bytes":1,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"right":{"exit_code":0,"signal":null,"stderr_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stdout_bytes":1,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"comparison":{"canonicalizations":["host-address-to-first-appearance-ordinal/v1"],"canonicalize_addresses":true,"compare_io_buffers":true,"compare_logs":true,"display_name":"BitwiseInfoV1","exact_remainder":true,"full_trace":true,"ignore_lines":false,"log_scope":"info","record_envelope":"all_records_v1","skip_commit":false,"skip_detlog":false,"strictness":"canonical","strip_lines":false,"stripped_prefixes":["real-wall-clock-prefix/v1"],"virtualize_time":true},"first_divergent_left_message":null,"first_divergent_record":null,"first_divergent_right_message":null,"first_divergent_scheduler_turn":null,"first_divergent_syscall":null,"first_divergent_virtual_nanoseconds":null,"guest_exit_code":0,"guest_signal":null,"infrastructure_error":null,"no_result_reason":null,"verdict":"matched","verified":true}"#).unwrap();
+        let report = serde_json::to_string(&verification).unwrap();
+        let mut attempts = Vec::new();
+        for (backend, index) in [("sabre", "1"), ("ptrace", "parity-reference")] {
+            attempts.push(serde_json::json!({
+                "index":index,"outcome":"PASS","error_kind":null,"status":0,
+                "signal":null,"timed_out":false,
+                "argv":["hermit","run","--backend",backend],"guest_argv":["fixture"],
+                "env":{"LC_ALL":"C"},"cwd":"/repo",
+                "shell_command":format!("cd /repo && env LC_ALL=C hermit run --backend {backend}"),
+                "verification_report":report,
+                "verification_report_sha256":format!("{:x}",Sha256::digest(report.as_bytes()))
+            }));
+        }
+        row["attempts"] = serde_json::json!(attempts);
+        let operand = |backend: &str, digest: &str| {
+            serde_json::json!({
+                "backend":backend,"verification":verification,
+                "output":verification["compared_outputs"]["left"],
+                "retained_log":format!("{backend}.log"),"retained_log_sha256":digest.repeat(64)
+            })
+        };
+        row["backend_parity"] = serde_json::json!({
+            "schema":1,"verdict":"matched","reference":operand("ptrace","c"),
+            "candidate":operand("sabre","d"),"comparison":{"schema": 1, "verdict": "matched", "inputs": {"left": {"sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "bytes": 10}, "right": {"sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "bytes": 10}}, "selected_messages": {"left": 1, "right": 1}, "records": {"compared": 1, "available_left": 1, "available_right": 1, "withheld_incomplete_tail": false}, "comparison": {"stream": "info", "record_envelope": "cross_backend_detcore_v1", "unsafe_strip_lines": false, "canonicalize_host_addresses": true, "require_structured_events": true, "ignored_line_substrings": [], "skip_commit": false, "skip_detlog": false, "included_detlog_kinds": ["syscall", "syscall_result", "other"], "git_diff": false}, "first_divergent_scheduler_turn": null, "first_divergent_virtual_nanoseconds": null, "first_divergent_record": null, "first_divergent_syscall": null, "first_divergent_left_message": null, "first_divergent_right_message": null}
+        });
+        serde_json::from_value(row).unwrap()
+    }
+
+    #[test]
+    fn ordinary_identity_keeps_absent_and_null_parity_replay_bytes() {
+        let row = ordinary();
+        row.comparison_evidence().unwrap();
+        assert_eq!(row.evidence_identity().unwrap(), ORDINARY);
+        let explicit_null: ResultRow =
+            serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
+        assert_eq!(explicit_null.evidence_identity().unwrap(), ORDINARY);
+        assert_ne!(ORDINARY, NULL_ERA);
+        let mut changed = row;
+        changed.attempts[0]["status"] = serde_json::json!(74);
+        assert_ne!(changed.evidence_identity().unwrap(), ORDINARY);
+    }
+
+    #[test]
+    fn present_parity_preserves_its_full_typed_witness_identity() {
+        let row = parity();
+        row.comparison_evidence().unwrap();
+        // Independently computed by the unchanged parent's typed serializer.
+        assert_eq!(
+            row.evidence_identity().unwrap(),
+            "9193b921e05087f3768cab0a30625ab20f42b54731c0c5f2caffe2b157b67ee3"
+        );
+        let mut changed = row;
+        let witness = changed.backend_parity.as_mut().unwrap();
+        witness.candidate.retained_log_sha256 = "e".repeat(64);
+        assert!(changed.comparison_evidence().is_err());
+        changed
+            .backend_parity
+            .as_mut()
+            .unwrap()
+            .comparison
+            .inputs
+            .as_mut()
+            .unwrap()
+            .right
+            .sha256 = "e".repeat(64);
+        changed.comparison_evidence().unwrap();
+        assert_ne!(
+            changed.evidence_identity().unwrap(),
+            "9193b921e05087f3768cab0a30625ab20f42b54731c0c5f2caffe2b157b67ee3"
+        );
+    }
+
+    #[test]
+    fn unresolved_null_era_receipt_is_preserved_and_refused() {
+        let row = ordinary();
+        let source: SeriesRow = serde_json::from_str(r#"{"emitted_at":"2026-09-21T12:00:00Z","event_id":"series-b5769c0e4c118dcfde4edc338197faa6d73103fbccacd2f58186473168870bb5","event_type":"series.observation","host":"fixture","producer":"validate","run_id":"finalized-a","schema":"stress-series/v3","series":{"attempt":1,"cell":"fixture/no-result/verify/ptrace","depth":{"hermit":{"commits":2,"first_parent":2}},"detcore_tree":"6dcaa1b03f8a53bc21bf714b2a0465845994b680","failure_class":"no_result","host_capabilities":{"cpuid-faulting":{"evidence":"Synthetic fixture — no hardware probe","present":false},"kvm":{"evidence":"Synthetic fixture — no hardware probe","present":false}},"kernel_version":"fixture-no-execution","machine_shortname":"fixture","main_ancestry":true,"no_verdict_evidence":{"attempts":[{"attempt_outcome":"ERROR","disposition":"no_result","error_kind":"incomplete-verification-evidence","index":"1","kind":"not_run","signal":null,"status":75,"timed_out":false,"verification_report_sha256":"0cf756d63a02c73f989586d9f6572c428ce52d55a510ffa4659baab4bdcef405"}],"evidence_sha256":"9bf1be90807ed0c84ae4592759239ad264779bd962a220542cca372d2151f032"},"num_runs":1,"outcome":"no_result","result":null,"run_index":1,"runtime":{"wall_time_max_ms":null,"wall_time_min_ms":null},"source_tree_dirty":false,"tree":"e6a1657c5cbe966d24f70ae88151471ca3fbd362"},"team":"hermit"}"#).unwrap();
+        let mut tracked: TrackedCells = serde_json::from_value(serde_json::json!({
+            "schema":8,"cells":[{"lane":row.lane,"category":row.category,"test":row.test,
+            "mode":row.mode,"backend":row.backend,"status":"green",
+            "measurement":"measured-no-verdict","observations":[{
+                "detcore_tree":source.series.detcore_tree,"provenance":"validate",
+                "hermit_shas":[row.hermit_sha],"results":[],"invocations":[{
+                    "hermit_sha":row.hermit_sha,"run_id":row.run_id,"attempt":1,
+                    "evidence_sha256":ORDINARY,"argv":row.argv,"guest_argv":row.guest_argv,
+                    "env":row.env,"cwd":row.cwd,"shell_command":row.shell_command,
+                    "attempts":row.attempts
+                }]
+            }]}]
+        }))
+        .unwrap();
+        let rows = [source];
+        let exact = direct_representation(&tracked, &rows, &CurrentResultAttempts::new()).unwrap();
+        assert_eq!(
+            exact.represented_event_ids,
+            BTreeSet::from([rows[0].event_id.clone()])
+        );
+        assert!(!exact.has_unrepresented_direct_evidence);
+        let observations = &mut tracked.cells[0].observations;
+        let mut old = observations[0].invocations.pop_first().unwrap();
+        old.evidence_sha256 = Some(NULL_ERA.into());
+        observations[0].invocations.insert(old);
+        let before = serde_json::to_vec(&tracked).unwrap();
+        let error =
+            direct_representation(&tracked, &rows, &CurrentResultAttempts::new()).unwrap_err();
+        assert!(
+            error.contains("disagrees with its exact direct result or outer attempt"),
+            "{error}"
+        );
+        assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
     }
 }
