@@ -47,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y libunwind-dev zstd
+          sudo apt-get install -y liblzma-dev libunwind-dev zstd
           channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1)"
           test -n "$channel"
           rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
@@ -75,6 +75,26 @@ jobs:
         timeout-minutes: 45
         shell: bash
         run: ./bootstrap/regenerate-rust-deps
+
+      - name: Configure Buck Rust flags
+        shell: bash
+        env:
+          RUSTFLAGS: -C link-arg=-llzma
+        run: |
+          set -euo pipefail
+          # Buck invokes rustc directly, so Cargo's RUSTFLAGS is not consumed.
+          wrapper_dir="$RUNNER_TEMP/buck2-rustc-wrapper"
+          real_rustc="$(rustup which rustc)"
+          read -r -a rustflags <<<"$RUSTFLAGS"
+          mkdir -p "$wrapper_dir"
+          {
+            echo '#!/usr/bin/env bash'
+            printf 'exec %q' "$real_rustc"
+            printf ' %q' "${rustflags[@]}"
+            printf ' "$@"\n'
+          } >"$wrapper_dir/rustc"
+          chmod +x "$wrapper_dir/rustc"
+          echo "$wrapper_dir" >>"$GITHUB_PATH"
 
       - name: Build the four Reverie targets
         timeout-minutes: 45
