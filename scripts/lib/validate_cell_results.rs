@@ -398,6 +398,15 @@ fn manifest_cell_scope(cell: &Value) -> Result<Value, String> {
             scoped.insert(key.into(), value.clone());
         }
     }
+    if cell.get("observations").is_none() {
+        // A catalogue is selection data. Missing history is not zero history.
+        scoped.insert("history_available".into(), Value::Bool(false));
+        scoped.insert("observed_pass_count".into(), Value::Null);
+        scoped.insert("observed_fail_count".into(), Value::Null);
+        scoped.insert("observed_other_results".into(), Value::Null);
+        return Ok(Value::Object(scoped));
+    }
+    scoped.insert("history_available".into(), Value::Bool(true));
     let mut passes = 0u64;
     let mut failures = 0u64;
     let mut other = BTreeMap::<String, u64>::new();
@@ -1102,6 +1111,22 @@ mod tests {
             "execution_wall_timeout_seconds": 57,
             "attempts": [attempt(&matched)]
         })
+    }
+
+    #[test]
+    fn catalogue_history_is_unavailable_not_zero_observations() {
+        let cell = serde_json::json!({"lane":"portable", "category":"c-programs", "test":"c-programs/a", "mode":"verify", "backend":"ptrace", "status":"green"});
+        let scope = manifest_cell_scope(&cell).unwrap();
+        assert_eq!(scope["status"], "green");
+        assert_eq!(scope["history_available"], false);
+        assert!(scope["observed_pass_count"].is_null());
+        assert!(scope["observed_fail_count"].is_null());
+        let mut empty_history = cell;
+        empty_history["observations"] = serde_json::json!([]);
+        let scope = manifest_cell_scope(&empty_history).unwrap();
+        assert_eq!(scope["history_available"], true);
+        assert_eq!(scope["observed_pass_count"], 0);
+        assert_eq!(scope["observed_fail_count"], 0);
     }
 
     #[test]
