@@ -33,6 +33,7 @@ agreeing with each other.
 | `hermit run --timeout N` | **one hermit invocation** = one guest execution, **ptrace and liteinst only** | the caller's argument | hermit drops the guest future and unwinds its own container | exit 124, `HERMIT_RUN_TIMEOUT class=run-timeout` |
 | hermit's unwind fallback | the same invocation, `N + 10s` | `RUN_TIMEOUT_UNWIND_GRACE` in `hermit-cli/src/lib.rs` | `_exit(124)` from a `SIGALRM` handler; no destructors | exit 124, `HERMIT_RUN_TIMEOUT_FALLBACK` |
 | `hermit record --record-timeout N` | one recording | the caller's argument | `_exit(124)` from a `SIGALRM` handler | exit 124 |
+| nextest per-test CPU limit | one cargo test process and its descendants | 22s base, scaled by the machine CPU multiplier | owned attempt cgroup: `SIGTERM`, 2s grace, then `cgroup.kill`; retain typed `cpu_timeout` | nextest fails the named test; CPU report identifies the inner limit |
 | nextest `slow-timeout` | **one cargo test process**, which may invoke hermit zero or many times | `.config/nextest.toml`: 57s base, scaled by the machine wall multiplier | `SIGTERM` to the test binary, 2s grace, then `SIGKILL` | wrapper exit 100, test named by nextest |
 | manifest cell CPU limit | all process-group CPU consumed by a cell's executions, aggregated across attempts or seeds | `cpu_timeout_seconds`: 22s default plus measured cell overrides, scaled by the machine CPU multiplier | the harness stops the process group and retains `error_kind=cpu-timeout` | typed cell `ERROR` |
 | manifest cell wall limit | fixture preparation and, separately, the complete execution phase | `timeout_seconds`: 57s default plus measured cell overrides, scaled by the machine wall multiplier | the harness stops the process group and retains `error_kind=wall-timeout` | typed cell `ERROR` |
@@ -73,9 +74,19 @@ Machine-specific CPU and wall multipliers are deliberately separate:
 `HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER` and
 `HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER`. Each defaults to `1`, must be a positive
 finite number, and scales its configured component with ceiling rounding. The
-nextest wrapper parses and rewrites every `slow-timeout.period` into a temporary
-TOML config with the wall multiplier, passes it with `--config-file`, and removes
-it on all exits. Validation refuses a wall multiplier whose scaled inner bounds
+nextest wrapper generates a temporary TOML config with the scaled 22-second CPU
+budget and every `slow-timeout.period` scaled by the wall multiplier, passes it
+with `--config-file`, and removes it on all exits. The CPU budget plus its
+two-second cleanup grace must remain below every finite wall termination bound
+(`period × terminate-after`); invalid or
+overflowing values refuse before tests start. Each test attempt runs in an owned
+cgroup so CPU used by descendants remains charged after their parent exits. A
+CPU stop is retained separately from a native failure, external signal, or
+nextest wall timeout; the first observed cause is preserved. Budgeted Nextest
+requires a writable delegated cgroup v2 subtree; normal boxed dagrun supplies
+`Delegate=yes`. A standalone invocation without delegation refuses rather than
+running without its CPU limit. This does not establish container-route support
+without an actual run in that container. Validation refuses a wall multiplier whose scaled inner bounds
 would outgrow a committed outer DAG backup. Current result rows carry both
 effective bounds as
 `execution_cpu_timeout_seconds` and `execution_wall_timeout_seconds`; readers
