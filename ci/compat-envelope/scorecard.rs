@@ -3342,16 +3342,26 @@ fn manifest_tool_root() -> Result<&'static Path, String> {
         .ok_or_else(|| "cannot locate the stable scorecard tool checkout".into())
 }
 
+fn manifest_target_dir(tool: &Path, configured: Option<&std::ffi::OsStr>) -> PathBuf {
+    configured
+        .map(PathBuf::from)
+        .unwrap_or_else(|| tool.join("target"))
+}
+
 fn derive(root: &Path) -> Result<Derived, String> {
     let tool = manifest_tool_root()?;
     let output = Command::new("cargo")
         .args(["run", "--quiet", "-p", "hermit-manifest-plan"])
         .arg("--manifest-path")
         .arg(tool.join("Cargo.toml"))
-        // Build once at the stable tool location; the measured checkout is
-        // an explicit data input, never inferred from the executable location.
+        // Immutable tool sources use the caller's standard mutable Cargo
+        // target. Direct callers retain the stable tool-local default; the
+        // measured checkout is always an explicit data input.
         .arg("--target-dir")
-        .arg(tool.join("target"))
+        .arg(manifest_target_dir(
+            tool,
+            env::var_os("CARGO_TARGET_DIR").as_deref(),
+        ))
         .args(["--", "--root"])
         .arg(root)
         .args(["--format", "matrix-json"])
@@ -14218,7 +14228,11 @@ fn self_test() -> Result<(), String> {
     // invocation. The comparison below checks retained bytes, not the identity
     // of every concurrently executing process.
     derive(&command_root)?;
-    let command_helper = manifest_tool_root()?.join("target/debug/hermit-manifest-plan");
+    let command_helper = manifest_target_dir(
+        manifest_tool_root()?,
+        env::var_os("CARGO_TARGET_DIR").as_deref(),
+    )
+    .join("debug/hermit-manifest-plan");
     let helper_sha256 = |path: &Path| -> Result<String, String> {
         let bytes = fs::read(path)
             .map_err(|error| format!("cannot read manifest helper {}: {error}", path.display()))?;
@@ -22373,6 +22387,24 @@ mod catalogue_ledger_tests {
                 "fixture",
             ],
         );
+    }
+
+    #[test]
+    fn manifest_build_target_is_separate_from_read_only_tool_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let tool = fixture.path().join("immutable-tool");
+        let output = fixture.path().join("mutable-target");
+        fs::create_dir(&tool).unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o555)).unwrap();
+        let selected = manifest_target_dir(&tool, Some(output.as_os_str()));
+        assert_eq!(selected, output);
+        fs::create_dir_all(selected.join("debug")).unwrap();
+        assert!(!tool.join("target").exists());
+        assert_eq!(manifest_target_dir(&tool, None), tool.join("target"));
+        assert_eq!(fs::metadata(&tool).unwrap().permissions().mode() & 0o222, 0);
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
