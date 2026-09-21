@@ -186,6 +186,114 @@ impl RawResultInputCensusV1 {
 }
 
 impl HistoryRow {
+    /// Verify finalized producer semantics against the complete retained raw
+    /// population and, when required, the original plan/cell/test artifacts.
+    /// Returns whether that population has zero rows, only after the full
+    /// selected-zero checks. Empty files remain separate census members.
+    ///
+    /// This does not establish canonical origin, select a ledger row, retain
+    /// file custody, or authorize a history proof. The canonical adapter must
+    /// acquire the exact row and repeat its query before durable publication.
+    pub fn verify_finalized_raw_input_bytes(
+        &self,
+        measured: &str,
+        started_at: &str,
+        inputs: &BTreeMap<String, Vec<u8>>,
+        artifact_bytes: Option<(&[u8], &[u8], &[u8])>,
+    ) -> Result<bool, String> {
+        self.run_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("finalized row omitted its run identity")?;
+        if self.commit.as_deref() != Some(measured)
+            || self.tree_dirty != Some(false)
+            || self.commit_anchored != Some(true)
+            || self.started_at.as_deref() != Some(started_at)
+            || self
+                .finished_at
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            || !matches!(self.result.as_deref(), Some("pass" | "fail" | "no_result"))
+        {
+            return Err(
+                "finalized row does not bind a terminal clean measured run and its stamp".into(),
+            );
+        }
+        let census = self.raw_result_input_census_v1()?.ok_or_else(|| {
+            format!(
+                "finalized run has no producer-bound raw input census: {}",
+                self.extra
+                    .get("raw_result_input_census_error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("historical absence cannot authorize current writeback")
+            )
+        })?;
+        census.verify_inputs(self, inputs)?;
+        let zero_cells = census.files.iter().all(|file| file.rows.is_empty());
+        if self.schema_version == Some(10) || zero_cells {
+            self.constructed_plan_artifact()?
+                .ok_or("zero-current proof requires schema 10")?;
+            let (plan, cells, tests) = artifact_bytes
+                .ok_or("finalized proof omitted required plan/cell/test artifact bytes")?;
+            let verified = self
+                .verify_schema10_artifact_bytes(plan, cells, tests)?
+                .ok_or("zero-current proof did not establish schema 10 evidence")?;
+            let cells = &verified.cell_results;
+            let recorded = cells
+                .cells
+                .iter()
+                .map(|cell| cell.identity())
+                .collect::<BTreeSet<_>>();
+            let actual = census
+                .files
+                .iter()
+                .flat_map(|file| &file.rows)
+                .map(|row| row.cell.clone())
+                .collect::<BTreeSet<_>>();
+            if recorded != actual {
+                return Err(
+                    "current raw cells differ from the verified recorded artifact population"
+                        .into(),
+                );
+            }
+            for cell in &cells.cells {
+                if let Some(selected_attempt) = cell.selected_attempt {
+                    if !census
+                        .files
+                        .iter()
+                        .flat_map(|file| &file.rows)
+                        .any(|input| {
+                            input.cell == cell.identity() && input.attempt == selected_attempt
+                        })
+                    {
+                        return Err(
+                            "verified selected attempt is absent from the raw input census".into(),
+                        );
+                    }
+                }
+            }
+            // Nonempty partial failures retain their missing planned work.
+            // Empty raw input must satisfy every existing selected-zero check.
+            if zero_cells
+                && (cells.selected_count != 0
+                    || cells.recorded_count != 0
+                    || cells.artifact.row_count != 0
+                    || !cells.selected.is_empty()
+                    || !cells.selected_backend_parity.is_empty()
+                    || !cells.cells.is_empty()
+                    || !verified.missing_cells.is_empty()
+                    || !verified.missing_backend_parity.is_empty()
+                    || !verified.missing_test_producers.is_empty()
+                    || !verified.full_test_results)
+            {
+                return Err(
+                    "empty current results contradict the finalized selected population".into(),
+                );
+            }
+        }
+        Ok(zero_cells)
+    }
+
     /// Preserve absence and the outer extension map's historical serialization.
     /// A present unknown/malformed version refuses, rather than becoming absent.
     pub fn raw_result_input_census_v1(&self) -> Result<Option<RawResultInputCensusV1>, String> {

@@ -6623,20 +6623,6 @@ impl FinalizedRunProof {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .ok_or("finalized row omitted its run identity")?;
-        if row.commit.as_deref() != Some(measured)
-            || row.tree_dirty != Some(false)
-            || row.commit_anchored != Some(true)
-            || row.started_at.as_deref() != Some(stamp)
-            || row
-                .finished_at
-                .as_deref()
-                .is_none_or(|value| value.trim().is_empty())
-            || !matches!(row.result.as_deref(), Some("pass" | "fail" | "no_result"))
-        {
-            return Err(
-                "finalized row does not bind a terminal clean measured run and its stamp".into(),
-            );
-        }
         if current
             .values()
             .flatten()
@@ -6644,16 +6630,6 @@ impl FinalizedRunProof {
         {
             return Err("current results differ from the finalized run identity".into());
         }
-        let census = row.raw_result_input_census_v1()?.ok_or_else(|| {
-            format!(
-                "finalized run has no producer-bound raw input census: {}",
-                row.extra
-                    .get("raw_result_input_census_error")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("historical absence cannot authorize current writeback")
-            )
-        })?;
-        census.verify_inputs(&row, inputs)?;
         let mut files = Vec::new();
         if row.schema_version == Some(10) || current.is_empty() {
             let plan = row
@@ -6692,62 +6668,24 @@ impl FinalizedRunProof {
                     Some(digest),
                 )?);
             }
-            let verified = row
-                .verify_schema10_artifact_bytes(&files[0].bytes, &files[1].bytes, &files[2].bytes)?
-                .ok_or("zero-current proof did not establish schema 10 evidence")?;
-            let cells = &verified.cell_results;
-            let recorded = cells
-                .cells
-                .iter()
-                .map(|cell| cell.identity())
-                .collect::<BTreeSet<_>>();
-            let actual = census
-                .files
-                .iter()
-                .flat_map(|file| &file.rows)
-                .map(|row| row.cell.clone())
-                .collect::<BTreeSet<_>>();
-            if recorded != actual {
-                return Err(
-                    "current raw cells differ from the verified recorded artifact population"
-                        .into(),
-                );
-            }
-            for cell in &cells.cells {
-                if let Some(selected_attempt) = cell.selected_attempt {
-                    if !census
-                        .files
-                        .iter()
-                        .flat_map(|file| &file.rows)
-                        .any(|input| {
-                            input.cell == cell.identity() && input.attempt == selected_attempt
-                        })
-                    {
-                        return Err(
-                            "verified selected attempt is absent from the raw input census".into(),
-                        );
-                    }
-                }
-            }
-            // A nonempty partial failed run keeps its actual observations and
-            // missing planned population. Only a zero-current completion needs
-            // independent proof that the selected cell population was zero.
-            if current.is_empty()
-                && (cells.selected_count != 0
-                    || cells.recorded_count != 0
-                    || cells.artifact.row_count != 0
-                    || !cells.selected.is_empty()
-                    || !cells.selected_backend_parity.is_empty()
-                    || !cells.cells.is_empty()
-                    || !verified.missing_cells.is_empty()
-                    || !verified.missing_backend_parity.is_empty()
-                    || !verified.missing_test_producers.is_empty()
-                    || !verified.full_test_results)
-            {
-                return Err(
-                    "empty current results contradict the finalized selected population".into(),
-                );
-            }
+        }
+        let artifact_bytes = if files.is_empty() {
+            None
+        } else {
+            Some((
+                files[0].bytes.as_slice(),
+                files[1].bytes.as_slice(),
+                files[2].bytes.as_slice(),
+            ))
+        };
+        let zero_cells =
+            row.verify_finalized_raw_input_bytes(measured, stamp, inputs, artifact_bytes)?;
+        // The current projection can filter raw rows. A nonempty census must
+        // not become selected-zero authority merely because that map is empty.
+        if current.is_empty() && !zero_cells {
+            return Err(
+                "empty current results contradict the finalized selected population".into(),
+            );
         }
         files.push(row_file);
         let proof = Self {
