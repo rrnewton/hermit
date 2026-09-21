@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::Duration;
+use std::time::SystemTime;
 
 use clap::Parser;
 use colored::Colorize;
@@ -379,6 +380,15 @@ pub struct RunOpts {
     /// defaults it to `None` when `RunOpts` is parsed or round-tripped.
     #[clap(skip)]
     resolved_happens_before: Option<HappensBeforeProgram>,
+
+    /// Whether this invocation's epoch was captured from the host clock because
+    /// neither `--epoch` nor `HERMIT_EPOCH` supplied an explicit input.
+    ///
+    /// This is CLI provenance only: the resolved timestamp itself is copied into
+    /// `DetConfig` before any backend starts and is the sole value serialized or
+    /// observed by the guest.
+    #[clap(skip)]
+    epoch_captured_from_host: bool,
 
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
@@ -2828,6 +2838,32 @@ fn restore_standard_fd_status_flags(before: [Option<libc::c_int>; VERIFY_RESTORE
 /// Create two logging destinations and two global configs. Returns non-zero exit
 /// status if there was a difference in any component of the output.
 impl RunOpts {
+    /// Resolve the one intentionally nondeterministic input of an ordinary run.
+    ///
+    /// The top-level parser calls this exactly once, before evidence setup or
+    /// guest launch. Both halves of `--verify` and every backend then receive the
+    /// same concrete `DateTime`; Detcore never reads the host clock itself.
+    pub(crate) fn capture_default_epoch(&mut self, capture_now: impl FnOnce() -> SystemTime) {
+        if self.det_opts.det_config.virtualize_time {
+            self.det_opts
+                .det_config
+                .capture_epoch_from_host_time(capture_now());
+            self.epoch_captured_from_host = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn epoch_capture_for_test(&self) -> (String, bool) {
+        (
+            self.det_opts.det_config.epoch.to_rfc3339(),
+            self.epoch_captured_from_host,
+        )
+    }
+
+    fn epoch_rfc3339(&self) -> String {
+        self.det_opts.det_config.epoch.to_rfc3339()
+    }
+
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the
@@ -3056,6 +3092,17 @@ impl RunOpts {
         // subsequent tracing_subscriber::fmt::init() call.
         // tracing::subscriber::with_default(super::tracing::stderr_subscriber(global.log), || {
         self.validate_args()?;
+        if self.det_opts.det_config.virtualize_time {
+            let epoch = self.epoch_rfc3339();
+            let source = if self.epoch_captured_from_host {
+                "host-now"
+            } else {
+                "explicit"
+            };
+            eprintln!(
+                "hermit: virtual-time epoch={epoch} source={source}; reproduce with --epoch={epoch}"
+            );
+        }
         if self.allow_unsupported_syscalls {
             eprintln!(
                 "WARNING: --allow-unsupported-syscalls permits unmodeled syscalls to reach the \

@@ -173,7 +173,11 @@ fn startup_stdin() -> io::Result<Option<File>> {
     }
 }
 
+use clap::ArgMatches;
+use clap::CommandFactory;
+use clap::FromArgMatches;
 use clap::Parser;
+use clap::parser::ValueSource;
 use colored::*;
 use hermit::BackendUnavailable;
 use hermit::Error;
@@ -213,6 +217,25 @@ struct Args {
 
     #[clap(subcommand)]
     command: Subcommand,
+}
+
+/// Build parsed arguments while resolving an omitted `run --epoch` exactly
+/// once at the process boundary. Keeping this above backend dispatch means a
+/// `--verify` pair and every backend adapter share one concrete input.
+fn args_from_matches_with_clock(
+    matches: &ArgMatches,
+    capture_now: impl FnOnce() -> std::time::SystemTime,
+) -> Result<Args, clap::Error> {
+    let run_epoch_source = matches
+        .subcommand_matches("run")
+        .and_then(|run| run.value_source("epoch"));
+    let mut args = Args::from_arg_matches(matches)?;
+    if run_epoch_source == Some(ValueSource::DefaultValue)
+        && let Subcommand::Run(run) = &mut args.command
+    {
+        run.capture_default_epoch(capture_now);
+    }
+    Ok(args)
 }
 
 #[derive(Debug, Parser)]
@@ -419,10 +442,16 @@ fn main() {
     if let Some(status) = liteinst_activation_probe() {
         status.raise_or_exit();
     }
+    // Parse through `ArgMatches` so the run command can distinguish an
+    // omitted epoch from an explicit CLI/environment value. `Config` keeps a
+    // stable library default for wire fingerprints and unit fixtures; only an
+    // actual `hermit run` invocation captures host wall time.
+    let matches = Args::command().get_matches();
     let Args {
         mut global,
         mut command,
-    } = Args::parse();
+    } = args_from_matches_with_clock(&matches, std::time::SystemTime::now)
+        .unwrap_or_else(|error| error.exit());
 
     // Claim the evidence destination before any fallible run preflight. The
     // directory itself is the invocation boundary: it must not exist, so no
@@ -641,12 +670,92 @@ mod tests {
 
     use super::Args;
     use super::Subcommand;
+    use super::args_from_matches_with_clock;
     use super::classify_failure;
     use super::failure_exit_code;
 
     #[test]
     fn clap_configuration_is_valid() {
         Args::command().debug_assert();
+    }
+
+    fn parse_at<const N: usize>(argv: [&str; N], now: std::time::SystemTime) -> Args {
+        let matches = Args::command().try_get_matches_from(argv).unwrap();
+        args_from_matches_with_clock(&matches, || now).unwrap()
+    }
+
+    #[test]
+    fn omitted_run_epoch_is_captured_once_at_parse_boundary() {
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_933_135_628);
+        let args = parse_at(["hermit", "run", "/bin/true"], now);
+        let Subcommand::Run(run) = args.command else {
+            panic!("expected run")
+        };
+        assert_eq!(
+            run.epoch_capture_for_test(),
+            ("2031-04-05T06:07:08+00:00".to_owned(), true)
+        );
+    }
+
+    #[test]
+    fn explicit_run_epoch_is_preserved_instead_of_reading_host_time() {
+        let matches = Args::command()
+            .try_get_matches_from([
+                "hermit",
+                "run",
+                "--epoch=2000-12-31T23:59:59.123456789Z",
+                "/bin/true",
+            ])
+            .unwrap();
+        let args = args_from_matches_with_clock(&matches, || {
+            panic!("an explicit epoch must not read the host clock")
+        })
+        .unwrap();
+        let Subcommand::Run(run) = args.command else {
+            panic!("expected run")
+        };
+        let (epoch, captured) = run.epoch_capture_for_test();
+        assert_eq!(epoch, "2000-12-31T23:59:59.123456789+00:00");
+        assert!(!captured);
+    }
+
+    #[test]
+    fn nonvirtualized_run_epoch_does_not_read_the_host_clock() {
+        let matches = Args::command()
+            .try_get_matches_from([
+                "hermit",
+                "run",
+                "--no-virtualize-time",
+                "--no-virtualize-metadata",
+                "/bin/true",
+            ])
+            .unwrap();
+        let args = args_from_matches_with_clock(&matches, || {
+            panic!("a nonvirtualized run must not capture a virtual epoch")
+        })
+        .unwrap();
+        let Subcommand::Run(run) = args.command else {
+            panic!("expected run")
+        };
+        assert!(!run.epoch_capture_for_test().1);
+    }
+
+    #[test]
+    fn invalid_run_epoch_is_rejected_by_the_cli() {
+        assert!(
+            Args::command()
+                .try_get_matches_from(["hermit", "run", "--epoch=not-a-time", "/bin/true"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn run_epoch_help_describes_capture_instead_of_the_fixture_default() {
+        let mut command = Args::command();
+        let run = command.find_subcommand_mut("run").unwrap();
+        let help = run.render_long_help().to_string();
+        assert!(help.contains("host wall-clock sample"), "{help}");
+        assert!(!help.contains("[default: 2026-01-01T00:00:00Z]"), "{help}");
     }
 
     #[test]
