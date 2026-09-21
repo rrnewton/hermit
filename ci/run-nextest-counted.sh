@@ -375,6 +375,9 @@ PYEOF
         "$scratch/scaled-nextest.toml" || return 1
     grep -q '^target-runner = "within-wrapper"$' \
         "$scratch/scaled-nextest.toml" || return 1
+    # This is the command Nextest receives, not the fixture's direct wrapper call.
+    grep -Fq '"--cpu-timeout-usec", "22000000", "--termination-grace-ms", "2000", "--"' \
+        "$scratch/scaled-nextest.toml" || return 1
     if compgen -G "$scratch/hermit-nextest-config.*.toml" >/dev/null; then
         printf 'run-nextest-counted: temporary nextest config leaked\n' >&2
         return 1
