@@ -215,8 +215,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.regular_crates", 573),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     ("test.hermit_unit", 710),
-    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
-    ("test.detcore_unit", 743),
+    // The measured inventory includes five new resource-limit mutation controls.
+    ("test.detcore_unit", 748),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     ("test.hermit_integration", 158),
@@ -242,7 +242,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 743),
+    ("test.detcore_unit_on_host", 748),
     ("test.hermit_integration_on_host", 158),
     ("test.hermit_unit_on_host", 710),
     ("test.ignored_syscall_regressions_on_host", 4),
