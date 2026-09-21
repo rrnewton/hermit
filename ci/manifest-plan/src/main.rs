@@ -156,12 +156,16 @@ fn parse_options(arguments: Vec<String>) -> Option<(Format, PathBuf)> {
     while let Some(arg) = args.next() {
         if arg == "--root" {
             let path = args.next().unwrap_or_else(|| die("--root requires a path"));
-            if path.is_empty() { die("--root requires a path"); }
+            if path.is_empty() {
+                die("--root requires a path");
+            }
             root = PathBuf::from(path);
             continue;
         }
         if let Some(path) = arg.strip_prefix("--root=") {
-            if path.is_empty() { die("--root requires a path"); }
+            if path.is_empty() {
+                die("--root requires a path");
+            }
             root = PathBuf::from(path);
             continue;
         }
@@ -191,7 +195,10 @@ fn load_defaults(repo_root: &Path) -> (PathBuf, Value) {
     let defaults_text = std::fs::read_to_string(&defaults_path)
         .unwrap_or_else(|error| die(format!("cannot read {}: {error}", defaults_path.display())));
     let defaults: Value = defaults_text.parse().unwrap_or_else(|error| {
-        die(format!("{}: invalid YAML: {error}", defaults_path.display()))
+        die(format!(
+            "{}: invalid YAML: {error}",
+            defaults_path.display()
+        ))
     });
     (script_dir, defaults)
 }
