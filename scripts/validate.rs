@@ -20579,7 +20579,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             std::env::set_var(PARENT_ENV, parent);
         }
     }
-    let (tool_root, verified_state_root) = match configured_tool_selection(parent.as_deref()) {
+    let (tool_root, mut verified_state_root) = match configured_tool_selection(parent.as_deref()) {
         Ok(selection) => selection,
         Err(error) => {
             return RunSummary::refused(
@@ -20765,6 +20765,29 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     }
 
     if let Some(proof) = admitted_context.as_ref() {
+        if let Some(supplied) = std::env::var_os(validate_admission::STATE_AUTHORITY_ENV) {
+            let retained = parent
+                .as_deref()
+                .ok_or_else(|| "admitted STATE authority has no canonical parent".to_string())
+                .and_then(|state| {
+                    validate_admission::VerifiedStateRoot::from_validation_supervisor(
+                        state,
+                        Path::new(&supplied),
+                        proof,
+                    )
+                });
+            match retained {
+                Ok(state) => verified_state_root = Some(state),
+                Err(error) => {
+                    return RunSummary::refused(
+                        4,
+                        &profile_name,
+                        "authenticated state root",
+                        vec![error],
+                    );
+                }
+            }
+        }
         let inherited = std::env::var_os("VALIDATE_RUN_STATE");
         if nesting.nested || verified_run_state_scope_reexec(&root, inherited.as_deref()) {
             let check = inherited

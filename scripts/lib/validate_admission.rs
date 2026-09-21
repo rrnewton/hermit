@@ -21,12 +21,46 @@ use hermit_manifest_plan::ledger::admission_hex;
 use hermit_manifest_plan::ledger::admission_sha256;
 use serde_json::Value;
 
-// A directory pathname is not this capability. Production constructs it only
-// from the state descriptor in the already authenticated immutable tool proof.
+pub(crate) const STATE_AUTHORITY_ENV: &str = "DEV_HERMIT_STATE_AUTHORITY";
+const STATE_AUTHORITY_SCHEMA: &str = "dev-hermit-state-authority/v1";
+
+// A directory pathname is not this capability. Production retains either the
+// state descriptor from authenticated immutable TOOL proof or the separate
+// descriptor held by this run's authenticated validate-lock supervisor.
 pub(crate) struct VerifiedStateRoot {
     path: std::path::PathBuf,
     directory: std::fs::File,
     identity: (u64, u64),
+    supervisor: Option<SupervisorStateAuthority>,
+}
+
+struct SupervisorStateAuthority {
+    record: std::fs::File,
+    record_path: std::path::PathBuf,
+    state_path: std::path::PathBuf,
+    owner_pid: i32,
+    owner_start_ticks: u64,
+}
+
+impl SupervisorStateAuthority {
+    fn verify(&self, state_identity: (u64, u64)) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        if !crate::validate_runtime::identity_in_ancestry(self.owner_pid, self.owner_start_ticks) {
+            return Err(
+                "STATE authority supervisor is no longer the live admitted ancestor".into(),
+            );
+        }
+        let record = self.record.metadata().map_err(|e| e.to_string())?;
+        let live_record = std::fs::metadata(&self.record_path).map_err(|e| e.to_string())?;
+        let live_state = std::fs::metadata(&self.state_path).map_err(|e| e.to_string())?;
+        if (record.dev(), record.ino()) != (live_record.dev(), live_record.ino())
+            || !live_state.is_dir()
+            || (live_state.dev(), live_state.ino()) != state_identity
+        {
+            return Err("STATE authority supervisor no longer holds the same descriptors".into());
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct RetainedFile {
@@ -56,6 +90,142 @@ impl VerifiedStateRoot {
             path: authority.state_root.clone(),
             directory,
             identity: (authority.state_dev, authority.state_ino),
+            supervisor: None,
+        };
+        result.verify()?;
+        Ok(result)
+    }
+
+    /// Retain ordinary checkout STATE without claiming immutable TOOL bytes.
+    /// The private admission value was already derived from the live canonical
+    /// lock response, including target, floor, boot and process ancestry.
+    pub(crate) fn from_validation_supervisor(
+        state_root: &Path,
+        supplied: &Path,
+        admission: &AuthenticatedValidationAdmission,
+    ) -> Result<Self, String> {
+        use std::collections::BTreeSet;
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let (holder_pid, record_fd) = super::proc_fd_path(supplied)
+            .ok_or("STATE authority must be an exact /proc/<pid>/fd/<fd> locator")?;
+        if holder_pid != admission.authority.owner_pid {
+            return Err("STATE authority holder is not the authenticated admission owner".into());
+        }
+        let record = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(supplied)
+            .map_err(|e| format!("cannot retain STATE authority record: {e}"))?;
+        let metadata = record.metadata().map_err(|e| e.to_string())?;
+        // SAFETY: record owns this valid descriptor throughout the seal query.
+        let seals = unsafe { libc::fcntl(record.as_raw_fd(), libc::F_GET_SEALS) };
+        let required_seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        if !metadata.is_file()
+            || metadata.nlink() != 0
+            || metadata.mode() & 0o222 != 0
+            || seals < 0
+            || seals & required_seals != required_seals
+        {
+            return Err(
+                "STATE authority must be an anonymous read-only fully sealed record".into(),
+            );
+        }
+        let mut bytes = Vec::new();
+        (&record)
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 4096 {
+            return Err("STATE authority exceeds 4096 bytes".into());
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let object = value
+            .as_object()
+            .ok_or("STATE authority must be one object")?;
+        let fields: BTreeSet<&str> = [
+            "schema",
+            "holder_pid",
+            "holder_start_ticks",
+            "holder_boot_id",
+            "holder_host",
+            "kind",
+            "target",
+            "authority_fd",
+            "state_fd",
+            "state_root",
+            "state_dev",
+            "state_ino",
+        ]
+        .into_iter()
+        .collect();
+        if object.keys().map(String::as_str).collect::<BTreeSet<_>>() != fields {
+            return Err("STATE authority has incomplete or unknown fields".into());
+        }
+        // The producer emits canonical JSON. This also rejects repeated keys,
+        // whose last-value interpretation would otherwise erase ambiguity.
+        let mut canonical = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+        canonical.push(b'\n');
+        if bytes != canonical {
+            return Err("STATE authority record is not canonical producer bytes".into());
+        }
+        let text = |key: &str| -> Result<&str, String> {
+            object[key]
+                .as_str()
+                .ok_or_else(|| format!("STATE authority {key} is not text"))
+        };
+        let number = |key: &str| -> Result<u64, String> {
+            object[key]
+                .as_u64()
+                .ok_or_else(|| format!("STATE authority {key} is not an integer"))
+        };
+        let owner = &admission.authority;
+        if text("schema")? != STATE_AUTHORITY_SCHEMA
+            || number("holder_pid")? != u64::from(holder_pid)
+            || number("authority_fd")? != u64::from(record_fd)
+            || number("holder_start_ticks")? != owner.owner_start_ticks
+            || text("holder_boot_id")? != owner.owner_boot_id
+            || text("holder_host")? != owner.owner_host
+            || text("kind")? != owner.kind
+            || text("target")? != owner.target
+        {
+            return Err("STATE authority differs from its authenticated live admission".into());
+        }
+        let state_fd = u32::try_from(number("state_fd")?).map_err(|e| e.to_string())?;
+        if state_fd == record_fd {
+            return Err("STATE authority conflates directory and record descriptors".into());
+        }
+        let path = std::path::PathBuf::from(text("state_root")?);
+        if !path.is_absolute()
+            || path != state_root
+            || path.canonicalize().map_err(|e| e.to_string())? != path
+        {
+            return Err("STATE authority differs from the canonical parent root".into());
+        }
+        let state_path = std::path::PathBuf::from(format!("/proc/{holder_pid}/fd/{state_fd}"));
+        if std::fs::read_link(&state_path).map_err(|e| e.to_string())? != path {
+            return Err("STATE descriptor does not name the canonical parent root".into());
+        }
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(&state_path)
+            .map_err(|e| format!("cannot retain supervisor STATE: {e}"))?;
+        let result = Self {
+            path,
+            directory,
+            identity: (number("state_dev")?, number("state_ino")?),
+            supervisor: Some(SupervisorStateAuthority {
+                record,
+                record_path: supplied.to_path_buf(),
+                state_path,
+                owner_pid: i32::try_from(holder_pid).map_err(|e| e.to_string())?,
+                owner_start_ticks: owner.owner_start_ticks,
+            }),
         };
         result.verify()?;
         Ok(result)
@@ -67,6 +237,9 @@ impl VerifiedStateRoot {
 
     pub(crate) fn verify(&self) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt;
+        if let Some(supervisor) = &self.supervisor {
+            supervisor.verify(self.identity)?;
+        }
         let held = self.directory.metadata().map_err(|e| e.to_string())?;
         let live = std::fs::symlink_metadata(&self.path).map_err(|e| e.to_string())?;
         if !held.is_dir()
@@ -203,6 +376,7 @@ impl VerifiedStateRoot {
             path: path.canonicalize().unwrap(),
             directory,
             identity: (metadata.dev(), metadata.ino()),
+            supervisor: None,
         }
     }
 }
@@ -902,6 +1076,249 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    fn live_fixture_admission(f: &Fixture) -> AuthenticatedValidationAdmission {
+        let target = f.commit("state authority fixture");
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        let pid = std::process::id() as i32;
+        let (_, ticks) = crate::validate_runtime::process_identity(pid).unwrap();
+        let mut status = f.authority(&target, &target);
+        status["owner"]["pid"] = pid.into();
+        status["owner"]["start_ticks"] = ticks.into();
+        status["owner"]["boot_id"] = boot.trim().into();
+        // Synthetic canonical status, but real process-generation/ancestry checks.
+        // This fixture does not claim a product run was admitted.
+        AuthenticatedValidationAdmission::from_status(
+            &f.0,
+            &serde_json::to_vec(&status).unwrap(),
+            &target,
+            "fixture-host",
+            Some(boot.trim()),
+            &mut crate::validate_runtime::identity_in_ancestry,
+        )
+        .unwrap()
+    }
+
+    struct SupervisorFixture {
+        directory: Option<std::fs::File>,
+        record: Option<std::fs::File>,
+        locator: std::path::PathBuf,
+    }
+
+    impl SupervisorFixture {
+        fn new(
+            root: &Path,
+            admission: &AuthenticatedValidationAdmission,
+            sealed: bool,
+            mutate: impl FnOnce(&mut Value),
+        ) -> Self {
+            use std::io::Write;
+            use std::os::fd::AsRawFd;
+            use std::os::fd::FromRawFd;
+            use std::os::unix::fs::MetadataExt;
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::PermissionsExt;
+            let directory = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(root)
+                .unwrap();
+            let metadata = directory.metadata().unwrap();
+            // SAFETY: the literal is terminated; the new descriptor is owned below.
+            let fd = unsafe {
+                libc::memfd_create(
+                    c"state-authority-test".as_ptr(),
+                    libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+                )
+            };
+            assert!(fd >= 0);
+            // SAFETY: successful memfd_create returned a new owned descriptor.
+            let mut record = unsafe { std::fs::File::from_raw_fd(fd) };
+            let owner = &admission.authority;
+            let mut value = serde_json::json!({
+                "schema": STATE_AUTHORITY_SCHEMA,
+                "holder_pid": owner.owner_pid,
+                "holder_start_ticks": owner.owner_start_ticks,
+                "holder_boot_id": owner.owner_boot_id,
+                "holder_host": owner.owner_host,
+                "kind": owner.kind,
+                "target": owner.target,
+                "authority_fd": fd,
+                "state_fd": directory.as_raw_fd(),
+                "state_root": root,
+                "state_dev": metadata.dev(),
+                "state_ino": metadata.ino(),
+            });
+            mutate(&mut value);
+            let mut bytes = serde_json::to_vec(&value).unwrap();
+            bytes.push(b'\n');
+            record.write_all(&bytes).unwrap();
+            record
+                .set_permissions(std::fs::Permissions::from_mode(0o400))
+                .unwrap();
+            if sealed {
+                let seals = libc::F_SEAL_SEAL
+                    | libc::F_SEAL_SHRINK
+                    | libc::F_SEAL_GROW
+                    | libc::F_SEAL_WRITE;
+                // SAFETY: record owns this valid memfd.
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) }, 0);
+            }
+            Self {
+                directory: Some(directory),
+                record: Some(record),
+                locator: format!("/proc/{}/fd/{fd}", std::process::id()).into(),
+            }
+        }
+    }
+
+    #[test]
+    fn supervisor_state_authority_retains_root_and_closes_descriptors_on_exec() {
+        use std::os::unix::fs::MetadataExt;
+        let f = Fixture::new();
+        let admission = live_fixture_admission(&f);
+        let holder = SupervisorFixture::new(&f.0, &admission, true, |_| {});
+        let root = VerifiedStateRoot::from_validation_supervisor(&f.0, &holder.locator, &admission)
+            .unwrap();
+        let locator = root
+            .locator(&f.0.join("ignored/validate/logs/state-fixture.log"))
+            .unwrap();
+        let retained = root.create(&locator).unwrap();
+        retained.write_exact(b"bounded fixture\n").unwrap();
+        root.verify_file(&retained).unwrap();
+        let record = holder.record.as_ref().unwrap().metadata().unwrap();
+        let script = r#"
+import os,sys
+from pathlib import Path
+identities={(int(sys.argv[1]),int(sys.argv[2])),(int(sys.argv[3]),int(sys.argv[4]))}
+for entry in Path('/proc/self/fd').iterdir():
+ try: item=entry.stat()
+ except FileNotFoundError: continue
+ assert (item.st_dev,item.st_ino) not in identities
+"#;
+        let mut child = Command::new("/usr/bin/python3")
+            .args(["-c", script])
+            .args([
+                root.identity.0.to_string(),
+                root.identity.1.to_string(),
+                record.dev().to_string(),
+                record.ino().to_string(),
+            ])
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("STATE descriptor exec probe exceeded five seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        root.verify().unwrap();
+    }
+
+    #[test]
+    fn supervisor_state_authority_rejects_tampering_partial_records_and_wrong_holders() {
+        let f = Fixture::new();
+        let admission = live_fixture_admission(&f);
+        let good = SupervisorFixture::new(&f.0, &admission, true, |_| {});
+        assert!(
+            VerifiedStateRoot::from_validation_supervisor(&f.0, &good.locator, &admission).is_ok()
+        );
+        type StateMutation = (&'static str, fn(&mut Value));
+        let mutations: &[StateMutation] = &[
+            ("schema", |v| v["schema"] = "other".into()),
+            ("holder pid", |v| v["holder_pid"] = 1.into()),
+            ("generation", |v| v["holder_start_ticks"] = 0.into()),
+            ("boot", |v| v["holder_boot_id"] = "other".into()),
+            ("host", |v| v["holder_host"] = "other".into()),
+            ("kind", |v| v["kind"] = "frozen-validate".into()),
+            ("target", |v| v["target"] = "0".repeat(40).into()),
+            ("record fd", |v| v["authority_fd"] = 0.into()),
+            ("state fd", |v| v["state_fd"] = v["authority_fd"].clone()),
+            ("root", |v| v["state_root"] = "/".into()),
+            ("device", |v| v["state_dev"] = u64::MAX.into()),
+            ("inode", |v| v["state_ino"] = 0.into()),
+            ("unknown", |v| v["trusted"] = true.into()),
+            ("missing", |v| {
+                v.as_object_mut().unwrap().remove("state_fd");
+            }),
+        ];
+        for (name, mutate) in mutations {
+            let bad = SupervisorFixture::new(&f.0, &admission, true, mutate);
+            assert!(
+                VerifiedStateRoot::from_validation_supervisor(&f.0, &bad.locator, &admission)
+                    .is_err(),
+                "{name}"
+            );
+        }
+        let unsealed = SupervisorFixture::new(&f.0, &admission, false, |_| {});
+        assert!(
+            VerifiedStateRoot::from_validation_supervisor(&f.0, &unsealed.locator, &admission)
+                .is_err()
+        );
+        assert!(
+            VerifiedStateRoot::from_validation_supervisor(
+                &f.0,
+                Path::new("/proc/self/fd/0"),
+                &admission
+            )
+            .is_err()
+        );
+        assert!(
+            VerifiedStateRoot::from_validation_supervisor(
+                &f.0,
+                Path::new("/proc/1/fd/0"),
+                &admission
+            )
+            .is_err()
+        );
+        assert!(
+            VerifiedStateRoot::from_validation_supervisor(
+                &f.0,
+                Path::new("/tmp/unheld-state.json"),
+                &admission
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn supervisor_state_authority_refuses_closed_descriptors_and_replaced_root() {
+        let f = Fixture::new();
+        let admission = live_fixture_admission(&f);
+        for close_record in [true, false] {
+            let mut holder = SupervisorFixture::new(&f.0, &admission, true, |_| {});
+            let root =
+                VerifiedStateRoot::from_validation_supervisor(&f.0, &holder.locator, &admission)
+                    .unwrap();
+            root.verify().unwrap();
+            if close_record {
+                holder.record.take();
+            } else {
+                holder.directory.take();
+            }
+            assert!(root.verify().is_err(), "closed record={close_record}");
+        }
+        let state = f.0.join("state");
+        std::fs::create_dir(&state).unwrap();
+        let holder = SupervisorFixture::new(&state, &admission, true, |_| {});
+        let root =
+            VerifiedStateRoot::from_validation_supervisor(&state, &holder.locator, &admission)
+                .unwrap();
+        let moved = f.0.join("moved-state");
+        std::fs::rename(&state, &moved).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        assert!(root.verify().is_err());
+        std::fs::remove_dir(&state).unwrap();
+        std::os::unix::fs::symlink(&moved, &state).unwrap();
+        assert!(root.verify().is_err());
     }
 
     #[test]
