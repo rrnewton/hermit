@@ -96,7 +96,7 @@ const PORTABLE_DAG: &str = "ci/dag/validate.json";
 /// schema N". That is a fail-closed refusal rather than silent misreading, but
 /// it takes the pressure test offline entirely, and nothing in either file
 /// points at the other -- which is how it was missed when 5 became 6.
-const TRACKED_CELLS_SCHEMA: u64 = 8;
+const TRACKED_CELLS_SCHEMA: u64 = 9;
 const RUN_SCHEMA: u64 = 3;
 const SUMMARY_SCHEMA: u64 = 5;
 const RUNNER_STEP_OUTPUT_DIR: &str = "runner-profile";
@@ -404,7 +404,7 @@ fn load_tracked_cells(root: &Path) -> Result<TrackedCells, String> {
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let tracked: TrackedCells = serde_json::from_str(&text)
         .map_err(|error| format!("invalid JSON in {}: {error}", path.display()))?;
-    if tracked.schema != TRACKED_CELLS_SCHEMA {
+    if !matches!(tracked.schema, 8 | TRACKED_CELLS_SCHEMA) {
         return Err(format!(
             "unsupported tracked cell schema {}",
             tracked.schema
