@@ -66,6 +66,7 @@
       "integration_test_binaries": ["hermit_modes"],
       "deps": ["pmu.preemption"],
       "timeout": 120,
+      "cpu_timeout": 258,
       "hint": {"est_duration_s": 45,
                "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "cpu-bound"}
@@ -136,6 +137,7 @@
       "integration_test_binaries": ["cli"],
       "deps": ["build.privileged_tests"],
       "timeout": 180,
+      "cpu_timeout": 852,
       "hint": {"est_duration_s": 60,
                "rss_baseline_bytes": 8589934592, "hard_mem_max_bytes": 17179869184,
                "classification": "cpu-bound"}

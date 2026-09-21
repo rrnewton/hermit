@@ -122,9 +122,12 @@ use dagrun::TestResults;
 use dagrun::container_core_budget;
 use dagrun::perflog::append_step_profiles;
 use dagrun::scheduler::run_dag_boxed_deadline;
+use dagrun::scheduler::run_dag_boxed_deadline_with_cpu;
+use dagrun::scheduler::start_run_cpu_budget;
 use dagrun::scheduler::steps_violating_run_timeout;
 use dagrun::scheduler::BoxedCgroups;
 use dagrun::scheduler::monotonic_now_ns;
+use dagrun::scheduler::RunCpuBudget;
 use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
 use hermit_manifest_plan::ledger::HistoryRow;
 use hermit_manifest_plan::runner::ManifestSet;
@@ -136,9 +139,12 @@ use hermit_manifest_plan::runner::E2E_MACHINE_SHORTNAME_ENV;
 use hermit_manifest_plan::service_result::FinalValidateStatus;
 use hermit_manifest_plan::service_result::ScorecardWriteback;
 use hermit_manifest_plan::service_result::ValidationServiceResult;
+use hermit_manifest_plan::timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS;
 use hermit_manifest_plan::timeouts::DEFAULT_TEST_WALL_TIMEOUT_SECONDS;
+use hermit_manifest_plan::timeouts::NEXTEST_WRAPPER_BACKUP_SECONDS;
 use hermit_manifest_plan::timeouts::scale_timeout_seconds;
 use hermit_manifest_plan::timeouts::timeout_multiplier_from_env;
+use hermit_manifest_plan::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV;
 use hermit_manifest_plan::timeouts::TEST_WALL_TIMEOUT_MULTIPLIER_ENV;
 
 use validate_plan::CompatMode;
@@ -10740,6 +10746,101 @@ fn clamp_cpu(plan: &mut Plan, cap: i64) {
     }
 }
 
+const VALIDATE_RUN_CPU_OVERHEAD_SECONDS: i64 = 600;
+
+/// Derive a cumulative CPU backstop for the exact selected graph.
+///
+/// Every node is already bounded independently. Summing those effective bounds means the
+/// whole-run limit cannot preempt a node that is still inside its own allowance; the explicit
+/// overhead covers the driver, scheduler, and between-lane work accounted to the outer cgroup.
+fn derived_validate_run_cpu_timeout(plan: &Plan) -> Result<i64, String> {
+    let mut total = 0i64;
+    for cfg in std::iter::once(&plan.cfg).chain(plan.second.iter()) {
+        for step in &cfg.steps {
+            let effective = dagrun::model::effective_cpu_timeout(
+                step,
+                cfg.default_step_cpu_timeout,
+                cfg.cpu_timeout_multiplier,
+            );
+            if effective <= 0 {
+                return Err(format!(
+                    "whole-run CPU budget cannot be derived because {} has no positive effective CPU budget",
+                    step.tag()
+                ));
+            }
+            total = total.checked_add(effective).ok_or_else(|| {
+                "whole-run CPU budget overflowed while summing node budgets".to_string()
+            })?;
+        }
+    }
+    total.checked_add(VALIDATE_RUN_CPU_OVERHEAD_SECONDS).ok_or_else(|| {
+        "whole-run CPU budget overflowed while adding driver overhead".to_string()
+    })
+}
+
+/// Check the exact plan that will execute after selection, wrapping, and operator tightening.
+///
+/// The checked-in full-plan bracket catches drift in authored files. This runtime check is still
+/// required because a focused selection or `VALIDATE_GATE_CPU_TIMEOUT_SECONDS` changes the plan
+/// after those files were read.
+fn validate_live_nextest_cpu_ordering<'a>(
+    configs: impl IntoIterator<Item = &'a DagConfig>,
+    inner_multiplier: f64,
+) -> Result<(), String> {
+    for cfg in configs {
+        for step in cfg
+            .steps
+            .iter()
+            .filter(|step| step.cmd.contains("run-nextest-counted.sh"))
+        {
+            let values = step
+                .cmd
+                .split_whitespace()
+                .filter_map(|word| word.strip_prefix("NEXTEST_EXPECTED_EXECUTED="))
+                .map(|value| {
+                    value.parse::<u64>().map_err(|error| {
+                        format!(
+                            "{} has invalid NEXTEST_EXPECTED_EXECUTED={value:?}: {error}",
+                            step.tag()
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let selected = match values.as_slice() {
+                [value] if *value > 0 => *value,
+                _ => {
+                    return Err(format!(
+                        "{} must declare exactly one positive NEXTEST_EXPECTED_EXECUTED",
+                        step.tag()
+                    ));
+                }
+            };
+            let per_attempt = scale_timeout_seconds(
+                DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+                inner_multiplier,
+                &format!("{} CPU multiplier", step.tag()),
+            )?;
+            let inner_total = selected.checked_mul(per_attempt).ok_or_else(|| {
+                format!("{} aggregate inner CPU allowance overflowed", step.tag())
+            })?;
+            let outer = dagrun::model::effective_cpu_timeout(
+                step,
+                cfg.default_step_cpu_timeout,
+                cfg.cpu_timeout_multiplier,
+            );
+            let outer = u64::try_from(outer)
+                .map_err(|_| format!("{} has no positive outer CPU backup", step.tag()))?;
+            if outer <= inner_total {
+                return Err(format!(
+                    "{} has a {outer}s outer CPU backup but {selected} selected tests can consume {inner_total}s at the live per-attempt multiplier {inner_multiplier}",
+                    step.tag()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Give every validation node an explicit fail-fast family.
 ///
 /// A node that already names a shared family keeps it. Every other node gets its own tag, so its
@@ -11664,6 +11765,10 @@ struct LaneResult {
     ok: bool,
     /// The whole-invocation deadline expired during this lane.
     run_timed_out: bool,
+    /// The cumulative whole-run CPU budget, rather than its wall backstop, fired.
+    run_cpu_timed_out: bool,
+    /// Required whole-run CPU accounting became unreadable or moved backwards.
+    run_cpu_accounting_failed: bool,
 }
 
 /// Return the durable log's byte length once it has stopped growing.
@@ -12074,6 +12179,10 @@ fn render_scaled_nextest_config(root: &Path, multiplier: f64) -> Result<String, 
         .arg(root.join(".config/nextest.toml"))
         .arg(multiplier.to_string())
         .arg(&output_path)
+        .env(
+            "HERMIT_NEXTEST_CPU_WRAPPER_BIN",
+            root.join("target/debug/nextest-cpu-wrapper"),
+        )
         .output()
         .map_err(|error| format!("cannot run nextest timeout transformer: {error}"))?;
     if !output.status.success() {
@@ -12095,14 +12204,16 @@ fn require_matching_scaled_default(
     multiplier: f64,
     nextest_caps: &[NextestTimeoutCap],
 ) -> Result<u64, String> {
-    let expected = scale_timeout_seconds(manifest_base_seconds, multiplier, "wall multiplier")?;
+    let expected = scale_timeout_seconds(manifest_base_seconds, multiplier, "wall multiplier")?
+        .checked_add(NEXTEST_WRAPPER_BACKUP_SECONDS)
+        .ok_or("generated nextest wall backup overflowed")?;
     let actual = nextest_caps
         .first()
         .ok_or("generated nextest config contains no default timeout")?
         .period_seconds;
     if actual != expected {
         return Err(format!(
-            "generated nextest default is {actual}s, but manifest {manifest_base_seconds}s scaled by {multiplier} with ceiling rounding is {expected}s"
+            "generated nextest backup is {actual}s, but manifest {manifest_base_seconds}s scaled by {multiplier} with ceiling rounding plus the {NEXTEST_WRAPPER_BACKUP_SECONDS}s backup is {expected}s"
         ));
     }
     Ok(expected)
@@ -12112,6 +12223,7 @@ fn require_outer_timeout_headroom(
     tag: &str,
     node_timeout_seconds: i64,
     base_inner_seconds: u64,
+    post_scale_slack_seconds: u64,
     termination_grace_seconds: u64,
     attempts: u64,
     wall_multiplier: f64,
@@ -12123,6 +12235,9 @@ fn require_outer_timeout_headroom(
         wall_multiplier,
         &format!("{tag} wall multiplier"),
     )?;
+    let scaled_inner_seconds = scaled_inner_seconds
+        .checked_add(post_scale_slack_seconds)
+        .ok_or_else(|| format!("retry bounds: {tag} scaled timeout plus backup overflowed"))?;
     let one_attempt_seconds = scaled_inner_seconds
         .checked_add(termination_grace_seconds)
         .ok_or_else(|| format!("retry bounds: {tag} timeout plus grace overflowed"))?;
@@ -12143,7 +12258,7 @@ mod nextest_timeout_tests {
     use super::*;
 
     #[test]
-    fn nextest_and_manifest_share_base_and_scaled_wall_bounds() {
+    fn nextest_declares_inner_wall_and_generated_backup_is_later() {
         let root = Path::new(file!())
             .parent()
             .and_then(Path::parent)
@@ -12192,17 +12307,42 @@ mod nextest_timeout_tests {
     #[test]
     fn enclosing_timeout_checks_scale_and_refuse_unsafe_multipliers() {
         assert_eq!(
-            require_outer_timeout_headroom("fixture", 600, 74, 10, 2, 1.0).unwrap(),
+            require_outer_timeout_headroom("fixture", 600, 74, 0, 10, 2, 1.0).unwrap(),
             432
         );
         assert_eq!(
-            require_outer_timeout_headroom("fixture", 600, 74, 10, 2, 1.5).unwrap(),
+            require_outer_timeout_headroom("fixture", 600, 74, 0, 10, 2, 1.5).unwrap(),
             358
         );
-        let error = require_outer_timeout_headroom("fixture", 600, 118, 10, 2, 10.0)
+        let error = require_outer_timeout_headroom("fixture", 600, 118, 0, 10, 2, 10.0)
             .expect_err("an oversized wall multiplier must not outgrow the outer backup");
         assert!(error.contains("wall multiplier 10"), "{error}");
         assert!(error.contains("can consume 2380s"), "{error}");
+    }
+
+    #[test]
+    fn production_nextest_cpu_ordering_accepts_default_and_supported_multiplier() {
+        let root = Path::new(file!())
+            .parent()
+            .and_then(Path::parent)
+            .expect("validate.rs has a repository parent");
+        let portable = validate_plan::lane_config(root, "portable").unwrap();
+        let privileged = validate_plan::lane_config(root, "privileged").unwrap();
+        validate_live_nextest_cpu_ordering([&portable, &privileged], 1.0).unwrap();
+        validate_live_nextest_cpu_ordering([&portable, &privileged], 1.5).unwrap();
+
+        let mut too_small = portable.clone();
+        let step = too_small
+            .steps
+            .iter_mut()
+            .find(|step| step.cmd.contains("run-nextest-counted.sh"))
+            .expect("portable DAG has a Nextest node");
+        let tag = step.tag();
+        step.cpu_timeout = 1;
+        let error = validate_live_nextest_cpu_ordering([&too_small], 1.0)
+            .expect_err("a tightened outer CPU cap must not preempt the inner test cap");
+        assert!(error.contains(&tag), "{error}");
+        assert!(error.contains("outer CPU backup"), "{error}");
     }
 }
 
@@ -12228,6 +12368,9 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
     const DEFAULT_TEST_CAP_S: i64 = DEFAULT_TEST_WALL_TIMEOUT_SECONDS as i64;
     const NEXTEST_TERMINATION_GRACE_S: i64 = 2;
     const MANIFEST_TERMINATION_GRACE_S: i64 = 10;
+    const NEXTEST_MAX_ATTEMPTS: u64 = 1;
+    const NEXTEST_NODE_CPU_OVERHEAD_S: u64 = 60;
+    const NEXTEST_OUTER_CPU_SUPPORTED_MULTIPLIER: f64 = 1.5;
 
     fn require_live_nextest_output(tag: &str, command: &str) -> Result<(), String> {
         let Some(wrapper) = command.find("run-nextest-counted.sh") else {
@@ -12259,6 +12402,66 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             ));
         }
         Ok(())
+    }
+
+    fn declared_nextest_count(tag: &str, command: &str) -> Result<u64, String> {
+        let values = command
+            .split_whitespace()
+            .filter_map(|word| word.strip_prefix("NEXTEST_EXPECTED_EXECUTED="))
+            .map(|value| {
+                value.parse::<u64>().map_err(|error| {
+                    format!(
+                        "retry bounds: {tag} has invalid NEXTEST_EXPECTED_EXECUTED={value:?}: {error}"
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        match values.as_slice() {
+            [value] if *value > 0 => Ok(*value),
+            [] => Err(format!(
+                "retry bounds: {tag} must declare one positive NEXTEST_EXPECTED_EXECUTED"
+            )),
+            [0] => Err(format!(
+                "retry bounds: {tag} declares zero NEXTEST_EXPECTED_EXECUTED"
+            )),
+            _ => Err(format!(
+                "retry bounds: {tag} declares NEXTEST_EXPECTED_EXECUTED more than once"
+            )),
+        }
+    }
+
+    fn nextest_outer_cpu_required(
+        tag: &str,
+        selected_tests: u64,
+        multiplier: f64,
+    ) -> Result<u64, String> {
+        let per_attempt = scale_timeout_seconds(
+            DEFAULT_TEST_CPU_TIMEOUT_SECONDS,
+            multiplier,
+            &format!("{tag} CPU multiplier"),
+        )?;
+        selected_tests
+            .checked_mul(NEXTEST_MAX_ATTEMPTS)
+            .and_then(|value| value.checked_mul(per_attempt))
+            .ok_or_else(|| format!("retry bounds: {tag} aggregate inner CPU allowance overflowed"))
+    }
+
+    fn require_nextest_outer_cpu_headroom(
+        tag: &str,
+        outer_cpu_seconds: i64,
+        selected_tests: u64,
+        multiplier: f64,
+    ) -> Result<i64, String> {
+        let outer = u64::try_from(outer_cpu_seconds)
+            .map_err(|_| format!("retry bounds: {tag} has no positive outer CPU backup"))?;
+        let required = nextest_outer_cpu_required(tag, selected_tests, multiplier)?;
+        if outer <= required {
+            return Err(format!(
+                "retry bounds: {tag} has a {outer}s outer CPU backup but {selected_tests} selected tests x {NEXTEST_MAX_ATTEMPTS} attempt(s) x the scaled inner CPU allowance can consume {required}s at multiplier {multiplier}"
+            ));
+        }
+        i64::try_from(outer - required)
+            .map_err(|error| format!("retry bounds: {tag} CPU headroom is too large: {error}"))
     }
 
     let nextest = std::fs::read_to_string(root.join(".config/nextest.toml"))
@@ -12335,8 +12538,11 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .into_iter()
         .map(|lane| validate_plan::lane_config(root, lane).map(|cfg| (lane, cfg)))
         .collect::<Result<Vec<_>, _>>()?;
+    let validated_cpu_multiplier =
+        timeout_multiplier_from_env(TEST_CPU_TIMEOUT_MULTIPLIER_ENV)?;
     let mut streamed_nextest_nodes = 0usize;
     let mut tightest_nextest_headroom_s = i64::MAX;
+    let mut tightest_nextest_cpu_headroom_s = i64::MAX;
     for (_, cfg) in &lane_configs {
         for step in cfg
             .steps
@@ -12344,10 +12550,51 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             .filter(|step| step.cmd.contains("run-nextest-counted.sh"))
         {
             require_live_nextest_output(&step.tag(), &step.cmd)?;
+            let selected_tests = declared_nextest_count(&step.tag(), &step.cmd)?;
+            if step.cmd.split_whitespace().any(|word| {
+                word == "--retries" || word.starts_with("--retries=")
+            }) {
+                return Err(format!(
+                    "retry bounds: {} declares Nextest retries but the production maximum-attempt policy is {NEXTEST_MAX_ATTEMPTS}; update the derivation and command together",
+                    step.tag()
+                ));
+            }
+            let supported_inner = nextest_outer_cpu_required(
+                &step.tag(),
+                selected_tests,
+                NEXTEST_OUTER_CPU_SUPPORTED_MULTIPLIER,
+            )?;
+            let expected_declared = supported_inner
+                .checked_add(NEXTEST_NODE_CPU_OVERHEAD_S)
+                .ok_or_else(|| format!("retry bounds: {} CPU backup overflowed", step.tag()))?;
+            let actual_declared = u64::try_from(step.cpu_timeout)
+                .map_err(|_| format!("retry bounds: {} has no positive CPU backup", step.tag()))?;
+            if actual_declared != expected_declared {
+                return Err(format!(
+                    "retry bounds: {} declares {actual_declared}s CPU, expected {selected_tests} tests x {NEXTEST_MAX_ATTEMPTS} attempt(s) x {}s at {NEXTEST_OUTER_CPU_SUPPORTED_MULTIPLIER}x + {NEXTEST_NODE_CPU_OVERHEAD_S}s overhead = {expected_declared}s",
+                    step.tag(),
+                    DEFAULT_TEST_CPU_TIMEOUT_SECONDS
+                ));
+            }
+            let actual_cpu_headroom = require_nextest_outer_cpu_headroom(
+                &step.tag(),
+                step.cpu_timeout,
+                selected_tests,
+                validated_cpu_multiplier,
+            )?;
+            require_nextest_outer_cpu_headroom(
+                &step.tag(),
+                step.cpu_timeout,
+                selected_tests,
+                NEXTEST_OUTER_CPU_SUPPORTED_MULTIPLIER,
+            )?;
+            tightest_nextest_cpu_headroom_s =
+                tightest_nextest_cpu_headroom_s.min(actual_cpu_headroom);
             let actual_headroom = require_outer_timeout_headroom(
                 &step.tag(),
                 step.timeout,
                 largest_base_nextest_cap_s,
+                NEXTEST_WRAPPER_BACKUP_SECONDS,
                 NEXTEST_TERMINATION_GRACE_S as u64,
                 1,
                 validated_wall_multiplier,
@@ -12359,6 +12606,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
                 &step.tag(),
                 step.timeout,
                 DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
+                NEXTEST_WRAPPER_BACKUP_SECONDS,
                 NEXTEST_TERMINATION_GRACE_S as u64,
                 1,
                 1.5,
@@ -12400,6 +12648,18 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             "retry bounds: exact-count mutation did not fail by node name: {count_error}"
         ));
     }
+    let cpu_error = require_nextest_outer_cpu_headroom(
+        "test.fixture",
+        7 * 33,
+        7,
+        NEXTEST_OUTER_CPU_SUPPORTED_MULTIPLIER,
+    )
+    .expect_err("outer CPU equal to aggregate inner CPU must be refused");
+    if !cpu_error.contains("test.fixture") || !cpu_error.contains("can consume 231s") {
+        return Err(format!(
+            "retry bounds: CPU-ordering mutation did not fail by node name and exact aggregate: {cpu_error}"
+        ));
+    }
     let attempts = validate_runtime::MAX_ATTEMPTS_PER_CELL as u64;
     let default_with_grace_s = i64::try_from(scale_timeout_seconds(
         DEFAULT_TEST_WALL_TIMEOUT_SECONDS,
@@ -12407,6 +12667,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         "validated wall multiplier",
     )?)
     .map_err(|error| format!("retry bounds: scaled default is too large: {error}"))?
+        + i64::try_from(NEXTEST_WRAPPER_BACKUP_SECONDS).unwrap()
         + NEXTEST_TERMINATION_GRACE_S;
     let largest_nextest_with_grace_s = largest_nextest_cap_s + NEXTEST_TERMINATION_GRACE_S;
 
@@ -12433,6 +12694,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             tag,
             node_timeout_s,
             largest_cell_cap_s,
+            0,
             MANIFEST_TERMINATION_GRACE_S as u64,
             attempts,
             wall_multiplier,
@@ -12504,6 +12766,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         "oversized-multiplier-control",
         600,
         118,
+        0,
         MANIFEST_TERMINATION_GRACE_S as u64,
         attempts,
         10.0,
@@ -12522,6 +12785,7 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
     if attempts != 2
         || nextest_caps.first().copied() != Some(default_with_grace_s - NEXTEST_TERMINATION_GRACE_S)
         || tightest_nextest_headroom_s == i64::MAX
+        || tightest_nextest_cpu_headroom_s == i64::MAX
         || checked_manifest_nodes == 0
     {
         return Err(format!(
@@ -12539,7 +12803,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
          {largest_nextest_with_grace_s}s leave at least {tightest_nextest_headroom_s}s in every \
          enclosing nextest node; {checked_manifest_nodes} manifest node(s) fit both cell attempts \
          at {validated_wall_multiplier}x and 1.5x with at least \
-         {tightest_manifest_headroom_s}s left at {validated_wall_multiplier}x; an oversized factor \
+         {tightest_manifest_headroom_s}s left at {validated_wall_multiplier}x; every Nextest node's \
+         outer CPU backup fits its exact selected population at {validated_cpu_multiplier}x and \
+         {NEXTEST_OUTER_CPU_SUPPORTED_MULTIPLIER}x with at least {tightest_nextest_cpu_headroom_s}s \
+         left at {validated_cpu_multiplier}x; an oversized factor \
          is refused"
     ))
 }
@@ -13638,6 +13905,30 @@ fn run_lane_once(
     deadline: Option<u64>,
     record_step_profiles: bool,
 ) -> LaneResult {
+    run_lane_once_with_cpu(
+        cfg,
+        jobs,
+        keep_going,
+        verbosity,
+        cgroups,
+        log_path,
+        deadline,
+        record_step_profiles,
+        None,
+    )
+}
+
+fn run_lane_once_with_cpu(
+    cfg: &DagConfig,
+    jobs: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+    log_path: &Path,
+    deadline: Option<u64>,
+    record_step_profiles: bool,
+    run_cpu_budget: Option<RunCpuBudget>,
+) -> LaneResult {
     if remaining_budget_s(deadline) == Some(0) {
         eprintln!(
             "validate: whole-run budget expired during setup; no DAG node will be started \
@@ -13650,11 +13941,13 @@ fn run_lane_once(
             complete: false,
             ok: false,
             run_timed_out: true,
+            run_cpu_timed_out: false,
+            run_cpu_accounting_failed: false,
         };
     }
 
     let log_start = settled_log_len(log_path);
-    let result = run_dag_boxed_deadline(
+    let result = run_dag_boxed_deadline_with_cpu(
         cfg,
         jobs,
         keep_going,
@@ -13663,12 +13956,15 @@ fn run_lane_once(
         None,
         Some(scheduler_cpu_budget()),
         remaining_budget_s(deadline),
+        run_cpu_budget,
     );
     if record_step_profiles {
         forward_step_profiles(&result, jobs);
     }
 
     let run_timed_out = result.run_timed_out;
+    let run_cpu_timed_out = result.run_cpu_timed_out;
+    let run_cpu_accounting_failed = result.run_cpu_accounting_failed;
     let mut scheduler_not_launched = BTreeSet::new();
     let mut refused = BTreeSet::new();
     let planned: Vec<String> = cfg.steps.iter().map(|step| step.tag()).collect();
@@ -13763,6 +14059,8 @@ fn run_lane_once(
         complete,
         ok,
         run_timed_out,
+        run_cpu_timed_out,
+        run_cpu_accounting_failed,
     }
 }
 
@@ -17492,6 +17790,7 @@ fn nextest_test_observations(
                 id,
                 passed,
                 attempts: inner_attempts,
+                ..
             } = result;
             let Ok(inner_attempts) = usize::try_from(*inner_attempts) else {
                 errors.push(format!(
@@ -18921,6 +19220,33 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         eprintln!("validate: VALIDATE_GATE_CPU_TIMEOUT_SECONDS={cap}: every gate's CPU budget lowered to at most {cap}s");
     }
 
+    let inner_cpu_multiplier = match timeout_multiplier_from_env(TEST_CPU_TIMEOUT_MULTIPLIER_ENV) {
+        Ok(multiplier) => multiplier,
+        Err(error) => {
+            return RunSummary::refused(
+                3,
+                &plan.profile,
+                "per-test CPU multiplier",
+                vec![error],
+            )
+        }
+    };
+    if let Err(error) = validate_live_nextest_cpu_ordering(
+        std::iter::once(&plan.cfg).chain(plan.second.iter()),
+        inner_cpu_multiplier,
+    ) {
+        return RunSummary::refused(
+            3,
+            &plan.profile,
+            "per-test CPU limit is not inside its DAG-node backup",
+            vec![
+                error,
+                "lower the per-test multiplier or regenerate the node CPU backup from the exact selected population"
+                    .into(),
+            ],
+        );
+    }
+
     // Fail-closed caps audit. A node without declared caps would run UNBOXED
     // while the driver still printed "boxing ACTIVE" — a green verifying less
     // than it claims. Refuse rather than run.
@@ -19245,6 +19571,36 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             }
         };
 
+    let whole_run_cpu_timeout_s = match derived_validate_run_cpu_timeout(&plan) {
+        Ok(timeout) => timeout,
+        Err(error) => {
+            return RunSummary::refused(
+                3,
+                &plan.profile,
+                "whole-run CPU budget derivation",
+                vec![error],
+            )
+        }
+    };
+    let run_cpu_budget = match start_run_cpu_budget(&cgroups, Some(whole_run_cpu_timeout_s)) {
+        Ok(budget) => budget,
+        Err(error) => {
+            return RunSummary::refused(
+                3,
+                &plan.profile,
+                "whole-run CPU accounting",
+                vec![
+                    error,
+                    "a declared CPU backstop without a readable counter would not enforce anything"
+                        .into(),
+                ],
+            )
+        }
+    };
+    eprintln!(
+        "validate: whole-run CPU backup {whole_run_cpu_timeout_s}s = sum of exact selected node CPU budgets + {VALIDATE_RUN_CPU_OVERHEAD_SECONDS}s driver overhead"
+    );
+
     let commit = git_sha();
     let git_depth = match measure_git_depth(&commit) {
         Ok(depth) => depth,
@@ -19443,7 +19799,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // allowance rather than each receiving a fresh budget.
     let deadline = deadline_ns;
     let lane = |cfg: &DagConfig| -> LaneResult {
-        run_lane_once(
+        run_lane_once_with_cpu(
             cfg,
             jobs,
             keep_going,
@@ -19452,9 +19808,12 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             &log_path,
             deadline,
             true,
+            run_cpu_budget,
         )
     };
     let mut run_timed_out = false;
+    let mut run_cpu_timed_out = false;
+    let mut run_cpu_accounting_failed = false;
 
     let r = lane(&plan.cfg);
     outcomes.extend(r.outcomes.iter().cloned());
@@ -19463,6 +19822,8 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     ok = ok && r.ok;
     execution_complete = execution_complete && r.complete;
     run_timed_out = run_timed_out || r.run_timed_out;
+    run_cpu_timed_out = run_cpu_timed_out || r.run_cpu_timed_out;
+    run_cpu_accounting_failed = run_cpu_accounting_failed || r.run_cpu_accounting_failed;
 
     if let Some(second) = &plan.second {
         // Sequential lanes are separate fail-fast families. A failure in the first lane must not
@@ -19475,10 +19836,21 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         ok = ok && r2.ok;
         execution_complete = execution_complete && r2.complete;
         run_timed_out = run_timed_out || r2.run_timed_out;
+        run_cpu_timed_out = run_cpu_timed_out || r2.run_cpu_timed_out;
+        run_cpu_accounting_failed =
+            run_cpu_accounting_failed || r2.run_cpu_accounting_failed;
     }
 
     let wall = (epoch_now() - started_epoch) as f64;
-    if run_timed_out {
+    if run_cpu_accounting_failed {
+        println!(
+            "VALIDATE RUN CPU ACCOUNTING FAILED: the required outer cgroup counter became unreadable or moved backwards; remaining work was cut and cannot report PASS"
+        );
+    } else if run_cpu_timed_out {
+        println!(
+            "VALIDATE RUN CPU BUDGET EXCEEDED (budget {whole_run_cpu_timeout_s}s): remaining work was cut so its node identities and rows could still be reported"
+        );
+    } else if run_timed_out {
         println!(
             "⏱ VALIDATE RUN BUDGET EXCEEDED after {wall:.0}s (budget {}s): remaining work was \
              cut so its node identities and rows could still be reported. This is an incomplete \
