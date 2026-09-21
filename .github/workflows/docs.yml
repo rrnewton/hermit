@@ -7,6 +7,15 @@ name: Docs
 
 on:
   workflow_dispatch:
+    inputs:
+      compatibility_registry_asset:
+        description: "Immutable release asset ID from the nightly compatibility builder"
+        required: false
+        type: string
+      compatibility_registry_sha256:
+        description: "SHA-256 of that complete append-only release registry"
+        required: false
+        type: string
 
 # Supersede older runs for the same ref so documentation deploys do not
 # accumulate behind newer commits.
@@ -55,6 +64,8 @@ jobs:
       if: github.ref == 'refs/heads/main'
       env:
         GH_TOKEN: ${{ github.token }}
+        NIGHTLY_REGISTRY_ASSET: ${{ inputs.compatibility_registry_asset }}
+        NIGHTLY_REGISTRY_SHA256: ${{ inputs.compatibility_registry_sha256 }}
       run: |
         set -euo pipefail
         umask 077
@@ -67,6 +78,38 @@ jobs:
         mkdir "$archives" "$pin_rows"
 
         python3 .github/scripts/publish-compatibility-site.py validate "$pins" .
+
+        # The existing host timer is authorized to rebuild this site nightly.
+        # Its immutable release handoff does not enable PR/main test Actions.
+        # Always preserve the registry already served by Pages, even on an
+        # ordinary manual docs rebuild with no new compatibility artifact.
+        pages_sha=$(gh api repos/rrnewton/hermit/git/ref/heads/gh-pages --jq .object.sha)
+        gh api "repos/rrnewton/hermit/contents/compatibility?ref=$pages_sha" > "$scratch/served.json"
+        previous="$scratch/previous.json"
+        if jq -e 'any(.[]; .name == "releases.json" and .type == "file")' "$scratch/served.json" >/dev/null; then
+          gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/rrnewton/hermit/contents/compatibility/releases.json?ref=$pages_sha" > "$previous"
+        else
+          # One-time adoption of the old checked-in registry is allowed only
+          # when it accounts for every already-public content-addressed tree.
+          jq -e --slurpfile pins "$pins" \
+            '([.[] | .name] | sort) == ([$pins[0].releases[].identity, "latest"] | sort)' \
+            "$scratch/served.json" >/dev/null
+          cp "$pins" "$previous"
+        fi
+        candidate="$scratch/registry.json"
+        if [[ -n "$NIGHTLY_REGISTRY_ASSET" || -n "$NIGHTLY_REGISTRY_SHA256" ]]; then
+          [[ "$NIGHTLY_REGISTRY_ASSET" =~ ^[0-9]{1,20}$ ]]
+          [[ "$NIGHTLY_REGISTRY_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          gh api -H 'Accept: application/octet-stream' \
+            "repos/rrnewton/hermit/releases/assets/$NIGHTLY_REGISTRY_ASSET" > "$candidate"
+          printf '%s  %s\n' "$NIGHTLY_REGISTRY_SHA256" "$candidate" | sha256sum -c -
+        else
+          cp "$previous" "$candidate"
+        fi
+        python3 .github/scripts/publish-compatibility-site.py validate-update \
+          "$candidate" "$pins" . "$previous"
+        pins="$candidate"
 
         release_repository=$(jq -er '.release_repository' "$pins")
         release_count=$(jq -er '.releases | length' "$pins")
