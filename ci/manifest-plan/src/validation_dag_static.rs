@@ -211,7 +211,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three policy controls retain all 559 prior identities.
     // Three real CPU-emission lifecycle controls retain all 562 prior identities.
     // The runtime manifest-root regression retains all 565 prior identities.
-    ("test.regular_crates", 566),
+    // Seven census/finalized-run/scope controls retain all 566 prior identities.
+    ("test.regular_crates", 573),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     ("test.hermit_unit", 710),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
@@ -247,7 +248,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 566),
+    ("test.regular_crates_on_host", 573),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];

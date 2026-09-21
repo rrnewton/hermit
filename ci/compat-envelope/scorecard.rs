@@ -40,6 +40,7 @@ use fs2::FileExt;
 use hermit_manifest_plan::backend_parity::BackendParityReport;
 use hermit_manifest_plan::backend_parity::BackendParityVerdict;
 use hermit_manifest_plan::canonical_verdict;
+use hermit_manifest_plan::ledger::HistoryRow;
 use hermit_manifest_plan::logdiff_report::LOG_DIFF_REPORT_SCHEMA;
 use hermit_manifest_plan::logdiff_report::LogDiffComparison;
 use hermit_manifest_plan::logdiff_report::LogDiffMessageCounts;
@@ -104,9 +105,9 @@ Commands:
   observe-results --results DIR
       Merge the canonical comparison results from ONE validate result directory
       into the ledger's retained observations, under the `validate` provenance
-      so they never mix with pressure-test bounds. Direct top-level local
-      validates run this after their ledger and receipt work; ci-hub additionally
-      runs it in the checkout that invoked validation after the isolated run.
+      so they never mix with pressure-test bounds. Automatic validation callers
+      use project-and-observe-results through the parent publisher after their
+      finalized row and complete raw census have been durably recorded.
   import-results --results DIR --current-summary FILE [--current-summary FILE ...]
       Import clean canonical comparisons retained on HEAD's history. A retained
       divergence position is imported only after current results classify it as
@@ -123,8 +124,9 @@ Commands:
       --results DIR --expected-head SHA --refreshed-at STAMP
       In one locked transaction, project one immutable canonical series
       snapshot and then merge one completed validate result directory. The
-      two generated files are replaced as one guarded pair. This command is
-      dormant until its parent snapshot provider and callers land together.
+      two generated files are replaced as one guarded pair. Automatic callers
+      bind their finalized ledger row and retained raw-input census before
+      reporting writeback completion.
   verify-results --results DIR [--lanes portable,privileged]
       Check the tracked files, then require a fresh PASS row at HEAD for every
       selected regression cell in the named lanes. The default is both lanes.
@@ -144,11 +146,16 @@ ptrace-vs-candidate evidence.
 
 const PROJECT_AND_OBSERVE_USAGE: &str = r#"Usage: ci/compat-envelope/scorecard.rs project-and-observe-results \
     --snapshot FILE --snapshot-sha256 HEX --results DIR \
-    --expected-head SHA --refreshed-at STAMP
+    --expected-head SHA [--results-head SHA] --refreshed-at STAMP \
+    [--finalized-row FILE --finalized-row-sha256 HEX --state-root DIR]
 
 Project one immutable scorecard-series-snapshot/v1 input, then merge one exact
 completed validation result directory, under one scorecard write-back lock and
-one guarded two-file replacement.
+one guarded two-file replacement. The expected head binds the receiving
+checkout; results-head binds the measured commit and defaults to expected-head.
+An empty current population requires the finalized schema-10 row and its actual
+constructed-plan, cell and test artifacts beneath state-root. An empty directory
+alone is not evidence that no cells were selected.
 "#;
 
 #[derive(Debug)]
@@ -157,7 +164,16 @@ struct ProjectAndObserveArgs {
     snapshot_sha256: String,
     results: PathBuf,
     expected_head: String,
+    results_head: Option<String>,
     refreshed_at: String,
+    finalized: Option<FinalizedRunArgs>,
+}
+
+#[derive(Debug)]
+struct FinalizedRunArgs {
+    row: PathBuf,
+    sha256: String,
+    state_root: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -3009,7 +3025,11 @@ where
     let mut snapshot_sha256 = None;
     let mut results = None;
     let mut expected_head = None;
+    let mut results_head = None;
     let mut refreshed_at = None;
+    let mut finalized_row = None;
+    let mut finalized_row_sha256 = None;
+    let mut state_root = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--snapshot" => set_project_and_observe_arg(&mut snapshot, "--snapshot", args.next())?,
@@ -3019,6 +3039,20 @@ where
             "--results" => set_project_and_observe_arg(&mut results, "--results", args.next())?,
             "--expected-head" => {
                 set_project_and_observe_arg(&mut expected_head, "--expected-head", args.next())?
+            }
+            "--results-head" => {
+                set_project_and_observe_arg(&mut results_head, "--results-head", args.next())?
+            }
+            "--finalized-row" => {
+                set_project_and_observe_arg(&mut finalized_row, "--finalized-row", args.next())?
+            }
+            "--finalized-row-sha256" => set_project_and_observe_arg(
+                &mut finalized_row_sha256,
+                "--finalized-row-sha256",
+                args.next(),
+            )?,
+            "--state-root" => {
+                set_project_and_observe_arg(&mut state_root, "--state-root", args.next())?
             }
             "--refreshed-at" => {
                 set_project_and_observe_arg(&mut refreshed_at, "--refreshed-at", args.next())?
@@ -3035,12 +3069,26 @@ where
             format!("project-and-observe-results requires {option}\n\n{PROJECT_AND_OBSERVE_USAGE}")
         })
     };
+    let finalized = match (finalized_row, finalized_row_sha256, state_root) {
+        (None, None, None) => None,
+        (Some(row), Some(sha256), Some(state_root)) => Some(FinalizedRunArgs {
+            row: row.into(),
+            sha256,
+            state_root: state_root.into(),
+        }),
+        _ => return Err(
+            "--finalized-row, --finalized-row-sha256 and --state-root must be supplied together"
+                .into(),
+        ),
+    };
     Ok(ProjectAndObserveArgs {
         snapshot: PathBuf::from(required(snapshot, "--snapshot FILE")?),
         snapshot_sha256: required(snapshot_sha256, "--snapshot-sha256 HEX")?,
         results: PathBuf::from(required(results, "--results DIR")?),
         expected_head: required(expected_head, "--expected-head SHA")?,
+        results_head,
         refreshed_at: required(refreshed_at, "--refreshed-at STAMP")?,
+        finalized,
     })
 }
 
@@ -3079,7 +3127,10 @@ fn run() -> Result<(), String> {
         return publish_history_command(&root, &command, args);
     }
     match command.as_str() {
-        "export-legacy" => { no_more(&mut args)?; export_legacy_history(&root)?; }
+        "export-legacy" => {
+            no_more(&mut args)?;
+            export_legacy_history(&root)?;
+        }
         "show" => {
             no_more(&mut args)?;
             let derived = derive(&root)?;
@@ -3168,14 +3219,7 @@ fn run() -> Result<(), String> {
                 return Ok(());
             }
             let options = parse_project_and_observe_args(remaining.into_iter())?;
-            project_and_observe_results(
-                &root,
-                &options.snapshot,
-                &options.snapshot_sha256,
-                &options.results,
-                &options.expected_head,
-                &options.refreshed_at,
-            )?;
+            project_and_observe_authorized_with(&root, &options, || Ok(()), |_| Ok(()))?;
         }
         "verify-results" => {
             let mut result_root = None;
@@ -3302,11 +3346,14 @@ fn derive(root: &Path) -> Result<Derived, String> {
     let tool = manifest_tool_root()?;
     let output = Command::new("cargo")
         .args(["run", "--quiet", "-p", "hermit-manifest-plan"])
-        .arg("--manifest-path").arg(tool.join("Cargo.toml"))
+        .arg("--manifest-path")
+        .arg(tool.join("Cargo.toml"))
         // Build once at the stable tool location; the measured checkout is
         // an explicit data input, never inferred from the executable location.
-        .arg("--target-dir").arg(tool.join("target"))
-        .args(["--", "--root"]).arg(root)
+        .arg("--target-dir")
+        .arg(tool.join("target"))
+        .args(["--", "--root"])
+        .arg(root)
         .args(["--format", "matrix-json"])
         .current_dir(root)
         .output()
@@ -4691,11 +4738,7 @@ fn wait_for_scorecard_write_lock(
 
 fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
     let output = Command::new("git")
-        .args([
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ])
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(root)
         .output()
         .map_err(|e| format!("cannot locate the scorecard write-back lock: {e}"))?;
@@ -4706,7 +4749,8 @@ fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
         std::str::from_utf8(&output.stdout)
             .map_err(|e| format!("scorecard write-back lock path is not UTF-8: {e}"))?
             .trim(),
-    ).join("scorecard-writeback.lock");
+    )
+    .join("scorecard-writeback.lock");
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -4904,6 +4948,7 @@ fn update_tracked(
 fn repo_depth_at(root: &Path, revision: &str) -> Option<SourceDepth> {
     let count = |args: &[&str]| -> Option<u64> {
         let out = Command::new("git")
+            .arg("--no-replace-objects")
             .args(args)
             .current_dir(root)
             .output()
@@ -4926,6 +4971,7 @@ fn repo_depth_at(root: &Path, revision: &str) -> Option<SourceDepth> {
 /// Read the unique full Reverie pin from one recorded Hermit revision.
 fn reverie_pin_at(root: &Path, hermit_revision: &str) -> Option<String> {
     let output = Command::new("git")
+        .arg("--no-replace-objects")
         .args(["show", &format!("{hermit_revision}:Cargo.lock")])
         .current_dir(root)
         .output()
@@ -6469,7 +6515,13 @@ fn measurement_transition(
 
 fn git_is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
     let status = Command::new("git")
-        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .args([
+            "--no-replace-objects",
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ])
         .current_dir(root)
         .status()
         .map_err(|e| format!("cannot compare Hermit revisions {ancestor} and {descendant}: {e}"))?;
@@ -6797,6 +6849,362 @@ fn project_and_observe_results(
     )
 }
 
+fn current_source_may_replace_stamp(
+    root: &Path,
+    previous: Option<&LastTested>,
+    measured: &str,
+    detcore_tree: &str,
+) -> Result<bool, String> {
+    let Some(previous) = previous else {
+        return Ok(true);
+    };
+    if previous.hermit_sha == measured {
+        if previous.detcore_tree != detcore_tree {
+            return Err("same measured commit has conflicting Detcore identities".into());
+        }
+        return Ok(true);
+    }
+    // A missing old object does not make the new result newer. Its observation
+    // is still retained, but only proven ancestry can advance a source stamp.
+    if git_no_replace_rev_parse(root, &format!("{}^{{commit}}", previous.hermit_sha))
+        .ok()
+        .as_deref()
+        != Some(previous.hermit_sha.as_str())
+    {
+        return Ok(false);
+    }
+    git_is_ancestor(root, &previous.hermit_sha, measured)
+}
+
+/// Files authorizing a transaction stay open, with every containing directory
+/// held and checked. Neither a pathname substitution nor a rewritten same-inode
+/// artifact can silently change the proof between admission and replacement.
+struct HeldEvidenceFile {
+    path: PathBuf,
+    directories: Vec<(PathBuf, File, SnapshotDirectoryIdentity)>,
+    file: File,
+    identity: SnapshotPathIdentity,
+    bytes: Vec<u8>,
+}
+
+impl HeldEvidenceFile {
+    fn open(path: &Path, expected_sha256: Option<&str>) -> Result<Self, String> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            env::current_dir()
+                .map_err(|error| error.to_string())?
+                .join(path)
+        };
+        let mut prefix = PathBuf::new();
+        let mut directories = Vec::new();
+        for component in absolute
+            .parent()
+            .ok_or("evidence path has no parent")?
+            .components()
+        {
+            match component {
+                std::path::Component::RootDir | std::path::Component::Normal(_) => {
+                    prefix.push(component)
+                }
+                std::path::Component::CurDir => continue,
+                _ => return Err("evidence path contains an unsupported component".into()),
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&prefix)
+                .map_err(|error| {
+                    format!(
+                        "cannot hold evidence directory {}: {error}",
+                        prefix.display()
+                    )
+                })?;
+            let identity =
+                SnapshotDirectoryIdentity::from_path_identity(SnapshotPathIdentity::from_metadata(
+                    &file.metadata().map_err(|error| error.to_string())?,
+                ));
+            directories.push((prefix.clone(), file, identity));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&absolute)
+            .map_err(|error| {
+                format!("cannot hold evidence file {}: {error}", absolute.display())
+            })?;
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_file() {
+            return Err("evidence input is not a regular file".into());
+        }
+        let identity = SnapshotPathIdentity::from_metadata(&metadata);
+        let bytes = read_held_snapshot_file(&file, identity)?;
+        if let Some(expected) = expected_sha256 {
+            if !is_sha256(expected) || format!("{:x}", Sha256::digest(&bytes)) != expected {
+                return Err(format!("evidence digest mismatch: {}", absolute.display()));
+            }
+        }
+        let held = Self {
+            path: absolute,
+            directories,
+            file,
+            identity,
+            bytes,
+        };
+        held.verify()?;
+        Ok(held)
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        for (path, file, identity) in &self.directories {
+            let opened =
+                SnapshotDirectoryIdentity::from_path_identity(SnapshotPathIdentity::from_metadata(
+                    &file.metadata().map_err(|error| error.to_string())?,
+                ));
+            let named = SnapshotDirectoryIdentity::from_path_identity(snapshot_path_identity(
+                path,
+                "directory",
+            )?);
+            if opened != *identity || named != *identity {
+                return Err(format!("evidence directory changed: {}", path.display()));
+            }
+        }
+        if SnapshotPathIdentity::from_metadata(
+            &self.file.metadata().map_err(|error| error.to_string())?,
+        ) != self.identity
+            || snapshot_path_identity(&self.path, "file")? != self.identity
+            || read_held_snapshot_file(&self.file, self.identity)? != self.bytes
+        {
+            return Err(format!("evidence file changed: {}", self.path.display()));
+        }
+        Ok(())
+    }
+}
+
+struct CurrentResultCensus {
+    root: PathBuf,
+    directories: BTreeMap<PathBuf, SnapshotDirectoryIdentity>,
+    files: Vec<HeldEvidenceFile>,
+}
+
+fn census_result_paths(
+    root: &Path,
+    directories: &mut BTreeMap<PathBuf, SnapshotDirectoryIdentity>,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    directories.insert(
+        root.to_path_buf(),
+        SnapshotDirectoryIdentity::from_path_identity(snapshot_path_identity(root, "directory")?),
+    );
+    for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let kind = entry.file_type().map_err(|error| error.to_string())?;
+        if kind.is_symlink() {
+            return Err(format!(
+                "current result census refuses a symlink: {}",
+                entry.path().display()
+            ));
+        }
+        if kind.is_dir() {
+            census_result_paths(&entry.path(), directories, files)?;
+        } else if entry.file_name() == "results.jsonl" {
+            if !kind.is_file() {
+                return Err("results.jsonl is not a regular file".into());
+            }
+            files.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+impl CurrentResultCensus {
+    fn open(root: &Path) -> Result<Self, String> {
+        let mut directories = BTreeMap::new();
+        let mut paths = Vec::new();
+        census_result_paths(root, &mut directories, &mut paths)?;
+        paths.sort();
+        let files = paths
+            .iter()
+            .map(|path| HeldEvidenceFile::open(path, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        let census = Self {
+            root: root.to_path_buf(),
+            directories,
+            files,
+        };
+        census.verify()?;
+        Ok(census)
+    }
+
+    fn inputs(&self) -> Vec<(PathBuf, &[u8])> {
+        self.files
+            .iter()
+            .map(|file| (file.path.clone(), file.bytes.as_slice()))
+            .collect()
+    }
+
+    fn relative_inputs(&self) -> Result<BTreeMap<String, Vec<u8>>, String> {
+        let root = if self.root.is_absolute() {
+            self.root.clone()
+        } else {
+            env::current_dir()
+                .map_err(|error| error.to_string())?
+                .join(&self.root)
+        };
+        self.files
+            .iter()
+            .map(|file| {
+                let path = file
+                    .path
+                    .strip_prefix(&root)
+                    .map_err(|error| error.to_string())?
+                    .to_str()
+                    .ok_or("raw result census path is not UTF-8")?
+                    .to_string();
+                Ok((path, file.bytes.clone()))
+            })
+            .collect()
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        let mut directories = BTreeMap::new();
+        let mut paths = Vec::new();
+        census_result_paths(&self.root, &mut directories, &mut paths)?;
+        paths.sort();
+        let expected = self
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        // Retain one absolute spelling for comparison with held inputs.
+        let actual = paths
+            .iter()
+            .map(|path| {
+                if path.is_absolute() {
+                    Ok(path.clone())
+                } else {
+                    env::current_dir()
+                        .map(|cwd| cwd.join(path))
+                        .map_err(|error| error.to_string())
+                }
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if directories != self.directories || actual != expected {
+            return Err(
+                "current result population or directory identity changed during writeback".into(),
+            );
+        }
+        for file in &self.files {
+            file.verify()?;
+        }
+        Ok(())
+    }
+}
+
+struct FinalizedRunProof {
+    files: Vec<HeldEvidenceFile>,
+    zero_cells: bool,
+}
+
+impl FinalizedRunProof {
+    fn open(
+        args: &FinalizedRunArgs,
+        measured: &str,
+        stamp: &str,
+        current: &BTreeMap<CellId, Vec<ResultCandidate>>,
+        inputs: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<Self, String> {
+        let row_file = HeldEvidenceFile::open(&args.row, Some(&args.sha256))?;
+        serde_json::from_slice::<UniqueJsonFields>(&row_file.bytes)
+            .map_err(|error| error.to_string())?;
+        let row: HistoryRow =
+            serde_json::from_slice(&row_file.bytes).map_err(|error| error.to_string())?;
+        let run = row
+            .run_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("finalized row omitted its run identity")?;
+        if current
+            .values()
+            .flatten()
+            .any(|candidate| candidate.row.run_id != run)
+        {
+            return Err("current results differ from the finalized run identity".into());
+        }
+        let mut files = Vec::new();
+        if row.schema_version == Some(10) || current.is_empty() {
+            let plan = row
+                .constructed_plan_artifact()?
+                .ok_or("zero-current proof requires schema 10")?;
+            let cells = row
+                .schema10_cell_results()?
+                .ok_or("zero-current proof requires schema 10 cell evidence")?;
+            // Decode only to locate the bytes; the schema-10 verifier below
+            // establishes their authority against the original row and plan.
+            let tests: hermit_manifest_plan::ledger::TestResultsEvidenceV9 =
+                serde_json::from_value(
+                    serde_json::to_value(
+                        row.test_results
+                            .as_ref()
+                            .ok_or("zero-current proof omitted test evidence")?,
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+            for (relative, digest) in [
+                (&plan.path, &plan.sha256),
+                (&cells.artifact.path, &cells.artifact.sha256),
+                (&tests.artifact.path, &tests.artifact.sha256),
+            ] {
+                let path = Path::new(relative);
+                if path.is_absolute()
+                    || path
+                        .components()
+                        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                {
+                    return Err("finalized artifact path is not relative to state root".into());
+                }
+                files.push(HeldEvidenceFile::open(
+                    &args.state_root.join(path),
+                    Some(digest),
+                )?);
+            }
+        }
+        let artifact_bytes = if files.is_empty() {
+            None
+        } else {
+            Some((
+                files[0].bytes.as_slice(),
+                files[1].bytes.as_slice(),
+                files[2].bytes.as_slice(),
+            ))
+        };
+        let zero_cells =
+            row.verify_finalized_raw_input_bytes(measured, stamp, inputs, artifact_bytes)?;
+        // The current projection can filter raw rows. A nonempty census must
+        // not become selected-zero authority merely because that map is empty.
+        if current.is_empty() && !zero_cells {
+            return Err(
+                "empty current results contradict the finalized selected population".into(),
+            );
+        }
+        files.push(row_file);
+        let proof = Self {
+            files,
+            zero_cells: current.is_empty(),
+        };
+        proof.verify()?;
+        Ok(proof)
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        for file in &self.files {
+            file.verify()?;
+        }
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn project_and_observe_results_with<BeforeGuard, BeforeReplace>(
     root: &Path,
@@ -6805,6 +7213,32 @@ fn project_and_observe_results_with<BeforeGuard, BeforeReplace>(
     results: &Path,
     expected_head: &str,
     refreshed_at: &str,
+    before_guard: BeforeGuard,
+    before_replace: BeforeReplace,
+) -> Result<(), String>
+where
+    BeforeGuard: FnMut() -> Result<(), String>,
+    BeforeReplace: FnMut(usize) -> Result<(), String>,
+{
+    project_and_observe_authorized_with(
+        root,
+        &ProjectAndObserveArgs {
+            snapshot: snapshot_path.to_path_buf(),
+            snapshot_sha256: snapshot_sha256.to_string(),
+            results: results.to_path_buf(),
+            expected_head: expected_head.to_string(),
+            results_head: None,
+            refreshed_at: refreshed_at.to_string(),
+            finalized: None,
+        },
+        before_guard,
+        before_replace,
+    )
+}
+
+fn project_and_observe_authorized_with<BeforeGuard, BeforeReplace>(
+    root: &Path,
+    options: &ProjectAndObserveArgs,
     mut before_guard: BeforeGuard,
     mut before_replace: BeforeReplace,
 ) -> Result<(), String>
@@ -6812,8 +7246,20 @@ where
     BeforeGuard: FnMut() -> Result<(), String>,
     BeforeReplace: FnMut(usize) -> Result<(), String>,
 {
+    let ProjectAndObserveArgs {
+        snapshot: snapshot_path,
+        snapshot_sha256,
+        results,
+        expected_head,
+        refreshed_at,
+        ..
+    } = options;
+    let measured = options.results_head.as_deref().unwrap_or(expected_head);
     if !is_object_id(expected_head) {
         return Err("--expected-head requires exactly 40 lowercase hexadecimal characters".into());
+    }
+    if !is_object_id(measured) {
+        return Err("--results-head requires exactly 40 lowercase hexadecimal characters".into());
     }
     if refreshed_at.trim().is_empty() {
         return Err("--refreshed-at requires a nonempty deterministic stamp".into());
@@ -6827,7 +7273,7 @@ where
 
     let _lock = acquire_history_write_lock(root)?;
     let head = git_head(root)?;
-    if head != expected_head {
+    if head != *expected_head {
         return Err(format!(
             "combined scorecard write-back expected HEAD {expected_head}, found {head}"
         ));
@@ -6836,14 +7282,44 @@ where
     let original = read_history_files(root)?;
     let derived = check_tracked(root)?;
     let snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
-    let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
-    let depth = source_depths(root, &head)?;
-    let result_rows = read_result_candidates(results, &head)?;
+    if git_no_replace_rev_parse(root, &format!("{measured}^{{commit}}"))? != measured {
+        return Err("measured source is not the specified actual commit".into());
+    }
+    let detcore_tree = git_no_replace_rev_parse(root, &format!("{measured}:detcore"))?;
+    let depth = source_depths(root, measured)?;
+    let census = CurrentResultCensus::open(results)?;
+    let result_rows = read_result_candidate_files(&census.inputs(), measured)?;
+    let finalized = options
+        .finalized
+        .as_ref()
+        .map(|proof| {
+            FinalizedRunProof::open(
+                proof,
+                measured,
+                refreshed_at,
+                &result_rows,
+                &census.relative_inputs()?,
+            )
+        })
+        .transpose()?;
+    if result_rows.is_empty() && !finalized.as_ref().is_some_and(|proof| proof.zero_cells) {
+        return Err(
+            "empty current results require verified finalized zero-selection evidence".into(),
+        );
+    }
 
     let mut tracked: TrackedCells = serde_json::from_slice(&original.cells)
         .map_err(|error| format!("cannot parse tracked {CELLS}: {error}"))?;
     reconcile_history_catalogue(root, &mut tracked)?;
     let before = tracked.clone();
+    for id in result_rows.keys() {
+        if !tracked.cells.iter().any(|cell| &cell.id == id) {
+            return Err(format!(
+                "current result {} has no cell in the invoker's tracked matrix",
+                display_id(id)
+            ));
+        }
+    }
     // Validate current inputs on a private copy before either projection can
     // encounter the old compact run matcher. Reconcile the complete snapshot
     // first; only exactly represented events may be suppressed. Existing
@@ -6852,15 +7328,15 @@ where
     apply_validate_results_from(
         &mut preview,
         &result_rows,
-        &head,
+        measured,
         &detcore_tree,
         &depth,
         ValidateInput {
             reports: ResultInput::Current,
             store_invocation: true,
             store_positions: true,
-            applicability: Some(SourceApplicability {
-                hermit_sha: &head,
+            applicability: (measured == head).then_some(SourceApplicability {
+                hermit_sha: measured,
                 applicable: &derived.applicable,
             }),
         },
@@ -6901,22 +7377,46 @@ where
         pre_series_corpus: true,
     });
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
+    let projected_stamps = tracked
+        .cells
+        .iter()
+        .map(|cell| (cell.id.clone(), cell.last_tested.clone()))
+        .collect::<BTreeMap<_, _>>();
     let fold = apply_validate_results_from(
         &mut tracked,
         &result_rows,
-        &head,
+        measured,
         &detcore_tree,
         &depth,
         ValidateInput {
             reports: ResultInput::Current,
             store_invocation: true,
             store_positions: true,
-            applicability: Some(SourceApplicability {
-                hermit_sha: &head,
+            applicability: (measured == head).then_some(SourceApplicability {
+                hermit_sha: measured,
                 applicable: &derived.applicable,
             }),
         },
     )?;
+    // Current is a new execution, including when it measured the same source.
+    // Preserve a newer or incomparable projected stamp without discarding any
+    // of the current observations or pretending they are retained imports.
+    let mut current_stamps = BTreeMap::new();
+    for cell in &tracked.cells {
+        if !result_rows.contains_key(&cell.id) {
+            continue;
+        }
+        let prior = projected_stamps.get(&cell.id).and_then(Option::as_ref);
+        let replace = current_source_may_replace_stamp(root, prior, measured, &detcore_tree)?;
+        current_stamps.insert(
+            cell.id.clone(),
+            if replace {
+                cell.last_tested.clone()
+            } else {
+                prior.cloned()
+            },
+        );
+    }
     // A normal validate publishes its series row before this local write-back.
     // Match the final direct evidence to the complete snapshot before choosing
     // its stored representation. Exactly represented events are suppressed in
@@ -6940,6 +7440,11 @@ where
         &projected_rows,
         Some(&snapshot.snapshot.source.path),
     )?;
+    for cell in &mut tracked.cells {
+        if let Some(stamp) = current_stamps.get(&cell.id) {
+            cell.last_tested = stamp.clone();
+        }
+    }
     tracked.projection = Some(ObservationProjection {
         source: snapshot.snapshot.source.path.clone(),
         source_repository: snapshot.snapshot.source.repository.clone(),
@@ -6965,6 +7470,10 @@ where
         &updated,
         || {
             before_guard()?;
+            census.verify()?;
+            if let Some(proof) = &finalized {
+                proof.verify()?;
+            }
             verify_combined_write_state(
                 root,
                 &head,
@@ -6975,6 +7484,10 @@ where
         },
         |replacement| {
             before_replace(replacement)?;
+            census.verify()?;
+            if let Some(proof) = &finalized {
+                proof.verify()?;
+            }
             let expected_scorecard = if replacement == 1 {
                 &original.scorecard
             } else {
@@ -8623,9 +9136,12 @@ fn validate_scorecard_snapshot(
             snapshot.schema
         ));
     }
-    if snapshot.source.repository.as_deref().is_some_and(|repository| {
-        repository != TEST_LEDGER_REPOSITORY
-    }) || snapshot.source.path != SCORECARD_SERIES_SNAPSHOT_SOURCE
+    if snapshot
+        .source
+        .repository
+        .as_deref()
+        .is_some_and(|repository| repository != TEST_LEDGER_REPOSITORY)
+        || snapshot.source.path != SCORECARD_SERIES_SNAPSHOT_SOURCE
         || !is_object_id(&snapshot.source.commit)
         || !is_object_id(&snapshot.source.tree)
     {
@@ -9372,9 +9888,30 @@ fn read_result_candidates(
     if files.is_empty() {
         return Err(format!("no results.jsonl files under {}", root.display()));
     }
+    let inputs = files
+        .into_iter()
+        .map(|path| {
+            fs::read(&path)
+                .map(|bytes| (path.clone(), bytes))
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    read_result_candidate_files(
+        &inputs
+            .iter()
+            .map(|(path, bytes)| (path.clone(), bytes.as_slice()))
+            .collect::<Vec<_>>(),
+        head,
+    )
+}
+
+fn read_result_candidate_files(
+    files: &[(PathBuf, &[u8])],
+    head: &str,
+) -> Result<BTreeMap<CellId, Vec<ResultCandidate>>, String> {
     let mut grouped: BTreeMap<(CellId, String), Vec<ResultCandidate>> = BTreeMap::new();
-    for path in files {
-        let text = fs::read_to_string(&path)
+    for (path, bytes) in files {
+        let text = std::str::from_utf8(bytes)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         for (index, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
@@ -10728,6 +11265,9 @@ fn recorded_shell_quote(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
     }
 }
+
+#[cfg(test)]
+static HISTORY_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct HistoryFixtureEnvironment {
     previous: [Option<std::ffi::OsString>; 2],
@@ -13978,9 +14518,9 @@ fn self_test() -> Result<(), String> {
     restore_generated()?;
 
     // --- combined immutable-snapshot + current-result transaction ---------
-    // This is deliberately dormant: the production callers continue to use
-    // their existing commands until the parent snapshot provider lands. The
-    // self-test exercises the new command's actual transaction boundary.
+    // Automatic callers use this transaction after durable finalization.
+    // These legacy CLI controls omit the optional finalized-row extension;
+    // capability-declaring callers additionally require its producer proof.
     let mut combined_baseline_cells: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
     for cell in &mut combined_baseline_cells.cells {
         cell.observations.clear();
@@ -14630,8 +15170,7 @@ fn self_test() -> Result<(), String> {
         };
         if refuse {
             let error = run().expect_err("contradictory invocation evidence was accepted");
-            if !error.contains("disagree") || read_history_files(&result_command_root)? != before
-            {
+            if !error.contains("disagree") || read_history_files(&result_command_root)? != before {
                 return Err(format!(
                     "{label} refusal changed the pair or lost its cause: {error}"
                 ));
@@ -20069,7 +20608,7 @@ fn self_test() -> Result<(), String> {
                 apply_series_rows(&root, &mut tracked, &captured_rows, Some(&snapshot.source))?;
             tracked.projection = Some(ObservationProjection {
                 source: snapshot.source,
-        source_repository: None,
+                source_repository: None,
                 source_commit: Some(snapshot.source_commit),
                 source_tree: Some(snapshot.source_tree),
                 refreshed_at: "fixture-no-verdict".into(),
@@ -20591,7 +21130,7 @@ fn self_test() -> Result<(), String> {
             schema: SCHEMA,
             projection: Some(ObservationProjection {
                 source: "fixture-series".into(),
-        source_repository: None,
+                source_repository: None,
                 source_commit: Some(source_commit.clone()),
                 source_tree: Some(source_tree.clone()),
                 refreshed_at: "fixture-stamp".into(),
@@ -20786,7 +21325,7 @@ fn self_test() -> Result<(), String> {
         schema: SCHEMA,
         projection: Some(ObservationProjection {
             source: "fixture-series".into(),
-        source_repository: None,
+            source_repository: None,
             source_commit: Some("a".repeat(40)),
             source_tree: Some("b".repeat(40)),
             refreshed_at: "fixture-stamp".into(),
@@ -21877,6 +22416,7 @@ mod catalogue_ledger_tests {
 
     #[test]
     fn exact_archive_and_parent_lock_are_required_before_history_changes() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
         let root = Path::new(file!())
             .parent()
             .unwrap()
@@ -22115,5 +22655,563 @@ mod catalogue_ledger_tests {
             cells: vec![],
         };
         assert!(validate_observation_identity_namespace(&cells).is_err());
+    }
+}
+
+#[cfg(test)]
+mod post_verdict_transaction_tests {
+    use std::os::fd::AsRawFd;
+
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().into()
+    }
+
+    fn commit(root: &Path, message: &str) -> String {
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                message,
+            ],
+        );
+        git(root, &["rev-parse", "HEAD"])
+    }
+
+    fn result_row(sha: &str) -> JsonValue {
+        let output = serde_json::json!({"exit_code":0,"signal":null,
+            "stdout_sha256":"e".repeat(64),"stdout_bytes":1,"stderr_sha256":"f".repeat(64),"stderr_bytes":0});
+        let report = serde_json::to_string(&serde_json::json!({
+            "verified":true,"bitwise_parity":true,"verdict":"matched","no_result_reason":null,
+            "infrastructure_error":null,"comparison":{
+                "strictness":"canonical","display_name":"BitwiseInfoV1","compare_logs":true,
+                "compare_io_buffers":true,"log_scope":"info","record_envelope":"all_records_v1",
+                "virtualize_time":false,"strip_lines":false,"canonicalize_addresses":true,"full_trace":true,
+                "exact_remainder":true,"stripped_prefixes":["real-wall-clock-prefix/v1"],
+                "canonicalizations":["host-address-to-first-appearance-ordinal/v1"],
+                "ignore_lines":false,"skip_commit":false,"skip_detlog":false
+            },"compared_log_messages":{"left":1,"right":1},"compared_outputs":{"left":output,"right":output},
+            "guest_exit_code":0,"guest_signal":null,
+            "first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,
+            "first_divergent_record":null,"first_divergent_syscall":null,
+            "first_divergent_left_message":null,"first_divergent_right_message":null
+        })).unwrap();
+        let attempt = serde_json::json!({"index":"1","outcome":"PASS","error_kind":null,"status":0,"signal":null,
+                "timed_out":false,"argv":["hermit","record","start"],"guest_argv":["fixture"],"env":{"LC_ALL":"C"},
+                "cwd":"/repo","shell_command":"cd /repo && env LC_ALL=C hermit record start",
+                "verification_report_sha256":format!("{:x}",Sha256::digest(report.as_bytes())),"verification_report":report});
+        serde_json::json!({
+            "schema":4,"run_id":"partial-current-run","attempt":1,"hermit_sha":sha,"source_tree_dirty":false,
+            "binary_sha256":"b".repeat(64),"test_sha256":"c".repeat(64),"test":"system-utils/record-getpid",
+            "category":"system-utils","lane":"portable","mode":"replay","backend":"ptrace",
+            "classification":"required","outcome":"PASS","result":"pass","failure_class":null,
+            "timeout_seconds":15,"execution_cpu_timeout_seconds":10,"execution_wall_timeout_seconds":15,
+            "log_level":"info","effective_args":["record","start"],"argv":["hermit","record","start"],
+            "guest_argv":["fixture"],"env":{"LC_ALL":"C"},"cwd":"/repo",
+            "shell_command":"cd /repo && env LC_ALL=C hermit record start","relaxations":[],
+            "attempts":[attempt]
+        })
+    }
+
+    struct Fixture {
+        _environment: HistoryFixtureEnvironment,
+        _lock: File,
+        _directory: tempfile::TempDir,
+        root: PathBuf,
+        ledger: PathBuf,
+        options: ProjectAndObserveArgs,
+        baseline: GeneratedFiles,
+        row: JsonValue,
+        id: CellId,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let source = Path::new(file!())
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("repo");
+            git(
+                directory.path(),
+                &[
+                    "clone",
+                    "--quiet",
+                    "--shared",
+                    source.to_str().unwrap(),
+                    root.to_str().unwrap(),
+                ],
+            );
+            let local_au = format!(
+                "submodule.agent-utils.url={}",
+                source.join("agent-utils").display()
+            );
+            git(
+                &root,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "-c",
+                    &local_au,
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--recursive",
+                    "--",
+                    "agent-utils",
+                ],
+            );
+            let measured = git(&root, &["rev-parse", "HEAD"]);
+            fs::write(
+                root.join("detcore/scorecard-fixture-source"),
+                "distinct invocation source\n",
+            )
+            .unwrap();
+            git(&root, &["add", "detcore/scorecard-fixture-source"]);
+            let invoker = commit(&root, "independent invocation source");
+            let derived = derive(&root).unwrap();
+            let mut cells: TrackedCells = read_json(&root.join(CELLS)).unwrap();
+            for cell in &mut cells.cells {
+                cell.observations.clear();
+                cell.last_tested = None;
+            }
+            cells.projection = None;
+            refresh_measurement(&mut cells);
+            let baseline = generated_files(&derived, &cells).unwrap();
+            let ledger = directory.path().join("ledger");
+            fs::create_dir_all(ledger.join("scorecard")).unwrap();
+            git(&ledger, &["init", "--quiet"]);
+            git(
+                &ledger,
+                &["remote", "add", "origin", TEST_LEDGER_REPOSITORY],
+            );
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(ledger.join(".git/ci-hub-series-publication.lock"))
+                .unwrap();
+            FileExt::lock_exclusive(&lock).unwrap();
+            let environment = HistoryFixtureEnvironment::set(&ledger, lock.as_raw_fd());
+            let snapshot = directory.path().join("snapshot.json");
+            let value =
+                scorecard_snapshot_fixture_value(&"a".repeat(40), &"b".repeat(40), &[]).unwrap();
+            let snapshot_sha256 = write_scorecard_snapshot_fixture(&snapshot, &value).unwrap();
+            let results = directory.path().join("results");
+            fs::create_dir(&results).unwrap();
+            let options = ProjectAndObserveArgs {
+                snapshot,
+                snapshot_sha256,
+                results,
+                expected_head: invoker,
+                results_head: Some(measured.clone()),
+                refreshed_at: "fixture-start".into(),
+                finalized: None,
+            };
+            let id = CellId {
+                lane: "portable".into(),
+                category: "system-utils".into(),
+                test: "system-utils/record-getpid".into(),
+                mode: "replay".into(),
+                backend: "ptrace".into(),
+            };
+            let mut fixture = Self {
+                _environment: environment,
+                _lock: lock,
+                _directory: directory,
+                root,
+                ledger,
+                options,
+                baseline,
+                row: result_row(&measured),
+                id,
+            };
+            fixture.restore();
+            fixture.publish_inputs();
+            fixture
+        }
+
+        fn restore(&self) {
+            fs::write(self.ledger.join(LEDGER_SCORECARD), &self.baseline.scorecard).unwrap();
+            fs::write(self.ledger.join(LEDGER_CELLS), &self.baseline.cells).unwrap();
+        }
+
+        fn publish_inputs(&mut self) {
+            let row = self.row.clone();
+            self.publish_rows(std::slice::from_ref(&row));
+        }
+
+        fn publish_rows(&mut self, rows: &[JsonValue]) {
+            let mut bytes = Vec::new();
+            for row in rows {
+                bytes.extend(serde_json::to_vec(row).unwrap());
+                bytes.push(b'\n');
+            }
+            fs::write(self.options.results.join("results.jsonl"), &bytes).unwrap();
+            let measured = self.row["hermit_sha"].as_str().unwrap();
+            let run = self.row["run_id"].as_str().unwrap();
+            let census = hermit_manifest_plan::ledger::RawResultInputCensusV1::from_inputs(
+                run,
+                measured,
+                &BTreeMap::from([("results.jsonl".into(), bytes)]),
+            )
+            .unwrap();
+            // This deliberately FAILED partial run made one real observation
+            // in the modeled input and leaves other planned work unexecuted.
+            // Writeback must preserve it, not require or invent full coverage.
+            let row = serde_json::json!({"schema_version":5,"run_id":run,"commit":measured,
+                "tree_dirty":false,"commit_anchored":true,"started_at":"fixture-start","finished_at":"fixture-end",
+                "result":"fail","raw_result":"fail","executed_tests":null,"gates_expected":3,"gates_run":1,
+                "raw_result_input_census_v1":census});
+            let path = self._directory.path().join("finalized.json");
+            let bytes = serde_json::to_vec(&row).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            self.options.finalized = Some(FinalizedRunArgs {
+                row: path,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+                state_root: self._directory.path().into(),
+            });
+        }
+
+        fn publish(&self) -> Result<(), String> {
+            project_and_observe_authorized_with(&self.root, &self.options, || Ok(()), |_| Ok(()))
+        }
+
+        fn cells(&self) -> TrackedCells {
+            read_json(&self.ledger.join(LEDGER_CELLS)).unwrap()
+        }
+    }
+
+    #[test]
+    fn two_head_writeback_preserves_attribution_and_refuses_unbound_or_moving_inputs() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let invoker = fixture.options.expected_head.clone();
+        let source_before = read_generated_files(&fixture.root).unwrap();
+        let original_tree =
+            git_no_replace_rev_parse(&fixture.root, &format!("{measured}:detcore")).unwrap();
+        let current_tree = git_no_replace_rev_parse(&fixture.root, "HEAD:detcore").unwrap();
+        assert_ne!(original_tree, current_tree);
+        let expected_depth = source_depths(&fixture.root, &measured).unwrap();
+        let expected_pin = reverie_pin_at(&fixture.root, &measured);
+        // A real replacement ref substitutes a different source and history.
+        // The writer must still bind the measured object's original content.
+        let forged = git(
+            &fixture.root,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit-tree",
+                &git(&fixture.root, &["rev-parse", "HEAD^{tree}"]),
+                "-m",
+                "replacement root",
+            ],
+        );
+        git(&fixture.root, &["replace", &measured, &forged]);
+        assert_eq!(
+            git_rev_parse(&fixture.root, &format!("{measured}:detcore")).unwrap(),
+            current_tree
+        );
+        fixture.publish().unwrap();
+        let written = fixture.cells();
+        let cell = written
+            .cells
+            .iter()
+            .find(|cell| cell.id == fixture.id)
+            .unwrap();
+        let stamp = cell.last_tested.as_ref().unwrap();
+        assert_eq!(stamp.hermit_sha, measured);
+        assert_eq!(stamp.detcore_tree, original_tree);
+        assert_eq!(stamp.depth, expected_depth);
+        assert_eq!(
+            stamp.applicable_when_tested, None,
+            "invoker applicability is not measured-source authority"
+        );
+        assert_eq!(reverie_pin_at(&fixture.root, &measured), expected_pin);
+        let first = read_history_files(&fixture.root).unwrap();
+        fixture.publish().unwrap();
+        assert!(
+            read_history_files(&fixture.root).unwrap() == first,
+            "identical current input must remain idempotent"
+        );
+        git(&fixture.root, &["replace", "-d", &measured]);
+        fixture.restore();
+        let original_row = fixture.row.clone();
+        for case in [
+            "old-default-head",
+            "wrong-source",
+            "unknown-cell",
+            "truncated",
+            "extra-file",
+            "missing-proof",
+        ] {
+            fixture.row = original_row.clone();
+            fixture.publish_inputs();
+            fixture.restore();
+            match case {
+                "old-default-head" => fixture.options.results_head = None,
+                "wrong-source" => fixture.options.results_head = Some(forged.clone()),
+                "unknown-cell" => {
+                    fixture.row["test"] = "fixture/only-at-target".into();
+                    fixture.publish_inputs();
+                }
+                "truncated" => {
+                    fs::write(fixture.options.results.join("results.jsonl"), b"").unwrap();
+                }
+                "extra-file" => {
+                    fs::create_dir(fixture.options.results.join("extra")).unwrap();
+                    fs::write(fixture.options.results.join("extra/results.jsonl"), b"").unwrap();
+                }
+                "missing-proof" => {
+                    let proof = fixture.options.finalized.as_mut().unwrap();
+                    let mut row: JsonValue = read_json(&proof.row).unwrap();
+                    row.as_object_mut()
+                        .unwrap()
+                        .remove("raw_result_input_census_v1");
+                    let bytes = serde_json::to_vec(&row).unwrap();
+                    proof.sha256 = format!("{:x}", Sha256::digest(&bytes));
+                    fs::write(&proof.row, bytes).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(fixture.publish().is_err(), "admitted {case}");
+            assert!(
+                read_history_files(&fixture.root).unwrap() == fixture.baseline,
+                "mutated output for {case}"
+            );
+            fixture.options.results_head = Some(measured.clone());
+            if case == "extra-file" {
+                fs::remove_dir_all(fixture.options.results.join("extra")).unwrap();
+            }
+        }
+        fixture.row = original_row;
+        fixture.publish_inputs();
+        fixture.restore();
+        let mut prior_attempt = fixture.row.clone();
+        prior_attempt["attempt"] = 2.into();
+        fixture.publish_rows(&[fixture.row.clone(), prior_attempt.clone()]);
+        fixture.publish().unwrap();
+        fixture.restore();
+        // A surviving valid latest attempt cannot authenticate loss of the
+        // superseded attempt recorded by the producer before finalization.
+        let mut surviving = serde_json::to_vec(&prior_attempt).unwrap();
+        surviving.push(b'\n');
+        fs::write(fixture.options.results.join("results.jsonl"), surviving).unwrap();
+        assert!(
+            fixture
+                .publish()
+                .unwrap_err()
+                .contains("producer-finalized raw census")
+        );
+        assert!(read_history_files(&fixture.root).unwrap() == fixture.baseline);
+        fixture.publish_inputs();
+        let mut wrong = fixture.row.clone();
+        wrong["hermit_sha"] = invoker.clone().into();
+        wrong["attempt"] = 2.into();
+        let mut mixed = fs::read(fixture.options.results.join("results.jsonl")).unwrap();
+        mixed.extend(serde_json::to_vec(&wrong).unwrap());
+        mixed.push(b'\n');
+        fs::write(fixture.options.results.join("results.jsonl"), mixed).unwrap();
+        assert!(
+            fixture.publish().is_err(),
+            "mixed source population accepted"
+        );
+        assert!(read_history_files(&fixture.root).unwrap() == fixture.baseline);
+        fixture.publish_inputs();
+        let moved = project_and_observe_authorized_with(
+            &fixture.root,
+            &fixture.options,
+            || {
+                // Keep the index/worktree unchanged so this reaches the HEAD
+                // guard instead of the earlier unrelated-source dirt guard.
+                git(
+                    &fixture.root,
+                    &[
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "commit",
+                        "--allow-empty",
+                        "-qm",
+                        "move invocation during writeback",
+                    ],
+                );
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+        let moved_error = moved.unwrap_err();
+        assert!(moved_error.contains("HEAD moved"), "{moved_error}");
+        assert!(read_history_files(&fixture.root).unwrap() == fixture.baseline);
+        git(&fixture.root, &["update-ref", "HEAD", &invoker]);
+        for replacement in [0, 1, 2] {
+            let result_path = fixture.options.results.join("results.jsonl");
+            let mutate = || {
+                fs::write(&result_path, b"changed after admission")
+                    .map_err(|error| error.to_string())
+            };
+            let result = project_and_observe_authorized_with(
+                &fixture.root,
+                &fixture.options,
+                || if replacement == 0 { mutate() } else { Ok(()) },
+                |index| {
+                    if replacement == index {
+                        mutate()
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(
+                result.is_err(),
+                "moving current input accepted at replacement {replacement}"
+            );
+            assert!(
+                read_history_files(&fixture.root).unwrap() == fixture.baseline,
+                "atomic rollback failed at {replacement}"
+            );
+            fixture.publish_inputs();
+        }
+        // The snapshot itself introduces a newer stamp after the transaction
+        // entry snapshot. The old Current result must not overwrite that stamp.
+        let series: SeriesRow=serde_json::from_value(serde_json::json!({
+            "schema":"stress-series/v3","event_id":"newer-snapshot-event","event_type":"series.observation",
+            "emitted_at":"2026-09-20T00:00:00Z","team":"hermit","host":"fixture-host","producer":"validate",
+            "run_id":"newer-snapshot-run","series":{"cell":series_cell_key(&fixture.id),"tree":invoker,
+                "detcore_tree":current_tree,"outcome":"passed","result":"pass","failure_class":null,
+                "run_index":1,"attempt":1,"num_runs":1,"main_ancestry":true,"source_tree_dirty":false,
+                "depth":source_depths(&fixture.root,&invoker).unwrap(),
+                "machine_shortname":"fixture-host","kernel_version":"fixture-kernel",
+                "host_capabilities":{"cpuid-faulting":{"present":true,"evidence":"fixture cpuid probe"},
+                    "kvm":{"present":false,"evidence":"fixture kvm probe"}}}
+        })).unwrap();
+        series.validate_for_read().unwrap();
+        let value =
+            scorecard_snapshot_fixture_value(&"a".repeat(40), &"b".repeat(40), &[series]).unwrap();
+        fixture.options.snapshot_sha256 =
+            write_scorecard_snapshot_fixture(&fixture.options.snapshot, &value).unwrap();
+        fixture.publish().unwrap();
+        let after_snapshot = fixture.cells();
+        let stamped = after_snapshot
+            .cells
+            .iter()
+            .find(|cell| cell.id == fixture.id)
+            .unwrap();
+        assert_eq!(stamped.last_tested.as_ref().unwrap().hermit_sha, invoker);
+        assert!(
+            stamped
+                .observations
+                .iter()
+                .any(|observation| observation.hermit_shas.contains(&measured))
+        );
+        // An unrelated root commit may have arbitrary apparent depth. Without
+        // ancestry it cannot replace the current source stamp.
+        let incomparable = LastTested {
+            hermit_sha: forged,
+            detcore_tree: current_tree.clone(),
+            depth: BTreeMap::new(),
+            check: None,
+            applicable_when_tested: None,
+            comparison_verdict: None,
+        };
+        assert!(
+            !current_source_may_replace_stamp(
+                &fixture.root,
+                Some(&incomparable),
+                &measured,
+                &original_tree
+            )
+            .unwrap()
+        );
+        let empty =
+            scorecard_snapshot_fixture_value(&"a".repeat(40), &"b".repeat(40), &[]).unwrap();
+        fixture.options.snapshot_sha256 =
+            write_scorecard_snapshot_fixture(&fixture.options.snapshot, &empty).unwrap();
+        fixture.restore();
+        // Same source is still a NEW Current run: refresh the check identity,
+        // rather than borrowing retained-import's same-SHA suppression rule.
+        fixture.row["hermit_sha"] = invoker.clone().into();
+        fixture.options.results_head = Some(invoker.clone());
+        fixture.publish_inputs();
+        let mut prior = fixture.cells();
+        let cell = prior
+            .cells
+            .iter_mut()
+            .find(|cell| cell.id == fixture.id)
+            .unwrap();
+        cell.last_tested = Some(LastTested {
+            hermit_sha: invoker.clone(),
+            detcore_tree: current_tree.clone(),
+            depth: BTreeMap::new(),
+            check: None,
+            applicable_when_tested: Some(true),
+            comparison_verdict: None,
+        });
+        let baseline = generated_files(&derive(&fixture.root).unwrap(), &prior).unwrap();
+        fs::write(fixture.ledger.join(LEDGER_SCORECARD), &baseline.scorecard).unwrap();
+        fs::write(fixture.ledger.join(LEDGER_CELLS), &baseline.cells).unwrap();
+        fixture.publish().unwrap();
+        let refreshed = fixture.cells();
+        let stamp = refreshed
+            .cells
+            .iter()
+            .find(|cell| cell.id == fixture.id)
+            .unwrap()
+            .last_tested
+            .as_ref()
+            .unwrap();
+        assert!(stamp.check.is_some());
+        assert_eq!(
+            stamp.comparison_verdict,
+            Some(StampComparisonVerdict::Matched)
+        );
+        // A later invocation of an older measured tree preserves that newer
+        // stamp while retaining the older observation as additional evidence.
+        fixture.row["hermit_sha"] = measured.clone().into();
+        fixture.row["run_id"] = "later-old-source-run".into();
+        fixture.options.results_head = Some(measured.clone());
+        fixture.publish_inputs();
+        fixture.publish().unwrap();
+        let retained = fixture.cells();
+        let cell = retained
+            .cells
+            .iter()
+            .find(|cell| cell.id == fixture.id)
+            .unwrap();
+        assert_eq!(cell.last_tested.as_ref().unwrap().hermit_sha, invoker);
+        assert!(
+            cell.observations
+                .iter()
+                .any(|observation| observation.hermit_shas.contains(&measured))
+        );
+        assert!(
+            read_generated_files(&fixture.root).unwrap() == source_before,
+            "ledger publication must not mutate Hermit's catalogue or page"
+        );
     }
 }

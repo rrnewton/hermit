@@ -222,9 +222,9 @@ six COMMIT records, every divergence between two of them reports the same turn.
 ### Writing observations
 
 These scorecard commands write the arrays. `update-observations`,
-`import-results`, and `project-observations` remain explicit. `observe-results`
-is also available directly, and validation invokes it automatically for each
-completed direct top-level run.
+`import-results`, `project-observations`, and `observe-results` are available
+explicitly. A completed top-level validation instead asks the parent publisher
+to run `project-and-observe-results` as one transaction after finalization.
 
 Run these commands from the Hermit repository root. Explicit observation
 commands automatically use the same parent publisher as ordinary validation.
@@ -266,19 +266,35 @@ they are regenerated with the immutable source identity.
 
 `observe-results` walks every `results.jsonl` under `DIR`, so several runs fold
 in one invocation — which is how a validate-side range widens beyond a point.
-Local validation invokes the parent publisher after recording the result. The
-publisher retains raw series rows and updates the ledger's detailed scorecard;
-it never copies observations back into the measured Hermit checkout. Nested
-validates do not publish separately. `observe-results` holds the inherited
-ledger publication lock and refuses staged or unrelated tracked changes in
-the measured source checkout.
-No-result directories are an explicit unchanged success. A refused write is
-reported separately from the validation verdict and makes the local command
-nonzero. Only the parent publisher commits the ledger updates.
+Local validation supplies only its finalized run ID to the parent publisher.
+The publisher queries the canonical terminal row, snapshots the committed
+series, and supplies both to `project-and-observe-results` under its ledger
+publication lock. The transaction checks the producer's original raw-input
+census, including empty files and superseded attempts, and the retained plan,
+cell, and test evidence before replacing the two detailed scorecard files.
+An empty current result directory requires verified zero cell selection and
+complete test evidence; directory emptiness alone cannot establish that result.
+The publisher requeries the canonical row before committing the derived update.
 
-An off-the-record local validate still adds any clean exact-HEAD per-cell
-observations. Those observations cannot qualify a receipt, and the scorecard
-writer cannot change which cells are selected or move their green/red state.
+Canonical `--only` selections in the quick, full, portable, and hosted-portable
+graphs retain their exact `only-*` profile and constructed subset. They can
+publish verified zero manifest cells alongside actual package-test results;
+they do not become full-profile validation receipts. Census authority requires
+the source-defined normal launch shapes and completed known raw writers. A
+custom or incomplete writer leaves an explicit census error while preserving
+its ordinary native results and captured raw evidence.
+
+Raw series delivery and derived publication have separate outcomes. A refused
+derived write preserves the original results and does not change the validation
+verdict, but the publication command remains nonzero. Only the parent publisher
+commits the ledger updates; it never copies observations back into the measured
+Hermit checkout. Nested and off-the-record validations do not request this
+finalized scorecard publication. Explicit `observe-results` keeps its existing
+unchanged-success behavior for a no-result directory and requires the inherited
+publication lock and a clean measured source.
+
+The scorecard writer cannot change which cells are selected or move their
+green/red state.
 `import-results` walks retained history without executing a guest, keeps only
 clean schema-4 `BitwiseInfoV1` terminal comparisons from commits on `HEAD`'s
 history, and selects the newest such commit independently for every applicable

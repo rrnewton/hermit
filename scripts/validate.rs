@@ -5472,7 +5472,7 @@ fn configure_e2e_result_root(
     root: &Path,
     log_path: &Path,
     temporary_build_root: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, Result<validate_cell_results::HeldInput, String>), String> {
     let fallback_run = log_path
         .file_stem()
         .ok_or_else(|| format!("durable log has no file name: {}", log_path.display()))?
@@ -5491,6 +5491,9 @@ fn configure_e2e_result_root(
         }
         _ => fallback_e2e_result_root(log_path, &run)?,
     };
+    // Failure to establish fresh custody only withholds the new extension.
+    // Keep the existing ordinary path behavior, including explicitly reused roots.
+    let fresh_root = validate_cell_results::HeldInput::create_directory(&path, false);
     std::fs::create_dir_all(&path)
         .map_err(|e| format!("cannot create E2E result directory {}: {e}", path.display()))?;
     std::env::set_var("E2E_RESULT_ROOT", &path);
@@ -5512,9 +5515,474 @@ fn configure_e2e_result_root(
         })?;
         std::env::set_var("E2E_BUILD_ROOT", temporary_build_root);
     }
-    Ok(path)
+    Ok((path, fresh_root))
 }
 
+/// A source-order witness for the normal harness publisher, independent of its
+/// test verdict. Unsupported routes keep ordinary validation behavior but do
+/// not acquire the new raw-input authority.
+struct RawCensusAuthority {
+    result_root: validate_cell_results::HeldInput,
+    log_root: validate_cell_results::HeldInput,
+    journal: Option<validate_cell_results::HeldInput>,
+    journal_prefix: Vec<u8>,
+    run_id: String,
+    files: BTreeSet<PathBuf>,
+    normal_launches: DagConfig,
+}
+
+/// The same generated graph and admitted pin substitution used by the normal
+/// driver, compiled with this producer. A caller's custom graph cannot define
+/// its own set of trusted non-writers merely by committing that graph.
+fn normal_census_launches(
+    admission: Option<&validate_admission::AuthenticatedValidationAdmission>,
+) -> Result<DagConfig, String> {
+    let normal = dag_from_json(include_str!("../ci/dag/validate.json"))
+        .map_err(|error| format!("compiled normal DAG is invalid: {error}"))?;
+    Ok(validate_admission::BoundExecutionPlan::bind(&normal, None, admission)?.cfg)
+}
+
+fn verify_census_launches(cfg: &DagConfig, normal: &DagConfig) -> Result<(), String> {
+    // DagConfig has no general environment overlay. These two defaults are its
+    // command/environment injection channels; step.env carries the rest.
+    if cfg.default_jobs_flag != normal.default_jobs_flag
+        || cfg.default_jobs_env != normal.default_jobs_env
+    {
+        return Err("raw census does not recognize this scheduler argument transport".into());
+    }
+    let known = normal.by_tag();
+    for step in &cfg.steps {
+        let tag = step.tag();
+        let expected = known.get(&tag).ok_or_else(|| {
+            format!("{tag} is not a source-defined normal raw-result producer context")
+        })?;
+        if step.cmd != expected.cmd
+            || step.cmdtype != expected.cmdtype
+            || step.env != expected.env
+            || step.jobs_flag != expected.jobs_flag
+            || step.jobs_env != expected.jobs_env
+            || step.manifest != expected.manifest
+            || step.result_manifests != expected.result_manifests
+            || step.integration_test_binaries != expected.integration_test_binaries
+        {
+            return Err(format!(
+                "{tag} changes the source-defined normal launch shape"
+            ));
+        }
+    }
+    // Selection, dependency omission, planner widths and native failure do not
+    // change the source-known command. In particular a package-only selection
+    // can prove zero manifest cells without claiming every normal node ran.
+    Ok(())
+}
+
+fn check_raw_census(
+    authority: &mut Result<RawCensusAuthority, String>,
+    check: impl FnOnce(&mut RawCensusAuthority) -> Result<(), String>,
+) {
+    if let Ok(current) = authority {
+        if let Err(error) = check(current) {
+            // Once a boundary is unknown, later bytes cannot repair its history.
+            *authority = Err(error);
+        }
+    }
+}
+
+fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> {
+    let tag = step.tag();
+    manifest_step_policy(step)?;
+    // These are the source-defined width contracts of the admitted payload:
+    // the scheduler appends only its decimal width, or suppresses injection for
+    // the system-utils payload that already fixes --jobs 1. This does not
+    // recognize a publisher by its tag or admit arbitrary flag templates.
+    let expected_jobs_flag = match step
+        .manifest
+        .as_ref()
+        .map(|manifest| (manifest.lane.as_str(), manifest.category.as_str()))
+    {
+        Some(("portable", "backend-parity-c" | "c-programs")) => Some("--jobs"),
+        Some(("portable", "system-utils")) => Some(""),
+        _ => None,
+    };
+    if step.cmdtype != dagrun::model::CmdType::Unknown
+        || step.jobs_flag.as_deref() != expected_jobs_flag
+        || step.jobs_env.is_some()
+    {
+        return Err(format!(
+            "{tag} changes the normal harness argument transport"
+        ));
+    }
+    let declaration = step
+        .structured_test_results_manifest()?
+        .ok_or_else(|| format!("{tag} has no required structured harness report"))?;
+    if declaration.schema != 2 {
+        return Err(format!("{tag} does not declare the normal harness report"));
+    }
+    for name in [
+        "E2E_RESULT_ROOT",
+        "E2E_RUN_ID",
+        "DAGRUN_LOG_DIR",
+        "DAGRUN_NO_LOGS",
+        "DAGRUN_TEST_COUNTS_PATH",
+        "BASH_ENV",
+        "ENV",
+    ] {
+        if step.env.contains_key(name) {
+            return Err(format!("{tag} overrides raw publisher context {name}"));
+        }
+    }
+    let guarded = guarded_command_source(&tag, &step.cmd)?;
+    if guarded != step.cmd {
+        const PREFIX: &str = "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo ";
+        let separator = format!(
+            " -- bash -c {} bash ",
+            validate_plan::shell_quote(
+                hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD
+            )
+        );
+        let (forwarded, payload) = step
+            .cmd
+            .strip_prefix(PREFIX)
+            .and_then(|rest| rest.split_once(&separator))
+            .ok_or_else(|| format!("{tag} has an unsupported pinned-root transport"))?;
+        let words = forwarded.split_whitespace().collect::<Vec<_>>();
+        let mut names = BTreeSet::new();
+        for pair in words.chunks(2) {
+            if pair.len() != 2
+                || pair[0] != "--env"
+                || !pair[1]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+                || !names.insert(pair[1])
+            {
+                return Err(format!("{tag} has an ambiguous pinned-root environment"));
+            }
+        }
+        if payload != validate_plan::shell_quote(&guarded)
+            || ["DAGRUN_TEST_COUNTS_PATH", "E2E_RESULT_ROOT", "E2E_RUN_ID"]
+                .iter()
+                .any(|name| !names.contains(name))
+        {
+            return Err(format!(
+                "{tag} does not forward the exact raw publisher context"
+            ));
+        }
+    }
+    let (payload, result) = if tag == "quick.e2e_verify" {
+        if Path::new(run_id).components().count() != 1
+            || !matches!(
+                Path::new(run_id).components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return Err("quick raw publisher requires one run-id path component".into());
+        }
+        ("target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only".to_owned(),
+            Path::new(run_id).join("results.jsonl"))
+    } else {
+        let manifest = step
+            .manifest
+            .as_ref()
+            .ok_or("raw publisher has no selector")?;
+        if !matches!(manifest.lane.as_str(), "portable" | "privileged")
+            || manifest.test.is_some()
+            || manifest.mode.is_some()
+            || manifest.backend.is_some()
+            || manifest.category.is_empty()
+            || !manifest
+                .category
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(format!("{tag} is not a normal manifest bucket"));
+        }
+        let bucket = format!(
+            "{}/manifest_{}",
+            manifest.lane,
+            manifest.category.replace('-', "_")
+        );
+        let install = if manifest.lane == "portable" {
+            "--require-install "
+        } else {
+            ""
+        };
+        let parity = if manifest.lane == "portable" && manifest.category == "backend-parity-c" {
+            " --parity-reference ptrace"
+        } else {
+            ""
+        };
+        let jobs = if manifest.category == "system-utils" {
+            " --jobs 1"
+        } else {
+            ""
+        };
+        (
+            format!(
+                "./ci/run-with-hermit-e2e-artifact.sh {install}target/debug/test-harness run \
+            --lane {} --category {} --ci-only --allow-empty --prebuilt{parity}{jobs} \
+            --results \"$E2E_RESULT_ROOT/{bucket}/results.jsonl\" \
+            --junit \"$E2E_RESULT_ROOT/{bucket}/junit.xml\"",
+                manifest.lane, manifest.category
+            ),
+            Path::new(&bucket).join("results.jsonl"),
+        )
+    };
+    // Exact source-known commands, not substring identity or a shell tokenizer:
+    // a custom valid-counts publisher followed by background writes is excluded.
+    if guarded != format!("{RUST_SCRIPT_COMMAND_PREFIX}{payload}") {
+        return Err(format!("{tag} is not the exact normal harness publisher"));
+    }
+    Ok(result)
+}
+
+impl RawCensusAuthority {
+    fn prepare(
+        result_root: validate_cell_results::HeldInput,
+        log_path: &Path,
+        admission: Option<&validate_admission::AuthenticatedValidationAdmission>,
+    ) -> Result<Self, String> {
+        let normal_launches = normal_census_launches(admission)?;
+        if std::env::var("DAGRUN_NO_LOGS").as_deref() == Ok("1") {
+            return Err("raw census requires scheduler evidence logs".into());
+        }
+        let configured = std::env::var_os("DAGRUN_LOG_DIR").filter(|value| !value.is_empty());
+        let log_root = configured
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| log_path.with_extension("dagrun"));
+        let log_root = if log_root.is_absolute() {
+            log_root
+        } else {
+            std::env::current_dir()
+                .map_err(|error| error.to_string())?
+                .join(log_root)
+        };
+        let log_root = validate_cell_results::HeldInput::create_directory(&log_root, true)?;
+        if configured.is_none() {
+            std::env::set_var("DAGRUN_LOG_DIR", log_root.path());
+        }
+        let run_id = std::env::var("E2E_RUN_ID").map_err(|error| error.to_string())?;
+        Ok(Self {
+            result_root,
+            log_root,
+            journal: None,
+            journal_prefix: Vec::new(),
+            run_id,
+            files: BTreeSet::new(),
+            normal_launches,
+        })
+    }
+
+    fn recheck_context(&self) -> Result<(), String> {
+        if ["BASH_ENV", "ENV"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+        {
+            return Err("raw census does not support shell startup overrides".into());
+        }
+        self.result_root.recheck()?;
+        self.log_root.recheck()?;
+        let configured = std::env::var_os("DAGRUN_LOG_DIR")
+            .map(PathBuf::from)
+            .ok_or("scheduler log root is no longer configured")?;
+        let configured = if configured.is_absolute() {
+            configured
+        } else {
+            std::env::current_dir()
+                .map_err(|error| error.to_string())?
+                .join(configured)
+        };
+        if configured != self.log_root.path()
+            || std::env::var("DAGRUN_NO_LOGS").as_deref() == Ok("1")
+            || std::env::var_os("E2E_RESULT_ROOT").as_deref()
+                != Some(self.result_root.path().as_os_str())
+            || std::env::var("E2E_RUN_ID").as_deref() != Ok(self.run_id.as_str())
+        {
+            return Err("raw publisher or scheduler log context changed".into());
+        }
+        Ok(())
+    }
+
+    fn journal_bytes(&mut self) -> Result<Vec<u8>, String> {
+        self.recheck_context()?;
+        if self.journal.is_none() {
+            let path = self.log_root.path().join("journal.jsonl");
+            match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => return Err(error.to_string()),
+                Ok(_) => {
+                    self.journal = Some(validate_cell_results::HeldInput::open(&path, false, true)?)
+                }
+            }
+        }
+        self.journal.as_ref().unwrap().read()
+    }
+
+    fn before_lane(&mut self, cfg: &DagConfig) -> Result<(), String> {
+        if self.journal_bytes()? != self.journal_prefix {
+            return Err("scheduler journal changed outside the admitted lane".into());
+        }
+        verify_census_launches(cfg, &self.normal_launches)?;
+        let mut paths = BTreeSet::new();
+        for step in &cfg.steps {
+            if validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+                && !paths.insert(normal_raw_result_path(step, &self.run_id)?)
+            {
+                return Err("multiple scheduled raw publishers share one result path".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn after_lane(&mut self, cfg: &DagConfig, lane: &LaneResult) -> Result<(), String> {
+        let bytes = self.journal_bytes()?;
+        let rows = raw_lane_journal(&self.journal_prefix, &bytes)?;
+        verify_raw_publisher_completion(cfg, lane, &rows)?;
+        for step in &cfg.steps {
+            if validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+                && lane
+                    .outcomes
+                    .iter()
+                    .any(|outcome| outcome.tag == step.tag())
+                && !self
+                    .files
+                    .insert(normal_raw_result_path(step, &self.run_id)?)
+            {
+                return Err("sequential lanes reused a raw publisher path".into());
+            }
+        }
+        self.journal_prefix = bytes;
+        Ok(())
+    }
+
+    fn census(
+        &mut self,
+        snapshot: &validate_cell_results::CapturedResults,
+        commit: &str,
+    ) -> Result<hermit_manifest_plan::ledger::RawResultInputCensusV1, String> {
+        if self.journal_bytes()? != self.journal_prefix {
+            return Err("scheduler journal changed after raw publisher completion".into());
+        }
+        if snapshot.root() != self.result_root.path() {
+            return Err("raw snapshot belongs to a different admitted root".into());
+        }
+        let census = snapshot.census(&self.run_id, commit, &self.files)?;
+        self.recheck_context()?;
+        Ok(census)
+    }
+}
+
+fn raw_lane_journal(prefix: &[u8], bytes: &[u8]) -> Result<Vec<serde_json::Value>, String> {
+    let suffix = bytes
+        .strip_prefix(prefix)
+        .ok_or("scheduler journal prefix changed during the lane")?;
+    let rows = std::str::from_utf8(suffix).map_err(|error| error.to_string())?;
+    if !rows.is_empty() && !rows.ends_with('\n') {
+        return Err("scheduler journal has an incomplete terminal record".into());
+    }
+    rows.lines()
+        .map(|line| {
+            serde_json::from_str(line)
+                .map_err(|error| format!("malformed scheduler journal: {error}"))
+        })
+        .collect()
+}
+
+fn verify_raw_publisher_completion(
+    cfg: &DagConfig,
+    lane: &LaneResult,
+    rows: &[serde_json::Value],
+) -> Result<(), String> {
+    let tags = cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    for row in rows.iter().filter(|row| row["event"] == "step_start") {
+        if !row["step"].as_str().is_some_and(|tag| tags.contains(tag)) {
+            return Err("scheduler journal contains an unowned lane start".into());
+        }
+    }
+    for step in &cfg.steps {
+        if validation_step_identity(step) != ValidationStepIdentity::ManifestRun {
+            continue;
+        }
+        let tag = step.tag();
+        let events = |name: &str| {
+            rows.iter()
+                .enumerate()
+                .filter(|(_, row)| row["event"] == name && row["step"] == tag)
+                .collect::<Vec<_>>()
+        };
+        let starts = events("step_start");
+        let ends = events("step_end");
+        let outcomes = lane
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.tag == tag)
+            .collect::<Vec<_>>();
+        if starts.is_empty()
+            && ends.is_empty()
+            && outcomes.is_empty()
+            && lane.skipped.contains(&tag)
+        {
+            continue; // A never-launched producer on a fresh root wrote no raw input.
+        }
+        let ([start], [end], [outcome]) = (starts.as_slice(), ends.as_slice(), outcomes.as_slice())
+        else {
+            return Err(format!(
+                "{tag} has no unique current-lane publisher completion"
+            ));
+        };
+        if start.0 >= end.0
+            || !start.1["pid"]
+                .as_str()
+                .and_then(|pid| pid.parse::<u32>().ok())
+                .is_some_and(|pid| pid > 0)
+            || !start.1["cmd"].as_str().is_some_and(|cmd| !cmd.is_empty())
+            || end.1["ok"].as_bool() != Some(outcome.ok)
+            || ["aborted", "timed_out", "cpu_timed_out"]
+                .iter()
+                .any(|key| end.1[*key] != "false")
+            || end.1.get("test_results_error").is_some()
+            || end.1.get("test_results_error_kind").is_some()
+            || outcome.aborted
+            || outcome.timed_out
+            || outcome.cpu_timed_out
+            || !outcome.returncode.is_some_and(|code| code >= 0)
+            || outcome.test_results.is_none()
+            || outcome.test_results_error.is_some()
+            || outcome.test_results_error_kind.is_some()
+        {
+            return Err(format!("{tag} raw publisher completion is unknown"));
+        }
+    }
+    Ok(())
+}
+
+/// This extension cannot revise ordinary verdicts, missing work, or nulls.
+fn add_raw_census(
+    record: &mut serde_json::Value,
+    census: Result<hermit_manifest_plan::ledger::RawResultInputCensusV1, String>,
+) {
+    if record.get("raw_result_input_census_error").is_some() {
+        return; // Publication authority cannot recover within this row.
+    }
+    if record
+        .as_object_mut()
+        .expect("ledger record object")
+        .remove("raw_result_input_census_v1")
+        .is_some()
+    {
+        record["raw_result_input_census_error"] =
+            "raw census publication was attempted twice".into();
+        return;
+    }
+    match census.and_then(|census| serde_json::to_value(census).map_err(|error| error.to_string()))
+    {
+        Ok(census) => record["raw_result_input_census_v1"] = census,
+        Err(error) => {
+            eprintln!("validate: raw input census unavailable: {error}");
+            record["raw_result_input_census_error"] = error.into();
+        }
+    }
+}
 #[cfg(test)]
 mod concurrent_validate_path_tests {
     use std::io::Write;
@@ -5650,14 +6118,15 @@ fn append_validate_series(
     parent: Option<&Path>,
     tool_root: Option<&Path>,
     checkout: &Path,
-    result_root: &Path,
+    snapshot: &validate_cell_results::CapturedResults,
     tree: &str,
 ) -> Result<bool, String> {
     let Some(parent) = parent else {
         return Ok(false);
     };
     let tool_root = tool_root.ok_or("dev-hermit state root has no executable tool root")?;
-    let rows = validate_cell_results::all_result_rows(result_root)?;
+    let result_root = snapshot.root();
+    let rows = snapshot.all_rows()?;
     if rows.is_empty() {
         return Ok(false);
     }
@@ -5731,72 +6200,81 @@ fn should_write_scorecard(nested: bool, off_the_record: bool) -> bool {
     !nested && !off_the_record
 }
 
+struct ScorecardPublication<'a> {
+    parent: Option<&'a Path>,
+    tool_root: Option<&'a Path>,
+    expected_head: &'a str,
+    finalized_row: Option<&'a serde_json::Value>,
+    delegated: bool,
+}
+
 fn local_scorecard_writeback(
     root: &Path,
     result_root: &Path,
     nested: bool,
     off_the_record: bool,
+    publication: &ScorecardPublication<'_>,
 ) -> Option<Result<(), String>> {
-    if !should_write_scorecard(nested, off_the_record) {
+    if !should_write_scorecard(nested, off_the_record) || publication.delegated {
         return None;
     }
-    let Some(parent) = find_parent(root) else {
-        return Some(Err("history publication unavailable: dev-hermit parent was not found; validation results remain retained".into()));
-    };
-    let tool = match configured_tool_root(Some(&parent)) {
-        Ok(Some(tool)) => tool,
-        Ok(None) => return Some(Err("history publication tool root is unavailable".into())),
-        Err(error) => return Some(Err(error)),
-    };
-    let script = tool.join("ci-hub/series/mirror.py");
-    let head = match Command::new("git")
-        .args(["rev-parse", "HEAD"])
+    Some(project_local_scorecard(root, result_root, publication))
+}
+
+fn project_local_scorecard(
+    root: &Path,
+    result_root: &Path,
+    publication: &ScorecardPublication<'_>,
+) -> Result<(), String> {
+    let finalized_row = publication
+        .finalized_row
+        .ok_or("no durable finalized ledger row; scorecard writeback did not run")?;
+    let run_id = finalized_row
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("finalized row has no run identity")?;
+    let parent = publication
+        .parent
+        .ok_or("no parent state root for scorecard publication")?;
+    let tool_root = publication
+        .tool_root
+        .ok_or("no executable publication-provider root")?;
+    let script = tool_root.join("ci-hub/series/mirror.py");
+    if !script.is_file() {
+        return Err(format!("{} does not exist", script.display()));
+    }
+    // The parent owns the ledger publication lock, obtains the canonical row,
+    // and rechecks it before committing. A caller-supplied row is not authority.
+    // The validator's invocation lock stays held without being acquired again.
+    Command::new("python3")
+        .arg(&script)
+        .arg("--parent")
+        .arg(parent)
+        .arg("--source-checkout")
+        .arg(root)
+        .arg("--target")
+        .arg(publication.expected_head)
+        .arg("--results")
+        .arg(result_root)
+        .arg("--finalized-run-id")
+        .arg(run_id)
         .current_dir(root)
         .output()
-    {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
-        Ok(output) => {
-            return Some(Err(format!(
-                "cannot resolve history source HEAD: {}",
-                output.status
-            )));
-        }
-        Err(error) => return Some(Err(format!("cannot resolve history source HEAD: {error}"))),
-    };
-    if !script.is_file() {
-        return Some(Err(format!("{} does not exist", script.display())));
-    }
-    Some(
-        Command::new("python3")
-            .arg(&script)
-            .arg("--parent").arg(&parent)
-            .arg("--source-checkout").arg(root)
-            .arg("--target").arg(head.trim())
-            .arg("--results")
-            .arg(result_root)
-            .current_dir(root)
-            .output()
-            .map_err(|error| format!("cannot run {}: {error}", script.display()))
-            .and_then(|output| {
-                // The child's streams used to be INHERITED, which is the only
-                // reason its explanation ever reached the run log. Capturing
-                // them must not take that away, so re-emit verbatim before
-                // deciding anything.
-                let _ = std::io::stdout().write_all(&output.stdout);
-                let _ = std::io::stderr().write_all(&output.stderr);
-                if output.status.success() {
-                    return Ok(());
-                }
-                Err(format!(
-                    "{} ledger publication refused with {}: {}",
-                    script.display(),
-                    output.status,
-                    refusal_detail(&output.stderr, &output.stdout),
-                ))
-            }),
-    )
+        .map_err(|error| format!("cannot run {}: {error}", script.display()))
+        .and_then(|output| {
+            let _ = std::io::stdout().write_all(&output.stdout);
+            let _ = std::io::stderr().write_all(&output.stderr);
+            if output.status.success() {
+                return Ok(());
+            }
+            Err(format!(
+                "{} ledger publication refused with {}: {}",
+                script.display(),
+                output.status,
+                refusal_detail(&output.stderr, &output.stdout),
+            ))
+        })
 }
 
 /// The largest child explanation carried into the durable record.
@@ -7401,6 +7879,23 @@ struct Plan {
     /// deliberately separate from `suite_complete`: it may satisfy one open
     /// cell obligation but can never authorize a whole-run landing receipt.
     cell_evidence_expected: Option<Vec<serde_json::Value>>,
+}
+
+/// Selected package runs still need the exact constructed population: an empty
+/// result directory alone cannot distinguish zero selected cells from lost data.
+fn should_capture_cumulative_evidence(plan: &Plan, nested: bool, off_record: bool) -> bool {
+    let selected_only = plan.selection_mode == "only"
+        && serde_json::from_value::<hermit_manifest_plan::ledger::ValidatePath>(
+            plan.profile.clone().into(),
+        )
+        .is_ok_and(hermit_manifest_plan::ledger::ValidatePath::is_selected_only);
+    validate_evidence::ENABLED
+        && !nested
+        && !off_record
+        && (plan.suite_complete
+            || plan.cell_evidence_expected.is_some()
+            || (plan.committed_selection.is_some()
+                && (matches!(plan.profile.as_str(), "full" | "quick" | "super") || selected_only)))
 }
 
 struct EnvelopePlan {
@@ -18384,7 +18879,7 @@ print("fixture append accepted")
         Some(&parent),
         Some(&tool_root),
         &checkout,
-        &root.join("results"),
+        &validate_cell_results::CapturedResults::capture(&root.join("results")),
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     );
     match saved {
@@ -18596,6 +19091,23 @@ fn no_result_propagation_bracket() -> Result<(), String> {
 /// downstream reader can pair a bare `pass` with inferred coverage. Field names
 /// and schema match what `validate.sh` wrote, so the parent aggregator and the
 /// merge gate keep reading one shape across the port.
+struct LedgerPublication<'a> {
+    ledger: &'a Path,
+    ctx: &'a LedgerCtx,
+    outcomes: &'a [StepOutcome],
+    attempts: &'a [NodeAttempt],
+    skipped: &'a [String],
+    host_inapplicable: &'a [validate_plan::HostInapplicableNode],
+    planned_tags: &'a BTreeSet<String>,
+    wall_s: f64,
+    exit_code: u8,
+    log_file: &'a str,
+    execution_complete: bool,
+    coverage: serde_json::Value,
+    cell_results: Option<&'a validate_cell_results::RetainedCellResults>,
+    cumulative_evidence: Option<&'a validate_evidence::RetainedEvidence>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_ledger(
     ledger: &Path,
@@ -18614,7 +19126,52 @@ fn write_ledger(
     coverage: serde_json::Value,
     cell_results: Option<&validate_cell_results::RetainedCellResults>,
     cumulative_evidence: Option<&validate_evidence::RetainedEvidence>,
-) {
+) -> Option<serde_json::Value> {
+    // Callers without admitted publisher custody retain their original row.
+    write_ledger_with_snapshot(
+        LedgerPublication {
+            ledger,
+            ctx,
+            outcomes,
+            attempts,
+            skipped,
+            host_inapplicable,
+            planned_tags,
+            wall_s,
+            exit_code,
+            log_file,
+            execution_complete,
+            coverage,
+            cell_results,
+            cumulative_evidence,
+        },
+        None,
+    )
+}
+
+fn write_ledger_with_snapshot(
+    publication: LedgerPublication<'_>,
+    raw_inputs: Option<(
+        &validate_cell_results::CapturedResults,
+        &mut Result<RawCensusAuthority, String>,
+    )>,
+) -> Option<serde_json::Value> {
+    let LedgerPublication {
+        ledger,
+        ctx,
+        outcomes,
+        attempts,
+        skipped,
+        host_inapplicable,
+        planned_tags,
+        wall_s,
+        exit_code,
+        log_file,
+        execution_complete,
+        coverage,
+        cell_results,
+        cumulative_evidence,
+    } = publication;
     let (coverage_schema, coverage) = ledger_schema_and_coverage(coverage);
     let ledger_schema = ledger_schema_version(coverage_schema, cell_results);
     // `gate_records` counts typed scheduler outcomes, including an explicit
@@ -18830,11 +19387,11 @@ fn write_ledger(
     if let Some(evidence) = cumulative_evidence {
         if let Err(error) = evidence.add_to_record(&mut record) {
             eprintln!("validate: ERROR: refusing malformed cumulative ledger row: {error}");
-            return;
+            return None;
         }
     } else if ledger_schema == 10 {
         eprintln!("validate: ERROR: schema 10 requires all cumulative evidence components");
-        return;
+        return None;
     }
     if let Some(identity) = &ctx.log_identity {
         record["log_identity"] =
@@ -18850,31 +19407,49 @@ fn write_ledger(
             eprintln!(
                 "validate: warning: generated ledger row does not match the shared HistoryRow: {error}"
             );
-            return;
+            return None;
         }
     };
     if let Some(evidence) = cumulative_evidence {
         if let Err(error) = evidence.verify_record(&typed) {
             eprintln!("validate: ERROR: refusing unbound cumulative ledger row: {error}");
-            return;
+            return None;
         }
     }
     if let Err(error) = typed.admission_evidence() {
         eprintln!("validate: ERROR: refusing mismatched admission ledger row: {error}");
-        return;
+        return None;
     }
     if typed.retry_rounds() != Ok(Some(ctx.retry_rounds)) {
         eprintln!(
             "validate: warning: generated ledger row has malformed HistoryRow retry_rounds"
         );
-        return;
+        return None;
     }
     if typed.executed_nodes() != Ok(Some(executed_nodes)) {
         eprintln!(
             "validate: warning: generated ledger row has malformed HistoryRow executed_nodes"
         );
-        return;
+        return None;
     }
+    let census = match raw_inputs {
+        Some((snapshot, authority)) => {
+            let result = authority
+                .as_mut()
+                .map_err(|error| error.clone())
+                .and_then(|authority| authority.census(snapshot, &ctx.commit))
+                .and_then(|census| {
+                    census.validate_for_row(&typed)?;
+                    Ok(census)
+                });
+            if let Err(error) = &result {
+                *authority = Err(error.clone());
+            }
+            result
+        }
+        None => Err("raw publisher authority was not admitted for this invocation".into()),
+    };
+    add_raw_census(&mut record, census);
     let line = format!("{}\n", serde_json::to_string(&record).unwrap());
     let explicit = std::env::var(LEDGER_ENV)
         .ok()
@@ -18889,7 +19464,7 @@ fn write_ledger(
             configured_tool_root.as_deref(),
         ) else {
             eprintln!("validate: warning: canonical ledger root has no parent: {}", ledger.display());
-            return;
+            return None;
         };
         let mut child = match Command::new("python3")
             .arg(&adapter)
@@ -18905,7 +19480,7 @@ fn write_ledger(
                     "validate: warning: cannot launch canonical ledger writer {}: {e}",
                     adapter.display()
                 );
-                return;
+                return None;
             }
         };
         use std::io::Write;
@@ -18916,14 +19491,17 @@ fn write_ledger(
         let output = child.wait_with_output();
         if let Some(error) = write_error {
             eprintln!("validate: warning: cannot send row to canonical ledger writer: {error}");
-            return;
+            return None;
         }
         match output {
-            Ok(output) if output.status.success() => eprintln!(
-                "validate: canonical ledger record appended via {}: {}",
-                adapter.display(),
-                String::from_utf8_lossy(&output.stdout).trim()
-            ),
+            Ok(output) if output.status.success() => {
+                eprintln!(
+                    "validate: canonical ledger record appended via {}: {}",
+                    adapter.display(),
+                    String::from_utf8_lossy(&output.stdout).trim()
+                );
+                return Some(record);
+            },
             Ok(output) => eprintln!(
                 "validate: warning: canonical ledger writer {} refused: {}",
                 adapter.display(),
@@ -18934,30 +19512,42 @@ fn write_ledger(
                 adapter.display()
             ),
         }
-        return;
+        return None;
     }
 
     if let Some(dir) = ledger.parent() {
         if !dir.as_os_str().is_empty() {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 eprintln!("validate: warning: cannot create ledger dir {}: {e}", dir.display());
-                return;
+                return None;
             }
         }
     }
     use std::io::Write;
     match std::fs::OpenOptions::new().create(true).append(true).open(ledger) {
-        Ok(mut f) => match f.write_all(line.as_bytes()) {
+        Ok(mut f) => match f.write_all(line.as_bytes()).and_then(|()| f.sync_all()).and_then(|()| {
+            // The first append can create the file. Its directory entry must
+            // survive with its bytes before it authorizes scorecard publication.
+            std::fs::File::open(ledger.parent().filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")))?.sync_all()
+        }) {
             Ok(()) => {
                 eprintln!(
                     "validate: fixture/standalone ledger record appended to {}",
                     ledger.display()
                 );
                 warn_if_unreadable_ledger(ledger);
+                Some(record)
             }
-            Err(e) => eprintln!("validate: warning: cannot append ledger {}: {e}", ledger.display()),
+            Err(e) => {
+                eprintln!("validate: warning: cannot append ledger {}: {e}", ledger.display());
+                None
+            },
         },
-        Err(e) => eprintln!("validate: warning: cannot open ledger {}: {e}", ledger.display()),
+        Err(e) => {
+            eprintln!("validate: warning: cannot open ledger {}: {e}", ledger.display());
+            None
+        },
     }
 }
 
@@ -19118,6 +19708,12 @@ enum Verdict {
 const FINAL_VALIDATE_STATUS_PREFIX: &str = "FINAL_VALIDATE_STATUS: ";
 const COULD_NOT_RUN_EXIT_CODE: u8 = NO_RESULT_EXIT_CODE as u8;
 const VALIDATE_SERVICE_RESULT_PATH_ENV: &str = "VALIDATE_SERVICE_RESULT_PATH";
+const SCORECARD_WRITEBACK_OWNER_ENV: &str = "HERMIT_SCORECARD_WRITEBACK_OWNER";
+const SCORECARD_WRITEBACK_OWNER: &str = "ci-hub-invoker-v1";
+
+fn parent_owns_scorecard_writeback(owner: Option<&str>, managed: bool) -> bool {
+    managed && owner == Some(SCORECARD_WRITEBACK_OWNER)
+}
 
 fn final_validate_status(verdict: Verdict) -> Option<FinalValidateStatus> {
     match verdict {
@@ -19571,83 +20167,73 @@ fn dbt_parity_test_observations(log: &str) -> Vec<TestAttemptObservation> {
     observations
 }
 
-fn collect_e2e_result_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
-    for entry in std::fs::read_dir(path)
-        .map_err(|error| format!("cannot read per-cell result root {}: {error}", path.display()))?
-    {
-        let entry = entry.map_err(|error| format!("cannot read per-cell result entry: {error}"))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("cannot classify {}: {error}", entry.path().display()))?;
-        if file_type.is_dir() {
-            collect_e2e_result_files(&entry.path(), output)?;
-        } else if file_type.is_file() && entry.file_name() == "results.jsonl" {
-            output.push(entry.path());
-        }
-    }
-    Ok(())
+fn e2e_test_observations(root: &Path) -> Result<Vec<TestAttemptObservation>, String> {
+    e2e_test_observations_snapshot(&validate_cell_results::CapturedResults::capture(root))
 }
 
-fn e2e_test_observations(root: &Path) -> Result<Vec<TestAttemptObservation>, String> {
-    let mut files = Vec::new();
-    collect_e2e_result_files(root, &mut files)?;
-    files.sort();
+fn e2e_test_observations_snapshot(
+    snapshot: &validate_cell_results::CapturedResults,
+) -> Result<Vec<TestAttemptObservation>, String> {
     let mut seen = BTreeSet::new();
     let mut observations = Vec::new();
-    for file in files {
-        let text = std::fs::read_to_string(&file)
-            .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
-        for (line_number, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let row: serde_json::Value = serde_json::from_str(line).map_err(|error| {
-                format!("{}:{} malformed result row: {error}", file.display(), line_number + 1)
-            })?;
-            let field = |name: &str| {
-                row.get(name)
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| format!("{}:{} has no {name}", file.display(), line_number + 1))
-            };
-            let lane = field("lane")?;
-            let category = field("category")?;
-            let test = field("test")?;
-            let mode = field("mode")?;
-            let backend = field("backend")?;
-            let outcome = field("outcome")?;
-            let attempt = row.get("attempt").and_then(serde_json::Value::as_u64).unwrap_or(1);
-            let attempt = usize::try_from(attempt)
-                .map_err(|_| format!("{}:{} attempt does not fit usize", file.display(), line_number + 1))?;
-            if attempt == 0 {
-                return Err(format!("{}:{} attempt must be positive", file.display(), line_number + 1));
-            }
-            let id = format!("{test} [{backend}/{mode}]");
-            if !seen.insert((lane.to_string(), id.clone(), attempt)) {
+    for (file, line_number, row) in snapshot.rows(false)? {
+        let field = |name: &str| {
+            row.get(name)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("{}:{} has no {name}", file.display(), line_number))
+        };
+        let lane = field("lane")?;
+        let category = field("category")?;
+        let test = field("test")?;
+        let mode = field("mode")?;
+        let backend = field("backend")?;
+        let outcome = field("outcome")?;
+        let attempt = row
+            .get("attempt")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1);
+        let attempt = usize::try_from(attempt).map_err(|_| {
+            format!(
+                "{}:{} attempt does not fit usize",
+                file.display(),
+                line_number
+            )
+        })?;
+        if attempt == 0 {
+            return Err(format!(
+                "{}:{} attempt must be positive",
+                file.display(),
+                line_number
+            ));
+        }
+        let id = format!("{test} [{backend}/{mode}]");
+        if !seen.insert((lane.to_string(), id.clone(), attempt)) {
+            return Err(format!(
+                "{}:{} duplicates test id {id} attempt {attempt}",
+                file.display(),
+                line_number
+            ));
+        }
+        let group = match lane {
+            "portable" => "e2e",
+            "privileged" => "privileged-e2e",
+            _ => {
                 return Err(format!(
-                    "{}:{} duplicates test id {id} attempt {attempt}",
-                    file.display(), line_number + 1
+                    "{}:{} has unrecognized lane {lane}",
+                    file.display(),
+                    line_number
                 ));
             }
-            let group = match lane {
-                "portable" => "e2e",
-                "privileged" => "privileged-e2e",
-                _ => {
-                    return Err(format!(
-                        "{}:{} has unrecognized lane {lane}",
-                        file.display(), line_number + 1
-                    ));
-                }
-            };
-            let category = category.replace('-', "_");
-            observations.push(TestAttemptObservation {
-                node: format!("{group}.manifest_{category}"),
-                attempt,
-                id,
-                passed: outcome == "PASS",
-                inner_attempts: 1,
-            });
-        }
+        };
+        let category = category.replace('-', "_");
+        observations.push(TestAttemptObservation {
+            node: format!("{group}.manifest_{category}"),
+            attempt,
+            id,
+            passed: outcome == "PASS",
+            inner_attempts: 1,
+        });
     }
     observations.sort_by(|left, right| {
         (&left.id, left.attempt, &left.node).cmp(&(&right.id, right.attempt, &right.node))
@@ -20313,12 +20899,22 @@ fn main() -> ExitCode {
     // invocations must not inherit authority to publish a competing result.
     let service_result_path = std::env::var_os(VALIDATE_SERVICE_RESULT_PATH_ENV).map(PathBuf::from);
     std::env::remove_var(VALIDATE_SERVICE_RESULT_PATH_ENV);
+    let scorecard_delegated = parent_owns_scorecard_writeback(
+        std::env::var(SCORECARD_WRITEBACK_OWNER_ENV).ok().as_deref(),
+        service_result_path.is_some(),
+    );
+    // A nested validator cannot inherit the parent's post-verdict ownership.
+    std::env::remove_var(SCORECARD_WRITEBACK_OWNER_ENV);
     install_stop_handlers();
     let started = std::time::Instant::now();
 
     // The durable log outlives `run` so the summary lands INSIDE it.
     let mut durable: Option<DurableLog> = None;
-    let mut summary = run(&mut durable, service_result_path.as_deref());
+    let mut summary = run(
+        &mut durable,
+        service_result_path.as_deref(),
+        scorecard_delegated,
+    );
     if let Err(error) =
         publish_validation_service_result_or_refuse(service_result_path.as_deref(), &mut summary)
     {
@@ -20499,7 +21095,11 @@ fn verified_run_state_scope_reexec(root: &Path, inherited: Option<&OsStr>) -> bo
     !unit.is_empty() && observe_own_containment(Some(&unit)).proof().is_some()
 }
 
-fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>) -> RunSummary {
+fn run(
+    durable_slot: &mut Option<DurableLog>,
+    service_result_path: Option<&Path>,
+    scorecard_delegated: bool,
+) -> RunSummary {
     let args = match parse_args() {
         Ok(a) => a,
         // `parse_args` returns 0 only for `--help`, whose usage text is the
@@ -21215,9 +21815,9 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         }
     };
 
-    let cumulative_selection = if validate_evidence::ENABLED
-        && !nesting.nested && !args.allow_local_off_the_record_run
-        && (plan.suite_complete || plan.cell_evidence_expected.is_some())
+    let cumulative_selection = if should_capture_cumulative_evidence(
+        &plan, nesting.nested, args.allow_local_off_the_record_run,
+    )
     {
         match validate_evidence::SelectedEvidence::capture(&root, &plan) {
             Ok(selected) => Some(selected),
@@ -21634,7 +22234,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     if let Some(lock) = invocation_lock.as_mut() {
         validate_runtime::record_invocation_log_path(lock, &log_path);
     }
-    let e2e_result_root =
+    let (e2e_result_root, fresh_result_root) =
         match configure_e2e_result_root(&root, &log_path, &tmp.join("e2e-build")) {
             Ok(path) => path,
             Err(message) => {
@@ -21652,6 +22252,8 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             }
         };
     eprintln!("validate: per-cell results: {}", e2e_result_root.display());
+    let mut raw_census = fresh_result_root
+        .and_then(|held| RawCensusAuthority::prepare(held, &log_path, admitted_context.as_ref()));
 
     let prepared_evidence = match cumulative_selection {
         Some(selected) => {
@@ -21861,8 +22463,9 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // One clock for the whole invocation. Sequential lanes spend from the same
     // allowance rather than each receiving a fresh budget.
     let deadline = deadline_ns;
-    let lane = |cfg: &DagConfig| -> LaneResult {
-        run_lane_once(
+    let mut lane = |cfg: &DagConfig| -> LaneResult {
+        check_raw_census(&mut raw_census, |authority| authority.before_lane(cfg));
+        let result = run_lane_once(
             cfg,
             jobs,
             keep_going,
@@ -21871,7 +22474,11 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             &log_path,
             deadline,
             true,
-        )
+        );
+        check_raw_census(&mut raw_census, |authority| {
+            authority.after_lane(cfg, &result)
+        });
+        result
     };
     let mut run_timed_out = false;
 
@@ -21923,6 +22530,9 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // INT TERM HUP` bought the bash.
     validate_runtime::enter_cleanup_critical_section();
     let interruption = interrupted_by().map(|s| s.to_string());
+    // One original byte population feeds series, both retention contracts and
+    // the final summary. Final authority checks never replace this snapshot.
+    let raw_snapshot = validate_cell_results::CapturedResults::capture(&e2e_result_root);
     let series_error = if nesting.nested || args.allow_local_off_the_record_run {
         None
     } else {
@@ -21930,7 +22540,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             parent.as_deref(),
             tool_root.as_deref(),
             &root,
-            &e2e_result_root,
+            &raw_snapshot,
             &commit,
         ) {
             Ok(_) => None,
@@ -22134,24 +22744,18 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // no_result verdict. Collected node limits remain failed conditions; a
     // whole-run deadline is incomplete and falls through to the normal fold below.
     if let Some(sig) = &interruption {
-        if !nesting.nested && !args.allow_local_off_the_record_run {
-            write_ledger(
-                &ledger,
-                &ctx,
-                &outcomes,
-                &attempts,
-                &skipped,
-                &plan.host_inapplicable,
-                &planned_tags,
-                wall,
-                130,
-                &log_path.to_string_lossy(),
-                false,
-                coverage.clone(),
-                None,
-                None,
-            );
-        }
+        let finalized_row = if !nesting.nested && !args.allow_local_off_the_record_run {
+            write_ledger_with_snapshot(
+                LedgerPublication {
+                    ledger: &ledger, ctx: &ctx, outcomes: &outcomes, attempts: &attempts,
+                    skipped: &skipped, host_inapplicable: &plan.host_inapplicable,
+                    planned_tags: &planned_tags, wall_s: wall, exit_code: 130,
+                    log_file: &log_path.to_string_lossy(), execution_complete: false,
+                    coverage: coverage.clone(), cell_results: None, cumulative_evidence: None,
+                },
+                Some((&raw_snapshot, &mut raw_census)),
+            )
+        } else { None };
         // This is below the interrupted run's ledger write. Keep the checkout
         // lock held while the generated files are replaced, so a second local
         // validate cannot begin against the tree between those two operations.
@@ -22160,6 +22764,11 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             &e2e_result_root,
             nesting.nested,
             args.allow_local_off_the_record_run,
+            &ScorecardPublication {
+                parent: parent.as_deref(), tool_root: tool_root.as_deref(),
+                expected_head: &ctx.commit, finalized_row: finalized_row.as_ref(),
+                delegated: scorecard_delegated,
+            },
         );
         drop(run_record);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -22390,8 +22999,8 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     let cumulative_expected = prepared_evidence.is_some();
     let retained_evidence = if execution_complete {
         match prepared_evidence {
-            Some(prepared) => match prepared.retain(parent.as_deref().unwrap_or(&root),
-                &e2e_result_root, &ctx, &outcomes, &attempts, plan.compat_prefix) {
+            Some(prepared) => match prepared.retain_snapshot(parent.as_deref().unwrap_or(&root),
+                &raw_snapshot, &ctx, &outcomes, &attempts, plan.compat_prefix) {
                 Ok(evidence) => Some(evidence),
                 Err(error) => {
                     let detail = format!("cannot retain cumulative validation evidence: {error}; refusing a schema-10 receipt");
@@ -22414,9 +23023,9 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             None => validate_cell_results::expected_plan(&root),
         };
         let result = expected.and_then(|expected| {
-            validate_cell_results::retain(
+            validate_cell_results::retain_snapshot(
                 parent.as_deref().unwrap_or(&root),
-                &e2e_result_root,
+                &raw_snapshot,
                 &commit,
                 &expected,
             )
@@ -22531,24 +23140,29 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
     // A NESTED payload writes nothing: the outer run owns the ledger and the
     // receipt, and a second row for one logical run is exactly the duplication
     // the re-entrancy guard exists to prevent.
-    if !nesting.nested && !args.allow_local_off_the_record_run {
-        write_ledger(
-            &ledger,
-            &ctx,
-            &outcomes,
-            &attempts,
-            &skipped,
-            &plan.host_inapplicable,
-            &planned_tags,
-            wall,
-            exit_code,
-            &log_path.to_string_lossy(),
-            execution_complete,
-            coverage,
-            retained_cell_results,
-            retained_evidence.as_ref(),
-        );
-    }
+    let finalized_row = if !nesting.nested && !args.allow_local_off_the_record_run {
+        write_ledger_with_snapshot(
+            LedgerPublication {
+                ledger: &ledger,
+                ctx: &ctx,
+                outcomes: &outcomes,
+                attempts: &attempts,
+                skipped: &skipped,
+                host_inapplicable: &plan.host_inapplicable,
+                planned_tags: &planned_tags,
+                wall_s: wall,
+                exit_code,
+                log_file: &log_path.to_string_lossy(),
+                execution_complete,
+                coverage,
+                cell_results: retained_cell_results,
+                cumulative_evidence: retained_evidence.as_ref(),
+            },
+            Some((&raw_snapshot, &mut raw_census)),
+        )
+    } else {
+        None
+    };
 
     // Receipt publication, strictly AFTER the ledger append: `ci-hub
     // apply-local-label` re-derives the receipt FROM the ledger, so publishing
@@ -22584,6 +23198,11 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
         &e2e_result_root,
         nesting.nested,
         args.allow_local_off_the_record_run,
+        &ScorecardPublication {
+            parent: parent.as_deref(), tool_root: tool_root.as_deref(),
+            expected_head: &ctx.commit, finalized_row: finalized_row.as_ref(),
+            delegated: scorecard_delegated,
+        },
     );
 
     // Read the individual results before removing the disposable build root: a
@@ -22610,7 +23229,7 @@ fn run(durable_slot: &mut Option<DurableLog>, service_result_path: Option<&Path>
             );
         }
     }
-    match e2e_test_observations(&e2e_result_root) {
+    match e2e_test_observations_snapshot(&raw_snapshot) {
         Ok(mut observations) => test_observations.append(&mut observations),
         Err(error) => test_summary_errors.push(format!(
             "individual E2E test ids could not be read from the per-cell results: {error}; \
@@ -22895,7 +23514,7 @@ fn stop_test_seam(
     // and leaves nothing unaccounted.
     let planned_tags: BTreeSet<String> = outcomes.iter().map(|o| o.tag.clone()).collect();
     if !off_the_record {
-        write_ledger(
+        let _ = write_ledger(
             &ledger,
             &ctx,
             &outcomes,
@@ -24407,11 +25026,20 @@ mod refusal_detail_tests {
         // is exactly the shape that stranded seven hours of validation.
         std::fs::write(
             &script,
-            "import sys\nassert '--source-checkout' in sys.argv and '--results' in sys.argv and '--target' in sys.argv\nprint('parity history changes candidate identity for CELL-X', file=sys.stderr)\nraise SystemExit(2)\n",
+            "import sys\nassert '--source-checkout' in sys.argv and '--results' in sys.argv and '--target' in sys.argv and '--finalized-run-id' in sys.argv\nprint('parity history changes candidate identity for CELL-X', file=sys.stderr)\nraise SystemExit(2)\n",
         )
         .expect("write the stand-in tool");
 
-        let error = local_scorecard_writeback(&root, &root, false, false)
+        let row = serde_json::json!({"run_id": "fixture-finalized-run"});
+        let publication = ScorecardPublication {
+            parent: Some(fixture.path()),
+            tool_root: Some(fixture.path()),
+            expected_head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            finalized_row: Some(&row),
+            delegated: false,
+        };
+
+        let error = local_scorecard_writeback(&root, &root, false, false, &publication)
             .expect("the writeback runs when not nested and on the record")
             .expect_err("a refusing tool must produce an error");
 
@@ -24426,15 +25054,15 @@ mod refusal_detail_tests {
         // Control in the other direction: a tool that succeeds produces no
         // error at all, so the assertions above are not passing because every
         // path errors.
-        std::fs::write(&script, "import sys\nassert '--source-checkout' in sys.argv and '--results' in sys.argv and '--target' in sys.argv\n").expect("rewrite the tool");
-        local_scorecard_writeback(&root, &root, false, false)
+        std::fs::write(&script, "import sys\nassert '--source-checkout' in sys.argv and '--results' in sys.argv and '--target' in sys.argv and '--finalized-run-id' in sys.argv\n").expect("rewrite the tool");
+        local_scorecard_writeback(&root, &root, false, false, &publication)
             .expect("still runs")
             .expect("a succeeding tool must not error");
 
         // And the gate is still a gate: nested or off-the-record runs do not
         // invoke the tool at all.
-        assert!(local_scorecard_writeback(&root, &root, true, false).is_none());
-        assert!(local_scorecard_writeback(&root, &root, false, true).is_none());
+        assert!(local_scorecard_writeback(&root, &root, true, false, &publication).is_none());
+        assert!(local_scorecard_writeback(&root, &root, false, true, &publication).is_none());
     }
 
     #[test]
@@ -24443,5 +25071,838 @@ mod refusal_detail_tests {
             refusal_detail(b"first line\n\n  second   line \n", b""),
             "stderr: first line second line"
         );
+    }
+}
+
+#[cfg(test)]
+mod scorecard_cutover_tests {
+    use sha2::Digest;
+
+    use super::*;
+
+    const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn versioned_parent_delegation_preserves_old_callers_and_the_held_local_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let script = root.join("ci-hub/series/mirror.py");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import fcntl, json, pathlib, sys
+root = pathlib.Path.cwd()
+with (root/'target/validation/validate-invocation.lock').open('a') as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise AssertionError('writeback ran without the existing invocation lock')
+args = sys.argv[1:]
+assert args[args.index('--target')+1] == 'a'*40
+assert args[args.index('--parent')+1] == str(root)
+assert args[args.index('--source-checkout')+1] == str(root)
+assert args[args.index('--results')+1] == str(root)
+assert args[args.index('--finalized-run-id')+1] == 'producer-finalized-run'
+assert '--finalized-row' not in args, 'caller files must not substitute for the canonical row'
+with (root/'calls.jsonl').open('a') as out:
+    out.write(json.dumps(args)+'\n')
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _lock = match validate_runtime::acquire_invocation_lock(root, "full", HEAD) {
+            validate_runtime::LockOutcome::Acquired(lock) => lock,
+            _ => panic!("the private invocation lock must be available"),
+        };
+        let row = serde_json::json!({"started_at":"2026-09-20T00:00:00Z", "run_id":"producer-finalized-run"});
+        let cases = [
+            (None, true, false),
+            (Some("unknown-owner"), true, false),
+            (Some("ci-hub-invoker-v1"), true, true),
+            (Some("ci-hub-invoker-v1"), false, false),
+        ];
+        let mut local_calls = 0;
+        for (owner, managed, delegated) in cases {
+            let publication = ScorecardPublication {
+                parent: Some(root),
+                tool_root: Some(root),
+                expected_head: HEAD,
+                finalized_row: Some(&row),
+                delegated: parent_owns_scorecard_writeback(owner, managed),
+            };
+            assert_eq!(publication.delegated, delegated);
+            let result = local_scorecard_writeback(root, root, false, false, &publication);
+            if delegated {
+                assert!(
+                    result.is_none(),
+                    "delegation must never claim child completion"
+                );
+            } else {
+                result.unwrap().unwrap();
+                local_calls += 1;
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.join("calls.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                local_calls
+            );
+            assert!(local_scorecard_writeback(root, root, true, false, &publication).is_none());
+            assert!(local_scorecard_writeback(root, root, false, true, &publication).is_none());
+        }
+        let publication = ScorecardPublication {
+            parent: Some(root),
+            tool_root: Some(root),
+            expected_head: HEAD,
+            finalized_row: None,
+            delegated: false,
+        };
+        let error = local_scorecard_writeback(root, root, false, false, &publication)
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("no durable finalized ledger row"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("calls.jsonl"))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        assert!(
+            !root.join("ignored/validate/scorecard-snapshots").exists(),
+            "the validator must leave proof capture to the parent's locked publisher"
+        );
+    }
+
+    fn context(
+        root: &Path,
+        profile: &str,
+        run_id: &str,
+        commit: String,
+        tree: String,
+    ) -> LedgerCtx {
+        LedgerCtx {
+            run_id: Some(run_id.into()),
+            admission_floor_evidence: None,
+            admission_provenance_error: None,
+            log_identity: None,
+            base_observation: serde_json::Value::Null,
+            main_observation: serde_json::Value::Null,
+            started_at: "2026-09-20T00:00:00Z".into(),
+            host: "scorecard-fixture".into(),
+            toolchain: "fixture-python-unittest".into(),
+            slot: "fixture".into(),
+            cwd: root.display().to_string(),
+            profile: profile.into(),
+            selection_mode: "selected".into(),
+            cache_state: "cold".into(),
+            commit,
+            tree,
+            git_depth: 1,
+            git_ahead: Some(0),
+            git_behind: Some(0),
+            commit_anchored: true,
+            tree_dirty: false,
+            dag_jobs: 1,
+            admission: None,
+            base_sha: serde_json::Value::Null,
+            base_tree: serde_json::Value::Null,
+            reverie_base_sha: serde_json::Value::Null,
+            reverie_base_tree: serde_json::Value::Null,
+            concurrent_validates: None,
+            concurrency_proof: None,
+            interruption: None,
+            cpu_user: 0.0,
+            cpu_sys: 0.0,
+            retry_rounds: 0,
+            reverie_pin_current: false,
+            executed_tests: Some(1),
+            passed_tests: Some(1),
+            filtered_tests: Some(0),
+        }
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("--no-replace-objects")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().into()
+    }
+
+    #[test]
+    fn selected_package_runs_retain_verified_zero_cells_and_actual_test_rows() {
+        // The real scheduler reads process environment. Isolate that context
+        // from other libtest cases rather than racing their log/result roots.
+        const CHILD: &str = "HERMIT_SELECTED_PACKAGE_CENSUS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "scorecard_cutover_tests::selected_package_runs_retain_verified_zero_cells_and_actual_test_rows", "--nocapture"])
+                .env(CHILD, "1")
+                .env_remove("DAGRUN_LOG_DIR")
+                .env_remove("DAGRUN_NO_LOGS")
+                .env_remove("BASH_ENV")
+                .env_remove("ENV")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed;"));
+            return;
+        }
+        let source = Path::new(file!()).parent().unwrap().parent().unwrap();
+        for (profile, fails) in [
+            ("full", false),
+            ("quick", false),
+            ("super", false),
+            ("full", true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            std::fs::create_dir_all(root.join("ci/dag")).unwrap();
+            // Keep the real, nonempty manifest population. This selected plan
+            // runs a package test and deliberately selects none of its cells.
+            std::fs::copy(
+                source.join("ci/expected-e2e-plan.json"),
+                root.join("ci/expected-e2e-plan.json"),
+            )
+            .unwrap();
+            let producer = root.join("package_test.py");
+            std::fs::write(&producer, r#"import io, json, os, pathlib, unittest
+class SelectedPackage(unittest.TestCase):
+    def test_roundtrip(self):
+        self.assertEqual(json.loads(json.dumps({'value':[1,2,3]})), {'value':[1,2,3]})
+        self.assertNotEqual(os.environ.get('SCORECARD_FIXTURE_FAIL'), '1', 'controlled actual package failure')
+result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.defaultTestLoader.loadTestsFromTestCase(SelectedPackage))
+assert result.testsRun == 1
+pathlib.Path(os.environ['DAGRUN_TEST_COUNTS_PATH']).write_text(json.dumps({'schema':2,'executed_tests':result.testsRun,'filtered_tests':0,'results':[{'id':'SelectedPackage.test_roundtrip','result':'pass' if result.wasSuccessful() else 'fail','attempts':1}]}))
+raise SystemExit(0 if result.wasSuccessful() else 1)
+"#).unwrap();
+            let cfg = dag_from_json(&serde_json::json!({"steps":[{
+                "group":"test", "job":"package", "cmd":format!("python3 {}", shell_words::quote(&producer.display().to_string())),
+                "jobs_flag":"", "timeout":10,
+                "env":{"SCORECARD_FIXTURE_FAIL":if fails {"1"} else {"0"}},
+                "result_manifests":[{"kind":"structured-test-results","schema":2,
+                    "path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.package"}]
+            }]}).to_string()).unwrap();
+            let dag = dag_to_json(&cfg);
+            let dag_path = root.join("ci/dag/validate.json");
+            std::fs::write(&dag_path, &dag).unwrap();
+            // A real measured commit has a distinct Detcore tree. The later
+            // composed writer test imports this object, never relabels it as
+            // the invocation checkout's source.
+            std::fs::create_dir(root.join("detcore")).unwrap();
+            std::fs::write(
+                root.join("detcore/source"),
+                "package-only infrastructure fixture\n",
+            )
+            .unwrap();
+            git(root, &["init", "-q"]);
+            git(
+                root,
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "add",
+                    "ci",
+                    "package_test.py",
+                    "detcore",
+                ],
+            );
+            git(
+                root,
+                &[
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-qm",
+                    "selected package fixture",
+                ],
+            );
+            let commit = git(root, &["rev-parse", "HEAD"]);
+            let tree = git(root, &["rev-parse", "HEAD^{tree}"]);
+            let plan = finish_committed_selection(
+                Plan {
+                    cfg,
+                    profile: profile.into(),
+                    selection_mode: "selected",
+                    ..Plan::default()
+                },
+                dag_path,
+                dag.into_bytes(),
+            );
+            assert!(!plan.suite_complete);
+            assert!(should_capture_cumulative_evidence(&plan, false, false));
+            assert!(!should_capture_cumulative_evidence(&plan, true, false));
+            assert!(!should_capture_cumulative_evidence(&plan, false, true));
+            let run_id = format!(
+                "selected-package-{profile}-{}",
+                if fails { "failed" } else { "passed" }
+            );
+            let prepared = validate_evidence::SelectedEvidence::capture(root, &plan)
+                .unwrap()
+                .publish(root, &plan, &run_id, &commit)
+                .unwrap();
+            assert!(prepared.plan.planned_cells().unwrap().is_empty());
+            assert_eq!(prepared.plan.path.as_str(), profile);
+            let results = root.join("results");
+            let held = validate_cell_results::HeldInput::create_directory(&results, false).unwrap();
+            std::env::set_var("E2E_RESULT_ROOT", &results);
+            std::env::set_var("E2E_RUN_ID", &run_id);
+            std::env::remove_var("DAGRUN_LOG_DIR");
+            let log_path = root.join("scheduler.log");
+            std::fs::write(&log_path, "selected package fixture\n").unwrap();
+            let mut authority = RawCensusAuthority::prepare(held, &log_path, None);
+            let custom_error =
+                verify_census_launches(&plan.cfg, &authority.as_ref().unwrap().normal_launches)
+                    .unwrap_err();
+            // This existing fixture exercises the actual scheduler, byte
+            // retention and selected-zero schema contract with its own known
+            // Python publisher. It is not a normal-route admission witness:
+            // the production constructor above correctly refuses its shape.
+            authority.as_mut().unwrap().normal_launches = plan.cfg.clone();
+            check_raw_census(&mut authority, |authority| authority.before_lane(&plan.cfg));
+            let deadline = monotonic_now_ns()
+                .unwrap()
+                .checked_add(30_000_000_000)
+                .unwrap();
+            let run = run_lane_once(
+                &plan.cfg,
+                1,
+                true,
+                0,
+                None,
+                &log_path,
+                Some(deadline),
+                false,
+            );
+            check_raw_census(&mut authority, |authority| {
+                authority.after_lane(&plan.cfg, &run)
+            });
+            assert!(authority.is_ok(), "{:?}", authority.as_ref().err());
+            assert_eq!(run.ok, !fails, "{:#?}", run.outcomes);
+            assert_eq!(run.outcomes.len(), 1);
+            assert_eq!(run.outcomes[0].executed_tests, Some(1));
+            assert_eq!(run.outcomes[0].test_results.as_ref().unwrap().len(), 1);
+            let attempts: Vec<_> = run
+                .outcomes
+                .iter()
+                .map(|outcome| reported_attempt(outcome, 1))
+                .collect();
+            let mut ctx = context(root, profile, &run_id, commit, tree);
+            ctx.passed_tests = Some(i64::from(!fails));
+            let snapshot = validate_cell_results::CapturedResults::capture(&results);
+            let evidence = prepared
+                .retain_snapshot(root, &snapshot, &ctx, &run.outcomes, &attempts, None)
+                .unwrap();
+            let tags = plan.cfg.steps.iter().map(Step::tag).collect();
+            let ledger = root.join("rows.jsonl");
+            let publish =
+                |path: &Path,
+                 exit_code: u8,
+                 snapshot: &validate_cell_results::CapturedResults,
+                 authority: &mut Result<RawCensusAuthority, String>| {
+                    write_ledger_with_snapshot(
+                        LedgerPublication {
+                            ledger: path,
+                            ctx: &ctx,
+                            outcomes: &run.outcomes,
+                            attempts: &attempts,
+                            skipped: &[],
+                            host_inapplicable: &[],
+                            planned_tags: &tags,
+                            wall_s: 0.0,
+                            exit_code,
+                            log_file: "",
+                            execution_complete: true,
+                            coverage: serde_json::json!({}),
+                            cell_results: Some(&evidence.cells),
+                            cumulative_evidence: Some(&evidence),
+                        },
+                        Some((snapshot, authority)),
+                    )
+                };
+            let row = publish(&ledger, u8::from(fails), &snapshot, &mut authority).unwrap();
+            assert_eq!(row["profile"], profile);
+            assert_eq!(row["selection_mode"], "selected");
+            assert_eq!(row["schema_version"], 10);
+            assert_eq!(row["executed_tests"], 1);
+            assert_eq!(row["result"], if fails { "fail" } else { "pass" });
+            assert_eq!(row["passed_tests"], u64::from(!fails));
+            assert_eq!(row["cell_results"]["selected_count"], 0);
+            assert_eq!(row["cell_results"]["recorded_count"], 0);
+            assert!(
+                row["cell_results"]["selected"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(std::fs::read_dir(&results).unwrap().count(), 0);
+            let typed: HistoryRow = serde_json::from_value(row.clone()).unwrap();
+            evidence.verify_record(&typed).unwrap();
+            typed
+                .raw_result_input_census_v1()
+                .unwrap()
+                .unwrap()
+                .verify_inputs(&typed, &BTreeMap::new())
+                .unwrap();
+            let reopened: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+            assert_eq!(
+                reopened, row,
+                "the actual durable row is the writeback authority"
+            );
+            let mut custom_authority = Err(custom_error);
+            let custom = publish(
+                &root.join("custom-route-row.jsonl"),
+                u8::from(fails),
+                &snapshot,
+                &mut custom_authority,
+            )
+            .unwrap();
+            assert_eq!(custom["result"], row["result"]);
+            assert_eq!(custom["raw_result"], row["raw_result"]);
+            assert_eq!(custom["executed_tests"], row["executed_tests"]);
+            assert_eq!(custom["passed_tests"], row["passed_tests"]);
+            assert_eq!(custom["cell_results"], row["cell_results"]);
+            assert_eq!(custom["test_results"], row["test_results"]);
+            assert!(custom.get("raw_result_input_census_v1").is_none());
+            assert!(
+                custom["raw_result_input_census_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("source-defined normal")
+            );
+            let missing = root.join("absent-parent");
+            std::fs::write(&missing, "not a directory").unwrap();
+            assert!(
+                write_ledger(
+                    &missing.join("rows.jsonl"),
+                    &ctx,
+                    &run.outcomes,
+                    &attempts,
+                    &[],
+                    &[],
+                    &tags,
+                    0.0,
+                    0,
+                    "",
+                    true,
+                    serde_json::json!({}),
+                    Some(&evidence.cells),
+                    Some(&evidence)
+                )
+                .is_none(),
+                "failed durable publication must not yield writeback authority"
+            );
+            if fails {
+                // A real failed framework case remains a canonical failure
+                // even when its raw-input proof cannot be captured. Evidence
+                // publication and execution verdict are separate outcomes.
+                let missing_snapshot =
+                    validate_cell_results::CapturedResults::capture(&root.join("missing-results"));
+                let mut missing_authority = missing_snapshot
+                    .census(&run_id, &ctx.commit, &BTreeSet::new())
+                    .map(|_| unreachable!("an absent root cannot produce a census"));
+                let refused_capture = publish(
+                    &root.join("proof-error-row.jsonl"),
+                    1,
+                    &missing_snapshot,
+                    &mut missing_authority,
+                )
+                .unwrap();
+                assert_eq!(refused_capture["result"], "fail");
+                assert_eq!(refused_capture["raw_result"], "fail");
+                assert_eq!(refused_capture["executed_tests"], 1);
+                assert_eq!(refused_capture["passed_tests"], 0);
+                assert!(refused_capture.get("raw_result_input_census_v1").is_none());
+                assert!(
+                    !refused_capture["raw_result_input_census_error"]
+                        .as_str()
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(refused_capture["cell_results"], row["cell_results"]);
+                assert_eq!(refused_capture["test_results"], row["test_results"]);
+                // Mutation after a successful producer capture has the same
+                // explicit unavailable disposition before append, without
+                // creating a replacement proof from the already-lost inputs.
+                std::fs::write(results.join("results.jsonl"), "truncated").unwrap();
+                let moved = publish(
+                    &root.join("proof-moved-row.jsonl"),
+                    1,
+                    &snapshot,
+                    &mut authority,
+                )
+                .unwrap();
+                assert_eq!(moved["result"], "fail");
+                assert!(moved.get("raw_result_input_census_v1").is_none());
+                assert!(
+                    moved["raw_result_input_census_error"]
+                        .as_str()
+                        .is_some_and(|error| !error.is_empty())
+                );
+                std::fs::remove_file(results.join("results.jsonl")).unwrap();
+            }
+            if let Some(destination) = std::env::var_os("HERMIT_SCORECARD_ZERO_TEST_EXPORT") {
+                let fixture = temp.keep();
+                let destination = PathBuf::from(destination);
+                std::fs::create_dir_all(&destination).unwrap();
+                std::fs::write(destination.join(format!("{profile}-{}.json", if fails {"failed"} else {"passed"})), serde_json::to_vec_pretty(&serde_json::json!({
+                    "root":fixture,"profile":profile,"row":row,"row_sha256":format!("{:x}",sha2::Sha256::digest(std::fs::read(&ledger).unwrap()))
+                })).unwrap()).unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod raw_census_publication_tests {
+    use super::*;
+
+    fn normal_cfg() -> DagConfig {
+        validate_plan::validation_config(&test_source_root()).unwrap()
+    }
+
+    #[test]
+    fn maintained_only_profiles_retain_the_true_selected_scope() {
+        let root = test_source_root();
+        for (lane, tag) in [
+            ("quick", "quick.detcore_unit"),
+            ("full", "test.rr_suite_contract"),
+            ("portable", "test.rr_suite_contract"),
+            ("hosted-portable", "test.rr_suite_contract_on_host"),
+        ] {
+            let args = parse_argv(&["--only".into(), lane.into(), tag.into()]).unwrap();
+            assert!(!args.allow_local_off_the_record_run);
+            let plan = build_plan(&root, &args, &root.join("ignored")).unwrap();
+            assert_eq!(plan.profile, format!("only-{lane}"));
+            assert_eq!(plan.selection_mode, "only");
+            assert!(!plan.suite_complete);
+            assert!(
+                plan.cfg
+                    .steps
+                    .iter()
+                    .all(|step| validation_step_identity(step)
+                        != ValidationStepIdentity::ManifestRun)
+            );
+            assert!(should_capture_cumulative_evidence(&plan, false, false));
+            assert!(!should_capture_cumulative_evidence(&plan, true, false));
+            assert!(!should_capture_cumulative_evidence(&plan, false, true));
+            verify_census_launches(&plan.cfg, &normal_census_launches(None).unwrap()).unwrap();
+            let selected = validate_evidence::SelectedEvidence::capture(&root, &plan).unwrap();
+            drop(selected);
+            let mut changed = plan;
+            changed.profile = "only-custom".into();
+            assert!(!should_capture_cumulative_evidence(&changed, false, false));
+            changed.profile = format!("only-{lane}");
+            changed.selection_mode = "label";
+            assert!(!should_capture_cumulative_evidence(&changed, false, false));
+            changed.selection_mode = "only";
+            changed.committed_selection = None;
+            assert!(!should_capture_cumulative_evidence(&changed, false, false));
+        }
+    }
+
+    #[test]
+    fn normal_selected_package_routes_refuse_unknown_launch_shapes() {
+        let normal = normal_census_launches(None).unwrap();
+        for (label, tag) in [
+            ("quick", "quick.detcore_unit"),
+            ("full", "test.regular_crates"),
+            ("hosted-portable", "test.regular_crates_on_host"),
+        ] {
+            let lane = dagrun::select_steps_by_labels(&normal, &[label.into()]).unwrap();
+            verify_census_launches(&lane, &normal).unwrap();
+            let selected = dagrun::select_steps_by_tags(&lane, &[tag.into()], true).unwrap();
+            assert_eq!(selected.steps.len(), 1);
+            assert_ne!(
+                validation_step_identity(&selected.steps[0]),
+                ValidationStepIdentity::ManifestRun
+            );
+            verify_census_launches(&selected, &normal).unwrap();
+            for opponent in [
+                "command",
+                "unknown",
+                "env",
+                "jobs-flag",
+                "jobs-env",
+                "default-flag",
+                "default-env",
+                "report",
+            ] {
+                let mut changed = selected.clone();
+                match opponent {
+                    "command" => changed.steps[0].cmd.push_str(
+                        "; (sleep 1; printf late >> \"$E2E_RESULT_ROOT/results.jsonl\") &",
+                    ),
+                    "unknown" => changed.steps[0].job.push_str("_custom"),
+                    "env" => {
+                        changed.steps[0]
+                            .env
+                            .insert("BASH_ENV".into(), "/custom".into());
+                    }
+                    "jobs-flag" => changed.steps[0].jobs_flag = Some("; custom &".into()),
+                    "jobs-env" => changed.steps[0].jobs_env = Some("E2E_RESULT_ROOT".into()),
+                    "default-flag" => changed.default_jobs_flag = "; custom &".into(),
+                    "default-env" => changed.default_jobs_env = "E2E_RESULT_ROOT".into(),
+                    "report" => changed.steps[0].result_manifests = None,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    verify_census_launches(&changed, &normal).is_err(),
+                    "{label}: {opponent}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_normal_publisher_binds_exact_command_root_and_report_contract() {
+        let cfg = normal_cfg();
+        let publishers = cfg
+            .steps
+            .iter()
+            .filter(|step| validation_step_identity(step) == ValidationStepIdentity::ManifestRun)
+            .collect::<Vec<_>>();
+        assert_eq!(publishers.len(), 33);
+        for step in publishers {
+            let path = normal_raw_result_path(step, "fixture-run").unwrap();
+            let expected_flag = match step
+                .manifest
+                .as_ref()
+                .map(|manifest| (manifest.lane.as_str(), manifest.category.as_str()))
+            {
+                Some(("portable", "backend-parity-c" | "c-programs")) => Some("--jobs"),
+                Some(("portable", "system-utils")) => Some(""),
+                _ => None,
+            };
+            assert_eq!(step.jobs_flag.as_deref(), expected_flag, "{}", step.tag());
+            for flag in [
+                None,
+                Some("--jobs"),
+                Some(""),
+                Some("-j"),
+                Some("--jobs=%d"),
+                Some("--jobs; false"),
+            ] {
+                if flag == expected_flag {
+                    continue;
+                }
+                let mut changed = step.clone();
+                changed.jobs_flag = flag.map(str::to_owned);
+                assert!(
+                    normal_raw_result_path(&changed, "fixture-run").is_err(),
+                    "{} unsupported width contract {flag:?}",
+                    step.tag(),
+                );
+            }
+            // Exercise the exact source scheduler renderer used after admission.
+            // Empty suppression must retain the payload's own literal width;
+            // positive injection remains one decimal value after the exact
+            // guarded command, without parsing or rebuilding its shell payload.
+            for width in [None, Some(1), Some(7)] {
+                let expected = match (expected_flag.unwrap_or("-j"), width) {
+                    ("", _) | (_, None) => step.cmd.clone(),
+                    (flag, Some(width)) => format!("{} {flag} {width}", step.cmd),
+                };
+                assert_eq!(
+                    dagrun::model::command_with_inner_jobs(step, "-j", width),
+                    expected,
+                    "{} width {width:?}",
+                    step.tag(),
+                );
+            }
+            assert!(path.ends_with("results.jsonl"));
+            if step.tag() == "quick.e2e_verify" {
+                assert_eq!(path, Path::new("fixture-run/results.jsonl"));
+            }
+            for opponent in [
+                "background",
+                "root-override",
+                "missing-report",
+                "unknown-transport",
+            ] {
+                let mut changed = step.clone();
+                match opponent {
+                    "background" => changed.cmd.push_str(" & wait; echo late-raw-writer &"),
+                    "root-override" => {
+                        changed
+                            .env
+                            .insert("E2E_RESULT_ROOT".into(), "/other".into());
+                    }
+                    "missing-report" => changed.result_manifests = None,
+                    "unknown-transport" => {
+                        changed.cmd = changed
+                            .cmd
+                            .replace("target/debug/test-harness", "custom-counts-publisher")
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    normal_raw_result_path(&changed, "fixture-run").is_err(),
+                    "{} {opponent}",
+                    step.tag()
+                );
+            }
+        }
+    }
+
+    fn failed_publisher() -> (DagConfig, LaneResult, Vec<serde_json::Value>) {
+        let mut cfg = normal_cfg();
+        cfg.steps.retain(|step| step.tag() == "quick.e2e_verify");
+        assert_eq!(cfg.steps.len(), 1);
+        let tag = cfg.steps[0].tag();
+        let mut outcome =
+            StepOutcome::passed(tag.clone(), 1.0, String::new(), Some(1), Some(1), Some(0));
+        outcome.ok = false;
+        outcome.test_results = Some(vec![
+            dagrun::TestResult::new("actual-failed-case".into(), false, 1).unwrap(),
+        ]);
+        let rows = vec![
+            serde_json::json!({"event":"step_start","step":tag,"pid":"123","cmd":"actual boxed command"}),
+            serde_json::json!({"event":"step_end","step":tag,"ok":false,
+                "aborted":"false","timed_out":"false","cpu_timed_out":"false"}),
+        ];
+        (
+            cfg,
+            LaneResult {
+                outcomes: vec![outcome],
+                skipped: Vec::new(),
+                attempts: Vec::new(),
+                complete: false,
+                ok: false,
+                run_timed_out: false,
+            },
+            rows,
+        )
+    }
+
+    #[test]
+    fn publisher_completion_preserves_native_failure_and_refuses_unknown_or_recovered_imports() {
+        let (cfg, lane, rows) = failed_publisher();
+        verify_raw_publisher_completion(&cfg, &lane, &rows).unwrap();
+        for opponent in [
+            "no-native",
+            "signal",
+            "missing-results",
+            "import-error",
+            "aborted",
+            "missing-start",
+            "duplicate-start",
+            "early-end",
+        ] {
+            let (_, mut changed_lane, mut changed_rows) = failed_publisher();
+            let outcome = &mut changed_lane.outcomes[0];
+            match opponent {
+                "no-native" => outcome.returncode = None,
+                "signal" => outcome.returncode = Some(-9),
+                "missing-results" => outcome.test_results = None,
+                "import-error" => outcome.test_results_error = Some("recovery was needed".into()),
+                "aborted" => outcome.aborted = true,
+                "missing-start" => {
+                    changed_rows.remove(0);
+                }
+                "duplicate-start" => changed_rows.insert(0, changed_rows[0].clone()),
+                "early-end" => changed_rows.reverse(),
+                _ => unreachable!(),
+            }
+            assert!(
+                verify_raw_publisher_completion(&cfg, &changed_lane, &changed_rows).is_err(),
+                "{opponent}"
+            );
+        }
+        let mut skipped = lane;
+        skipped.skipped.push(cfg.steps[0].tag());
+        skipped.outcomes.clear();
+        verify_raw_publisher_completion(&cfg, &skipped, &[]).unwrap();
+        assert!(
+            verify_raw_publisher_completion(&cfg, &skipped, &rows).is_err(),
+            "a launched publisher cannot become a never-launched one"
+        );
+    }
+
+    #[test]
+    fn journal_lane_prefix_prevents_reusing_an_earlier_report() {
+        let (cfg, lane, rows) = failed_publisher();
+        let prior = rows
+            .iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>();
+        let current = raw_lane_journal(prior.as_bytes(), prior.as_bytes()).unwrap();
+        assert!(verify_raw_publisher_completion(&cfg, &lane, &current).is_err());
+        assert!(raw_lane_journal(prior.as_bytes(), b"replaced\n").is_err());
+        assert!(raw_lane_journal(b"", b"{\"event\":\"step_start\"}").is_err());
+        assert!(raw_lane_journal(b"", b"not-json\n").is_err());
+        let bytes = format!("{prior}{prior}");
+        let current = raw_lane_journal(prior.as_bytes(), bytes.as_bytes()).unwrap();
+        verify_raw_publisher_completion(&cfg, &lane, &current).unwrap();
+    }
+
+    #[test]
+    fn census_publication_error_changes_no_result_null_or_unknown_field() {
+        for result in ["pass", "fail", "no_result"] {
+            let original = serde_json::json!({"schema_version":10,"result":result,
+                "raw_result":"fail","executed_tests":null,"passed_tests":null,
+                "filtered_tests":null,"cell_results":null,"future_field":{"known":false}});
+            let mut row = original.clone();
+            add_raw_census(&mut row, Err("explicit publication failure".into()));
+            assert_eq!(
+                row["raw_result_input_census_error"],
+                "explicit publication failure"
+            );
+            assert!(row.get("raw_result_input_census_v1").is_none());
+            let later = hermit_manifest_plan::ledger::RawResultInputCensusV1::from_inputs(
+                "fixture-run",
+                &"a".repeat(40),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            add_raw_census(&mut row, Ok(later));
+            assert_eq!(
+                row["raw_result_input_census_error"],
+                "explicit publication failure"
+            );
+            assert!(row.get("raw_result_input_census_v1").is_none());
+            row.as_object_mut()
+                .unwrap()
+                .remove("raw_result_input_census_error");
+            assert_eq!(row, original);
+            let census = hermit_manifest_plan::ledger::RawResultInputCensusV1::from_inputs(
+                "fixture-run",
+                &"a".repeat(40),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            add_raw_census(&mut row, Ok(census));
+            assert!(row.get("raw_result_input_census_error").is_none());
+            assert_eq!(
+                row["raw_result_input_census_v1"]["files"],
+                serde_json::json!([])
+            );
+            row.as_object_mut()
+                .unwrap()
+                .remove("raw_result_input_census_v1");
+            assert_eq!(row, original);
+        }
     }
 }
