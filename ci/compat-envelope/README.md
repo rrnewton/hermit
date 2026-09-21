@@ -1,13 +1,47 @@
 # Compatibility scorecard
 
-The compatibility scorecard reports two separate facts from a Hermit checkout:
-which manifest-declared test, mode, and backend combinations are selected for
-ordinary validation, and what canonical results have been imported for them.
+Hermit owns the catalogue of manifest-declared test, mode, and backend
+combinations and their selection/applicability reasons. Start at
+[`SCORECARD.md`](../../SCORECARD.md); the same stable identities live in
+[`cells.json`](cells.json). Schema 9 contains this selection data and a reference
+to the existing [hermit_test_ledger](https://github.com/rrnewton/hermit_test_ledger)
+repository, not accumulated run observations.
 
-Start at [`SCORECARD.md`](../../SCORECARD.md). It is intentionally a small,
-versioned table. The stable per-cell identities behind the totals live in
-[`cells.json`](cells.json). Raw results, logs, durations, timestamps, and host
-data are not versioned; each validate run retains those under `ignored/`.
+Detailed observations remain in that repository's `scorecard/cells.json`, using
+the existing history decoder and result/provenance fields. Raw validation
+results remain retained by their producer and are published through the parent
+workspace's ledger pipeline. A missing ledger is reported as **history
+unavailable**, never as zero measurements. Catalogue checks and test selection
+do not require the history checkout.
+
+The transition preserves the exact old Hermit `cells.json` in
+`scorecard/legacy/<original-Git-blob>.json`, with its source commit, path, hash,
+byte count and observation count in an adjacent identity file. `export-legacy`
+copies the original bytes without normalizing old fields or inventing dates,
+hosts or attempts. `update` refuses to remove that old document until this exact
+archive is committed in the ledger. Existing Hermit Git history is unchanged.
+
+Read the preserved document at the published ledger commit, without changing
+the current history projection:
+
+```console
+git -C /path/to/hermit_test_ledger show <ledger-commit>:scorecard/legacy/<original-Git-blob>.identity.json
+git -C /path/to/hermit_test_ledger show <ledger-commit>:scorecard/legacy/<original-Git-blob>.json > /path/to/legacy-cells.json
+sha256sum /path/to/legacy-cells.json
+```
+
+Compare the digest and byte count with the identity file. The original JSON
+retains all legacy fields and can be read using the existing history schema.
+The archive is separate from the richer current ledger document: differences
+between aggregate observation bodies do not establish distinct executions.
+Legacy aggregates without a safe attempt identity remain readable here but are
+not automatically merged, counted in rankings, or assigned timeline dates.
+
+Later catalogue changes refresh the current history projection without
+rewriting observations for identities that remain. New identities start
+unmeasured. Retired identities may leave that projection only when its exact
+previous document is committed in ledger Git history; an uncommitted document
+refuses retirement. Selection changes do not fabricate a result or timestamp.
 
 The denominator is the complete comparable manifest matrix, not just the
 combinations selected by one validate path. For `N` manifest tests, verify,
@@ -18,6 +52,11 @@ is not `N × 6 × 3`. Explicit `custom` commands still run when selected by
 ordinary validation, but they are not multiplied across every test/backend
 pair: unlike the three common modes, they do not define a uniform product-wide
 denominator.
+
+This is the catalogue's population, not the website's backend-ranking
+denominator. Backend comparison percentages use the distinct test-and-mode
+population actually recorded Green on ptrace. Missing backend evidence stays
+in that common population and earns no comparison credit.
 
 For one dated example only: on 2026-08-13, `N = 336`, so the comparable matrix
 has `336 × (5 × 3 + 1) = 5,376` cells. The checked-in table is generated from
@@ -63,19 +102,20 @@ The path is deliberately direct:
 4. The final `scorecard.compatibility` node requires a clean, exact-HEAD PASS
    row for every selected cell and prints the table.
 5. The checked-in table and cell identities must still equal what the manifest
-   and expected plan derive. After the ledger and receipt work is complete, a
-   direct top-level local validate merges its per-cell rows and rewrites
-   `SCORECARD.md` and `ci/compat-envelope/cells.json`. A ci-hub validate performs
-   that write in its isolated checkout after the receipt, then applies the same
-   results to the checkout that invoked it. The agent reviews the generated diff
-   and decides whether to commit it; validation never commits it automatically.
+   and expected plan derive. After receipt work, ordinary validation calls the
+   existing parent `ci-hub/series/mirror.py` publisher. It publishes raw series
+   and updates the detailed scorecard inside the existing ledger repository;
+   it does not rewrite Hermit's catalogue or create a second history store.
+   Publication failure remains visible and leaves the original results retained.
+
 6. A top-level full run retains `ignored/validate/artifacts/<run-id>/coverage.json`.
    It names the exact plan and outer nodes, every selected E2E cell, every
    cell in the manifest not selected by that path, with its recorded reason
-   and observed
-   pass/fail counts, and the complete integration-test-binary registration
+   and any available historical pass/fail counts, and the complete integration-test-binary registration
    partition. The ledger row carries the same counts and binds the artifact by
-   SHA-256.
+   SHA-256. When the manifest input is a catalogue rather than a history document,
+   historical counts are null with `history_available: false`; current run
+   results and their denominator remain separate.
 
 `./scripts/validate.rs --show-plan` lists outer DAG nodes only. It does not list
 the Rust test IDs or E2E cells inside those nodes; `coverage.json` records the
@@ -88,12 +128,12 @@ validation checks even though they are outside this uniform comparable
 denominator. `scorecard.rs check` refuses unless every selected row is accounted
 for by either the comparable green cells or that custom-command list.
 
-The Basic Sanity Milestone 1 `verify` cells run each selected backend twice against
-itself. Bare `--verify` still uses the legacy Stripped comparator. These cells
-therefore measure same-backend repeatability under the current contract; they
-do not establish strict INFO-log determinism or cross-backend parity. The
-scorecard says this directly and reports no cross-backend parity count until
-the manifest has cells that really compare fresh ptrace and non-ptrace logs.
+Selection alone establishes neither determinism nor parity. The website reads
+the retained typed comparison evidence: canonical repeat comparisons establish
+determinism, while explicit comparisons between ptrace and another backend
+establish cross-backend parity. A same-backend `bitwise_parity` result cannot
+substitute for that second comparison. Historical rows lacking the required
+evidence remain unavailable for the corresponding metric.
 
 Scorecard selection records whether a cell in the manifest is selected by full.
 Measurement is separate: importing a pass or divergence records what happened
@@ -186,10 +226,20 @@ These scorecard commands write the arrays. `update-observations`,
 is also available directly, and validation invokes it automatically for each
 completed direct top-level run.
 
-Run these commands from the Hermit repository root. In the standard
-`dev-hermit/hermit` checkout, the parent series directory is `../series`.
-Because `--series-root` is resolved from the current directory, a checkout under
-`dev-hermit/worktrees/NAME` uses `../../series` instead.
+Run these commands from the Hermit repository root. Explicit observation
+commands automatically use the same parent publisher as ordinary validation.
+The publisher owns its existing linked ledger writer and publication lock;
+setting `DEV_HERMIT_TEST_LEDGER_ROOT` alone grants no write access. Read-only
+commands use that override or the parent's `hermit_test_ledger` checkout.
+The canonical series directory is `hermit_test_ledger/series` in that repository.
+
+`scorecard-series-snapshot/v1` now optionally records `source.repository`, and
+its flattened observation projection records `source_repository`. New records
+name the ledger URL exactly. Missing repository fields retain their historical
+meaning: the commit/tree belongs to dev-hermit, not the ledger. Producer Hermit
+and Reverie code identities and explicit determinism/parity evidence are unchanged.
+The publisher supplies the ledger writer's absolute `series` path. For a manual
+read, resolve `--series-root` relative to the current directory.
 
 ```console
 ./ci/compat-envelope/scorecard.rs update-observations --summary FILE   # pressure test
@@ -197,13 +247,13 @@ Because `--series-root` is resolved from the current directory, a checkout under
 ./ci/compat-envelope/scorecard.rs import-results \
   --results DIR --current-summary FILE [--current-summary FILE ...]
 ./ci/compat-envelope/scorecard.rs project-observations \
-  --series-root ../series --refreshed-at STAMP                         # series
+  --series-root ../hermit_test_ledger/series --refreshed-at STAMP                         # series
 ```
 
 `project-observations` records the selected source as a canonical
 repository-relative path together with the exact commit and Git tree object
-whose series rows it projected. Thus `../series`, `../../series`, and a symlink
-to that directory all record the same checkout-independent `series` identity.
+whose series rows it projected. Different paths to the same ledger checkout
+record the same repository URL and checkout-independent `series` identity.
 It snapshots the committed JSONL shard population and bytes, then refuses a
 worktree with changed, missing, or untracked shards. Git replacement refs are
 ignored so the recorded object IDs and read tree cannot disagree.
@@ -216,16 +266,15 @@ they are regenerated with the immutable source identity.
 
 `observe-results` walks every `results.jsonl` under `DIR`, so several runs fold
 in one invocation — which is how a validate-side range widens beyond a point.
-Local validation runs it only after ledger and receipt publication, so the
-generated-file write cannot change the tree named by an in-flight receipt.
-Nested validates do not write separately. ci-hub also applies the completed
-results from its isolated checkout to the checkout that invoked it.
-`observe-results` serializes writes for each checkout and merges onto existing
-unstaged changes to these two generated files. It refuses staged changes and
-unstaged changes to any other tracked file.
+Local validation invokes the parent publisher after recording the result. The
+publisher retains raw series rows and updates the ledger's detailed scorecard;
+it never copies observations back into the measured Hermit checkout. Nested
+validates do not publish separately. `observe-results` holds the inherited
+ledger publication lock and refuses staged or unrelated tracked changes in
+the measured source checkout.
 No-result directories are an explicit unchanged success. A refused write is
 reported separately from the validation verdict and makes the local command
-nonzero; neither path commits the generated files.
+nonzero. Only the parent publisher commits the ledger updates.
 
 An off-the-record local validate still adds any clean exact-HEAD per-cell
 observations. Those observations cannot qualify a receipt, and the scorecard
@@ -387,7 +436,7 @@ After a clean periodic run, deliberately merge its red-cell measurements with:
 ```console
 ./ci/compat-envelope/scorecard.rs update-observations \
   --summary ignored/compat-envelope/pressure-<SHA>-<time>/summary.json
-git diff -- ci/compat-envelope/cells.json
+# The parent publisher reports the ledger commit; Hermit cells.json is unchanged.
 ```
 
 The command requires the summary's Hermit commit and Detcore tree to equal the

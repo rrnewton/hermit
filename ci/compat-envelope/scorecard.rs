@@ -24,6 +24,7 @@ use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::FileExt as UnixFileExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -72,10 +73,14 @@ const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SCHEMA: u64 = 8;
+const CATALOGUE_SCHEMA: u64 = 9;
+const LEDGER_CELLS: &str = "scorecard/cells.json";
+const LEDGER_SCORECARD: &str = "scorecard/SCORECARD.md";
 const PRESSURE_SUMMARY_SCHEMA: u64 = 5;
 const CELL_RESULT_SCHEMA: u64 = 4;
 const SCORECARD_SERIES_SNAPSHOT_SCHEMA: &str = "scorecard-series-snapshot/v1";
 const SCORECARD_SERIES_SNAPSHOT_SOURCE: &str = "series";
+const TEST_LEDGER_REPOSITORY: &str = "https://github.com/rrnewton/hermit_test_ledger.git";
 
 const USAGE: &str = r#"Usage: ci/compat-envelope/scorecard.rs COMMAND [OPTIONS]
 
@@ -87,15 +92,18 @@ Commands:
   update [--allow-green-removal REASON] [--allow-cell-removal]
       Rewrite the two tracked files. Green regressions and cell deletion are
       refused unless the matching explicit flag is present.
+  export-legacy
+      Preserve the exact current legacy cells document in the existing ledger.
+      The parent publication adapter owns the write; Hermit is unchanged.
   update-observations --summary FILE [--summary FILE ...] [--retained]
-      Merge completed clean pressure-test summaries into the cells' checked-in
+      Merge completed clean pressure-test summaries into the ledger's retained
       observations. By default every summary must name HEAD. --retained admits
       summaries from other readable Hermit commits after checking each commit's
       recorded Detcore tree, without replacing newer last_tested evidence.
       This never changes which cells are green.
   observe-results --results DIR
       Merge the canonical comparison results from ONE validate result directory
-      into the cells' checked-in observations, under the `validate` provenance
+      into the ledger's retained observations, under the `validate` provenance
       so they never mix with pressure-test bounds. Direct top-level local
       validates run this after their ledger and receipt work; ci-hub additionally
       runs it in the checkout that invoked validation after the isolated run.
@@ -193,6 +201,97 @@ struct TrackedCells {
     cells: Vec<TrackedCell>,
 }
 
+/// The implementation repository owns selection, not accumulated run history.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Catalogue {
+    schema: u64,
+    history: CatalogueHistory,
+    cells: Vec<CatalogueCell>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogueHistory {
+    repository: String,
+    path: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogueCell {
+    #[serde(flatten)]
+    id: CellId,
+    status: CellStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    not_selected_by_full_reason: Option<CiDisabledReasonData>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    green_removal_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    not_applicable_reason: Option<String>,
+}
+
+fn encoded_catalogue(cells: &TrackedCells) -> Result<String, String> {
+    let catalogue = Catalogue {
+        schema: CATALOGUE_SCHEMA,
+        history: CatalogueHistory {
+            repository: TEST_LEDGER_REPOSITORY.into(),
+            path: LEDGER_CELLS.into(),
+        },
+        cells: cells
+            .cells
+            .iter()
+            .map(|cell| CatalogueCell {
+                id: cell.id.clone(),
+                status: cell.status,
+                not_selected_by_full_reason: cell.ci_disabled_reason.clone(),
+                green_removal_reason: cell.green_removal_reason.clone(),
+                not_applicable_reason: cell.not_applicable_reason.clone(),
+            })
+            .collect(),
+    };
+    serde_json::to_string(&catalogue)
+        .map(|text| text + "\n")
+        .map_err(|error| format!("cannot encode catalogue: {error}"))
+}
+
+fn decode_catalogue(bytes: &[u8]) -> Result<TrackedCells, String> {
+    let value: JsonValue = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    if value.get("schema").and_then(JsonValue::as_u64) != Some(CATALOGUE_SCHEMA) {
+        return serde_json::from_value(value).map_err(|error| error.to_string());
+    }
+    let catalogue: Catalogue = serde_json::from_value(value).map_err(|error| error.to_string())?;
+    if catalogue.history.repository != TEST_LEDGER_REPOSITORY
+        || catalogue.history.path != LEDGER_CELLS
+    {
+        return Err("catalogue names an unsupported history repository or path".into());
+    }
+    // This temporary shape is used ONLY by the existing selection ratchets.
+    // It is never returned as a history answer or serialized as observations.
+    Ok(TrackedCells {
+        schema: SCHEMA,
+        projection: None,
+        cells: catalogue
+            .cells
+            .into_iter()
+            .map(|cell| TrackedCell {
+                id: cell.id,
+                status: cell.status,
+                ci_disabled_reason: cell.not_selected_by_full_reason,
+                green_removal_reason: cell.green_removal_reason,
+                not_applicable_reason: cell.not_applicable_reason,
+                last_tested: None,
+                observations: Vec::new(),
+                measurement: default_measurement(),
+            })
+            .collect(),
+    })
+}
+
+fn catalogue_history_notice() -> &'static str {
+    "\n## Run history\n\nDetailed observations and the generated history website live in [hermit_test_ledger](https://github.com/rrnewton/hermit_test_ledger). This catalogue records selection and applicability, not whether a cell has been measured. Run `./ci/compat-envelope/scorecard.rs show` with the ledger checkout available to read history.\n"
+}
+
 /// Declares that `observations` are a DERIVED PROJECTION, not the source of
 /// truth, and records how stale that projection is.
 ///
@@ -207,6 +306,9 @@ struct ObservationProjection {
     /// Repository-relative path to the authoritative rows. Recorded so a stale
     /// projection can be re-derived without anyone having to remember.
     source: String,
+    /// Missing in historical projections: those commits belong to dev-hermit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_repository: Option<String>,
     /// A commit in the Git repository containing `source` whose JSONL shard
     /// population and bytes produced this projection.
     ///
@@ -2963,7 +3065,21 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let root = repo_root()?;
+    if matches!(
+        command.as_str(),
+        "observe-results"
+            | "import-results"
+            | "update-observations"
+            | "project-observations"
+            | "project-and-observe-results"
+            | "export-legacy"
+    ) && env::var_os("DEV_HERMIT_TEST_LEDGER_PUBLISH_LOCK_FD").is_none()
+        && !empty_observation_command(&command, env::args().skip(2).collect())?
+    {
+        return publish_history_command(&root, &command, args);
+    }
     match command.as_str() {
+        "export-legacy" => { no_more(&mut args)?; export_legacy_history(&root)?; }
         "show" => {
             no_more(&mut args)?;
             let derived = derive(&root)?;
@@ -3170,15 +3286,39 @@ fn repo_root() -> Result<PathBuf, String> {
     Ok(root)
 }
 
+fn manifest_tool_root() -> Result<&'static Path, String> {
+    let source = Path::new(file!());
+    if !source.is_absolute() {
+        return Err("scorecard helper source location is not absolute".into());
+    }
+    source
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or_else(|| "cannot locate the stable scorecard tool checkout".into())
+}
+
+fn manifest_target_dir(tool: &Path, configured: Option<&std::ffi::OsStr>) -> PathBuf {
+    configured
+        .map(PathBuf::from)
+        .unwrap_or_else(|| tool.join("target"))
+}
+
 fn derive(root: &Path) -> Result<Derived, String> {
+    let tool = manifest_tool_root()?;
     let output = Command::new("cargo")
         .args(["run", "--quiet", "-p", "hermit-manifest-plan"])
-        // This helper embeds its source root. Keep each checkout's executable
-        // separate even when parallel audits inherit one CARGO_TARGET_DIR.
-        // This intentionally overrides external targets for this helper only.
+        .arg("--manifest-path").arg(tool.join("Cargo.toml"))
+        // Immutable tool sources use the caller's standard mutable Cargo
+        // target. Direct callers retain the stable tool-local default; the
+        // measured checkout is always an explicit data input.
         .arg("--target-dir")
-        .arg(root.join("target"))
-        .args(["--", "--format", "matrix-json"])
+        .arg(manifest_target_dir(
+            tool,
+            env::var_os("CARGO_TARGET_DIR").as_deref(),
+        ))
+        .args(["--", "--root"]).arg(root)
+        .args(["--format", "matrix-json"])
         .current_dir(root)
         .output()
         .map_err(|e| format!("cannot run hermit-manifest-plan: {e}"))?;
@@ -4127,14 +4267,361 @@ fn enforce_writer_boundary(
     Ok(())
 }
 
-fn load_existing(root: &Path) -> Result<Option<TrackedCells>, String> {
+fn load_catalogue(root: &Path) -> Result<Option<TrackedCells>, String> {
     let path = root.join(CELLS);
     if !path.exists() {
         return Ok(None);
     }
-    let cells = read_json(&path)?;
+    let bytes =
+        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    decode_catalogue(&bytes).map(Some)
+}
+
+fn ledger_root(root: &Path, writing: bool) -> Result<PathBuf, String> {
+    let explicit = env::var_os("DEV_HERMIT_TEST_LEDGER_ROOT");
+    if writing && explicit.is_none() {
+        return Err("history writes require the parent ledger publisher; run ci-hub/series/mirror.py with this checkout and retained results (DEV_HERMIT_TEST_LEDGER_ROOT is unset)".into());
+    }
+    let candidate = explicit
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("DEV_HERMIT_PARENT")
+                .map(|parent| PathBuf::from(parent).join("hermit_test_ledger"))
+        })
+        .or_else(|| {
+            root.ancestors()
+                .map(|parent| parent.join("hermit_test_ledger"))
+                .find(|path| path.join(".git").exists())
+        })
+        .ok_or("history unavailable: the existing hermit_test_ledger checkout was not found")?;
+    let ledger = fs::canonicalize(&candidate)
+        .map_err(|error| format!("history unavailable at {}: {error}", candidate.display()))?;
+    let git = |args: &[&str]| -> Result<String, String> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&ledger)
+            .output()
+            .map_err(|error| format!("cannot inspect history repository: {error}"))?;
+        if !output.status.success() {
+            return Err("history unavailable: ledger Git identity could not be read".into());
+        }
+        String::from_utf8(output.stdout)
+            .map(|text| text.trim().into())
+            .map_err(|error| error.to_string())
+    };
+    if fs::canonicalize(git(&["rev-parse", "--show-toplevel"])?)
+        .map_err(|error| error.to_string())?
+        != ledger
+        // Repository identity is the configured URL. `remote get-url` expands
+        // transport-only insteadOf routing, including normal proxy routes.
+        || git(&["config", "--get", "remote.origin.url"])? != TEST_LEDGER_REPOSITORY
+    {
+        return Err("history repository is not the expected hermit_test_ledger checkout".into());
+    }
+    Ok(ledger)
+}
+
+fn load_existing(root: &Path) -> Result<Option<TrackedCells>, String> {
+    let path = ledger_root(root, false)?.join(LEDGER_CELLS);
+    let cells = read_json(&path).map_err(|error| format!("history unavailable: {error}"))?;
     validate_observation_identity_namespace(&cells)?;
     Ok(Some(cells))
+}
+
+/// Selection belongs to the current catalogue; observations belong to history.
+/// Retired cells remain in the ledger's existing Git history, never an
+/// uncommitted projection that a later writer could overwrite.
+fn reconcile_history_catalogue(root: &Path, history: &mut TrackedCells) -> Result<(), String> {
+    let catalogue = load_catalogue(root)?.ok_or("the source catalogue is unavailable")?;
+    let current_ids = catalogue
+        .cells
+        .iter()
+        .map(|cell| &cell.id)
+        .collect::<BTreeSet<_>>();
+    let previous_ids = history
+        .cells
+        .iter()
+        .map(|cell| &cell.id)
+        .collect::<BTreeSet<_>>();
+    if current_ids.len() != catalogue.cells.len() || previous_ids.len() != history.cells.len() {
+        return Err("catalogue reconciliation refuses duplicate cell identities".into());
+    }
+    let retired = previous_ids.difference(&current_ids).count();
+    if retired != 0 {
+        let ledger = ledger_root(root, true)?;
+        let current = fs::read(ledger.join(LEDGER_CELLS)).map_err(|error| error.to_string())?;
+        let committed = Command::new("git")
+            .args(["show", &format!("HEAD:{LEDGER_CELLS}")])
+            .current_dir(&ledger)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !committed.status.success() || committed.stdout != current {
+            return Err("catalogue reconciliation refuses to retire uncommitted history; publish the exact existing detailed document first".into());
+        }
+        println!(
+            "compatibility scorecard: retaining {retired} retired cell(s) in ledger commit {}",
+            git_head(&ledger)?
+        );
+    }
+    let unchanged = history.cells.len() == catalogue.cells.len()
+        && history
+            .cells
+            .iter()
+            .zip(&catalogue.cells)
+            .all(|(old, current)| {
+                old.id == current.id
+                    && old.status == current.status
+                    && old.ci_disabled_reason == current.ci_disabled_reason
+                    && old.green_removal_reason == current.green_removal_reason
+                    && old.not_applicable_reason == current.not_applicable_reason
+            });
+    if unchanged {
+        return Ok(());
+    }
+    let mut previous = std::mem::take(&mut history.cells)
+        .into_iter()
+        .map(|cell| (cell.id.clone(), cell))
+        .collect::<BTreeMap<_, _>>();
+    history.cells = catalogue
+        .cells
+        .into_iter()
+        .map(|mut current| {
+            if let Some(mut retained) = previous.remove(&current.id) {
+                retained.status = current.status;
+                retained.ci_disabled_reason = current.ci_disabled_reason;
+                retained.green_removal_reason = current.green_removal_reason;
+                retained.not_applicable_reason = current.not_applicable_reason;
+                retained
+            } else {
+                current.observations.clear();
+                current.last_tested = None;
+                current.measurement = default_measurement();
+                current
+            }
+        })
+        .collect();
+    Ok(())
+}
+
+fn history_files(root: &Path, writing: bool) -> Result<(PathBuf, PathBuf), String> {
+    let ledger = ledger_root(root, writing)?;
+    Ok((ledger.join(LEDGER_SCORECARD), ledger.join(LEDGER_CELLS)))
+}
+
+fn read_history_files(root: &Path) -> Result<GeneratedFiles, String> {
+    let (scorecard, cells) = history_files(root, false)?;
+    Ok(GeneratedFiles {
+        scorecard: fs::read(&scorecard)
+            .map_err(|error| format!("history unavailable at {}: {error}", scorecard.display()))?,
+        cells: fs::read(&cells)
+            .map_err(|error| format!("history unavailable at {}: {error}", cells.display()))?,
+    })
+}
+
+fn acquire_history_write_lock(root: &Path) -> Result<File, String> {
+    let ledger = ledger_root(root, true)?;
+    let fd: i32 = env::var("DEV_HERMIT_TEST_LEDGER_PUBLISH_LOCK_FD")
+        .map_err(|_| "history writes must run through the parent ledger publisher")?
+        .parse()
+        .map_err(|_| "invalid inherited ledger publication lock descriptor")?;
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        return Err("parent ledger publication lock is not open".into());
+    }
+    let inherited = unsafe { File::from_raw_fd(duplicate) };
+    let output = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(&ledger)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("cannot locate ledger publication lock".into());
+    }
+    let common = PathBuf::from(
+        String::from_utf8(output.stdout)
+            .map_err(|error| error.to_string())?
+            .trim(),
+    );
+    let contender = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(common.join("ci-hub-series-publication.lock"))
+        .map_err(|error| format!("cannot read parent ledger publication lock: {error}"))?;
+    let actual = inherited.metadata().map_err(|error| error.to_string())?;
+    let expected = contender.metadata().map_err(|error| error.to_string())?;
+    if actual.dev() != expected.dev() || actual.ino() != expected.ino() || !actual.is_file() {
+        return Err("inherited descriptor is not this ledger's publication lock".into());
+    }
+    match FileExt::try_lock_exclusive(&contender) {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            FileExt::try_lock_exclusive(&inherited).map_err(|error| {
+                format!("inherited descriptor does not own the publication lock: {error}")
+            })?;
+            Ok(inherited)
+        }
+        Ok(()) => {
+            FileExt::unlock(&contender).map_err(|error| error.to_string())?;
+            Err("ledger publication lock is not held by the parent".into())
+        }
+        Err(error) => Err(format!(
+            "cannot verify parent ledger publication lock: {error}"
+        )),
+    }
+}
+
+fn legacy_archive_identity(root: &Path, bytes: &[u8]) -> Result<(String, JsonValue), String> {
+    let changed = Command::new("git")
+        .args(["log", "-1", "--format=%H", "--", CELLS])
+        .current_dir(root)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !changed.status.success() {
+        return Err("cannot read legacy source commit".into());
+    }
+    let head = String::from_utf8(changed.stdout)
+        .map_err(|error| error.to_string())?
+        .trim()
+        .to_string();
+    let blob = git_rev_parse(root, &format!("HEAD:{CELLS}"))?;
+    let output = Command::new("git")
+        .args(["show", &format!("HEAD:{CELLS}")])
+        .current_dir(root)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() || output.stdout != bytes {
+        return Err("legacy export refuses changed catalogue bytes; preserve the current committed history first".into());
+    }
+    let cells: TrackedCells = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    validate_observation_identity_namespace(&cells)?;
+    let identity = serde_json::json!({
+        "repository": "https://github.com/rrnewton/hermit.git", "commit": head,
+        "path": CELLS, "blob": blob, "sha256": format!("{:x}", Sha256::digest(bytes)),
+        "bytes": bytes.len(), "cells": cells.cells.len(),
+        "observations": cells.cells.iter().map(|cell| cell.observations.len()).sum::<usize>(),
+    });
+    Ok((blob, identity))
+}
+
+fn preserve_exact_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => file
+            .write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if fs::read(path).map_err(|error| error.to_string())? == bytes {
+                Ok(())
+            } else {
+                Err(format!(
+                    "legacy identity conflict at {}; existing bytes were preserved",
+                    path.display()
+                ))
+            }
+        }
+        Err(error) => Err(format!("cannot preserve {}: {error}", path.display())),
+    }
+}
+
+fn export_legacy_history(root: &Path) -> Result<(), String> {
+    let _lock = acquire_history_write_lock(root)?;
+    let bytes = fs::read(root.join(CELLS)).map_err(|error| error.to_string())?;
+    let (blob, identity) = legacy_archive_identity(root, &bytes)?;
+    let ledger = ledger_root(root, true)?;
+    let directory = ledger.join("scorecard/legacy");
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    // The original document is copied byte-for-byte, not decoded and rewritten.
+    preserve_exact_file(&directory.join(format!("{blob}.json")), &bytes)?;
+    let metadata = serde_json::to_vec_pretty(&identity).map_err(|error| error.to_string())?;
+    preserve_exact_file(&directory.join(format!("{blob}.identity.json")), &metadata)?;
+    println!(
+        "preserved exact legacy cells {blob}: {} bytes, {} observations; Hermit files unchanged",
+        bytes.len(),
+        identity["observations"]
+    );
+    Ok(())
+}
+
+fn require_legacy_archive_before_trim(root: &Path) -> Result<(), String> {
+    let path = root.join(CELLS);
+    if !path.exists() {
+        return Ok(());
+    }
+    let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+    let value: JsonValue = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if value.get("schema").and_then(JsonValue::as_u64) == Some(CATALOGUE_SCHEMA) {
+        return Ok(());
+    }
+    let (blob, identity) = legacy_archive_identity(root, &bytes)?;
+    let ledger = ledger_root(root, false)?;
+    for (path, expected) in [
+        (format!("scorecard/legacy/{blob}.json"), bytes),
+        (
+            format!("scorecard/legacy/{blob}.identity.json"),
+            serde_json::to_vec_pretty(&identity).map_err(|error| error.to_string())?,
+        ),
+    ] {
+        let output = Command::new("git")
+            .args(["show", &format!("HEAD:{path}")])
+            .current_dir(&ledger)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() || output.stdout != expected {
+            return Err(format!(
+                "catalogue trim requires the exact committed ledger archive {path}; run export-legacy through the parent publisher first"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn empty_observation_command(command: &str, arguments: Vec<String>) -> Result<bool, String> {
+    if command != "observe-results" || arguments.len() != 2 || arguments[0] != "--results" {
+        return Ok(false);
+    }
+    let results = Path::new(&arguments[1]);
+    if !results.is_dir() {
+        return Ok(false);
+    }
+    let mut files = Vec::new();
+    find_result_files(results, &mut files)?;
+    Ok(files.is_empty())
+}
+
+fn publish_history_command(
+    root: &Path,
+    command: &str,
+    arguments: impl Iterator<Item = String>,
+) -> Result<(), String> {
+    let parent = env::var_os("DEV_HERMIT_PARENT").map(PathBuf::from).or_else(|| {
+        root.ancestors().find(|parent| parent.join("ci-hub/series/mirror.py").is_file()).map(Path::to_path_buf)
+    }).ok_or("history publication unavailable: set DEV_HERMIT_PARENT to the existing dev-hermit workspace; retained inputs were not changed")?;
+    let tool = env::var_os("DEV_HERMIT_TOOL_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| parent.clone());
+    let mut child = Command::new("python3");
+    child
+        .arg(tool.join("ci-hub/series/mirror.py"))
+        .arg("--parent")
+        .arg(&parent)
+        .arg("--source-checkout")
+        .arg(root)
+        .arg("--target")
+        .arg(git_head(root)?)
+        .arg("--scorecard-command")
+        .arg(command);
+    for argument in arguments {
+        child.arg(format!("--scorecard-arg={argument}"));
+    }
+    let status = child
+        .current_dir(root)
+        .status()
+        .map_err(|error| format!("cannot invoke ledger publisher: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "ledger publisher refused with {status}; retained inputs were not changed"
+        ));
+    }
+    Ok(())
 }
 
 fn encoded_cells(cells: &TrackedCells) -> Result<String, String> {
@@ -4175,9 +4662,9 @@ fn encoded_cells(cells: &TrackedCells) -> Result<String, String> {
                 .collect();
         }
     }
-    // Retained observations must fit the repository's per-file size limit.
-    // Compact typed serialization preserves every field and its order while
-    // removing only JSON formatting whitespace.
+    // Detailed observations belong to the ledger repository. The Hermit
+    // catalogue uses encoded_catalogue instead; compacting history is not a
+    // substitute for keeping it out of the implementation repository.
     let mut text = serde_json::to_string(&normalised)
         .map_err(|e| format!("cannot serialize tracked cells: {e}"))?;
     text.push('\n');
@@ -4218,8 +4705,7 @@ fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
         .args([
             "rev-parse",
             "--path-format=absolute",
-            "--git-path",
-            "scorecard-writeback.lock",
+            "--git-common-dir",
         ])
         .current_dir(root)
         .output()
@@ -4231,7 +4717,7 @@ fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
         std::str::from_utf8(&output.stdout)
             .map_err(|e| format!("scorecard write-back lock path is not UTF-8: {e}"))?
             .trim(),
-    );
+    ).join("scorecard-writeback.lock");
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -4321,7 +4807,7 @@ fn check_tracked(root: &Path) -> Result<Derived, String> {
     // nowhere in the message the operator actually saw. Deleting a cell already reported its own
     // cause correctly, because that path has no SCORECARD.md difference to mask it -- which is
     // why this looked intermittent rather than ordered.
-    let mut cells = tracked_from(&derived, load_existing(root)?, None, false)?;
+    let mut cells = tracked_from(&derived, load_catalogue(root)?, None, false)?;
     // The WRITE path applies this before serialising (see `update_tracked`), so the READ path
     // must too or the two derive different bytes from the same inputs and `check` reports a
     // staleness that `update` cannot clear. Measured 2026-08-25: `update` was a fixed point --
@@ -4331,13 +4817,29 @@ fn check_tracked(root: &Path) -> Result<Derived, String> {
     // run. The asymmetry only became reachable once observations were non-empty for the first
     // time, which is why it appeared tonight rather than when it was introduced.
     refresh_measurement(&mut cells);
-    let expected_scorecard = format!(
-        "{}{}",
-        render_scorecard(&derived),
-        render_measurement_section(&cells)
-    );
-    compare_file(&root.join(SCORECARD), &expected_scorecard)?;
-    compare_file(&root.join(CELLS), &encoded_cells(&cells)?)?;
+    let raw: JsonValue = read_json(&root.join(CELLS))?;
+    if raw.get("schema").and_then(JsonValue::as_u64) == Some(CATALOGUE_SCHEMA) {
+        compare_file(
+            &root.join(SCORECARD),
+            &format!(
+                "{}{}",
+                render_scorecard(&derived),
+                catalogue_history_notice()
+            ),
+        )?;
+        compare_file(&root.join(CELLS), &encoded_catalogue(&cells)?)?;
+    } else {
+        // Read the old checked-in generation until its exact archive is verified.
+        compare_file(
+            &root.join(SCORECARD),
+            &format!(
+                "{}{}",
+                render_scorecard(&derived),
+                render_measurement_section(&cells)
+            ),
+        )?;
+        compare_file(&root.join(CELLS), &encoded_cells(&cells)?)?;
+    }
     Ok(derived)
 }
 
@@ -4363,7 +4865,7 @@ fn update_tracked(
     allow_cell_removal: bool,
 ) -> Result<(), String> {
     let derived = derive(root)?;
-    let existing = load_existing(root)?;
+    let existing = load_catalogue(root)?;
     let mut cells = tracked_from(
         &derived,
         existing.clone(),
@@ -4374,14 +4876,15 @@ fn update_tracked(
     if let Some(before) = existing.as_ref() {
         enforce_writer_boundary(before, &cells, Writer::Update)?;
     }
+    require_legacy_archive_before_trim(root)?;
     let scorecard = format!(
         "{}{}",
         render_scorecard(&derived),
-        render_measurement_section(&cells)
+        catalogue_history_notice()
     );
     fs::write(root.join(SCORECARD), scorecard)
         .map_err(|e| format!("cannot write {SCORECARD}: {e}"))?;
-    fs::write(root.join(CELLS), encoded_cells(&cells)?)
+    fs::write(root.join(CELLS), encoded_catalogue(&cells)?)
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
     // NOT APPLICABLE IS REPORTED SEPARATELY, NOT FOLDED INTO RED. This line is
     // the number people quote; leaving it as "population minus green" is exactly
@@ -5497,7 +6000,6 @@ fn apply_validate_results_from(
 }
 
 fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
-    let _lock = acquire_scorecard_write_lock(root)?;
     let head = git_head(root)?;
     if !results.is_dir() {
         return Err(format!(
@@ -5515,8 +6017,9 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
         println!("compatibility scorecard: generated files unchanged");
         return Ok(());
     }
+    let _lock = acquire_history_write_lock(root)?;
     check_observation_worktree(root)?;
-    let original = read_generated_files(root)?;
+    let original = read_history_files(root)?;
     let derived = check_tracked(root)?;
     let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
     let rows = read_result_candidates(results, &head)?;
@@ -5529,6 +6032,7 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     }
     let mut tracked: TrackedCells = serde_json::from_slice(&original.cells)
         .map_err(|e| format!("cannot parse tracked {CELLS}: {e}"))?;
+    reconcile_history_catalogue(root, &mut tracked)?;
     let before = tracked.clone();
     let fold = apply_validate_results_from(
         &mut tracked,
@@ -5550,7 +6054,7 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     let transitions = measurement_transitions(root, &before, &tracked, &head)?;
     let updated = generated_files(&derived, &tracked)?;
-    let changed = replace_generated_files_with(
+    let changed = replace_history_files_with(
         root,
         &original,
         &updated,
@@ -5562,7 +6066,7 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
                     "HEAD moved from {head} to {current_head} during write-back"
                 ));
             }
-            if read_generated_files(root)? != original {
+            if read_history_files(root)? != original {
                 return Err("the generated scorecard files changed during write-back".into());
             }
             Ok(())
@@ -5630,6 +6134,7 @@ fn import_results(
     results: &Path,
     current_summaries: &[PathBuf],
 ) -> Result<(), String> {
+    let _lock = acquire_history_write_lock(root)?;
     let status = Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=no"])
         .current_dir(root)
@@ -5651,8 +6156,9 @@ fn import_results(
         ));
     }
 
-    let derived = derive(root)?;
-    let before = load_existing(root)?.ok_or("tracked cell file does not exist")?;
+    let derived = check_tracked(root)?;
+    let mut before = load_existing(root)?.ok_or("tracked cell file does not exist")?;
+    reconcile_history_catalogue(root, &mut before)?;
     if before.cells.len() != derived.population.len() {
         return Err(format!(
             "tracked population is {}, derived population is {}; run update before importing",
@@ -5825,15 +6331,7 @@ fn import_results(
     let resolution_head = git_head(root)?;
     let transitions = measurement_transitions(root, &before, &tracked, &resolution_head)?;
 
-    let scorecard = format!(
-        "{}{}",
-        render_scorecard(&derived),
-        render_measurement_section(&tracked)
-    );
-    fs::write(root.join(SCORECARD), scorecard)
-        .map_err(|e| format!("cannot write {SCORECARD}: {e}"))?;
-    fs::write(root.join(CELLS), encoded_cells(&tracked)?)
-        .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
+    write_observation_files(root, &derived, &tracked)?;
 
     println!(
         "compatibility scorecard: found {} eligible cell(s) with {} ordinary terminal or backend-parity attempt comparison(s) in {} retained results.jsonl file(s) containing {} row(s); imported {} retained row(s) and {} current pressure row(s); no guest was executed",
@@ -6069,6 +6567,7 @@ fn update_observations(
     summary_paths: &[PathBuf],
     retained: bool,
 ) -> Result<(), String> {
+    let _lock = acquire_history_write_lock(root)?;
     let derived = check_tracked(root)?;
     let status = Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=no"])
@@ -6089,6 +6588,7 @@ fn update_observations(
     let head = git_head(root)?;
     let head_detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
+    reconcile_history_catalogue(root, &mut tracked)?;
     let before = tracked.clone();
     let mut changed_cells = BTreeSet::new();
     let mut total_rows = 0usize;
@@ -6192,14 +6692,22 @@ fn update_observations(
 /// `test/mode/backend` identity. Retained validate history uses a different
 /// input path; the import and this projection preserve one another's evidence.
 fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> Result<(), String> {
+    let _lock = acquire_history_write_lock(root)?;
     let derived = check_tracked(root)?;
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
+    reconcile_history_catalogue(root, &mut tracked)?;
     let before = tracked.clone();
 
     // Resolve and verify the source once, then parse only the captured commit
     // bytes. A later worktree mutation cannot change the rows while leaving the
     // recorded commit behind.
     let snapshot = snapshot_series_source(series_root)?;
+    if snapshot.source_repository.as_deref() != Some(TEST_LEDGER_REPOSITORY) {
+        return Err(
+            "new observation projections must read the existing hermit_test_ledger repository"
+                .into(),
+        );
+    }
     let rows = read_series_rows(&snapshot)?;
     let projection = apply_series_rows(root, &mut tracked, &rows, Some(&snapshot.source))?;
     let skipped = &projection.skipped;
@@ -6208,6 +6716,7 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
     tracked.schema = SCHEMA;
     tracked.projection = Some(ObservationProjection {
         source: snapshot.source.clone(),
+        source_repository: snapshot.source_repository.clone(),
         source_commit: Some(snapshot.source_commit.clone()),
         source_tree: Some(snapshot.source_tree.clone()),
         refreshed_at: refreshed_at.to_string(),
@@ -6265,7 +6774,7 @@ fn verify_combined_write_state(
             "HEAD moved from {expected_head} to {current_head} during combined scorecard write-back"
         ));
     }
-    let current = read_generated_files(root)?;
+    let current = read_history_files(root)?;
     if current.scorecard != expected_scorecard {
         return Err(format!(
             "{SCORECARD} changed during combined scorecard write-back"
@@ -6327,7 +6836,7 @@ where
         ));
     }
 
-    let _lock = acquire_scorecard_write_lock(root)?;
+    let _lock = acquire_history_write_lock(root)?;
     let head = git_head(root)?;
     if head != expected_head {
         return Err(format!(
@@ -6335,7 +6844,7 @@ where
         ));
     }
     check_observation_worktree(root)?;
-    let original = read_generated_files(root)?;
+    let original = read_history_files(root)?;
     let derived = check_tracked(root)?;
     let snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
     let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
@@ -6344,6 +6853,7 @@ where
 
     let mut tracked: TrackedCells = serde_json::from_slice(&original.cells)
         .map_err(|error| format!("cannot parse tracked {CELLS}: {error}"))?;
+    reconcile_history_catalogue(root, &mut tracked)?;
     let before = tracked.clone();
     // Validate current inputs on a private copy before either projection can
     // encounter the old compact run matcher. Reconcile the complete snapshot
@@ -6394,6 +6904,7 @@ where
     tracked.schema = SCHEMA;
     tracked.projection = Some(ObservationProjection {
         source: snapshot.snapshot.source.path.clone(),
+        source_repository: snapshot.snapshot.source.repository.clone(),
         source_commit: Some(snapshot.snapshot.source.commit.clone()),
         source_tree: Some(snapshot.snapshot.source.tree.clone()),
         refreshed_at: refreshed_at.to_string(),
@@ -6442,6 +6953,7 @@ where
     )?;
     tracked.projection = Some(ObservationProjection {
         source: snapshot.snapshot.source.path.clone(),
+        source_repository: snapshot.snapshot.source.repository.clone(),
         source_commit: Some(snapshot.snapshot.source.commit.clone()),
         source_tree: Some(snapshot.snapshot.source.tree.clone()),
         refreshed_at: refreshed_at.to_string(),
@@ -6458,7 +6970,7 @@ where
     let updated = generated_files(&derived, &tracked)?;
     let partial_scorecard = updated.scorecard.clone();
 
-    let changed = replace_generated_files_with(
+    let changed = replace_history_files_with(
         root,
         &original,
         &updated,
@@ -6534,12 +7046,33 @@ fn write_observation_files(
     derived: &Derived,
     tracked: &TrackedCells,
 ) -> Result<(), String> {
+    let original = read_history_files(root)?;
     let generated = generated_files(derived, tracked)?;
-    fs::write(root.join(SCORECARD), generated.scorecard)
-        .map_err(|e| format!("cannot write {SCORECARD}: {e}"))?;
-    fs::write(root.join(CELLS), generated.cells)
-        .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
+    replace_history_files_with(
+        root,
+        &original,
+        &generated,
+        || {
+            if read_history_files(root)? == original {
+                Ok(())
+            } else {
+                Err("ledger history changed during update".into())
+            }
+        },
+        |_| Ok(()),
+    )?;
     Ok(())
+}
+
+fn replace_history_files_with(
+    root: &Path,
+    original: &GeneratedFiles,
+    updated: &GeneratedFiles,
+    guard: impl FnOnce() -> Result<(), String>,
+    before_replace: impl FnMut(usize) -> Result<(), String>,
+) -> Result<bool, String> {
+    let (scorecard, cells) = history_files(root, true)?;
+    replace_generated_paths_with(&scorecard, &cells, original, updated, guard, before_replace)
 }
 
 fn prepared_replacement(path: &Path, bytes: &[u8]) -> Result<NamedTempFile, String> {
@@ -6559,30 +7092,46 @@ fn replace_generated_files_with(
     original: &GeneratedFiles,
     updated: &GeneratedFiles,
     guard: impl FnOnce() -> Result<(), String>,
+    before_replace: impl FnMut(usize) -> Result<(), String>,
+) -> Result<bool, String> {
+    replace_generated_paths_with(
+        &root.join(SCORECARD),
+        &root.join(CELLS),
+        original,
+        updated,
+        guard,
+        before_replace,
+    )
+}
+
+fn replace_generated_paths_with(
+    scorecard: &Path,
+    cells: &Path,
+    original: &GeneratedFiles,
+    updated: &GeneratedFiles,
+    guard: impl FnOnce() -> Result<(), String>,
     mut before_replace: impl FnMut(usize) -> Result<(), String>,
 ) -> Result<bool, String> {
     if original == updated {
         guard()?;
         return Ok(false);
     }
-    let scorecard = root.join(SCORECARD);
-    let cells = root.join(CELLS);
-    let new_scorecard = prepared_replacement(&scorecard, &updated.scorecard)?;
-    let old_scorecard = prepared_replacement(&scorecard, &original.scorecard)?;
-    let new_cells = prepared_replacement(&cells, &updated.cells)?;
+    let new_scorecard = prepared_replacement(scorecard, &updated.scorecard)?;
+    let old_scorecard = prepared_replacement(scorecard, &original.scorecard)?;
+    let new_cells = prepared_replacement(cells, &updated.cells)?;
     guard()?;
     before_replace(1)?;
     new_scorecard
-        .persist(&scorecard)
+        .persist(scorecard)
         .map_err(|e| format!("cannot replace {SCORECARD}: {}", e.error))?;
     let second = before_replace(2).and_then(|()| {
         new_cells
-            .persist(&cells)
+            .persist(cells)
             .map(|_| ())
             .map_err(|e| format!("cannot replace {CELLS}: {}", e.error))
     });
     if let Err(error) = second {
-        return match old_scorecard.persist(&scorecard) {
+        return match old_scorecard.persist(scorecard) {
             Ok(_) => Err(format!("{error}; restored the original generated files")),
             Err(rollback) => {
                 let rollback_error = rollback.error;
@@ -7129,6 +7678,15 @@ where
 }
 
 fn validate_observation_identity_namespace(cells: &TrackedCells) -> Result<(), String> {
+    if cells
+        .projection
+        .as_ref()
+        .and_then(|projection| projection.source_repository.as_deref())
+        .is_some_and(|repository| repository != TEST_LEDGER_REPOSITORY)
+    {
+        return Err("unsupported history projection source repository".into());
+    }
+
     let permits_projected_identity = cells.schema >= 7
         && cells.projection.as_ref().is_some_and(|projection| {
             projection.source_commit.is_some() && projection.source_tree.is_some()
@@ -7813,6 +8371,7 @@ fn apply_series_rows_inner(
 #[derive(Debug)]
 struct SeriesSourceSnapshot {
     source: String,
+    source_repository: Option<String>,
     source_commit: String,
     source_tree: String,
     shards: Vec<SeriesSourceShard>,
@@ -7837,6 +8396,9 @@ struct ScorecardSeriesSnapshot {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScorecardSeriesSnapshotSource {
+    /// Missing only in historical snapshots, where commit/tree belong to dev-hermit.
+    #[serde(default)]
+    repository: Option<String>,
     path: String,
     commit: String,
     tree: String,
@@ -8072,7 +8634,9 @@ fn validate_scorecard_snapshot(
             snapshot.schema
         ));
     }
-    if snapshot.source.path != SCORECARD_SERIES_SNAPSHOT_SOURCE
+    if snapshot.source.repository.as_deref().is_some_and(|repository| {
+        repository != TEST_LEDGER_REPOSITORY
+    }) || snapshot.source.path != SCORECARD_SERIES_SNAPSHOT_SOURCE
         || !is_object_id(&snapshot.source.commit)
         || !is_object_id(&snapshot.source.tree)
     {
@@ -8627,7 +9191,20 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
             bytes: committed.stdout,
         });
     }
+    let origin = Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(&repository)
+        .output()
+        .map_err(|error| error.to_string())?;
+    let source_repository = if origin.status.success()
+        && String::from_utf8_lossy(&origin.stdout).trim() == TEST_LEDGER_REPOSITORY
+    {
+        Some(TEST_LEDGER_REPOSITORY.into())
+    } else {
+        None
+    };
     Ok(SeriesSourceSnapshot {
+        source_repository,
         source,
         source_commit,
         source_tree,
@@ -8726,10 +9303,7 @@ fn verify_results(root: &Path, result_root: &Path, lanes: &BTreeSet<String>) -> 
     }
 
     print!("{}", render_scorecard(&derived));
-    if let Some(mut tracked) = load_existing(root)? {
-        refresh_measurement(&mut tracked);
-        print!("{}", render_measurement_section(&tracked));
-    }
+    print!("{}", catalogue_history_notice());
     let green_checked = expected
         .iter()
         .filter(|id| derived.green.contains(*id))
@@ -10163,6 +10737,44 @@ fn recorded_shell_quote(value: &str) -> String {
         value.into()
     } else {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+struct HistoryFixtureEnvironment {
+    previous: [Option<std::ffi::OsString>; 2],
+}
+
+impl HistoryFixtureEnvironment {
+    fn set(root: &Path, fd: i32) -> Self {
+        let previous = [
+            env::var_os("DEV_HERMIT_TEST_LEDGER_ROOT"),
+            env::var_os("DEV_HERMIT_TEST_LEDGER_PUBLISH_LOCK_FD"),
+        ];
+        unsafe {
+            env::set_var("DEV_HERMIT_TEST_LEDGER_ROOT", root);
+            env::set_var("DEV_HERMIT_TEST_LEDGER_PUBLISH_LOCK_FD", fd.to_string());
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for HistoryFixtureEnvironment {
+    fn drop(&mut self) {
+        for (key, previous) in [
+            "DEV_HERMIT_TEST_LEDGER_ROOT",
+            "DEV_HERMIT_TEST_LEDGER_PUBLISH_LOCK_FD",
+        ]
+        .into_iter()
+        .zip(&self.previous)
+        {
+            unsafe {
+                if let Some(value) = previous {
+                    env::set_var(key, value);
+                } else {
+                    env::remove_var(key);
+                }
+            }
+        }
     }
 }
 
@@ -13077,7 +13689,11 @@ fn self_test() -> Result<(), String> {
     // invocation. The comparison below checks retained bytes, not the identity
     // of every concurrently executing process.
     derive(&command_root)?;
-    let command_helper = command_root.join("target/debug/hermit-manifest-plan");
+    let command_helper = manifest_target_dir(
+        manifest_tool_root()?,
+        env::var_os("CARGO_TARGET_DIR").as_deref(),
+    )
+    .join("debug/hermit-manifest-plan");
     let helper_sha256 = |path: &Path| -> Result<String, String> {
         let bytes = fs::read(path)
             .map_err(|error| format!("cannot read manifest helper {}: {error}", path.display()))?;
@@ -13127,15 +13743,29 @@ fn self_test() -> Result<(), String> {
             String::from_utf8_lossy(&clone.stderr).trim()
         ));
     }
-    // The clone contains committed data, while the executable may contain an
-    // uncommitted serialization change. Encode the fixture with this writer
-    // before recording its baseline; the command must still require exact bytes.
-    let fixture_cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    // Exercise the actual split: the source clone has the complete catalogue,
+    // while its separate ledger retains ALL existing observations. Copying the
+    // bulk history into both would test the obsolete layout and spend each
+    // bounded child interval decoding it twice. No history assertion or input
+    // is removed, and the real five-second snapshot controls remain unchanged.
+    let fixture_cells =
+        load_catalogue(&result_command_root)?.ok_or("result-command fixture has no catalogue")?;
+    let fixture_derived = derive(&result_command_root)?;
+    let fixture_history = generated_files(&fixture_derived, &fixture_cells)?;
     fs::write(
         result_command_root.join(CELLS),
-        encoded_cells(&fixture_cells)?,
+        encoded_catalogue(&fixture_cells)?,
     )
     .map_err(|e| format!("cannot encode result-command fixture cells: {e}"))?;
+    fs::write(
+        result_command_root.join(SCORECARD),
+        format!(
+            "{}{}",
+            render_scorecard(&fixture_derived),
+            catalogue_history_notice()
+        ),
+    )
+    .map_err(|e| format!("cannot encode result-command fixture catalogue table: {e}"))?;
     let git_ok = |repo: &Path, args: &[&str]| -> Result<(), String> {
         let status = Command::new("git")
             .args(args)
@@ -13180,6 +13810,36 @@ fn self_test() -> Result<(), String> {
         ));
     }
 
+    let fixture_ledger = result_command_fixture.path().join("ledger");
+    fs::create_dir(&fixture_ledger).map_err(|error| error.to_string())?;
+    git_ok(&fixture_ledger, &["init", "--quiet"])?;
+    git_ok(
+        &fixture_ledger,
+        &["remote", "add", "origin", TEST_LEDGER_REPOSITORY],
+    )?;
+    fs::create_dir(fixture_ledger.join("scorecard")).map_err(|error| error.to_string())?;
+    fs::write(fixture_ledger.join(LEDGER_CELLS), &fixture_history.cells)
+        .map_err(|error| error.to_string())?;
+    fs::write(
+        fixture_ledger.join(LEDGER_SCORECARD),
+        &fixture_history.scorecard,
+    )
+    .map_err(|error| error.to_string())?;
+    let publication_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(fixture_ledger.join(".git/ci-hub-series-publication.lock"))
+        .map_err(|error| error.to_string())?;
+    FileExt::lock_exclusive(&publication_lock).map_err(|error| error.to_string())?;
+    use std::os::fd::AsRawFd;
+    let publication_fd = publication_lock.as_raw_fd();
+    if unsafe { libc::fcntl(publication_fd, libc::F_SETFD, 0) } < 0 {
+        return Err("cannot inherit fixture publication lock".into());
+    }
+    // self-test is a single-threaded CLI. Restore its prior environment on exit.
+    let _history_environment = HistoryFixtureEnvironment::set(&fixture_ledger, publication_fd);
+
     // Give the clone an unrelated sibling Reverie history. Its HEAD is not the
     // pin recorded by this Hermit revision, so it must be omitted rather than
     // substituted. Advancing it after the first write must not change metadata
@@ -13205,7 +13865,7 @@ fn self_test() -> Result<(), String> {
         )
     };
     commit("recorded")?;
-    let result_command_before = read_generated_files(&result_command_root)?;
+    let result_command_before = read_history_files(&result_command_root)?;
     let fixture_head = git_head(&result_command_root)?;
     let fixture_detcore_tree = git_rev_parse(&result_command_root, "HEAD:detcore")?;
     let replay_id = CellId {
@@ -13260,7 +13920,7 @@ fn self_test() -> Result<(), String> {
             .args([command, "--results"])
             .arg(&result_root)
             // Reproduce the shared target inherited by the parallel audits.
-            // The common derive boundary must still select the clone's target.
+            // The helper must still read the clone's explicit data root.
             .env("CARGO_TARGET_DIR", command_root.join("target"))
             .current_dir(&result_command_root);
         if let Some(summary) = summary {
@@ -13268,16 +13928,16 @@ fn self_test() -> Result<(), String> {
         }
         child.output().map_err(|e| e.to_string())
     };
-    let require_separate_clone_helper = || -> Result<(), String> {
-        let clone_helper = result_command_root.join("target/debug/hermit-manifest-plan");
-        let clone_sha256 = helper_sha256(&clone_helper)?;
-        if helper_sha256(&command_helper)? != command_helper_before {
-            return Err("clone manifest generation changed the real checkout helper bytes".into());
+    let require_shared_clone_helper = || -> Result<(), String> {
+        if result_command_root
+            .join("target/debug/hermit-manifest-plan")
+            .exists()
+        {
+            return Err("clone observation write created a duplicate manifest helper".into());
         }
-        eprintln!(
-            "scorecard clone manifest helper: {} sha256={clone_sha256}; real helper sha256={command_helper_before} unchanged",
-            clone_helper.display()
-        );
+        if helper_sha256(&command_helper)? != command_helper_before {
+            return Err("clone manifest generation changed the stable helper bytes".into());
+        }
         Ok(())
     };
     let has_current_replay = |cells: &TrackedCells| {
@@ -13293,12 +13953,12 @@ fn self_test() -> Result<(), String> {
     };
     let restore_generated = || -> Result<(), String> {
         fs::write(
-            result_command_root.join(SCORECARD),
+            fixture_ledger.join(LEDGER_SCORECARD),
             &result_command_before.scorecard,
         )
         .and_then(|()| {
             fs::write(
-                result_command_root.join(CELLS),
+                fixture_ledger.join(LEDGER_CELLS),
                 &result_command_before.cells,
             )
         })
@@ -13308,22 +13968,22 @@ fn self_test() -> Result<(), String> {
     write_result_row(&replay_row)?;
     let observe_output = run_result_command("observe-results", None)?;
     if !observe_output.status.success()
-        || !has_current_replay(&read_json(&result_command_root.join(CELLS))?)
+        || !has_current_replay(&read_json(&fixture_ledger.join(LEDGER_CELLS))?)
     {
         return Err(format!(
             "observe-results did not admit canonical replay evidence with real time: {:?}",
             String::from_utf8_lossy(&observe_output.stderr)
         ));
     }
-    require_separate_clone_helper()?;
-    let first_observe = read_generated_files(&result_command_root)?;
+    require_shared_clone_helper()?;
+    let first_observe = read_history_files(&result_command_root)?;
     fs::write(reverie_root.join("fixture"), "advanced\n").map_err(|e| e.to_string())?;
     commit("advance sibling")?;
     let repeated = run_result_command("observe-results", None)?;
     if !repeated.status.success()
         || !String::from_utf8_lossy(&repeated.stdout)
             .contains("compatibility scorecard: generated files unchanged")
-        || read_generated_files(&result_command_root)? != first_observe
+        || read_history_files(&result_command_root)? != first_observe
     {
         return Err(
             "identical observe-results input changed after the sibling Reverie HEAD advanced"
@@ -13336,7 +13996,7 @@ fn self_test() -> Result<(), String> {
     // This is deliberately dormant: the production callers continue to use
     // their existing commands until the parent snapshot provider lands. The
     // self-test exercises the new command's actual transaction boundary.
-    let mut combined_baseline_cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    let mut combined_baseline_cells: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
     for cell in &mut combined_baseline_cells.cells {
         cell.observations.clear();
         cell.last_tested = None;
@@ -13344,20 +14004,20 @@ fn self_test() -> Result<(), String> {
     combined_baseline_cells.projection = None;
     refresh_measurement(&mut combined_baseline_cells);
     let combined_derived = derive(&result_command_root)?;
-    require_separate_clone_helper()?;
+    require_shared_clone_helper()?;
     let combined_baseline = generated_files(&combined_derived, &combined_baseline_cells)?;
     fs::write(
-        result_command_root.join(SCORECARD),
+        fixture_ledger.join(LEDGER_SCORECARD),
         &combined_baseline.scorecard,
     )
-    .and_then(|()| fs::write(result_command_root.join(CELLS), &combined_baseline.cells))
+    .and_then(|()| fs::write(fixture_ledger.join(LEDGER_CELLS), &combined_baseline.cells))
     .map_err(|error| format!("cannot write combined transaction baseline: {error}"))?;
     let restore_combined_baseline = || -> Result<(), String> {
         fs::write(
-            result_command_root.join(SCORECARD),
+            fixture_ledger.join(LEDGER_SCORECARD),
             &combined_baseline.scorecard,
         )
-        .and_then(|()| fs::write(result_command_root.join(CELLS), &combined_baseline.cells))
+        .and_then(|()| fs::write(fixture_ledger.join(LEDGER_CELLS), &combined_baseline.cells))
         .map_err(|error| error.to_string())
     };
     let snapshot_root = result_command_fixture.path().join("scorecard-snapshots");
@@ -13403,7 +14063,8 @@ fn self_test() -> Result<(), String> {
                     let killed = child.kill();
                     let reaped = child.wait();
                     return Err(format!(
-                        "snapshot command control did not complete: {status:?}; kill={killed:?}; reap={reaped:?}"
+                        "snapshot command control {} did not complete: {status:?}; kill={killed:?}; reap={reaped:?}",
+                        path.display()
                     ));
                 }
             }
@@ -13425,7 +14086,7 @@ fn self_test() -> Result<(), String> {
     let fifo_output = run_snapshot_command(&fifo_snapshot_path, &empty_snapshot_sha)?;
     if fifo_output.status.code() != Some(2)
         || !String::from_utf8_lossy(&fifo_output.stderr).contains("not a regular file")
-        || read_generated_files(&result_command_root)? != combined_baseline
+        || read_history_files(&result_command_root)? != combined_baseline
     {
         return Err(format!(
             "snapshot FIFO was not refused without changing the generated pair: status={} stderr={:?}",
@@ -13441,7 +14102,7 @@ fn self_test() -> Result<(), String> {
         &empty_snapshot_value,
     )?;
     let bare_output = run_snapshot_command(bare_snapshot_path, &bare_snapshot_sha)?;
-    let bare_written: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    let bare_written: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
     if !bare_output.status.success()
         || !has_current_replay(&bare_written)
         || bare_written
@@ -13672,7 +14333,7 @@ fn self_test() -> Result<(), String> {
         &fixture_head,
         "fixture-refresh",
     )?;
-    let before_publication: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    let before_publication: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
     let count_run_representations =
         |cells: &TrackedCells, id: &CellId, run_id: &str, event_id: &str| {
             cells
@@ -13722,7 +14383,7 @@ fn self_test() -> Result<(), String> {
         &fixture_head,
         "fixture-refresh",
     )?;
-    let after_publication: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    let after_publication: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
     if count_current_result(&after_publication) != 1
         || after_publication
             .projection
@@ -13738,7 +14399,7 @@ fn self_test() -> Result<(), String> {
                 .into(),
         );
     }
-    let stable_publication = read_generated_files(&result_command_root)?;
+    let stable_publication = read_history_files(&result_command_root)?;
     project_and_observe_results(
         &result_command_root,
         &row_snapshot_path,
@@ -13747,7 +14408,7 @@ fn self_test() -> Result<(), String> {
         &fixture_head,
         "fixture-refresh",
     )?;
-    if read_generated_files(&result_command_root)? != stable_publication {
+    if read_history_files(&result_command_root)? != stable_publication {
         return Err("repeating the same combined transaction changed its generated pair".into());
     }
 
@@ -13763,7 +14424,8 @@ fn self_test() -> Result<(), String> {
         &fixture_head,
         "fixture-refresh",
     )?;
-    let first_write_with_published_row: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    let first_write_with_published_row: TrackedCells =
+        read_json(&fixture_ledger.join(LEDGER_CELLS))?;
     if count_current_result(&first_write_with_published_row) != 1
         || first_write_with_published_row
             .projection
@@ -13775,7 +14437,7 @@ fn self_test() -> Result<(), String> {
                 .into(),
         );
     }
-    let stable_publication = read_generated_files(&result_command_root)?;
+    let stable_publication = read_history_files(&result_command_root)?;
 
     // Exercise the same exact reconciliation for every current result class.
     // A canonical divergence is keyed by its product result. ERROR and
@@ -13957,8 +14619,8 @@ fn self_test() -> Result<(), String> {
         restore_combined_baseline()?;
         if let Some(seed) = seed {
             let pair = generated_files(&combined_derived, seed)?;
-            fs::write(result_command_root.join(SCORECARD), pair.scorecard)
-                .and_then(|()| fs::write(result_command_root.join(CELLS), pair.cells))
+            fs::write(fixture_ledger.join(LEDGER_SCORECARD), pair.scorecard)
+                .and_then(|()| fs::write(fixture_ledger.join(LEDGER_CELLS), pair.cells))
                 .map_err(|error| error.to_string())?;
         }
         write_result_row(current)?;
@@ -13970,7 +14632,7 @@ fn self_test() -> Result<(), String> {
         let value = scorecard_snapshot_fixture_value(&source_commit, &source_tree, &rows)?;
         let path = snapshot_root.join(format!("reconcile-{label}.json"));
         let sha = write_scorecard_snapshot_fixture(&path, &value)?;
-        let before = read_generated_files(&result_command_root)?;
+        let before = read_history_files(&result_command_root)?;
         let run = || {
             project_and_observe_results(
                 &result_command_root,
@@ -13983,7 +14645,7 @@ fn self_test() -> Result<(), String> {
         };
         if refuse {
             let error = run().expect_err("contradictory invocation evidence was accepted");
-            if !error.contains("disagree") || read_generated_files(&result_command_root)? != before
+            if !error.contains("disagree") || read_history_files(&result_command_root)? != before
             {
                 return Err(format!(
                     "{label} refusal changed the pair or lost its cause: {error}"
@@ -13992,16 +14654,16 @@ fn self_test() -> Result<(), String> {
             println!("scorecard self-test: reconciliation {label} refused unchanged");
         } else {
             run()?;
-            let first = read_generated_files(&result_command_root)?;
+            let first = read_history_files(&result_command_root)?;
             run()?;
-            if read_generated_files(&result_command_root)? != first {
+            if read_history_files(&result_command_root)? != first {
                 return Err(format!(
                     "repeating reconciliation {label} changed the generated pair"
                 ));
             }
             println!("scorecard self-test: reconciliation {label} passed twice identically");
         }
-        read_json(&result_command_root.join(CELLS))
+        read_json(&fixture_ledger.join(LEDGER_CELLS))
     };
     let (same_attempt_no_result, same_attempt_claim) =
         no_result_claim(&replay_row.run_id, 1, "fixture-conflicting-no-result")?;
@@ -14082,6 +14744,7 @@ fn self_test() -> Result<(), String> {
     )?;
     projected_seed.projection = Some(ObservationProjection {
         source: "series".into(),
+        source_repository: None,
         source_commit: Some(source_commit.clone()),
         source_tree: Some(source_tree.clone()),
         refreshed_at: "fixture-before-current".into(),
@@ -14154,7 +14817,7 @@ fn self_test() -> Result<(), String> {
         let value = scorecard_snapshot_fixture_value(&source_commit, &source_tree, &source_rows)?;
         let path = snapshot_root.join(format!("reconcile-{label}.json"));
         let sha = write_scorecard_snapshot_fixture(&path, &value)?;
-        let before = read_generated_files(&result_command_root)?;
+        let before = read_history_files(&result_command_root)?;
         let run = || {
             project_and_observe_results(
                 &result_command_root,
@@ -14169,7 +14832,7 @@ fn self_test() -> Result<(), String> {
             let error =
                 run().expect_err("contradictory current outer-attempt records were accepted");
             if !error.contains("conflicting evidence for outer attempt 1")
-                || read_generated_files(&result_command_root)? != before
+                || read_history_files(&result_command_root)? != before
             {
                 return Err(format!(
                     "{label} refusal changed the pair or lost its cause: {error}"
@@ -14179,14 +14842,14 @@ fn self_test() -> Result<(), String> {
             continue;
         }
         run()?;
-        let first = read_generated_files(&result_command_root)?;
+        let first = read_history_files(&result_command_root)?;
         run()?;
-        if read_generated_files(&result_command_root)? != first {
+        if read_history_files(&result_command_root)? != first {
             return Err(
                 "repeating the multiple-current-attempt write changed its generated pair".into(),
             );
         }
-        let written: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+        let written: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
         let observations = &written
             .cells
             .iter()
@@ -14257,7 +14920,7 @@ fn self_test() -> Result<(), String> {
             &fixture_head,
             "fixture-refresh",
         )?;
-        let written: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+        let written: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
         if count_run_representations(
             &written,
             &replay_id,
@@ -14311,7 +14974,7 @@ fn self_test() -> Result<(), String> {
         .wait_with_output()
         .map_err(|error| format!("cannot finish second combined writer: {error}"))?;
     if !waiting_output.status.success()
-        || read_generated_files(&result_command_root)? != stable_publication
+        || read_history_files(&result_command_root)? != stable_publication
     {
         return Err(format!(
             "serialized second combined writer failed or changed an idempotent pair: status={} stderr={:?}",
@@ -14321,7 +14984,7 @@ fn self_test() -> Result<(), String> {
     }
 
     restore_combined_baseline()?;
-    let original_combined_pair = read_generated_files(&result_command_root)?;
+    let original_combined_pair = read_history_files(&result_command_root)?;
 
     // A valid outer digest must not turn malformed snapshot metadata or rows
     // into admissible input. Row mutations also receive a freshly computed
@@ -14362,7 +15025,7 @@ fn self_test() -> Result<(), String> {
                     "combined snapshot {label} refusal lost its cause: {error}"
                 ));
             }
-            if read_generated_files(&result_command_root)? != original_combined_pair {
+            if read_history_files(&result_command_root)? != original_combined_pair {
                 return Err(format!(
                     "combined snapshot {label} refusal changed the generated pair"
                 ));
@@ -14480,7 +15143,7 @@ fn self_test() -> Result<(), String> {
     )
     .expect_err("combined transaction accepted a moved HEAD");
     if !moved_head_error.contains("HEAD moved")
-        || read_generated_files(&result_command_root)? != original_combined_pair
+        || read_history_files(&result_command_root)? != original_combined_pair
     {
         return Err(format!(
             "moved-HEAD refusal changed the generated pair or lost its cause: {moved_head_error}"
@@ -14489,8 +15152,8 @@ fn self_test() -> Result<(), String> {
     git_ok(&result_command_root, &["update-ref", "HEAD", &fixture_head])?;
 
     for (path, label) in [
-        (result_command_root.join(SCORECARD), SCORECARD),
-        (result_command_root.join(CELLS), CELLS),
+        (fixture_ledger.join(LEDGER_SCORECARD), SCORECARD),
+        (fixture_ledger.join(LEDGER_CELLS), CELLS),
     ] {
         let preimage_error = project_and_observe_results_with(
             &result_command_root,
@@ -14553,7 +15216,7 @@ fn self_test() -> Result<(), String> {
     )
     .expect_err("combined transaction ignored a second-file replacement failure");
     if !rollback_error.contains("restored the original generated files")
-        || read_generated_files(&result_command_root)? != original_combined_pair
+        || read_history_files(&result_command_root)? != original_combined_pair
     {
         return Err(format!(
             "combined transaction did not roll back its first replacement: {rollback_error}"
@@ -14588,7 +15251,7 @@ fn self_test() -> Result<(), String> {
             "multiple-mapping refusal lost its cause: {multiple_error}"
         ));
     }
-    if read_generated_files(&result_command_root)? != original_combined_pair {
+    if read_history_files(&result_command_root)? != original_combined_pair {
         return Err("multiple-mapping refusal changed the generated pair".into());
     }
     let mut conflicting_mapping = series_row.clone();
@@ -14614,7 +15277,7 @@ fn self_test() -> Result<(), String> {
             "conflicting-mapping refusal lost its cause: {conflicting_error}"
         ));
     }
-    if read_generated_files(&result_command_root)? != original_combined_pair {
+    if read_history_files(&result_command_root)? != original_combined_pair {
         return Err("conflicting-mapping refusal changed the generated pair".into());
     }
     restore_generated()?;
@@ -14641,7 +15304,7 @@ fn self_test() -> Result<(), String> {
     // disabled same-backend row for that identical coordinate must remain
     // excluded. Calling the readers/folders directly cannot prove that the
     // front-door eligibility sets and write-back path agree.
-    let command_tracked: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    let command_tracked: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
     let command_parity_id = command_tracked
         .cells
         .iter()
@@ -14705,7 +15368,7 @@ fn self_test() -> Result<(), String> {
             })
     };
     let front_door_scorecard_lists_parity = || -> Result<bool, String> {
-        let scorecard = fs::read_to_string(result_command_root.join(SCORECARD))
+        let scorecard = fs::read_to_string(fixture_ledger.join(LEDGER_SCORECARD))
             .map_err(|error| format!("cannot read front-door scorecard fixture: {error}"))?;
         Ok(scorecard.contains(&format!(
             "| `{}` | `kvm` | `pass` | 3 | 3 | 3 |",
@@ -14715,7 +15378,7 @@ fn self_test() -> Result<(), String> {
 
     let parity_observed = run_result_command("observe-results", None)?;
     if !parity_observed.status.success()
-        || !front_door_admitted_only_parity(&read_json(&result_command_root.join(CELLS))?)
+        || !front_door_admitted_only_parity(&read_json(&fixture_ledger.join(LEDGER_CELLS))?)
         || !front_door_scorecard_lists_parity()?
     {
         return Err(format!(
@@ -14728,7 +15391,7 @@ fn self_test() -> Result<(), String> {
 
     let parity_imported = run_result_command("import-results", Some(&current_summary))?;
     if !parity_imported.status.success()
-        || !front_door_admitted_only_parity(&read_json(&result_command_root.join(CELLS))?)
+        || !front_door_admitted_only_parity(&read_json(&fixture_ledger.join(LEDGER_CELLS))?)
         || !front_door_scorecard_lists_parity()?
     {
         return Err(format!(
@@ -14955,7 +15618,7 @@ fn self_test() -> Result<(), String> {
         fs::write(&current_summary, &original_current_summary).map_err(|e| e.to_string())
     };
     let imported_parity_cell = || -> Result<TrackedCell, String> {
-        let cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+        let cells: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
         cells
             .cells
             .into_iter()
@@ -15018,7 +15681,7 @@ fn self_test() -> Result<(), String> {
                 (command == "import-results").then_some(current_summary.as_path()),
             )?;
             if output.status.success()
-                || read_generated_files(&result_command_root)? != result_command_before
+                || read_history_files(&result_command_root)? != result_command_before
             {
                 return Err(format!(
                     "{command} admitted contradictory ordinary matched outputs: {mutation}"
@@ -15088,7 +15751,7 @@ fn self_test() -> Result<(), String> {
         let refused = run_result_command("observe-results", None)?;
         if refused.status.success()
             || !String::from_utf8_lossy(&refused.stderr).contains("compared_outputs")
-            || read_generated_files(&result_command_root)? != result_command_before
+            || read_history_files(&result_command_root)? != result_command_before
         {
             return Err(
                 "current observer admitted historical output absence or mutated on refusal".into(),
@@ -15119,7 +15782,7 @@ fn self_test() -> Result<(), String> {
         let refused = run_result_command("import-results", Some(&current_summary))?;
         if refused.status.success()
             || !String::from_utf8_lossy(&refused.stderr).contains("compared_outputs")
-            || read_generated_files(&result_command_root)? != result_command_before
+            || read_history_files(&result_command_root)? != result_command_before
         {
             return Err("retained parity import admitted absent operand outputs".into());
         }
@@ -15203,7 +15866,7 @@ fn self_test() -> Result<(), String> {
                     (command == "import-results").then_some(current_summary.as_path()),
                 )?;
                 if output.status.success()
-                    || read_generated_files(&result_command_root)? != result_command_before
+                    || read_history_files(&result_command_root)? != result_command_before
                 {
                     return Err(format!(
                         "{command} admitted missing-reference contradiction {field}"
@@ -15275,7 +15938,7 @@ fn self_test() -> Result<(), String> {
                     command,
                     (command == "import-results").then_some(current_summary.as_path()),
                 )?;
-                let cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+                let cells: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
                 let cell = cells.cells.iter().find(|cell| &cell.id == id).unwrap();
                 let ordinary = cell
                     .observations
@@ -15321,7 +15984,7 @@ fn self_test() -> Result<(), String> {
             let refused = run_result_command("import-results", Some(&current_summary))?;
             if refused.status.success()
                 || !String::from_utf8_lossy(&refused.stderr).contains("changes candidate identity")
-                || read_generated_files(&result_command_root)? != result_command_before
+                || read_history_files(&result_command_root)? != result_command_before
             {
                 return Err("parity history admitted changed candidate identity".into());
             }
@@ -15567,12 +16230,12 @@ fn self_test() -> Result<(), String> {
                     "{command} lost parity FAIL then {terminal} evidence: {output:?}"
                 ));
             }
-            let once = read_generated_files(&result_command_root)?;
+            let once = read_history_files(&result_command_root)?;
             let repeated = run_result_command(
                 command,
                 (command == "import-results").then_some(current_summary.as_path()),
             )?;
-            if !repeated.status.success() || read_generated_files(&result_command_root)? != once {
+            if !repeated.status.success() || read_history_files(&result_command_root)? != once {
                 return Err(format!(
                     "{command} parity FAIL then {terminal} was not byte-idempotent"
                 ));
@@ -15629,7 +16292,7 @@ fn self_test() -> Result<(), String> {
             };
             if refused.status.success()
                 || !String::from_utf8_lossy(&refused.stderr).contains(expected_error)
-                || read_generated_files(&result_command_root)? != result_command_before
+                || read_history_files(&result_command_root)? != result_command_before
             {
                 return Err(format!(
                     "retained parity {terminal}/{invalid} did not refuse with {expected_error}: {refused:?}"
@@ -15774,7 +16437,7 @@ fn self_test() -> Result<(), String> {
                         (command == "import-results").then_some(current_summary.as_path()),
                     )?;
                     if refused.status.success()
-                        || read_generated_files(&result_command_root)? != result_command_before
+                        || read_history_files(&result_command_root)? != result_command_before
                     {
                         return Err(format!(
                             "{command} admitted or wrote invalid retry identity {invalid}"
@@ -15812,9 +16475,9 @@ fn self_test() -> Result<(), String> {
     if !output.status.success() || !kept_old_parity(&imported_parity_cell()?) {
         parity_import_failures.push("ordinary-only second import erased stored parity");
     }
-    let once = read_generated_files(&result_command_root)?;
+    let once = read_history_files(&result_command_root)?;
     let twice = run_result_command("import-results", Some(&current_summary))?;
-    if !twice.status.success() || read_generated_files(&result_command_root)? != once {
+    if !twice.status.success() || read_history_files(&result_command_root)? != once {
         parity_import_failures.push("ordinary-only parity preservation was not byte-idempotent");
     }
 
@@ -15897,9 +16560,9 @@ fn self_test() -> Result<(), String> {
         parity_import_failures
             .push("later parity and ordinary receipts did not retain separate latest meanings");
     }
-    let once = read_generated_files(&result_command_root)?;
+    let once = read_history_files(&result_command_root)?;
     let repeated = run_result_command("import-results", Some(&current_summary))?;
-    if !repeated.status.success() || read_generated_files(&result_command_root)? != once {
+    if !repeated.status.success() || read_history_files(&result_command_root)? != once {
         parity_import_failures.push("repeated parity import duplicated receipts or coordinates");
     }
 
@@ -16018,7 +16681,7 @@ fn self_test() -> Result<(), String> {
             {
                 parity_import_failures.push("result front door admitted an identical or contradictory duplicate aggregate count");
             }
-            if read_generated_files(&result_command_root)? != result_command_before {
+            if read_history_files(&result_command_root)? != result_command_before {
                 parity_import_failures
                     .push("duplicate aggregate refusal changed generated evidence");
                 restore_generated()?;
@@ -16036,14 +16699,14 @@ fn self_test() -> Result<(), String> {
     write_result_row(&replay_row)?;
     let imported = run_result_command("import-results", Some(&current_summary))?;
     if !imported.status.success()
-        || !has_current_replay(&read_json(&result_command_root.join(CELLS))?)
+        || !has_current_replay(&read_json(&fixture_ledger.join(LEDGER_CELLS))?)
     {
         return Err(format!(
             "import-results did not admit canonical replay evidence with real time: {:?}",
             String::from_utf8_lossy(&imported.stderr)
         ));
     }
-    let imported_cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    let imported_cells: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
     let imported_stamp = imported_cells
         .cells
         .iter()
@@ -16072,7 +16735,7 @@ fn self_test() -> Result<(), String> {
     if refused_retained.status.success()
         || !String::from_utf8_lossy(&refused_retained.stderr)
             .contains("verification-report identity does not match")
-        || read_generated_files(&result_command_root)? != result_command_before
+        || read_history_files(&result_command_root)? != result_command_before
     {
         return Err("retained import silently skipped a malformed report identity".into());
     }
@@ -16106,7 +16769,7 @@ fn self_test() -> Result<(), String> {
             String::from_utf8_lossy(&seeded.stderr)
         ));
     }
-    let seeded_cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    let seeded_cells: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
     let seeded_cell = seeded_cells
         .cells
         .iter()
@@ -16169,7 +16832,7 @@ fn self_test() -> Result<(), String> {
     write_result_row(&verify_row)?;
     let unavailable = run_result_command("observe-results", None)?;
     let unavailable_stdout = String::from_utf8_lossy(&unavailable.stdout);
-    let observed_cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+    let observed_cells: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
     let observed_cell = observed_cells
         .cells
         .iter()
@@ -16247,7 +16910,7 @@ fn self_test() -> Result<(), String> {
         Ok::<_, String>(row)
     };
     let read_transition_cell = || -> Result<TrackedCell, String> {
-        let cells: TrackedCells = read_json(&result_command_root.join(CELLS))?;
+        let cells: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
         cells
             .cells
             .into_iter()
@@ -19208,7 +19871,7 @@ fn self_test() -> Result<(), String> {
         ));
     }
 
-    let generated_before_legacy_mapping = read_generated_files(&result_command_root)?;
+    let generated_before_legacy_mapping = read_history_files(&result_command_root)?;
     let mut claimed_source_row = current_validate_row.clone();
     claimed_source_row.producer = SeriesProducer::PressureTest;
     claimed_source_row.run_id = legacy_run_id.into();
@@ -19223,7 +19886,7 @@ fn self_test() -> Result<(), String> {
     )?;
     if !unrelated_representation.represented_event_ids.is_empty()
         || !unrelated_representation.has_unrepresented_direct_evidence
-        || read_generated_files(&result_command_root)? != generated_before_legacy_mapping
+        || read_history_files(&result_command_root)? != generated_before_legacy_mapping
     {
         return Err(
             "unclaimed duplicate retained evidence changed a generated file or was not preserved as opaque history"
@@ -19237,7 +19900,7 @@ fn self_test() -> Result<(), String> {
     )
     .expect_err("a source event claimed duplicate retained direct evidence");
     if !claimed_duplicate_error.contains("2 records for that exact identity")
-        || read_generated_files(&result_command_root)? != generated_before_legacy_mapping
+        || read_history_files(&result_command_root)? != generated_before_legacy_mapping
     {
         return Err(format!(
             "claimed duplicate retained-evidence refusal changed a generated file or lost its cause: {claimed_duplicate_error}"
@@ -19421,6 +20084,7 @@ fn self_test() -> Result<(), String> {
                 apply_series_rows(&root, &mut tracked, &captured_rows, Some(&snapshot.source))?;
             tracked.projection = Some(ObservationProjection {
                 source: snapshot.source,
+        source_repository: None,
                 source_commit: Some(snapshot.source_commit),
                 source_tree: Some(snapshot.source_tree),
                 refreshed_at: "fixture-no-verdict".into(),
@@ -19942,6 +20606,7 @@ fn self_test() -> Result<(), String> {
             schema: SCHEMA,
             projection: Some(ObservationProjection {
                 source: "fixture-series".into(),
+        source_repository: None,
                 source_commit: Some(source_commit.clone()),
                 source_tree: Some(source_tree.clone()),
                 refreshed_at: "fixture-stamp".into(),
@@ -20136,6 +20801,7 @@ fn self_test() -> Result<(), String> {
         schema: SCHEMA,
         projection: Some(ObservationProjection {
             source: "fixture-series".into(),
+        source_repository: None,
             source_commit: Some("a".repeat(40)),
             source_tree: Some("b".repeat(40)),
             refreshed_at: "fixture-stamp".into(),
@@ -21144,5 +21810,343 @@ mod baseline_resolution_tests {
         assert!(reason.contains("DIFFERENT CHECK"));
         assert!(!reason.contains("BAR RAISE"));
         assert!(!reason.contains("never passed"));
+    }
+}
+
+#[cfg(test)]
+mod catalogue_ledger_tests {
+    use std::os::fd::AsRawFd;
+
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-c")
+            .arg("core.hooksPath=/dev/null")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn commit(root: &Path) {
+        git(root, &["add", "."]);
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        );
+    }
+
+    #[test]
+    fn manifest_build_target_is_separate_from_read_only_tool_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let tool = fixture.path().join("immutable-tool");
+        let output = fixture.path().join("mutable-target");
+        fs::create_dir(&tool).unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o555)).unwrap();
+        let selected = manifest_target_dir(&tool, Some(output.as_os_str()));
+        assert_eq!(selected, output);
+        fs::create_dir_all(selected.join("debug")).unwrap();
+        assert!(!tool.join("target").exists());
+        assert_eq!(manifest_target_dir(&tool, None), tool.join("target"));
+        assert_eq!(fs::metadata(&tool).unwrap().permissions().mode() & 0o222, 0);
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn catalogue_keeps_exact_selection_and_reasons_without_history() {
+        let root = Path::new(file!())
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let legacy = load_catalogue(root).unwrap().unwrap();
+        let encoded = encoded_catalogue(&legacy).unwrap();
+        let value: JsonValue = serde_json::from_str(&encoded).unwrap();
+        println!(
+            "catalogue: {} cells, {} bytes, history reference only",
+            legacy.cells.len(),
+            encoded.len()
+        );
+        assert_eq!(value["schema"], CATALOGUE_SCHEMA);
+        assert_eq!(value["history"]["repository"], TEST_LEDGER_REPOSITORY);
+        assert_eq!(value["history"]["path"], LEDGER_CELLS);
+        let decoded = decode_catalogue(encoded.as_bytes()).unwrap();
+        assert_eq!(decoded.cells.len(), legacy.cells.len());
+        for (before, after) in legacy.cells.iter().zip(&decoded.cells) {
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.status, after.status);
+            assert_eq!(before.ci_disabled_reason, after.ci_disabled_reason);
+            assert_eq!(before.green_removal_reason, after.green_removal_reason);
+            assert_eq!(before.not_applicable_reason, after.not_applicable_reason);
+        }
+        for cell in value["cells"].as_array().unwrap() {
+            for key in ["observations", "last_tested", "measurement"] {
+                assert!(
+                    cell.get(key).is_none(),
+                    "catalogue must not make a history claim through {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_archive_and_parent_lock_are_required_before_history_changes() {
+        let root = Path::new(file!())
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let legacy = load_catalogue(root).unwrap().unwrap();
+        let mut retained = legacy.cells.into_iter().next().unwrap();
+        retained.observations = vec![serde_json::from_value(serde_json::json!({
+            "detcore_tree": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "provenance": "pressure-test",
+            "hermit_shas": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"], "results": ["pass"], "invocations": []
+        })).unwrap()];
+        let small = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![retained],
+        };
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("hermit");
+        let ledger = fixture.path().join("ledger");
+        fs::create_dir_all(source.join("ci/compat-envelope")).unwrap();
+        fs::create_dir(&ledger).unwrap();
+        git(&source, &["init", "--quiet"]);
+        git(&ledger, &["init", "--quiet"]);
+        git(
+            &ledger,
+            &["remote", "add", "origin", TEST_LEDGER_REPOSITORY],
+        );
+        let mut legacy_value = serde_json::to_value(&small).unwrap();
+        legacy_value["retained_legacy_annotation"] =
+            "preserve original fields and formatting".into();
+        let bytes = serde_json::to_vec_pretty(&legacy_value).unwrap();
+        fs::write(source.join(CELLS), &bytes).unwrap();
+        fs::write(
+            source.join(SCORECARD),
+            "source catalogue remains untouched\n",
+        )
+        .unwrap();
+        commit(&source);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(ledger.join(".git/ci-hub-series-publication.lock"))
+            .unwrap();
+        let _environment = HistoryFixtureEnvironment::set(&ledger, lock.as_raw_fd());
+        git(
+            &ledger,
+            &[
+                "config",
+                "url.file:///fixture-ledger-transport/.insteadOf",
+                TEST_LEDGER_REPOSITORY,
+            ],
+        );
+        let routed = Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(&ledger)
+            .output()
+            .unwrap();
+        assert!(routed.status.success());
+        assert_eq!(
+            String::from_utf8(routed.stdout).unwrap().trim(),
+            "file:///fixture-ledger-transport/"
+        );
+        assert_eq!(ledger_root(&source, false).unwrap(), ledger);
+        git(
+            &ledger,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://example.invalid/foreign.git",
+            ],
+        );
+        assert!(
+            ledger_root(&source, false).is_err(),
+            "transport routing must not authorize a different configured repository"
+        );
+        git(
+            &ledger,
+            &["config", "remote.origin.url", TEST_LEDGER_REPOSITORY],
+        );
+        assert!(
+            load_existing(&source)
+                .unwrap_err()
+                .contains("history unavailable")
+        );
+        assert!(
+            acquire_history_write_lock(&source).is_err(),
+            "an open but unheld descriptor must refuse"
+        );
+        FileExt::lock_exclusive(&lock).unwrap();
+        let foreign = File::open(ledger.join(".git/ci-hub-series-publication.lock")).unwrap();
+        {
+            let _wrong = HistoryFixtureEnvironment::set(&ledger, foreign.as_raw_fd());
+            assert!(
+                acquire_history_write_lock(&source).is_err(),
+                "a separate descriptor cannot borrow another publisher's lock"
+            );
+        }
+        assert!(require_legacy_archive_before_trim(&source).is_err());
+        export_legacy_history(&source).unwrap();
+        let blob = git_rev_parse(&source, &format!("HEAD:{CELLS}")).unwrap();
+        let archive = ledger.join(format!("scorecard/legacy/{blob}.json"));
+        assert_eq!(fs::read(&archive).unwrap(), bytes);
+        assert_eq!(fs::read(source.join(CELLS)).unwrap(), bytes);
+        assert!(
+            require_legacy_archive_before_trim(&source).is_err(),
+            "unpublished archive is not durable authority"
+        );
+        commit(&ledger);
+        require_legacy_archive_before_trim(&source).unwrap();
+        export_legacy_history(&source).unwrap();
+        assert!(
+            preserve_exact_file(&archive, b"conflicting body")
+                .unwrap_err()
+                .contains("conflict")
+        );
+        assert_eq!(fs::read(&archive).unwrap(), bytes);
+        fs::write(ledger.join(LEDGER_CELLS), &bytes).unwrap();
+        fs::write(ledger.join(LEDGER_SCORECARD), b"old page\n").unwrap();
+        let original = read_history_files(&source).unwrap();
+        let updated = GeneratedFiles {
+            scorecard: b"new page\n".to_vec(),
+            cells: bytes.clone(),
+        };
+        replace_history_files_with(&source, &original, &updated, || Ok(()), |_| Ok(())).unwrap();
+        assert_eq!(
+            fs::read(ledger.join(LEDGER_SCORECARD)).unwrap(),
+            b"new page\n"
+        );
+        assert_eq!(
+            fs::read(source.join(SCORECARD)).unwrap(),
+            b"source catalogue remains untouched\n"
+        );
+        assert_eq!(fs::read(source.join(CELLS)).unwrap(), bytes);
+
+        // A reviewed catalogue may add and retire identities. Retain the
+        // unchanged cell's evidence, use current selection/reasons, and leave
+        // a new identity unmeasured. Retirement must first preserve the exact
+        // prior document in ordinary ledger Git history.
+        let unchanged = small.cells[0].clone();
+        let mut retired = unchanged.clone();
+        retired.id.test.push_str("-retired");
+        let old_history = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![unchanged.clone(), retired],
+        };
+        let old_history_bytes = encoded_cells(&old_history).unwrap();
+        fs::write(ledger.join(LEDGER_CELLS), &old_history_bytes).unwrap();
+        let mut selected = unchanged.clone();
+        selected.status = CellStatus::Red;
+        selected.green_removal_reason = Some("reviewed catalogue transition".into());
+        let mut added = selected.clone();
+        added.id.test.push_str("-new");
+        let current_catalogue = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![selected.clone(), added],
+        };
+        fs::write(
+            source.join(CELLS),
+            encoded_catalogue(&current_catalogue).unwrap(),
+        )
+        .unwrap();
+        let mut refreshed = old_history.clone();
+        assert!(
+            reconcile_history_catalogue(&source, &mut refreshed)
+                .unwrap_err()
+                .contains("uncommitted history")
+        );
+        assert_eq!(encoded_cells(&refreshed).unwrap(), old_history_bytes);
+        commit(&ledger);
+        let retained_commit = git_head(&ledger).unwrap();
+        reconcile_history_catalogue(&source, &mut refreshed).unwrap();
+        assert_eq!(refreshed.cells.len(), 2);
+        assert_eq!(refreshed.cells[0].id, unchanged.id);
+        assert_eq!(
+            serde_json::to_value(&refreshed.cells[0].observations).unwrap(),
+            serde_json::to_value(&unchanged.observations).unwrap()
+        );
+        assert_eq!(refreshed.cells[0].last_tested, unchanged.last_tested);
+        assert_eq!(refreshed.cells[0].status, selected.status);
+        assert_eq!(
+            refreshed.cells[0].green_removal_reason,
+            selected.green_removal_reason
+        );
+        assert!(refreshed.cells[1].observations.is_empty());
+        assert!(refreshed.cells[1].last_tested.is_none());
+        assert_eq!(
+            serde_json::to_value(refreshed.cells[1].measurement).unwrap(),
+            serde_json::to_value(default_measurement()).unwrap()
+        );
+        let retained = Command::new("git")
+            .args(["show", &format!("{retained_commit}:{LEDGER_CELLS}")])
+            .current_dir(&ledger)
+            .output()
+            .unwrap();
+        assert!(retained.status.success());
+        assert_eq!(retained.stdout, old_history_bytes.as_bytes());
+        // observe-results may leave the refreshed file dirty before the
+        // immediately following projector. Reconciliation is now idempotent,
+        // so that normal one-writer transaction remains possible.
+        let refreshed_bytes = encoded_cells(&refreshed).unwrap();
+        fs::write(ledger.join(LEDGER_CELLS), &refreshed_bytes).unwrap();
+        reconcile_history_catalogue(&source, &mut refreshed).unwrap();
+        assert_eq!(encoded_cells(&refreshed).unwrap(), refreshed_bytes);
+        for (expected, actual) in current_catalogue.cells.iter().zip(&refreshed.cells) {
+            assert_eq!(expected.id, actual.id);
+            assert_eq!(expected.status, actual.status);
+            assert_eq!(expected.ci_disabled_reason, actual.ci_disabled_reason);
+            assert_eq!(expected.green_removal_reason, actual.green_removal_reason);
+            assert_eq!(expected.not_applicable_reason, actual.not_applicable_reason);
+        }
+    }
+
+    #[test]
+    fn projection_repository_does_not_reinterpret_historical_commits() {
+        let base = serde_json::json!({"source":"series", "source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source_tree":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "refreshed_at":"recorded", "rows_read":0,
+            "pre_series_corpus":true});
+        let legacy: ObservationProjection = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(legacy.source_repository, None);
+        let mut new = base;
+        new["source_repository"] = TEST_LEDGER_REPOSITORY.into();
+        let projection: ObservationProjection = serde_json::from_value(new.clone()).unwrap();
+        assert_eq!(
+            projection.source_repository.as_deref(),
+            Some(TEST_LEDGER_REPOSITORY)
+        );
+        new["source_repository"] = "https://example.invalid/foreign.git".into();
+        let cells = TrackedCells {
+            schema: SCHEMA,
+            projection: Some(serde_json::from_value(new).unwrap()),
+            cells: vec![],
+        };
+        assert!(validate_observation_identity_namespace(&cells).is_err());
     }
 }
