@@ -204,8 +204,37 @@ static void check_limit_mutations(void) {
   if (syscall(SYS_prlimit64, 0, RLIMIT_CORE, NULL, &observed) != 0) {
     fail("SYS_prlimit64 RLIMIT_CORE query");
   }
+  changed = observed;
+  changed.rlim_cur = 0;
+  if (syscall(SYS_prlimit64, 0, RLIMIT_CORE, &changed, &previous) != 0) {
+    fail("SYS_prlimit64 RLIMIT_CORE soft-limit mutation");
+  }
+  require_limit("idempotent prlimit64 previous", &previous, &observed);
+  if (syscall(SYS_prlimit64, 0, RLIMIT_CORE, &changed, &previous) != 0) {
+    fail("idempotent SYS_prlimit64 RLIMIT_CORE mutation");
+  }
+  require_limit("idempotent prlimit64 previous", &previous, &changed);
+  if (syscall(SYS_prlimit64, 0, RLIMIT_CORE, NULL, &previous) != 0) {
+    fail("SYS_prlimit64 RLIMIT_CORE query after mutation");
+  }
+  require_limit("idempotent prlimit64 state", &previous, &changed);
+  if (syscall(SYS_prlimit64, 0, RLIMIT_CORE, &observed, NULL) != 0) {
+    fail("restore after SYS_prlimit64 RLIMIT_CORE mutation");
+  }
+
+  if (syscall(SYS_prlimit64, 0, RLIMIT_CPU, NULL, &observed) != 0) {
+    fail("SYS_prlimit64 RLIMIT_CPU query");
+  }
+  changed = observed;
+  if (changed.rlim_cur != 0) {
+    changed.rlim_cur = 0;
+  } else if (changed.rlim_max != 0) {
+    changed.rlim_cur = 1;
+  } else {
+    changed.rlim_max = 1;
+  }
   require_prlimit_error(
-      0, RLIMIT_CORE, &observed, EPERM, "dangerous prlimit64 mutation");
+      0, RLIMIT_CPU, &changed, EPERM, "dangerous prlimit64 mutation");
   require_prlimit_error(
       getpid() + 1, RLIMIT_NOFILE, NULL, EPERM, "other-pid prlimit64 query");
   require_prlimit_error(

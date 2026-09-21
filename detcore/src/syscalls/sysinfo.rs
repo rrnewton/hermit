@@ -67,6 +67,34 @@ fn prlimit_targets_current_process(
     target_pid == 0 || target_pid == deterministic_pid.unwrap_or(physical_pid)
 }
 
+fn validate_resource_limit_mutation(
+    resource: u32,
+    previous: ResourceLimit,
+    requested: ResourceLimit,
+) -> Result<(), Errno> {
+    if requested.current > requested.maximum {
+        return Err(Errno::EINVAL);
+    }
+    // Linux accepts an exact no-op for every valid resource, including limits
+    // that an unprivileged process could not otherwise change. Recognize that
+    // case before applying Detcore's narrower virtual-mutation policy.
+    if requested == previous {
+        return Ok(());
+    }
+    // CORE is virtual compatibility state too: changing it cannot enable host
+    // core dumps, while Linux sanitizers routinely lower its soft limit.
+    if resource != libc::RLIMIT_STACK
+        && resource != libc::RLIMIT_NOFILE
+        && resource != libc::RLIMIT_CORE
+    {
+        return Err(Errno::EPERM);
+    }
+    if requested.maximum > previous.maximum {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
@@ -113,26 +141,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             .lock()
             .expect("resource limits mutex poisoned");
         let previous = limits.get(resource).ok_or(Errno::EINVAL)?;
-        if requested.current > requested.maximum {
-            return Err(Errno::EINVAL.into());
+        validate_resource_limit_mutation(resource, previous, requested)?;
+        if requested != previous {
+            limits.set(resource, requested);
         }
-        if resource != libc::RLIMIT_STACK && resource != libc::RLIMIT_NOFILE {
-            return Err(Errno::EPERM.into());
-        }
-        if requested.maximum > previous.maximum {
-            return Err(Errno::EPERM.into());
-        }
-        limits.set(resource, requested);
         Ok(0)
     }
 
     /// Virtualize `prlimit64(2)` for the current guest process.
     ///
-    /// Queries return process-local deterministic values. Mutations are kept
-    /// virtual and restricted to limits that do not grant access to host
-    /// resources or affect host scheduling. Accepted mutations update only
-    /// guest-observable compatibility state; they are not a sandbox boundary
-    /// and do not ask the host kernel to enforce the virtual limit.
+    /// Queries return process-local deterministic values. Exact no-op updates
+    /// succeed for every valid resource, as on Linux. Changes are kept virtual
+    /// and restricted to limits that do not grant access to host resources or
+    /// affect host scheduling. Accepted changes update only guest-observable
+    /// compatibility state; they are not a sandbox boundary and do not ask the
+    /// host kernel to enforce the virtual limit.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#534)
     pub async fn handle_prlimit64<G: Guest<Self>>(
@@ -176,16 +199,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .expect("resource validity changed while handling prlimit64");
 
             if let Some(requested) = requested {
-                if requested.current > requested.maximum {
-                    return Err(Errno::EINVAL.into());
+                validate_resource_limit_mutation(resource, previous, requested)?;
+                if requested != previous {
+                    limits.set(resource, requested);
                 }
-                if resource != libc::RLIMIT_STACK && resource != libc::RLIMIT_NOFILE {
-                    return Err(Errno::EPERM.into());
-                }
-                if requested.maximum > previous.maximum {
-                    return Err(Errno::EPERM.into());
-                }
-                limits.set(resource, requested);
             }
 
             previous
@@ -443,6 +460,82 @@ mod tests {
     fn prlimit_self_target_falls_back_to_physical_identity_before_init() {
         assert!(prlimit_targets_current_process(10_003, None, 10_003));
         assert!(!prlimit_targets_current_process(3, None, 10_003));
+    }
+
+    #[test]
+    fn prlimit_accepts_exact_noop_for_restricted_resource() {
+        let limit = ResourceLimit {
+            current: 0,
+            maximum: 0,
+        };
+        assert_eq!(
+            validate_resource_limit_mutation(libc::RLIMIT_CPU, limit, limit),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn prlimit_accepts_core_soft_limit_change() {
+        let previous = ResourceLimit {
+            current: 1,
+            maximum: 1,
+        };
+        let requested = ResourceLimit {
+            current: 0,
+            maximum: 1,
+        };
+        assert_eq!(
+            validate_resource_limit_mutation(libc::RLIMIT_CORE, previous, requested),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn prlimit_rejects_actual_change_to_restricted_resource() {
+        let previous = ResourceLimit {
+            current: 1,
+            maximum: 1,
+        };
+        let requested = ResourceLimit {
+            current: 0,
+            maximum: 1,
+        };
+        assert_eq!(
+            validate_resource_limit_mutation(libc::RLIMIT_CPU, previous, requested),
+            Err(Errno::EPERM)
+        );
+    }
+
+    #[test]
+    fn prlimit_rejects_invalid_soft_limit_before_noop_policy() {
+        let previous = ResourceLimit {
+            current: 1,
+            maximum: 1,
+        };
+        let requested = ResourceLimit {
+            current: 2,
+            maximum: 1,
+        };
+        assert_eq!(
+            validate_resource_limit_mutation(libc::RLIMIT_CORE, previous, requested),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn prlimit_rejects_core_hard_limit_raise() {
+        let previous = ResourceLimit {
+            current: 1,
+            maximum: 1,
+        };
+        let requested = ResourceLimit {
+            current: 1,
+            maximum: 2,
+        };
+        assert_eq!(
+            validate_resource_limit_mutation(libc::RLIMIT_CORE, previous, requested),
+            Err(Errno::EPERM)
+        );
     }
 
     #[test]
