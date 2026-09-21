@@ -838,6 +838,14 @@ pub enum ValidatePath {
     /// Evidence for the selected cell owner and dependencies, not the full suite.
     #[serde(rename = "cell-requalification")]
     CellRequalification,
+    #[serde(rename = "only-quick")]
+    OnlyQuick,
+    #[serde(rename = "only-full")]
+    OnlyFull,
+    #[serde(rename = "only-portable")]
+    OnlyPortable,
+    #[serde(rename = "only-hosted-portable")]
+    OnlyHostedPortable,
 }
 
 impl ValidatePath {
@@ -847,7 +855,28 @@ impl ValidatePath {
             Self::Full => "full",
             Self::Super => "super",
             Self::CellRequalification => "cell-requalification",
+            Self::OnlyQuick => "only-quick",
+            Self::OnlyFull => "only-full",
+            Self::OnlyPortable => "only-portable",
+            Self::OnlyHostedPortable => "only-hosted-portable",
         }
+    }
+
+    /// These are existing maintained `--only` profiles, not full-run aliases.
+    pub fn is_selected_only(self) -> bool {
+        matches!(
+            self,
+            Self::OnlyQuick | Self::OnlyFull | Self::OnlyPortable | Self::OnlyHostedPortable
+        )
+    }
+
+    fn validate_selected_scope(self, row: &HistoryRow) -> Result<(), String> {
+        if self.is_selected_only()
+            && (row.schema_version != Some(10) || row.selection_mode.as_deref() != Some("only"))
+        {
+            return Err("selected-only evidence requires schema 10 and selection_mode=only".into());
+        }
+        Ok(())
     }
 }
 
@@ -1036,6 +1065,11 @@ impl<'de> Deserialize<'de> for CellResultsEvidenceV8 {
         D: Deserializer<'de>,
     {
         let value = CellResultsEvidenceV8Wire::deserialize(deserializer)?;
+        if value.path.is_selected_only() {
+            return Err(serde::de::Error::custom(
+                "selected-only evidence is not a schema 8/9 path",
+            ));
+        }
         Ok(Self {
             path: value.path,
             run_id: value.run_id,
@@ -1551,6 +1585,7 @@ fn checked_summary(summary: &TestResultTotals, row_count: u64) -> Result<(), Str
 
 impl TestResultsEvidenceV9 {
     fn validate_for_row(&self, row: &HistoryRow) -> Result<(), String> {
+        self.path.validate_selected_scope(row)?;
         if row.profile.as_deref() != Some(self.path.as_str()) {
             return Err("schema 9 test_results path differs from row profile".into());
         }
@@ -2325,6 +2360,25 @@ mod tests {
         });
         let evidence: CellResultsEvidenceV8 = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(evidence.path, ValidatePath::Quick);
+        for path in [
+            "only-quick",
+            "only-full",
+            "only-portable",
+            "only-hosted-portable",
+        ] {
+            let mut selected = json.clone();
+            selected["path"] = path.into();
+            assert!(serde_json::from_value::<CellResultsEvidenceV8>(selected.clone()).is_err());
+            for schema in [8, 9] {
+                let selected_row: HistoryRow = serde_json::from_value(serde_json::json!({
+                    "schema_version":schema, "profile":path, "selection_mode":"only",
+                    "cell_results":selected,
+                }))
+                .unwrap();
+                assert!(selected_row.cell_results_evidence().is_none());
+                assert!(selected_row.cell_results_validate_path().is_none());
+            }
+        }
         let value: CellResultsValue = serde_json::from_value(json.clone()).unwrap();
         assert!(matches!(value, CellResultsValue::Other(_)));
         assert_eq!(serde_json::to_value(value).unwrap(), json);
