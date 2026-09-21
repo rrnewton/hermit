@@ -13,8 +13,6 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 
-use dagrun::TestResult;
-use dagrun::TestResults;
 use hermit_manifest_plan::cli_help::is_help_flag;
 use hermit_manifest_plan::runner::CellResult;
 use hermit_manifest_plan::runner::FailureClass;
@@ -26,13 +24,13 @@ use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 use hermit_manifest_plan::runner::Selection;
 use hermit_manifest_plan::runner::append_result;
 use hermit_manifest_plan::runner::cell_result_after_retries;
-use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::checked_add_cpu_usage;
 use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::infrastructure_error_result;
 use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::run_cell;
+use hermit_manifest_plan::runner::structured_test_results;
 use hermit_manifest_plan::runner::write_junit;
 use hermit_manifest_plan::stress_series::HostCapabilities;
 #[cfg(test)]
@@ -331,42 +329,6 @@ fn parse(mut values: impl Iterator<Item = String>) -> Args {
         }
     }
     args
-}
-
-fn structured_test_results(histories: &[Vec<CellResult>]) -> Result<TestResults, String> {
-    let rows = histories
-        .iter()
-        .map(|history| {
-            let (result, attempts) = cell_result_and_attempts_after_retries(history)?;
-            Ok((result.outcome != "HOST-INAPPLICABLE").then(|| {
-                (
-                    format!(
-                        "{} [{}/{}]",
-                        result.test,
-                        result.backend.as_deref().unwrap_or("native"),
-                        result.mode
-                    ),
-                    result.outcome == "PASS",
-                    attempts,
-                )
-            }))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    structured_test_results_from_rows(rows.into_iter().flatten())
-}
-
-fn structured_test_results_from_rows(
-    rows: impl IntoIterator<Item = (String, bool, u64)>,
-) -> Result<TestResults, String> {
-    let rows = rows
-        .into_iter()
-        .map(|(id, passed, attempts)| TestResult::new(id, passed, attempts))
-        .collect::<Result<Vec<_>, _>>()?;
-    TestResults::current(
-        u64::try_from(rows.len()).map_err(|_| "cell result count does not fit u64")?,
-        0,
-        rows,
-    )
 }
 
 fn accumulate_cell_cpu_usage(
@@ -1675,6 +1637,12 @@ fn for_each_parallel<T: Send>(
         }
     });
 }
+/// Retry only a completed product failure. Re-running a named infrastructure,
+/// prerequisite, or no-result condition duplicates evidence without changing
+/// the cause, and was doubling every affected row.
+fn retryable_cell_outcome(outcome: &str, failure_class: Option<FailureClass>) -> bool {
+    outcome == "FAIL" && failure_class == Some(FailureClass::ProductFailure)
+}
 
 fn run_with_retry<T>(
     first_attempt: u64,
@@ -1766,7 +1734,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                         Err(error) => infrastructure_error_result(&attempt_context, cell, error),
                     }
                 },
-                |result| !matches!(result.outcome.as_str(), "PASS" | "HOST-INAPPLICABLE"),
+                |result| retryable_cell_outcome(&result.outcome, result.failure_class),
                 emit,
             );
         },
@@ -1806,17 +1774,14 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                     result.test,
                     result.mode,
                     result.backend.as_deref().unwrap_or("native"),
-                    result.reason.as_deref().unwrap_or("infrastructure error")
+                    result.reason_for_display()
                 );
             }
             // A FAILURE MUST SAY ENOUGH TO BE CLASSIFIED, NOT JUST COUNTED.
             let located = if result.outcome == "PASS" {
                 String::new()
             } else if result.outcome == "HOST-INAPPLICABLE" {
-                format!(
-                    " {}",
-                    result.reason.as_deref().unwrap_or("host-inapplicable")
-                )
+                format!(" {}", result.reason_for_display())
             } else {
                 let coords = [
                     ("turn", result.first_divergent_scheduler_turn),
@@ -1831,8 +1796,8 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 if !coords.is_empty() {
                     suffix.push_str(&format!(" [{}]", coords.join(" ")));
                 }
-                if let Some(reason) = result.reason.as_deref() {
-                    suffix.push_str(&format!(" {reason}"));
+                if result.outcome != "PASS" {
+                    suffix.push_str(&format!(" {}", result.reason_for_display()));
                 }
                 suffix.push_str(&format!("\n    evidence: {}", result.artifact_dir));
                 suffix
@@ -1960,6 +1925,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use hermit_manifest_plan::runner::FailureClass;
     use hermit_manifest_plan::runner::ManifestSet;
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
 
@@ -1975,9 +1941,9 @@ mod tests {
     use super::for_each_parallel;
     use super::host_inapplicable_reason;
     use super::parse;
+    use super::retryable_cell_outcome;
     use super::run_with_retry;
     use super::scheduled_worker_capacity;
-    use super::structured_test_results_from_rows;
     use super::unique_plan_rows;
 
     #[test]
@@ -2040,40 +2006,6 @@ mod tests {
         accumulate_cell_cpu_usage(&mut total, &mut measurements, "ERROR", None);
         assert_eq!(measurements, 3);
         assert_eq!(total, None);
-    }
-
-    #[test]
-    fn structured_test_results_are_machine_readable_and_exact_on_failure() {
-        let path = std::env::temp_dir().join(format!(
-            "hermit-manifest-counts-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        structured_test_results_from_rows([
-            ("suite$passes".into(), true, 1),
-            ("suite$fails".into(), false, 2),
-        ])
-        .unwrap()
-        .write_current(&path)
-        .unwrap();
-        let counts: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        std::fs::remove_file(path).unwrap();
-        assert_eq!(
-            counts,
-            serde_json::json!({
-                "schema": 2,
-                "executed_tests": 2,
-                "filtered_tests": 0,
-                "results": [
-                    {"id": "suite$passes", "result": "pass", "attempts": 1},
-                    {"id": "suite$fails", "result": "fail", "attempts": 2},
-                ],
-            })
-        );
     }
 
     #[test]
@@ -2191,6 +2123,26 @@ mod tests {
         rows.sort_unstable();
         assert_eq!(rows, (0..8).map(|index| (index, index)).collect::<Vec<_>>());
         assert!(maximum.load(Ordering::SeqCst) > 1);
+    }
+    #[test]
+    fn retry_policy_retries_only_classified_product_failures() {
+        assert!(retryable_cell_outcome(
+            "FAIL",
+            Some(FailureClass::ProductFailure)
+        ));
+        for (outcome, class) in [
+            ("PASS", None),
+            ("HOST-INAPPLICABLE", None),
+            ("FAIL", None),
+            ("FAIL", Some(FailureClass::UnderstoodInfrastructureFailure)),
+            ("ERROR", Some(FailureClass::NoResult)),
+            ("ERROR", Some(FailureClass::UnderstoodPrerequisiteFailure)),
+        ] {
+            assert!(
+                !retryable_cell_outcome(outcome, class),
+                "{outcome} {class:?}"
+            );
+        }
     }
 
     #[test]
