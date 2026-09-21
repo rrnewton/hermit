@@ -384,6 +384,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         warn_non_zero_binds: false,
         sched_heuristic: Default::default(),
         sched_seed: default_config.sched_seed,
+        network_trace: Default::default(),
         recordreplay_modes: true,
         record_preemptions: false,
         record_preemptions_to: None,
