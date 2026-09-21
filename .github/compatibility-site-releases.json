@@ -1,5 +1,5 @@
 {
-  "latest_identity": "24cd25bb9be3cac6eb2e46a396f8cfcd542b35a7c3d339907452ea1df6f7190e",
+  "latest_identity": "d2e7d82d3fa16c96a7ede07085dd4d4a0999dd79626f582af48d427c9f005c2a",
   "release_repository": "rrnewton/hermit",
   "releases": [
     {
@@ -271,6 +271,36 @@
       "recursive_identity_sha256": "241555c724ac041daf00ff19122a3e1d5646939dd6c876ee4546f1d80b53ab21",
       "release_title": "Compatibility website snapshot b7d031dde2907da05829f46ffede2105f61bdf671bf9485856d831f7eebf6ff0",
       "tag": "compatibility-website-b7d031dde2907da05829f46ffede2105f61bdf671bf9485856d831f7eebf6ff0"
+    },
+    {
+      "archive_bytes": 45159356,
+      "archive_member_count": 277,
+      "archive_sha256": "99e76f6be0d646eed4a173f04e0a87ef957f62bb7d44ed37682187e73d53644f",
+      "artifacts_sha256": "a155bb0d7687c6b5cccf8732480ae9a9b2f34156aea357c7da9c48ae1c975a08",
+      "asset": "compatibility-website-d2e7d82d3fa16c96a7ede07085dd4d4a0999dd79626f582af48d427c9f005c2a.tar.gz",
+      "build_sha256": "d6b8491f3e332f33a46a2277e186bb847defa73cac8d69934ac40e91f54ac95c",
+      "content_tree_sha256": "0060a6dee7732ff43b2373808a42788755a8cf6e19da03a5bdb8adcce3f3970a",
+      "counts": {
+        "current_validation_run_row_count": 111,
+        "green_cell_count": 805,
+        "in_manifest_cell_count": 5760,
+        "never_measured_cell_count": 4911,
+        "physical_row_count": 44969,
+        "red_cell_count": 30,
+        "represented_run_count": 51593,
+        "selected_by_full_custom_command_count": 3,
+        "test_count": 360,
+        "validation_history_row_count": 124
+      },
+      "directories": ["assets", "cells", "data", "runs", "tests"],
+      "file_bytes": 86413013,
+      "file_count": 271,
+      "identity": "d2e7d82d3fa16c96a7ede07085dd4d4a0999dd79626f582af48d427c9f005c2a",
+      "manifest_tree_sha256": "d44fe1c4c0c725380bc1a0fef3179676158633d188a84a6f6fd67be2460d29a0",
+      "mode_sha256": "95e4e0ee114d807dee0ca6f6677a39df3b3e8c662c4b0fee24a2f97fa0f347dc",
+      "recursive_identity_sha256": "1bbaa497e3bfa4967e097062506f4f27b5c4ed78040c255ba7e4970b53bd8568",
+      "release_title": "Compatibility website d2e7d82d3fa16c96a7ede07085dd4d4a0999dd79626f582af48d427c9f005c2a",
+      "tag": "compatibility-website-d2e7d82d3fa16c96a7ede07085dd4d4a0999dd79626f582af48d427c9f005c2a"
     },
     {
       "archive_bytes": 13929857,
