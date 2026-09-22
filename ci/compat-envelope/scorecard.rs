@@ -3558,6 +3558,140 @@ fn selected_partition(
     Ok((comparable, custom))
 }
 
+/// Custom commands are selected regressions, but are not comparable cells.
+/// Their complete invocations remain in the held raw-result census and their
+/// outcomes in the immutable canonical series. Authenticate both operands
+/// before excluding these exact declared identities from comparison projection.
+#[derive(Debug, Default)]
+struct SelectedCustomRetention {
+    receipts: Vec<String>,
+    event_ids: BTreeSet<String>,
+}
+
+fn series_last_run_index(row: &SeriesRow) -> Option<u64> {
+    row.series.last_run_index.or_else(|| {
+        row.series
+            .num_runs
+            .checked_sub(1)
+            .and_then(|span| row.series.run_index.checked_add(span))
+    })
+}
+
+fn retain_selected_custom_results(
+    tracked: &TrackedCells,
+    selected_custom: &BTreeSet<CellId>,
+    results: &BTreeMap<CellId, Vec<ResultCandidate>>,
+    series: &[SeriesRow],
+) -> Result<SelectedCustomRetention, String> {
+    let mut retained = SelectedCustomRetention::default();
+    let mut attempts = BTreeSet::new();
+    for (id, candidates) in results {
+        if tracked.cells.iter().any(|cell| &cell.id == id) {
+            continue;
+        }
+        if !selected_custom.contains(id) {
+            return Err(format!(
+                "current result {} has no cell in the invoker's tracked matrix or selected custom commands",
+                display_id(id)
+            ));
+        }
+        let key = series_cell_key(id);
+        if selected_custom
+            .iter()
+            .filter(|id| series_cell_key(id) == key)
+            .count()
+            != 1
+        {
+            return Err(format!(
+                "selected custom command {key} has an ambiguous series identity"
+            ));
+        }
+        for candidate in candidates {
+            let row = &candidate.row;
+            row.require_ingestible_classification()?;
+            row.require_provenance()?;
+            row.validate_recorded_classification()?;
+            if !attempts.insert((id, &row.run_id, row.attempt)) {
+                return Err(format!(
+                    "{} has duplicate custom outer attempt {}",
+                    display_id(id),
+                    row.attempt
+                ));
+            }
+            let represented = series
+                .iter()
+                .filter(|event| {
+                    event.producer == SeriesProducer::Validate
+                        && event.run_id == row.run_id
+                        && event.cell() == key
+                        && event.series.tree == row.hermit_sha
+                        && event.series.run_index <= row.attempt
+                        && series_last_run_index(event).is_some_and(|last| row.attempt <= last)
+                })
+                .collect::<Vec<_>>();
+            let [event] = represented.as_slice() else {
+                return Err(format!(
+                    "{} custom outer attempt {} requires exactly one canonical series event, found {}",
+                    display_id(id),
+                    row.attempt,
+                    represented.len()
+                ));
+            };
+            event.validate_for_read()?;
+            let first = event.series.run_index;
+            let last =
+                series_last_run_index(event).ok_or("custom series attempt span overflows")?;
+            // Historical series may span sparse repetitions. Current validate
+            // attempts need complete, consecutive coverage, not mere interval
+            // membership. An explicit attempt is a single outer invocation.
+            let covered = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.row.run_id == row.run_id
+                        && candidate.row.hermit_sha == row.hermit_sha
+                        && first <= candidate.row.attempt
+                        && candidate.row.attempt <= last
+                })
+                .map(|candidate| candidate.row.attempt)
+                .collect::<BTreeSet<_>>();
+            if event.schema != SeriesSchema::V3
+                || event.series.source_tree_dirty
+                || last.checked_sub(first).and_then(|span| span.checked_add(1))
+                    != Some(event.series.num_runs)
+                || covered.len() as u64 != event.series.num_runs
+                || event
+                    .series
+                    .attempt
+                    .is_some_and(|attempt| event.series.num_runs != 1 || attempt != row.attempt)
+                || event.series.result != row.result
+                || event.series.failure_class != row.failure_class
+                || event
+                    .series
+                    .no_verdict_evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.evidence_sha256 != candidate.evidence_identity)
+            {
+                return Err(format!(
+                    "{} custom series classification or evidence differs from its raw attempt",
+                    display_id(id)
+                ));
+            }
+            retained.event_ids.insert(event.event_id.clone());
+            retained.receipts.push(format!(
+                "{} source={} run={} attempt={} outcome={} evidence={} series={}",
+                display_id(id),
+                row.hermit_sha,
+                row.run_id,
+                row.attempt,
+                row.outcome,
+                candidate.evidence_identity,
+                event.event_id
+            ));
+        }
+    }
+    Ok(retained)
+}
+
 fn tracked_current_summary(derived: &Derived) -> String {
     format!(
         "compatibility scorecard: tracked table and {} comparable cells are current; selected regression denominator {} = {} comparable + {} custom",
@@ -7542,14 +7676,18 @@ where
         .map_err(|error| format!("cannot parse tracked {CELLS}: {error}"))?;
     reconcile_history_catalogue(root, &mut tracked)?;
     let before = tracked.clone();
-    for id in result_rows.keys() {
-        if !tracked.cells.iter().any(|cell| &cell.id == id) {
-            return Err(format!(
-                "current result {} has no cell in the invoker's tracked matrix",
-                display_id(id)
-            ));
-        }
-    }
+    let custom_retention = retain_selected_custom_results(
+        &tracked,
+        &derived.selected_custom,
+        &result_rows,
+        &snapshot.rows,
+    )?;
+    // The complete census and finalized proof above still cover every raw row.
+    // Only comparable cells enter the existing grade/observation projection.
+    let result_rows = result_rows
+        .into_iter()
+        .filter(|(id, _)| !derived.selected_custom.contains(id))
+        .collect::<BTreeMap<_, _>>();
     // Validate current inputs on a private copy before either projection can
     // encounter the old compact run matcher. Reconcile the complete snapshot
     // first; only exactly represented events may be suppressed. Existing
@@ -7586,6 +7724,7 @@ where
             !preview_representation
                 .represented_event_ids
                 .contains(&row.event_id)
+                && !custom_retention.event_ids.contains(&row.event_id)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -7661,7 +7800,10 @@ where
     let projected_rows = snapshot
         .rows
         .iter()
-        .filter(|row| !representation.represented_event_ids.contains(&row.event_id))
+        .filter(|row| {
+            !representation.represented_event_ids.contains(&row.event_id)
+                && !custom_retention.event_ids.contains(&row.event_id)
+        })
         .cloned()
         .collect::<Vec<_>>();
     let projection = apply_series_rows(
@@ -7734,6 +7876,9 @@ where
         "compatibility scorecard: generated files {}",
         if changed { "changed" } else { "unchanged" }
     );
+    for receipt in custom_retention.receipts {
+        println!("  retained selected custom command outside comparable projection: {receipt}");
+    }
     for transition in transitions {
         println!("{transition}");
     }
@@ -23668,6 +23813,223 @@ mod post_verdict_transaction_tests {
         fn cells(&self) -> TrackedCells {
             read_json(&self.ledger.join(LEDGER_CELLS)).unwrap()
         }
+    }
+
+    #[test]
+    fn selected_custom_attempts_publish_without_becoming_comparable_cells() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let mut fixture = Fixture::new();
+        fixture.publish().unwrap();
+        let comparable = serde_json::to_value(fixture.cells().cells).unwrap();
+        fixture.restore();
+        // These are the complete three unmatched identities from full run1897.
+        // They are already declared by the real manifest/selected plan.
+        let selected = derive(&fixture.root).unwrap().selected_custom;
+        assert_eq!(selected.len(), 3);
+        assert_eq!(
+            selected.iter().map(display_id).collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "portable/backend-parity-c/backend-parity-c/environment-and-workdir/custom@ptrace"
+                    .into(),
+                "portable/system-utils/system-utils/clock-determinism/custom@liteinst".into(),
+                "portable/system-utils/system-utils/clock-determinism/custom@ptrace".into(),
+            ])
+        );
+        let mut rows = vec![fixture.row.clone()];
+        let mut events = Vec::new();
+        for (index, id) in selected.iter().enumerate() {
+            let mut row = fixture.row.clone();
+            for (key, value) in [
+                ("lane", &id.lane),
+                ("category", &id.category),
+                ("test", &id.test),
+                ("mode", &id.mode),
+                ("backend", &id.backend),
+            ] {
+                row[key] = value.clone().into();
+            }
+            let argv = vec![
+                "hermit",
+                "run",
+                "--backend",
+                id.backend.as_str(),
+                "--",
+                "fixture",
+            ];
+            row["argv"] = serde_json::json!(argv);
+            row["effective_args"] = serde_json::json!(&argv[1..]);
+            row["shell_command"] = literal_shell_command(
+                "/repo",
+                &BTreeMap::from([("LC_ALL".into(), "C".into())]),
+                &argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>(),
+            )
+            .into();
+            for key in ["argv", "guest_argv", "env", "cwd", "shell_command"] {
+                row["attempts"][0][key] = row[key].clone();
+            }
+            row["attempts"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("verification_report");
+            row["attempts"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("verification_report_sha256");
+            let event: SeriesRow = serde_json::from_value(serde_json::json!({
+                            "schema":"stress-series/v3", "event_id":format!("fixture-custom-{index}"),
+                            "event_type":"series.observation", "emitted_at":"2026-09-22T00:00:00Z",
+                            "team":"hermit", "host":"fixture", "producer":"validate", "run_id":row["run_id"],
+                            "series":{"cell":series_cell_key(id),"tree":row["hermit_sha"],"outcome":"passed",
+                                "result":"pass","failure_class":null,"run_index":1,"num_runs":1,
+                                "source_tree_dirty":false,"machine_shortname":"fixture","kernel_version":"fixture",
+                                "host_capabilities":{"cpuid-faulting":{"present":false,"evidence":"synthetic fixture"},
+                                    "kvm":{"present":false,"evidence":"synthetic fixture"}}}
+                        })).unwrap();
+            event.validate_for_read().unwrap();
+            events.push(event);
+            rows.push(row);
+        }
+        fixture.publish_rows(&rows);
+        let value =
+            scorecard_snapshot_fixture_value(&"a".repeat(40), &"b".repeat(40), &events).unwrap();
+        fixture.options.snapshot_sha256 =
+            write_scorecard_snapshot_fixture(&fixture.options.snapshot, &value).unwrap();
+        let raw_before = fs::read(fixture.options.results.join("results.jsonl")).unwrap();
+        let snapshot_before = fs::read(&fixture.options.snapshot).unwrap();
+        fixture.publish().unwrap();
+        assert_eq!(
+            serde_json::to_value(fixture.cells().cells).unwrap(),
+            comparable,
+            "custom invocations changed comparable observations, grades, or population"
+        );
+        assert_eq!(
+            fs::read(fixture.options.results.join("results.jsonl")).unwrap(),
+            raw_before
+        );
+        assert_eq!(
+            fs::read(&fixture.options.snapshot).unwrap(),
+            snapshot_before
+        );
+        let candidates = read_result_candidates(
+            &fixture.options.results,
+            fixture.row["hermit_sha"].as_str().unwrap(),
+        )
+        .unwrap();
+        let tracked = fixture.cells();
+        assert_eq!(
+            retain_selected_custom_results(&tracked, &selected, &candidates, &events)
+                .unwrap()
+                .receipts
+                .len(),
+            3
+        );
+
+        // Refuse absence, ambiguity, altered classifications and malformed
+        // invocations rather than silently dropping a declared custom result.
+        let mut duplicate = events.clone();
+        duplicate.push(events[0].clone());
+        let mut different = events.clone();
+        different[0].series.result = Some(ObservedResult::CrashError);
+        different[0].series.failure_class = Some(FailureClass::ProductFailure);
+        different[0].series.outcome = SeriesOutcome::Errored;
+        for bad in [Vec::new(), duplicate, different] {
+            assert!(retain_selected_custom_results(&tracked, &selected, &candidates, &bad).is_err());
+        }
+        let mut sparse = events.clone();
+        sparse[0].series.last_run_index = Some(3);
+        sparse[0].series.num_runs = 2;
+        sparse[0].validate_for_read().unwrap();
+        let mut sparse_candidates = candidates.clone();
+        let middle = &mut sparse_candidates
+            .get_mut(selected.first().unwrap())
+            .unwrap()[0];
+        middle.row.attempt = 2;
+        middle.evidence_identity = middle.row.evidence_identity().unwrap();
+        assert!(
+            retain_selected_custom_results(&tracked, &selected, &sparse_candidates, &sparse).is_err()
+        );
+        let mut wrong_attempt = events.clone();
+        wrong_attempt[0].series.attempt = Some(2);
+        assert!(
+            retain_selected_custom_results(&tracked, &selected, &candidates, &wrong_attempt).is_err()
+        );
+        let id = selected.first().unwrap();
+        let mut bad = candidates.clone();
+        bad.get_mut(id).unwrap()[0]
+            .row
+            .shell_command
+            .push_str(" || true");
+        assert!(retain_selected_custom_results(&tracked, &selected, &bad, &events).is_err());
+        let mut unknown = id.clone();
+        unknown.test.push_str("-unknown");
+        let mut bad = candidates.clone();
+        let unknown_candidates = bad.remove(id).unwrap();
+        bad.insert(unknown, unknown_candidates);
+        assert!(
+            retain_selected_custom_results(&tracked, &selected, &bad, &events)
+                .unwrap_err()
+                .contains("no cell")
+        );
+
+        // A failed first attempt followed by a pass remains two records. It
+        // still confers no comparison grade on the custom command.
+        let mut retried = candidates.clone();
+        let mut failed = retried[id][0].clone();
+        failed.row.outcome = "FAIL".into();
+        failed.row.result = Some(ObservedResult::CrashError);
+        failed.row.failure_class = Some(FailureClass::ProductFailure);
+        failed.row.attempts[0]["outcome"] = "FAIL".into();
+        failed.row.attempts[0]["status"] = 1.into();
+        failed.evidence_identity = failed.row.evidence_identity().unwrap();
+        let pass = &mut retried.get_mut(id).unwrap()[0];
+        pass.row.attempt = 2;
+        pass.evidence_identity = pass.row.evidence_identity().unwrap();
+        retried.get_mut(id).unwrap().insert(0, failed);
+        let mut retry_events = events.clone();
+        retry_events[0].series.run_index = 2;
+        let mut fail_event = retry_events[0].clone();
+        fail_event.event_id.push_str("-failed");
+        fail_event.series.run_index = 1;
+        fail_event.series.result = Some(ObservedResult::CrashError);
+        fail_event.series.failure_class = Some(FailureClass::ProductFailure);
+        fail_event.series.outcome = SeriesOutcome::Errored;
+        retry_events.push(fail_event);
+        let receipts =
+            retain_selected_custom_results(&tracked, &selected, &retried, &retry_events).unwrap();
+        assert_eq!(receipts.receipts.len(), 4);
+        assert_eq!(receipts.event_ids.len(), 4);
+        assert_eq!(
+            receipts
+                .receipts
+                .iter()
+                .filter(|receipt| receipt.contains("outcome=FAIL"))
+                .count(),
+            1
+        );
+        // The producer may losslessly fold consecutive equal attempts. Accept
+        // the complete raw population, but refuse the same span with a hole.
+        let first = &mut retried.get_mut(id).unwrap()[0];
+        first.row.outcome = "PASS".into();
+        first.row.result = Some(ObservedResult::Pass);
+        first.row.failure_class = None;
+        first.row.attempts[0]["outcome"] = "PASS".into();
+        first.row.attempts[0]["status"] = 0.into();
+        first.evidence_identity = first.row.evidence_identity().unwrap();
+        let mut folded = events.clone();
+        folded[0].series.last_run_index = Some(2);
+        folded[0].series.num_runs = 2;
+        let receipts = retain_selected_custom_results(&tracked, &selected, &retried, &folded).unwrap();
+        assert_eq!(receipts.receipts.len(), 4);
+        assert_eq!(receipts.event_ids.len(), 3);
+        folded[0].series.last_run_index = None;
+        let implicit = retain_selected_custom_results(&tracked, &selected, &retried, &folded).unwrap();
+        assert_eq!(implicit.receipts, receipts.receipts);
+        assert_eq!(implicit.event_ids, receipts.event_ids);
+        assert!(retain_selected_custom_results(&tracked, &selected, &candidates, &folded).is_err());
+        folded[0].series.run_index = u64::MAX;
+        assert_eq!(series_last_run_index(&folded[0]), None);
+        assert!(retain_selected_custom_results(&tracked, &selected, &retried, &folded).is_err());
+        assert_eq!(serde_json::to_value(tracked.cells).unwrap(), comparable);
     }
 
     #[test]
