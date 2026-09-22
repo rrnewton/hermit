@@ -9,13 +9,15 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::fs::OpenOptions;
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::path::Path;
 use std::path::PathBuf;
 
 use detcore::BlockingMode;
+use detcore::network_replay::NetworkTracePublication;
+use detcore_model::config::Epoch;
 use detcore_model::config::MountInfoRootRewrite;
 use detcore_model::network_trace::MAX_NETWORK_TRACE_PAYLOAD_BYTES;
 use detcore_model::network_trace::NETWORK_TRACE_MAGIC;
@@ -144,7 +146,14 @@ impl RecordVersion {
 // a 0x117 reader cannot reconstruct schedule-independent network state from an
 // old syscall-local event. Exact version selection therefore refuses both
 // directions rather than falling back to the live network.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x117);
+//
+// 0x117 -> 0x118: metadata now persists the one exact logical epoch selected
+// before recording starts. Replay seeds Detcore from that value and requires
+// the content-addressed V2 network sidecar to carry the same epoch. A 0x117
+// recording has no metadata authority for this value, so accepting it would
+// either recapture wall time during replay or silently run the scheduler and
+// network availability model in different absolute time domains.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x118);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -169,7 +178,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x117);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x117;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x118;
 
 /// Final network trace sidecar name within a full recording.
 pub(crate) const NETWORK_TRACE_NAME: &str = "network.trace";
@@ -227,6 +236,13 @@ pub struct Metadata {
     pub envs: BTreeMap<String, String>,
     /// Hermit record/replay version.
     pub version: RecordVersion,
+    /// Exact logical epoch resolved once before the recording guest starts.
+    ///
+    /// Full replay must reuse this value rather than consulting wall time or a
+    /// fresh [`detcore::Config::default`]. The network sidecar is required to
+    /// carry the same epoch so scheduler time and network availability share
+    /// one absolute domain.
+    pub epoch: Epoch,
     /// Finalized schedule-independent external-network sidecar.
     ///
     /// Version 0x117 and later require this field. `None` marks an incomplete
@@ -256,7 +272,7 @@ pub struct Metadata {
 impl Metadata {
     /// Creates a new metadata object, populating it with information about a
     /// command.
-    pub fn new(command: &Command) -> Result<Self, Error> {
+    pub fn new(command: &Command, epoch: Epoch) -> Result<Self, Error> {
         let exe = command.find_program()?;
 
         let program = command.get_program().to_string_lossy().into_owned();
@@ -299,6 +315,7 @@ impl Metadata {
             domainname,
             envs,
             version: RECORD_VERSION,
+            epoch,
             network_trace: None,
             mountinfo_root_rewrites: Vec::new(),
             mountinfo_mount_ids: Vec::new(),
@@ -330,7 +347,11 @@ impl Metadata {
     }
 }
 
-pub fn record_or_replay_config(data: &Path, phase: FullReplayPhase) -> detcore::Config {
+pub fn record_or_replay_config(
+    data: &Path,
+    phase: FullReplayPhase,
+    epoch: Epoch,
+) -> detcore::Config {
     // NOTE: Record and replay share the same Detcore configuration except for
     // the direction and filename of the one network sidecar. Callers add the
     // completed producer namespace's mountinfo order and unlisted fdinfo
@@ -424,7 +445,10 @@ pub fn record_or_replay_config(data: &Path, phase: FullReplayPhase) -> detcore::
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),
         clock_multiplier: None,
-        epoch: default_config.epoch,
+        // The caller owns epoch selection. In particular replay supplies the
+        // exact persisted metadata value; this function never substitutes the
+        // freshly constructed default config's epoch.
+        epoch,
         gdbserver: false,
         gdbserver_port: default_config.gdbserver_port,
         kill_daemons: default_config.kill_daemons,
@@ -439,13 +463,14 @@ pub fn record_or_replay_config(data: &Path, phase: FullReplayPhase) -> detcore::
         sched_heuristic: Default::default(),
         sched_seed: default_config.sched_seed,
         network_trace: match phase {
-            FullReplayPhase::Record => {
-                NetworkTraceConfig::record(data.join(NETWORK_TRACE_PENDING_NAME))
-            }
+            FullReplayPhase::Record => NetworkTraceConfig::record(data.join(NETWORK_TRACE_NAME)),
             FullReplayPhase::Replay => {
                 NetworkTraceConfig::replay(data.join(NETWORK_TRACE_NAME), None)
             }
         },
+        network_trace_input: None,
+        network_trace_output_fd: None,
+        epoch_explicit: true,
         recordreplay_modes: true,
         record_preemptions: false,
         record_preemptions_to: None,
@@ -510,28 +535,17 @@ fn path_entry_exists(path: &Path) -> Result<bool, Error> {
     }
 }
 
-/// Validate and atomically publish the pending V2 sidecar.
+/// Validate and atomically publish the reserved V2 sidecar.
 ///
-/// The Detcore runtime owns trace production. This helper is the narrow
-/// handoff boundary: after the tracer has stopped writing, it validates the
-/// framed codec, fsyncs the completed file, renames it atomically, and returns
-/// the metadata committed by [`crate::record::Record`].
-pub(crate) fn finalize_network_trace_recording(data: &Path) -> Result<NetworkTraceArtifact, Error> {
-    let pending = data.join(NETWORK_TRACE_PENDING_NAME);
-    let final_path = data.join(NETWORK_TRACE_NAME);
-    if path_entry_exists(&final_path)? {
-        return Err(Error::msg(format!(
-            "refusing to replace finalized network trace {}",
-            final_path.display()
-        )));
-    }
-
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&pending)
-        .with_context(|| format!("Missing network trace sidecar {}", pending.display()))?;
+/// The Detcore runtime writes through a duplicate of `publication`'s already
+/// open private file. This helper reads that same open file description after
+/// the tracer stops, validates its framed codec and epoch, and commits it with
+/// a no-replace rename. It never reopens the destination pathname.
+pub(crate) fn finalize_network_trace_recording(
+    mut publication: NetworkTracePublication,
+    expected_epoch: Epoch,
+) -> Result<NetworkTraceArtifact, Error> {
+    let file = publication.writer();
     let file_metadata = file.metadata()?;
     if !file_metadata.file_type().is_file() {
         return Err(Error::msg("pending network trace is not a regular file"));
@@ -543,27 +557,29 @@ pub(crate) fn finalize_network_trace_recording(data: &Path) -> Result<NetworkTra
         )));
     }
     let mut bytes = Vec::new();
+    file.seek(SeekFrom::Start(0))?;
     file.read_to_end(&mut bytes)?;
-    match NetworkTrace::read_framed(bytes.as_slice())
+    let trace_epoch = match NetworkTrace::read_framed(bytes.as_slice())
         .context("Failed to validate recorded network trace sidecar")?
     {
-        NetworkTrace::V2(_) => {}
+        NetworkTrace::V2(trace) => trace.epoch,
         NetworkTrace::V1(_) => {
             return Err(Error::msg(
                 "new full recordings require network trace codec V2",
             ));
         }
+    };
+    if trace_epoch != expected_epoch {
+        return Err(Error::msg(format!(
+            "recorded network trace epoch {} does not match recording metadata epoch {}",
+            trace_epoch.to_rfc3339(),
+            expected_epoch.to_rfc3339()
+        )));
     }
     let digest = detcore::Digest::new(&bytes);
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&pending, &final_path).with_context(|| {
-        format!(
-            "Failed to atomically finalize network trace {}",
-            final_path.display()
-        )
+    publication.commit().map_err(|error| {
+        Error::msg(format!("Failed to publish recorded network trace: {error}"))
     })?;
-    fs::File::open(data)?.sync_all()?;
     Ok(NetworkTraceArtifact {
         codec_version: NETWORK_TRACE_VERSION_V2,
         length,
@@ -571,8 +587,15 @@ pub(crate) fn finalize_network_trace_recording(data: &Path) -> Result<NetworkTra
     })
 }
 
-/// Validate the exact finalized sidecar named by current full-replay metadata.
-pub(crate) fn validate_network_trace_replay(data: &Path, metadata: &Metadata) -> Result<(), Error> {
+/// Validate and return the exact finalized sidecar named by full-replay metadata.
+///
+/// The returned bytes are the bytes whose length, digest, codec and epoch were
+/// checked here in the host namespace. Passing them through the Detcore config
+/// keeps replay from reopening a pathname after container setup.
+pub(crate) fn validate_network_trace_replay(
+    mut file: fs::File,
+    metadata: &Metadata,
+) -> Result<Vec<u8>, Error> {
     let artifact = metadata
         .network_trace
         .as_ref()
@@ -583,12 +606,6 @@ pub(crate) fn validate_network_trace_replay(data: &Path, metadata: &Metadata) ->
             artifact.codec_version, NETWORK_TRACE_VERSION_V2
         )));
     }
-    let path = data.join(NETWORK_TRACE_NAME);
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-        .with_context(|| format!("Missing network trace sidecar {}", path.display()))?;
     let file_metadata = file.metadata()?;
     if !file_metadata.file_type().is_file() {
         return Err(Error::msg("network trace sidecar is not a regular file"));
@@ -616,14 +633,24 @@ pub(crate) fn validate_network_trace_replay(data: &Path, metadata: &Metadata) ->
             artifact.digest, actual_digest
         )));
     }
-    match NetworkTrace::read_framed(bytes.as_slice())
+    let trace_epoch = match NetworkTrace::read_framed(bytes.as_slice())
         .context("Failed to decode network trace sidecar")?
     {
-        NetworkTrace::V2(_) => Ok(()),
-        NetworkTrace::V1(_) => Err(Error::msg(
-            "full replay metadata requires network trace codec V2",
-        )),
+        NetworkTrace::V2(trace) => trace.epoch,
+        NetworkTrace::V1(_) => {
+            return Err(Error::msg(
+                "full replay metadata requires network trace codec V2",
+            ));
+        }
+    };
+    if trace_epoch != metadata.epoch {
+        return Err(Error::msg(format!(
+            "network trace epoch {} does not match recording metadata epoch {}",
+            trace_epoch.to_rfc3339(),
+            metadata.epoch.to_rfc3339()
+        )));
     }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -634,6 +661,14 @@ mod tests {
     use reverie::syscalls::Sysno;
 
     use super::*;
+
+    fn epoch() -> Epoch {
+        "2026-01-01T00:00:00Z".parse().unwrap()
+    }
+
+    fn other_epoch() -> Epoch {
+        "2026-01-02T00:00:00Z".parse().unwrap()
+    }
 
     #[test]
     fn record_version_requires_an_exact_match() {
@@ -671,7 +706,8 @@ mod tests {
 
     #[test]
     fn record_and_replay_preserve_partial_subscriptions_and_fail_closed() {
-        let config = record_or_replay_config(Path::new("replay-data"), FullReplayPhase::Record);
+        let config =
+            record_or_replay_config(Path::new("replay-data"), FullReplayPhase::Record, epoch());
         assert!(config.passthru_opt);
         assert!(config.panic_on_unsupported_syscalls);
         assert!(config.exit_on_unsupported_syscall);
@@ -683,7 +719,8 @@ mod tests {
         let run_default = detcore::Config::default();
         assert_eq!(run_default.memory, 1_000_000_000);
         assert_eq!(
-            record_or_replay_config(Path::new("replay-data"), FullReplayPhase::Record).memory,
+            record_or_replay_config(Path::new("replay-data"), FullReplayPhase::Record, epoch(),)
+                .memory,
             run_default.memory
         );
     }
@@ -704,7 +741,8 @@ mod tests {
     /// defect the disclosure exists to close.
     #[test]
     fn recording_does_not_virtualize_time_as_documented() {
-        let config = record_or_replay_config(Path::new("replay-data"), FullReplayPhase::Record);
+        let config =
+            record_or_replay_config(Path::new("replay-data"), FullReplayPhase::Record, epoch());
         assert!(
             !config.virtualize_time,
             "record/replay must not virtualize time; a green replay verdict would \
@@ -721,9 +759,9 @@ mod tests {
     #[test]
     fn record_and_replay_subscribe_every_determinized_syscall() {
         let record_config =
-            record_or_replay_config(Path::new("replay-data"), FullReplayPhase::Record);
+            record_or_replay_config(Path::new("replay-data"), FullReplayPhase::Record, epoch());
         let replay_config =
-            record_or_replay_config(Path::new("replay-data"), FullReplayPhase::Replay);
+            record_or_replay_config(Path::new("replay-data"), FullReplayPhase::Replay, epoch());
         let record =
             <detcore::Detcore<crate::recorder::Recorder> as Tool>::subscriptions(&record_config);
         let replay =
@@ -779,79 +817,129 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x102)));
     }
 
-    fn write_pending_v2(directory: &Path) {
+    fn publication_with_v2(directory: &Path, trace_epoch: Epoch) -> NetworkTracePublication {
         let trace = NetworkTraceV2 {
-            epoch: detcore::Config::default().epoch,
+            epoch: trace_epoch,
             channels: Vec::new(),
             inputs: Vec::new(),
             outputs: Vec::new(),
         };
-        let file = fs::File::create(directory.join(NETWORK_TRACE_PENDING_NAME)).unwrap();
-        trace.write_framed(file).unwrap();
+        let mut publication =
+            NetworkTracePublication::reserve(&directory.join(NETWORK_TRACE_NAME)).unwrap();
+        trace.write_framed(publication.writer()).unwrap();
+        publication
     }
 
-    fn metadata_with_artifact(artifact: NetworkTraceArtifact) -> Metadata {
-        let mut metadata = Metadata::new(&Command::new("/bin/true")).unwrap();
+    fn metadata_with_artifact(artifact: NetworkTraceArtifact, metadata_epoch: Epoch) -> Metadata {
+        let mut metadata = Metadata::new(&Command::new("/bin/true"), metadata_epoch).unwrap();
         metadata.network_trace = Some(artifact);
         metadata
     }
 
     #[test]
+    fn metadata_round_trip_preserves_the_exact_epoch() {
+        let metadata = Metadata::new(&Command::new("/bin/true"), epoch()).unwrap();
+        let bytes = serde_json::to_vec(&metadata).unwrap();
+        let decoded: Metadata = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.version, RECORD_VERSION);
+        assert_eq!(decoded.epoch, epoch());
+    }
+
+    #[test]
     fn full_replay_config_uses_one_sidecar_for_record_and_replay() {
         let directory = Path::new("recording");
-        let record = record_or_replay_config(directory, FullReplayPhase::Record);
+        let record = record_or_replay_config(directory, FullReplayPhase::Record, epoch());
         assert_eq!(
             record.network_trace,
-            NetworkTraceConfig::record(directory.join(NETWORK_TRACE_PENDING_NAME))
+            NetworkTraceConfig::record(directory.join(NETWORK_TRACE_NAME))
         );
-        let replay = record_or_replay_config(directory, FullReplayPhase::Replay);
+        let replay = record_or_replay_config(directory, FullReplayPhase::Replay, epoch());
         assert_eq!(
             replay.network_trace,
             NetworkTraceConfig::replay(directory.join(NETWORK_TRACE_NAME), None)
         );
+        assert_eq!(record.epoch, epoch());
+        assert_eq!(replay.epoch, record.epoch);
+        assert!(record.epoch_explicit);
+        assert!(replay.epoch_explicit);
     }
 
     #[test]
     fn network_sidecar_is_validated_then_atomically_published() {
         let directory = tempfile::tempdir().unwrap();
-        write_pending_v2(directory.path());
-        let artifact = finalize_network_trace_recording(directory.path()).unwrap();
+        let publication = publication_with_v2(directory.path(), epoch());
+        let artifact = finalize_network_trace_recording(publication, epoch()).unwrap();
         assert_eq!(artifact.codec_version, NETWORK_TRACE_VERSION_V2);
         assert!(!directory.path().join(NETWORK_TRACE_PENDING_NAME).exists());
         assert!(directory.path().join(NETWORK_TRACE_NAME).is_file());
-        let metadata = metadata_with_artifact(artifact);
-        validate_network_trace_replay(directory.path(), &metadata).unwrap();
+        let metadata = metadata_with_artifact(artifact, epoch());
+        let file = fs::File::open(directory.path().join(NETWORK_TRACE_NAME)).unwrap();
+        let verified = validate_network_trace_replay(file, &metadata).unwrap();
+        assert!(!verified.is_empty());
     }
 
     #[test]
     fn network_sidecar_replay_fails_closed_on_missing_corrupt_or_wrong_metadata() {
         let directory = tempfile::tempdir().unwrap();
-        let missing_metadata = Metadata::new(&Command::new("/bin/true")).unwrap();
+        let missing_metadata = Metadata::new(&Command::new("/bin/true"), epoch()).unwrap();
         assert!(
-            validate_network_trace_replay(directory.path(), &missing_metadata)
+            validate_network_trace_replay(fs::File::open("/dev/null").unwrap(), &missing_metadata,)
                 .unwrap_err()
                 .to_string()
                 .contains("metadata is missing")
         );
 
-        write_pending_v2(directory.path());
-        let artifact = finalize_network_trace_recording(directory.path()).unwrap();
-        let metadata = metadata_with_artifact(artifact.clone());
+        let publication = publication_with_v2(directory.path(), epoch());
+        let artifact = finalize_network_trace_recording(publication, epoch()).unwrap();
+        let metadata = metadata_with_artifact(artifact.clone(), epoch());
         fs::write(directory.path().join(NETWORK_TRACE_NAME), b"corrupt").unwrap();
-        let error = validate_network_trace_replay(directory.path(), &metadata).unwrap_err();
+        let file = fs::File::open(directory.path().join(NETWORK_TRACE_NAME)).unwrap();
+        let error = validate_network_trace_replay(file, &metadata).unwrap_err();
         assert!(
             error.to_string().contains("length mismatch")
                 || error.to_string().contains("digest mismatch")
         );
 
-        let mut wrong_version = metadata_with_artifact(artifact);
+        let mut wrong_version = metadata_with_artifact(artifact, epoch());
         wrong_version.network_trace.as_mut().unwrap().codec_version =
             detcore_model::network_trace::NETWORK_TRACE_VERSION_V1;
         assert!(
-            validate_network_trace_replay(directory.path(), &wrong_version)
-                .unwrap_err()
-                .to_string()
-                .contains("unsupported network trace codec version")
+            validate_network_trace_replay(
+                fs::File::open(directory.path().join(NETWORK_TRACE_NAME)).unwrap(),
+                &wrong_version,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported network trace codec version")
         );
+    }
+
+    #[test]
+    fn network_sidecar_epoch_mismatch_refuses_before_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let publication = publication_with_v2(directory.path(), epoch());
+        let artifact = finalize_network_trace_recording(publication, epoch()).unwrap();
+        let metadata = metadata_with_artifact(artifact, other_epoch());
+        let file = fs::File::open(directory.path().join(NETWORK_TRACE_NAME)).unwrap();
+        let error = validate_network_trace_replay(file, &metadata).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match recording metadata epoch")
+        );
+    }
+
+    #[test]
+    fn recording_refuses_to_publish_a_sidecar_from_another_epoch() {
+        let directory = tempfile::tempdir().unwrap();
+        let publication = publication_with_v2(directory.path(), epoch());
+        let error = finalize_network_trace_recording(publication, other_epoch()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match recording metadata epoch")
+        );
+        assert!(!directory.path().join(NETWORK_TRACE_PENDING_NAME).exists());
+        assert!(!directory.path().join(NETWORK_TRACE_NAME).exists());
     }
 }
