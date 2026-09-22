@@ -1826,7 +1826,12 @@ pub struct VerifiedValidationEvidenceV10 {
     pub full_backend_parity: bool,
 }
 
-fn validate_ordinary_verdict(identity: &CellIdentity, verdict: &CellVerdict) -> Result<(), String> {
+/// Validate the existing canonical ordinary-comparison contract independently
+/// of its carrier. Public derived operands use the same mode and INFO policy.
+pub fn validate_ordinary_verdict(
+    identity: &CellIdentity,
+    verdict: &CellVerdict,
+) -> Result<(), String> {
     match verdict {
         CellVerdict::ComparedAndMatched {
             comparison_tier,
