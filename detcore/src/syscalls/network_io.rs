@@ -8,6 +8,8 @@
 
 //! Single guest-memory adapter for engine-owned network syscalls.
 
+use std::time::Duration;
+
 use detcore_model::network_trace::NetworkAddressV2;
 use detcore_model::network_trace::NetworkChannelId;
 use detcore_model::network_trace::NetworkChannelV2;
@@ -16,6 +18,7 @@ use detcore_model::network_trace::NetworkEndpointRoleV2;
 use detcore_model::network_trace::NetworkInputEventV2;
 use detcore_model::network_trace::NetworkInputKindV2;
 use detcore_model::network_trace::NetworkPolicy;
+use detcore_model::network_trace::NetworkReadinessV2;
 use detcore_model::network_trace::NetworkReleaseV2;
 use detcore_model::network_trace::NetworkShutdownV2;
 use detcore_model::network_trace::NetworkTransportV2;
@@ -47,6 +50,7 @@ use crate::tool_global::NetworkStreamTransmit;
 use crate::tool_global::network_request;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
+use crate::types::LogicalTime;
 use crate::types::OpenFileId;
 
 fn engine_error(error: impl std::fmt::Display) -> Error {
@@ -99,6 +103,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             Syscall::Recvmsg(call) => self.network_open_file(guest, call.sockfd()).is_some(),
             Syscall::Sendmsg(call) => self.network_open_file(guest, call.fd()).is_some(),
             Syscall::Shutdown(call) => self.network_open_file(guest, call.fd()).is_some(),
+            Syscall::Poll(call) => self.poll_array_has_network_fd(
+                guest,
+                call.fds().map(|address| address.cast()),
+                call.nfds(),
+            ),
+            Syscall::Ppoll(call) => self.poll_array_has_network_fd(guest, call.fds(), call.nfds()),
+            Syscall::Select(call) => self.select_has_network_fd(
+                guest,
+                call.nfds(),
+                call.readfds(),
+                call.writefds(),
+                call.exceptfds(),
+            ),
+            Syscall::Pselect6(call) => self.select_has_network_fd(
+                guest,
+                call.nfds(),
+                call.readfds(),
+                call.writefds(),
+                call.exceptfds(),
+            ),
             _ => false,
         }
     }
@@ -152,6 +176,42 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             Syscall::Shutdown(call) if self.network_open_file(guest, call.fd()).is_some() => {
                 Some(self.network_shutdown(guest, call, policy).await)
+            }
+            Syscall::Poll(call)
+                if self.poll_array_has_network_fd(
+                    guest,
+                    call.fds().map(|address| address.cast()),
+                    call.nfds(),
+                ) =>
+            {
+                Some(self.network_poll(guest, call, policy).await)
+            }
+            Syscall::Ppoll(call)
+                if self.poll_array_has_network_fd(guest, call.fds(), call.nfds()) =>
+            {
+                Some(self.network_ppoll(guest, call, policy).await)
+            }
+            Syscall::Select(call)
+                if self.select_has_network_fd(
+                    guest,
+                    call.nfds(),
+                    call.readfds(),
+                    call.writefds(),
+                    call.exceptfds(),
+                ) =>
+            {
+                Some(self.network_select(guest, call, policy).await)
+            }
+            Syscall::Pselect6(call)
+                if self.select_has_network_fd(
+                    guest,
+                    call.nfds(),
+                    call.readfds(),
+                    call.writefds(),
+                    call.exceptfds(),
+                ) =>
+            {
+                Some(self.network_pselect(guest, call, policy).await)
             }
             Syscall::Readv(call) if self.network_open_file(guest, call.fd()).is_some() => {
                 Some(self.network_readv(guest, call, policy).await)
@@ -649,6 +709,409 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
     }
 
+    fn poll_array_has_network_fd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        address: Option<AddrMut<'_, libc::pollfd>>,
+        count: libc::nfds_t,
+    ) -> bool {
+        read_pollfds(guest, address, count).is_ok_and(|fds| {
+            fds.iter()
+                .any(|pollfd| self.network_open_file(guest, pollfd.fd).is_some())
+        })
+    }
+
+    async fn network_poll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Poll,
+        policy: NetworkPolicy,
+    ) -> Result<i64, Error> {
+        let timeout = match call.timeout() {
+            -1 => None,
+            timeout if timeout < -1 => return Err(Errno::EINVAL.into()),
+            timeout => Some(Duration::from_millis(timeout as u64)),
+        };
+        self.network_poll_common(
+            guest,
+            call.into(),
+            NetworkPollState {
+                address: call.fds().map(|address| address.as_raw()),
+                count: call.nfds(),
+                timeout,
+                remaining_address: None,
+            },
+            policy,
+        )
+        .await
+    }
+
+    async fn network_ppoll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Ppoll,
+        policy: NetworkPolicy,
+    ) -> Result<i64, Error> {
+        if call.sigmask().is_some() {
+            return Err(engine_error(
+                "ppoll with a temporary signal mask is not replayable",
+            ));
+        }
+        let timeout = call
+            .timeout()
+            .map(|address| guest.memory().read_value(address))
+            .transpose()?
+            .map(timespec_duration)
+            .transpose()?;
+        self.network_poll_common(
+            guest,
+            call.into(),
+            NetworkPollState {
+                address: call.fds().map(|address| address.as_raw()),
+                count: call.nfds(),
+                timeout,
+                remaining_address: call.timeout().map(|address| address.as_raw()),
+            },
+            policy,
+        )
+        .await
+    }
+
+    async fn network_poll_common<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        live_call: Syscall,
+        state: NetworkPollState,
+        policy: NetworkPolicy,
+    ) -> Result<i64, Error> {
+        let address = state.poll_address()?;
+        let fds = read_pollfds(guest, address, state.count)?;
+        let mut interests = Vec::new();
+        for pollfd in &fds {
+            if pollfd.fd < 0 {
+                continue;
+            }
+            if pollfd.events & (libc::POLLPRI | libc::POLLRDBAND | libc::POLLWRBAND) != 0 {
+                return Err(engine_error(format!(
+                    "unsupported poll event mask {:#x}",
+                    pollfd.events
+                )));
+            }
+            match self.network_open_file(guest, pollfd.fd) {
+                Some(open_file) => interests.push((open_file, NetworkWaitKind::Any)),
+                None if guest.thread_state().with_detfd(pollfd.fd, |_| ()).is_ok() => {
+                    return Err(engine_error(
+                        "mixed network and non-network poll sets are not replayable",
+                    ));
+                }
+                None => {}
+            }
+        }
+
+        match policy {
+            NetworkPolicy::Record => {
+                let result = self.live_network_syscall(guest, live_call).await;
+                let ready_count = match result {
+                    Ok(ready_count) => ready_count,
+                    Err(error) => {
+                        return Err(engine_error(format!(
+                            "poll error outcome is not represented in trace v2: {error}"
+                        )));
+                    }
+                };
+                let observed_at = thread_observe_time(guest).await;
+                let observed = read_pollfds(guest, address, state.count)?;
+                for pollfd in observed {
+                    let Some(open_file) = self.network_open_file(guest, pollfd.fd) else {
+                        continue;
+                    };
+                    network_request(
+                        guest,
+                        NetworkRequest::CaptureReadiness {
+                            open_file,
+                            observed_at,
+                            readiness: poll_revents_to_readiness(pollfd.revents),
+                        },
+                    )
+                    .await
+                    .map_err(engine_error)?;
+                }
+                Ok(ready_count)
+            }
+            NetworkPolicy::Replay => {
+                let start = thread_observe_time(guest).await;
+                let deadline = state.timeout.map(|duration| start + duration);
+                loop {
+                    let now = thread_observe_time(guest).await;
+                    network_request(guest, NetworkRequest::ReleaseEligible(now))
+                        .await
+                        .map_err(engine_error)?;
+                    let mut result = fds.clone();
+                    let mut ready_count = 0i64;
+                    for pollfd in &mut result {
+                        pollfd.revents = 0;
+                        if pollfd.fd < 0 {
+                            continue;
+                        }
+                        let Some(open_file) = self.network_open_file(guest, pollfd.fd) else {
+                            pollfd.revents = libc::POLLNVAL;
+                            ready_count += 1;
+                            continue;
+                        };
+                        let readiness =
+                            match network_request(guest, NetworkRequest::Readiness(open_file))
+                                .await
+                                .map_err(engine_error)?
+                            {
+                                NetworkReply::Readiness(readiness) => readiness,
+                                reply => {
+                                    return Err(engine_error(format!(
+                                        "unexpected readiness reply {reply:?}"
+                                    )));
+                                }
+                            };
+                        pollfd.revents = readiness_to_poll_revents(readiness, pollfd.events);
+                        ready_count += i64::from(pollfd.revents != 0);
+                    }
+                    if ready_count != 0 || deadline.is_some_and(|deadline| now >= deadline) {
+                        write_pollfds(guest, address, &result)?;
+                        write_remaining_timeout(guest, state.remaining_address, deadline, now)?;
+                        return Ok(ready_count);
+                    }
+                    let mut resources = Resources::new(guest.thread_state().dettid);
+                    resources.insert(
+                        ResourceID::NetworkWaitSet {
+                            interests: interests.clone(),
+                            deadline,
+                        },
+                        Permission::R,
+                    );
+                    resource_request(guest, resources).await;
+                }
+            }
+            NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => unreachable!(),
+        }
+    }
+
+    fn select_has_network_fd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        nfds: i32,
+        read_address: Option<AddrMut<'_, libc::fd_set>>,
+        write_address: Option<AddrMut<'_, libc::fd_set>>,
+        except_address: Option<AddrMut<'_, libc::fd_set>>,
+    ) -> bool {
+        read_select_state(
+            guest,
+            nfds,
+            read_address,
+            write_address,
+            except_address,
+            None,
+            SelectTimeoutAddress::None,
+        )
+        .is_ok_and(|state| {
+            (0..state.nfds)
+                .any(|fd| state.requested(fd) && self.network_open_file(guest, fd).is_some())
+        })
+    }
+
+    async fn network_select<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Select,
+        policy: NetworkPolicy,
+    ) -> Result<i64, Error> {
+        let timeout = call
+            .timeout()
+            .map(|address| guest.memory().read_value(address))
+            .transpose()?
+            .map(timeval_duration)
+            .transpose()?;
+        let state = read_select_state(
+            guest,
+            call.nfds(),
+            call.readfds(),
+            call.writefds(),
+            call.exceptfds(),
+            timeout,
+            call.timeout()
+                .map_or(SelectTimeoutAddress::None, |address| {
+                    SelectTimeoutAddress::Timeval(address.as_raw())
+                }),
+        )?;
+        self.network_select_common(guest, call.into(), state, policy)
+            .await
+    }
+
+    async fn network_pselect<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pselect6,
+        policy: NetworkPolicy,
+    ) -> Result<i64, Error> {
+        if call.sigmask().is_some() {
+            return Err(engine_error(
+                "pselect with a temporary signal mask is not replayable",
+            ));
+        }
+        let timeout = call
+            .timeout()
+            .map(|address| guest.memory().read_value(address))
+            .transpose()?
+            .map(timespec_duration)
+            .transpose()?;
+        let state = read_select_state(
+            guest,
+            call.nfds(),
+            call.readfds(),
+            call.writefds(),
+            call.exceptfds(),
+            timeout,
+            call.timeout()
+                .map_or(SelectTimeoutAddress::None, |address| {
+                    SelectTimeoutAddress::Timespec(address.as_raw())
+                }),
+        )?;
+        self.network_select_common(guest, call.into(), state, policy)
+            .await
+    }
+
+    async fn network_select_common<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        live_call: Syscall,
+        state: NetworkSelectState,
+        policy: NetworkPolicy,
+    ) -> Result<i64, Error> {
+        if state
+            .except
+            .as_ref()
+            .is_some_and(|set| (0..state.nfds).any(|fd| fd_is_set(fd, set)))
+        {
+            return Err(engine_error(
+                "select exceptional/OOB readiness is not represented by trace v2",
+            ));
+        }
+        let mut interests = Vec::new();
+        for fd in 0..state.nfds {
+            if !state.requested(fd) {
+                continue;
+            }
+            match self.network_open_file(guest, fd) {
+                Some(open_file) => {
+                    if !interests.contains(&(open_file, NetworkWaitKind::Any)) {
+                        interests.push((open_file, NetworkWaitKind::Any));
+                    }
+                }
+                None if guest.thread_state().with_detfd(fd, |_| ()).is_ok() => {
+                    return Err(engine_error(
+                        "mixed network and non-network select sets are not replayable",
+                    ));
+                }
+                None => return Err(Errno::EBADF.into()),
+            }
+        }
+        match policy {
+            NetworkPolicy::Record => {
+                let ready_count =
+                    self.live_network_syscall(guest, live_call)
+                        .await
+                        .map_err(|error| {
+                            engine_error(format!(
+                                "select error outcome is not represented in trace v2: {error}"
+                            ))
+                        })?;
+                let observed_at = thread_observe_time(guest).await;
+                let observed = state.read_outputs(guest)?;
+                for fd in 0..state.nfds {
+                    let Some(open_file) = self.network_open_file(guest, fd) else {
+                        continue;
+                    };
+                    network_request(
+                        guest,
+                        NetworkRequest::CaptureReadiness {
+                            open_file,
+                            observed_at,
+                            readiness: NetworkReadinessV2 {
+                                readable: observed
+                                    .read
+                                    .as_ref()
+                                    .is_some_and(|set| fd_is_set(fd, set)),
+                                writable: observed
+                                    .write
+                                    .as_ref()
+                                    .is_some_and(|set| fd_is_set(fd, set)),
+                                error: false,
+                                hangup: false,
+                            },
+                        },
+                    )
+                    .await
+                    .map_err(engine_error)?;
+                }
+                Ok(ready_count)
+            }
+            NetworkPolicy::Replay => {
+                let start = thread_observe_time(guest).await;
+                let deadline = state.timeout.map(|duration| start + duration);
+                loop {
+                    let now = thread_observe_time(guest).await;
+                    network_request(guest, NetworkRequest::ReleaseEligible(now))
+                        .await
+                        .map_err(engine_error)?;
+                    let mut output = state.empty_output();
+                    let mut ready_count = 0i64;
+                    for fd in 0..state.nfds {
+                        if !state.requested(fd) {
+                            continue;
+                        }
+                        let open_file = guest.thread_state().socket_open_file_id(fd)?;
+                        let readiness =
+                            match network_request(guest, NetworkRequest::Readiness(open_file))
+                                .await
+                                .map_err(engine_error)?
+                            {
+                                NetworkReply::Readiness(readiness) => readiness,
+                                reply => {
+                                    return Err(engine_error(format!(
+                                        "unexpected readiness reply {reply:?}"
+                                    )));
+                                }
+                            };
+                        let read_ready = state.read.as_ref().is_some_and(|set| fd_is_set(fd, set))
+                            && (readiness.readable || readiness.error || readiness.hangup);
+                        let write_ready =
+                            state.write.as_ref().is_some_and(|set| fd_is_set(fd, set))
+                                && (readiness.writable || readiness.error);
+                        if read_ready {
+                            output.set_read(fd);
+                        }
+                        if write_ready {
+                            output.set_write(fd);
+                        }
+                        ready_count += i64::from(read_ready || write_ready);
+                    }
+                    if ready_count != 0 || deadline.is_some_and(|deadline| now >= deadline) {
+                        output.write(guest)?;
+                        state.write_remaining(guest, deadline, now)?;
+                        return Ok(ready_count);
+                    }
+                    let mut resources = Resources::new(guest.thread_state().dettid);
+                    resources.insert(
+                        ResourceID::NetworkWaitSet {
+                            interests: interests.clone(),
+                            deadline,
+                        },
+                        Permission::R,
+                    );
+                    resource_request(guest, resources).await;
+                }
+            }
+            NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => unreachable!(),
+        }
+    }
+
     async fn network_recvfrom<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -887,6 +1350,352 @@ where
         .collect();
     iovec_capacity(&segments)?;
     Ok(segments)
+}
+
+const MAX_NETWORK_POLL_FDS: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct NetworkPollState {
+    address: Option<usize>,
+    count: libc::nfds_t,
+    timeout: Option<Duration>,
+    remaining_address: Option<usize>,
+}
+
+impl NetworkPollState {
+    fn poll_address(&self) -> Result<Option<AddrMut<'_, libc::pollfd>>, Error> {
+        self.address
+            .map(|raw| AddrMut::from_raw(raw).ok_or_else(|| Errno::EFAULT.into()))
+            .transpose()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SelectTimeoutAddress {
+    None,
+    Timeval(usize),
+    Timespec(usize),
+}
+
+#[derive(Clone)]
+struct NetworkSelectState {
+    nfds: i32,
+    read: Option<libc::fd_set>,
+    write: Option<libc::fd_set>,
+    except: Option<libc::fd_set>,
+    read_address: Option<usize>,
+    write_address: Option<usize>,
+    except_address: Option<usize>,
+    timeout: Option<Duration>,
+    timeout_address: SelectTimeoutAddress,
+}
+
+impl NetworkSelectState {
+    fn requested(&self, fd: i32) -> bool {
+        self.read.as_ref().is_some_and(|set| fd_is_set(fd, set))
+            || self.write.as_ref().is_some_and(|set| fd_is_set(fd, set))
+            || self.except.as_ref().is_some_and(|set| fd_is_set(fd, set))
+    }
+
+    fn empty_output(&self) -> NetworkSelectOutput {
+        NetworkSelectOutput {
+            read: self.read_address.map(|_| empty_fd_set()),
+            write: self.write_address.map(|_| empty_fd_set()),
+            except: self.except_address.map(|_| empty_fd_set()),
+            read_address: self.read_address,
+            write_address: self.write_address,
+            except_address: self.except_address,
+        }
+    }
+
+    fn read_outputs<G, T>(&self, guest: &mut G) -> Result<NetworkSelectOutput, Error>
+    where
+        G: Guest<Detcore<T>>,
+        T: RecordOrReplay,
+    {
+        Ok(NetworkSelectOutput {
+            read: read_fd_set_at(guest, self.read_address)?,
+            write: read_fd_set_at(guest, self.write_address)?,
+            except: read_fd_set_at(guest, self.except_address)?,
+            read_address: self.read_address,
+            write_address: self.write_address,
+            except_address: self.except_address,
+        })
+    }
+
+    fn write_remaining<G, T>(
+        &self,
+        guest: &mut G,
+        deadline: Option<LogicalTime>,
+        now: LogicalTime,
+    ) -> Result<(), Error>
+    where
+        G: Guest<Detcore<T>>,
+        T: RecordOrReplay,
+    {
+        let Some(deadline) = deadline else {
+            return Ok(());
+        };
+        let remaining = if deadline > now {
+            deadline.duration_since(now)
+        } else {
+            Duration::ZERO
+        };
+        match self.timeout_address {
+            SelectTimeoutAddress::None => Ok(()),
+            SelectTimeoutAddress::Timeval(raw) => {
+                let address = AddrMut::from_raw(raw).ok_or(Errno::EFAULT)?;
+                guest.memory().write_value(
+                    address,
+                    &libc::timeval {
+                        tv_sec: remaining.as_secs() as libc::time_t,
+                        tv_usec: remaining.subsec_micros() as libc::suseconds_t,
+                    },
+                )?;
+                Ok(())
+            }
+            SelectTimeoutAddress::Timespec(raw) => {
+                let address = AddrMut::from_raw(raw).ok_or(Errno::EFAULT)?;
+                guest.memory().write_value(
+                    address,
+                    &reverie::syscalls::Timespec {
+                        tv_sec: remaining.as_secs() as libc::time_t,
+                        tv_nsec: remaining.subsec_nanos() as libc::c_long,
+                    },
+                )?;
+                Ok(())
+            }
+        }
+    }
+}
+
+struct NetworkSelectOutput {
+    read: Option<libc::fd_set>,
+    write: Option<libc::fd_set>,
+    except: Option<libc::fd_set>,
+    read_address: Option<usize>,
+    write_address: Option<usize>,
+    except_address: Option<usize>,
+}
+
+impl NetworkSelectOutput {
+    fn set_read(&mut self, fd: i32) {
+        if let Some(set) = &mut self.read {
+            fd_set(fd, set);
+        }
+    }
+
+    fn set_write(&mut self, fd: i32) {
+        if let Some(set) = &mut self.write {
+            fd_set(fd, set);
+        }
+    }
+
+    fn write<G, T>(&self, guest: &mut G) -> Result<(), Error>
+    where
+        G: Guest<Detcore<T>>,
+        T: RecordOrReplay,
+    {
+        write_fd_set_at(guest, self.read_address, self.read.as_ref())?;
+        write_fd_set_at(guest, self.write_address, self.write.as_ref())?;
+        write_fd_set_at(guest, self.except_address, self.except.as_ref())?;
+        Ok(())
+    }
+}
+
+fn empty_fd_set() -> libc::fd_set {
+    // SAFETY: an all-zero fd_set is the empty set.
+    unsafe { std::mem::zeroed() }
+}
+
+fn fd_is_set(fd: i32, set: &libc::fd_set) -> bool {
+    // SAFETY: callers bound fd to [0, FD_SETSIZE), and set is initialized.
+    unsafe { libc::FD_ISSET(fd, set) }
+}
+
+fn fd_set(fd: i32, set: &mut libc::fd_set) {
+    // SAFETY: callers bound fd to [0, FD_SETSIZE), and set is initialized.
+    unsafe { libc::FD_SET(fd, set) }
+}
+
+fn read_fd_set_at<G, T>(guest: &mut G, raw: Option<usize>) -> Result<Option<libc::fd_set>, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    raw.map(|raw| {
+        let address = Addr::<libc::fd_set>::from_raw(raw).ok_or(Errno::EFAULT)?;
+        guest.memory().read_value(address).map_err(Error::from)
+    })
+    .transpose()
+}
+
+fn write_fd_set_at<G, T>(
+    guest: &mut G,
+    raw: Option<usize>,
+    set: Option<&libc::fd_set>,
+) -> Result<(), Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if let (Some(raw), Some(set)) = (raw, set) {
+        let address = AddrMut::from_raw(raw).ok_or(Errno::EFAULT)?;
+        guest.memory().write_value(address, set)?;
+    }
+    Ok(())
+}
+
+fn read_select_state<G, T>(
+    guest: &mut G,
+    nfds: i32,
+    read_address: Option<AddrMut<'_, libc::fd_set>>,
+    write_address: Option<AddrMut<'_, libc::fd_set>>,
+    except_address: Option<AddrMut<'_, libc::fd_set>>,
+    timeout: Option<Duration>,
+    timeout_address: SelectTimeoutAddress,
+) -> Result<NetworkSelectState, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if nfds < 0 || nfds as usize > libc::FD_SETSIZE {
+        return Err(Errno::EINVAL.into());
+    }
+    let read_address = read_address.map(|address| address.as_raw());
+    let write_address = write_address.map(|address| address.as_raw());
+    let except_address = except_address.map(|address| address.as_raw());
+    Ok(NetworkSelectState {
+        nfds,
+        read: read_fd_set_at(guest, read_address)?,
+        write: read_fd_set_at(guest, write_address)?,
+        except: read_fd_set_at(guest, except_address)?,
+        read_address,
+        write_address,
+        except_address,
+        timeout,
+        timeout_address,
+    })
+}
+
+fn read_pollfds<G, T>(
+    guest: &mut G,
+    address: Option<AddrMut<'_, libc::pollfd>>,
+    count: libc::nfds_t,
+) -> Result<Vec<libc::pollfd>, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let count = usize::try_from(count).map_err(|_| Errno::EINVAL)?;
+    if count > MAX_NETWORK_POLL_FDS {
+        return Err(Errno::EINVAL.into());
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let address = address.ok_or(Errno::EFAULT)?;
+    let mut pollfds = vec![
+        libc::pollfd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        };
+        count
+    ];
+    guest.memory().read_values(address.into(), &mut pollfds)?;
+    Ok(pollfds)
+}
+
+fn write_pollfds<G, T>(
+    guest: &mut G,
+    address: Option<AddrMut<'_, libc::pollfd>>,
+    pollfds: &[libc::pollfd],
+) -> Result<(), Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if pollfds.is_empty() {
+        return Ok(());
+    }
+    guest
+        .memory()
+        .write_values(address.ok_or(Errno::EFAULT)?, pollfds)?;
+    Ok(())
+}
+
+fn timespec_duration(timespec: reverie::syscalls::Timespec) -> Result<Duration, Error> {
+    if timespec.tv_sec < 0 || !(0..1_000_000_000).contains(&timespec.tv_nsec) {
+        return Err(Errno::EINVAL.into());
+    }
+    Ok(Duration::new(
+        timespec.tv_sec as u64,
+        timespec.tv_nsec as u32,
+    ))
+}
+
+fn timeval_duration(timeval: libc::timeval) -> Result<Duration, Error> {
+    if timeval.tv_sec < 0 || !(0..1_000_000).contains(&timeval.tv_usec) {
+        return Err(Errno::EINVAL.into());
+    }
+    Ok(Duration::new(
+        timeval.tv_sec as u64,
+        (timeval.tv_usec as u32) * 1_000,
+    ))
+}
+
+fn write_remaining_timeout<G, T>(
+    guest: &mut G,
+    address: Option<usize>,
+    deadline: Option<LogicalTime>,
+    now: LogicalTime,
+) -> Result<(), Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (Some(address), Some(deadline)) = (address, deadline) else {
+        return Ok(());
+    };
+    let address = AddrMut::from_raw(address).ok_or(Errno::EFAULT)?;
+    let remaining = if deadline > now {
+        deadline.duration_since(now)
+    } else {
+        Duration::ZERO
+    };
+    let remaining = reverie::syscalls::Timespec {
+        tv_sec: remaining.as_secs() as libc::time_t,
+        tv_nsec: remaining.subsec_nanos() as libc::c_long,
+    };
+    guest.memory().write_value(address, &remaining)?;
+    Ok(())
+}
+
+fn poll_revents_to_readiness(revents: i16) -> NetworkReadinessV2 {
+    NetworkReadinessV2 {
+        readable: revents & (libc::POLLIN | libc::POLLRDNORM) != 0,
+        writable: revents & (libc::POLLOUT | libc::POLLWRNORM) != 0,
+        error: revents & libc::POLLERR != 0,
+        hangup: revents & libc::POLLHUP != 0,
+    }
+}
+
+fn readiness_to_poll_revents(readiness: NetworkReadinessV2, events: i16) -> i16 {
+    let mut revents = 0;
+    if readiness.readable {
+        revents |= events & (libc::POLLIN | libc::POLLRDNORM);
+    }
+    if readiness.writable {
+        revents |= events & (libc::POLLOUT | libc::POLLWRNORM);
+    }
+    if readiness.error {
+        revents |= libc::POLLERR;
+    }
+    if readiness.hangup {
+        revents |= libc::POLLHUP;
+    }
+    revents
 }
 
 fn iovec_capacity(segments: &[(usize, usize)]) -> Result<usize, Error> {
@@ -1160,5 +1969,49 @@ mod tests {
                 .len(),
             path_offset
         );
+    }
+
+    #[test]
+    fn poll_readiness_respects_interest_but_always_reports_error_and_hangup() {
+        let readiness = NetworkReadinessV2 {
+            readable: true,
+            writable: true,
+            error: true,
+            hangup: true,
+        };
+        assert_eq!(
+            readiness_to_poll_revents(readiness, libc::POLLIN),
+            libc::POLLIN | libc::POLLERR | libc::POLLHUP
+        );
+        assert_eq!(
+            readiness_to_poll_revents(readiness, libc::POLLOUT),
+            libc::POLLOUT | libc::POLLERR | libc::POLLHUP
+        );
+    }
+
+    #[test]
+    fn readiness_timeouts_reject_non_linux_shapes_without_rounding() {
+        assert_eq!(
+            timespec_duration(reverie::syscalls::Timespec {
+                tv_sec: 2,
+                tv_nsec: 345_678_901,
+            })
+            .unwrap(),
+            Duration::new(2, 345_678_901)
+        );
+        assert!(matches!(
+            timespec_duration(reverie::syscalls::Timespec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000_000,
+            }),
+            Err(Error::Errno(errno)) if errno == Errno::EINVAL
+        ));
+        assert!(matches!(
+            timeval_duration(libc::timeval {
+                tv_sec: -1,
+                tv_usec: 0,
+            }),
+            Err(Error::Errno(errno)) if errno == Errno::EINVAL
+        ));
     }
 }

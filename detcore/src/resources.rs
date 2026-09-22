@@ -269,6 +269,15 @@ pub enum ResourceID {
         kind: NetworkWaitKind,
     },
 
+    /// Wait until any modeled socket condition becomes ready or an exact
+    /// continuous-virtual-time deadline expires.
+    NetworkWaitSet {
+        /// Stable OFD interests. Raw descriptor reuse cannot retarget them.
+        interests: Vec<(OpenFileId, NetworkWaitKind)>,
+        /// Absolute timeout; `None` represents an indefinite wait.
+        deadline: Option<LogicalTime>,
+    },
+
     /// An internal event that is only used when implementing context switches under tracereplay.
     /// It should not bump global time.
     TraceReplay,

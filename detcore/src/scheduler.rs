@@ -314,7 +314,7 @@ pub struct BlockedPool {
     /// Replay waiters keyed by stable open-file description.  Multiple dup/fork
     /// aliases may wait on the same socket; readiness wakes all eligible
     /// threads and the normal scheduler order decides which one consumes it.
-    pub network_waiters: BTreeMap<DetTid, (OpenFileId, NetworkWaitKind)>,
+    pub network_waiters: BTreeMap<DetTid, Vec<(OpenFileId, NetworkWaitKind)>>,
 }
 
 impl BlockedPool {
@@ -2744,24 +2744,34 @@ impl Scheduler {
                 return Err(SkipTurn);
             }
             let mut ready = Vec::new();
-            for (&dettid, &(open_file, kind)) in &self.blocked.network_waiters {
-                match engine.readiness(open_file) {
-                    Ok(readiness) if Self::network_wait_is_ready(readiness, kind) => {
-                        ready.push(dettid);
+            for (&dettid, interests) in &self.blocked.network_waiters {
+                let mut any_ready = false;
+                for &(open_file, kind) in interests {
+                    match engine.readiness(open_file) {
+                        Ok(readiness) if Self::network_wait_is_ready(readiness, kind) => {
+                            any_ready = true;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            self.terminal_deadlock.get_or_insert_with(|| {
+                                format!(
+                                    "network replay readiness failed for {open_file:?}: {error}"
+                                )
+                            });
+                            return Err(SkipTurn);
+                        }
                     }
-                    Ok(_) => {}
-                    Err(error) => {
-                        self.terminal_deadlock.get_or_insert_with(|| {
-                            format!("network replay readiness failed for {open_file:?}: {error}")
-                        });
-                        return Err(SkipTurn);
-                    }
+                }
+                if any_ready {
+                    ready.push(dettid);
                 }
             }
             ready
         };
         for dettid in ready {
             assert!(self.blocked.network_waiters.remove(&dettid).is_some());
+            self.blocked.timed_waiters.remove(dettid);
             self.runqueue_push_back(dettid);
         }
         Ok(())
@@ -3079,6 +3089,7 @@ impl Scheduler {
     }
 
     fn wake_timed_event(&mut self, time_ns: LogicalTime, dettid: DetTid) {
+        self.blocked.network_waiters.remove(&dettid);
         let futex_timed_out = {
             let next_turn = self
                 .next_turns
@@ -4342,9 +4353,56 @@ impl Scheduler {
                     assert!(
                         self.blocked
                             .network_waiters
-                            .insert(dettid, (*open_file, *kind))
+                            .insert(dettid, vec![(*open_file, *kind)])
                             .is_none()
                     );
+                    self.skip_turn_blocked(dettid)
+                }
+            }
+
+            ResourceID::NetworkWaitSet {
+                interests,
+                deadline,
+            } => {
+                let Some(engine) = self.network_engine.as_ref() else {
+                    self.terminal_deadlock.get_or_insert_with(|| {
+                        "network wait set requested without a capture/replay engine".to_owned()
+                    });
+                    return Err(SkipTurn);
+                };
+                let readiness = {
+                    let engine = engine.lock().unwrap();
+                    interests
+                        .iter()
+                        .map(|&(open_file, kind)| {
+                            engine
+                                .readiness(open_file)
+                                .map(|readiness| Self::network_wait_is_ready(readiness, kind))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                let ready = match readiness {
+                    Ok(readiness) => readiness.into_iter().any(|ready| ready),
+                    Err(error) => {
+                        self.terminal_deadlock.get_or_insert_with(|| {
+                            format!("network replay wait-set readiness failed: {error}")
+                        });
+                        return Err(SkipTurn);
+                    }
+                };
+                if ready || deadline.is_some_and(|deadline| deadline <= self.committed_time) {
+                    Ok(())
+                } else {
+                    assert!(!interests.is_empty());
+                    assert!(
+                        self.blocked
+                            .network_waiters
+                            .insert(dettid, interests.clone())
+                            .is_none()
+                    );
+                    if let Some(deadline) = deadline {
+                        self.blocked.timed_waiters.insert(*deadline, dettid);
+                    }
                     self.skip_turn_blocked(dettid)
                 }
             }

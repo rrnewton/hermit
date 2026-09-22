@@ -2902,6 +2902,31 @@ impl GlobalState {
                     Ok(NetworkReply::Unit)
                 })()
             }
+            NetworkRequest::CaptureReadiness {
+                open_file,
+                observed_at,
+                readiness,
+            } => (|| -> Result<NetworkReply, NetworkReplayError> {
+                let channel = engine
+                    .channel_for(open_file)
+                    .ok_or(NetworkReplayError::UnboundOpenFile(open_file))?;
+                let outbound_stream = self
+                    .network_record_progress
+                    .lock()
+                    .unwrap()
+                    .get(&open_file)
+                    .map_or(0, |progress| progress.outbound_stream);
+                engine.record_input(NetworkInputEventV2 {
+                    ordinal: 0,
+                    channel,
+                    release: NetworkReleaseV2 {
+                        not_before_global_time: observed_at,
+                        after_transmitted_offset: outbound_stream,
+                    },
+                    event: NetworkInputKindV2::Readiness(readiness),
+                })?;
+                Ok(NetworkReply::Unit)
+            })(),
             NetworkRequest::Bind(open_file, channel) => {
                 engine.bind(open_file, channel).map(|()| NetworkReply::Unit)
             }
@@ -3067,6 +3092,15 @@ pub enum NetworkRequest {
         open_file: OpenFileId,
         /// Normalized output result.
         output: NetworkCapturedStreamOutput,
+    },
+    /// Append one host readiness observation with engine-owned release gates.
+    CaptureReadiness {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Continuous logical time at host observation.
+        observed_at: LogicalTime,
+        /// Complete level-readiness snapshot, including clear transitions.
+        readiness: NetworkReadinessV2,
     },
     /// Bind a stable open-file description to a trace channel.
     Bind(OpenFileId, NetworkChannelId),
