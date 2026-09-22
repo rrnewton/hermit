@@ -13,7 +13,10 @@ use detcore_model::network_trace::NetworkChannelId;
 use detcore_model::network_trace::NetworkChannelV2;
 use detcore_model::network_trace::NetworkConnectionResultV2;
 use detcore_model::network_trace::NetworkEndpointRoleV2;
+use detcore_model::network_trace::NetworkInputEventV2;
+use detcore_model::network_trace::NetworkInputKindV2;
 use detcore_model::network_trace::NetworkPolicy;
+use detcore_model::network_trace::NetworkReleaseV2;
 use detcore_model::network_trace::NetworkShutdownV2;
 use detcore_model::network_trace::NetworkTransportV2;
 use nix::fcntl::OFlag;
@@ -84,6 +87,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         match call {
             Syscall::Socket(_) | Syscall::Connect(_) => true,
+            Syscall::Listen(call) => self.network_open_file(guest, call.fd()).is_some(),
+            Syscall::Accept(call) => self.network_open_file(guest, call.sockfd()).is_some(),
+            Syscall::Accept4(call) => self.network_open_file(guest, call.sockfd()).is_some(),
             Syscall::Read(call) => self.network_open_file(guest, call.fd()).is_some(),
             Syscall::Write(call) => self.network_open_file(guest, call.fd()).is_some(),
             Syscall::Readv(call) => self.network_open_file(guest, call.fd()).is_some(),
@@ -123,6 +129,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         match call {
             Syscall::Socket(call) => Some(self.network_socket(guest, call).await),
             Syscall::Connect(call) => Some(self.network_connect(guest, call, policy).await),
+            Syscall::Listen(call) if self.network_open_file(guest, call.fd()).is_some() => {
+                Some(self.network_listen(guest, call, policy).await)
+            }
+            Syscall::Accept(call) if self.network_open_file(guest, call.sockfd()).is_some() => {
+                Some(self.network_accept4(guest, call.into(), policy).await)
+            }
+            Syscall::Accept4(call) if self.network_open_file(guest, call.sockfd()).is_some() => {
+                Some(self.network_accept4(guest, call, policy).await)
+            }
             Syscall::Read(call) if self.network_open_file(guest, call.fd()).is_some() => {
                 Some(self.network_read(guest, call, policy).await)
             }
@@ -279,6 +294,223 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                     reply => {
                         break Err(engine_error(format!("unexpected connect reply {reply:?}")));
+                    }
+                }
+            },
+            NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => unreachable!(),
+        }
+    }
+
+    async fn ensure_listener_channel<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        open_file: OpenFileId,
+        policy: NetworkPolicy,
+    ) -> Result<NetworkChannelId, Error> {
+        let channel = NetworkChannelId(open_file.deterministic_socket_cookie());
+        if matches!(
+            network_request(guest, NetworkRequest::ChannelFor(open_file))
+                .await
+                .map_err(engine_error)?,
+            NetworkReply::Channel(Some(_))
+        ) {
+            return Ok(channel);
+        }
+        if policy == NetworkPolicy::Record {
+            network_request(
+                guest,
+                NetworkRequest::RecordChannel(NetworkChannelV2 {
+                    id: channel,
+                    transport: NetworkTransportV2::Tcp,
+                    role: NetworkEndpointRoleV2::Listener,
+                    local_address: None,
+                    peer_address: None,
+                    accepted_from: None,
+                }),
+            )
+            .await
+            .map_err(engine_error)?;
+        }
+        match network_request(guest, NetworkRequest::Bind(open_file, channel))
+            .await
+            .map_err(engine_error)?
+        {
+            NetworkReply::Unit => Ok(channel),
+            reply => Err(engine_error(format!(
+                "unexpected listener bind reply {reply:?}"
+            ))),
+        }
+    }
+
+    async fn network_listen<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Listen,
+        policy: NetworkPolicy,
+    ) -> Result<i64, Error> {
+        let open_file = guest.thread_state().socket_open_file_id(call.fd())?;
+        self.ensure_listener_channel(guest, open_file, policy)
+            .await?;
+        match policy {
+            NetworkPolicy::Record => {
+                let result = self.live_network_syscall(guest, call.into()).await;
+                if result.is_err() {
+                    return Err(engine_error(
+                        "unsuccessful listen cannot be represented by trace v2",
+                    ));
+                }
+                result
+            }
+            NetworkPolicy::Replay => Ok(0),
+            NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => unreachable!(),
+        }
+    }
+
+    async fn network_accept4<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Accept4,
+        policy: NetworkPolicy,
+    ) -> Result<i64, Error> {
+        let listener = guest.thread_state().socket_open_file_id(call.sockfd())?;
+        let listener_channel = self
+            .ensure_listener_channel(guest, listener, policy)
+            .await?;
+        match policy {
+            NetworkPolicy::Record => {
+                let result = self.live_network_syscall(guest, call.into()).await;
+                let fd = match result {
+                    Ok(fd) => i32::try_from(fd).map_err(|_| Errno::EIO)?,
+                    Err(error) => {
+                        let errno = error_errno(&error).ok_or_else(|| engine_error(&error))?;
+                        self.capture_input(
+                            guest,
+                            listener,
+                            NetworkCapturedStreamInput::Error(errno),
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                };
+                self.add_fd(
+                    guest,
+                    fd,
+                    OFlag::from_bits_truncate(call.flags().bits()),
+                    FdType::Socket,
+                )
+                .await?;
+                let accepted = guest.thread_state().socket_open_file_id(fd)?;
+                let accepted_channel = NetworkChannelId(accepted.deterministic_socket_cookie());
+                let peer = read_accept_peer(guest, call)?;
+                let transport = match peer.as_ref() {
+                    Some(NetworkAddressV2::UnixPath(_))
+                    | Some(NetworkAddressV2::UnixAbstract(_))
+                    | Some(NetworkAddressV2::UnixUnnamed) => NetworkTransportV2::UnixStream,
+                    _ => NetworkTransportV2::Tcp,
+                };
+                network_request(
+                    guest,
+                    NetworkRequest::RecordChannel(NetworkChannelV2 {
+                        id: accepted_channel,
+                        transport,
+                        role: NetworkEndpointRoleV2::Accepted,
+                        local_address: None,
+                        peer_address: peer.clone(),
+                        accepted_from: Some(listener_channel),
+                    }),
+                )
+                .await
+                .map_err(engine_error)?;
+                network_request(guest, NetworkRequest::Bind(accepted, accepted_channel))
+                    .await
+                    .map_err(engine_error)?;
+                let observed_at = thread_observe_time(guest).await;
+                network_request(
+                    guest,
+                    NetworkRequest::RecordInput(NetworkInputEventV2 {
+                        ordinal: 0,
+                        channel: listener_channel,
+                        release: NetworkReleaseV2 {
+                            not_before_global_time: observed_at,
+                            after_transmitted_offset: 0,
+                        },
+                        event: NetworkInputKindV2::Accept {
+                            accepted: accepted_channel,
+                            peer,
+                            ancillary: None,
+                        },
+                    }),
+                )
+                .await
+                .map_err(engine_error)?;
+                Ok(i64::from(fd))
+            }
+            NetworkPolicy::Replay => loop {
+                let now = thread_observe_time(guest).await;
+                network_request(guest, NetworkRequest::ReleaseEligible(now))
+                    .await
+                    .map_err(engine_error)?;
+                match network_request(guest, NetworkRequest::TakeConnectionOutcome(listener))
+                    .await
+                    .map_err(engine_error)?
+                {
+                    NetworkReply::Connection(Some(crate::NetworkConnection::Accept {
+                        accepted,
+                        peer,
+                        ancillary: None,
+                    })) => {
+                        let family = match peer.as_ref() {
+                            Some(NetworkAddressV2::Inet6 { .. }) => libc::AF_INET6,
+                            Some(NetworkAddressV2::UnixPath(_))
+                            | Some(NetworkAddressV2::UnixAbstract(_))
+                            | Some(NetworkAddressV2::UnixUnnamed) => libc::AF_UNIX,
+                            _ => libc::AF_INET,
+                        };
+                        let socket = syscalls::Socket::new()
+                            .with_family(family)
+                            .with_type(libc::SOCK_STREAM | call.flags().bits())
+                            .with_protocol(0);
+                        let fd =
+                            i32::try_from(guest.inject(socket).await?).map_err(|_| Errno::EIO)?;
+                        self.add_fd(
+                            guest,
+                            fd,
+                            OFlag::from_bits_truncate(call.flags().bits()),
+                            FdType::Socket,
+                        )
+                        .await?;
+                        let open_file = guest.thread_state().socket_open_file_id(fd)?;
+                        match network_request(guest, NetworkRequest::Bind(open_file, accepted))
+                            .await
+                            .map_err(engine_error)?
+                        {
+                            NetworkReply::Unit => {}
+                            reply => {
+                                return Err(engine_error(format!(
+                                    "unexpected accepted bind reply {reply:?}"
+                                )));
+                            }
+                        }
+                        write_accept_peer(guest, call, peer.as_ref())?;
+                        break Ok(i64::from(fd));
+                    }
+                    NetworkReply::Connection(Some(crate::NetworkConnection::Accept {
+                        ancillary: Some(_),
+                        ..
+                    })) => {
+                        break Err(engine_error(
+                            "accept ancillary objects require message-level materialization",
+                        ));
+                    }
+                    NetworkReply::Connection(Some(crate::NetworkConnection::Error(errno))) => {
+                        break errno_result(errno);
+                    }
+                    NetworkReply::Connection(None) => {
+                        self.wait_for_network(guest, listener, NetworkWaitKind::Readable)
+                            .await;
+                    }
+                    reply => {
+                        break Err(engine_error(format!("unexpected accept reply {reply:?}")));
                     }
                 }
             },
@@ -730,6 +962,113 @@ where
     Ok(())
 }
 
+fn read_accept_peer<G, T>(
+    guest: &mut G,
+    call: syscalls::Accept4,
+) -> Result<Option<NetworkAddressV2>, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let Some(address) = call.sockaddr() else {
+        return Ok(None);
+    };
+    let length = guest
+        .memory()
+        .read_value(call.addrlen().ok_or(Errno::EFAULT)?)?;
+    let length = i32::try_from(length).map_err(|_| Errno::EINVAL)?;
+    read_network_address(guest, Some(address), length).map(Some)
+}
+
+fn write_accept_peer<G, T>(
+    guest: &mut G,
+    call: syscalls::Accept4,
+    peer: Option<&NetworkAddressV2>,
+) -> Result<(), Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let Some(address) = call.sockaddr() else {
+        return Ok(());
+    };
+    let length_address = call.addrlen().ok_or(Errno::EFAULT)?;
+    let capacity: usize = guest.memory().read_value(length_address)?;
+    let bytes = peer
+        .map(network_address_bytes)
+        .transpose()?
+        .unwrap_or_default();
+    let copied = capacity.min(bytes.len());
+    if copied != 0 {
+        guest
+            .memory()
+            .write_exact(address.cast(), &bytes[..copied])?;
+    }
+    guest.memory().write_value(length_address, &bytes.len())?;
+    Ok(())
+}
+
+fn network_address_bytes(address: &NetworkAddressV2) -> Result<Vec<u8>, Error> {
+    fn bytes_of<T>(value: &T) -> &[u8] {
+        // SAFETY: these libc socket-address records contain only integer fields
+        // and byte arrays, are initialized from zero, and are copied as bytes.
+        unsafe {
+            std::slice::from_raw_parts((value as *const T).cast::<u8>(), std::mem::size_of::<T>())
+        }
+    }
+
+    match address {
+        NetworkAddressV2::Inet4 { address, port } => {
+            // SAFETY: all-zero is a valid initialized sockaddr_in.
+            let mut raw: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            raw.sin_family = libc::AF_INET as libc::sa_family_t;
+            raw.sin_port = port.to_be();
+            raw.sin_addr.s_addr = u32::from_ne_bytes(*address);
+            Ok(bytes_of(&raw).to_vec())
+        }
+        NetworkAddressV2::Inet6 {
+            address,
+            port,
+            flowinfo,
+            scope_id,
+        } => {
+            // SAFETY: all-zero is a valid initialized sockaddr_in6.
+            let mut raw: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            raw.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            raw.sin6_port = port.to_be();
+            raw.sin6_addr.s6_addr = *address;
+            raw.sin6_flowinfo = *flowinfo;
+            raw.sin6_scope_id = *scope_id;
+            Ok(bytes_of(&raw).to_vec())
+        }
+        NetworkAddressV2::UnixPath(path) | NetworkAddressV2::UnixAbstract(path) => {
+            let path_offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+            let abstract_prefix = usize::from(matches!(address, NetworkAddressV2::UnixAbstract(_)));
+            if path.len() + abstract_prefix > 108 {
+                return Err(engine_error("Unix socket address exceeds sun_path"));
+            }
+            // SAFETY: all-zero is a valid initialized sockaddr_un.
+            let mut raw: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            raw.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            let raw_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    (&mut raw as *mut libc::sockaddr_un).cast::<u8>(),
+                    std::mem::size_of::<libc::sockaddr_un>(),
+                )
+            };
+            let start = path_offset + abstract_prefix;
+            raw_bytes[start..start + path.len()].copy_from_slice(path);
+            Ok(raw_bytes[..start + path.len()].to_vec())
+        }
+        NetworkAddressV2::UnixUnnamed => {
+            // SAFETY: all-zero is a valid initialized sockaddr_un.
+            let mut raw: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            raw.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            Ok(bytes_of(&raw)[..std::mem::offset_of!(libc::sockaddr_un, sun_path)].to_vec())
+        }
+    }
+}
+
 fn read_network_address<G, T>(
     guest: &mut G,
     address: Option<reverie::syscalls::AddrMut<'_, libc::sockaddr>>,
@@ -767,6 +1106,24 @@ where
                 scope_id: raw.sin6_scope_id,
             })
         }
+        libc::AF_UNIX => {
+            let path_offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+            let length = usize::try_from(length).map_err(|_| Errno::EINVAL)?;
+            if length > std::mem::size_of::<libc::sockaddr_un>() {
+                return Err(Errno::EINVAL.into());
+            }
+            if length <= path_offset {
+                return Ok(NetworkAddressV2::UnixUnnamed);
+            }
+            let mut bytes = vec![0; length];
+            guest.memory().read_exact(address.cast(), &mut bytes)?;
+            let path = &bytes[path_offset..];
+            if path.first() == Some(&0) {
+                Ok(NetworkAddressV2::UnixAbstract(path[1..].to_vec()))
+            } else {
+                Ok(NetworkAddressV2::UnixPath(path.to_vec()))
+            }
+        }
         family => Err(engine_error(format!(
             "unsupported connect address family {family}"
         ))),
@@ -785,5 +1142,23 @@ mod tests {
             iovec_capacity(&[(1, isize::MAX as usize), (2, 1)]),
             Err(Error::Errno(errno)) if errno == Errno::EINVAL
         ));
+    }
+
+    #[test]
+    fn normalized_unix_addresses_preserve_exact_path_bytes() {
+        let path_offset = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+        let pathname =
+            network_address_bytes(&NetworkAddressV2::UnixPath(vec![b'a', b'b', b'c', 0])).unwrap();
+        assert_eq!(&pathname[path_offset..], b"abc\0");
+
+        let abstract_name =
+            network_address_bytes(&NetworkAddressV2::UnixAbstract(b"abc".to_vec())).unwrap();
+        assert_eq!(&abstract_name[path_offset..], b"\0abc");
+        assert_eq!(
+            network_address_bytes(&NetworkAddressV2::UnixUnnamed)
+                .unwrap()
+                .len(),
+            path_offset
+        );
     }
 }

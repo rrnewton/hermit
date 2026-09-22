@@ -2981,20 +2981,41 @@ impl GlobalState {
                 .shutdown(open_file, direction)
                 .map(|()| NetworkReply::Unit),
             NetworkRequest::TakeConnectionOutcome(open_file) => {
-                engine.take_connection_outcome(open_file).map(|outcome| {
-                    NetworkReply::Connection(outcome.map(|outcome| match outcome {
-                        ConnectionOutcome::Connect(result) => NetworkConnection::Connect(result),
-                        ConnectionOutcome::Accept {
+                (|| -> Result<NetworkReply, NetworkReplayError> {
+                    let outcome = engine.take_connection_outcome(open_file)?;
+                    let outcome = match outcome {
+                        Some(ConnectionOutcome::Connect(result)) => {
+                            Some(NetworkConnection::Connect(result))
+                        }
+                        Some(ConnectionOutcome::Accept {
                             accepted,
                             peer,
                             ancillary,
-                        } => NetworkConnection::Accept {
+                        }) => Some(NetworkConnection::Accept {
                             accepted,
                             peer,
                             ancillary,
+                        }),
+                        None => match engine.receive_stream_with_options(
+                            open_file,
+                            NetworkReceiveOptions {
+                                maximum: 0,
+                                nonblocking: true,
+                                flags: 0,
+                                receive_low_water: 1,
+                            },
+                        )? {
+                            StreamReceiveOutcome::Error(errno) => {
+                                Some(NetworkConnection::Error(errno))
+                            }
+                            StreamReceiveOutcome::WouldBlock
+                            | StreamReceiveOutcome::Pending
+                            | StreamReceiveOutcome::Bytes(_)
+                            | StreamReceiveOutcome::EndOfFile => None,
                         },
-                    }))
-                })
+                    };
+                    Ok(NetworkReply::Connection(outcome))
+                })()
             }
             NetworkRequest::Readiness(open_file) => {
                 engine.readiness(open_file).map(NetworkReply::Readiness)
@@ -3191,6 +3212,8 @@ pub enum NetworkConnection {
         /// Creation-time ancillary relocation metadata.
         ancillary: Option<NetworkAncillaryDataV2>,
     },
+    /// Exact recorded error from an accept attempt.
+    Error(i32),
 }
 
 /// Response vocabulary for the normalized network engine RPC.
