@@ -2390,10 +2390,7 @@ fn run_kvm_exact_child_waits_have_stable_scheduler_turns() {
             log.contains("hermit::kvm: launching guest through reverie-kvm"),
             "iteration {iteration} did not use the KVM backend:\n{log}"
         );
-        let sigchld_deliveries = log
-            .lines()
-            .filter(|line| line.contains("Alarm fired, delivering signal SIGCHLD"))
-            .count();
+        let sigchld_deliveries = count_handled_inbound_signal(&log, "SIGCHLD");
         assert!(
             sigchld_deliveries >= 4,
             "iteration {iteration} did not race each ready child against SIGCHLD:\n{log}"
@@ -2414,6 +2411,25 @@ fn run_kvm_exact_child_waits_have_stable_scheduler_turns() {
             "iteration {iteration} changed the scheduler child-wait turn population:\n{log}"
         );
     }
+}
+
+fn count_handled_inbound_signal(log: &str, signal: &str) -> usize {
+    log.lines()
+        .filter(|line| {
+            line.contains("handling inbound signal (#") && line.trim_end().ends_with(signal)
+        })
+        .count()
+}
+
+#[test]
+fn handled_inbound_signal_count_rejects_legacy_alarm_and_other_signals() {
+    let log = concat!(
+        "INFO detcore::scheduler: Alarm fired, delivering signal SIGCHLD to guest.\n",
+        "INFO detcore: [dtid 3] handling inbound signal (#0) SIGALRM\n",
+        "INFO detcore: [dtid 3] finish delivering signal (#0) SIGCHLD\n",
+        "INFO detcore: [dtid 3] handling inbound signal (#1) SIGCHLD\n",
+    );
+    assert_eq!(count_handled_inbound_signal(log, "SIGCHLD"), 1);
 }
 
 #[test]
