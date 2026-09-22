@@ -174,6 +174,9 @@
         image = pkgs.dockerTools.buildLayeredImage {
           name = "hermit-hermetic-validate";
           tag = "nix";
+          # One content layer plus the customisation layer avoids nondeterministic
+          # tie-breaking in dockerTools' automatic multi-layer partitioning.
+          maxLayers = 2;
           # Fixed timestamp: a build whose output moves with the wall clock
           # cannot be checked for reproducibility.
           created = "1970-01-01T00:00:01Z";
