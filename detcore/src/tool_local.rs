@@ -18,6 +18,8 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::time::Duration;
 
+use detcore_model::network_trace::NetworkAncillaryObjectV2;
+use detcore_model::network_trace::NetworkObjectId;
 use detcore_model::pedigree::Pedigree;
 use detcore_model::summary::TimesliceStats;
 use nix::fcntl::OFlag;
@@ -119,6 +121,45 @@ pub(crate) struct CapturedDetFdInstallCleanup {
     pub(crate) close_fd: RawFd,
     /// A scheduler resource whose final modeled OFD reference was the capture.
     pub(crate) release_open_file: Option<OpenFileId>,
+}
+
+/// One SCM_RIGHTS object bound to a trace-stable identity and a retained OFD.
+#[derive(Debug, Clone)]
+#[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+pub(crate) struct ScmRightsObjectSnapshot {
+    pub(crate) object: NetworkObjectId,
+    pub(crate) open_file: OpenFileId,
+    description: OpenFileDescriptionRef,
+}
+
+/// One descriptor slot installed from an SCM_RIGHTS object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+pub(crate) struct InstalledScmRight {
+    pub(crate) object: NetworkObjectId,
+    pub(crate) fd: RawFd,
+    pub(crate) open_file: OpenFileId,
+}
+
+/// Installation result plus exact physical fds which the adapter must close
+/// because the guest control buffer truncated them.
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+pub(crate) struct ScmRightsInstallResult {
+    pub(crate) installed: Vec<InstalledScmRight>,
+    pub(crate) close_excess_fds: Vec<RawFd>,
+}
+
+/// Fail-closed SCM_RIGHTS metadata error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+pub(crate) enum ScmRightsError {
+    BadDescriptor(Errno),
+    UnsupportedObjectKind,
+    ObjectIdentityMismatch(NetworkObjectId),
+    OpenFileIdentityMismatch(OpenFileId),
+    ResultCountMismatch,
+    DestinationOccupied(RawFd),
 }
 
 impl CapturedDetFdInstallError {
@@ -804,6 +845,92 @@ impl FileMetadata {
         })
     }
 
+    /// Snapshot SCM_RIGHTS source slots while binding each OFD to the trace
+    /// object identity selected by the shared network engine.
+    #[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+    fn snapshot_scm_rights(
+        &mut self,
+        rights: &[(RawFd, NetworkAncillaryObjectV2)],
+    ) -> Result<Vec<ScmRightsObjectSnapshot>, ScmRightsError> {
+        let mut objects = BTreeMap::new();
+        let mut open_files = BTreeMap::new();
+        let mut snapshots = Vec::with_capacity(rights.len());
+        for (fd, object) in rights {
+            let NetworkAncillaryObjectV2::FileDescriptor { object } = object else {
+                return Err(ScmRightsError::UnsupportedObjectKind);
+            };
+            let detfd = self
+                .file_handles
+                .get(fd)
+                .ok_or(ScmRightsError::BadDescriptor(Errno::EBADF))?;
+            let open_file = detfd.open_file_id();
+            if objects
+                .insert(*object, open_file)
+                .is_some_and(|known| known != open_file)
+            {
+                return Err(ScmRightsError::ObjectIdentityMismatch(*object));
+            }
+            if open_files
+                .insert(open_file, *object)
+                .is_some_and(|known| known != *object)
+            {
+                return Err(ScmRightsError::OpenFileIdentityMismatch(open_file));
+            }
+            let description = detfd.open_file_description_ref();
+            snapshots.push(ScmRightsObjectSnapshot {
+                object: *object,
+                open_file,
+                description,
+            });
+        }
+        Ok(snapshots)
+    }
+
+    /// Install the prefix visible through the guest control buffer. Physical
+    /// descriptors in the suffix must be closed by the adapter, exactly as
+    /// Linux closes excess SCM_RIGHTS descriptors when setting `MSG_CTRUNC`.
+    #[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+    fn install_scm_rights(
+        &mut self,
+        snapshots: &[ScmRightsObjectSnapshot],
+        returned_fds: &[RawFd],
+        visible_count: usize,
+        cmsg_cloexec: bool,
+    ) -> Result<ScmRightsInstallResult, ScmRightsError> {
+        if snapshots.len() != returned_fds.len() || visible_count > snapshots.len() {
+            return Err(ScmRightsError::ResultCountMismatch);
+        }
+        for fd in returned_fds.iter().take(visible_count) {
+            if self.file_handles.contains_key(fd) {
+                return Err(ScmRightsError::DestinationOccupied(*fd));
+            }
+        }
+        let flags = if cmsg_cloexec {
+            OFlag::O_CLOEXEC
+        } else {
+            OFlag::empty()
+        };
+        let close_excess_fds = returned_fds[visible_count..].to_vec();
+        let mut installed = Vec::with_capacity(visible_count);
+        for (snapshot, &fd) in snapshots.iter().zip(returned_fds).take(visible_count) {
+            debug_assert_eq!(snapshot.open_file, snapshot.description.open_file_id());
+            self.add_detfd(DetFd::from_open_file_description(
+                fd,
+                flags,
+                snapshot.description.clone(),
+            ));
+            installed.push(InstalledScmRight {
+                object: snapshot.object,
+                fd,
+                open_file: snapshot.open_file,
+            });
+        }
+        Ok(ScmRightsInstallResult {
+            installed,
+            close_excess_fds,
+        })
+    }
+
     /// Install a previously captured open-file description as `newfd`.
     ///
     /// Unlike [`Self::dup_fd`], this never resolves the source fd number again.
@@ -1333,6 +1460,116 @@ mod file_metadata_tests {
                 .expect("captured alias should be installed"),
             (source_id, true)
         );
+    }
+
+    #[test]
+    fn scm_rights_repeated_object_preserves_ofd_across_install_dup_and_fork() {
+        let owner = DetTid::from_raw(60);
+        let mut source = FileMetadata::new(owner);
+        source
+            .add_fd(owner, 3, OFlag::O_NONBLOCK, FdType::Regular, None)
+            .unwrap();
+        let object = NetworkObjectId(9);
+        let rights = [(3, NetworkAncillaryObjectV2::FileDescriptor { object })];
+        let snapshot = source.snapshot_scm_rights(&rights).unwrap().remove(0);
+        let open_file = snapshot.open_file;
+        let repeated = vec![snapshot.clone(), snapshot];
+
+        let mut receiver = FileMetadata::new(DetTid::from_raw(61));
+        let result = receiver
+            .install_scm_rights(&repeated, &[10, 11], 2, true)
+            .unwrap();
+        assert_eq!(
+            result.installed,
+            vec![
+                InstalledScmRight {
+                    object,
+                    fd: 10,
+                    open_file,
+                },
+                InstalledScmRight {
+                    object,
+                    fd: 11,
+                    open_file,
+                },
+            ]
+        );
+        assert!(result.close_excess_fds.is_empty());
+        for fd in [10, 11] {
+            assert_eq!(
+                receiver
+                    .with_detfd(fd, |detfd| (detfd.open_file_id(), detfd.is_cloexec()))
+                    .unwrap(),
+                (open_file, true),
+                "MSG_CMSG_CLOEXEC is per installed descriptor slot"
+            );
+        }
+
+        drop(repeated);
+        assert_eq!(source.remove_fd(3), None);
+        assert_eq!(receiver.remove_fd(10), None);
+        let mut child = receiver.fork_for(DetTid::from_raw(62));
+        assert_eq!(receiver.remove_fd(11), None);
+        assert_eq!(
+            child.remove_fd(11),
+            Some(open_file),
+            "only the final fork/dup/SCM_RIGHTS alias retires the OFD"
+        );
+    }
+
+    #[test]
+    fn scm_rights_truncation_returns_exact_close_obligations() {
+        let owner = DetTid::from_raw(63);
+        let mut source = FileMetadata::new(owner);
+        source
+            .add_fd(owner, 3, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        let object = NetworkObjectId(10);
+        let snapshot = source
+            .snapshot_scm_rights(&[(3, NetworkAncillaryObjectV2::FileDescriptor { object })])
+            .unwrap()
+            .remove(0);
+        let snapshots = vec![snapshot.clone(), snapshot.clone(), snapshot];
+        let mut receiver = FileMetadata::new(DetTid::from_raw(64));
+        let result = receiver
+            .install_scm_rights(&snapshots, &[20, 21, 22], 1, false)
+            .unwrap();
+        assert_eq!(result.installed.len(), 1);
+        assert_eq!(result.close_excess_fds, vec![21, 22]);
+        assert!(!receiver.with_detfd(20, |fd| fd.is_cloexec()).unwrap());
+        assert_eq!(receiver.with_detfd(21, |_| ()), Err(Errno::EBADF));
+        assert_eq!(receiver.with_detfd(22, |_| ()), Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn scm_rights_refuses_unsupported_or_inconsistent_object_metadata() {
+        let owner = DetTid::from_raw(65);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, 3, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        metadata
+            .add_fd(owner, 4, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        assert!(matches!(
+            metadata.snapshot_scm_rights(&[(
+                3,
+                NetworkAncillaryObjectV2::Credentials {
+                    pid: 1,
+                    uid: 2,
+                    gid: 3,
+                },
+            )]),
+            Err(ScmRightsError::UnsupportedObjectKind)
+        ));
+        let object = NetworkObjectId(11);
+        assert!(matches!(
+            metadata.snapshot_scm_rights(&[
+                (3, NetworkAncillaryObjectV2::FileDescriptor { object }),
+                (4, NetworkAncillaryObjectV2::FileDescriptor { object }),
+            ]),
+            Err(ScmRightsError::ObjectIdentityMismatch(id)) if id == object
+        ));
     }
 
     #[test]
@@ -2603,6 +2840,37 @@ impl<T> ThreadState<T> {
     /// Abandon an uninstalled capture and identify a deferred final-OFD release.
     pub(crate) fn abandon_captured_fd(&self, captured: CapturedDetFd) -> Option<OpenFileId> {
         self.metadata().abandon_captured_fd(captured)
+    }
+
+    /// Snapshot SCM_RIGHTS source descriptors under one descriptor-table lock.
+    #[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+    pub(crate) fn snapshot_scm_rights(
+        &self,
+        rights: &[(RawFd, NetworkAncillaryObjectV2)],
+    ) -> Result<Vec<ScmRightsObjectSnapshot>, ScmRightsError> {
+        let mut metadata = self.metadata();
+        if self.discover_live_file_metadata {
+            for (fd, _) in rights {
+                metadata
+                    .discover_fd_from_current_process(self.dettid, *fd)
+                    .map_err(ScmRightsError::BadDescriptor)?;
+            }
+        }
+        metadata.snapshot_scm_rights(rights)
+    }
+
+    /// Install the visible SCM_RIGHTS prefix into deterministic fd slots.
+    /// `close_excess_fds` in the result is a mandatory guest-close obligation.
+    #[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+    pub(crate) fn install_scm_rights(
+        &self,
+        snapshots: &[ScmRightsObjectSnapshot],
+        returned_fds: &[RawFd],
+        visible_count: usize,
+        cmsg_cloexec: bool,
+    ) -> Result<ScmRightsInstallResult, ScmRightsError> {
+        self.metadata()
+            .install_scm_rights(snapshots, returned_fds, visible_count, cmsg_cloexec)
     }
 
     /// get thread prng, note this rng is deterministic and should not be used

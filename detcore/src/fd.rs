@@ -178,6 +178,24 @@ struct OpenFileDescription {
     flock_mode_ever_known: bool,
 }
 
+/// Opaque retained reference to one Linux open file description.
+///
+/// SCM_RIGHTS snapshots carry this handle rather than a raw fd so installation
+/// in another descriptor slot preserves the same status flags, offsets,
+/// identity, and lifetime as `dup`/`fork`.
+#[derive(Debug, Clone)]
+#[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+pub(crate) struct OpenFileDescriptionRef {
+    open_file: Arc<Mutex<OpenFileDescription>>,
+}
+
+impl OpenFileDescriptionRef {
+    #[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+    pub(crate) fn open_file_id(&self) -> OpenFileId {
+        self.open_file.lock().expect("open file mutex poisoned").id
+    }
+}
+
 impl PartialEq for DetFd {
     fn eq(&self, other: &Self) -> bool {
         self.fd == other.fd
@@ -327,6 +345,28 @@ impl DetFd {
     /// Stable identity shared by dup and fork aliases.
     pub fn open_file_id(&self) -> OpenFileId {
         self.description().id
+    }
+
+    /// Retain this descriptor's open file description for SCM_RIGHTS transfer.
+    #[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+    pub(crate) fn open_file_description_ref(&self) -> OpenFileDescriptionRef {
+        OpenFileDescriptionRef {
+            open_file: Arc::clone(&self.open_file),
+        }
+    }
+
+    /// Create a descriptor slot referring to a retained open file description.
+    #[allow(dead_code, reason = "consumed by the in-flight SCM_RIGHTS adapter")]
+    pub(crate) fn from_open_file_description(
+        fd: RawFd,
+        flags: OFlag,
+        description: OpenFileDescriptionRef,
+    ) -> Self {
+        Self {
+            fd,
+            fd_flags: flags.bits() & OFlag::O_CLOEXEC.bits(),
+            open_file: description.open_file,
+        }
     }
 
     /// Stable network identity for this open-file description.
