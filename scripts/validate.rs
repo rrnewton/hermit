@@ -25606,6 +25606,9 @@ with (root/'calls.jsonl').open('a') as out:
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "scorecard_cutover_tests::selected_package_runs_retain_verified_zero_cells_and_actual_test_rows", "--nocapture"])
                 .env(CHILD, "1")
+                // An ambient build-width channel must not redefine this
+                // fixture's explicitly declared scheduler transport.
+                .env("DAGRUN_JOBS_ENV", "CARGO_BUILD_JOBS")
                 .env_remove("DAGRUN_LOG_DIR")
                 .env_remove("DAGRUN_NO_LOGS")
                 .env_remove("BASH_ENV")
@@ -25655,7 +25658,9 @@ assert result.testsRun == 1
 pathlib.Path(os.environ['DAGRUN_TEST_COUNTS_PATH']).write_text(json.dumps({'schema':2,'executed_tests':result.testsRun,'filtered_tests':0,'results':[{'id':'SelectedPackage.test_roundtrip','result':'pass' if result.wasSuccessful() else 'fail','attempts':1}]}))
 raise SystemExit(0 if result.wasSuccessful() else 1)
 "#).unwrap();
-            let cfg = dag_from_json(&serde_json::json!({"steps":[{
+            // Match the normal graph's explicit transport so the custom
+            // command still reaches the source-defined producer refusal.
+            let cfg = dag_from_json(&serde_json::json!({"default_jobs_env":"", "steps":[{
                 "group":"test", "job":"package", "cmd":format!("python3 {}", shell_words::quote(&producer.display().to_string())),
                 "jobs_flag":"", "timeout":10,
                 "env":{"SCORECARD_FIXTURE_FAIL":if fails {"1"} else {"0"}},
