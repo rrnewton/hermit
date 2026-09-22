@@ -5473,6 +5473,13 @@ fn configure_e2e_result_root(
     log_path: &Path,
     temporary_build_root: &Path,
 ) -> Result<(PathBuf, Result<validate_cell_results::HeldInput, String>), String> {
+    // Ordinary validation consumes the artifact published by its own DAG.
+    // An inherited standalone override must not replace that producer output,
+    // including when the fixed output is missing or fails verification.
+    std::env::set_var(
+        "HERMIT_E2E_ARTIFACT_POINTER",
+        root.join("target/ci/hermit-e2e-artifact.path"),
+    );
     let fallback_run = log_path
         .file_stem()
         .ok_or_else(|| format!("durable log has no file name: {}", log_path.display()))?
@@ -5516,6 +5523,158 @@ fn configure_e2e_result_root(
         std::env::set_var("E2E_BUILD_ROOT", temporary_build_root);
     }
     Ok((path, fresh_root))
+}
+
+#[cfg(test)]
+mod ordinary_artifact_pointer_tests {
+    use super::*;
+
+    fn publish_fixture(root: &Path, marker: &str) -> PathBuf {
+        let source = Path::new(file!()).parent().unwrap().parent().unwrap();
+        std::fs::create_dir_all(root.join("ci")).unwrap();
+        for name in [
+            "publish-hermit-e2e-artifact.sh",
+            "verify-hermit-e2e-artifact.sh",
+            "run-with-hermit-e2e-artifact.sh",
+        ] {
+            std::fs::copy(source.join("ci").join(name), root.join("ci").join(name)).unwrap();
+        }
+        let binary = root.join("fixture-hermit");
+        std::fs::write(&binary, format!("#!/bin/sh\n# {marker}\nexit 0\n")).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let install = root.join("fixture-install");
+        for name in [
+            "libdetcore_dbt.so",
+            "libdetcore_sabre.so",
+            "libreverie_dbt_client.so",
+            "libreverie_liteinst.so",
+            "dynamorio/bin64/drrun",
+            "sabre",
+            "e9patch",
+            "e9tool",
+        ] {
+            let path = install.join("rsrcs").join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("#!/bin/sh\n# {marker} {name}\nexit 0\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let pointer = root.join("target/ci/hermit-e2e-artifact.path");
+        let output = Command::new(root.join("ci/publish-hermit-e2e-artifact.sh"))
+            .arg(binary)
+            .arg(root.join("target/ci/hermit-e2e-artifacts"))
+            .arg(&pointer)
+            .arg(install)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        pointer
+    }
+
+    fn consumer(root: &Path, pointer: Option<&Path>) -> std::process::Output {
+        let mut command = Command::new(root.join("ci/run-with-hermit-e2e-artifact.sh"));
+        command.args([
+            "--require-install",
+            "/bin/sh",
+            "-c",
+            "printf '%s\\n' \"$HERMIT_BIN\"",
+        ]);
+        if let Some(pointer) = pointer {
+            command.env("HERMIT_E2E_ARTIFACT_POINTER", pointer);
+        }
+        command.output().unwrap()
+    }
+
+    #[test]
+    fn ordinary_validation_uses_its_own_verified_artifact() {
+        const CHILD: &str = "HERMIT_VALIDATE_ARTIFACT_POINTER_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The real setup changes process environment. Exercise it in a
+            // separate test process so parallel tests retain their own inputs.
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ordinary_artifact_pointer_tests::ordinary_validation_uses_its_own_verified_artifact",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let measured = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let fixed_pointer = publish_fixture(measured.path(), "measured producer");
+        let external_pointer = publish_fixture(external.path(), "standalone producer");
+        let fixed_bundle = std::fs::read_to_string(&fixed_pointer).unwrap();
+        let external_bundle = std::fs::read_to_string(&external_pointer).unwrap();
+        assert_ne!(fixed_bundle, external_bundle);
+
+        let standalone = consumer(measured.path(), Some(&external_pointer));
+        assert!(standalone.status.success());
+        assert_eq!(
+            String::from_utf8(standalone.stdout).unwrap().trim(),
+            format!("{}/hermit", external_bundle.trim())
+        );
+
+        std::env::set_var("HERMIT_E2E_ARTIFACT_POINTER", &external_pointer);
+        std::env::remove_var("E2E_RESULT_ROOT");
+        std::env::remove_var("E2E_RUN_ID");
+        std::env::remove_var("E2E_BUILD_ROOT");
+        std::fs::create_dir_all(measured.path().join("logs/e2e")).unwrap();
+        let (_, retained_results) = configure_e2e_result_root(
+            measured.path(),
+            &measured.path().join("logs/ordinary.log"),
+            &measured.path().join("fixture-build"),
+        )
+        .unwrap();
+        let _retained_results = retained_results.unwrap();
+        let ordinary = consumer(measured.path(), None);
+        assert!(ordinary.status.success());
+        assert_eq!(
+            String::from_utf8(ordinary.stdout).unwrap().trim(),
+            format!("{}/hermit", fixed_bundle.trim())
+        );
+
+        let saved_pointer = fixed_pointer.with_extension("saved");
+        std::fs::rename(&fixed_pointer, &saved_pointer).unwrap();
+        let missing = consumer(measured.path(), None);
+        assert!(
+            !missing.status.success(),
+            "external artifact hid a missing ordinary producer"
+        );
+        assert!(
+            String::from_utf8_lossy(&missing.stderr)
+                .contains("artifact pointer is missing or empty")
+        );
+        std::fs::rename(saved_pointer, &fixed_pointer).unwrap();
+
+        std::fs::write(Path::new(fixed_bundle.trim()).join("hermit"), "tampered\n").unwrap();
+        let tampered = consumer(measured.path(), None);
+        assert!(
+            !tampered.status.success(),
+            "external artifact hid a tampered ordinary producer"
+        );
+        assert!(
+            String::from_utf8_lossy(&tampered.stderr).contains("published Hermit hash mismatch")
+        );
+        let standalone = consumer(measured.path(), Some(&external_pointer));
+        assert!(standalone.status.success());
+        assert_eq!(
+            String::from_utf8(standalone.stdout).unwrap().trim(),
+            format!("{}/hermit", external_bundle.trim())
+        );
+    }
 }
 
 /// A source-order witness for the normal harness publisher, independent of its
