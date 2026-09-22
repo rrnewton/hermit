@@ -448,62 +448,19 @@ impl NetworkTraceV1 {
     }
 
     /// Write one complete, length-delimited v1 trace.
-    pub fn write_framed<W: Write>(&self, mut writer: W) -> Result<(), NetworkTraceCodecError> {
+    pub fn write_framed<W: Write>(&self, writer: W) -> Result<(), NetworkTraceCodecError> {
         self.validate()?;
-        let payload = bincode::serde::encode_to_vec(self, bincode::config::standard())
-            .map_err(NetworkTraceCodecError::Encode)?;
-        let payload_len =
-            u64::try_from(payload.len()).map_err(|_| NetworkTraceCodecError::TooLarge)?;
-        if payload_len > MAX_NETWORK_TRACE_PAYLOAD_BYTES {
-            return Err(NetworkTraceCodecError::TooLarge);
-        }
-        writer.write_all(&NETWORK_TRACE_MAGIC)?;
-        writer.write_all(&NETWORK_TRACE_VERSION_V1.to_le_bytes())?;
-        writer.write_all(&payload_len.to_le_bytes())?;
-        writer.write_all(&payload)?;
-        Ok(())
+        write_payload(writer, NETWORK_TRACE_VERSION_V1, self)
     }
 
     /// Read exactly one complete trace, rejecting truncation, trailing bytes,
     /// unknown versions, malformed payloads, and invalid v1 semantics.
-    pub fn read_framed<R: Read>(mut reader: R) -> Result<Self, NetworkTraceCodecError> {
-        let mut header = [0u8; FRAME_HEADER_LEN];
-        read_exact_or_truncated(&mut reader, &mut header)?;
-        if header[..NETWORK_TRACE_MAGIC.len()] != NETWORK_TRACE_MAGIC {
-            return Err(NetworkTraceCodecError::BadMagic);
-        }
-        let version_start = NETWORK_TRACE_MAGIC.len();
-        let version = u32::from_le_bytes(
-            header[version_start..version_start + 4]
-                .try_into()
-                .expect("fixed-size version field"),
-        );
+    pub fn read_framed<R: Read>(reader: R) -> Result<Self, NetworkTraceCodecError> {
+        let (version, payload) = read_payload(reader)?;
         if version != NETWORK_TRACE_VERSION_V1 {
             return Err(NetworkTraceCodecError::UnsupportedVersion(version));
         }
-        let len_start = version_start + 4;
-        let payload_len = u64::from_le_bytes(
-            header[len_start..len_start + 8]
-                .try_into()
-                .expect("fixed-size length field"),
-        );
-        if payload_len > MAX_NETWORK_TRACE_PAYLOAD_BYTES {
-            return Err(NetworkTraceCodecError::TooLarge);
-        }
-        let payload_len =
-            usize::try_from(payload_len).map_err(|_| NetworkTraceCodecError::TooLarge)?;
-        let mut payload = vec![0; payload_len];
-        read_exact_or_truncated(&mut reader, &mut payload)?;
-        let mut trailing = [0u8; 1];
-        if reader.read(&mut trailing)? != 0 {
-            return Err(NetworkTraceCodecError::TrailingData);
-        }
-        let (trace, consumed): (Self, usize) =
-            bincode::serde::decode_from_slice(&payload, bincode::config::standard())
-                .map_err(NetworkTraceCodecError::Decode)?;
-        if consumed != payload.len() {
-            return Err(NetworkTraceCodecError::TrailingPayloadData);
-        }
+        let trace: Self = decode_payload(&payload)?;
         trace.validate()?;
         Ok(trace)
     }
@@ -557,7 +514,8 @@ pub enum NetworkAddressV2 {
         flowinfo: u32,
         scope_id: u32,
     },
-    /// Filesystem Unix-domain address, without a trailing NUL.
+    /// Exact filesystem Unix-domain `sun_path` bytes. A trailing NUL, when
+    /// supplied by the guest or returned by Linux, is preserved.
     UnixPath(Vec<u8>),
     /// Linux abstract Unix-domain address, without its leading NUL.
     UnixAbstract(Vec<u8>),
@@ -718,6 +676,23 @@ pub struct NetworkDatagramV2 {
     pub message_flags: i32,
 }
 
+/// Datagram metadata which preserves the kernel-reported socket-address
+/// lengths in addition to the host-layout-independent decoded addresses.
+///
+/// This is a separate envelope rather than new fields on [`NetworkDatagramV2`]
+/// so existing version-two frames continue to decode byte-for-byte. New
+/// recordings use this representation whenever an address was present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkDatagramExactV2 {
+    /// Boundary-preserving payload and decoded addresses.
+    pub datagram: NetworkDatagramV2,
+    /// Original `msg_namelen`/`addrlen` for the source address.
+    pub source_length: Option<u32>,
+    /// Original address length supplied for an explicit destination.
+    pub destination_length: Option<u32>,
+}
+
 /// Result of connect or accept, including asynchronous failure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -754,6 +729,16 @@ pub enum NetworkInputKindV2 {
     SocketError { stream_offset: u64, errno: i32 },
     /// Host readiness transition which cannot be derived from buffered data.
     Readiness(NetworkReadinessV2),
+    /// One stream message with ancillary data tied to its first unread byte.
+    /// Plain `read(2)` adaptation must not silently materialize these objects.
+    StreamMessage {
+        stream_offset: u64,
+        bytes: Vec<u8>,
+        ancillary: NetworkAncillaryDataV2,
+        message_flags: i32,
+    },
+    /// One complete datagram with exact socket-address lengths.
+    DatagramExact(NetworkDatagramExactV2),
 }
 
 /// One globally ordered observation with schedule-independent release gates.
@@ -785,6 +770,15 @@ pub enum NetworkOutputKindV2 {
     },
     /// A transmit attempt failed at this offset.
     SocketError { stream_offset: u64, errno: i32 },
+    /// Stream bytes emitted with one exact ancillary control message.
+    StreamMessage {
+        stream_offset: u64,
+        bytes: Vec<u8>,
+        ancillary: NetworkAncillaryDataV2,
+        message_flags: i32,
+    },
+    /// One exact datagram boundary with exact socket-address lengths.
+    DatagramExact(NetworkDatagramExactV2),
 }
 
 /// One expected outbound observation.
@@ -861,12 +855,14 @@ impl NetworkTraceV2 {
             output_terminal: bool,
             last_release_time: Option<LogicalTime>,
             last_release_output: u64,
+            connect_seen: bool,
         }
         let mut progress: BTreeMap<_, Progress> = channels
             .keys()
             .copied()
             .map(|id| (id, Progress::default()))
             .collect();
+        let mut accepted_channels = BTreeSet::new();
 
         for output in &self.outputs {
             let Some(channel) = channels.get(&output.channel) else {
@@ -886,6 +882,18 @@ impl NetworkTraceV2 {
                     check_offset(*stream_offset, state.output_offset, true)?;
                     state.output_offset = checked_advance(state.output_offset, bytes.len())?;
                 }
+                NetworkOutputKindV2::StreamMessage {
+                    stream_offset,
+                    bytes,
+                    ancillary,
+                    ..
+                } => {
+                    require_stream(channel)?;
+                    require_nonempty(bytes)?;
+                    check_offset(*stream_offset, state.output_offset, true)?;
+                    validate_ancillary(ancillary)?;
+                    state.output_offset = checked_advance(state.output_offset, bytes.len())?;
+                }
                 NetworkOutputKindV2::Datagram(datagram) => {
                     require_datagram(channel)?;
                     validate_datagram(datagram, state.output_datagram)?;
@@ -895,6 +903,16 @@ impl NetworkTraceV2 {
                         .ok_or(NetworkTraceValidationError::StreamOffsetOverflow)?;
                     state.output_offset =
                         checked_advance(state.output_offset, datagram.bytes.len())?;
+                }
+                NetworkOutputKindV2::DatagramExact(exact) => {
+                    require_datagram(channel)?;
+                    validate_exact_datagram(exact, state.output_datagram)?;
+                    state.output_datagram = state
+                        .output_datagram
+                        .checked_add(1)
+                        .ok_or(NetworkTraceValidationError::StreamOffsetOverflow)?;
+                    state.output_offset =
+                        checked_advance(state.output_offset, exact.datagram.bytes.len())?;
                 }
                 NetworkOutputKindV2::Shutdown {
                     stream_offset,
@@ -950,6 +968,10 @@ impl NetworkTraceV2 {
                     if channel.role != NetworkEndpointRoleV2::OutboundClient {
                         return Err(NetworkTraceValidationError::InvalidChannelRelationship);
                     }
+                    if state.connect_seen {
+                        return Err(NetworkTraceValidationError::DuplicateConnect);
+                    }
+                    state.connect_seen = true;
                     if let NetworkConnectionResultV2::Error(errno) = result {
                         validate_errno(*errno)?;
                     }
@@ -966,6 +988,9 @@ impl NetworkTraceV2 {
                     {
                         return Err(NetworkTraceValidationError::InvalidChannelRelationship);
                     }
+                    if !accepted_channels.insert(*accepted) {
+                        return Err(NetworkTraceValidationError::DuplicateAcceptedChannel);
+                    }
                     if let Some(ancillary) = ancillary {
                         validate_ancillary(ancillary)?;
                     }
@@ -979,9 +1004,29 @@ impl NetworkTraceV2 {
                     check_offset(*stream_offset, state.input_offset, false)?;
                     state.input_offset = checked_advance(state.input_offset, bytes.len())?;
                 }
+                NetworkInputKindV2::StreamMessage {
+                    stream_offset,
+                    bytes,
+                    ancillary,
+                    ..
+                } => {
+                    require_stream(channel)?;
+                    require_nonempty(bytes)?;
+                    check_offset(*stream_offset, state.input_offset, false)?;
+                    validate_ancillary(ancillary)?;
+                    state.input_offset = checked_advance(state.input_offset, bytes.len())?;
+                }
                 NetworkInputKindV2::Datagram(datagram) => {
                     require_datagram(channel)?;
                     validate_datagram(datagram, state.input_datagram)?;
+                    state.input_datagram = state
+                        .input_datagram
+                        .checked_add(1)
+                        .ok_or(NetworkTraceValidationError::StreamOffsetOverflow)?;
+                }
+                NetworkInputKindV2::DatagramExact(exact) => {
+                    require_datagram(channel)?;
+                    validate_exact_datagram(exact, state.input_datagram)?;
                     state.input_datagram = state
                         .input_datagram
                         .checked_add(1)
@@ -1007,11 +1052,8 @@ impl NetworkTraceV2 {
                     check_offset(*stream_offset, state.input_offset, false)?;
                     validate_errno(*errno)?;
                 }
-                NetworkInputKindV2::Readiness(readiness) => {
-                    if readiness.is_empty() {
-                        return Err(NetworkTraceValidationError::EmptyReadiness);
-                    }
-                }
+                // An empty state is a meaningful readiness-clear transition.
+                NetworkInputKindV2::Readiness(_) => {}
             }
         }
 
@@ -1168,20 +1210,33 @@ fn validate_datagram(
     Ok(())
 }
 
+fn validate_exact_datagram(
+    exact: &NetworkDatagramExactV2,
+    expected_sequence: u64,
+) -> Result<(), NetworkTraceValidationError> {
+    validate_datagram(&exact.datagram, expected_sequence)?;
+    if exact.source_length.is_some() != exact.datagram.source.is_some()
+        || exact.destination_length.is_some() != exact.datagram.destination.is_some()
+    {
+        return Err(NetworkTraceValidationError::AddressLengthMismatch);
+    }
+    Ok(())
+}
+
 fn validate_ancillary(
     ancillary: &NetworkAncillaryDataV2,
 ) -> Result<(), NetworkTraceValidationError> {
-    let mut offsets = BTreeSet::new();
+    let mut occupied = BTreeSet::new();
     for object in &ancillary.objects {
         let offset = object.byte_offset as usize;
         let object_len = match object.object {
             NetworkAncillaryObjectV2::FileDescriptor { .. } => std::mem::size_of::<i32>(),
             NetworkAncillaryObjectV2::Credentials { .. } => 3 * std::mem::size_of::<i32>(),
         };
-        if offset
-            .checked_add(object_len)
-            .is_none_or(|end| end > ancillary.bytes.len() || !offsets.insert(object.byte_offset))
-        {
+        let Some(end) = offset.checked_add(object_len) else {
+            return Err(NetworkTraceValidationError::InvalidAncillaryObjectOffset);
+        };
+        if end > ancillary.bytes.len() || (offset..end).any(|byte| !occupied.insert(byte)) {
             return Err(NetworkTraceValidationError::InvalidAncillaryObjectOffset);
         }
     }
@@ -1302,6 +1357,11 @@ pub enum NetworkTraceValidationError {
     TransportEventMismatch,
     NonCanonicalDatagramSequence,
     InvalidAncillaryObjectOffset,
+    DuplicateConnect,
+    DuplicateAcceptedChannel,
+    AddressLengthMismatch,
+    /// Retained so callers matching errors from early V2 implementations keep
+    /// compiling. Empty readiness is now a valid clear transition.
     EmptyReadiness,
 }
 
@@ -1961,6 +2021,85 @@ mod tests {
         assert_eq!(
             trace.validate(),
             Err(NetworkTraceValidationError::InvalidAncillaryObjectOffset)
+        );
+
+        let mut trace = valid_v2_trace();
+        let NetworkInputKindV2::Datagram(datagram) = &mut trace.inputs[1].event else {
+            unreachable!()
+        };
+        let ancillary = datagram.ancillary.as_mut().unwrap();
+        ancillary.objects = vec![
+            NetworkAncillaryObjectRefV2 {
+                byte_offset: 4,
+                object: NetworkAncillaryObjectV2::FileDescriptor {
+                    object: NetworkObjectId(1),
+                },
+            },
+            NetworkAncillaryObjectRefV2 {
+                byte_offset: 6,
+                object: NetworkAncillaryObjectV2::FileDescriptor {
+                    object: NetworkObjectId(2),
+                },
+            },
+        ];
+        assert_eq!(
+            trace.validate(),
+            Err(NetworkTraceValidationError::InvalidAncillaryObjectOffset)
+        );
+    }
+
+    #[test]
+    fn v2_accepts_readiness_clear_but_rejects_duplicate_connect() {
+        let mut trace = valid_v2_trace();
+        trace.inputs.push(NetworkInputEventV2 {
+            ordinal: 2,
+            channel: NetworkChannelId(10),
+            release: NetworkReleaseV2 {
+                not_before_global_time: global_time_after_epoch(12),
+                after_transmitted_offset: 3,
+            },
+            event: NetworkInputKindV2::Readiness(NetworkReadinessV2::default()),
+        });
+        trace.validate().unwrap();
+
+        let connect = |ordinal, delta| NetworkInputEventV2 {
+            ordinal,
+            channel: NetworkChannelId(10),
+            release: NetworkReleaseV2 {
+                not_before_global_time: global_time_after_epoch(delta),
+                after_transmitted_offset: 0,
+            },
+            event: NetworkInputKindV2::Connect(NetworkConnectionResultV2::Connected),
+        };
+        trace.inputs = vec![connect(0, 1), connect(1, 2)];
+        assert_eq!(
+            trace.validate(),
+            Err(NetworkTraceValidationError::DuplicateConnect)
+        );
+    }
+
+    #[test]
+    fn exact_datagram_requires_address_lengths_to_match_addresses() {
+        let mut trace = valid_v2_trace();
+        let NetworkInputKindV2::Datagram(datagram) = trace.inputs.remove(1).event else {
+            unreachable!()
+        };
+        trace.inputs.push(NetworkInputEventV2 {
+            ordinal: 1,
+            channel: NetworkChannelId(20),
+            release: NetworkReleaseV2 {
+                not_before_global_time: global_time_after_epoch(11),
+                after_transmitted_offset: 0,
+            },
+            event: NetworkInputKindV2::DatagramExact(NetworkDatagramExactV2 {
+                datagram,
+                source_length: None,
+                destination_length: Some(16),
+            }),
+        });
+        assert_eq!(
+            trace.validate(),
+            Err(NetworkTraceValidationError::AddressLengthMismatch)
         );
     }
 }
