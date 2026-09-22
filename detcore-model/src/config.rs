@@ -1430,11 +1430,7 @@ mod tests {
         };
         assert_eq!(config.network_trace.network_perturb_seed, None);
 
-        config.network_trace = NetworkTraceConfig {
-            mode: crate::network_trace::NetworkTraceMode::Replay,
-            path: Some("network.trace".into()),
-            network_perturb_seed: Some(43),
-        };
+        config.network_trace = NetworkTraceConfig::replay("network.trace", Some(43));
         assert_eq!(config.seed, 41);
         assert_eq!(config.sched_seed(), 42);
         assert_eq!(config.network_trace.network_perturb_seed, Some(43));

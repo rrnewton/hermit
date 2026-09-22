@@ -51,6 +51,8 @@ mod ivar;
 pub mod logdiff;
 mod memory;
 pub mod netlink_route;
+/// Schedule-independent external-network capture and replay state machine.
+pub mod network_replay;
 mod procfs;
 mod procmaps;
 pub mod random;

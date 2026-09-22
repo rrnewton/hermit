@@ -2502,6 +2502,17 @@ impl<T> ThreadState<T> {
         metadata.with_detfd(fd, f)
     }
 
+    /// Resolve a raw socket descriptor to its stable open-file identity.
+    ///
+    /// Network capture/replay calls this once at the syscall boundary and
+    /// retains the returned identity across blocking retries. Resolving the fd
+    /// again after a close and numeric reuse could otherwise retarget an
+    /// operation to a different socket.
+    pub fn socket_open_file_id(&self, fd: RawFd) -> Result<OpenFileId, Errno> {
+        self.with_detfd(fd, |detfd| detfd.socket_open_file_id())?
+            .ok_or(Errno::ENOTSOCK)
+    }
+
     pub(crate) fn count_open_files_at_paths(&self, paths: &[&Path]) -> usize {
         self.metadata().count_open_files_at_paths(paths)
     }

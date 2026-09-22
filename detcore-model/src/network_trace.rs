@@ -9,11 +9,13 @@
 //! Versioned data model for schedule-independent external network input.
 //!
 //! This module deliberately contains no recorder, replayer, or scheduler hook.
-//! It defines the fail-closed v1 envelope and its framing so a future runtime
-//! integration cannot accidentally reuse the schedule-coupled syscall event
-//! stream. Merely constructing a [`NetworkTraceConfig`] does not enable any
-//! behavior today.
+//! V1 is the deliberately narrow, single-client prototype. V2 is the runtime
+//! format: it assigns trace-stable channel identities independently of guest
+//! thread and syscall order, and represents TCP streams, datagram boundaries,
+//! readiness, ancillary data, partial progress, shutdown, and socket errors.
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -33,55 +35,109 @@ use crate::time::LogicalTime;
 
 /// The on-disk format magic. The version is stored in the following four bytes.
 pub const NETWORK_TRACE_MAGIC: [u8; 16] = *b"HERMIT-NET-TRACE";
-/// The only network trace format this build accepts.
+/// The legacy single-client network trace format.
 pub const NETWORK_TRACE_VERSION_V1: u32 = 1;
+/// The multi-channel schedule-independent network trace format.
+pub const NETWORK_TRACE_VERSION_V2: u32 = 2;
 /// Refuse hostile or corrupt length headers before allocating memory.
 pub const MAX_NETWORK_TRACE_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 const FRAME_HEADER_LEN: usize = NETWORK_TRACE_MAGIC.len() + 4 + 8;
 
-/// Whether the future runtime integration records or replays external input.
+/// Guest network policy selected for one run.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum NetworkTraceMode {
-    /// No network trace behavior. This is the default and has no runtime effect.
+pub enum NetworkPolicy {
+    /// Refuse external networking. This is the deterministic default.
+    #[serde(alias = "off")]
     #[default]
-    Off,
-    /// Capture supported external TCP input in a new trace.
+    Deny,
+    /// Capture supported external networking in a new trace.
     Record,
     /// Replay a trace without consulting the host network.
     Replay,
+    /// Consult the live host network without recording it.
+    UnsafeLive,
 }
 
-/// Configuration reserved for the future network recorder/replayer seam.
+/// Configuration for the shared external-network engine.
 ///
 /// `network_perturb_seed` is intentionally optional and has no fallback to the
-/// scheduler or global seed. A future perturbation layer must consume only this
+/// scheduler or global seed. A perturbation layer must consume only this
 /// seed so varying `sched_seed` cannot change the external input stream.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkTraceConfig {
-    pub mode: NetworkTraceMode,
+    /// Policy for external sockets.
+    #[serde(alias = "mode")]
+    pub policy: NetworkPolicy,
+    /// Trace path for record and replay policies.
     pub path: Option<PathBuf>,
+    /// Replay-only perturbation seed, independent of scheduler seeds.
     pub network_perturb_seed: Option<u64>,
 }
 
 impl NetworkTraceConfig {
+    /// Deterministic fail-closed policy.
+    pub fn deny() -> Self {
+        Self::default()
+    }
+
+    /// Record external network observations at `path`.
+    pub fn record(path: impl Into<PathBuf>) -> Self {
+        Self {
+            policy: NetworkPolicy::Record,
+            path: Some(path.into()),
+            network_perturb_seed: None,
+        }
+    }
+
+    /// Replay `path`, optionally perturbing only network delivery.
+    pub fn replay(path: impl Into<PathBuf>, network_perturb_seed: Option<u64>) -> Self {
+        Self {
+            policy: NetworkPolicy::Replay,
+            path: Some(path.into()),
+            network_perturb_seed,
+        }
+    }
+
+    /// Explicitly opt into nondeterministic live host networking.
+    pub fn unsafe_live() -> Self {
+        Self {
+            policy: NetworkPolicy::UnsafeLive,
+            path: None,
+            network_perturb_seed: None,
+        }
+    }
+
+    /// Whether the container must expose the host network.
+    pub fn needs_host_network(&self) -> bool {
+        matches!(
+            self.policy,
+            NetworkPolicy::Record | NetworkPolicy::UnsafeLive
+        )
+    }
+
+    /// Whether this policy consumes or produces a trace.
+    pub fn uses_trace(&self) -> bool {
+        matches!(self.policy, NetworkPolicy::Record | NetworkPolicy::Replay)
+    }
+
     /// Validate configuration independently of any scheduler configuration.
     pub fn validate(&self) -> Result<(), NetworkTraceConfigError> {
-        match self.mode {
-            NetworkTraceMode::Off => {
+        match self.policy {
+            NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => {
                 if self.path.is_some() || self.network_perturb_seed.is_some() {
-                    return Err(NetworkTraceConfigError::OptionsWhileOff);
+                    return Err(NetworkTraceConfigError::OptionsWithoutTrace);
                 }
             }
-            NetworkTraceMode::Record => {
+            NetworkPolicy::Record => {
                 validate_trace_path(self.path.as_ref())?;
                 if self.network_perturb_seed.is_some() {
                     return Err(NetworkTraceConfigError::PerturbationDuringRecord);
                 }
             }
-            NetworkTraceMode::Replay => validate_trace_path(self.path.as_ref())?,
+            NetworkPolicy::Replay => validate_trace_path(self.path.as_ref())?,
         }
         Ok(())
     }
@@ -100,7 +156,7 @@ fn validate_trace_path(path: Option<&PathBuf>) -> Result<(), NetworkTraceConfigE
 /// Invalid combinations in [`NetworkTraceConfig`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkTraceConfigError {
-    OptionsWhileOff,
+    OptionsWithoutTrace,
     MissingPath,
     EmptyPath,
     PerturbationDuringRecord,
@@ -109,7 +165,7 @@ pub enum NetworkTraceConfigError {
 impl fmt::Display for NetworkTraceConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::OptionsWhileOff => {
+            Self::OptionsWithoutTrace => {
                 write!(f, "network trace options require record or replay mode")
             }
             Self::MissingPath => write!(f, "network trace record/replay requires a path"),
@@ -453,6 +509,737 @@ impl NetworkTraceV1 {
     }
 }
 
+/// Trace-stable identity of a socket channel.
+///
+/// This is deliberately not an fd, [`OpenFileId`], thread id, or syscall
+/// ordinal. The runtime binds one live open-file description to this identity;
+/// dup and fork aliases therefore retain the binding while fd-number reuse
+/// cannot inherit it.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize
+)]
+pub struct NetworkChannelId(pub u64);
+
+/// Trace-stable identity of an object transferred in ancillary data.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize
+)]
+pub struct NetworkObjectId(pub u64);
+
+/// A host-layout-independent socket address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum NetworkAddressV2 {
+    /// IPv4 address and host-order port.
+    Inet4 { address: [u8; 4], port: u16 },
+    /// IPv6 address and host-order port.
+    Inet6 {
+        address: [u8; 16],
+        port: u16,
+        flowinfo: u32,
+        scope_id: u32,
+    },
+    /// Filesystem Unix-domain address, without a trailing NUL.
+    UnixPath(Vec<u8>),
+    /// Linux abstract Unix-domain address, without its leading NUL.
+    UnixAbstract(Vec<u8>),
+    /// An unnamed Unix-domain address.
+    UnixUnnamed,
+}
+
+/// Socket transport represented by a V2 channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkTransportV2 {
+    /// Reliable byte stream.
+    Tcp,
+    /// Boundary-preserving datagrams.
+    Udp,
+    /// Unix-domain stream.
+    UnixStream,
+    /// Unix-domain datagrams.
+    UnixDatagram,
+}
+
+impl NetworkTransportV2 {
+    /// Whether this transport preserves datagram boundaries.
+    pub fn is_datagram(self) -> bool {
+        matches!(self, Self::Udp | Self::UnixDatagram)
+    }
+}
+
+/// How a recorded channel came into existence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkEndpointRoleV2 {
+    /// Socket which initiated a connection.
+    OutboundClient,
+    /// Listening socket.
+    Listener,
+    /// Socket returned by accept.
+    Accepted,
+    /// Connectionless endpoint.
+    Datagram,
+}
+
+/// Metadata for one stable network channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkChannelV2 {
+    /// Trace-stable channel identity.
+    pub id: NetworkChannelId,
+    /// Transport semantics.
+    pub transport: NetworkTransportV2,
+    /// Creation role.
+    pub role: NetworkEndpointRoleV2,
+    /// Bound local address, if known.
+    pub local_address: Option<NetworkAddressV2>,
+    /// Connected peer address, if any.
+    pub peer_address: Option<NetworkAddressV2>,
+    /// Listener from which an accepted channel originated.
+    pub accepted_from: Option<NetworkChannelId>,
+}
+
+/// Conditions which must both hold before an observation becomes available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkReleaseV2 {
+    /// Absolute continuous virtual time; never host wall time.
+    pub not_before_global_time: LogicalTime,
+    /// Validated bytes transmitted on this channel before release.
+    pub after_transmitted_offset: u64,
+}
+
+impl NetworkReleaseV2 {
+    /// Test both release conditions without rounding or changing the clock.
+    pub fn is_eligible(self, now: LogicalTime, transmitted: u64) -> bool {
+        now >= self.not_before_global_time && transmitted >= self.after_transmitted_offset
+    }
+}
+
+/// Readiness bits independent of a host `pollfd` layout.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkReadinessV2 {
+    /// A receive can make progress without blocking.
+    pub readable: bool,
+    /// A transmit can make progress without blocking.
+    pub writable: bool,
+    /// A pending socket error is observable.
+    pub error: bool,
+    /// The peer closed or shut down its write side.
+    pub hangup: bool,
+}
+
+impl NetworkReadinessV2 {
+    /// Whether no readiness condition is present.
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+/// Direction for `shutdown(2)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkShutdownV2 {
+    /// Stop receiving.
+    Read,
+    /// Stop transmitting.
+    Write,
+    /// Stop both directions.
+    Both,
+}
+
+/// Typed metadata for kernel objects embedded in ancillary bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum NetworkAncillaryObjectV2 {
+    /// One descriptor carried by `SCM_RIGHTS`.
+    FileDescriptor { object: NetworkObjectId },
+    /// Credentials carried by `SCM_CREDENTIALS`.
+    Credentials { pid: i32, uid: u32, gid: u32 },
+}
+
+/// Exact control bytes plus typed object relocation metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkAncillaryDataV2 {
+    /// Exact logical control-message bytes before fd-number relocation.
+    pub bytes: Vec<u8>,
+    /// Objects and byte offsets of their native-endian integer slots.
+    pub objects: Vec<NetworkAncillaryObjectRefV2>,
+    /// Linux `MSG_CTRUNC` observation.
+    pub truncated: bool,
+}
+
+/// Location and identity of one ancillary object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkAncillaryObjectRefV2 {
+    /// Byte offset within [`NetworkAncillaryDataV2::bytes`].
+    pub byte_offset: u32,
+    /// Object represented at that offset.
+    pub object: NetworkAncillaryObjectV2,
+}
+
+/// Boundary-preserving datagram payload and addressing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkDatagramV2 {
+    /// Per-channel datagram sequence, independent of consuming thread.
+    pub sequence: u64,
+    /// Entire datagram payload before a receiving buffer truncates it.
+    pub bytes: Vec<u8>,
+    /// Sender address returned to the receiver.
+    pub source: Option<NetworkAddressV2>,
+    /// Destination address supplied by the sender, when explicit.
+    pub destination: Option<NetworkAddressV2>,
+    /// Ancillary bytes and object metadata.
+    pub ancillary: Option<NetworkAncillaryDataV2>,
+    /// Linux message flags observed on receive.
+    pub message_flags: i32,
+}
+
+/// Result of connect or accept, including asynchronous failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum NetworkConnectionResultV2 {
+    /// Operation completed successfully.
+    Connected,
+    /// Operation failed with this positive Linux errno.
+    Error(i32),
+}
+
+/// One inbound external observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum NetworkInputKindV2 {
+    /// Completion of a connect attempt.
+    Connect(NetworkConnectionResultV2),
+    /// One accepted connection became available on a listener.
+    Accept {
+        accepted: NetworkChannelId,
+        peer: Option<NetworkAddressV2>,
+        ancillary: Option<NetworkAncillaryDataV2>,
+    },
+    /// Bytes appended to a stream at an exact stream offset.
+    StreamBytes { stream_offset: u64, bytes: Vec<u8> },
+    /// One complete datagram.
+    Datagram(NetworkDatagramV2),
+    /// Peer half-close at an exact stream offset.
+    PeerShutdown {
+        stream_offset: u64,
+        direction: NetworkShutdownV2,
+    },
+    /// Socket operation failed. Retryable errors are represented explicitly
+    /// rather than being mistaken for stream termination.
+    SocketError { stream_offset: u64, errno: i32 },
+    /// Host readiness transition which cannot be derived from buffered data.
+    Readiness(NetworkReadinessV2),
+}
+
+/// One globally ordered observation with schedule-independent release gates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkInputEventV2 {
+    /// Canonical trace order, used only between external observations.
+    pub ordinal: u64,
+    /// Channel affected by this observation.
+    pub channel: NetworkChannelId,
+    /// Continuous-time and outbound-progress gate.
+    pub release: NetworkReleaseV2,
+    /// Observation payload.
+    pub event: NetworkInputKindV2,
+}
+
+/// Expected guest output. Stream fragments may be split or coalesced by replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum NetworkOutputKindV2 {
+    /// Contiguous expected stream bytes.
+    StreamBytes { stream_offset: u64, bytes: Vec<u8> },
+    /// One exact datagram boundary.
+    Datagram(NetworkDatagramV2),
+    /// Local shutdown transition.
+    Shutdown {
+        stream_offset: u64,
+        direction: NetworkShutdownV2,
+    },
+    /// A transmit attempt failed at this offset.
+    SocketError { stream_offset: u64, errno: i32 },
+}
+
+/// One expected outbound observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkOutputEventV2 {
+    /// Channel which emitted the output.
+    pub channel: NetworkChannelId,
+    /// Expected output.
+    pub event: NetworkOutputKindV2,
+}
+
+/// Multi-channel schedule-independent network trace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkTraceV2 {
+    /// Trace epoch in the same absolute domain as `GlobalTime`.
+    pub epoch: DateTime<Utc>,
+    /// Stable channel definitions.
+    pub channels: Vec<NetworkChannelV2>,
+    /// External observations in canonical arrival order.
+    pub inputs: Vec<NetworkInputEventV2>,
+    /// Expected output, grouped into per-channel progress during validation.
+    pub outputs: Vec<NetworkOutputEventV2>,
+}
+
+/// A decoded trace with an explicit on-disk version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkTrace {
+    /// Legacy single-client trace.
+    V1(NetworkTraceV1),
+    /// Current multi-channel trace.
+    V2(NetworkTraceV2),
+}
+
+impl NetworkTraceV2 {
+    /// Convert the epoch to Hermit's absolute logical-time domain.
+    pub fn epoch_global_time(&self) -> Result<LogicalTime, NetworkTraceValidationError> {
+        epoch_global_time(self.epoch)
+    }
+
+    /// Validate all identities, stream offsets, datagram boundaries, ancillary
+    /// relocations, release gates, and terminal states before runtime use.
+    pub fn validate(&self) -> Result<(), NetworkTraceValidationError> {
+        let epoch = self.epoch_global_time()?;
+        let mut channels = BTreeMap::new();
+        for channel in &self.channels {
+            if channels.insert(channel.id, channel).is_some() {
+                return Err(NetworkTraceValidationError::DuplicateChannel);
+            }
+            validate_channel(channel)?;
+        }
+
+        for channel in &self.channels {
+            if let Some(listener) = channel.accepted_from {
+                let Some(parent) = channels.get(&listener) else {
+                    return Err(NetworkTraceValidationError::UnknownChannel);
+                };
+                if parent.role != NetworkEndpointRoleV2::Listener
+                    || channel.role != NetworkEndpointRoleV2::Accepted
+                {
+                    return Err(NetworkTraceValidationError::InvalidChannelRelationship);
+                }
+            }
+        }
+
+        #[derive(Default)]
+        struct Progress {
+            input_offset: u64,
+            output_offset: u64,
+            input_datagram: u64,
+            output_datagram: u64,
+            input_terminal: bool,
+            output_terminal: bool,
+            last_release_time: Option<LogicalTime>,
+            last_release_output: u64,
+        }
+        let mut progress: BTreeMap<_, Progress> = channels
+            .keys()
+            .copied()
+            .map(|id| (id, Progress::default()))
+            .collect();
+
+        for output in &self.outputs {
+            let Some(channel) = channels.get(&output.channel) else {
+                return Err(NetworkTraceValidationError::UnknownChannel);
+            };
+            let state = progress.get_mut(&output.channel).unwrap();
+            if state.output_terminal {
+                return Err(NetworkTraceValidationError::EventAfterTerminal);
+            }
+            match &output.event {
+                NetworkOutputKindV2::StreamBytes {
+                    stream_offset,
+                    bytes,
+                } => {
+                    require_stream(channel)?;
+                    require_nonempty(bytes)?;
+                    check_offset(*stream_offset, state.output_offset, true)?;
+                    state.output_offset = checked_advance(state.output_offset, bytes.len())?;
+                }
+                NetworkOutputKindV2::Datagram(datagram) => {
+                    require_datagram(channel)?;
+                    validate_datagram(datagram, state.output_datagram)?;
+                    state.output_datagram = state
+                        .output_datagram
+                        .checked_add(1)
+                        .ok_or(NetworkTraceValidationError::StreamOffsetOverflow)?;
+                    state.output_offset =
+                        checked_advance(state.output_offset, datagram.bytes.len())?;
+                }
+                NetworkOutputKindV2::Shutdown {
+                    stream_offset,
+                    direction,
+                } => {
+                    require_stream(channel)?;
+                    check_offset(*stream_offset, state.output_offset, true)?;
+                    if matches!(
+                        direction,
+                        NetworkShutdownV2::Write | NetworkShutdownV2::Both
+                    ) {
+                        state.output_terminal = true;
+                    }
+                }
+                NetworkOutputKindV2::SocketError {
+                    stream_offset,
+                    errno,
+                } => {
+                    check_offset(*stream_offset, state.output_offset, true)?;
+                    validate_errno(*errno)?;
+                }
+            }
+        }
+
+        for (index, input) in self.inputs.iter().enumerate() {
+            if input.ordinal != index as u64 {
+                return Err(NetworkTraceValidationError::NonCanonicalOrdinal);
+            }
+            let Some(channel) = channels.get(&input.channel) else {
+                return Err(NetworkTraceValidationError::UnknownChannel);
+            };
+            let state = progress.get_mut(&input.channel).unwrap();
+            if input.release.not_before_global_time < epoch {
+                return Err(NetworkTraceValidationError::ReleaseBeforeEpoch);
+            }
+            if state
+                .last_release_time
+                .is_some_and(|time| input.release.not_before_global_time < time)
+                || input.release.after_transmitted_offset < state.last_release_output
+            {
+                return Err(NetworkTraceValidationError::NonMonotonicRelease);
+            }
+            if input.release.after_transmitted_offset > state.output_offset {
+                return Err(NetworkTraceValidationError::UnreachableTransmitWatermark);
+            }
+            state.last_release_time = Some(input.release.not_before_global_time);
+            state.last_release_output = input.release.after_transmitted_offset;
+            if state.input_terminal && !matches!(input.event, NetworkInputKindV2::Readiness(_)) {
+                return Err(NetworkTraceValidationError::EventAfterTerminal);
+            }
+            match &input.event {
+                NetworkInputKindV2::Connect(result) => {
+                    if channel.role != NetworkEndpointRoleV2::OutboundClient {
+                        return Err(NetworkTraceValidationError::InvalidChannelRelationship);
+                    }
+                    if let NetworkConnectionResultV2::Error(errno) = result {
+                        validate_errno(*errno)?;
+                    }
+                }
+                NetworkInputKindV2::Accept {
+                    accepted,
+                    ancillary,
+                    ..
+                } => {
+                    if channel.role != NetworkEndpointRoleV2::Listener
+                        || channels.get(accepted).is_none_or(|accepted_channel| {
+                            accepted_channel.accepted_from != Some(input.channel)
+                        })
+                    {
+                        return Err(NetworkTraceValidationError::InvalidChannelRelationship);
+                    }
+                    if let Some(ancillary) = ancillary {
+                        validate_ancillary(ancillary)?;
+                    }
+                }
+                NetworkInputKindV2::StreamBytes {
+                    stream_offset,
+                    bytes,
+                } => {
+                    require_stream(channel)?;
+                    require_nonempty(bytes)?;
+                    check_offset(*stream_offset, state.input_offset, false)?;
+                    state.input_offset = checked_advance(state.input_offset, bytes.len())?;
+                }
+                NetworkInputKindV2::Datagram(datagram) => {
+                    require_datagram(channel)?;
+                    validate_datagram(datagram, state.input_datagram)?;
+                    state.input_datagram = state
+                        .input_datagram
+                        .checked_add(1)
+                        .ok_or(NetworkTraceValidationError::StreamOffsetOverflow)?;
+                }
+                NetworkInputKindV2::PeerShutdown {
+                    stream_offset,
+                    direction,
+                } => {
+                    require_stream(channel)?;
+                    check_offset(*stream_offset, state.input_offset, false)?;
+                    if matches!(
+                        direction,
+                        NetworkShutdownV2::Write | NetworkShutdownV2::Both
+                    ) {
+                        state.input_terminal = true;
+                    }
+                }
+                NetworkInputKindV2::SocketError {
+                    stream_offset,
+                    errno,
+                } => {
+                    check_offset(*stream_offset, state.input_offset, false)?;
+                    validate_errno(*errno)?;
+                }
+                NetworkInputKindV2::Readiness(readiness) => {
+                    if readiness.is_empty() {
+                        return Err(NetworkTraceValidationError::EmptyReadiness);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write the current V2 frame.
+    pub fn write_framed<W: Write>(&self, writer: W) -> Result<(), NetworkTraceCodecError> {
+        self.validate()?;
+        write_payload(writer, NETWORK_TRACE_VERSION_V2, self)
+    }
+
+    /// Read a V2 frame, refusing V1 rather than silently migrating semantics.
+    pub fn read_framed<R: Read>(reader: R) -> Result<Self, NetworkTraceCodecError> {
+        let (version, payload) = read_payload(reader)?;
+        if version != NETWORK_TRACE_VERSION_V2 {
+            return Err(NetworkTraceCodecError::UnsupportedVersion(version));
+        }
+        let trace: Self = decode_payload(&payload)?;
+        trace.validate()?;
+        Ok(trace)
+    }
+}
+
+impl NetworkTrace {
+    /// Decode either explicitly supported version.
+    pub fn read_framed<R: Read>(reader: R) -> Result<Self, NetworkTraceCodecError> {
+        let (version, payload) = read_payload(reader)?;
+        match version {
+            NETWORK_TRACE_VERSION_V1 => {
+                let trace: NetworkTraceV1 = decode_payload(&payload)?;
+                trace.validate()?;
+                Ok(Self::V1(trace))
+            }
+            NETWORK_TRACE_VERSION_V2 => {
+                let trace: NetworkTraceV2 = decode_payload(&payload)?;
+                trace.validate()?;
+                Ok(Self::V2(trace))
+            }
+            version => Err(NetworkTraceCodecError::UnsupportedVersion(version)),
+        }
+    }
+
+    /// Write the variant using its explicit version number.
+    pub fn write_framed<W: Write>(&self, writer: W) -> Result<(), NetworkTraceCodecError> {
+        match self {
+            Self::V1(trace) => trace.write_framed(writer),
+            Self::V2(trace) => trace.write_framed(writer),
+        }
+    }
+}
+
+fn epoch_global_time(epoch: DateTime<Utc>) -> Result<LogicalTime, NetworkTraceValidationError> {
+    let seconds = u64::try_from(epoch.timestamp())
+        .map_err(|_| NetworkTraceValidationError::EpochOutOfRange)?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|whole| whole.checked_add(u64::from(epoch.timestamp_subsec_micros()) * 1_000))
+        .map(LogicalTime::from_nanos)
+        .ok_or(NetworkTraceValidationError::EpochOutOfRange)
+}
+
+fn validate_channel(channel: &NetworkChannelV2) -> Result<(), NetworkTraceValidationError> {
+    match channel.role {
+        NetworkEndpointRoleV2::OutboundClient => {
+            if channel.peer_address.is_none() || channel.accepted_from.is_some() {
+                return Err(NetworkTraceValidationError::InvalidChannelRelationship);
+            }
+        }
+        NetworkEndpointRoleV2::Listener => {
+            if channel.peer_address.is_some() || channel.accepted_from.is_some() {
+                return Err(NetworkTraceValidationError::InvalidChannelRelationship);
+            }
+        }
+        NetworkEndpointRoleV2::Accepted => {
+            if channel.accepted_from.is_none() {
+                return Err(NetworkTraceValidationError::InvalidChannelRelationship);
+            }
+        }
+        NetworkEndpointRoleV2::Datagram => {
+            if !channel.transport.is_datagram() || channel.accepted_from.is_some() {
+                return Err(NetworkTraceValidationError::InvalidChannelRelationship);
+            }
+        }
+    }
+    if channel.transport.is_datagram() != matches!(channel.role, NetworkEndpointRoleV2::Datagram) {
+        return Err(NetworkTraceValidationError::TransportRoleMismatch);
+    }
+    Ok(())
+}
+
+fn require_stream(channel: &NetworkChannelV2) -> Result<(), NetworkTraceValidationError> {
+    if channel.transport.is_datagram() {
+        Err(NetworkTraceValidationError::TransportEventMismatch)
+    } else {
+        Ok(())
+    }
+}
+
+fn require_datagram(channel: &NetworkChannelV2) -> Result<(), NetworkTraceValidationError> {
+    if channel.transport.is_datagram() {
+        Ok(())
+    } else {
+        Err(NetworkTraceValidationError::TransportEventMismatch)
+    }
+}
+
+fn require_nonempty(bytes: &[u8]) -> Result<(), NetworkTraceValidationError> {
+    if bytes.is_empty() {
+        Err(NetworkTraceValidationError::EmptyByteChunk)
+    } else {
+        Ok(())
+    }
+}
+
+fn check_offset(
+    actual: u64,
+    expected: u64,
+    output: bool,
+) -> Result<(), NetworkTraceValidationError> {
+    if actual == expected {
+        Ok(())
+    } else if output {
+        Err(NetworkTraceValidationError::NonContiguousOutput)
+    } else {
+        Err(NetworkTraceValidationError::NonContiguousInput)
+    }
+}
+
+fn checked_advance(offset: u64, count: usize) -> Result<u64, NetworkTraceValidationError> {
+    offset
+        .checked_add(count as u64)
+        .ok_or(NetworkTraceValidationError::StreamOffsetOverflow)
+}
+
+fn validate_errno(errno: i32) -> Result<(), NetworkTraceValidationError> {
+    if (1..=4095).contains(&errno) {
+        Ok(())
+    } else {
+        Err(NetworkTraceValidationError::InvalidErrno)
+    }
+}
+
+fn validate_datagram(
+    datagram: &NetworkDatagramV2,
+    expected_sequence: u64,
+) -> Result<(), NetworkTraceValidationError> {
+    if datagram.sequence != expected_sequence {
+        return Err(NetworkTraceValidationError::NonCanonicalDatagramSequence);
+    }
+    if let Some(ancillary) = &datagram.ancillary {
+        validate_ancillary(ancillary)?;
+    }
+    Ok(())
+}
+
+fn validate_ancillary(
+    ancillary: &NetworkAncillaryDataV2,
+) -> Result<(), NetworkTraceValidationError> {
+    let mut offsets = BTreeSet::new();
+    for object in &ancillary.objects {
+        let offset = object.byte_offset as usize;
+        let object_len = match object.object {
+            NetworkAncillaryObjectV2::FileDescriptor { .. } => std::mem::size_of::<i32>(),
+            NetworkAncillaryObjectV2::Credentials { .. } => 3 * std::mem::size_of::<i32>(),
+        };
+        if offset
+            .checked_add(object_len)
+            .is_none_or(|end| end > ancillary.bytes.len() || !offsets.insert(object.byte_offset))
+        {
+            return Err(NetworkTraceValidationError::InvalidAncillaryObjectOffset);
+        }
+    }
+    Ok(())
+}
+
+fn write_payload<W: Write, T: Serialize>(
+    mut writer: W,
+    version: u32,
+    trace: &T,
+) -> Result<(), NetworkTraceCodecError> {
+    let payload = bincode::serde::encode_to_vec(trace, bincode::config::standard())
+        .map_err(NetworkTraceCodecError::Encode)?;
+    let payload_len = u64::try_from(payload.len()).map_err(|_| NetworkTraceCodecError::TooLarge)?;
+    if payload_len > MAX_NETWORK_TRACE_PAYLOAD_BYTES {
+        return Err(NetworkTraceCodecError::TooLarge);
+    }
+    writer.write_all(&NETWORK_TRACE_MAGIC)?;
+    writer.write_all(&version.to_le_bytes())?;
+    writer.write_all(&payload_len.to_le_bytes())?;
+    writer.write_all(&payload)?;
+    Ok(())
+}
+
+fn read_payload<R: Read>(mut reader: R) -> Result<(u32, Vec<u8>), NetworkTraceCodecError> {
+    let mut header = [0u8; FRAME_HEADER_LEN];
+    read_exact_or_truncated(&mut reader, &mut header)?;
+    if header[..NETWORK_TRACE_MAGIC.len()] != NETWORK_TRACE_MAGIC {
+        return Err(NetworkTraceCodecError::BadMagic);
+    }
+    let version_start = NETWORK_TRACE_MAGIC.len();
+    let version = u32::from_le_bytes(header[version_start..version_start + 4].try_into().unwrap());
+    let len_start = version_start + 4;
+    let payload_len = u64::from_le_bytes(header[len_start..len_start + 8].try_into().unwrap());
+    if payload_len > MAX_NETWORK_TRACE_PAYLOAD_BYTES {
+        return Err(NetworkTraceCodecError::TooLarge);
+    }
+    let payload_len = usize::try_from(payload_len).map_err(|_| NetworkTraceCodecError::TooLarge)?;
+    let mut payload = vec![0; payload_len];
+    read_exact_or_truncated(&mut reader, &mut payload)?;
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(NetworkTraceCodecError::TrailingData);
+    }
+    Ok((version, payload))
+}
+
+fn decode_payload<T: for<'de> Deserialize<'de>>(
+    payload: &[u8],
+) -> Result<T, NetworkTraceCodecError> {
+    let (trace, consumed) = bincode::serde::decode_from_slice(payload, bincode::config::standard())
+        .map_err(NetworkTraceCodecError::Decode)?;
+    if consumed != payload.len() {
+        return Err(NetworkTraceCodecError::TrailingPayloadData);
+    }
+    Ok(trace)
+}
+
 fn validate_outputs(
     outputs: &[NetworkOutputV1],
     channel: OpenFileId,
@@ -492,6 +1279,7 @@ fn read_exact_or_truncated<R: Read>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkTraceValidationError {
     ChannelCount(usize),
+    DuplicateChannel,
     EpochOutOfRange,
     NonSocketChannelIdentity,
     ScheduleDependentChannelIdentity,
@@ -509,6 +1297,12 @@ pub enum NetworkTraceValidationError {
     InvalidErrno,
     NonTerminalSocketError,
     EventAfterTerminal,
+    InvalidChannelRelationship,
+    TransportRoleMismatch,
+    TransportEventMismatch,
+    NonCanonicalDatagramSequence,
+    InvalidAncillaryObjectOffset,
+    EmptyReadiness,
 }
 
 impl fmt::Display for NetworkTraceValidationError {
@@ -840,15 +1634,11 @@ mod tests {
     #[test]
     fn config_is_off_by_default_and_perturbation_has_no_seed_fallback() {
         let config = NetworkTraceConfig::default();
-        assert_eq!(config.mode, NetworkTraceMode::Off);
+        assert_eq!(config.policy, NetworkPolicy::Deny);
         assert_eq!(config.network_perturb_seed, None);
         assert_eq!(config.validate(), Ok(()));
 
-        let replay = NetworkTraceConfig {
-            mode: NetworkTraceMode::Replay,
-            path: Some("trace.net".into()),
-            network_perturb_seed: Some(17),
-        };
+        let replay = NetworkTraceConfig::replay("trace.net", Some(17));
         assert_eq!(replay.network_perturb_seed, Some(17));
         assert_eq!(replay.validate(), Ok(()));
 
@@ -856,6 +1646,13 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<NetworkTraceConfig>(&encoded).unwrap(),
             replay
+        );
+        assert_eq!(
+            serde_json::from_str::<NetworkTraceConfig>(
+                r#"{"mode":"off","path":null,"network_perturb_seed":null}"#
+            )
+            .unwrap(),
+            NetworkTraceConfig::deny()
         );
         assert!(
             serde_json::from_str::<NetworkTraceConfig>(
@@ -873,11 +1670,11 @@ mod tests {
                 ..NetworkTraceConfig::default()
             }
             .validate(),
-            Err(NetworkTraceConfigError::OptionsWhileOff)
+            Err(NetworkTraceConfigError::OptionsWithoutTrace)
         );
         assert_eq!(
             NetworkTraceConfig {
-                mode: NetworkTraceMode::Replay,
+                policy: NetworkPolicy::Replay,
                 ..NetworkTraceConfig::default()
             }
             .validate(),
@@ -885,7 +1682,7 @@ mod tests {
         );
         assert_eq!(
             NetworkTraceConfig {
-                mode: NetworkTraceMode::Record,
+                policy: NetworkPolicy::Record,
                 path: Some("trace.net".into()),
                 network_perturb_seed: Some(1),
             }
@@ -1029,6 +1826,141 @@ mod tests {
         assert_eq!(
             trace.validate(),
             Err(NetworkTraceValidationError::EventAfterTerminal)
+        );
+    }
+
+    fn valid_v2_trace() -> NetworkTraceV2 {
+        let client = NetworkChannelId(10);
+        let datagram = NetworkChannelId(20);
+        NetworkTraceV2 {
+            epoch: trace_epoch(),
+            channels: vec![
+                NetworkChannelV2 {
+                    id: client,
+                    transport: NetworkTransportV2::Tcp,
+                    role: NetworkEndpointRoleV2::OutboundClient,
+                    local_address: Some(NetworkAddressV2::Inet4 {
+                        address: [10, 0, 0, 2],
+                        port: 40_000,
+                    }),
+                    peer_address: Some(NetworkAddressV2::Inet4 {
+                        address: [192, 0, 2, 10],
+                        port: 443,
+                    }),
+                    accepted_from: None,
+                },
+                NetworkChannelV2 {
+                    id: datagram,
+                    transport: NetworkTransportV2::Udp,
+                    role: NetworkEndpointRoleV2::Datagram,
+                    local_address: Some(NetworkAddressV2::Inet4 {
+                        address: [10, 0, 0, 2],
+                        port: 50_000,
+                    }),
+                    peer_address: None,
+                    accepted_from: None,
+                },
+            ],
+            outputs: vec![NetworkOutputEventV2 {
+                channel: client,
+                event: NetworkOutputKindV2::StreamBytes {
+                    stream_offset: 0,
+                    bytes: b"request".to_vec(),
+                },
+            }],
+            inputs: vec![
+                NetworkInputEventV2 {
+                    ordinal: 0,
+                    channel: client,
+                    release: NetworkReleaseV2 {
+                        not_before_global_time: global_time_after_epoch(10),
+                        after_transmitted_offset: 3,
+                    },
+                    event: NetworkInputKindV2::StreamBytes {
+                        stream_offset: 0,
+                        bytes: b"response".to_vec(),
+                    },
+                },
+                NetworkInputEventV2 {
+                    ordinal: 1,
+                    channel: datagram,
+                    release: NetworkReleaseV2 {
+                        not_before_global_time: global_time_after_epoch(11),
+                        after_transmitted_offset: 0,
+                    },
+                    event: NetworkInputKindV2::Datagram(NetworkDatagramV2 {
+                        sequence: 0,
+                        bytes: b"packet".to_vec(),
+                        source: Some(NetworkAddressV2::Inet4 {
+                            address: [198, 51, 100, 2],
+                            port: 53,
+                        }),
+                        destination: Some(NetworkAddressV2::Inet4 {
+                            address: [10, 0, 0, 2],
+                            port: 50_000,
+                        }),
+                        ancillary: Some(NetworkAncillaryDataV2 {
+                            bytes: vec![0; 16],
+                            objects: vec![NetworkAncillaryObjectRefV2 {
+                                byte_offset: 4,
+                                object: NetworkAncillaryObjectV2::Credentials {
+                                    pid: 7,
+                                    uid: 1000,
+                                    gid: 1000,
+                                },
+                            }],
+                            truncated: false,
+                        }),
+                        message_flags: 0,
+                    }),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn v2_round_trips_with_multi_channel_datagram_and_ancillary_metadata() {
+        let trace = valid_v2_trace();
+        trace.validate().unwrap();
+        let mut bytes = Vec::new();
+        NetworkTrace::V2(trace.clone())
+            .write_framed(&mut bytes)
+            .unwrap();
+        assert_eq!(
+            NetworkTrace::read_framed(Cursor::new(bytes)).unwrap(),
+            NetworkTrace::V2(trace)
+        );
+    }
+
+    #[test]
+    fn versioned_reader_preserves_v1_decode_compatibility() {
+        let v1 = valid_trace();
+        assert_eq!(
+            NetworkTrace::read_framed(Cursor::new(framed(&v1))).unwrap(),
+            NetworkTrace::V1(v1)
+        );
+    }
+
+    #[test]
+    fn v2_refuses_broken_datagram_boundaries_and_ancillary_relocations() {
+        let mut trace = valid_v2_trace();
+        let NetworkInputKindV2::Datagram(datagram) = &mut trace.inputs[1].event else {
+            unreachable!()
+        };
+        datagram.sequence = 2;
+        assert_eq!(
+            trace.validate(),
+            Err(NetworkTraceValidationError::NonCanonicalDatagramSequence)
+        );
+
+        let mut trace = valid_v2_trace();
+        let NetworkInputKindV2::Datagram(datagram) = &mut trace.inputs[1].event else {
+            unreachable!()
+        };
+        datagram.ancillary.as_mut().unwrap().objects[0].byte_offset = 15;
+        assert_eq!(
+            trace.validate(),
+            Err(NetworkTraceValidationError::InvalidAncillaryObjectOffset)
         );
     }
 }

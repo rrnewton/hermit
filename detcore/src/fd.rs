@@ -329,6 +329,16 @@ impl DetFd {
         self.description().id
     }
 
+    /// Stable network identity for this open-file description.
+    ///
+    /// Every dup/fork alias returns the same value. A later socket reusing the
+    /// same numeric fd receives a distinct value, so network replay must use
+    /// this identity rather than the raw descriptor number.
+    pub fn socket_open_file_id(&self) -> Option<OpenFileId> {
+        let description = self.description();
+        (description.ty == FdType::Socket).then_some(description.id)
+    }
+
     /// Number of modeled descriptor slots that retain this open file description.
     pub(crate) fn open_file_alias_count(&self) -> usize {
         Arc::strong_count(&self.open_file)
@@ -665,6 +675,11 @@ mod tests {
         let duplicate = original.clone().with_fd(4).with_fd_flags(OFlag::O_CLOEXEC);
 
         assert_eq!(original.open_file_id(), duplicate.open_file_id());
+        assert_eq!(
+            original.socket_open_file_id(),
+            duplicate.socket_open_file_id(),
+            "network identity belongs to the shared OFD, not either fd slot"
+        );
         assert!(
             !original.is_cloexec(),
             "dup must not alter the source fd flags"
