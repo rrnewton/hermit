@@ -504,17 +504,38 @@ and reproducibility.
 
 Network modes are:
 
-- `--network=local` (default): isolated loopback networking.
-- `--network=host`: host networking. External responses and port state become
-  nondeterministic inputs.
+- Default / `--network=none`: create a fresh network namespace and leave its
+  kernel-mandatory loopback interface down. External connections fail closed.
+- `--network=local`: explicitly enable loopback inside the isolated network
+  namespace for guest-internal client/server communication.
+- `--record-networking=NEW_TRACE --unsafe-live-network`: contact the live
+  network while capturing supported external traffic in a new versioned trace.
+- `--replay-networking=TRACE`: replay that trace without consulting the live
+  network. Scheduler seeds and timeslices may vary independently of the fixed
+  external input.
+- `--unsafe-live-network`: expose the host network without capturing it. This
+  admits uncontrolled input and forfeits Hermit's deterministic-execution
+  guarantee. Legacy `--network=host` is accepted but canonicalizes to this
+  explicit unsafe spelling.
+
+Run-mode recording/replay and full `hermit replay` configure one shared network
+engine and trace codec. Full replay obtains its network policy and trace from the
+recording metadata; it is not a separate network replayer.
+
+`--namespace-only` does not load Detcore and therefore cannot record or replay a
+network trace. `--no-namespace` and `--strace-only` share the host network and
+require `--unsafe-live-network`; neither silently enables it. DBT can enforce
+the default Detcore denial but cannot yet provide isolated loopback or network
+trace capture/replay; those modes redirect users to the ptrace backend.
 
 `hermit run --gdbserver` needs a host gdb client to reach the gdbserver port.
-Because `--network=local` binds that port inside the guest's isolated network
-namespace, run mode forces host networking (printing a warning) whenever
-`--gdbserver` is set so the debugger can attach. Attach from another terminal
-with `gdb -ex 'target remote :PORT'` (default port 1234, override with
+Both isolated policies hide that port from the host, so `--gdbserver` requires
+the explicit `--unsafe-live-network` acknowledgment and never enables host
+networking as a side effect. Attach from another terminal with
+`gdb -ex 'target remote :PORT'` (default port 1234, override with
 `--gdbserver-port=PORT`). `--gdbserver` cannot be combined with
-`--analyze-networking`, which requires the isolated namespace.
+network capture/replay or `--analyze-networking`, which requires isolated
+loopback.
 
 Environment controls include `--base-env=empty`, `--base-env=minimal`,
 `--base-env=host`, `-e NAME[=VALUE]`, and `--workdir=PATH`.
