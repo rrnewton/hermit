@@ -5594,8 +5594,10 @@ mod tests {
     #[test]
     fn explicit_epoch_is_preserved_and_rendered_exactly() {
         let explicit = "2026-01-01T00:00:00Z".parse().unwrap();
-        let mut config = DetConfig::default();
-        config.epoch = explicit;
+        let mut config = DetConfig {
+            epoch: explicit,
+            ..DetConfig::default()
+        };
         resolve_run_epoch(&mut config, true, None, capture_current_epoch()).unwrap();
         assert_eq!(config.epoch, explicit);
         assert!(config.epoch_explicit);
@@ -5608,8 +5610,10 @@ mod tests {
 
     #[test]
     fn explicit_epoch_mismatch_with_replay_refuses() {
-        let mut config = DetConfig::default();
-        config.epoch = "2026-01-01T00:00:00Z".parse().unwrap();
+        let mut config = DetConfig {
+            epoch: "2026-01-01T00:00:00Z".parse().unwrap(),
+            ..DetConfig::default()
+        };
         let replay_epoch = "2026-01-01T00:00:00.000001Z".parse().unwrap();
         let error = resolve_run_epoch(
             &mut config,
