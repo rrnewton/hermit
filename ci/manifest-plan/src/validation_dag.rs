@@ -548,7 +548,10 @@ pub(crate) fn refresh_pinned_root_environment(tag: &str, command: &str) -> Resul
         .filter(|word| **word == "--proc-locks-runtime")
         .count();
     match (needs_proc_locks_runtime(tag), lease_options) {
-        (true, 0) => refreshed.push_str(" --proc-locks-runtime"),
+        (true, 0) => {
+            let position = header.find(" --env ").unwrap_or(header.len());
+            refreshed.insert_str(position, " --proc-locks-runtime");
+        }
         (true, 1) | (false, 0) => {}
         _ => return Err(format!("{tag} has an unexpected proc-locks runtime option")),
     }
