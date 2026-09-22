@@ -125,11 +125,13 @@ fn cargo_rebuilds_provenance_after_staging_a_tracked_edit() {
     let repo = initialized_repo();
     let crate_dir = repo.path().join("fixture");
     fs::create_dir_all(crate_dir.join("src")).expect("failed to create fixture crate");
-    fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("build_support.rs"),
-        crate_dir.join("build_support.rs"),
-    )
-    .expect("failed to copy build support");
+    for source in ["build_support.rs", "reverie_pin.rs"] {
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(source),
+            crate_dir.join(source),
+        )
+        .expect("failed to copy build support source");
+    }
     fs::write(
         crate_dir.join("Cargo.toml"),
         r#"[package]
@@ -146,7 +148,10 @@ build = "build.rs"
 mod build_support;
 
 fn main() {
-    println!("cargo:rustc-env=FIXTURE_SHA={}", build_support::git_short_sha());
+    // `gen` is legal in Rust 2021 and reserved in Rust 2024. Keep the fixture's
+    // edition observable so changing it cannot conceal incompatible support.
+    let gen = build_support::git_short_sha();
+    println!("cargo:rustc-env=FIXTURE_SHA={gen}");
     for path in build_support::git_watch_paths() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
@@ -207,5 +212,25 @@ fn main() {
         checked_output(&mut Command::new(&binary)),
         format!("{expected}-dirty"),
         "staging changes the watched index and must refresh embedded provenance"
+    );
+
+    let manifest = crate_dir.join("Cargo.toml");
+    let rust_2021 = fs::read_to_string(&manifest).expect("failed to read fixture manifest");
+    fs::write(&manifest, rust_2021.replace("\"2021\"", "\"2024\""))
+        .expect("failed to plant edition mismatch");
+    let mismatched = Command::new(&cargo)
+        .current_dir(&crate_dir)
+        .args(["build", "--quiet"])
+        .output()
+        .expect("failed to build mismatched fixture");
+    assert!(
+        !mismatched.status.success(),
+        "the Rust-2021 fixture must reject a planted Rust-2024 edition mismatch"
+    );
+    assert!(
+        String::from_utf8_lossy(&mismatched.stderr)
+            .contains("expected identifier, found reserved keyword `gen`"),
+        "the mismatch must fail on the edition sentinel: {}",
+        String::from_utf8_lossy(&mismatched.stderr)
     );
 }
