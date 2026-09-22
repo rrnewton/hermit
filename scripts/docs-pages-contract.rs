@@ -26,9 +26,8 @@ const PUBLISHER: &str = ".github/scripts/publish-compatibility-site.py";
 const LANDING_PAGE: &str = "docs/site/index.html";
 const PUBLICATION_STEP: &str = "Add reviewed compatibility website";
 const BUILDER_CHECKOUT_STEP: &str = "Check out reviewed website builder";
-const SERVED_REGISTRY_QUERY: &str =
-    "jq -e 'any(.[]; .name == \"releases.json\" and .type == \"file\")' \"$scratch/served.json\"";
-const BOOTSTRAP_INVENTORY_QUERY: &str = "jq -e --slurpfile pins \"$pins\" \\\n    '([.[] | .name] | sort) == ([$pins[0].releases[].identity, \"latest\"] | sort)' \\\n    \"$scratch/served.json\"";
+const SERVED_REGISTRY_QUERY: &str = "if jq -e 'any(.[]; .name == \"releases.json\" and .type == \"file\")' \"$scratch/served.json\" >/dev/null; then";
+const BOOTSTRAP_INVENTORY_QUERY: &str = "jq -e --slurpfile pins \"$pins\" \\\n    '([.[] | .name] | sort) == ([$pins[0].releases[].identity, \"latest\"] | sort)' \\\n    \"$scratch/served.json\" >/dev/null";
 const LANDING_ALIAS: &str = "href=\"compatibility/latest/\"";
 const LANDING_WORDING: &str = "<strong>Compatibility snapshot:</strong>";
 
@@ -119,6 +118,30 @@ fn require_once(errors: &mut Vec<String>, scope: &str, source: &str, needle: &st
             "{scope} must contain `{needle}` exactly once, found {count}"
         ));
     }
+}
+
+fn require_statement(
+    errors: &mut Vec<String>,
+    scope: &str,
+    shell: &str,
+    statement: &str,
+) -> Option<std::ops::Range<usize>> {
+    let lines = shell.lines().map(str::trim).collect::<Vec<_>>();
+    let expected = statement.lines().map(str::trim).collect::<Vec<_>>();
+    let matches = lines
+        .windows(expected.len())
+        .enumerate()
+        .filter(|(_, window)| *window == expected)
+        .map(|(start, _)| start..start + expected.len())
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        errors.push(format!(
+            "{scope} must contain exactly one complete statement `{statement}`, found {}",
+            matches.len()
+        ));
+        return None;
+    }
+    Some(matches[0].clone())
 }
 
 fn checkout_steps(workflow: &str) -> Result<Vec<String>, String> {
@@ -352,14 +375,21 @@ fn validate_contract(workflow: &str, landing: &str) -> Result<(), Vec<String>> {
 
     // These queries inspect the served directory inventory. Registry selection
     // and append-only-history validation still belong to the Python publisher.
+    let mut non_inventory_lines = shell.lines().map(str::to_owned).collect::<Vec<_>>();
     for query in [SERVED_REGISTRY_QUERY, BOOTSTRAP_INVENTORY_QUERY] {
-        require_once(&mut errors, "served registry inventory", &shell, query);
+        if let Some(range) =
+            require_statement(&mut errors, "served registry inventory", &shell, query)
+        {
+            for line in &mut non_inventory_lines[range] {
+                line.clear();
+            }
+        }
     }
     for command in [
         "python3 .github/scripts/publish-compatibility-site.py select-registry \\\n  \"${selection[@]}\" > \"$candidate\"",
         "python3 .github/scripts/publish-compatibility-site.py validate-update \\\n  \"$candidate\" \"$pins\" . \"$previous\"",
     ] {
-        require_once(&mut errors, "registry selection", &shell, command);
+        require_statement(&mut errors, "registry selection", &shell, command);
     }
     let selection = shell.find("publish-compatibility-site.py select-registry");
     let update = shell.find("publish-compatibility-site.py validate-update");
@@ -371,9 +401,7 @@ fn validate_contract(workflow: &str, landing: &str) -> Result<(), Vec<String>> {
         );
     }
     let other_steps = workflow.replacen(&step, "", 1);
-    let other_queries = shell
-        .replace(SERVED_REGISTRY_QUERY, "")
-        .replace(BOOTSTRAP_INVENTORY_QUERY, "");
+    let other_queries = non_inventory_lines.join("\n");
     if other_steps.contains("jq -e ") || other_queries.contains("jq -e ") {
         errors.push(format!(
             "workflow must delegate publication semantics to {PUBLISHER}; jq -e is only for the served directory inventory"
@@ -959,6 +987,16 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
                 "served registry inventory",
             ),
             (
+                "\"$scratch/served.json\" >/dev/null; then",
+                "\"$scratch/served.json\" >/dev/null || true; then",
+                "served registry inventory",
+            ),
+            (
+                "\"$scratch/served.json\" >/dev/null\n",
+                "\"$scratch/served.json\" >/dev/null || true\n",
+                "served registry inventory",
+            ),
+            (
                 "publish-compatibility-site.py select-registry",
                 "publish-compatibility-site.py show-registry",
                 "registry selection",
@@ -966,6 +1004,16 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
             (
                 "publish-compatibility-site.py validate-update",
                 "publish-compatibility-site.py show-update",
+                "registry selection",
+            ),
+            (
+                "> \"$candidate\"\n",
+                "> \"$candidate\" || true\n",
+                "registry selection",
+            ),
+            (
+                "\"$candidate\" \"$pins\" . \"$previous\"\n",
+                "\"$candidate\" \"$pins\" . \"$previous\" || true\n",
                 "registry selection",
             ),
             (
