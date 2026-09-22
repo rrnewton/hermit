@@ -467,6 +467,7 @@ fn resolve_budgets(
     wall_multiplier: f64,
 ) -> Result<ResolvedBudgets, String> {
     let identities = nextest_cpu::selected_inventory(inventory)?;
+    context.validate_execution_cohort()?;
     // This calibration never covers the serialized Hermit integration group.
     if identities
         .iter()
@@ -481,6 +482,7 @@ fn resolve_budgets(
     let mut rows = std::collections::BTreeMap::new();
     let mut applicability = "absent: unchanged defaults".to_string();
     if let Some(table) = &calibration {
+        table.context.validate_execution_cohort()?;
         if table.schema != nextest_cpu::BUDGET_SCHEMA
             || table.test_threads == 0
             || table.evidence_sha256.is_empty()
@@ -504,7 +506,7 @@ fn resolve_budgets(
             }
         }
         applicability =
-            if context.source_clean && table.context == context && table.test_threads == threads {
+            if context.matches_calibration(&table.context) && table.test_threads == threads {
                 "applicable".into()
             } else {
                 rows.clear();
@@ -735,6 +737,117 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    #[test]
+    fn calibration_requires_the_same_actual_execution_cohort_not_the_same_launch() {
+        let (inventory, context, mut table) = budget_fixture();
+        let resolve = |current: BudgetContext, table: &BudgetCalibration| {
+            resolve_budgets(
+                &inventory,
+                current,
+                Some(&serde_json::to_vec(table).unwrap()),
+                8,
+                0,
+                1.0,
+                1.0,
+            )
+            .unwrap()
+        };
+        table.context.launch_proof = None;
+        assert_eq!(resolve(context.clone(), &table).applicability, "applicable");
+        let mut other_launch = context.clone();
+        other_launch.launch_proof.as_mut().unwrap().path = "/other-launch/proof.json".into();
+        other_launch.launch_proof.as_mut().unwrap().sha256 = "e".repeat(64);
+        assert_eq!(resolve(other_launch, &table).applicability, "applicable");
+
+        let mut opponents = Vec::new();
+        let mut changed = context.clone();
+        changed.execution_cohort.as_mut().unwrap().domain =
+            nextest_cpu::ExecutionDomain::PinnedRoot {
+                image: format!("localhost/image@sha256:{}", "a".repeat(64)),
+                image_id: "b".repeat(64),
+            };
+        opponents.push(changed.clone());
+        let mut pinned_table = table.clone();
+        pinned_table.context = changed.clone();
+        if let nextest_cpu::ExecutionDomain::PinnedRoot { image, .. } =
+            &mut changed.execution_cohort.as_mut().unwrap().domain
+        {
+            *image = format!("localhost/image@sha256:{}", "c".repeat(64));
+        }
+        assert_ne!(resolve(changed, &pinned_table).applicability, "applicable");
+        assert_ne!(
+            resolve(context.clone(), &pinned_table).applicability,
+            "applicable"
+        );
+        let mut changed_config = pinned_table.context.clone();
+        if let nextest_cpu::ExecutionDomain::PinnedRoot { image_id, .. } =
+            &mut changed_config.execution_cohort.as_mut().unwrap().domain
+        {
+            *image_id = "d".repeat(64);
+        }
+        assert_ne!(
+            resolve(changed_config, &pinned_table).applicability,
+            "applicable"
+        );
+        let mut same_ratio = context.clone();
+        let quota = &mut same_ratio
+            .execution_cohort
+            .as_mut()
+            .unwrap()
+            .resources
+            .cpu_limits[0];
+        quota.quota_usec *= 2;
+        quota.period_usec *= 2;
+        opponents.push(same_ratio);
+        for field in 0..6 {
+            let mut changed = context.clone();
+            let resources = &mut changed.execution_cohort.as_mut().unwrap().resources;
+            match field {
+                0 => resources.cpu_limits[0].quota_usec -= 1,
+                1 => resources.cpu_limits[0].period_usec += 1,
+                2 => {
+                    resources.affinity.pop();
+                }
+                3 => {
+                    resources.cpuset.pop();
+                }
+                4 => resources.memory_bytes = nextest_cpu::ResourceLimit::Max(4 << 30),
+                _ => resources.swap_bytes = nextest_cpu::ResourceLimit::Unlimited,
+            }
+            opponents.push(changed);
+        }
+        for changed in opponents {
+            let result = resolve(changed, &table);
+            assert_ne!(result.applicability, "applicable");
+            assert!(
+                result
+                    .entries
+                    .iter()
+                    .all(|row| row.cpu_seconds == 22 && row.wall_seconds == 57)
+            );
+        }
+        let mut legacy = context.clone();
+        legacy.execution_cohort = None;
+        legacy.launch_proof = None;
+        let mut legacy_table = table.clone();
+        legacy_table.context = legacy.clone();
+        assert_ne!(resolve(legacy, &legacy_table).applicability, "applicable");
+        let mut malformed = context;
+        malformed.execution_cohort.as_mut().unwrap().schema = 99;
+        assert!(
+            resolve_budgets(
+                &inventory,
+                malformed,
+                Some(&serde_json::to_vec(&table).unwrap()),
+                8,
+                0,
+                1.0,
+                1.0
+            )
+            .is_err()
+        );
+    }
+
     fn budget_fixture() -> (Vec<u8>, BudgetContext, BudgetCalibration) {
         let inventory = serde_json::json!({"rust-suites": {
             "fixture": {"package-name":"fixture", "binary-id":"fixture", "binary-name":"fixture", "kind":"lib", "binary-path":"/fixture/lib", "testcases": {
@@ -753,6 +866,25 @@ mod tests {
             build_sha256: "b".repeat(64),
             machine: "fixture CPU".into(),
             available_cpus: 8,
+            execution_cohort: Some(nextest_cpu::ExecutionCohort {
+                schema: 1,
+                domain: nextest_cpu::ExecutionDomain::Host,
+                resources: nextest_cpu::ResourceEnvelope {
+                    cpu_limits: vec![nextest_cpu::CpuQuota {
+                        quota_usec: 800_000,
+                        period_usec: 100_000,
+                    }],
+                    affinity: (0..8).collect(),
+                    cpuset: (0..8).collect(),
+                    memory_bytes: nextest_cpu::ResourceLimit::Max(8 << 30),
+                    swap_bytes: nextest_cpu::ResourceLimit::Max(0),
+                },
+            }),
+            launch_proof: Some(nextest_cpu::LaunchProofRef {
+                path: "/fixture/launch.json".into(),
+                bytes: 100,
+                sha256: "d".repeat(64),
+            }),
         };
         let calibration = BudgetCalibration {
             schema: 1,

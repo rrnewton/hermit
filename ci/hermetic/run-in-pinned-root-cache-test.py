@@ -50,15 +50,16 @@ class CargoCacheMounts(unittest.TestCase):
             "    by_destination = {dict(field.split('=', 1) for field in mount.split(','))['destination']: dict(field.split('=', 1) for field in mount.split(','))['source'] for mount in mounts}\n"
             "    for destination in ['/src/agent-utils/rs/target', '/src/agent-utils/rs/.agent-utils-locks', '/src/agent-utils/rs/.agent-utils-snapshots']:\n"
             "        pathlib.Path(by_destination[destination], 'container-write').write_text(destination + '\\n')\n"
+            "if sys.argv[1:3] == ['image', 'inspect']: print('c' * 64); sys.exit(0)\n"
             "sys.exit(0 if sys.argv[1:3] == ['image', 'exists'] or sys.argv[1] == 'run' else 90)\n"
         )
         fake.chmod(0o755)
 
-    def invoke(self, cargo_home="cargo", run_state=None, source="source", output="output", proc_locks_runtime=None):
+    def invoke(self, cargo_home="cargo", run_state=None, source="source", output="output", proc_locks_runtime=None, calibration=False):
         env = os.environ.copy()
         env["PATH"] = str(self.root / "tools") + os.pathsep + env["PATH"]
         env["PINNED_ROOT_CAPTURE"] = str(self.capture)
-        forwarded = []
+        forwarded = ["--nextest-calibration"] if calibration else []
         if proc_locks_runtime is not None:
             env["XDG_RUNTIME_DIR"] = str(proc_locks_runtime)
             forwarded.append("--proc-locks-runtime")
@@ -76,6 +77,91 @@ class CargoCacheMounts(unittest.TestCase):
         )
         calls = [json.loads(line) for line in self.capture.read_text().splitlines()]
         return result, calls
+
+    def prepare_capture_fixture(self, probe_status=0, resolve_status=0):
+        source = self.root / "source"
+        published = source / "target/ci/rust-scripts"
+        published.mkdir(parents=True, exist_ok=True)
+        (published / "manifest.tsv").write_text("fixture producer manifest\n")
+        runner = source / "ci/rust-script-bin/rust-script"
+        runner.parent.mkdir(parents=True, exist_ok=True)
+        runner.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, pathlib, sys\n"
+            "manifest = pathlib.Path(os.environ.get('HERMIT_RUST_SCRIPT_ARTIFACT_ROOT', '.'), 'manifest.tsv')\n"
+            "if sys.argv[1] == '--resolve-optional' and (not manifest.is_file() or manifest.is_symlink()): sys.exit(2)\n"
+            f"if sys.argv[1] == '--resolve-optional': print(pathlib.Path(__file__).resolve()) if {resolve_status} == 0 else None; sys.exit({resolve_status})\n"
+            f"if sys.argv[-1] == '--probe': print('nextest-launch-observation-v1'); sys.exit({probe_status})\n"
+            "assert sys.argv[1:3] == ['capture-launch', '--pinned-image']\n"
+            "assert sys.argv[4:6] == ['--image-id', 'c' * 64]\n"
+            "assert sys.argv[6] == '--output'\n"
+            "path = pathlib.Path(sys.argv[7])\n"
+            "fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)\n"
+            "with os.fdopen(fd, 'w') as out: json.dump({'fixture_only': True, 'image': sys.argv[3]}, out)\n"
+        )
+        runner.chmod(0o755)
+
+    def test_calibration_opt_in_uses_unique_read_only_proofs_and_exact_inspected_image(self):
+        self.prepare_capture_fixture()
+        retained = []
+        for _ in range(2):
+            self.capture.unlink(missing_ok=True)
+            result, calls = self.invoke(calibration=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(calls[1], ["image", "inspect", "--format", "{{.Id}}", calls[0][-1]])
+            self.assertEqual(calls[2][-3], calls[0][-1])
+            mounts = [calls[2][i + 1] for i, value in enumerate(calls[2]) if value == "--mount"]
+            proof_mounts = [m for m in mounts if "destination=/run/hermit-nextest-launch.json" in m]
+            self.assertEqual(len(proof_mounts), 1)
+            fields = dict(part.split("=", 1) for part in proof_mounts[0].split(","))
+            self.assertEqual(fields["ro"], "true")
+            path = Path(fields["source"])
+            self.assertTrue(path.is_relative_to(self.root / "output"))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+            self.assertEqual(json.loads(path.read_text())["image"], calls[0][-1])
+            retained.append((path, path.read_bytes()))
+        self.assertNotEqual(retained[0][0], retained[1][0])
+        self.assertEqual(retained[0][0].read_bytes(), retained[0][1])
+
+    def test_bootstrap_and_unavailable_capture_do_not_compile_or_claim_a_proof(self):
+        # Bootstrap remains independent of a producer which may itself use this wrapper.
+        for installed, status, opt_in, expected in [(False, 0, True, 0), (True, 23, False, 0), (True, 2, True, 0), (True, 126, True, 126), (True, 127, True, 127)]:
+            with self.subTest(installed=installed, status=status, opt_in=opt_in):
+                if installed:
+                    self.prepare_capture_fixture(probe_status=status)
+                self.capture.unlink(missing_ok=True)
+                result, calls = self.invoke(calibration=opt_in)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(len(calls), 2 if expected == 0 else 1)
+                self.assertFalse(any("hermit-nextest-launch.json" in arg for call in calls for arg in call))
+
+    def test_malformed_preparation_is_distinct_from_missing_optional_capture(self):
+        for status in [2, 3]:
+            self.prepare_capture_fixture(resolve_status=status)
+            self.capture.unlink(missing_ok=True)
+            result, calls = self.invoke(calibration=True)
+            self.assertEqual(result.returncode, 2 if status == 2 else 0, result.stderr)
+            self.assertEqual(len(calls), 1 if status == 2 else 2)
+            self.assertFalse(any("hermit-nextest-launch.json" in arg for call in calls for arg in call))
+
+    def test_existing_invalid_manifest_is_not_optional_absence(self):
+        self.prepare_capture_fixture()
+        manifest = self.root / "source/target/ci/rust-scripts/manifest.tsv"
+        manifest.unlink()
+        for kind in ["directory", "dangling-symlink"]:
+            if kind == "directory":
+                manifest.mkdir()
+            else:
+                manifest.symlink_to(manifest.with_name("absent"))
+            self.capture.unlink(missing_ok=True)
+            result, calls = self.invoke(calibration=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(len(calls), 1)
+            if kind == "directory":
+                manifest.rmdir()
+            else:
+                manifest.unlink()
 
     def test_imports_only_registry_and_git_from_the_host_cargo_home(self):
         result, calls = self.invoke()

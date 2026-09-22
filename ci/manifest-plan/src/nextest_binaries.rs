@@ -484,7 +484,15 @@ pub fn cpu_wrapper(root: &Path) -> Result<PathBuf, String> {
 
 /// A comparison context for the regular calibration, after the ordinary
 /// preparation checks. Other selectors retain their existing timeout path.
-pub fn budget_context(root: &Path, args: &[String]) -> Result<String, String> {
+pub fn budget_context(
+    root: &Path,
+    args: &[String],
+    launch: Option<&Path>,
+) -> Result<String, String> {
+    let launch_context = match launch {
+        Some(path) => crate::nextest_cohort::verify(path)?,
+        None => (None, None),
+    };
     let parsed = split_arguments(args)?;
     let regular = [
         "--workspace",
@@ -573,6 +581,7 @@ pub fn budget_context(root: &Path, args: &[String]) -> Result<String, String> {
                 .map(|(_, value)| value.trim().to_string())
         })
         .ok_or("cannot identify calibration CPU model")?;
+    let (execution_cohort, launch_proof) = launch_context;
     let context = crate::nextest_cpu::BudgetContext {
         source_sha256,
         source_clean: dirty.is_empty(),
@@ -581,6 +590,8 @@ pub fn budget_context(root: &Path, args: &[String]) -> Result<String, String> {
         available_cpus: std::thread::available_parallelism()
             .map_err(|e| e.to_string())?
             .get() as u64,
+        execution_cohort,
+        launch_proof,
     };
     serde_json::to_string(&context).map_err(|e| e.to_string())
 }
@@ -1388,6 +1399,8 @@ pub fn run(
     operation: &str,
     config: Option<&Path>,
     args: &[String],
+    launch: Option<&Path>,
+    budget_map: Option<(&Path, &str)>,
 ) -> Result<i32, String> {
     if !matches!(operation, "run" | "list") {
         return Err(format!("unsupported Nextest operation {operation}"));
@@ -1409,6 +1422,37 @@ pub fn run(
     let selection = verify_selection(&record, &cargo, &parsed.build)?;
     let guests = verify_guests(&record)?;
     let record_workloads = verify_record_workloads(&record, &cargo)?;
+    if budget_map.is_none() {
+        if let Some(path) = launch {
+            crate::nextest_cohort::verify(path)?;
+        }
+    }
+    if let Some((path, digest)) = budget_map {
+        if operation != "run" {
+            return Err("resolved budgets bind a run, not an inventory query".into());
+        }
+        let file =
+            fs::File::open(path).map_err(|e| format!("cannot read resolved run budgets: {e}"))?;
+        let mut bytes = Vec::new();
+        file.take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 16 * 1024 * 1024 {
+            return Err("resolved run budget map exceeds its size bound".into());
+        }
+        if format!("{:x}", Sha256::digest(&bytes)) != digest {
+            return Err("resolved Nextest budget map changed before execution".into());
+        }
+        let map: crate::nextest_cpu::ResolvedBudgets =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        map.validate()?;
+        let actual: Option<crate::nextest_cpu::BudgetContext> =
+            serde_json::from_str(&budget_context(&root, args, launch)?)
+                .map_err(|e| e.to_string())?;
+        if actual.as_ref() != Some(&map.context) {
+            return Err("Nextest source/build/launch context changed after budget resolution; resolve again before running".into());
+        }
+    }
     let mut command = Command::new("cargo");
     command.arg("nextest");
     if let Some(config) = config {

@@ -411,8 +411,24 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
         if !command.contains(marker) {
             continue;
         }
-        let parsed = split_arguments(&command_arguments(&command, marker)?)
-            .map_err(|error| format!("{tag}: {error}"))?;
+        let mut arguments = command_arguments(&command, marker)?;
+        if marker == "run-nextest-counted.sh" {
+            match arguments.first().map(String::as_str) {
+                Some("--calibration-host") => {
+                    arguments.remove(0);
+                }
+                Some("--calibration-launch-proof") => {
+                    if arguments.get(1).map(String::as_str)
+                        != Some(crate::nextest_cohort::PINNED_PROOF_PATH)
+                    {
+                        return Err(format!("{tag} has an unsupported calibration launch proof"));
+                    }
+                    arguments.drain(..2);
+                }
+                _ => {}
+            }
+        }
+        let parsed = split_arguments(&arguments).map_err(|error| format!("{tag}: {error}"))?;
         if parsed.build != expected {
             return Err(format!(
                 "{tag} command has Cargo selection {:?}, declared {expected:?}",

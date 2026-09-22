@@ -2567,6 +2567,8 @@ fn budget_map_self_test(
             build_sha256: "b".repeat(64),
             machine: "control".into(),
             available_cpus: 1,
+            execution_cohort: None,
+            launch_proof: None,
         },
         calibration_sha256: None,
         applicability: "native control".into(),

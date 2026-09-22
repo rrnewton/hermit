@@ -10,6 +10,10 @@ readonly PREBUILT_RUST_SCRIPT="$SCRIPT_DIR/rust-script-bin/rust-script"
 
 nextest_config=
 cpu_measurement_dir=
+calibration_launch=
+calibration_host=false
+nextest_budget_map=
+nextest_budget_sha=
 
 # Do not rely on a nested `/usr/bin/env rust-script` shebang resolving the
 # repository wrapper after validation has entered its hosted namespace.  The
@@ -55,9 +59,14 @@ function build_cpu_wrapper {
 
 function invoke_nextest {
     local operation=$1
+    local -a context_args=()
     shift
     if [[ ${HERMIT_PREPARED_NEXTEST_REQUIRED:-0} == 1 ]]; then
-        run_rust_script "$SCRIPT_DIR/nextest-binaries.rs" "$operation" --config-file "$nextest_config" "$@"
+        [[ -z $calibration_launch ]] || context_args+=(--launch-proof "$calibration_launch")
+        if [[ $operation == run && -n $nextest_budget_map ]]; then
+            context_args+=(--budget-map "$nextest_budget_map" "$nextest_budget_sha")
+        fi
+        run_rust_script "$SCRIPT_DIR/nextest-binaries.rs" "$operation" "${context_args[@]}" --config-file "$nextest_config" "$@"
     else
         cargo nextest --config-file "$nextest_config" "$operation" "$@"
     fi
@@ -147,6 +156,7 @@ function run_nextest {
     local budget_map="$4/../resolved-budgets.json" budget_context="$4/../budget-context.json"
     local status count_status=0
     local -a inventory_arguments=()
+    local -a launch_arguments=()
     shift 7
 
     if [[ $cpu_report != - && $cpu_report == "${DAGRUN_TEST_COUNTS_PATH:--}" ]]; then
@@ -155,6 +165,8 @@ function run_nextest {
     fi
 
     cleanup_nextest_config
+    nextest_budget_map=
+    nextest_budget_sha=
     nextest_config=$(mktemp "${TMPDIR:-/tmp}/hermit-nextest-config.XXXXXX.toml") || return $?
     if ! HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" run_rust_script "$TIMEOUT_CONFIG_WRITER" \
         "$SCRIPT_DIR/../.config/nextest.toml" "$wall_multiplier" "$nextest_config"; then
@@ -179,8 +191,9 @@ function run_nextest {
     # selected inventory. Standalone/unsupported populations keep the existing
     # path. Never infer a calibration context from unchecked executable names.
     if [[ ${HERMIT_PREPARED_NEXTEST_REQUIRED:-0} == 1 && $cpu_report != - ]]; then
+        [[ -z $calibration_launch ]] || launch_arguments+=(--launch-proof "$calibration_launch")
         if ! run_rust_script "$SCRIPT_DIR/nextest-binaries.rs" budget-context \
-            "${inventory_arguments[@]}" >"$budget_context"; then
+            "${launch_arguments[@]}" "${inventory_arguments[@]}" >"$budget_context"; then
             cleanup_nextest_config
             return 2
         fi
@@ -192,6 +205,10 @@ function run_nextest {
             return 2
         fi
         if [[ -f $budget_map ]]; then
+            local digest_line
+            digest_line=$(sha256sum -- "$budget_map") || return $?
+            nextest_budget_map=$budget_map
+            nextest_budget_sha=${digest_line%% *}
             # Keep the exact digest-bound CPU/wall input on both success and
             # failure, beside the existing attempt report. Never replace an
             # earlier invocation's retained calibration evidence.
@@ -474,6 +491,21 @@ PYEOF
     printf 'run-nextest-counted: self-test PASS (typed counts, executed failure, zero-terminal launch failure, CPU reconciliation, refusal controls)\n'
 }
 
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+    printf '%s\n' 'usage: ci/run-nextest-counted.sh [--calibration-host | --calibration-launch-proof PATH] NEXTEST_ARGS...' \
+        'The maintained native host boundary may capture actual resources with --calibration-host.' \
+        'Pinned callers use the existing wrapper-provided read-only launch proof.' \
+        'Missing evidence keeps defaults; malformed or changed evidence refuses. Capture never compiles.'
+    exit 0
+fi
+if [[ ${1:-} == --calibration-host ]]; then
+    calibration_host=true
+    shift
+elif [[ ${1:-} == --calibration-launch-proof ]]; then
+    [[ $# -ge 2 && $2 == /* ]] || { printf 'run-nextest-counted: --calibration-launch-proof requires an absolute path; use --help\n' >&2; exit 2; }
+    calibration_launch=$2
+    shift 2
+fi
 if [[ ${1:-} == --self-test ]]; then
     self_test
     exit
@@ -488,5 +520,34 @@ mkdir "$cpu_attempt_records" || exit $?
 trap 'cleanup_nextest_config; cleanup_cpu_measurement_dir; rm -f "$events_log"' EXIT
 cpu_wrapper=$(build_cpu_wrapper) || exit $?
 cpu_report=$(configured_cpu_report_path) || exit $?
+if "$calibration_host"; then
+    capture_manifest=${HERMIT_RUST_SCRIPT_ARTIFACT_ROOT:-$SCRIPT_DIR/../target/ci/rust-scripts}/manifest.tsv
+    if [[ -e $capture_manifest || -L $capture_manifest ]]; then
+        resolve_status=0
+        capture_binary=$("$PREBUILT_RUST_SCRIPT" --resolve-optional --force "$SCRIPT_DIR/nextest-binaries.rs") || resolve_status=$?
+        if ((resolve_status != 0 && resolve_status != 3)); then exit "$resolve_status"; fi
+        capture_status=2
+        if ((resolve_status == 0)); then
+            capture_status=0
+            capture_version=$("$capture_binary" capture-launch --probe) || capture_status=$?
+        fi
+        case $capture_status in
+            0)
+                [[ $capture_version == nextest-launch-observation-v1 ]] || { printf 'nextest budgets: malformed prepared capture capability; refresh build.rust_scripts\n' >&2; exit 2; }
+                calibration_launch="$cpu_measurement_dir/launch.json"
+                "$capture_binary" capture-launch --host --output "$calibration_launch" || exit $?
+                ;;
+            2) printf 'nextest budgets: prepared capture capability unavailable; unchanged defaults\n' >&2 ;;
+            *) exit "$capture_status" ;;
+        esac
+    else
+        printf 'nextest budgets: prepared host capture unavailable; unchanged defaults\n' >&2
+    fi
+fi
+if [[ -n $calibration_launch && ( -e $calibration_launch || -L $calibration_launch ) && $cpu_report != - ]]; then
+    [[ -f $calibration_launch && ! -L $calibration_launch ]] || { printf 'nextest budgets: launch proof must be a regular non-symlink file\n' >&2; exit 2; }
+    (set -o noclobber; head -c 262145 -- "$calibration_launch" >"$cpu_report.launch.json") || exit $?
+    # Preserve the wrapper mount as authority; this copy only retains evidence.
+fi
 run_nextest "$events_log" "$(configured_wall_timeout_multiplier)" "$cpu_wrapper" \
     "$cpu_attempt_records" "$cpu_binary_map" "$cpu_inventory" "$cpu_report" "$@"

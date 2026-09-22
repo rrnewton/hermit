@@ -114,6 +114,137 @@ pub struct BudgetContext {
     pub build_sha256: String,
     pub machine: String,
     pub available_cpus: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_cohort: Option<ExecutionCohort>,
+    /// Invocation evidence is retained with the resolved map, not compared as
+    /// part of the reusable calibration cohort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_proof: Option<LaunchProofRef>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ExecutionDomain {
+    Host,
+    PinnedRoot { image: String, image_id: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResourceLimit {
+    Unlimited,
+    Max(u64),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CpuQuota {
+    pub quota_usec: u64,
+    pub period_usec: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceEnvelope {
+    /// Keep distinct periods: equal quota ratios need not throttle identically.
+    pub cpu_limits: Vec<CpuQuota>,
+    pub affinity: Vec<u32>,
+    pub cpuset: Vec<u32>,
+    pub memory_bytes: ResourceLimit,
+    pub swap_bytes: ResourceLimit,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionCohort {
+    pub schema: u64,
+    pub domain: ExecutionDomain,
+    pub resources: ResourceEnvelope,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchProofRef {
+    pub path: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+impl ExecutionDomain {
+    pub fn validate(&self) -> Result<(), String> {
+        let digest = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if let Self::PinnedRoot { image, image_id } = self {
+            if !image.split_once("@sha256:").is_some_and(|(name, hash)| {
+                !name.is_empty()
+                    && !name.contains('@')
+                    && !name.chars().any(char::is_whitespace)
+                    && digest(hash)
+            }) || !digest(image_id)
+            {
+                return Err(
+                    "execution cohort requires the actual exact image reference and config ID"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ExecutionCohort {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != 1 {
+            return Err("unsupported Nextest execution cohort schema".into());
+        }
+        self.domain.validate()?;
+        let r = &self.resources;
+        if [&r.affinity, &r.cpuset]
+            .iter()
+            .any(|cpus| cpus.is_empty() || cpus.windows(2).any(|pair| pair[0] >= pair[1]))
+            || r.cpu_limits
+                .iter()
+                .any(|limit| limit.quota_usec == 0 || limit.period_usec == 0)
+            || r.cpu_limits.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err("execution cohort has invalid CPU limits or CPU sets".into());
+        }
+        Ok(())
+    }
+}
+
+impl BudgetContext {
+    pub fn validate_execution_cohort(&self) -> Result<(), String> {
+        if let Some(cohort) = &self.execution_cohort {
+            cohort.validate()?;
+        }
+        if let Some(proof) = &self.launch_proof {
+            if !Path::new(&proof.path).is_absolute()
+                || proof.bytes == 0
+                || proof.bytes > 262_144
+                || proof.sha256.len() != 64
+                || !proof.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err("invalid retained Nextest launch proof reference".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn matches_calibration(&self, table: &Self) -> bool {
+        if self.execution_cohort.is_none() || self.launch_proof.is_none() {
+            return false;
+        }
+        let mut current = self.clone();
+        let mut calibrated = table.clone();
+        current.launch_proof = None;
+        calibrated.launch_proof = None;
+        current.source_clean && current == calibrated
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -227,6 +358,7 @@ pub struct ResolvedBudgets {
 
 impl ResolvedBudgets {
     pub fn validate(&self) -> Result<(), String> {
+        self.context.validate_execution_cohort()?;
         if self.schema != BUDGET_SCHEMA {
             return Err("unsupported resolved Nextest budget schema".into());
         }

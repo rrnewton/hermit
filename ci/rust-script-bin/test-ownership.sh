@@ -129,4 +129,58 @@ for result in failure empty missing unrelated; do
     expect_refusal 'cannot establish Git ownership for repository script'
 done
 
+# Optional capability resolution preserves ownership/path refusals while giving
+# absence its own status. It never executes either prepared or external code.
+case_label='optional checked resolution'
+invoke --resolve-optional --force "$listed"
+[[ $status == 0 && $(<"$scratch/stdout") == "$published/run" && ! -s "$scratch/stderr" && ! -s "$HERMIT_TEST_RUST_SCRIPT_CALLS" ]]
+for help in --help -h; do
+    invoke --resolve-optional "$help"
+    [[ $status == 0 && ! -s "$HERMIT_TEST_RUST_SCRIPT_CALLS" ]]
+    grep -Fq '3 means absent' "$scratch/stdout"
+done
+invoke --resolve-optional --version
+expect_refusal '--resolve-optional accepts a source path'
+invoke --resolve-optional "$unlisted"
+[[ $status == 3 && ! -s "$scratch/stdout" && ! -s "$HERMIT_TEST_RUST_SCRIPT_CALLS" ]]
+mv "$published/manifest.tsv" "$published/manifest.saved"
+invoke --resolve-optional "$listed"
+[[ $status == 3 && ! -s "$scratch/stdout" && ! -s "$HERMIT_TEST_RUST_SCRIPT_CALLS" ]]
+mv "$published/manifest.saved" "$published/manifest.tsv"
+mv "$published/run" "$published/run.saved"
+invoke --resolve-optional "$listed"
+[[ $status == 3 && ! -s "$scratch/stdout" && ! -s "$HERMIT_TEST_RUST_SCRIPT_CALLS" ]]
+mkdir "$published/run"
+invoke --resolve-optional "$listed"
+expect_refusal 'not executable'
+rmdir "$published/run"
+mv "$published/run.saved" "$published/run"
+chmod -x "$published/run"
+invoke --resolve-optional "$listed"
+expect_refusal 'not executable'
+chmod +x "$published/run"
+cp "$published/manifest.tsv" "$published/manifest.saved"
+for kind in duplicate malformed absolute escaping; do
+    case_label="optional $kind"
+    case $kind in
+        duplicate) cat "$published/manifest.saved" "$published/manifest.saved" > "$published/manifest.tsv" ;;
+        malformed) printf 'scripts/listed source.rs\trun\n' > "$published/manifest.tsv" ;;
+        absolute) printf 'scripts/listed source.rs\t/absent\ttest\n' > "$published/manifest.tsv" ;;
+        escaping) printf 'scripts/listed source.rs\t./../absent\ttest\n' > "$published/manifest.tsv" ;;
+    esac
+    invoke --resolve-optional "$listed"
+    [[ $status == 2 && ! -s "$scratch/stdout" && ! -s "$HERMIT_TEST_RUST_SCRIPT_CALLS" ]]
+done
+mv "$published/manifest.saved" "$published/manifest.tsv"
+for candidate in "$external" "$root/target/nested-directory/source.rs"; do
+    invoke --resolve-optional "$candidate"
+    [[ $status == 2 && ! -s "$scratch/stdout" && ! -s "$HERMIT_TEST_RUST_SCRIPT_CALLS" ]]
+done
+for result in failure empty missing unrelated; do
+    case_label="optional Git ownership $result"
+    export HERMIT_TEST_GIT_OWNER_RESULT="$result"
+    PATH="$scratch/git-control:$PATH" invoke --resolve-optional "$unlisted"
+    expect_refusal 'cannot establish Git ownership for repository script'
+done
+
 echo 'rust-script ownership: prepared, external, nested, and refusal controls passed'
