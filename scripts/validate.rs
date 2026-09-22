@@ -9500,7 +9500,8 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             ));
         }
         let mut cfg = dagrun::select_steps_by_labels(&committed, &[label.into()])?;
-        let mut selection_mode = "label";
+        let suite_complete = label == "full" && args.selected.is_none();
+        let mut selection_mode = if suite_complete { "full" } else { "label" };
         if let Some(selected) = args.selected.as_deref() {
             let mut tags = requested_step_ids(selected, "--selected")?;
             map_privileged_public_tags(&mut tags, label);
@@ -9557,7 +9558,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             selection_mode,
             compat,
             compat_prefix,
-            suite_complete: label == "full" && args.selected.is_none(),
+            suite_complete,
             super_mode: label == "super",
             envelope: match &args.focused {
                 Some(Focused::Envelope { baseline }) => Some(EnvelopePlan {
@@ -25313,6 +25314,128 @@ mod scorecard_cutover_tests {
     use super::*;
 
     const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn complete_full_plans_preserve_full_selection_in_ledger() {
+        let source = test_source_root();
+        let (committed, _, _) = load_committed_validation_dag(&source).unwrap();
+        let complete = dagrun::select_steps_by_labels(&committed, &["full".into()]).unwrap();
+        for argv in [vec!["full"], vec!["full", "--all"]] {
+            let temp = tempfile::tempdir().unwrap();
+            let args =
+                parse_argv(&argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>()).unwrap();
+            let plan = build_plan(&source, &args, temp.path()).unwrap();
+            assert!(plan.suite_complete);
+            assert_eq!(dag_to_json(&plan.cfg), dag_to_json(&complete));
+
+            // Exercise the real writer without running the graph or inventing
+            // successful coverage: a refused full attempt still has full scope.
+            let mut ctx = context(
+                temp.path(),
+                &plan.profile,
+                "full-selection-fixture",
+                HEAD.into(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            );
+            ctx.selection_mode = plan.selection_mode.into();
+            ctx.executed_tests = Some(0);
+            ctx.passed_tests = Some(0);
+            let tags = plan.cfg.steps.iter().map(Step::tag).collect();
+            let ledger = temp.path().join("rows.jsonl");
+            let row = write_ledger(
+                &ledger,
+                &ctx,
+                &[],
+                &[],
+                &[],
+                &[],
+                &tags,
+                0.0,
+                75,
+                "",
+                false,
+                serde_json::json!({}),
+                None,
+                None,
+            )
+            .unwrap();
+            let retained: HistoryRow =
+                serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+            assert_eq!(retained.profile.as_deref(), Some("full"));
+            assert_eq!(retained.selection_mode.as_deref(), Some("full"));
+            assert_eq!(row["selection_mode"], "full");
+            assert_eq!(row["result"], "no_result");
+            assert_eq!(row["validation_complete"], false);
+            assert_eq!(row["executed_tests"], 0);
+        }
+    }
+
+    #[test]
+    fn explicit_selections_and_other_labels_do_not_acquire_full_scope() {
+        let source = test_source_root();
+        let (committed, _, _) = load_committed_validation_dag(&source).unwrap();
+        let complete = dagrun::select_steps_by_labels(&committed, &["full".into()]).unwrap();
+        let all_tags = complete
+            .steps
+            .iter()
+            .map(Step::tag)
+            .collect::<Vec<_>>()
+            .join(",");
+        for selected in ["test.regular_crates", &all_tags] {
+            assert!(parse_argv(&["full".into(), "--selected".into(), selected.into()]).is_err());
+        }
+        assert!(parse_argv(&["--hosted-portable-only".into()]).is_err());
+        let cases = [
+            (
+                vec![
+                    "full",
+                    "--selected",
+                    "test.regular_crates",
+                    ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION,
+                ],
+                "full",
+                "selected",
+            ),
+            (
+                vec![
+                    "full",
+                    "--selected",
+                    &all_tags,
+                    ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION,
+                ],
+                "full",
+                "selected",
+            ),
+            (
+                vec!["--only", "full", "test.regular_crates"],
+                "only-full",
+                "only",
+            ),
+            (
+                vec![
+                    "--hosted-portable-only",
+                    ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION,
+                ],
+                "hosted-portable",
+                "label",
+            ),
+            (vec!["portable-only"], "portable-only", "label"),
+            (vec!["quick"], "quick", "label"),
+            (vec!["super"], "super", "label"),
+        ];
+        for (argv, profile, selection) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let args =
+                parse_argv(&argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>()).unwrap();
+            let plan = build_plan(&source, &args, temp.path()).unwrap();
+            assert_eq!(plan.profile, profile, "{argv:?}");
+            assert_eq!(plan.selection_mode, selection, "{argv:?}");
+            assert!(!plan.suite_complete, "{argv:?}");
+            if argv.get(2) == Some(&all_tags.as_str()) {
+                assert_eq!(dag_to_json(&plan.cfg), dag_to_json(&complete));
+            }
+        }
+    }
 
     #[test]
     fn versioned_parent_delegation_preserves_old_callers_and_the_held_local_lock() {
