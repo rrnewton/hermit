@@ -508,14 +508,16 @@ Network modes are:
   kernel-mandatory loopback interface down. External connections fail closed.
 - `--network=local`: explicitly enable loopback inside the isolated network
   namespace for guest-internal client/server communication.
-- `--record-networking=NEW_TRACE --unsafe-live-network`: contact the live
-  network while capturing supported external traffic in a new versioned trace.
+- `--record-networking=NEW_TRACE`: contact the live network while capturing
+  supported external traffic in a new versioned trace. Recording is its own
+  captured-input policy, not unsafe live networking.
 - `--replay-networking=TRACE`: replay that trace without consulting the live
   network. Scheduler seeds and timeslices may vary independently of the fixed
   external input.
 - `--unsafe-live-network`: expose the host network without capturing it. This
   admits uncontrolled input and forfeits Hermit's deterministic-execution
-  guarantee. Legacy `--network=host` is accepted but canonicalizes to this
+  guarantee, conflicts with recording and replay, and never acts as an enabler
+  for either. Legacy `--network=host` is accepted but canonicalizes to this
   explicit unsafe spelling.
 
 Run-mode recording/replay and full `hermit replay` configure one shared network

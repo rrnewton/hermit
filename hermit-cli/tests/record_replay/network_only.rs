@@ -396,7 +396,6 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
     fs::create_dir(&record_directory).expect("create record controller directory");
     let (controller, port) = Controller::start(fixture, &record_directory);
     let mut record_arguments = common_run_arguments(0, 1_000_000);
-    record_arguments.push("--unsafe-live-network".into());
     record_arguments.push(format!("--record-networking={}", trace.display()));
     let recorded = safehermit_command(
         evidence.path(),

@@ -92,6 +92,26 @@ use super::verify::write_skid_overshoot_verification_json;
 use super::verify::write_skid_overshoot_without_comparison_json;
 use super::verify::write_verification_json;
 
+fn network_policy_refusal(message: impl Into<String>) -> Error {
+    Error::new(PolicyRefusal).context(message.into())
+}
+
+#[cfg(test)]
+fn assert_network_policy_refusal(error: &Error) {
+    assert!(
+        error.downcast_ref::<PolicyRefusal>().is_some(),
+        "network policy refusal lost its typed classification: {error:#}"
+    );
+    assert_eq!(
+        super::failure_exit_code(error),
+        detcore_model::HERMIT_POLICY_REFUSAL_EXIT
+    );
+    assert_eq!(
+        super::classify_failure(error),
+        "HERMIT_POLICY_REFUSAL class=policy-refusal"
+    );
+}
+
 const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
 const NORMALIZED_SABRE_DETLOG_TIMESTAMP: &str = "1970-01-01T00:00:00.000000Z";
@@ -454,24 +474,23 @@ pub struct RunOpts {
     )]
     network: NetworkingMode,
 
-    /// Expose the live host network to the guest. This admits uncontrolled external input and
-    /// therefore forfeits Hermit's deterministic-execution guarantee unless paired with
-    /// `--record-networking`. The old `--network=host` spelling remains accepted for compatibility.
+    /// Expose the live host network to the guest without recording it. This admits uncontrolled
+    /// external input and therefore forfeits Hermit's deterministic-execution guarantee. The old
+    /// `--network=host` spelling remains accepted for compatibility.
     #[clap(
         long,
         visible_alias = "unsafe-allow-networking",
-        conflicts_with = "replay_networking"
+        conflicts_with_all = ["record_networking", "replay_networking"]
     )]
     unsafe_live_network: bool,
 
-    /// Record schedule-independent external network traffic to a new trace. Recording requires
-    /// `--unsafe-live-network` because it is the only policy that intentionally contacts the live
-    /// network; future replay does not.
+    /// Contact the live network while recording schedule-independent external traffic to a new
+    /// trace. This captured-input policy is deterministic on future replay and is distinct from
+    /// unrecorded `--unsafe-live-network` access.
     #[clap(
         long,
         value_name = "NEW_TRACE",
-        requires = "unsafe_live_network",
-        conflicts_with_all = ["replay_networking", "network", "verify"]
+        conflicts_with_all = ["replay_networking", "network", "unsafe_live_network", "verify"]
     )]
     record_networking: Option<PathBuf>,
 
@@ -1066,7 +1085,11 @@ impl fmt::Display for RunOpts {
         if self.allow_unsupported_syscalls {
             write!(f, " --allow-unsupported-syscalls")?;
         }
-        let network = if self.unsafe_live_network {
+        let network = if self.record_networking.is_some() {
+            // Recording physically uses the host network, but the recorded
+            // policy is canonicalized by its trace option, never as unsafe live.
+            NetworkingMode::None
+        } else if self.unsafe_live_network {
             NetworkingMode::UnsafeHost
         } else {
             self.network
@@ -2257,6 +2280,7 @@ fn strict_rejects_every_route_to_host_networking() {
         let error = opts
             .validate_args_with_perf_support(true)
             .expect_err(&format!("{argv:?} must be refused under --strict"));
+        assert_network_policy_refusal(&error);
         let message = error.to_string();
         assert!(
             message.contains("--strict"),
@@ -2303,7 +2327,6 @@ fn network_policies_parse_validate_and_render_canonically() {
     let mut record = RunOpts::parse_from([
         "fakehermit",
         "--strict",
-        "--unsafe-live-network",
         "--record-networking=net trace",
         "fakeprog",
     ]);
@@ -2315,7 +2338,7 @@ fn network_policies_parse_validate_and_render_canonically() {
     );
     assert_eq!(
         format!("{record}"),
-        " --unsafe-live-network --record-networking='net trace' -- fakeprog"
+        " --record-networking='net trace' -- fakeprog"
     );
 
     let mut replay =
@@ -2333,15 +2356,7 @@ fn network_policies_parse_validate_and_render_canonically() {
 }
 
 #[test]
-fn record_requires_explicit_live_network_and_replay_forbids_it() {
-    let error = RunOpts::try_parse_from(["fakehermit", "--record-networking=trace", "fakeprog"])
-        .unwrap_err();
-    assert_eq!(
-        error.kind(),
-        clap::error::ErrorKind::MissingRequiredArgument
-    );
-    assert!(error.to_string().contains("--unsafe-live-network"));
-
+fn recorded_replayed_and_unsafe_live_policies_are_mutually_exclusive() {
     let error = RunOpts::try_parse_from([
         "fakehermit",
         "--unsafe-live-network",
@@ -2353,8 +2368,16 @@ fn record_requires_explicit_live_network_and_replay_forbids_it() {
 
     let error = RunOpts::try_parse_from([
         "fakehermit",
-        "--verify",
         "--unsafe-live-network",
+        "--record-networking=trace",
+        "fakeprog",
+    ])
+    .unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+    let error = RunOpts::try_parse_from([
+        "fakehermit",
+        "--verify",
         "--record-networking=trace",
         "fakeprog",
     ])
@@ -2430,12 +2453,23 @@ async fn denied_and_local_modes_differ_only_by_loopback_up_state() {
 #[test]
 fn gdbserver_requires_explicit_unsafe_live_network() {
     let mut opts = RunOpts::parse_from(["fakehermit", "--gdbserver", "fakeprog"]);
-    let message = opts
-        .validate_args_with_perf_support(true)
-        .unwrap_err()
-        .to_string();
+    let error = opts.validate_args_with_perf_support(true).unwrap_err();
+    assert_network_policy_refusal(&error);
+    let message = error.to_string();
     assert!(message.contains("--gdbserver"), "{message}");
     assert!(message.contains("--unsafe-live-network"), "{message}");
+
+    for trace_flag in ["--record-networking=trace", "--replay-networking=trace"] {
+        let mut opts = RunOpts::parse_from(["fakehermit", "--gdbserver", trace_flag, "fakeprog"]);
+        let error = opts.validate_args_with_perf_support(true).unwrap_err();
+        assert_network_policy_refusal(&error);
+        let message = error.to_string();
+        assert!(message.contains("--gdbserver"), "{message}");
+        assert!(
+            message.contains(trace_flag.split('=').next().unwrap()),
+            "{message}"
+        );
+    }
 
     let mut live = RunOpts::parse_from([
         "fakehermit",
@@ -2456,6 +2490,7 @@ fn gdbserver_conflicts_with_analyze_networking() {
         "fakeprog",
     ]);
     let error = opts.validate_args_with_perf_support(true).unwrap_err();
+    assert_network_policy_refusal(&error);
     let message = error.to_string();
     assert!(message.contains("--gdbserver"), "message: {message}");
     assert!(
@@ -2467,10 +2502,9 @@ fn gdbserver_conflicts_with_analyze_networking() {
 #[test]
 fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
     let mut denied = RunOpts::parse_from(["fakehermit", "--core-only", "fakeprog"]);
-    let message = denied
-        .validate_args_with_perf_support(true)
-        .unwrap_err()
-        .to_string();
+    let error = denied.validate_args_with_perf_support(true).unwrap_err();
+    assert_network_policy_refusal(&error);
+    let message = error.to_string();
     assert!(message.contains("--no-namespace"), "{message}");
     assert!(message.contains("--unsafe-live-network"), "{message}");
 
@@ -2497,15 +2531,11 @@ fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
 fn namespace_only_refuses_trace_modes_with_a_remedy() {
     for flag in ["--record-networking=trace", "--replay-networking=trace"] {
         let mut args = vec!["fakehermit", "--namespace-only"];
-        if flag.starts_with("--record") {
-            args.push("--unsafe-live-network");
-        }
         args.extend([flag, "fakeprog"]);
         let mut opts = RunOpts::parse_from(args);
-        let message = opts
-            .validate_args_with_perf_support(true)
-            .unwrap_err()
-            .to_string();
+        let error = opts.validate_args_with_perf_support(true).unwrap_err();
+        assert_network_policy_refusal(&error);
+        let message = error.to_string();
         assert!(message.contains("--namespace-only"), "{message}");
         assert!(message.contains("Remove --namespace-only"), "{message}");
     }
@@ -2516,20 +2546,15 @@ fn dbt_refuses_unenforceable_network_policies_but_allows_explicit_live_network()
     for args in [
         vec!["--backend=dbt", "--network=local"],
         vec!["--backend=dbt", "--replay-networking=trace"],
-        vec![
-            "--backend=dbt",
-            "--unsafe-live-network",
-            "--record-networking=trace",
-        ],
+        vec!["--backend=dbt", "--record-networking=trace"],
     ] {
         let mut argv = vec!["fakehermit"];
         argv.extend(args);
         argv.push("fakeprog");
         let mut opts = RunOpts::parse_from(argv);
-        let message = opts
-            .validate_args_with_perf_support(true)
-            .unwrap_err()
-            .to_string();
+        let error = opts.validate_args_with_perf_support(true).unwrap_err();
+        assert_network_policy_refusal(&error);
+        let message = error.to_string();
         assert!(message.contains("backend `dbt`"), "{message}");
         assert!(message.contains("--backend=ptrace"), "{message}");
     }
@@ -3564,11 +3589,11 @@ impl RunOpts {
         })?;
 
         if self.namespace_only && network_trace.uses_trace() {
-            anyhow::bail!(
+            return Err(network_policy_refusal(
                 "--namespace-only does not load Detcore and therefore cannot record or replay a \
                  network trace. Remove --namespace-only to use --record-networking or \
-                 --replay-networking."
-            );
+                 --replay-networking.",
+            ));
         }
         if network_trace.needs_host_network() {
             self.network = NetworkingMode::UnsafeHost;
@@ -3648,21 +3673,21 @@ impl RunOpts {
             );
         }
         if self.no_namespace && !self.unsafe_live_network {
-            anyhow::bail!(
+            return Err(network_policy_refusal(
                 "--no-namespace shares the host network and cannot enforce the default denied \
                  network policy. Add --unsafe-live-network to acknowledge live networking, or \
-                 remove --no-namespace to keep networking denied."
-            );
+                 remove --no-namespace to keep networking denied.",
+            ));
         }
         if backend == Backend::Dbt
             && (self.network == NetworkingMode::Local || network_trace.uses_trace())
         {
-            anyhow::bail!(
+            return Err(network_policy_refusal(
                 "backend `dbt` bypasses Hermit's network namespace and has not qualified isolated \
                  loopback or network trace capture/replay. Select --backend=ptrace; use the default \
                  denied policy for deterministic DBT execution, or add --unsafe-live-network only \
-                 when nondeterministic host networking is intentional."
-            );
+                 when nondeterministic host networking is intentional.",
+            ));
         }
 
         let config = &mut self.det_opts.det_config;
@@ -3809,32 +3834,32 @@ impl RunOpts {
         // A host gdb client cannot reach a listener in an isolated namespace.
         // Never turn networking on as a side effect of asking for a debugger.
         if self.det_opts.det_config.gdbserver && self.record_networking.is_some() {
-            anyhow::bail!(
+            return Err(network_policy_refusal(
                 "--gdbserver cannot be combined with --record-networking because debugger traffic \
                  would become ambiguous network input. Record without --gdbserver, or run a \
-                 separate explicitly unsafe debug session."
-            );
+                 separate explicitly unsafe debug session.",
+            ));
         }
         if self.det_opts.det_config.gdbserver && self.replay_networking.is_some() {
-            anyhow::bail!(
+            return Err(network_policy_refusal(
                 "--gdbserver cannot be combined with --replay-networking because replay denies the \
                  live host network. Replay without --gdbserver, or use `hermit replay --serve-only` \
-                 for the full-recording debugger workflow."
-            );
+                 for the full-recording debugger workflow.",
+            ));
         }
         if self.det_opts.det_config.gdbserver && self.network != NetworkingMode::UnsafeHost {
             if self.analyze_networking {
-                anyhow::bail!(
+                return Err(network_policy_refusal(
                     "--gdbserver requires host networking so a host gdb client can reach the \
                      gdbserver port, but --analyze-networking requires isolated loopback \
-                     namespace. Run these two modes separately."
-                );
+                     namespace. Run these two modes separately.",
+                ));
             }
-            anyhow::bail!(
+            return Err(network_policy_refusal(
                 "--gdbserver requires a host-reachable TCP listener. Add \
                  --unsafe-live-network to acknowledge that the debug session exposes the live \
-                 host network, or remove --gdbserver to keep networking denied."
-            );
+                 host network, or remove --gdbserver to keep networking denied.",
+            ));
         }
 
         // Strict mode accepts captured network input but must reject uncaptured
@@ -3853,12 +3878,12 @@ impl RunOpts {
             } else {
                 "--network=host"
             };
-            anyhow::bail!(
+            return Err(network_policy_refusal(format!(
                 "--strict is fail-closed deterministic mode and cannot be combined with {}: \
                  host networking exposes the guest to external traffic that hermit does not \
                  determinize. Remove --strict, or use --record-networking to capture that input.",
                 cause
-            );
+            )));
         }
 
         // Advise when running a VMM (e.g. QEMU) under host-time virtualization,

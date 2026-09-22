@@ -19,7 +19,10 @@ use crate::consts::EXE_NAME;
 use crate::consts::METADATA_NAME;
 use crate::error::Context;
 use crate::error::Error;
+use crate::metadata::FullReplayPhase;
 use crate::metadata::Metadata;
+use crate::metadata::finalize_network_trace_recording;
+use crate::metadata::prepare_network_trace_recording;
 use crate::metadata::record_or_replay_config;
 use crate::recorder::Recorder;
 
@@ -32,6 +35,7 @@ pub struct Record {
     tracer: Tracer,
     metadata: Metadata,
     metadata_path: PathBuf,
+    data: PathBuf,
 }
 
 impl Record {
@@ -43,6 +47,7 @@ impl Record {
         mountinfo_root_rewrites: Vec<MountInfoRootRewrite>,
         mountinfo_mount_ids: Option<Vec<u64>>,
     ) -> Result<Self, Error> {
+        prepare_network_trace_recording(dir)?;
         let mut metadata = Metadata::new(&command)?;
         metadata.mountinfo_root_rewrites = mountinfo_root_rewrites;
         metadata.mountinfo_mount_ids_captured = mountinfo_mount_ids.is_some();
@@ -60,7 +65,7 @@ impl Record {
         serde_json::to_writer_pretty(fs::File::create(&metadata_path)?, &metadata)
             .context("Failed to serialize metadata")?;
 
-        let mut config = record_or_replay_config(dir);
+        let mut config = record_or_replay_config(dir, FullReplayPhase::Record);
         config.mountinfo_root_rewrites = metadata.mountinfo_root_rewrites.clone();
         config.mountinfo_mount_ids = metadata.mountinfo_mount_ids.clone();
         config.mountinfo_mount_ids_captured = metadata.mountinfo_mount_ids_captured;
@@ -75,6 +80,7 @@ impl Record {
             tracer,
             metadata,
             metadata_path,
+            data: dir.to_path_buf(),
         })
     }
 
@@ -90,17 +96,19 @@ impl Record {
             metadata.mountinfo_mount_ids = provenance.mountinfo_order;
             metadata.mountinfo_mount_ids_captured = true;
             metadata.fdinfo_unlisted_mount_ids = provenance.unlisted_order;
-            let directory = metadata_path
-                .parent()
-                .ok_or_else(|| Error::msg("recording metadata path has no parent"))?;
-            let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-            serde_json::to_writer_pretty(temporary.as_file_mut(), metadata)
-                .context("Failed to serialize final recording metadata")?;
-            temporary
-                .persist(metadata_path)
-                .map_err(|error| error.error)
-                .context("Failed to persist final recording metadata")?;
         }
+        let directory = metadata_path
+            .parent()
+            .ok_or_else(|| Error::msg("recording metadata path has no parent"))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+        serde_json::to_writer_pretty(temporary.as_file_mut(), metadata)
+            .context("Failed to serialize final recording metadata")?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(metadata_path)
+            .map_err(|error| error.error)
+            .context("Failed to persist final recording metadata")?;
+        fs::File::open(directory)?.sync_all()?;
         Ok(())
     }
 
@@ -110,10 +118,21 @@ impl Record {
             tracer,
             mut metadata,
             metadata_path,
+            data,
         } = self;
-        let (exit_status, global_state) = tracer.wait().await?;
-        let persist =
-            Self::persist_mount_identity_provenance(&mut metadata, &metadata_path, &global_state);
+        let (exit_status, mut global_state) = tracer.wait().await?;
+        let persist = global_state
+            .finalize_network_trace()
+            .map_err(Error::msg)
+            .and_then(|()| finalize_network_trace_recording(&data))
+            .and_then(|artifact| {
+                metadata.network_trace = Some(artifact);
+                Self::persist_mount_identity_provenance(
+                    &mut metadata,
+                    &metadata_path,
+                    &global_state,
+                )
+            });
         global_state.clean_up(false, &None).await;
         persist?;
         Ok(exit_status)
@@ -125,10 +144,21 @@ impl Record {
             tracer,
             mut metadata,
             metadata_path,
+            data,
         } = self;
-        let (output, global_state) = tracer.wait_with_output().await?;
-        let persist =
-            Self::persist_mount_identity_provenance(&mut metadata, &metadata_path, &global_state);
+        let (output, mut global_state) = tracer.wait_with_output().await?;
+        let persist = global_state
+            .finalize_network_trace()
+            .map_err(Error::msg)
+            .and_then(|()| finalize_network_trace_recording(&data))
+            .and_then(|artifact| {
+                metadata.network_trace = Some(artifact);
+                Self::persist_mount_identity_provenance(
+                    &mut metadata,
+                    &metadata_path,
+                    &global_state,
+                )
+            });
         global_state.clean_up(false, &None).await;
         persist?;
         Ok(output)

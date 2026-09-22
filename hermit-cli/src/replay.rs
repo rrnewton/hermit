@@ -37,9 +37,11 @@ use crate::event::ExecTarget;
 use crate::event::SyscallEvent;
 use crate::event_stream::EventReader;
 use crate::event_stream::EventStreamId;
+use crate::metadata::FullReplayPhase;
 use crate::metadata::Metadata;
 use crate::metadata::RECORD_VERSION;
 use crate::metadata::record_or_replay_config;
+use crate::metadata::validate_network_trace_replay;
 use crate::replayer::Replayer;
 
 type ReplayTool = detcore::Detcore<Replayer>;
@@ -84,6 +86,7 @@ impl Replay {
                 recording_version, replayer_version
             )));
         }
+        validate_network_trace_replay(dir, &metadata)?;
 
         let mut command = metadata.command();
 
@@ -93,7 +96,7 @@ impl Replay {
             command.stderr(Stdio::piped());
         }
 
-        let mut config = record_or_replay_config(dir);
+        let mut config = record_or_replay_config(dir, FullReplayPhase::Replay);
         // Recorder events contain the raw bytes from the recording namespace.
         // Reapply Detcore's sanitizer with the recording-time mount IDs, not
         // the unrelated IDs of this fresh replay namespace.
