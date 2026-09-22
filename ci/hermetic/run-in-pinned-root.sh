@@ -173,7 +173,7 @@ if "$nextest_calibration"; then
         fi
         case $capture_status in
             0)
-                [[ $capture_version == nextest-launch-observation-v1 ]] || { printf 'nextest budgets: malformed prepared capture capability; refresh build.rust_scripts\n' >&2; exit 2; }
+                [[ $capture_version == nextest-launch-observation-v2 ]] || { printf 'nextest budgets: malformed prepared capture capability; refresh build.rust_scripts\n' >&2; exit 2; }
                 launch_dir=$(mktemp -d "$out/nextest-launch.XXXXXX")
                 launch_file="$launch_dir/context.json"
                 image_id=$(timeout --verbose --signal=TERM --kill-after=2s 10s \

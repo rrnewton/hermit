@@ -8413,10 +8413,7 @@ fn current_comparison_representation(
     let mut covered = BTreeSet::new();
     let mut represented_counts = BTreeMap::<DirectEvidenceKey, usize>::new();
     for row in rows {
-        if row.producer != SeriesProducer::Validate
-            || row.schema != SeriesSchema::V3
-            || row.series.no_verdict_evidence.is_some()
-        {
+        if row.producer != SeriesProducer::Validate || row.schema != SeriesSchema::V3 {
             continue;
         }
         let matches = bound
@@ -8454,8 +8451,23 @@ fn current_comparison_representation(
         }
         // Range over existing evidence, not an event-declared allocation.
         let matching = attempts.range(first..=last).collect::<Vec<_>>();
+        if row.series.no_verdict_evidence.is_some() {
+            // Representing a current comparison must not hide a contradictory
+            // no-verdict claim from the legacy reconciliation below. Only an
+            // explicit, different outer attempt can remain as a separate event.
+            if !matching.is_empty() {
+                return Err(
+                    "current series no-verdict evidence disagrees with its bound comparison or outer attempt"
+                        .into(),
+                );
+            }
+            continue;
+        }
         if matching.len() as u64 != row.series.num_runs {
-            return Err("current series lacks complete bound outer-attempt coverage".into());
+            return Err(
+                "current series lacks complete bound outer-attempt coverage: declared attempts disagree with bound comparisons"
+                    .into(),
+            );
         }
         for (attempt, key) in matching {
             if row.series.result.map(DirectEvidenceKind::Result).as_ref() != Some(&key.kind) {
@@ -8472,7 +8484,10 @@ fn current_comparison_representation(
                 ));
             }
             if !covered.insert(((*base).clone(), *attempt)) {
-                return Err("current series events overlap the same bound outer attempt".into());
+                return Err(
+                    "current series cannot map one-to-one: events overlap the same bound outer attempt"
+                        .into(),
+                );
             }
             *represented_counts.entry(key.clone()).or_default() += 1;
         }
@@ -24606,6 +24621,87 @@ mod evidence_identity_tests {
             );
             assert!(!represented.has_unrepresented_direct_evidence);
             assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
+            for detcore_tree in [None, Some(tree.clone())] {
+                let mut duplicate_event = events[1].clone();
+                duplicate_event.event_id = "retry-overlapping-event".into();
+                duplicate_event.emitted_at = "2026-09-22T00:00:01Z".into();
+                duplicate_event.series.detcore_tree = detcore_tree.clone();
+                let error = direct_representation(
+                    &tracked,
+                    &[events[1].clone(), duplicate_event],
+                    &attempts,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error,
+                    "current series cannot map one-to-one: events overlap the same bound outer attempt"
+                );
+                assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
+
+                let mut wrong_attempt = events[1].clone();
+                wrong_attempt.series.detcore_tree = detcore_tree.clone();
+                wrong_attempt.series.attempt = Some(3);
+                wrong_attempt.series.run_index = 3;
+                let error =
+                    direct_representation(&tracked, &[wrong_attempt], &attempts).unwrap_err();
+                assert_eq!(
+                    error,
+                    "current series lacks complete bound outer-attempt coverage: declared attempts disagree with bound comparisons"
+                );
+                assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
+
+                let mut no_result = events[1].clone();
+                no_result.event_id = "retry-no-result".into();
+                no_result.series.detcore_tree = detcore_tree;
+                no_result.series.attempt = Some(2);
+                no_result.series.outcome = SeriesOutcome::NoResult;
+                no_result.series.result = None;
+                no_result.series.failure_class = Some(FailureClass::NoResult);
+                no_result.series.no_verdict_evidence = Some(SeriesNoVerdictEvidence {
+                    evidence_sha256: "e".repeat(64),
+                    attempts: vec![SeriesAttemptDisposition {
+                        index: "1".into(),
+                        kind: SeriesNoVerdictKind::NotRun,
+                        detail: None,
+                        attempt_outcome: "ERROR".into(),
+                        disposition: SeriesOutcome::NoResult,
+                        error_kind: Some("incomplete-verification-evidence".into()),
+                        status: Some(125),
+                        signal: None,
+                        timed_out: false,
+                        verification_report_sha256: Some("f".repeat(64)),
+                    }],
+                });
+                no_result.validate_for_projection().unwrap();
+                let with_claim = |claim: &SeriesRow| {
+                    let mut rows = events.clone();
+                    rows.push(claim.clone());
+                    rows
+                };
+                let error = direct_representation(&tracked, &with_claim(&no_result), &attempts)
+                    .unwrap_err();
+                assert!(error.contains("disagree"), "{error}");
+                assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
+
+                no_result.series.attempt = Some(3);
+                no_result.series.run_index = 3;
+                let distinct =
+                    direct_representation(&tracked, &with_claim(&no_result), &attempts).unwrap();
+                assert_eq!(
+                    distinct.represented_event_ids,
+                    represented.represented_event_ids
+                );
+                assert!(!distinct.has_unrepresented_direct_evidence);
+                assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
+
+                no_result.series.attempt = None;
+                let error = direct_representation(&tracked, &with_claim(&no_result), &attempts)
+                    .unwrap_err();
+                assert_eq!(
+                    error,
+                    "no_verdict_evidence requires an explicit outer attempt"
+                );
+            }
             let mut duplicate = tracked.clone();
             duplicate.cells[0]
                 .observations
