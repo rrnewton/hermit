@@ -132,7 +132,21 @@ fi
 check_pinned_image || exit $?
 
 pinned_home="$out/home"
-mkdir -p "$out/target" "$pinned_home"
+# `agent-utils/rs/bin/*` deliberately keeps its Cargo target, provenance lock,
+# and content-addressed launch snapshots beside the agent-utils checkout.  The
+# source mount below is writable for build/test nodes, so without more-specific
+# mounts a pinned-root invocation at `/src` and a host invocation at the real
+# checkout path mutate one cache under two absolute source identities.  Cargo
+# then invalidates the otherwise warm artifacts, and the shared launcher lock
+# turns that rebuild into a cross-environment queue.  Keep all three writable
+# state roots private to this pinned output, just like the repository target.
+agent_utils_state="$out/agent-utils-rs"
+mkdir -p \
+    "$out/target" \
+    "$pinned_home" \
+    "$agent_utils_state/target" \
+    "$agent_utils_state/locks" \
+    "$agent_utils_state/snapshots"
 
 cargo_mount=(); cargo_home_in=/build/.cargo
 git_mounts=()
@@ -351,6 +365,9 @@ exec podman run --rm \
     --tmpfs /test:rw,nosuid,nodev,mode=1777 \
     --mount "type=bind,source=$src,destination=/src,$src_mode" \
     --mount "type=bind,source=$out/target,destination=/src/target" \
+    --mount "type=bind,source=$agent_utils_state/target,destination=/src/agent-utils/rs/target" \
+    --mount "type=bind,source=$agent_utils_state/locks,destination=/src/agent-utils/rs/.agent-utils-locks" \
+    --mount "type=bind,source=$agent_utils_state/snapshots,destination=/src/agent-utils/rs/.agent-utils-snapshots" \
     --mount "type=bind,source=$pinned_home,destination=/build" \
     "${cargo_mount[@]}" \
     "${git_mounts[@]}" \

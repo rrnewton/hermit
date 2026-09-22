@@ -26,7 +26,15 @@ class CargoCacheMounts(unittest.TestCase):
         self.scratch = tempfile.TemporaryDirectory(prefix="hermit-pinned-root-cache-")
         self.addCleanup(self.scratch.cleanup)
         self.root = Path(self.scratch.name)
-        for directory in ("source", "tools", "cargo/bin", "cargo/registry", "cargo/git"):
+        for directory in (
+            "source/agent-utils/rs/target",
+            "source/agent-utils/rs/.agent-utils-locks",
+            "source/agent-utils/rs/.agent-utils-snapshots",
+            "tools",
+            "cargo/bin",
+            "cargo/registry",
+            "cargo/git",
+        ):
             (self.root / directory).mkdir(parents=True, exist_ok=True)
         (self.root / "cargo/config.toml").write_text("host configuration must not be imported\n")
         (self.root / "cargo/bin/cargo-clippy").write_text("host executable must not be imported\n")
@@ -34,9 +42,14 @@ class CargoCacheMounts(unittest.TestCase):
         fake = self.root / "tools/podman"
         fake.write_text(
             f"#!{sys.executable}\n"
-            "import json, os, sys\n"
+            "import json, os, pathlib, sys\n"
             "with open(os.environ['PINNED_ROOT_CAPTURE'], 'a') as out:\n"
             "    out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "if sys.argv[1] == 'run' and os.environ.get('PINNED_ROOT_WRITE_AGENT_UTILS_STATE') == '1':\n"
+            "    mounts = [sys.argv[i + 1] for i, arg in enumerate(sys.argv) if arg == '--mount']\n"
+            "    by_destination = {dict(field.split('=', 1) for field in mount.split(','))['destination']: dict(field.split('=', 1) for field in mount.split(','))['source'] for mount in mounts}\n"
+            "    for destination in ['/src/agent-utils/rs/target', '/src/agent-utils/rs/.agent-utils-locks', '/src/agent-utils/rs/.agent-utils-snapshots']:\n"
+            "        pathlib.Path(by_destination[destination], 'container-write').write_text(destination + '\\n')\n"
             "sys.exit(0 if sys.argv[1:3] == ['image', 'exists'] or sys.argv[1] == 'run' else 90)\n"
         )
         fake.chmod(0o755)
@@ -81,12 +94,64 @@ class CargoCacheMounts(unittest.TestCase):
         )
         self.assertIn(f"type=bind,source={self.root}/source,destination=/src,ro=true", mounts)
         self.assertIn(f"type=bind,source={self.root}/output/target,destination=/src/target", mounts)
+        self.assertIn(
+            f"type=bind,source={self.root}/output/agent-utils-rs/target,destination=/src/agent-utils/rs/target",
+            mounts,
+        )
+        self.assertIn(
+            f"type=bind,source={self.root}/output/agent-utils-rs/locks,destination=/src/agent-utils/rs/.agent-utils-locks",
+            mounts,
+        )
+        self.assertIn(
+            f"type=bind,source={self.root}/output/agent-utils-rs/snapshots,destination=/src/agent-utils/rs/.agent-utils-snapshots",
+            mounts,
+        )
         self.assertIn("CARGO_HOME=/build/.cargo", argv)
         self.assertEqual(argv.count("--cgroups=disabled"), 1)
         self.assertFalse(any(arg.startswith(("--cgroup-parent", "--cgroupns")) for arg in argv))
         self.assertIn("--network=none", argv)
         self.assertIn("--http-proxy=false", argv)
         self.assertEqual(argv[-3:], ["fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000", "/not-executed/command", "literal argument"])
+
+    def test_agent_utils_writable_state_is_confined_to_the_pinned_output(self):
+        host_state = self.root / "source/agent-utils/rs"
+        sentinels = {}
+        for relative in ("target", ".agent-utils-locks", ".agent-utils-snapshots"):
+            directory = host_state / relative
+            sentinel = directory / "host-sentinel"
+            sentinel.write_bytes((relative + "\n").encode())
+            sentinels[relative] = (
+                sentinel.read_bytes(),
+                sentinel.stat().st_mtime_ns,
+                directory.stat().st_mtime_ns,
+            )
+
+        os.environ["PINNED_ROOT_WRITE_AGENT_UTILS_STATE"] = "1"
+        self.addCleanup(os.environ.pop, "PINNED_ROOT_WRITE_AGENT_UTILS_STATE", None)
+        result, calls = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+
+        for relative, before in sentinels.items():
+            directory = host_state / relative
+            sentinel = directory / "host-sentinel"
+            self.assertEqual(
+                (sentinel.read_bytes(), sentinel.stat().st_mtime_ns, directory.stat().st_mtime_ns),
+                before,
+                f"host agent-utils {relative} state changed",
+            )
+            self.assertFalse((directory / "container-write").exists())
+
+        output_state = self.root / "output/agent-utils-rs"
+        expected = {
+            "target": "/src/agent-utils/rs/target\n",
+            "locks": "/src/agent-utils/rs/.agent-utils-locks\n",
+            "snapshots": "/src/agent-utils/rs/.agent-utils-snapshots\n",
+        }
+        for relative, contents in expected.items():
+            marker = output_state / relative / "container-write"
+            self.assertEqual(marker.read_text(), contents)
+            self.assertTrue(marker.is_relative_to(self.root / "output"))
 
     def test_proc_locks_mount_reuses_the_native_host_inode(self):
         runtime = self.root / "runtime with spaces"

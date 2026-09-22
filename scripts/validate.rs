@@ -10647,6 +10647,16 @@ fn raw_run_dag_engine_bracket(root: &Path) -> Result<String, String> {
         dag_to_json(&validate_plan::config_from(vec![step], "structured result engine fixture")),
     )
     .map_err(|error| format!("raw run-dag engine: cannot write committed fixture: {error}"))?;
+    // This nested public launcher must retain the CPU width admitted for the
+    // enclosing gate. `run-dag.sh` sources configure-build-jobs.sh, whose
+    // launcher input is CI_DAG_BUILD_JOBS; leaving it absent replaces the
+    // scheduler's CARGO_BUILD_JOBS=1 with the launcher default of eight.
+    let scheduled_build_jobs = std::env::var("CARGO_BUILD_JOBS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
+        .to_string();
     let launch = |engine: Option<&str>| -> Result<std::process::Output, String> {
         let mut command = Command::new("timeout");
         command
@@ -10659,7 +10669,8 @@ fn raw_run_dag_engine_bracket(root: &Path) -> Result<String, String> {
             .env_remove("RUN_DAG_FILE_OVERRIDE")
             .env_remove("VALIDATE_RUN_STATE")
             .env_remove("E2E_RESULT_ROOT")
-            .env_remove("E2E_BUILD_ROOT");
+            .env_remove("E2E_BUILD_ROOT")
+            .env("CI_DAG_BUILD_JOBS", &scheduled_build_jobs);
         if let Some(engine) = engine {
             command.env("DAGRUN_ENGINE", engine);
         }
@@ -10667,7 +10678,27 @@ fn raw_run_dag_engine_bracket(root: &Path) -> Result<String, String> {
     };
     let rust = launch(None)?;
     let rust_stderr = String::from_utf8_lossy(&rust.stderr);
-    if !rust.status.success() || !rust_stderr.contains("[dagrun] engine=rust") || !marker.exists() {
+    let expected_jobs = format!("cargo-jobs={scheduled_build_jobs}");
+    let banner_has_exact_field = |stderr: &str, expected: &str| {
+        stderr.lines().any(|line| {
+            line.strip_prefix("run-dag.sh: ").is_some_and(|banner| {
+                banner
+                    .split_ascii_whitespace()
+                    .any(|field| field == expected)
+            })
+        })
+    };
+    if banner_has_exact_field(
+        "run-dag.sh: lane=portable cargo-jobs=10 runner=fixture",
+        "cargo-jobs=1",
+    ) {
+        return Err("raw run-dag engine: exact cargo-jobs field accepted a prefix collision".into());
+    }
+    if !rust.status.success()
+        || !rust_stderr.contains("[dagrun] engine=rust")
+        || !banner_has_exact_field(&rust_stderr, &expected_jobs)
+        || !marker.exists()
+    {
         return Err(format!(
             "raw run-dag engine: default runner did not execute the structured committed fixture: status={} marker={} stdout={} stderr={rust_stderr}",
             rust.status, marker.exists(), String::from_utf8_lossy(&rust.stdout),
