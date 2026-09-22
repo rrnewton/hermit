@@ -23558,7 +23558,7 @@ mod post_verdict_transaction_tests {
             git(&root, &["add", "detcore/scorecard-fixture-source"]);
             let invoker = commit(&root, "independent invocation source");
             let derived = derive(&root).unwrap();
-            let mut cells: TrackedCells = read_json(&root.join(CELLS)).unwrap();
+            let mut cells = load_catalogue(&root).unwrap().unwrap();
             for cell in &mut cells.cells {
                 cell.observations.clear();
                 cell.last_tested = None;
