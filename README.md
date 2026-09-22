@@ -75,6 +75,9 @@ making a standalone installation or archive.
 
 ## Quick Start
 
+Coding agents running experiments from the `dev-hermit` workspace should first
+read the [Hermit quick start for coding agents](docs/AGENT_QUICKSTART.md).
+
 Run a command deterministically by placing `hermit run --` before it:
 
 ```bash
