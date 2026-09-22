@@ -207,11 +207,30 @@ if [[ -e "$src/.git" ]]; then
         submodule_root="$src/$submodule_path"
         [[ -f "$submodule_root/.git" ]] || continue
         submodule_git_dir=$(git -C "$submodule_root" rev-parse --path-format=absolute --git-dir)
+        submodule_common_dir=$(git -C "$submodule_root" rev-parse --path-format=absolute --git-common-dir)
         raw_git_dir=$(sed -n "s/^gitdir: //p" "$submodule_root/.git")
         if [[ $raw_git_dir == /* ]]; then
             guest_git_dir=$raw_git_dir
         else
             guest_git_dir=$(realpath -m "/src/$submodule_path/$raw_git_dir")
+        fi
+        guest_submodule_common_dir=$guest_git_dir
+        if [[ -f "$submodule_git_dir/commondir" ]]; then
+            raw_common_dir=$(cat "$submodule_git_dir/commondir")
+            if [[ $raw_common_dir == /* ]]; then
+                guest_submodule_common_dir=$raw_common_dir
+            else
+                guest_submodule_common_dir=$(realpath -m "$guest_git_dir/$raw_common_dir")
+            fi
+        fi
+        # A linked submodule worktree can keep its common objects, refs and
+        # config outside the root repository's metadata. Its gitdir alone is
+        # not a repository: preserve the unchanged commondir resolution too.
+        if [[ $submodule_common_dir != "$submodule_git_dir" ]]; then
+            git_mounts+=(--mount "type=bind,source=$submodule_common_dir,destination=$submodule_common_dir,ro=true")
+            if [[ $guest_submodule_common_dir != "$submodule_common_dir" ]]; then
+                git_mounts+=(--mount "type=bind,source=$submodule_common_dir,destination=$guest_submodule_common_dir,ro=true")
+            fi
         fi
         git_mounts+=(--mount "type=bind,source=$submodule_git_dir,destination=$guest_git_dir,ro=true")
         if [[ -z $git_config_root ]]; then
@@ -219,11 +238,17 @@ if [[ -e "$src/.git" ]]; then
         fi
         mkdir -p "$git_config_root/$submodule_path"
         for config_name in config config.worktree; do
-            [[ -f "$submodule_git_dir/$config_name" ]] || continue
+            config_source="$submodule_common_dir/config"
+            config_destination="$guest_submodule_common_dir/config"
+            if [[ $config_name == config.worktree ]]; then
+                config_source="$submodule_git_dir/config.worktree"
+                config_destination="$guest_git_dir/config.worktree"
+            fi
+            [[ -f $config_source ]] || continue
             config_copy="$git_config_root/$submodule_path/$config_name"
-            cp -- "$submodule_git_dir/$config_name" "$config_copy"
+            cp -- "$config_source" "$config_copy"
             git config --file "$config_copy" core.worktree "/src/$submodule_path"
-            git_mounts+=(--mount "type=bind,source=$config_copy,destination=$guest_git_dir/$config_name,ro=true")
+            git_mounts+=(--mount "type=bind,source=$config_copy,destination=$config_destination,ro=true")
         done
     done <<< "$submodule_paths"
 fi

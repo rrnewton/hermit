@@ -367,6 +367,108 @@ class CargoCacheMounts(unittest.TestCase):
                     self.assertEqual(Path(file).read_bytes(), contents, file)
 
 
+    def test_relocates_nested_linked_worktrees_with_external_common_metadata(self):
+        git_bin = shutil.which("git")
+        self.assertIsNotNone(git_bin)
+        git_env = os.environ.copy()
+        git_env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                       GIT_OPTIONAL_LOCKS="0")
+
+        def git(root, *args):
+            result = subprocess.run(
+                [git_bin, "-c", "protocol.file.allow=always", "-c", "user.name=fixture",
+                 "-c", "user.email=fixture@example.invalid", "-C", str(root), *args],
+                env=git_env, capture_output=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            return result.stdout
+
+        def seed(name):
+            root = self.root / name
+            root.mkdir()
+            git(root, "init", "-q")
+            (root / "payload").write_text(name + "\n")
+            git(root, "add", "payload")
+            git(root, "commit", "-qm", "fixture")
+            return root
+
+        leaf = seed("external-leaf")
+        child = seed("external-child")
+        git(child, "submodule", "add", "-q", str(leaf), "nested leaf")
+        git(child, "commit", "-qam", "nested fixture")
+        product = seed("external-product")
+        git(product, "submodule", "add", "-q", str(child), "nested child")
+        git(product, "commit", "-qam", "product fixture")
+        source = self.root / "linked-source"
+        git(product, "worktree", "add", "--detach", str(source))
+        paths = ["nested child", "nested child/nested leaf"]
+        # These child worktrees share the external seed stores, not the root's
+        # metadata tree. Their unchanged commondir files must resolve in /src.
+        git(child, "worktree", "add", "--detach", str(source / paths[0]))
+        git(leaf, "worktree", "add", "--detach", str(source / paths[1]))
+        metadata = {}
+        for path in paths:
+            repo = source / path
+            git(repo, "config", "extensions.worktreeConfig", "true")
+            git(repo, "config", "--worktree", "core.worktree", str(repo))
+            git(repo, "config", "--worktree", "fixture.value", "preserve child value")
+            directory = Path(git(repo, "rev-parse", "--absolute-git-dir").decode().strip())
+            common = Path(git(repo, "rev-parse", "--path-format=absolute",
+                              "--git-common-dir").decode().strip())
+            self.assertNotEqual(directory, common)
+            self.assertFalse(common.is_relative_to(product / ".git"))
+            metadata[path] = (directory, common)
+        self.assertEqual(git(source, "status", "--porcelain=v1", "--ignore-submodules=none"), b"")
+        before = {str(f): f.read_bytes() for directory, common in metadata.values()
+                  for f in (directory / "HEAD", directory / "index", directory / "commondir",
+                            directory / "config.worktree", common / "config") if f.is_file()}
+        gitfiles = {path: (source / path / ".git").read_bytes() for path in paths}
+        identities = {path: (git(source / path, "rev-parse", "HEAD"),
+                             git(source / path, "ls-files", "--stage", "-z"),
+                             git(source / path, "show", "HEAD:payload")) for path in paths}
+        result, calls = self.invoke(source=source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        argv = calls[1]
+        mounts = [dict(field.split("=", 1) for field in argv[i + 1].split(","))
+                  for i, arg in enumerate(argv) if arg == "--mount"]
+        destinations = {mount["destination"]: mount for mount in mounts}
+        for path, (directory, common) in metadata.items():
+            raw = gitfiles[path].decode().removeprefix("gitdir: ").strip()
+            guest_dir = os.path.normpath(os.path.join("/src", path, raw))
+            guest_common = os.path.normpath(os.path.join(
+                guest_dir, (directory / "commondir").read_text().strip()))
+            self.assertIn(guest_common, destinations,
+                          "nested commondir must resolve outside the root metadata mount")
+            for actual, destination in ((common, guest_common), (directory, guest_dir)):
+                self.assertEqual(destinations[destination]["source"], str(actual))
+                self.assertEqual(destinations[destination]["ro"], "true")
+            for actual, destination in ((common / "config", guest_common + "/config"),
+                                         (directory / "config.worktree", guest_dir + "/config.worktree")):
+                overlay = destinations[destination]
+                self.assertEqual(overlay["ro"], "true")
+                copied = Path(overlay["source"])
+                self.assertNotEqual(copied, actual)
+                self.assertTrue(copied.is_relative_to(self.root / "output"))
+                self.assertEqual(git(source, "config", "--file", str(copied),
+                                     "--get", "core.worktree").decode().strip(), "/src/" + path)
+
+                def non_worktree(config):
+                    values = git(source, "config", "--file", str(config),
+                                 "--null", "--list").split(b"\0")
+                    return [value for value in values if not value.startswith(b"core.worktree\n")]
+
+                self.assertEqual(non_worktree(copied), non_worktree(actual))
+            self.assertEqual((source / path / ".git").read_bytes(), gitfiles[path])
+            self.assertEqual((git(source / path, "rev-parse", "HEAD"),
+                              git(source / path, "ls-files", "--stage", "-z"),
+                              git(source / path, "show", "HEAD:payload")), identities[path])
+        for filename, data in before.items():
+            self.assertEqual(Path(filename).read_bytes(), data, filename)
+        self.assertFalse(any(value.startswith(("GIT_DIR=", "GIT_WORK_TREE=", "GIT_CONFIG_COUNT="))
+                             for value in argv))
+
+
     def test_relocates_gitfile_roots_and_common_metadata_without_global_git_overrides(self):
         git_bin = shutil.which("git")
         self.assertIsNotNone(git_bin)
