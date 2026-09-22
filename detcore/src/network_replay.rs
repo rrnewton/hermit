@@ -33,8 +33,8 @@ use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use chrono::DateTime;
-use chrono::Utc;
+pub use chrono::DateTime;
+pub use chrono::Utc;
 use detcore_model::fd::OpenFileId;
 use detcore_model::network_trace::NetworkAddressV1;
 use detcore_model::network_trace::NetworkAddressV2;
@@ -47,6 +47,7 @@ use detcore_model::network_trace::NetworkDatagramV2;
 use detcore_model::network_trace::NetworkInputEventV2;
 use detcore_model::network_trace::NetworkInputKindV1;
 use detcore_model::network_trace::NetworkInputKindV2;
+use detcore_model::network_trace::NetworkObjectId;
 use detcore_model::network_trace::NetworkOutputEventV2;
 use detcore_model::network_trace::NetworkOutputKindV2;
 use detcore_model::network_trace::NetworkReadinessV2;
@@ -169,6 +170,35 @@ pub struct NetworkReceiveOptions {
     pub receive_low_water: usize,
 }
 
+/// Kernel-object category represented by one trace-stable ancillary object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkAncillaryObjectKind {
+    /// Open file description transferred through `SCM_RIGHTS`.
+    FileDescriptor,
+}
+
+/// Resolved ancillary object used by the adapter to install a guest fd alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkAncillaryObject {
+    /// Trace-stable object identity.
+    pub id: NetworkObjectId,
+    /// Stable Detcore open-file-description identity.
+    pub open_file: OpenFileId,
+    /// Object category.
+    pub kind: NetworkAncillaryObjectKind,
+    /// Number of currently installed descriptor aliases.
+    pub alias_count: u64,
+}
+
+/// One deterministic epoll result, ordered by target OFD identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkEpollEvent {
+    /// Ready target open-file description.
+    pub target: OpenFileId,
+    /// Linux `EPOLL*` result bits.
+    pub events: u32,
+}
+
 /// Connect or accept observation ready for syscall adaptation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionOutcome {
@@ -194,6 +224,35 @@ pub struct NetworkReplayEngine {
     /// A trace channel identity is single-use even after its last OFD alias is
     /// retired; fd/OFD reuse must never resurrect an old connection.
     retired_channels: BTreeSet<NetworkChannelId>,
+    ancillary_objects: BTreeMap<NetworkObjectId, AncillaryObjectState>,
+    ancillary_by_open_file: BTreeMap<OpenFileId, NetworkObjectId>,
+    retired_ancillary_objects: BTreeSet<NetworkObjectId>,
+    retired_ancillary_open_files: BTreeSet<OpenFileId>,
+    epolls: BTreeMap<OpenFileId, BTreeMap<OpenFileId, EpollInterestState>>,
+}
+
+#[derive(Debug)]
+struct AncillaryObjectState {
+    open_file: OpenFileId,
+    kind: NetworkAncillaryObjectKind,
+    alias_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ReadinessGeneration {
+    readable: u64,
+    writable: u64,
+    error: u64,
+    hangup: u64,
+}
+
+#[derive(Debug)]
+struct EpollInterestState {
+    events: u32,
+    edge_triggered: bool,
+    one_shot: bool,
+    enabled: bool,
+    seen: ReadinessGeneration,
 }
 
 #[derive(Debug)]
@@ -219,6 +278,8 @@ struct ChannelState {
     outbound: VecDeque<OutboundOutcome>,
     local_write_closed: bool,
     peer_write_closed: bool,
+    readiness: NetworkReadinessV2,
+    readiness_generation: ReadinessGeneration,
 }
 
 #[derive(Debug)]
@@ -263,6 +324,65 @@ enum OutboundOutcome {
         stream_offset: u64,
         direction: NetworkShutdownV2,
     },
+}
+
+impl EpollInterestState {
+    fn new(events: u32, generation: ReadinessGeneration, rearm: bool) -> Self {
+        let seen = if rearm {
+            ReadinessGeneration {
+                readable: generation.readable.saturating_sub(1),
+                writable: generation.writable.saturating_sub(1),
+                error: generation.error.saturating_sub(1),
+                hangup: generation.hangup.saturating_sub(1),
+            }
+        } else {
+            ReadinessGeneration::default()
+        };
+        Self {
+            events,
+            edge_triggered: events & libc::EPOLLET as u32 != 0,
+            one_shot: events & libc::EPOLLONESHOT as u32 != 0,
+            enabled: true,
+            seen,
+        }
+    }
+}
+
+fn epoll_events(readiness: NetworkReadinessV2, interest: u32) -> u32 {
+    let mut events = 0;
+    if readiness.readable && interest & libc::EPOLLIN as u32 != 0 {
+        events |= libc::EPOLLIN as u32;
+    }
+    if readiness.writable && interest & libc::EPOLLOUT as u32 != 0 {
+        events |= libc::EPOLLOUT as u32;
+    }
+    // Linux reports ERR/HUP whether or not the caller requested those bits.
+    if readiness.error {
+        events |= libc::EPOLLERR as u32;
+    }
+    if readiness.hangup {
+        events |= libc::EPOLLHUP as u32;
+        if interest & libc::EPOLLRDHUP as u32 != 0 {
+            events |= libc::EPOLLRDHUP as u32;
+        }
+    }
+    events
+}
+
+fn readiness_transitioned(
+    readiness: NetworkReadinessV2,
+    generation: ReadinessGeneration,
+    seen: ReadinessGeneration,
+    interest: u32,
+) -> bool {
+    (readiness.readable
+        && interest & libc::EPOLLIN as u32 != 0
+        && generation.readable > seen.readable)
+        || (readiness.writable
+            && interest & libc::EPOLLOUT as u32 != 0
+            && generation.writable > seen.writable)
+        || (readiness.error && generation.error > seen.error)
+        || (readiness.hangup && generation.hangup > seen.hangup)
 }
 
 /// Upgrade the fully validated V1 single-client envelope into the V2 shared
@@ -355,6 +475,15 @@ pub fn upgrade_v1_trace(trace: NetworkTraceV1) -> Result<NetworkTraceV2, Network
 pub fn replay_from_reader<R: Read>(reader: R) -> Result<NetworkReplayEngine, NetworkReplayError> {
     let trace = NetworkTrace::read_framed(reader).map_err(NetworkReplayError::Codec)?;
     NetworkReplayEngine::replay_versioned(trace)
+}
+
+/// Decode once and require exact agreement with the pre-container run epoch.
+pub fn replay_from_reader_with_expected_epoch<R: Read>(
+    reader: R,
+    expected_epoch: DateTime<Utc>,
+) -> Result<NetworkReplayEngine, NetworkReplayError> {
+    let trace = NetworkTrace::read_framed(reader).map_err(NetworkReplayError::Codec)?;
+    NetworkReplayEngine::replay_versioned_with_expected_epoch(trace, expected_epoch)
 }
 
 static PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -535,6 +664,14 @@ impl NetworkReplayEngine {
         replay_from_reader(reader)
     }
 
+    /// Decode once and require exact agreement with the pre-container epoch.
+    pub fn replay_from_reader_with_expected_epoch<R: Read>(
+        reader: R,
+        expected_epoch: DateTime<Utc>,
+    ) -> Result<Self, NetworkReplayError> {
+        replay_from_reader_with_expected_epoch(reader, expected_epoch)
+    }
+
     /// Create an empty recorder in the supplied absolute epoch.
     pub fn record(epoch: DateTime<Utc>) -> Self {
         Self {
@@ -547,19 +684,12 @@ impl NetworkReplayEngine {
             bindings: BTreeMap::new(),
             reverse_bindings: BTreeMap::new(),
             retired_channels: BTreeSet::new(),
+            ancillary_objects: BTreeMap::new(),
+            ancillary_by_open_file: BTreeMap::new(),
+            retired_ancillary_objects: BTreeSet::new(),
+            retired_ancillary_open_files: BTreeSet::new(),
+            epolls: BTreeMap::new(),
         }
-    }
-
-    /// Capture the host wall clock exactly once as an explicit recorded input.
-    /// Replay subsequently uses only the epoch serialized in the trace.
-    pub fn record_now() -> Self {
-        Self::record(Utc::now())
-    }
-
-    /// Use an explicitly supplied epoch or capture the current wall clock once
-    /// when the caller did not supply one.
-    pub fn record_with_optional_epoch(epoch: Option<DateTime<Utc>>) -> Self {
-        epoch.map_or_else(Self::record_now, Self::record)
     }
 
     /// Create a fail-closed replayer after validating the entire trace.
@@ -575,6 +705,9 @@ impl NetworkReplayEngine {
                 .expect("validated channel")
                 .append_expected_output(&output.event);
         }
+        for state in channels.values_mut() {
+            state.refresh_readiness();
+        }
         let released = vec![false; trace.inputs.len()];
         Ok(Self {
             mode: EngineState::Replay(ReplayState {
@@ -585,6 +718,11 @@ impl NetworkReplayEngine {
             bindings: BTreeMap::new(),
             reverse_bindings: BTreeMap::new(),
             retired_channels: BTreeSet::new(),
+            ancillary_objects: BTreeMap::new(),
+            ancillary_by_open_file: BTreeMap::new(),
+            retired_ancillary_objects: BTreeSet::new(),
+            retired_ancillary_open_files: BTreeSet::new(),
+            epolls: BTreeMap::new(),
         })
     }
 
@@ -598,11 +736,38 @@ impl NetworkReplayEngine {
         }
     }
 
+    /// Replay either codec version only when its authoritative epoch exactly
+    /// matches the epoch already resolved for this run.
+    pub fn replay_versioned_with_expected_epoch(
+        trace: NetworkTrace,
+        expected_epoch: DateTime<Utc>,
+    ) -> Result<Self, NetworkReplayError> {
+        let actual_epoch = match &trace {
+            NetworkTrace::V1(trace) => trace.epoch,
+            NetworkTrace::V2(trace) => trace.epoch,
+        };
+        if actual_epoch != expected_epoch {
+            return Err(NetworkReplayError::EpochMismatch {
+                expected: expected_epoch,
+                actual: actual_epoch,
+            });
+        }
+        Self::replay_versioned(trace)
+    }
+
     /// Current capture/replay mode.
     pub fn mode(&self) -> NetworkEngineMode {
         match self.mode {
             EngineState::Record(_) => NetworkEngineMode::Record,
             EngineState::Replay(_) => NetworkEngineMode::Replay,
+        }
+    }
+
+    /// Exact epoch persisted by the active record or replay trace.
+    pub fn trace_epoch(&self) -> DateTime<Utc> {
+        match &self.mode {
+            EngineState::Record(trace) => trace.epoch,
+            EngineState::Replay(replay) => replay.trace.epoch,
         }
     }
 
@@ -688,15 +853,249 @@ impl NetworkReplayEngine {
 
     /// Remove a binding only when the caller has proved the final OFD alias closed.
     pub fn retire_open_file(&mut self, open_file: OpenFileId) -> Option<NetworkChannelId> {
-        let channel = self.bindings.remove(&open_file)?;
-        self.reverse_bindings.remove(&channel);
-        self.retired_channels.insert(channel);
-        Some(channel)
+        self.epolls.remove(&open_file);
+        for interests in self.epolls.values_mut() {
+            interests.remove(&open_file);
+        }
+        let channel = self.bindings.remove(&open_file);
+        if let Some(channel) = channel {
+            self.reverse_bindings.remove(&channel);
+            self.retired_channels.insert(channel);
+        }
+        channel
     }
 
     /// Resolve a stable OFD binding.
     pub fn channel_for(&self, open_file: OpenFileId) -> Option<NetworkChannelId> {
         self.bindings.get(&open_file).copied()
+    }
+
+    /// Register or confirm one trace-stable ancillary object. Re-registering
+    /// the same identity is idempotent; remapping either side fails closed.
+    pub fn register_ancillary_object(
+        &mut self,
+        id: NetworkObjectId,
+        open_file: OpenFileId,
+        kind: NetworkAncillaryObjectKind,
+    ) -> Result<(), NetworkReplayError> {
+        if self.retired_ancillary_objects.contains(&id) {
+            return Err(NetworkReplayError::AncillaryObjectRetired(id));
+        }
+        if self.retired_ancillary_open_files.contains(&open_file) {
+            return Err(NetworkReplayError::AncillaryOpenFileRetired(open_file));
+        }
+        if let Some(existing) = self.ancillary_objects.get(&id) {
+            return if existing.open_file == open_file && existing.kind == kind {
+                Ok(())
+            } else {
+                Err(NetworkReplayError::AncillaryObjectRemap(id))
+            };
+        }
+        if self.ancillary_by_open_file.contains_key(&open_file) {
+            return Err(NetworkReplayError::AncillaryOpenFileAlreadyRegistered(
+                open_file,
+            ));
+        }
+        self.ancillary_objects.insert(
+            id,
+            AncillaryObjectState {
+                open_file,
+                kind,
+                alias_count: 0,
+            },
+        );
+        self.ancillary_by_open_file.insert(open_file, id);
+        Ok(())
+    }
+
+    /// Resolve an active ancillary object for SCM_RIGHTS installation.
+    pub fn ancillary_object(
+        &self,
+        id: NetworkObjectId,
+    ) -> Result<NetworkAncillaryObject, NetworkReplayError> {
+        if self.retired_ancillary_objects.contains(&id) {
+            return Err(NetworkReplayError::AncillaryObjectRetired(id));
+        }
+        let state = self
+            .ancillary_objects
+            .get(&id)
+            .ok_or(NetworkReplayError::UnknownAncillaryObject(id))?;
+        Ok(NetworkAncillaryObject {
+            id,
+            open_file: state.open_file,
+            kind: state.kind,
+            alias_count: state.alias_count,
+        })
+    }
+
+    /// Reverse-resolve an active trace object from an OFD.
+    pub fn ancillary_object_for_open_file(
+        &self,
+        open_file: OpenFileId,
+    ) -> Result<NetworkAncillaryObject, NetworkReplayError> {
+        let id = self
+            .ancillary_by_open_file
+            .get(&open_file)
+            .copied()
+            .ok_or(NetworkReplayError::UnknownAncillaryOpenFile(open_file))?;
+        self.ancillary_object(id)
+    }
+
+    /// Account for one newly installed fd alias and return its stable OFD.
+    pub fn retain_ancillary_alias(
+        &mut self,
+        id: NetworkObjectId,
+    ) -> Result<OpenFileId, NetworkReplayError> {
+        if self.retired_ancillary_objects.contains(&id) {
+            return Err(NetworkReplayError::AncillaryObjectRetired(id));
+        }
+        let state = self
+            .ancillary_objects
+            .get_mut(&id)
+            .ok_or(NetworkReplayError::UnknownAncillaryObject(id))?;
+        state.alias_count = state
+            .alias_count
+            .checked_add(1)
+            .ok_or(NetworkReplayError::Overflow)?;
+        Ok(state.open_file)
+    }
+
+    /// Account for one closed fd alias without retiring the trace object.
+    pub fn release_ancillary_alias(
+        &mut self,
+        id: NetworkObjectId,
+    ) -> Result<u64, NetworkReplayError> {
+        let state = self.ancillary_objects.get_mut(&id).ok_or_else(|| {
+            if self.retired_ancillary_objects.contains(&id) {
+                NetworkReplayError::AncillaryObjectRetired(id)
+            } else {
+                NetworkReplayError::UnknownAncillaryObject(id)
+            }
+        })?;
+        state.alias_count = state
+            .alias_count
+            .checked_sub(1)
+            .ok_or(NetworkReplayError::AncillaryAliasUnderflow(id))?;
+        Ok(state.alias_count)
+    }
+
+    /// Permanently retire an object after all installed aliases have closed.
+    pub fn retire_ancillary_object(
+        &mut self,
+        id: NetworkObjectId,
+    ) -> Result<OpenFileId, NetworkReplayError> {
+        if self.retired_ancillary_objects.contains(&id) {
+            return Err(NetworkReplayError::AncillaryObjectRetired(id));
+        }
+        let state = self
+            .ancillary_objects
+            .get(&id)
+            .ok_or(NetworkReplayError::UnknownAncillaryObject(id))?;
+        if state.alias_count != 0 {
+            return Err(NetworkReplayError::AncillaryAliasesRemain {
+                id,
+                count: state.alias_count,
+            });
+        }
+        let state = self.ancillary_objects.remove(&id).unwrap();
+        self.ancillary_by_open_file.remove(&state.open_file);
+        self.retired_ancillary_objects.insert(id);
+        self.retired_ancillary_open_files.insert(state.open_file);
+        Ok(state.open_file)
+    }
+
+    /// Register a network OFD with an epoll OFD (`EPOLL_CTL_ADD`).
+    pub fn epoll_add(
+        &mut self,
+        epoll: OpenFileId,
+        target: OpenFileId,
+        events: u32,
+    ) -> Result<(), NetworkReplayError> {
+        self.validate_epoll_registration(epoll, target, events)?;
+        let generation = self.readiness_state(target)?.1;
+        let interests = self.epolls.entry(epoll).or_default();
+        if interests.contains_key(&target) {
+            return Err(NetworkReplayError::EpollInterestAlreadyExists { epoll, target });
+        }
+        interests.insert(target, EpollInterestState::new(events, generation, false));
+        Ok(())
+    }
+
+    /// Replace an interest and rearm `EPOLLONESHOT` (`EPOLL_CTL_MOD`).
+    pub fn epoll_modify(
+        &mut self,
+        epoll: OpenFileId,
+        target: OpenFileId,
+        events: u32,
+    ) -> Result<(), NetworkReplayError> {
+        self.validate_epoll_registration(epoll, target, events)?;
+        let generation = self.readiness_state(target)?.1;
+        let interest = self
+            .epolls
+            .get_mut(&epoll)
+            .and_then(|interests| interests.get_mut(&target))
+            .ok_or(NetworkReplayError::UnknownEpollInterest { epoll, target })?;
+        *interest = EpollInterestState::new(events, generation, true);
+        Ok(())
+    }
+
+    /// Delete an interest (`EPOLL_CTL_DEL`).
+    pub fn epoll_delete(
+        &mut self,
+        epoll: OpenFileId,
+        target: OpenFileId,
+    ) -> Result<(), NetworkReplayError> {
+        let interests = self
+            .epolls
+            .get_mut(&epoll)
+            .ok_or(NetworkReplayError::UnknownEpollInterest { epoll, target })?;
+        if interests.remove(&target).is_none() {
+            return Err(NetworkReplayError::UnknownEpollInterest { epoll, target });
+        }
+        if interests.is_empty() {
+            self.epolls.remove(&epoll);
+        }
+        Ok(())
+    }
+
+    /// Return current events in deterministic target-OFD order.
+    pub fn epoll_ready(
+        &mut self,
+        epoll: OpenFileId,
+    ) -> Result<Vec<NetworkEpollEvent>, NetworkReplayError> {
+        let targets: Vec<_> = self
+            .epolls
+            .get(&epoll)
+            .ok_or(NetworkReplayError::UnknownEpollInstance(epoll))?
+            .keys()
+            .copied()
+            .collect();
+        let snapshots: BTreeMap<_, _> = targets
+            .into_iter()
+            .map(|target| self.readiness_state(target).map(|state| (target, state)))
+            .collect::<Result<_, _>>()?;
+        let interests = self.epolls.get_mut(&epoll).unwrap();
+        let mut ready = Vec::new();
+        for (target, interest) in interests {
+            if !interest.enabled {
+                continue;
+            }
+            let (readiness, generation) = snapshots[target];
+            let current = epoll_events(readiness, interest.events);
+            let transitioned = !interest.edge_triggered
+                || readiness_transitioned(readiness, generation, interest.seen, interest.events);
+            if current != 0 && transitioned {
+                ready.push(NetworkEpollEvent {
+                    target: *target,
+                    events: current,
+                });
+                interest.seen = generation;
+                if interest.one_shot {
+                    interest.enabled = false;
+                }
+            }
+        }
+        Ok(ready)
     }
 
     /// Release every currently eligible external observation.
@@ -911,6 +1310,7 @@ impl NetworkReplayEngine {
                 }) if *stream_offset == state.inbound_consumed && received.is_empty() => {
                     let errno = *errno;
                     state.inbound.pop_front();
+                    state.refresh_readiness();
                     return Ok(StreamReceiveOutcome::Error(errno));
                 }
                 Some(InboundOutcome::PeerShutdown {
@@ -924,6 +1324,7 @@ impl NetworkReplayEngine {
                     state.inbound.pop_front();
                     if closes_write {
                         state.peer_write_closed = true;
+                        state.refresh_readiness();
                         return Ok(StreamReceiveOutcome::EndOfFile);
                     }
                 }
@@ -931,6 +1332,7 @@ impl NetworkReplayEngine {
                 None => break,
             }
         }
+        state.refresh_readiness();
         if !received.is_empty() {
             return Ok(StreamReceiveOutcome::Bytes(received));
         }
@@ -958,7 +1360,7 @@ impl NetworkReplayEngine {
         if state.transport.is_datagram() {
             return Err(NetworkReplayError::TransportMismatch(channel));
         }
-        match state.inbound.front_mut() {
+        let outcome = match state.inbound.front_mut() {
             Some(InboundOutcome::Stream {
                 bytes,
                 ancillary,
@@ -1010,7 +1412,9 @@ impl NetworkReplayEngine {
             None if state.peer_write_closed => Ok(StreamMessageReceiveOutcome::EndOfFile),
             None if nonblocking => Ok(StreamMessageReceiveOutcome::WouldBlock),
             None => Ok(StreamMessageReceiveOutcome::Pending),
-        }
+        };
+        state.refresh_readiness();
+        outcome
     }
 
     /// Consume one recorded datagram boundary.
@@ -1062,7 +1466,7 @@ impl NetworkReplayEngine {
         if !state.transport.is_datagram() {
             return Err(NetworkReplayError::TransportMismatch(channel));
         }
-        match state.inbound.front() {
+        let outcome = match state.inbound.front() {
             Some(InboundOutcome::Error { errno, .. }) => {
                 let errno = *errno;
                 state.inbound.pop_front();
@@ -1111,7 +1515,9 @@ impl NetworkReplayEngine {
             } else {
                 DatagramReceiveOutcome::Pending
             }),
-        }
+        };
+        state.refresh_readiness();
+        outcome
     }
 
     /// Validate stream bytes. Callers may split a recorded fragment, while a
@@ -1127,7 +1533,7 @@ impl NetworkReplayEngine {
         if state.transport.is_datagram() || state.local_write_closed {
             return Err(NetworkReplayError::TransportMismatch(channel));
         }
-        match state.outbound.front_mut() {
+        let outcome = match state.outbound.front_mut() {
             Some(OutboundOutcome::Error {
                 stream_offset,
                 errno,
@@ -1167,7 +1573,9 @@ impl NetworkReplayEngine {
             Some(_) => Err(NetworkReplayError::OperationOrderMismatch(channel)),
             None if bytes.is_empty() => Ok(StreamTransmitOutcome::Accepted(0)),
             None => Err(NetworkReplayError::TraceExhausted(channel)),
-        }
+        };
+        state.refresh_readiness();
+        outcome
     }
 
     /// Validate one stream `sendmsg(2)` fragment and its ancillary metadata.
@@ -1217,6 +1625,7 @@ impl NetworkReplayEngine {
         if accepted == expected.len() {
             state.outbound.pop_front();
         }
+        state.refresh_readiness();
         Ok(StreamTransmitOutcome::Accepted(accepted))
     }
 
@@ -1244,6 +1653,7 @@ impl NetworkReplayEngine {
             .transmitted
             .checked_add(datagram.bytes.len() as u64)
             .ok_or(NetworkReplayError::Overflow)?;
+        state.refresh_readiness();
         Ok(())
     }
 
@@ -1271,6 +1681,7 @@ impl NetworkReplayEngine {
             .transmitted
             .checked_add(datagram.datagram.bytes.len() as u64)
             .ok_or(NetworkReplayError::Overflow)?;
+        state.refresh_readiness();
         Ok(())
     }
 
@@ -1298,6 +1709,7 @@ impl NetworkReplayEngine {
         ) {
             state.local_write_closed = true;
         }
+        state.refresh_readiness();
         Ok(())
     }
 
@@ -1314,6 +1726,7 @@ impl NetworkReplayEngine {
         let Some(InboundOutcome::Control(outcome)) = state.inbound.pop_front() else {
             unreachable!()
         };
+        state.refresh_readiness();
         Ok(Some(outcome))
     }
 
@@ -1324,19 +1737,7 @@ impl NetworkReplayEngine {
     ) -> Result<NetworkReadinessV2, NetworkReplayError> {
         let channel = self.bound_channel(open_file)?;
         let state = self.replay_channel(channel)?;
-        let mut readiness = state.explicit_readiness;
-        readiness.readable |= !state.inbound.is_empty() || state.peer_write_closed;
-        readiness.writable |= !state.local_write_closed && !state.outbound.is_empty();
-        readiness.error |= matches!(state.inbound.front(), Some(InboundOutcome::Error { .. }));
-        readiness.hangup |= state.peer_write_closed
-            || matches!(
-                state.inbound.front(),
-                Some(InboundOutcome::PeerShutdown {
-                    direction: NetworkShutdownV2::Write | NetworkShutdownV2::Both,
-                    ..
-                })
-            );
-        Ok(readiness)
+        Ok(state.readiness)
     }
 
     /// Query readiness for a registration. Edge-triggered and one-shot epoll
@@ -1385,6 +1786,44 @@ impl NetworkReplayEngine {
             .ok_or(NetworkReplayError::UnboundOpenFile(open_file))
     }
 
+    fn readiness_state(
+        &self,
+        open_file: OpenFileId,
+    ) -> Result<(NetworkReadinessV2, ReadinessGeneration), NetworkReplayError> {
+        let channel = self.bound_channel(open_file)?;
+        let state = self.replay_channel(channel)?;
+        Ok((state.readiness, state.readiness_generation))
+    }
+
+    fn validate_epoll_registration(
+        &self,
+        epoll: OpenFileId,
+        target: OpenFileId,
+        events: u32,
+    ) -> Result<(), NetworkReplayError> {
+        if epoll == target {
+            return Err(NetworkReplayError::EpollSelfRegistration(epoll));
+        }
+        let exclusive = libc::EPOLLEXCLUSIVE as u32;
+        if events & exclusive != 0 {
+            return Err(NetworkReplayError::UnsupportedEpollFlags(exclusive));
+        }
+        let supported = (libc::EPOLLIN
+            | libc::EPOLLOUT
+            | libc::EPOLLERR
+            | libc::EPOLLHUP
+            | libc::EPOLLRDHUP
+            | libc::EPOLLET
+            | libc::EPOLLONESHOT) as u32;
+        if events & !supported != 0 {
+            return Err(NetworkReplayError::UnsupportedEpollFlags(
+                events & !supported,
+            ));
+        }
+        self.readiness_state(target)?;
+        Ok(())
+    }
+
     fn replay_channel(
         &self,
         channel: NetworkChannelId,
@@ -1420,7 +1859,42 @@ impl ChannelState {
             outbound: VecDeque::new(),
             local_write_closed: false,
             peer_write_closed: false,
+            readiness: NetworkReadinessV2::default(),
+            readiness_generation: ReadinessGeneration::default(),
         }
+    }
+
+    fn computed_readiness(&self) -> NetworkReadinessV2 {
+        let mut readiness = self.explicit_readiness;
+        readiness.readable |= !self.inbound.is_empty() || self.peer_write_closed;
+        readiness.writable |= !self.local_write_closed && !self.outbound.is_empty();
+        readiness.error |= matches!(self.inbound.front(), Some(InboundOutcome::Error { .. }));
+        readiness.hangup |= self.peer_write_closed
+            || matches!(
+                self.inbound.front(),
+                Some(InboundOutcome::PeerShutdown {
+                    direction: NetworkShutdownV2::Write | NetworkShutdownV2::Both,
+                    ..
+                })
+            );
+        readiness
+    }
+
+    fn refresh_readiness(&mut self) {
+        let next = self.computed_readiness();
+        if !self.readiness.readable && next.readable {
+            self.readiness_generation.readable += 1;
+        }
+        if !self.readiness.writable && next.writable {
+            self.readiness_generation.writable += 1;
+        }
+        if !self.readiness.error && next.error {
+            self.readiness_generation.error += 1;
+        }
+        if !self.readiness.hangup && next.hangup {
+            self.readiness_generation.hangup += 1;
+        }
+        self.readiness = next;
     }
 
     fn append_expected_output(&mut self, output: &NetworkOutputKindV2) {
@@ -1532,6 +2006,7 @@ impl ChannelState {
             }),
             NetworkInputKindV2::Readiness(readiness) => self.explicit_readiness = readiness,
         }
+        self.refresh_readiness();
         Ok(())
     }
 }
@@ -1547,6 +2022,13 @@ pub enum NetworkReplayError {
     Codec(NetworkTraceCodecError),
     /// Host-side trace handle or atomic publication failed.
     Io(io::Error),
+    /// Resolved run epoch disagrees with the authoritative trace epoch.
+    EpochMismatch {
+        /// Epoch resolved before container entry.
+        expected: DateTime<Utc>,
+        /// Epoch persisted in the trace.
+        actual: DateTime<Utc>,
+    },
     /// OFD is not a socket identity.
     NonSocketOpenFile(OpenFileId),
     /// Trace channel is unknown.
@@ -1567,8 +2049,49 @@ pub enum NetworkReplayError {
     OperationOrderMismatch(NetworkChannelId),
     /// Ancillary objects require the normalized sendmsg/recvmsg path.
     AncillaryRequiresMessageIo(NetworkChannelId),
+    /// Trace object identity was never registered.
+    UnknownAncillaryObject(NetworkObjectId),
+    /// OFD has no trace object identity.
+    UnknownAncillaryOpenFile(OpenFileId),
+    /// Retired trace object identity cannot be reused.
+    AncillaryObjectRetired(NetworkObjectId),
+    /// Existing trace object cannot be remapped to another OFD or kind.
+    AncillaryObjectRemap(NetworkObjectId),
+    /// One OFD cannot have two trace object identities.
+    AncillaryOpenFileAlreadyRegistered(OpenFileId),
+    /// A retired OFD identity cannot be assigned to a new trace object.
+    AncillaryOpenFileRetired(OpenFileId),
+    /// An alias release had no matching retain.
+    AncillaryAliasUnderflow(NetworkObjectId),
+    /// Object retirement requires every installed alias to be closed.
+    AncillaryAliasesRemain {
+        /// Trace object identity.
+        id: NetworkObjectId,
+        /// Installed alias count.
+        count: u64,
+    },
     /// Edge-triggered or one-shot readiness requires adapter-owned interest state.
     UnsupportedReadinessMode,
+    /// Epoll flags are not modeled and therefore cannot be replayed safely.
+    UnsupportedEpollFlags(u32),
+    /// An epoll OFD cannot watch itself.
+    EpollSelfRegistration(OpenFileId),
+    /// `EPOLL_CTL_ADD` found an existing target registration.
+    EpollInterestAlreadyExists {
+        /// Epoll open-file description.
+        epoll: OpenFileId,
+        /// Watched open-file description.
+        target: OpenFileId,
+    },
+    /// `EPOLL_CTL_MOD`/`DEL` found no target registration.
+    UnknownEpollInterest {
+        /// Epoll open-file description.
+        epoll: OpenFileId,
+        /// Watched open-file description.
+        target: OpenFileId,
+    },
+    /// Epoll OFD has no registered interest set.
+    UnknownEpollInstance(OpenFileId),
     /// Receive flags outside the normalized modeled subset.
     UnsupportedReceiveFlags(i32),
     /// Guest output bytes or datagram metadata differ.
@@ -1805,22 +2328,21 @@ mod tests {
     }
 
     #[test]
-    fn record_epoch_is_explicit_or_captured_once_within_call_range() {
+    fn record_epoch_is_explicit_and_replay_requires_exact_match() {
         let explicit = epoch();
         assert_eq!(
-            NetworkReplayEngine::record_with_optional_epoch(Some(explicit))
-                .into_recorded_trace()
-                .unwrap()
-                .epoch,
+            NetworkReplayEngine::record(explicit).trace_epoch(),
             explicit
         );
-        let before = Utc::now();
-        let captured = NetworkReplayEngine::record_with_optional_epoch(None)
-            .into_recorded_trace()
-            .unwrap()
-            .epoch;
-        let after = Utc::now();
-        assert!(captured >= before && captured <= after);
+        let wrong = explicit + chrono::Duration::nanoseconds(1);
+        assert!(matches!(
+            NetworkReplayEngine::replay_versioned_with_expected_epoch(
+                NetworkTrace::V2(trace()),
+                wrong,
+            ),
+            Err(NetworkReplayError::EpochMismatch { expected, actual })
+                if expected == wrong && actual == explicit
+        ));
     }
 
     #[test]
@@ -2154,6 +2676,205 @@ mod tests {
             StreamReceiveOutcome::Bytes(b"v1".to_vec())
         );
         engine.finish().unwrap();
+    }
+
+    #[test]
+    fn ancillary_registry_preserves_alias_identity_and_tombstones_retirement() {
+        let mut engine = NetworkReplayEngine::replay(trace()).unwrap();
+        let object = NetworkObjectId(41);
+        let underlying = OpenFileId::new(DetTid::from_raw(7), 3);
+        engine
+            .register_ancillary_object(
+                object,
+                underlying,
+                NetworkAncillaryObjectKind::FileDescriptor,
+            )
+            .unwrap();
+        // Dup and fork install distinct descriptor aliases for the same OFD.
+        assert_eq!(engine.retain_ancillary_alias(object).unwrap(), underlying);
+        assert_eq!(engine.retain_ancillary_alias(object).unwrap(), underlying);
+        assert_eq!(engine.ancillary_object(object).unwrap().alias_count, 2);
+        assert_eq!(
+            engine
+                .ancillary_object_for_open_file(underlying)
+                .unwrap()
+                .id,
+            object
+        );
+        assert!(matches!(
+            engine.retire_ancillary_object(object),
+            Err(NetworkReplayError::AncillaryAliasesRemain { count: 2, .. })
+        ));
+        assert_eq!(engine.release_ancillary_alias(object).unwrap(), 1);
+        assert_eq!(engine.release_ancillary_alias(object).unwrap(), 0);
+        assert_eq!(engine.retire_ancillary_object(object).unwrap(), underlying);
+        assert!(matches!(
+            engine.ancillary_object(object),
+            Err(NetworkReplayError::AncillaryObjectRetired(id)) if id == object
+        ));
+        assert!(matches!(
+            engine.register_ancillary_object(
+                object,
+                OpenFileId::new(DetTid::from_raw(7), 4),
+                NetworkAncillaryObjectKind::FileDescriptor,
+            ),
+            Err(NetworkReplayError::AncillaryObjectRetired(id)) if id == object
+        ));
+        assert!(matches!(
+            engine.register_ancillary_object(
+                NetworkObjectId(42),
+                underlying,
+                NetworkAncillaryObjectKind::FileDescriptor,
+            ),
+            Err(NetworkReplayError::AncillaryOpenFileRetired(ofd)) if ofd == underlying
+        ));
+        engine
+            .register_ancillary_object(
+                NetworkObjectId(42),
+                OpenFileId::new(DetTid::from_raw(7), 4),
+                NetworkAncillaryObjectKind::FileDescriptor,
+            )
+            .unwrap();
+    }
+
+    fn readiness_trace(events: Vec<NetworkReadinessV2>) -> NetworkTraceV2 {
+        NetworkTraceV2 {
+            epoch: epoch(),
+            channels: vec![channel()],
+            outputs: vec![],
+            inputs: events
+                .into_iter()
+                .enumerate()
+                .map(|(index, readiness)| NetworkInputEventV2 {
+                    ordinal: index as u64,
+                    channel: channel_id(),
+                    release: NetworkReleaseV2 {
+                        not_before_global_time: time(index as u64 + 1),
+                        after_transmitted_offset: 0,
+                    },
+                    event: NetworkInputKindV2::Readiness(readiness),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn epoll_edge_does_not_repeat_until_a_new_transition() {
+        let readable = NetworkReadinessV2 {
+            readable: true,
+            ..NetworkReadinessV2::default()
+        };
+        let mut engine = NetworkReplayEngine::replay(readiness_trace(vec![
+            readable,
+            NetworkReadinessV2::default(),
+            readable,
+        ]))
+        .unwrap();
+        let target = open_file(0);
+        let epoll = OpenFileId::new(DetTid::from_raw(1), 90);
+        engine.bind(target, channel_id()).unwrap();
+        engine
+            .epoll_add(epoll, target, (libc::EPOLLIN | libc::EPOLLET) as u32)
+            .unwrap();
+        engine.release_eligible(time(1)).unwrap();
+        assert_eq!(engine.epoll_ready(epoll).unwrap().len(), 1);
+        assert!(engine.epoll_ready(epoll).unwrap().is_empty());
+        engine.release_eligible(time(2)).unwrap();
+        assert!(engine.epoll_ready(epoll).unwrap().is_empty());
+        engine.release_eligible(time(3)).unwrap();
+        assert_eq!(engine.epoll_ready(epoll).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn epoll_oneshot_mod_rearms_and_err_hup_are_unconditional() {
+        let readiness = NetworkReadinessV2 {
+            readable: true,
+            error: true,
+            hangup: true,
+            ..NetworkReadinessV2::default()
+        };
+        let mut engine = NetworkReplayEngine::replay(readiness_trace(vec![readiness])).unwrap();
+        let target = open_file(0);
+        let epoll = OpenFileId::new(DetTid::from_raw(1), 91);
+        engine.bind(target, channel_id()).unwrap();
+        let events = libc::EPOLLONESHOT as u32;
+        engine.epoll_add(epoll, target, events).unwrap();
+        engine.release_eligible(time(1)).unwrap();
+        let first = engine.epoll_ready(epoll).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_ne!(first[0].events & libc::EPOLLERR as u32, 0);
+        assert_ne!(first[0].events & libc::EPOLLHUP as u32, 0);
+        assert!(engine.epoll_ready(epoll).unwrap().is_empty());
+        engine.epoll_modify(epoll, target, events).unwrap();
+        assert_eq!(engine.epoll_ready(epoll).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn epoll_orders_by_ofd_retires_interests_and_refuses_exclusive() {
+        let second_channel = NetworkChannelId(2);
+        let mut second = channel();
+        second.id = second_channel;
+        let ready = NetworkReadinessV2 {
+            readable: true,
+            ..NetworkReadinessV2::default()
+        };
+        let mut two = NetworkTraceV2 {
+            epoch: epoch(),
+            channels: vec![channel(), second],
+            outputs: vec![],
+            inputs: vec![],
+        };
+        for (ordinal, channel) in [second_channel, channel_id()].into_iter().enumerate() {
+            two.inputs.push(NetworkInputEventV2 {
+                ordinal: ordinal as u64,
+                channel,
+                release: NetworkReleaseV2 {
+                    not_before_global_time: time(1),
+                    after_transmitted_offset: 0,
+                },
+                event: NetworkInputKindV2::Readiness(ready),
+            });
+        }
+        let mut engine = NetworkReplayEngine::replay(two).unwrap();
+        let first = open_file(1);
+        let second = open_file(2);
+        let epoll = OpenFileId::new(DetTid::from_raw(1), 92);
+        engine.bind(first, channel_id()).unwrap();
+        engine.bind(second, second_channel).unwrap();
+        engine
+            .epoll_add(epoll, second, libc::EPOLLIN as u32)
+            .unwrap();
+        engine
+            .epoll_add(epoll, first, libc::EPOLLIN as u32)
+            .unwrap();
+        assert!(matches!(
+            engine.epoll_add(
+                OpenFileId::new(DetTid::from_raw(1), 93),
+                first,
+                libc::EPOLLEXCLUSIVE as u32,
+            ),
+            Err(NetworkReplayError::UnsupportedEpollFlags(flags))
+                if flags == libc::EPOLLEXCLUSIVE as u32
+        ));
+        engine.release_eligible(time(1)).unwrap();
+        let ready = engine.epoll_ready(epoll).unwrap();
+        assert_eq!(
+            ready.iter().map(|event| event.target).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(engine.retire_open_file(first), Some(channel_id()));
+        assert_eq!(
+            engine.epoll_ready(epoll).unwrap(),
+            vec![NetworkEpollEvent {
+                target: second,
+                events: libc::EPOLLIN as u32,
+            }]
+        );
+        engine.retire_open_file(epoll);
+        assert!(matches!(
+            engine.epoll_ready(epoll),
+            Err(NetworkReplayError::UnknownEpollInstance(id)) if id == epoll
+        ));
     }
 
     #[test]
