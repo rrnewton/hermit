@@ -63,7 +63,7 @@ fn run() -> Result<i32, String> {
                 return Ok(0);
             }
             if remaining == ["--probe"] {
-                println!("nextest-launch-observation-v1");
+                println!("nextest-launch-observation-v2");
                 return Ok(0);
             }
             let (domain, output) = match remaining.as_slice() {
@@ -196,7 +196,7 @@ mod tests {
         assert!(observed.1.is_some());
         for value in [
             json!({}),
-            json!({"schema":2,"invocation":"/fixture/unique","observation":{"state":"unavailable","reason":"unsupported"}}),
+            json!({"schema":3,"invocation":"/fixture/unique","observation":{"state":"unavailable","reason":"unsupported"}}),
             json!({"schema":1,"invocation":"/fixture/unique","observation":{"state":"unavailable","reason":""}}),
             json!({"schema":1,"invocation":"/fixture/unique","observation":{"state":"unavailable","reason":"missing","fabricated":true}}),
         ] {
@@ -213,12 +213,20 @@ mod tests {
     fn pinned_evidence_copy_cannot_claim_hidden_host_ancestors() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("forged.json");
-        let proof = json!({"schema":1,"invocation":"/fixture/unique","observation":{
+        let proof = json!({"schema":2,"invocation":"/fixture/unique","observation":{
             "state":"complete","domain":{"kind":"pinned-root","image":format!("fixture@sha256:{}","a".repeat(64)),"image_id":"b".repeat(64)},
-            "host":{"membership":"/actual-leaf","namespace":"cgroup:[123]","affinity":[0],"ancestors":[{"anchor":{"device":27,"inode":123},"controls":{"cpu":{"quota_usec":100000,"period_usec":100000},"cpuset":[0],"memory":{"max":1024},"swap":{"max":0}}},{"anchor":{"device":27,"inode":1},"controls":{"cpu":null,"cpuset":[0],"memory":"unlimited","swap":"unlimited"}}]}
+            "host":{"membership":"/actual-leaf","namespace":"cgroup:[123]","affinity":[0],"ancestors":[{"anchor":{"device":27,"inode":123},"controls":{"cpu":{"quota_usec":100000,"period_usec":100000},"cpuset":{"state":"observed","cpus":[0]},"cpuset_enabled_for_children":true,"memory":{"max":1024},"swap":{"max":0}}},{"anchor":{"device":27,"inode":1},"controls":{"cpu":null,"cpuset":{"state":"observed","cpus":[0]},"cpuset_enabled_for_children":true,"memory":"unlimited","swap":"unlimited"}}]}
         }});
         fs::write(&path, serde_json::to_vec(&proof).unwrap()).unwrap();
         assert!(verify(&path).unwrap_err().contains("fixed read-only mount"));
+        let mut old_complete = proof.clone();
+        old_complete["schema"] = json!(1);
+        fs::write(&path, serde_json::to_vec(&old_complete).unwrap()).unwrap();
+        assert!(
+            verify(&path)
+                .unwrap_err()
+                .contains("current controller-enable evidence")
+        );
         for duplicate in [false, true] {
             let mut malformed = proof.clone();
             let layers = malformed["observation"]["host"]["ancestors"]

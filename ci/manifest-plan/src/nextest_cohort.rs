@@ -36,11 +36,19 @@ struct Anchor {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+enum CpusetInterface {
+    Observed { cpus: Vec<u32> },
+    Absent,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Controls {
     #[serde(deserialize_with = "required_quota")]
     cpu: Option<CpuQuota>,
-    cpuset: Vec<u32>,
+    cpuset: CpusetInterface,
+    cpuset_enabled_for_children: bool,
     memory: ResourceLimit,
     swap: ResourceLimit,
 }
@@ -212,13 +220,38 @@ fn controls(directory: &File, global_root: bool) -> Result<Controls, String> {
     };
     Ok(Controls {
         cpu,
-        cpuset: cpu_set(
-            &control(directory, "cpuset.cpus.effective", false)?
-                .ok_or("missing effective cpuset")?,
+        cpuset: match child(directory, "cpuset.cpus.effective", libc::O_RDONLY) {
+            Ok(file) => CpusetInterface::Observed {
+                cpus: cpu_set(
+                    String::from_utf8(bounded(file, 16_384)?)
+                        .map_err(|e| e.to_string())?
+                        .trim(),
+                )?,
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => CpusetInterface::Absent,
+            Err(error) => return Err(format!("cannot observe cgroup cpuset: {error}")),
+        },
+        cpuset_enabled_for_children: cpuset_enabled(
+            &control(directory, "cgroup.subtree_control", false)?
+                .ok_or("missing cgroup controller-enable state")?,
         )?,
         memory: limit(control(directory, "memory.max", global_root)?)?,
         swap: limit(control(directory, "memory.swap.max", global_root)?)?,
     })
+}
+
+fn cpuset_enabled(raw: &str) -> Result<bool, String> {
+    let mut controllers = BTreeSet::new();
+    for name in raw.split_whitespace() {
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            || !controllers.insert(name)
+        {
+            return Err("malformed cgroup controller-enable state".into());
+        }
+    }
+    Ok(controllers.contains("cpuset"))
 }
 
 fn bounded_text(path: &str, limit: u64) -> Result<String, String> {
@@ -351,17 +384,53 @@ fn cohort(domain: &ExecutionDomain, host: &HostObservation) -> Result<ExecutionC
     let mut cpu = BTreeSet::new();
     let mut memory = ResourceLimit::Unlimited;
     let mut swap = ResourceLimit::Unlimited;
-    for layer in &host.ancestors {
-        if layer.anchor.device == 0
-            || layer.anchor.inode == 0
-            || layer.controls.cpuset.is_empty()
-            || layer
-                .controls
-                .cpuset
-                .windows(2)
-                .any(|pair| pair[0] >= pair[1])
-        {
+    let mut effective_cpuset = None;
+    // Traverse the authenticated hierarchy from its global root to the leaf.
+    // A child lacks cpuset interfaces when its parent has not enabled that
+    // controller. Retain that absence in the proof; it is not an empty or
+    // unrestricted effective set, and task affinity is a separate observation.
+    for (index, layer) in host.ancestors.iter().enumerate().rev() {
+        if layer.anchor.device == 0 || layer.anchor.inode == 0 {
             return Err("malformed ancestor in complete launch observation".into());
+        }
+        match &layer.controls.cpuset {
+            CpusetInterface::Observed { cpus } => {
+                if host
+                    .ancestors
+                    .get(index + 1)
+                    .is_some_and(|parent| !parent.controls.cpuset_enabled_for_children)
+                {
+                    return Err("cpuset interface exists beneath a disabled controller".into());
+                }
+                if cpus.is_empty()
+                    || cpus.len() > 65_536
+                    || cpus.last().is_some_and(|cpu| *cpu > 1_048_576)
+                    || cpus.windows(2).any(|pair| pair[0] >= pair[1])
+                    || effective_cpuset.as_ref().is_some_and(|parent: &Vec<u32>| {
+                        cpus.iter().any(|cpu| parent.binary_search(cpu).is_err())
+                    })
+                {
+                    return Err("malformed ancestor effective cpuset".into());
+                }
+                effective_cpuset = Some(cpus.clone());
+            }
+            CpusetInterface::Absent => {
+                if layer.controls.cpuset_enabled_for_children {
+                    return Err(
+                        "absent local cpuset cannot enable the controller for children".into(),
+                    );
+                }
+                let parent = host
+                    .ancestors
+                    .get(index + 1)
+                    .ok_or("absent cpuset has no authenticated ancestor authority")?;
+                if parent.controls.cpuset_enabled_for_children {
+                    return Err("missing cpuset interface beneath an enabled controller".into());
+                }
+                if effective_cpuset.is_none() {
+                    return Err("absent cpuset has no observed ancestor effective set".into());
+                }
+            }
         }
         if let Some(limit) = &layer.controls.cpu {
             cpu.insert(limit.clone());
@@ -375,12 +444,20 @@ fn cohort(domain: &ExecutionDomain, host: &HostObservation) -> Result<ExecutionC
         resources: ResourceEnvelope {
             cpu_limits: cpu.into_iter().collect(),
             affinity: host.affinity.clone(),
-            cpuset: host.ancestors[0].controls.cpuset.clone(),
+            cpuset: effective_cpuset.ok_or("no observed effective cpuset")?,
             memory_bytes: memory,
             swap_bytes: swap,
         },
     };
     value.validate()?;
+    if value
+        .resources
+        .affinity
+        .iter()
+        .any(|cpu| value.resources.cpuset.binary_search(cpu).is_err())
+    {
+        return Err("task affinity lies outside the observed effective cpuset".into());
+    }
     Ok(value)
 }
 
@@ -391,24 +468,9 @@ pub fn capture(domain: ExecutionDomain, output: &Path) -> Result<(), String> {
     if !output.is_absolute() {
         return Err("launch proof requires a fresh absolute output path".into());
     }
-    let observation = match observe_host() {
-        Ok(first) => match observe_host() {
-            Ok(second) if first == second => {
-                cohort(&domain, &first)?;
-                Observation::Complete {
-                    domain,
-                    host: first,
-                }
-            }
-            Ok(_) => Observation::Unavailable {
-                reason: "cgroup membership or limits changed during launch capture".into(),
-            },
-            Err(reason) => Observation::Unavailable { reason },
-        },
-        Err(reason) => Observation::Unavailable { reason },
-    };
+    let observation = capture_observation(domain, observe_host)?;
     let bytes = serde_json::to_vec(&LaunchObservation {
-        schema: 1,
+        schema: 2,
         invocation: output.to_string_lossy().into_owned(),
         observation,
     })
@@ -427,6 +489,28 @@ pub fn capture(domain: ExecutionDomain, output: &Path) -> Result<(), String> {
         })?;
     file.write_all(&bytes).map_err(|e| e.to_string())?;
     file.sync_all().map_err(|e| e.to_string())
+}
+
+fn capture_observation(
+    domain: ExecutionDomain,
+    mut observe: impl FnMut() -> Result<HostObservation, String>,
+) -> Result<Observation, String> {
+    Ok(match observe() {
+        Ok(first) => match observe() {
+            Ok(second) if first == second => {
+                cohort(&domain, &first)?;
+                Observation::Complete {
+                    domain,
+                    host: first,
+                }
+            }
+            Ok(_) => Observation::Unavailable {
+                reason: "cgroup membership or limits changed during launch capture".into(),
+            },
+            Err(reason) => Observation::Unavailable { reason },
+        },
+        Err(reason) => Observation::Unavailable { reason },
+    })
 }
 
 fn container_image() -> Result<(String, String), String> {
@@ -483,7 +567,7 @@ pub fn verify(path: &Path) -> Result<(Option<ExecutionCohort>, Option<LaunchProo
     }
     let proof: LaunchObservation =
         serde_json::from_slice(&bytes).map_err(|e| format!("malformed launch proof: {e}"))?;
-    if proof.schema != 1 || !Path::new(&proof.invocation).is_absolute() {
+    if !matches!(proof.schema, 1 | 2) || !Path::new(&proof.invocation).is_absolute() {
         return Err("unsupported or malformed launch proof identity".into());
     }
     let value = match proof.observation {
@@ -494,6 +578,11 @@ pub fn verify(path: &Path) -> Result<(Option<ExecutionCohort>, Option<LaunchProo
             None
         }
         Observation::Complete { domain, host } => {
+            if proof.schema != 2 {
+                return Err(
+                    "complete launch proof requires current controller-enable evidence".into(),
+                );
+            }
             let value = cohort(&domain, &host)?;
             match &domain {
                 ExecutionDomain::Host => {
@@ -551,4 +640,224 @@ pub fn verify(path: &Path) -> Result<(Option<ExecutionCohort>, Option<LaunchProo
             sha256: format!("{:x}", Sha256::digest(&bytes)),
         }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inherited_host() -> HostObservation {
+        let layer = |inode, cpuset, enabled| Layer {
+            anchor: Anchor { device: 27, inode },
+            controls: Controls {
+                cpu: None,
+                cpuset,
+                cpuset_enabled_for_children: enabled,
+                memory: ResourceLimit::Unlimited,
+                swap: ResourceLimit::Unlimited,
+            },
+        };
+        HostObservation {
+            membership: "/slice/leaf".into(),
+            namespace: "cgroup:[123]".into(),
+            affinity: vec![1, 2],
+            ancestors: vec![
+                layer(30, CpusetInterface::Absent, false),
+                layer(
+                    20,
+                    CpusetInterface::Observed {
+                        cpus: vec![0, 1, 2],
+                    },
+                    false,
+                ),
+                layer(
+                    1,
+                    CpusetInterface::Observed {
+                        cpus: vec![0, 1, 2, 3],
+                    },
+                    true,
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn disabled_cpuset_inherits_the_nearest_authenticated_effective_set() {
+        let mut host = inherited_host();
+        let inherited = cohort(&ExecutionDomain::Host, &host).unwrap();
+        assert_eq!(inherited.resources.cpuset, vec![0, 1, 2]);
+        assert_eq!(inherited.resources.affinity, vec![1, 2]);
+        assert_eq!(host.ancestors[0].controls.cpuset, CpusetInterface::Absent);
+        host.ancestors[0].controls.cpuset = CpusetInterface::Observed {
+            cpus: vec![0, 1, 2],
+        };
+        host.ancestors[1].controls.cpuset_enabled_for_children = true;
+        assert_eq!(cohort(&ExecutionDomain::Host, &host).unwrap(), inherited);
+
+        host.ancestors[0].controls.cpuset = CpusetInterface::Absent;
+        host.ancestors[1].controls.cpuset = CpusetInterface::Absent;
+        host.ancestors[1].controls.cpuset_enabled_for_children = false;
+        host.ancestors[2].controls.cpuset_enabled_for_children = false;
+        assert_eq!(
+            cohort(&ExecutionDomain::Host, &host)
+                .unwrap()
+                .resources
+                .cpuset,
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn inherited_cpuset_refuses_missing_or_contradictory_authority() {
+        let mut host = inherited_host();
+        host.ancestors[0].controls.cpuset = CpusetInterface::Observed {
+            cpus: vec![0, 1, 2],
+        };
+        assert_eq!(
+            cohort(&ExecutionDomain::Host, &host).unwrap_err(),
+            "cpuset interface exists beneath a disabled controller"
+        );
+        host = inherited_host();
+        host.ancestors[1].controls.cpuset_enabled_for_children = true;
+        assert_eq!(
+            cohort(&ExecutionDomain::Host, &host).unwrap_err(),
+            "missing cpuset interface beneath an enabled controller"
+        );
+        host = inherited_host();
+        host.ancestors[0].controls.cpuset_enabled_for_children = true;
+        assert_eq!(
+            cohort(&ExecutionDomain::Host, &host).unwrap_err(),
+            "absent local cpuset cannot enable the controller for children"
+        );
+        host = inherited_host();
+        host.ancestors[2].controls.cpuset = CpusetInterface::Absent;
+        host.ancestors[2].controls.cpuset_enabled_for_children = false;
+        assert_eq!(
+            cohort(&ExecutionDomain::Host, &host).unwrap_err(),
+            "absent cpuset has no authenticated ancestor authority"
+        );
+        for cpus in [vec![], vec![1, 1], vec![2, 1], vec![0, 4], vec![1_048_577]] {
+            host = inherited_host();
+            host.ancestors[1].controls.cpuset = CpusetInterface::Observed { cpus };
+            assert_eq!(
+                cohort(&ExecutionDomain::Host, &host).unwrap_err(),
+                "malformed ancestor effective cpuset"
+            );
+        }
+        host = inherited_host();
+        host.affinity.push(3);
+        assert_eq!(
+            cohort(&ExecutionDomain::Host, &host).unwrap_err(),
+            "task affinity lies outside the observed effective cpuset"
+        );
+        let mut raw = serde_json::to_value(inherited_host()).unwrap();
+        raw["ancestors"][1]["controls"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cpuset_enabled_for_children");
+        assert!(serde_json::from_value::<HostObservation>(raw).is_err());
+    }
+
+    #[test]
+    fn local_cpuset_observation_preserves_absence_and_refuses_read_errors() {
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "hermit-cpuset-controls-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        let temp = Scratch(path);
+        let root = &temp.0;
+        for (name, value) in [
+            ("cpu.max", "max 100000"),
+            ("memory.max", "max"),
+            ("memory.swap.max", "0"),
+            ("cgroup.subtree_control", "cpu memory pids"),
+        ] {
+            fs::write(root.join(name), value).unwrap();
+        }
+        let file = File::open(root).unwrap();
+        let absent = controls(&file, false).unwrap();
+        assert_eq!(absent.cpuset, CpusetInterface::Absent);
+        assert!(!absent.cpuset_enabled_for_children);
+        let path = root.join("cpuset.cpus.effective");
+        fs::write(&path, "0-3\n").unwrap();
+        let present = controls(&file, false).unwrap();
+        assert_eq!(
+            present.cpuset,
+            CpusetInterface::Observed {
+                cpus: vec![0, 1, 2, 3]
+            }
+        );
+        assert_ne!(present, absent);
+        for value in ["", "0,0", "3-1", "max"] {
+            fs::write(&path, value).unwrap();
+            assert!(controls(&file, false).is_err(), "accepted {value:?}");
+        }
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("cpu.max", &path).unwrap();
+        assert!(
+            controls(&file, false)
+                .unwrap_err()
+                .contains("cannot observe cgroup cpuset")
+        );
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(controls(&file, false).is_err());
+        fs::remove_dir(&path).unwrap();
+        fs::remove_file(root.join("cgroup.subtree_control")).unwrap();
+        assert!(controls(&file, false).is_err());
+        for raw in ["cpuset cpuset", "+cpuset", "cpuset/cpu"] {
+            assert!(cpuset_enabled(raw).is_err());
+        }
+        assert!(cpuset_enabled("cpu cpuset memory pids\n").unwrap());
+        assert!(!cpuset_enabled("").unwrap());
+    }
+
+    #[test]
+    fn changed_cpuset_capture_never_becomes_complete() {
+        let first = inherited_host();
+        assert!(matches!(
+            capture_observation(ExecutionDomain::Host, || Ok(first.clone())).unwrap(),
+            Observation::Complete { .. }
+        ));
+        let mut changes = Vec::new();
+        let mut second = first.clone();
+        second.ancestors[0].controls.cpuset = CpusetInterface::Observed {
+            cpus: vec![0, 1, 2],
+        };
+        changes.push(second);
+        second = first.clone();
+        second.ancestors[1].controls.cpuset_enabled_for_children = true;
+        changes.push(second);
+        second = first.clone();
+        second.ancestors[1].controls.cpuset = CpusetInterface::Observed { cpus: vec![1, 2] };
+        changes.push(second);
+        for second in changes {
+            let mut observations = [Ok(first.clone()), Ok(second)].into_iter();
+            assert_eq!(
+                capture_observation(ExecutionDomain::Host, || observations.next().unwrap())
+                    .unwrap(),
+                Observation::Unavailable {
+                    reason: "cgroup membership or limits changed during launch capture".into()
+                }
+            );
+        }
+        let mut observations = [Ok(first), Err("unreadable ancestor".into())].into_iter();
+        assert_eq!(
+            capture_observation(ExecutionDomain::Host, || observations.next().unwrap()).unwrap(),
+            Observation::Unavailable {
+                reason: "unreadable ancestor".into()
+            }
+        );
+    }
 }
