@@ -10,9 +10,11 @@
 //!
 //! Local exact-head validation is the landing authority. The portable workflow
 //! is supplemental evidence and may run automatically only after a commit is
-//! pushed to `integration`; every workflow may remain manually dispatchable.
-//! This checker deliberately accepts only the small YAML shape used here. An
-//! unfamiliar or ambiguous trigger block is an error, never a silent pass.
+//! pushed to `integration`. Two owner-approved maintenance workflows also run
+//! at their exact reviewed schedules; every workflow may remain manually
+//! dispatchable. This checker deliberately accepts only the small YAML shape
+//! used here. An unfamiliar or ambiguous trigger block is an error, never a
+//! silent pass.
 
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
@@ -29,6 +31,7 @@ const PORTABLE: &str = "ci-portable.yml";
 struct Triggers {
     events: BTreeSet<String>,
     push_branches: Option<Vec<String>>,
+    schedule_crons: Option<Vec<String>>,
 }
 
 fn indentation(line: &str) -> Result<usize, String> {
@@ -70,6 +73,15 @@ fn inline_list(value: &str) -> Option<Vec<String>> {
         return None;
     }
     Some(entries)
+}
+
+fn quoted_scalar(value: &str) -> Option<String> {
+    let value = value.trim();
+    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+    if inner.is_empty() || inner.contains('"') {
+        return None;
+    }
+    Some(inner.to_string())
 }
 
 fn parse_triggers(source: &str) -> Result<Triggers, String> {
@@ -117,6 +129,9 @@ fn parse_triggers(source: &str) -> Result<Triggers, String> {
     let mut push_indent = None;
     let mut push_child_indent = None;
     let mut push_branches = None;
+    let mut schedule_indent = None;
+    let mut schedule_child_indent = None;
+    let mut schedule_crons = None;
     for raw in &lines[on_index + 1..] {
         let line = code(raw);
         if line.trim().is_empty() {
@@ -142,6 +157,11 @@ fn parse_triggers(source: &str) -> Result<Triggers, String> {
             }
             push_indent = (event == "push").then_some(indent);
             push_child_indent = None;
+            schedule_indent = (event == "schedule").then_some(indent);
+            schedule_child_indent = None;
+            if event == "schedule" {
+                schedule_crons = Some(Vec::new());
+            }
             continue;
         }
 
@@ -168,6 +188,29 @@ fn parse_triggers(source: &str) -> Result<Triggers, String> {
                     ));
                 }
             }
+        } else if let Some(indent_of_schedule) = schedule_indent {
+            if indent > indent_of_schedule {
+                let direct_schedule_indent = *schedule_child_indent.get_or_insert(indent);
+                if indent != direct_schedule_indent {
+                    return Err(format!(
+                        "ambiguous nested structure in `schedule`: `{}`",
+                        line.trim()
+                    ));
+                }
+                let trimmed = line.trim();
+                let value = trimmed.strip_prefix("- cron:").ok_or_else(|| {
+                    format!(
+                        "unsupported direct `schedule` entry; only `- cron: \"...\"` is permitted: `{trimmed}`"
+                    )
+                })?;
+                let cron = quoted_scalar(value).ok_or_else(|| {
+                    "`schedule` cron must be an explicit nonempty double-quoted scalar".to_string()
+                })?;
+                schedule_crons
+                    .as_mut()
+                    .expect("schedule trigger initializes cron storage")
+                    .push(cron);
+            }
         }
     }
 
@@ -177,13 +220,26 @@ fn parse_triggers(source: &str) -> Result<Triggers, String> {
     Ok(Triggers {
         events,
         push_branches,
+        schedule_crons,
     })
 }
 
+fn approved_schedule(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        "buck2-oss-nightly.yml" => Some(&["17 10 * * *"]),
+        "docs.yml" => Some(&["23 8 * * *"]),
+        _ => None,
+    }
+}
+
 fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
-    let allowed = BTreeSet::from(["push".to_string(), "workflow_dispatch".to_string()]);
+    let recognized = BTreeSet::from([
+        "push".to_string(),
+        "schedule".to_string(),
+        "workflow_dispatch".to_string(),
+    ]);
     let mut errors = Vec::new();
-    for event in triggers.events.difference(&allowed) {
+    for event in triggers.events.difference(&recognized) {
         errors.push(format!("automatic `{event}` trigger is not permitted"));
     }
     if !triggers.events.contains("workflow_dispatch") {
@@ -197,7 +253,31 @@ fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
         errors.push("found `push.branches` without a `push` trigger".to_string());
     }
 
+    if let Some(expected_crons) = approved_schedule(name) {
+        let required_events =
+            BTreeSet::from(["schedule".to_string(), "workflow_dispatch".to_string()]);
+        if triggers.events != required_events {
+            errors.push(format!(
+                "{name} must have exactly `workflow_dispatch` and `schedule` triggers"
+            ));
+        }
+        let actual_crons = triggers.schedule_crons.as_deref().unwrap_or_default();
+        if !actual_crons
+            .iter()
+            .map(String::as_str)
+            .eq(expected_crons.iter().copied())
+        {
+            errors.push(format!(
+                "{name} must use exactly the approved cron schedule: {}",
+                expected_crons.join(", ")
+            ));
+        }
+    } else if triggers.events.contains("schedule") {
+        errors.push("automatic `schedule` trigger is not permitted".to_string());
+    }
+
     if name == PORTABLE {
+        let allowed = BTreeSet::from(["push".to_string(), "workflow_dispatch".to_string()]);
         if triggers.events != allowed {
             errors.push(
                 "ci-portable.yml must have exactly `workflow_dispatch` and `push` triggers"
@@ -275,7 +355,7 @@ fn main() {
     rust_script_prelude::init();
     match run(Path::new(WORKFLOW_DIR)) {
         Ok(count) => println!(
-            "GitHub Actions triggers OK: {count} workflows; automatic runs are limited to integration"
+            "GitHub Actions triggers OK: {count} workflows; automatic runs are limited to integration and exact approved schedules"
         ),
         Err(errors) => {
             for error in errors {
@@ -305,7 +385,20 @@ mod tests {
     #[test]
     fn manual_only_workflow_is_allowed() {
         let triggers = parsed("on:\n  workflow_dispatch:\njobs:\n");
-        assert!(validate("docs.yml", &triggers).is_empty());
+        assert!(validate("other.yml", &triggers).is_empty());
+    }
+
+    #[test]
+    fn exact_approved_schedules_are_allowed() {
+        for (name, cron) in [
+            ("buck2-oss-nightly.yml", "17 10 * * *"),
+            ("docs.yml", "23 8 * * *"),
+        ] {
+            let triggers = parsed(&format!(
+                "on:\n  schedule:\n    - cron: \"{cron}\"\n  workflow_dispatch:\njobs:\n"
+            ));
+            assert!(validate(name, &triggers).is_empty(), "{name}");
+        }
     }
 
     #[test]
@@ -320,6 +413,42 @@ mod tests {
             assert!(
                 !validate("other.yml", &triggers).is_empty(),
                 "{event} unexpectedly passed"
+            );
+        }
+    }
+
+    #[test]
+    fn copied_or_modified_schedules_are_rejected() {
+        for (name, cron) in [
+            ("other.yml", "17 10 * * *"),
+            ("buck2-oss-nightly.yml", "18 10 * * *"),
+            ("docs.yml", "23 8 * * 1"),
+        ] {
+            let triggers = parsed(&format!(
+                "on:\n  schedule:\n    - cron: \"{cron}\"\n  workflow_dispatch:\njobs:\n"
+            ));
+            assert!(!validate(name, &triggers).is_empty(), "{name} {cron}");
+        }
+    }
+
+    #[test]
+    fn approved_schedule_rejects_extra_automatic_trigger() {
+        let triggers = parsed(
+            "on:\n  schedule:\n    - cron: \"17 10 * * *\"\n  workflow_dispatch:\n  push:\n    branches: [integration]\njobs:\n",
+        );
+        assert!(!validate("buck2-oss-nightly.yml", &triggers).is_empty());
+    }
+
+    #[test]
+    fn ambiguous_schedule_shapes_fail_to_parse() {
+        for source in [
+            "on:\n  schedule:\n    cron: \"17 10 * * *\"\n  workflow_dispatch:\njobs:\n",
+            "on:\n  schedule:\n    - cron: 17 10 * * *\n  workflow_dispatch:\njobs:\n",
+            "on:\n  schedule:\n    - cron: \"17 10 * * *\"\n      timezone: UTC\n  workflow_dispatch:\njobs:\n",
+        ] {
+            assert!(
+                parse_triggers(source).is_err(),
+                "schedule fixture unexpectedly parsed"
             );
         }
     }
