@@ -13642,6 +13642,112 @@ mod nextest_timeout_tests {
     use super::*;
 
     #[test]
+    fn kvm_inventory_guard_requires_current_nonignored_selection() {
+        let root = Path::new(file!()).parent().unwrap().parent().unwrap();
+        let config = validate_plan::validation_config(root).unwrap();
+        let mut filters = Vec::new();
+        for tag in [
+            "privileged-test.cli_kvm",
+            "privileged-only-test.cli_kvm",
+            "privileged-only-test.cli_kvm_on_host",
+        ] {
+            let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "31");
+            // Unwrap the pinned-root shell argument when present, then exercise
+            // the actual committed jq predicate without opening /dev/kvm.
+            let mut words = shell_words::split(&step.cmd).unwrap();
+            if !words.iter().any(|word| word == "jq") {
+                let command = words
+                    .iter()
+                    .find(|word| word.contains("if ! jq -e "))
+                    .unwrap();
+                words = shell_words::split(command).unwrap();
+            }
+            let jq = words.iter().position(|word| word == "jq").unwrap();
+            assert_eq!(words[jq + 1], "-e");
+            filters.push(words[jq + 2].clone());
+        }
+        assert!(filters.iter().all(|filter| filter == &filters[0]));
+        let cli = std::fs::read_to_string(root.join("hermit-cli/tests/cli.rs")).unwrap();
+        let mut names = cli
+            .lines()
+            .filter_map(|line| {
+                let name = line.trim().strip_prefix("fn run_kvm_")?.split_once('(')?.0;
+                Some(format!("run_kvm_{name}"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names.len(),
+            30,
+            "update the exact CI inventory with new KVM tests"
+        );
+        let new_case = "run_kvm_self_sigkill_from_nonleader_is_group_fatal";
+        assert!(names.iter().any(|name| name == new_case));
+        names.push("kvm_execution_tests::initialized_vm_setup_failures_consume_detcore_state_without_further_guest_execution".into());
+        let cases = names
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    serde_json::json!({
+                        "ignored": false, "filter-match": {"status": "matches"}
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let inventory = serde_json::json!({"rust-suites": {"fixture": {"testcases": cases}}});
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("inventory.json");
+        let check = |value: &serde_json::Value, expected: i32| {
+            std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+            let result = Command::new("jq")
+                .args(["-e", &filters[0]])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert_eq!(
+                result.status.code(),
+                Some(expected),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        check(&inventory, 0);
+        for name in &names {
+            let mut missing = inventory.clone();
+            missing["rust-suites"]["fixture"]["testcases"]
+                .as_object_mut()
+                .unwrap()
+                .remove(name);
+            check(&missing, 1);
+            let mut ignored = inventory.clone();
+            ignored["rust-suites"]["fixture"]["testcases"][name]["ignored"] = true.into();
+            check(&ignored, 1);
+            let mut filtered = inventory.clone();
+            filtered["rust-suites"]["fixture"]["testcases"][name]["filter-match"]["status"] =
+                "mismatch".into();
+            check(&filtered, 1);
+        }
+        let mut replacement = inventory.clone();
+        let cases = replacement["rust-suites"]["fixture"]["testcases"]
+            .as_object_mut()
+            .unwrap();
+        let value = cases.remove(new_case).unwrap();
+        cases.insert("run_kvm_unrelated_replacement".into(), value);
+        check(&replacement, 1);
+        // A same-count duplicate in another suite cannot replace an old case.
+        let mut duplicate = inventory.clone();
+        duplicate["rust-suites"]["fixture"]["testcases"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&names[0]);
+        duplicate["rust-suites"]["other"] = serde_json::json!({"testcases": {
+            names[1].clone(): {"ignored": false, "filter-match": {"status": "matches"}}
+        }});
+        check(&duplicate, 1);
+    }
+
+    #[test]
     fn nextest_and_manifest_share_base_and_scaled_wall_bounds() {
         let root = Path::new(file!())
             .parent()
@@ -14530,10 +14636,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .ok_or("retry bounds: privileged lane is absent")?;
     for (tag, expected) in [
         ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
-        // The shipped KVM selection contains 29 run_kvm_ declarations and
+        // The shipped KVM selection contains 30 run_kvm_ declarations and
         // the unchanged initialized-VM setup control. The eight-mode timer
         // and two-role retirement tests each count as one selected test.
-        ("privileged-only-test.cli_kvm", 30usize),
+        ("privileged-only-test.cli_kvm", 31usize),
     ] {
         let step = privileged
             .steps
