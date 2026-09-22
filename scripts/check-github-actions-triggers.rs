@@ -26,6 +26,8 @@ use std::path::PathBuf;
 
 const WORKFLOW_DIR: &str = ".github/workflows";
 const PORTABLE: &str = "ci-portable.yml";
+const VALIDATION_LEVELS: &str = "validation-levels.yml";
+const RUST_SCRIPT_VERSION: &str = "0.36.0";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Triggers {
@@ -291,6 +293,98 @@ fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
     errors
 }
 
+fn named_step<'a>(job: &'a str, name: &str) -> Result<(usize, &'a str), String> {
+    let marker = format!("      - name: {name}");
+    if job.matches(&marker).count() != 1 {
+        return Err(format!("expected exactly one `{name}` step"));
+    }
+    let start = job
+        .find(&marker)
+        .expect("unique marker must have an offset");
+    let rest = &job[start..];
+    let end = rest[1..]
+        .find("\n      - ")
+        .map_or(rest.len(), |offset| offset + 1);
+    Ok((start, rest[..end].trim_end()))
+}
+
+fn validate_validation_levels_bootstrap(source: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    let version_declaration = format!("  RUST_SCRIPT_VERSION: \"{RUST_SCRIPT_VERSION}\"");
+    if source.matches("RUST_SCRIPT_VERSION:").count() != 1
+        || !source.lines().any(|line| line == version_declaration)
+    {
+        errors.push(format!(
+            "validation-levels.yml must declare exactly one global RUST_SCRIPT_VERSION pinned to {RUST_SCRIPT_VERSION}"
+        ));
+    }
+
+    let Some(quick_start) = source.find("\n  quick:\n") else {
+        errors.push("validation-levels.yml is missing its quick job".to_string());
+        return errors;
+    };
+    let Some(relative_quick_end) = source[quick_start + 1..].find("\n  full:\n") else {
+        errors.push("validation-levels.yml quick job has no full-job boundary".to_string());
+        return errors;
+    };
+    let quick_end = quick_start + 1 + relative_quick_end;
+    let quick = &source[quick_start..quick_end];
+
+    let expected_install = "      - name: Install rust-script\n        env:\n          RUSTFLAGS: \"\"\n        run: cargo install rust-script --version \"${RUST_SCRIPT_VERSION}\" --locked";
+    let expected_verification = r#"      - name: Verify rust-script resolves at the pinned version
+        run: |
+          rust_script_path=$(command -v rust-script) || {
+            echo "::error::rust-script is not on PATH; scripts/validate.rs would die at exec with status 127."
+            exit 1
+          }
+          actual_version=$(rust-script --version)
+          expected_version="rust-script ${RUST_SCRIPT_VERSION}"
+          if [[ "$actual_version" != "$expected_version" ]]; then
+            echo "::error::expected ${expected_version}, found ${actual_version} at ${rust_script_path}"
+            exit 1
+          fi
+          echo "rust-script resolved: ${rust_script_path} ${actual_version}""#;
+    let expected_validation = "      - name: GitHub-managed portable test lane\n        run: ./scripts/validate.rs --portable-only --no-label-pr";
+
+    let install = named_step(quick, "Install rust-script");
+    let verification = named_step(quick, "Verify rust-script resolves at the pinned version");
+    let validation = named_step(quick, "GitHub-managed portable test lane");
+    if install.as_ref().map(|(_, step)| *step) != Ok(expected_install) {
+        errors.push(
+            "validation-levels.yml quick job must install the pinned rust-script with tool-only RUSTFLAGS"
+                .to_string(),
+        );
+    }
+    if verification.as_ref().map(|(_, step)| *step) != Ok(expected_verification) {
+        errors.push(
+            "validation-levels.yml quick job must fail closed unless rust-script resolves at the pinned version"
+                .to_string(),
+        );
+    }
+    if validation.as_ref().map(|(_, step)| *step) != Ok(expected_validation) {
+        errors.push(
+            "validation-levels.yml quick job must run the canonical portable validation command"
+                .to_string(),
+        );
+    }
+
+    let validation_command = "./scripts/validate.rs --portable-only --no-label-pr";
+    let actual_validation_offset = quick.find(validation_command);
+    if quick.matches(validation_command).count() != 1
+        || !matches!(
+            (&install, &verification, &validation, actual_validation_offset),
+            (Ok((install, _)), Ok((verify, _)), Ok((validation, _)), Some(actual))
+                if install < verify && verify < validation && validation < &actual
+        )
+    {
+        errors.push(
+            "validation-levels.yml must install and verify rust-script before invoking scripts/validate.rs"
+                .to_string(),
+        );
+    }
+    errors
+}
+
 fn workflow_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let entries =
         fs::read_dir(dir).map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
@@ -339,6 +433,13 @@ fn run(dir: &Path) -> Result<usize, Vec<String>> {
                 );
             }
             Err(error) => errors.push(format!("{}: {error}", path.display())),
+        }
+        if name == VALIDATION_LEVELS {
+            errors.extend(
+                validate_validation_levels_bootstrap(&source)
+                    .into_iter()
+                    .map(|error| format!("{}: {error}", path.display())),
+            );
         }
     }
     if !saw_portable {
@@ -479,6 +580,70 @@ mod tests {
     fn portable_requires_both_allowed_events() {
         let triggers = parsed("on:\n  workflow_dispatch:\njobs:\n");
         assert!(!validate(PORTABLE, &triggers).is_empty());
+    }
+
+    #[test]
+    fn validation_levels_quick_job_bootstraps_the_pinned_rust_script() {
+        let source = include_str!("../.github/workflows/validation-levels.yml");
+        assert!(
+            validate_validation_levels_bootstrap(source).is_empty(),
+            "checked-in workflow lost its rust-script bootstrap"
+        );
+    }
+
+    #[test]
+    fn validation_levels_bootstrap_rejects_missing_or_unpinned_tools() {
+        let source = include_str!("../.github/workflows/validation-levels.yml");
+        let premature_validation = source
+            .replacen(
+                "      - name: GitHub-managed portable test lane\n        run: ./scripts/validate.rs --portable-only --no-label-pr",
+                "      - name: GitHub-managed portable test lane\n        run: echo skipped",
+                1,
+            )
+            .replacen(
+                "      - name: Install rust-script",
+                "      - name: Premature portable validation\n        run: ./scripts/validate.rs --portable-only --no-label-pr\n      - name: Install rust-script",
+                1,
+            );
+        for broken in [
+            source.replacen("  RUST_SCRIPT_VERSION: \"0.36.0\"\n", "", 1),
+            source.replacen(
+                "cargo install rust-script --version \"${RUST_SCRIPT_VERSION}\" --locked",
+                "cargo install rust-script",
+                1,
+            ),
+            source.replacen(
+                "rust_script_path=$(command -v rust-script)",
+                "rust_script_path=rust-script",
+                1,
+            ),
+            source.replacen(
+                "actual_version=$(rust-script --version)",
+                "actual_version=unknown",
+                1,
+            ),
+            source.replacen(
+                "rust_script_path=$(command -v rust-script) || {\n            echo \"::error::rust-script is not on PATH; scripts/validate.rs would die at exec with status 127.\"\n            exit 1",
+                "rust_script_path=$(command -v rust-script) || {\n            echo \"::error::rust-script is not on PATH; scripts/validate.rs would die at exec with status 127.\"\n            true",
+                1,
+            ),
+            source.replacen(
+                "echo \"::error::expected ${expected_version}, found ${actual_version} at ${rust_script_path}\"\n            exit 1",
+                "echo \"::error::expected ${expected_version}, found ${actual_version} at ${rust_script_path}\"\n            true",
+                1,
+            ),
+            source.replacen(
+                "[[ \"$actual_version\" != \"$expected_version\" ]]",
+                "[[ \"$actual_version\" == \"$expected_version\" ]]",
+                1,
+            ),
+            premature_validation,
+        ] {
+            assert!(
+                !validate_validation_levels_bootstrap(&broken).is_empty(),
+                "broken bootstrap unexpectedly passed"
+            );
+        }
     }
 
     #[test]

@@ -20,6 +20,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_VERSION: "0.9.100"
+  RUST_SCRIPT_VERSION: "0.36.0"
   RUSTFLAGS: -D warnings -C link-arg=-llzma
   RUSTDOCFLAGS: -D warnings
   DETCORE_TEST_RUST_LOG: "off"
@@ -61,6 +62,23 @@ jobs:
           tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       - name: Rust components
         run: rustup component add clippy rustfmt
+      - name: Install rust-script
+        env:
+          RUSTFLAGS: ""
+        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
+      - name: Verify rust-script resolves at the pinned version
+        run: |
+          rust_script_path=$(command -v rust-script) || {
+            echo "::error::rust-script is not on PATH; scripts/validate.rs would die at exec with status 127."
+            exit 1
+          }
+          actual_version=$(rust-script --version)
+          expected_version="rust-script ${RUST_SCRIPT_VERSION}"
+          if [[ "$actual_version" != "$expected_version" ]]; then
+            echo "::error::expected ${expected_version}, found ${actual_version} at ${rust_script_path}"
+            exit 1
+          fi
+          echo "rust-script resolved: ${rust_script_path} ${actual_version}"
       - name: GitHub-managed portable test lane
         run: ./scripts/validate.rs --portable-only --no-label-pr
       - name: Upload nextest JUnit report
