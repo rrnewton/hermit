@@ -107,7 +107,7 @@ fn absent_report_is_the_only_failure(attempt: &NodeAttempt) -> bool {
         && attempt.timed_out != Some(true)
         && attempt.cpu_timed_out != Some(true)
         && attempt.oomed != Some(true)
-        && !attempt.oom_kills.is_some_and(|kills| kills > 0)
+        && attempt.oom_kills.is_none_or(|kills| kills <= 0)
         && refused_without_writing_any_report(attempt)
 }
 
@@ -125,7 +125,7 @@ fn publication_report_is_unavailable(attempt: &NodeAttempt) -> bool {
         && attempt.timed_out != Some(true)
         && attempt.cpu_timed_out != Some(true)
         && attempt.oomed != Some(true)
-        && !attempt.oom_kills.is_some_and(|kills| kills > 0)
+        && attempt.oom_kills.is_none_or(|kills| kills <= 0)
 }
 
 /// Evidence of a failed condition remains authoritative alongside a diagnostic.

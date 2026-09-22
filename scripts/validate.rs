@@ -6122,11 +6122,11 @@ fn verify_raw_publisher_completion(
             ));
         };
         if start.0 >= end.0
-            || !start.1["pid"]
+            || start.1["pid"]
                 .as_str()
                 .and_then(|pid| pid.parse::<u32>().ok())
-                .is_some_and(|pid| pid > 0)
-            || !start.1["cmd"].as_str().is_some_and(|cmd| !cmd.is_empty())
+                .is_none_or(|pid| pid == 0)
+            || start.1["cmd"].as_str().is_none_or(|cmd| cmd.is_empty())
             || end.1["ok"].as_bool() != Some(outcome.ok)
             || ["aborted", "timed_out", "cpu_timed_out"]
                 .iter()
@@ -6136,7 +6136,7 @@ fn verify_raw_publisher_completion(
             || outcome.aborted
             || outcome.timed_out
             || outcome.cpu_timed_out
-            || !outcome.returncode.is_some_and(|code| code >= 0)
+            || outcome.returncode.is_none_or(|code| code < 0)
             || outcome.test_results.is_none()
             || outcome.test_results_error.is_some()
             || outcome.test_results_error_kind.is_some()
