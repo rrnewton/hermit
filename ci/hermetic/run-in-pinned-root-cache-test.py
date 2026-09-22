@@ -91,7 +91,7 @@ class CargoCacheMounts(unittest.TestCase):
             "manifest = pathlib.Path(os.environ.get('HERMIT_RUST_SCRIPT_ARTIFACT_ROOT', '.'), 'manifest.tsv')\n"
             "if sys.argv[1] == '--resolve-optional' and (not manifest.is_file() or manifest.is_symlink()): sys.exit(2)\n"
             f"if sys.argv[1] == '--resolve-optional': print(pathlib.Path(__file__).resolve()) if {resolve_status} == 0 else None; sys.exit({resolve_status})\n"
-            f"if sys.argv[-1] == '--probe': print('nextest-launch-observation-v1'); sys.exit({probe_status})\n"
+            f"if sys.argv[-1] == '--probe': print('nextest-launch-observation-v2'); sys.exit({probe_status})\n"
             "assert sys.argv[1:3] == ['capture-launch', '--pinned-image']\n"
             "assert sys.argv[4:6] == ['--image-id', 'c' * 64]\n"
             "assert sys.argv[6] == '--output'\n"

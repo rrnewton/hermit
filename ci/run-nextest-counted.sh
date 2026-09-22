@@ -533,7 +533,7 @@ if "$calibration_host"; then
         fi
         case $capture_status in
             0)
-                [[ $capture_version == nextest-launch-observation-v1 ]] || { printf 'nextest budgets: malformed prepared capture capability; refresh build.rust_scripts\n' >&2; exit 2; }
+                [[ $capture_version == nextest-launch-observation-v2 ]] || { printf 'nextest budgets: malformed prepared capture capability; refresh build.rust_scripts\n' >&2; exit 2; }
                 calibration_launch="$cpu_measurement_dir/launch.json"
                 "$capture_binary" capture-launch --host --output "$calibration_launch" || exit $?
                 ;;
