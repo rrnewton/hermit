@@ -8464,7 +8464,10 @@ fn current_comparison_representation(
             continue;
         }
         if matching.len() as u64 != row.series.num_runs {
-            return Err("current series lacks complete bound outer-attempt coverage".into());
+            return Err(
+                "current series lacks complete bound outer-attempt coverage: declared attempts disagree with bound comparisons"
+                    .into(),
+            );
         }
         for (attempt, key) in matching {
             if row.series.result.map(DirectEvidenceKind::Result).as_ref() != Some(&key.kind) {
@@ -24616,6 +24619,18 @@ mod evidence_identity_tests {
             assert!(!represented.has_unrepresented_direct_evidence);
             assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
             for detcore_tree in [None, Some(tree.clone())] {
+                let mut wrong_attempt = events[1].clone();
+                wrong_attempt.series.detcore_tree = detcore_tree.clone();
+                wrong_attempt.series.attempt = Some(3);
+                wrong_attempt.series.run_index = 3;
+                let error =
+                    direct_representation(&tracked, &[wrong_attempt], &attempts).unwrap_err();
+                assert_eq!(
+                    error,
+                    "current series lacks complete bound outer-attempt coverage: declared attempts disagree with bound comparisons"
+                );
+                assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
+
                 let mut no_result = events[1].clone();
                 no_result.event_id = "retry-no-result".into();
                 no_result.series.detcore_tree = detcore_tree;
