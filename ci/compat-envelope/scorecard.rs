@@ -40,6 +40,7 @@ use fs2::FileExt;
 use hermit_manifest_plan::backend_parity::BackendParityReport;
 use hermit_manifest_plan::backend_parity::BackendParityVerdict;
 use hermit_manifest_plan::canonical_verdict;
+use hermit_manifest_plan::ledger::HistoryRow;
 use hermit_manifest_plan::logdiff_report::LOG_DIFF_REPORT_SCHEMA;
 use hermit_manifest_plan::logdiff_report::LogDiffComparison;
 use hermit_manifest_plan::logdiff_report::LogDiffMessageCounts;
@@ -82,6 +83,20 @@ const SCORECARD_SERIES_SNAPSHOT_SCHEMA: &str = "scorecard-series-snapshot/v1";
 const SCORECARD_SERIES_SNAPSHOT_SOURCE: &str = "series";
 const TEST_LEDGER_REPOSITORY: &str = "https://github.com/rrnewton/hermit_test_ledger.git";
 
+// This is a fixed self-test corpus, not the catalogue's live history reference.
+// The original source document remains byte-for-byte in the existing ledger.
+const SELF_TEST_CORPUS: PinnedSelfTestCorpus<'static> = PinnedSelfTestCorpus {
+    ledger_commit: "352c54f800e62426fe54bd58c9110e8d93d8daaf",
+    archive_blob: "c55b6e644a6f32aadfdea8fbbf76dfaddb20de3e",
+    identity_blob: "cc25483da6bf92e361a0a7596ba87ea33872eb15",
+    source_commit: "97c39b308efd854693038f24962484182d932f27",
+    sha256: "e07c158d1f697e6eea027414550c017fd9d88d80eebe4e35b73fb2eb8ac7eb0f",
+    bytes: 81_434_443,
+    cells: 5_760,
+    observations: 9_509,
+    invocations: 8_703,
+};
+
 const USAGE: &str = r#"Usage: ci/compat-envelope/scorecard.rs COMMAND [OPTIONS]
 
 Commands:
@@ -104,9 +119,9 @@ Commands:
   observe-results --results DIR
       Merge the canonical comparison results from ONE validate result directory
       into the ledger's retained observations, under the `validate` provenance
-      so they never mix with pressure-test bounds. Direct top-level local
-      validates run this after their ledger and receipt work; ci-hub additionally
-      runs it in the checkout that invoked validation after the isolated run.
+      so they never mix with pressure-test bounds. Automatic validation callers
+      use project-and-observe-results through the parent publisher after their
+      finalized row and complete raw census have been durably recorded.
   import-results --results DIR --current-summary FILE [--current-summary FILE ...]
       Import clean canonical comparisons retained on HEAD's history. A retained
       divergence position is imported only after current results classify it as
@@ -123,13 +138,17 @@ Commands:
       --results DIR --expected-head SHA --refreshed-at STAMP
       In one locked transaction, project one immutable canonical series
       snapshot and then merge one completed validate result directory. The
-      two generated files are replaced as one guarded pair. This command is
-      dormant until its parent snapshot provider and callers land together.
+      two generated files are replaced as one guarded pair. Automatic callers
+      bind their finalized ledger row and retained raw-input census before
+      reporting writeback completion.
   verify-results --results DIR [--lanes portable,privileged]
       Check the tracked files, then require a fresh PASS row at HEAD for every
       selected regression cell in the named lanes. The default is both lanes.
   self-test
       Exercise accepting and refusing result sets without running a guest.
+      Requires the pinned full-corpus archive in hermit_test_ledger; use
+      DEV_HERMIT_TEST_LEDGER_ROOT to select that existing checkout. Missing
+      archive objects are an error; the test does not fetch or use live history.
   self-test-and-check
       Run the self-test and exact tracked-file check in one forced compilation.
   --help
@@ -144,11 +163,16 @@ ptrace-vs-candidate evidence.
 
 const PROJECT_AND_OBSERVE_USAGE: &str = r#"Usage: ci/compat-envelope/scorecard.rs project-and-observe-results \
     --snapshot FILE --snapshot-sha256 HEX --results DIR \
-    --expected-head SHA --refreshed-at STAMP
+    --expected-head SHA [--results-head SHA] --refreshed-at STAMP \
+    [--finalized-row FILE --finalized-row-sha256 HEX --state-root DIR]
 
 Project one immutable scorecard-series-snapshot/v1 input, then merge one exact
 completed validation result directory, under one scorecard write-back lock and
-one guarded two-file replacement.
+one guarded two-file replacement. The expected head binds the receiving
+checkout; results-head binds the measured commit and defaults to expected-head.
+An empty current population requires the finalized schema-10 row and its actual
+constructed-plan, cell and test artifacts beneath state-root. An empty directory
+alone is not evidence that no cells were selected.
 "#;
 
 #[derive(Debug)]
@@ -157,7 +181,16 @@ struct ProjectAndObserveArgs {
     snapshot_sha256: String,
     results: PathBuf,
     expected_head: String,
+    results_head: Option<String>,
     refreshed_at: String,
+    finalized: Option<FinalizedRunArgs>,
+}
+
+#[derive(Debug)]
+struct FinalizedRunArgs {
+    row: PathBuf,
+    sha256: String,
+    state_root: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1856,7 +1889,7 @@ impl ResultRow {
     }
 
     fn evidence_identity(&self) -> Result<String, String> {
-        let evidence = serde_json::json!({
+        let mut evidence = serde_json::json!({
             "run_id": self.run_id,
             "attempt": self.attempt,
             "hermit_sha": self.hermit_sha,
@@ -1879,8 +1912,12 @@ impl ResultRow {
             "shell_command": self.shell_command,
             "relaxations": self.relaxations,
             "attempts": self.attempts,
-            "backend_parity": self.backend_parity,
         });
+        // Ordinary evidence predates backend parity. Keep its original hash;
+        // a present typed parity witness remains part of the exact identity.
+        if let Some(parity) = &self.backend_parity {
+            evidence["backend_parity"] = serde_json::json!(parity);
+        }
         let encoded = serde_json::to_vec(&evidence)
             .map_err(|error| format!("cannot encode result evidence: {error}"))?;
         Ok(format!("{:x}", Sha256::digest(encoded)))
@@ -3009,7 +3046,11 @@ where
     let mut snapshot_sha256 = None;
     let mut results = None;
     let mut expected_head = None;
+    let mut results_head = None;
     let mut refreshed_at = None;
+    let mut finalized_row = None;
+    let mut finalized_row_sha256 = None;
+    let mut state_root = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--snapshot" => set_project_and_observe_arg(&mut snapshot, "--snapshot", args.next())?,
@@ -3019,6 +3060,20 @@ where
             "--results" => set_project_and_observe_arg(&mut results, "--results", args.next())?,
             "--expected-head" => {
                 set_project_and_observe_arg(&mut expected_head, "--expected-head", args.next())?
+            }
+            "--results-head" => {
+                set_project_and_observe_arg(&mut results_head, "--results-head", args.next())?
+            }
+            "--finalized-row" => {
+                set_project_and_observe_arg(&mut finalized_row, "--finalized-row", args.next())?
+            }
+            "--finalized-row-sha256" => set_project_and_observe_arg(
+                &mut finalized_row_sha256,
+                "--finalized-row-sha256",
+                args.next(),
+            )?,
+            "--state-root" => {
+                set_project_and_observe_arg(&mut state_root, "--state-root", args.next())?
             }
             "--refreshed-at" => {
                 set_project_and_observe_arg(&mut refreshed_at, "--refreshed-at", args.next())?
@@ -3035,12 +3090,26 @@ where
             format!("project-and-observe-results requires {option}\n\n{PROJECT_AND_OBSERVE_USAGE}")
         })
     };
+    let finalized = match (finalized_row, finalized_row_sha256, state_root) {
+        (None, None, None) => None,
+        (Some(row), Some(sha256), Some(state_root)) => Some(FinalizedRunArgs {
+            row: row.into(),
+            sha256,
+            state_root: state_root.into(),
+        }),
+        _ => return Err(
+            "--finalized-row, --finalized-row-sha256 and --state-root must be supplied together"
+                .into(),
+        ),
+    };
     Ok(ProjectAndObserveArgs {
         snapshot: PathBuf::from(required(snapshot, "--snapshot FILE")?),
         snapshot_sha256: required(snapshot_sha256, "--snapshot-sha256 HEX")?,
         results: PathBuf::from(required(results, "--results DIR")?),
         expected_head: required(expected_head, "--expected-head SHA")?,
+        results_head,
         refreshed_at: required(refreshed_at, "--refreshed-at STAMP")?,
+        finalized,
     })
 }
 
@@ -3079,7 +3148,10 @@ fn run() -> Result<(), String> {
         return publish_history_command(&root, &command, args);
     }
     match command.as_str() {
-        "export-legacy" => { no_more(&mut args)?; export_legacy_history(&root)?; }
+        "export-legacy" => {
+            no_more(&mut args)?;
+            export_legacy_history(&root)?;
+        }
         "show" => {
             no_more(&mut args)?;
             let derived = derive(&root)?;
@@ -3168,14 +3240,7 @@ fn run() -> Result<(), String> {
                 return Ok(());
             }
             let options = parse_project_and_observe_args(remaining.into_iter())?;
-            project_and_observe_results(
-                &root,
-                &options.snapshot,
-                &options.snapshot_sha256,
-                &options.results,
-                &options.expected_head,
-                &options.refreshed_at,
-            )?;
+            project_and_observe_authorized_with(&root, &options, || Ok(()), |_| Ok(()))?;
         }
         "verify-results" => {
             let mut result_root = None;
@@ -3308,7 +3373,8 @@ fn derive(root: &Path) -> Result<Derived, String> {
     let tool = manifest_tool_root()?;
     let output = Command::new("cargo")
         .args(["run", "--quiet", "-p", "hermit-manifest-plan"])
-        .arg("--manifest-path").arg(tool.join("Cargo.toml"))
+        .arg("--manifest-path")
+        .arg(tool.join("Cargo.toml"))
         // Immutable tool sources use the caller's standard mutable Cargo
         // target. Direct callers retain the stable tool-local default; the
         // measured checkout is always an explicit data input.
@@ -3317,7 +3383,8 @@ fn derive(root: &Path) -> Result<Derived, String> {
             tool,
             env::var_os("CARGO_TARGET_DIR").as_deref(),
         ))
-        .args(["--", "--root"]).arg(root)
+        .args(["--", "--root"])
+        .arg(root)
         .args(["--format", "matrix-json"])
         .current_dir(root)
         .output()
@@ -4328,6 +4395,132 @@ fn load_existing(root: &Path) -> Result<Option<TrackedCells>, String> {
     Ok(Some(cells))
 }
 
+#[derive(Clone, Copy)]
+struct PinnedSelfTestCorpus<'a> {
+    ledger_commit: &'a str,
+    archive_blob: &'a str,
+    identity_blob: &'a str,
+    source_commit: &'a str,
+    sha256: &'a str,
+    bytes: usize,
+    cells: usize,
+    observations: usize,
+    invocations: usize,
+}
+
+fn decode_self_test_corpus(
+    corpus: &PinnedSelfTestCorpus<'_>,
+    archive: &[u8],
+    identity: &[u8],
+) -> Result<TrackedCells, String> {
+    if archive.len() != corpus.bytes || format!("{:x}", Sha256::digest(archive)) != corpus.sha256 {
+        return Err("self-test corpus archive has the wrong byte count or SHA-256".into());
+    }
+    let identity: JsonValue = serde_json::from_slice(identity)
+        .map_err(|error| format!("self-test corpus identity is invalid: {error}"))?;
+    if identity
+        != serde_json::json!({
+            "repository": "https://github.com/rrnewton/hermit.git",
+            "commit": corpus.source_commit, "path": CELLS, "blob": corpus.archive_blob,
+            "sha256": corpus.sha256, "bytes": corpus.bytes, "cells": corpus.cells,
+            "observations": corpus.observations,
+        })
+    {
+        return Err("self-test corpus identity differs from the pinned source document".into());
+    }
+    let cells: TrackedCells = serde_json::from_slice(archive)
+        .map_err(|error| format!("self-test corpus history is invalid: {error}"))?;
+    let observations = cells
+        .cells
+        .iter()
+        .map(|cell| cell.observations.len())
+        .sum::<usize>();
+    let invocations = cells
+        .cells
+        .iter()
+        .flat_map(|cell| &cell.observations)
+        .map(|observation| observation.invocations.len())
+        .sum::<usize>();
+    if cells.schema != SCHEMA
+        || cells.cells.len() != corpus.cells
+        || observations != corpus.observations
+        || invocations != corpus.invocations
+    {
+        return Err(
+            "self-test corpus has the wrong schema or cell/observation/invocation counts".into(),
+        );
+    }
+    validate_observation_identity_namespace(&cells)?;
+    Ok(cells)
+}
+
+fn load_self_test_corpus(
+    root: &Path,
+    corpus: &PinnedSelfTestCorpus<'_>,
+) -> Result<TrackedCells, String> {
+    let load = || -> Result<TrackedCells, String> {
+        let ledger = ledger_root(root, false)?;
+        let git = || {
+            let mut command = Command::new("git");
+            command
+                .arg("--no-replace-objects")
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .current_dir(&ledger);
+            command
+        };
+        let commit = git()
+            .args(["rev-parse", &format!("{}^{{commit}}", corpus.ledger_commit)])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !commit.status.success()
+            || commit.stdout != format!("{}\n", corpus.ledger_commit).as_bytes()
+        {
+            return Err("self-test corpus revision is not the pinned commit".into());
+        }
+        let archive_path = format!("scorecard/legacy/{}.json", corpus.archive_blob);
+        let identity_path = format!("scorecard/legacy/{}.identity.json", corpus.archive_blob);
+        let read = |path: &str, blob: &str| -> Result<Vec<u8>, String> {
+            let entry = git()
+                .args(["ls-tree", "-z", corpus.ledger_commit, "--", path])
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !entry.status.success()
+                || entry.stdout != format!("100644 blob {blob}\t{path}\0").as_bytes()
+            {
+                return Err(format!(
+                    "self-test corpus requires the exact committed regular blob {path}"
+                ));
+            }
+            let output = git()
+                .args([
+                    "cat-file",
+                    "blob",
+                    &format!("{}:{path}", corpus.ledger_commit),
+                ])
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !output.status.success() {
+                return Err(format!("self-test corpus object is unavailable: {path}"));
+            }
+            Ok(output.stdout)
+        };
+        decode_self_test_corpus(
+            corpus,
+            &read(&archive_path, corpus.archive_blob)?,
+            &read(&identity_path, corpus.identity_blob)?,
+        )
+    };
+    load().map_err(|error| {
+        format!(
+            "required scorecard self-test corpus is unavailable or invalid: {error}. \
+         Prepare the existing {TEST_LEDGER_REPOSITORY} checkout with commit {}; \
+         set DEV_HERMIT_TEST_LEDGER_ROOT when it is outside the parent workspace. \
+         The self-test never substitutes the current projection or empty history.",
+            corpus.ledger_commit,
+        )
+    })
+}
+
 /// Selection belongs to the current catalogue; observations belong to history.
 /// Retired cells remain in the ledger's existing Git history, never an
 /// uncommitted projection that a later writer could overwrite.
@@ -4702,11 +4895,7 @@ fn wait_for_scorecard_write_lock(
 
 fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
     let output = Command::new("git")
-        .args([
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ])
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(root)
         .output()
         .map_err(|e| format!("cannot locate the scorecard write-back lock: {e}"))?;
@@ -4717,7 +4906,8 @@ fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
         std::str::from_utf8(&output.stdout)
             .map_err(|e| format!("scorecard write-back lock path is not UTF-8: {e}"))?
             .trim(),
-    ).join("scorecard-writeback.lock");
+    )
+    .join("scorecard-writeback.lock");
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -4739,19 +4929,6 @@ fn check_tracked_with_lock(root: &Path) -> Result<Derived, String> {
     check_tracked(root)
 }
 
-fn git_diff_clean(root: &Path, args: &[&str]) -> Result<bool, String> {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .status()
-        .map_err(|e| format!("cannot inspect tracked changes: {e}"))?;
-    match status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err("git diff failed while checking tracked changes".into()),
-    }
-}
-
 fn observation_dirt_error(staged_clean: bool, unrelated_clean: bool) -> Option<&'static str> {
     if !staged_clean {
         Some("observe-results refuses staged changes")
@@ -4762,21 +4939,102 @@ fn observation_dirt_error(staged_clean: bool, unrelated_clean: bool) -> Option<&
     }
 }
 
+struct ObservationWorktreeState {
+    head: String,
+    staged_clean: bool,
+    unrelated_clean: bool,
+}
+
+impl ObservationWorktreeState {
+    fn ensure_clean(&self) -> Result<(), String> {
+        observation_dirt_error(self.staged_clean, self.unrelated_clean)
+            .map_or(Ok(()), |error| Err(error.into()))
+    }
+}
+
+fn parse_observation_worktree_state(bytes: &[u8]) -> Result<ObservationWorktreeState, String> {
+    let malformed = || "git returned malformed observation worktree state".to_string();
+    if bytes.last() != Some(&0) {
+        return Err(malformed());
+    }
+    let mut head = None;
+    let mut staged_clean = true;
+    let mut unrelated_clean = true;
+    for record in bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        if let Some(value) = record.strip_prefix(b"# branch.oid ") {
+            let value = std::str::from_utf8(value).map_err(|_| malformed())?;
+            if head.is_some() || !(is_object_id(value) || value == "(initial)") {
+                return Err(malformed());
+            }
+            head = Some(value.to_string());
+        } else if record.starts_with(b"# branch.head ")
+            || record.starts_with(b"# branch.upstream ")
+            || record.starts_with(b"# branch.ab ")
+        {
+            continue;
+        } else if record.starts_with(b"1 ") {
+            // --no-renames leaves one NUL-delimited ordinary record per path.
+            // Paths remain bytes: spaces, newlines and non-UTF8 names cannot
+            // become headers or broaden the two existing generated-file exceptions.
+            let fields = record.splitn(9, |byte| *byte == b' ').collect::<Vec<_>>();
+            if fields.len() != 9
+                || fields[1].len() != 2
+                || !fields[1].iter().all(|byte| b".MADRCUT".contains(byte))
+                || fields[2].len() != 4
+                || fields[8].is_empty()
+            {
+                return Err(malformed());
+            }
+            staged_clean &= fields[1][0] == b'.';
+            unrelated_clean &= fields[1][1] == b'.'
+                || fields[8] == SCORECARD.as_bytes()
+                || fields[8] == CELLS.as_bytes();
+        } else if record.starts_with(b"u ") {
+            let fields = record.splitn(11, |byte| *byte == b' ').collect::<Vec<_>>();
+            if fields.len() != 11 || fields[1].len() != 2 || fields[10].is_empty() {
+                return Err(malformed());
+            }
+            staged_clean = false;
+            unrelated_clean &= fields[10] == SCORECARD.as_bytes() || fields[10] == CELLS.as_bytes();
+        } else {
+            return Err(malformed());
+        }
+    }
+    Ok(ObservationWorktreeState {
+        head: head.ok_or_else(malformed)?,
+        staged_clean,
+        unrelated_clean,
+    })
+}
+
+fn observation_worktree_state(root: &Path) -> Result<ObservationWorktreeState, String> {
+    // Capture the same staged/unstaged policy and HEAD in one Git observation.
+    // Every original transaction boundary still obtains a fresh observation;
+    // there is no cross-boundary cache or change to publication authority.
+    let output = Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--no-ahead-behind",
+            "--no-renames",
+            "--untracked-files=no",
+            "-z",
+        ])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("cannot inspect tracked changes: {error}"))?;
+    if !output.status.success() {
+        return Err("git status failed while checking tracked changes".into());
+    }
+    parse_observation_worktree_state(&output.stdout)
+}
+
 fn check_observation_worktree(root: &Path) -> Result<(), String> {
-    let staged_clean = git_diff_clean(root, &["diff", "--cached", "--quiet", "--no-ext-diff"])?;
-    let unrelated_clean = git_diff_clean(
-        root,
-        &[
-            "diff",
-            "--quiet",
-            "--no-ext-diff",
-            "--",
-            ".",
-            ":(exclude)SCORECARD.md",
-            ":(exclude)ci/compat-envelope/cells.json",
-        ],
-    )?;
-    observation_dirt_error(staged_clean, unrelated_clean).map_or(Ok(()), |e| Err(e.into()))
+    observation_worktree_state(root)?.ensure_clean()
 }
 
 #[derive(Clone, PartialEq)]
@@ -4915,6 +5173,7 @@ fn update_tracked(
 fn repo_depth_at(root: &Path, revision: &str) -> Option<SourceDepth> {
     let count = |args: &[&str]| -> Option<u64> {
         let out = Command::new("git")
+            .arg("--no-replace-objects")
             .args(args)
             .current_dir(root)
             .output()
@@ -4937,6 +5196,7 @@ fn repo_depth_at(root: &Path, revision: &str) -> Option<SourceDepth> {
 /// Read the unique full Reverie pin from one recorded Hermit revision.
 fn reverie_pin_at(root: &Path, hermit_revision: &str) -> Option<String> {
     let output = Command::new("git")
+        .arg("--no-replace-objects")
         .args(["show", &format!("{hermit_revision}:Cargo.lock")])
         .current_dir(root)
         .output()
@@ -6480,7 +6740,13 @@ fn measurement_transition(
 
 fn git_is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
     let status = Command::new("git")
-        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .args([
+            "--no-replace-objects",
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ])
         .current_dir(root)
         .status()
         .map_err(|e| format!("cannot compare Hermit revisions {ancestor} and {descendant}: {e}"))?;
@@ -6767,8 +7033,9 @@ fn verify_combined_write_state(
     expected_cells: &[u8],
     snapshot: &HeldScorecardSeriesSnapshot,
 ) -> Result<(), String> {
-    check_observation_worktree(root)?;
-    let current_head = git_head(root)?;
+    let worktree = observation_worktree_state(root)?;
+    worktree.ensure_clean()?;
+    let current_head = worktree.head;
     if current_head != expected_head {
         return Err(format!(
             "HEAD moved from {expected_head} to {current_head} during combined scorecard write-back"
@@ -6808,6 +7075,362 @@ fn project_and_observe_results(
     )
 }
 
+fn current_source_may_replace_stamp(
+    root: &Path,
+    previous: Option<&LastTested>,
+    measured: &str,
+    detcore_tree: &str,
+) -> Result<bool, String> {
+    let Some(previous) = previous else {
+        return Ok(true);
+    };
+    if previous.hermit_sha == measured {
+        if previous.detcore_tree != detcore_tree {
+            return Err("same measured commit has conflicting Detcore identities".into());
+        }
+        return Ok(true);
+    }
+    // A missing old object does not make the new result newer. Its observation
+    // is still retained, but only proven ancestry can advance a source stamp.
+    if git_no_replace_rev_parse(root, &format!("{}^{{commit}}", previous.hermit_sha))
+        .ok()
+        .as_deref()
+        != Some(previous.hermit_sha.as_str())
+    {
+        return Ok(false);
+    }
+    git_is_ancestor(root, &previous.hermit_sha, measured)
+}
+
+/// Files authorizing a transaction stay open, with every containing directory
+/// held and checked. Neither a pathname substitution nor a rewritten same-inode
+/// artifact can silently change the proof between admission and replacement.
+struct HeldEvidenceFile {
+    path: PathBuf,
+    directories: Vec<(PathBuf, File, SnapshotDirectoryIdentity)>,
+    file: File,
+    identity: SnapshotPathIdentity,
+    bytes: Vec<u8>,
+}
+
+impl HeldEvidenceFile {
+    fn open(path: &Path, expected_sha256: Option<&str>) -> Result<Self, String> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            env::current_dir()
+                .map_err(|error| error.to_string())?
+                .join(path)
+        };
+        let mut prefix = PathBuf::new();
+        let mut directories = Vec::new();
+        for component in absolute
+            .parent()
+            .ok_or("evidence path has no parent")?
+            .components()
+        {
+            match component {
+                std::path::Component::RootDir | std::path::Component::Normal(_) => {
+                    prefix.push(component)
+                }
+                std::path::Component::CurDir => continue,
+                _ => return Err("evidence path contains an unsupported component".into()),
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&prefix)
+                .map_err(|error| {
+                    format!(
+                        "cannot hold evidence directory {}: {error}",
+                        prefix.display()
+                    )
+                })?;
+            let identity =
+                SnapshotDirectoryIdentity::from_path_identity(SnapshotPathIdentity::from_metadata(
+                    &file.metadata().map_err(|error| error.to_string())?,
+                ));
+            directories.push((prefix.clone(), file, identity));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&absolute)
+            .map_err(|error| {
+                format!("cannot hold evidence file {}: {error}", absolute.display())
+            })?;
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_file() {
+            return Err("evidence input is not a regular file".into());
+        }
+        let identity = SnapshotPathIdentity::from_metadata(&metadata);
+        let bytes = read_held_snapshot_file(&file, identity)?;
+        if let Some(expected) = expected_sha256 {
+            if !is_sha256(expected) || format!("{:x}", Sha256::digest(&bytes)) != expected {
+                return Err(format!("evidence digest mismatch: {}", absolute.display()));
+            }
+        }
+        let held = Self {
+            path: absolute,
+            directories,
+            file,
+            identity,
+            bytes,
+        };
+        held.verify()?;
+        Ok(held)
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        for (path, file, identity) in &self.directories {
+            let opened =
+                SnapshotDirectoryIdentity::from_path_identity(SnapshotPathIdentity::from_metadata(
+                    &file.metadata().map_err(|error| error.to_string())?,
+                ));
+            let named = SnapshotDirectoryIdentity::from_path_identity(snapshot_path_identity(
+                path,
+                "directory",
+            )?);
+            if opened != *identity || named != *identity {
+                return Err(format!("evidence directory changed: {}", path.display()));
+            }
+        }
+        if SnapshotPathIdentity::from_metadata(
+            &self.file.metadata().map_err(|error| error.to_string())?,
+        ) != self.identity
+            || snapshot_path_identity(&self.path, "file")? != self.identity
+            || read_held_snapshot_file(&self.file, self.identity)? != self.bytes
+        {
+            return Err(format!("evidence file changed: {}", self.path.display()));
+        }
+        Ok(())
+    }
+}
+
+struct CurrentResultCensus {
+    root: PathBuf,
+    directories: BTreeMap<PathBuf, SnapshotDirectoryIdentity>,
+    files: Vec<HeldEvidenceFile>,
+}
+
+fn census_result_paths(
+    root: &Path,
+    directories: &mut BTreeMap<PathBuf, SnapshotDirectoryIdentity>,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    directories.insert(
+        root.to_path_buf(),
+        SnapshotDirectoryIdentity::from_path_identity(snapshot_path_identity(root, "directory")?),
+    );
+    for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let kind = entry.file_type().map_err(|error| error.to_string())?;
+        if kind.is_symlink() {
+            return Err(format!(
+                "current result census refuses a symlink: {}",
+                entry.path().display()
+            ));
+        }
+        if kind.is_dir() {
+            census_result_paths(&entry.path(), directories, files)?;
+        } else if entry.file_name() == "results.jsonl" {
+            if !kind.is_file() {
+                return Err("results.jsonl is not a regular file".into());
+            }
+            files.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+impl CurrentResultCensus {
+    fn open(root: &Path) -> Result<Self, String> {
+        let mut directories = BTreeMap::new();
+        let mut paths = Vec::new();
+        census_result_paths(root, &mut directories, &mut paths)?;
+        paths.sort();
+        let files = paths
+            .iter()
+            .map(|path| HeldEvidenceFile::open(path, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        let census = Self {
+            root: root.to_path_buf(),
+            directories,
+            files,
+        };
+        census.verify()?;
+        Ok(census)
+    }
+
+    fn inputs(&self) -> Vec<(PathBuf, &[u8])> {
+        self.files
+            .iter()
+            .map(|file| (file.path.clone(), file.bytes.as_slice()))
+            .collect()
+    }
+
+    fn relative_inputs(&self) -> Result<BTreeMap<String, Vec<u8>>, String> {
+        let root = if self.root.is_absolute() {
+            self.root.clone()
+        } else {
+            env::current_dir()
+                .map_err(|error| error.to_string())?
+                .join(&self.root)
+        };
+        self.files
+            .iter()
+            .map(|file| {
+                let path = file
+                    .path
+                    .strip_prefix(&root)
+                    .map_err(|error| error.to_string())?
+                    .to_str()
+                    .ok_or("raw result census path is not UTF-8")?
+                    .to_string();
+                Ok((path, file.bytes.clone()))
+            })
+            .collect()
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        let mut directories = BTreeMap::new();
+        let mut paths = Vec::new();
+        census_result_paths(&self.root, &mut directories, &mut paths)?;
+        paths.sort();
+        let expected = self
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        // Retain one absolute spelling for comparison with held inputs.
+        let actual = paths
+            .iter()
+            .map(|path| {
+                if path.is_absolute() {
+                    Ok(path.clone())
+                } else {
+                    env::current_dir()
+                        .map(|cwd| cwd.join(path))
+                        .map_err(|error| error.to_string())
+                }
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if directories != self.directories || actual != expected {
+            return Err(
+                "current result population or directory identity changed during writeback".into(),
+            );
+        }
+        for file in &self.files {
+            file.verify()?;
+        }
+        Ok(())
+    }
+}
+
+struct FinalizedRunProof {
+    files: Vec<HeldEvidenceFile>,
+    zero_cells: bool,
+}
+
+impl FinalizedRunProof {
+    fn open(
+        args: &FinalizedRunArgs,
+        measured: &str,
+        stamp: &str,
+        current: &BTreeMap<CellId, Vec<ResultCandidate>>,
+        inputs: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<Self, String> {
+        let row_file = HeldEvidenceFile::open(&args.row, Some(&args.sha256))?;
+        serde_json::from_slice::<UniqueJsonFields>(&row_file.bytes)
+            .map_err(|error| error.to_string())?;
+        let row: HistoryRow =
+            serde_json::from_slice(&row_file.bytes).map_err(|error| error.to_string())?;
+        let run = row
+            .run_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("finalized row omitted its run identity")?;
+        if current
+            .values()
+            .flatten()
+            .any(|candidate| candidate.row.run_id != run)
+        {
+            return Err("current results differ from the finalized run identity".into());
+        }
+        let mut files = Vec::new();
+        if row.schema_version == Some(10) || current.is_empty() {
+            let plan = row
+                .constructed_plan_artifact()?
+                .ok_or("zero-current proof requires schema 10")?;
+            let cells = row
+                .schema10_cell_results()?
+                .ok_or("zero-current proof requires schema 10 cell evidence")?;
+            // Decode only to locate the bytes; the schema-10 verifier below
+            // establishes their authority against the original row and plan.
+            let tests: hermit_manifest_plan::ledger::TestResultsEvidenceV9 =
+                serde_json::from_value(
+                    serde_json::to_value(
+                        row.test_results
+                            .as_ref()
+                            .ok_or("zero-current proof omitted test evidence")?,
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+            for (relative, digest) in [
+                (&plan.path, &plan.sha256),
+                (&cells.artifact.path, &cells.artifact.sha256),
+                (&tests.artifact.path, &tests.artifact.sha256),
+            ] {
+                let path = Path::new(relative);
+                if path.is_absolute()
+                    || path
+                        .components()
+                        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                {
+                    return Err("finalized artifact path is not relative to state root".into());
+                }
+                files.push(HeldEvidenceFile::open(
+                    &args.state_root.join(path),
+                    Some(digest),
+                )?);
+            }
+        }
+        let artifact_bytes = if files.is_empty() {
+            None
+        } else {
+            Some((
+                files[0].bytes.as_slice(),
+                files[1].bytes.as_slice(),
+                files[2].bytes.as_slice(),
+            ))
+        };
+        let zero_cells =
+            row.verify_finalized_raw_input_bytes(measured, stamp, inputs, artifact_bytes)?;
+        // The current projection can filter raw rows. A nonempty census must
+        // not become selected-zero authority merely because that map is empty.
+        if current.is_empty() && !zero_cells {
+            return Err(
+                "empty current results contradict the finalized selected population".into(),
+            );
+        }
+        files.push(row_file);
+        let proof = Self {
+            files,
+            zero_cells: current.is_empty(),
+        };
+        proof.verify()?;
+        Ok(proof)
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        for file in &self.files {
+            file.verify()?;
+        }
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn project_and_observe_results_with<BeforeGuard, BeforeReplace>(
     root: &Path,
@@ -6816,6 +7439,32 @@ fn project_and_observe_results_with<BeforeGuard, BeforeReplace>(
     results: &Path,
     expected_head: &str,
     refreshed_at: &str,
+    before_guard: BeforeGuard,
+    before_replace: BeforeReplace,
+) -> Result<(), String>
+where
+    BeforeGuard: FnMut() -> Result<(), String>,
+    BeforeReplace: FnMut(usize) -> Result<(), String>,
+{
+    project_and_observe_authorized_with(
+        root,
+        &ProjectAndObserveArgs {
+            snapshot: snapshot_path.to_path_buf(),
+            snapshot_sha256: snapshot_sha256.to_string(),
+            results: results.to_path_buf(),
+            expected_head: expected_head.to_string(),
+            results_head: None,
+            refreshed_at: refreshed_at.to_string(),
+            finalized: None,
+        },
+        before_guard,
+        before_replace,
+    )
+}
+
+fn project_and_observe_authorized_with<BeforeGuard, BeforeReplace>(
+    root: &Path,
+    options: &ProjectAndObserveArgs,
     mut before_guard: BeforeGuard,
     mut before_replace: BeforeReplace,
 ) -> Result<(), String>
@@ -6823,8 +7472,20 @@ where
     BeforeGuard: FnMut() -> Result<(), String>,
     BeforeReplace: FnMut(usize) -> Result<(), String>,
 {
+    let ProjectAndObserveArgs {
+        snapshot: snapshot_path,
+        snapshot_sha256,
+        results,
+        expected_head,
+        refreshed_at,
+        ..
+    } = options;
+    let measured = options.results_head.as_deref().unwrap_or(expected_head);
     if !is_object_id(expected_head) {
         return Err("--expected-head requires exactly 40 lowercase hexadecimal characters".into());
+    }
+    if !is_object_id(measured) {
+        return Err("--results-head requires exactly 40 lowercase hexadecimal characters".into());
     }
     if refreshed_at.trim().is_empty() {
         return Err("--refreshed-at requires a nonempty deterministic stamp".into());
@@ -6837,24 +7498,58 @@ where
     }
 
     let _lock = acquire_history_write_lock(root)?;
-    let head = git_head(root)?;
-    if head != expected_head {
+    // Validate and hold caller-owned operands before unrelated catalogue work.
+    // A malformed or nonregular snapshot must not wait for history decoding or
+    // manifest generation. The held file is still rechecked before publication.
+    let snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
+    let worktree = observation_worktree_state(root)?;
+    let head = worktree.head.clone();
+    if head != *expected_head {
         return Err(format!(
             "combined scorecard write-back expected HEAD {expected_head}, found {head}"
         ));
     }
-    check_observation_worktree(root)?;
+    worktree.ensure_clean()?;
     let original = read_history_files(root)?;
     let derived = check_tracked(root)?;
-    let snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
-    let detcore_tree = git_rev_parse(root, "HEAD:detcore")?;
-    let depth = source_depths(root, &head)?;
-    let result_rows = read_result_candidates(results, &head)?;
+    if git_no_replace_rev_parse(root, &format!("{measured}^{{commit}}"))? != measured {
+        return Err("measured source is not the specified actual commit".into());
+    }
+    let detcore_tree = git_no_replace_rev_parse(root, &format!("{measured}:detcore"))?;
+    let depth = source_depths(root, measured)?;
+    let census = CurrentResultCensus::open(results)?;
+    let result_rows = read_result_candidate_files(&census.inputs(), measured)?;
+    let finalized = options
+        .finalized
+        .as_ref()
+        .map(|proof| {
+            FinalizedRunProof::open(
+                proof,
+                measured,
+                refreshed_at,
+                &result_rows,
+                &census.relative_inputs()?,
+            )
+        })
+        .transpose()?;
+    if result_rows.is_empty() && !finalized.as_ref().is_some_and(|proof| proof.zero_cells) {
+        return Err(
+            "empty current results require verified finalized zero-selection evidence".into(),
+        );
+    }
 
     let mut tracked: TrackedCells = serde_json::from_slice(&original.cells)
         .map_err(|error| format!("cannot parse tracked {CELLS}: {error}"))?;
     reconcile_history_catalogue(root, &mut tracked)?;
     let before = tracked.clone();
+    for id in result_rows.keys() {
+        if !tracked.cells.iter().any(|cell| &cell.id == id) {
+            return Err(format!(
+                "current result {} has no cell in the invoker's tracked matrix",
+                display_id(id)
+            ));
+        }
+    }
     // Validate current inputs on a private copy before either projection can
     // encounter the old compact run matcher. Reconcile the complete snapshot
     // first; only exactly represented events may be suppressed. Existing
@@ -6863,15 +7558,15 @@ where
     apply_validate_results_from(
         &mut preview,
         &result_rows,
-        &head,
+        measured,
         &detcore_tree,
         &depth,
         ValidateInput {
             reports: ResultInput::Current,
             store_invocation: true,
             store_positions: true,
-            applicability: Some(SourceApplicability {
-                hermit_sha: &head,
+            applicability: (measured == head).then_some(SourceApplicability {
+                hermit_sha: measured,
                 applicable: &derived.applicable,
             }),
         },
@@ -6912,22 +7607,46 @@ where
         pre_series_corpus: true,
     });
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
+    let projected_stamps = tracked
+        .cells
+        .iter()
+        .map(|cell| (cell.id.clone(), cell.last_tested.clone()))
+        .collect::<BTreeMap<_, _>>();
     let fold = apply_validate_results_from(
         &mut tracked,
         &result_rows,
-        &head,
+        measured,
         &detcore_tree,
         &depth,
         ValidateInput {
             reports: ResultInput::Current,
             store_invocation: true,
             store_positions: true,
-            applicability: Some(SourceApplicability {
-                hermit_sha: &head,
+            applicability: (measured == head).then_some(SourceApplicability {
+                hermit_sha: measured,
                 applicable: &derived.applicable,
             }),
         },
     )?;
+    // Current is a new execution, including when it measured the same source.
+    // Preserve a newer or incomparable projected stamp without discarding any
+    // of the current observations or pretending they are retained imports.
+    let mut current_stamps = BTreeMap::new();
+    for cell in &tracked.cells {
+        if !result_rows.contains_key(&cell.id) {
+            continue;
+        }
+        let prior = projected_stamps.get(&cell.id).and_then(Option::as_ref);
+        let replace = current_source_may_replace_stamp(root, prior, measured, &detcore_tree)?;
+        current_stamps.insert(
+            cell.id.clone(),
+            if replace {
+                cell.last_tested.clone()
+            } else {
+                prior.cloned()
+            },
+        );
+    }
     // A normal validate publishes its series row before this local write-back.
     // Match the final direct evidence to the complete snapshot before choosing
     // its stored representation. Exactly represented events are suppressed in
@@ -6951,6 +7670,11 @@ where
         &projected_rows,
         Some(&snapshot.snapshot.source.path),
     )?;
+    for cell in &mut tracked.cells {
+        if let Some(stamp) = current_stamps.get(&cell.id) {
+            cell.last_tested = stamp.clone();
+        }
+    }
     tracked.projection = Some(ObservationProjection {
         source: snapshot.snapshot.source.path.clone(),
         source_repository: snapshot.snapshot.source.repository.clone(),
@@ -6976,6 +7700,10 @@ where
         &updated,
         || {
             before_guard()?;
+            census.verify()?;
+            if let Some(proof) = &finalized {
+                proof.verify()?;
+            }
             verify_combined_write_state(
                 root,
                 &head,
@@ -6986,6 +7714,10 @@ where
         },
         |replacement| {
             before_replace(replacement)?;
+            census.verify()?;
+            if let Some(proof) = &finalized {
+                proof.verify()?;
+            }
             let expected_scorecard = if replacement == 1 {
                 &original.scorecard
             } else {
@@ -8634,9 +9366,12 @@ fn validate_scorecard_snapshot(
             snapshot.schema
         ));
     }
-    if snapshot.source.repository.as_deref().is_some_and(|repository| {
-        repository != TEST_LEDGER_REPOSITORY
-    }) || snapshot.source.path != SCORECARD_SERIES_SNAPSHOT_SOURCE
+    if snapshot
+        .source
+        .repository
+        .as_deref()
+        .is_some_and(|repository| repository != TEST_LEDGER_REPOSITORY)
+        || snapshot.source.path != SCORECARD_SERIES_SNAPSHOT_SOURCE
         || !is_object_id(&snapshot.source.commit)
         || !is_object_id(&snapshot.source.tree)
     {
@@ -9383,9 +10118,30 @@ fn read_result_candidates(
     if files.is_empty() {
         return Err(format!("no results.jsonl files under {}", root.display()));
     }
+    let inputs = files
+        .into_iter()
+        .map(|path| {
+            fs::read(&path)
+                .map(|bytes| (path.clone(), bytes))
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    read_result_candidate_files(
+        &inputs
+            .iter()
+            .map(|(path, bytes)| (path.clone(), bytes.as_slice()))
+            .collect::<Vec<_>>(),
+        head,
+    )
+}
+
+fn read_result_candidate_files(
+    files: &[(PathBuf, &[u8])],
+    head: &str,
+) -> Result<BTreeMap<CellId, Vec<ResultCandidate>>, String> {
     let mut grouped: BTreeMap<(CellId, String), Vec<ResultCandidate>> = BTreeMap::new();
-    for path in files {
-        let text = fs::read_to_string(&path)
+    for (path, bytes) in files {
+        let text = std::str::from_utf8(bytes)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         for (index, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
@@ -10739,6 +11495,9 @@ fn recorded_shell_quote(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
     }
 }
+
+#[cfg(test)]
+static HISTORY_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct HistoryFixtureEnvironment {
     previous: [Option<std::ffi::OsString>; 2],
@@ -13685,6 +14444,9 @@ fn self_test() -> Result<(), String> {
     }
 
     let command_root = repo_root()?;
+    // Resolve and authenticate the fixed complete corpus before installing the
+    // private fixture ledger environment. Catalogue-only source has no history.
+    let fixture_corpus = load_self_test_corpus(&command_root, &SELF_TEST_CORPUS)?;
     // Establish the normal helper through its real producer before any clone
     // invocation. The comparison below checks retained bytes, not the identity
     // of every concurrently executing process.
@@ -13751,7 +14513,7 @@ fn self_test() -> Result<(), String> {
     let fixture_cells =
         load_catalogue(&result_command_root)?.ok_or("result-command fixture has no catalogue")?;
     let fixture_derived = derive(&result_command_root)?;
-    let fixture_history = generated_files(&fixture_derived, &fixture_cells)?;
+    let fixture_history = generated_files(&fixture_derived, &fixture_corpus)?;
     fs::write(
         result_command_root.join(CELLS),
         encoded_catalogue(&fixture_cells)?,
@@ -13993,9 +14755,9 @@ fn self_test() -> Result<(), String> {
     restore_generated()?;
 
     // --- combined immutable-snapshot + current-result transaction ---------
-    // This is deliberately dormant: the production callers continue to use
-    // their existing commands until the parent snapshot provider lands. The
-    // self-test exercises the new command's actual transaction boundary.
+    // Automatic callers use this transaction after durable finalization.
+    // These legacy CLI controls omit the optional finalized-row extension;
+    // capability-declaring callers additionally require its producer proof.
     let mut combined_baseline_cells: TrackedCells = read_json(&fixture_ledger.join(LEDGER_CELLS))?;
     for cell in &mut combined_baseline_cells.cells {
         cell.observations.clear();
@@ -14645,8 +15407,7 @@ fn self_test() -> Result<(), String> {
         };
         if refuse {
             let error = run().expect_err("contradictory invocation evidence was accepted");
-            if !error.contains("disagree") || read_history_files(&result_command_root)? != before
-            {
+            if !error.contains("disagree") || read_history_files(&result_command_root)? != before {
                 return Err(format!(
                     "{label} refusal changed the pair or lost its cause: {error}"
                 ));
@@ -20084,7 +20845,7 @@ fn self_test() -> Result<(), String> {
                 apply_series_rows(&root, &mut tracked, &captured_rows, Some(&snapshot.source))?;
             tracked.projection = Some(ObservationProjection {
                 source: snapshot.source,
-        source_repository: None,
+                source_repository: None,
                 source_commit: Some(snapshot.source_commit),
                 source_tree: Some(snapshot.source_tree),
                 refreshed_at: "fixture-no-verdict".into(),
@@ -20606,7 +21367,7 @@ fn self_test() -> Result<(), String> {
             schema: SCHEMA,
             projection: Some(ObservationProjection {
                 source: "fixture-series".into(),
-        source_repository: None,
+                source_repository: None,
                 source_commit: Some(source_commit.clone()),
                 source_tree: Some(source_tree.clone()),
                 refreshed_at: "fixture-stamp".into(),
@@ -20801,7 +21562,7 @@ fn self_test() -> Result<(), String> {
         schema: SCHEMA,
         projection: Some(ObservationProjection {
             source: "fixture-series".into(),
-        source_repository: None,
+            source_repository: None,
             source_commit: Some("a".repeat(40)),
             source_tree: Some("b".repeat(40)),
             refreshed_at: "fixture-stamp".into(),
@@ -21852,6 +22613,314 @@ mod catalogue_ledger_tests {
     }
 
     #[test]
+    fn self_test_corpus_retains_the_complete_archived_input() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let root = Path::new(file!())
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let corpus = load_self_test_corpus(root, &SELF_TEST_CORPUS).unwrap();
+        // The pinned historical population is independent of future changes to
+        // the current catalogue. Its complete counts are checked by the loader.
+        assert!(
+            corpus
+                .cells
+                .iter()
+                .any(|cell| !cell.observations.is_empty())
+        );
+        println!(
+            "pinned corpus {}:{}: {} bytes, {} cells, {} observations, {} invocations",
+            SELF_TEST_CORPUS.ledger_commit,
+            SELF_TEST_CORPUS.archive_blob,
+            SELF_TEST_CORPUS.bytes,
+            SELF_TEST_CORPUS.cells,
+            SELF_TEST_CORPUS.observations,
+            SELF_TEST_CORPUS.invocations,
+        );
+    }
+
+    #[test]
+    fn self_test_corpus_requires_exact_committed_objects_and_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let root = Path::new(file!())
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let mut cell = load_catalogue(root).unwrap().unwrap().cells.remove(0);
+        cell.observations = vec![
+            serde_json::from_value(serde_json::json!({
+                "detcore_tree": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "provenance": "pressure-test",
+                "hermit_shas": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+                "results": ["pass"], "invocations": []
+            }))
+            .unwrap(),
+        ];
+        let small = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![cell],
+        };
+        let archive = encoded_cells(&small).unwrap().into_bytes();
+        let fixture = tempfile::tempdir().unwrap();
+        let ledger = fixture.path();
+        git(ledger, &["init", "--quiet"]);
+        git(ledger, &["remote", "add", "origin", TEST_LEDGER_REPOSITORY]);
+        fs::write(ledger.join("seed.json"), &archive).unwrap();
+        commit(ledger);
+        let blob = git_rev_parse(ledger, "HEAD:seed.json").unwrap();
+        let digest = format!("{:x}", Sha256::digest(&archive));
+        let source_commit = "b".repeat(40);
+        let identity_for = |corpus: &PinnedSelfTestCorpus<'_>| {
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "repository": "https://github.com/rrnewton/hermit.git",
+                "commit": corpus.source_commit, "path": CELLS, "blob": corpus.archive_blob,
+                "sha256": corpus.sha256, "bytes": corpus.bytes, "cells": corpus.cells,
+                "observations": corpus.observations,
+            }))
+            .unwrap()
+        };
+        let mut corpus = PinnedSelfTestCorpus {
+            ledger_commit: "",
+            archive_blob: &blob,
+            identity_blob: "",
+            source_commit: &source_commit,
+            sha256: &digest,
+            bytes: archive.len(),
+            cells: 1,
+            observations: 1,
+            invocations: 0,
+        };
+        let archive_path = format!("scorecard/legacy/{blob}.json");
+        let identity_path = format!("scorecard/legacy/{blob}.identity.json");
+        fs::create_dir_all(ledger.join("scorecard/legacy")).unwrap();
+        let identity = identity_for(&corpus);
+        fs::write(ledger.join(&archive_path), &archive).unwrap();
+        fs::write(ledger.join(&identity_path), &identity).unwrap();
+        commit(ledger);
+        let ledger_commit = git_head(ledger).unwrap();
+        let identity_blob = git_rev_parse(ledger, &format!("HEAD:{identity_path}")).unwrap();
+        corpus.ledger_commit = &ledger_commit;
+        corpus.identity_blob = &identity_blob;
+        let lock = File::open(ledger.join(".git/HEAD")).unwrap();
+        let _environment = HistoryFixtureEnvironment::set(ledger, lock.as_raw_fd());
+        assert_eq!(load_self_test_corpus(root, &corpus).unwrap().cells.len(), 1);
+
+        // The test reads the fixed committed objects, never the current files
+        // or a live projection whose history could be empty or still growing.
+        fs::write(ledger.join(&archive_path), b"wrong worktree bytes").unwrap();
+        fs::write(ledger.join(LEDGER_CELLS), b"{\"cells\":[]}").unwrap();
+        assert_eq!(load_self_test_corpus(root, &corpus).unwrap().cells.len(), 1);
+        let wrong = "c".repeat(40);
+        for changed in [
+            PinnedSelfTestCorpus {
+                ledger_commit: &wrong,
+                ..corpus
+            },
+            PinnedSelfTestCorpus {
+                archive_blob: &wrong,
+                ..corpus
+            },
+            PinnedSelfTestCorpus {
+                identity_blob: &wrong,
+                ..corpus
+            },
+        ] {
+            assert!(load_self_test_corpus(root, &changed).is_err());
+        }
+        git(
+            ledger,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://example.invalid/foreign.git",
+            ],
+        );
+        assert!(load_self_test_corpus(root, &corpus).is_err());
+        git(
+            ledger,
+            &["config", "remote.origin.url", TEST_LEDGER_REPOSITORY],
+        );
+
+        assert!(
+            decode_self_test_corpus(&corpus, &archive[..archive.len() - 1], &identity).is_err()
+        );
+        let mut changed = archive.clone();
+        changed[0] ^= 1;
+        assert!(decode_self_test_corpus(&corpus, &changed, &identity).is_err());
+        for key in [
+            "repository",
+            "commit",
+            "path",
+            "blob",
+            "sha256",
+            "bytes",
+            "cells",
+            "observations",
+            "extra",
+        ] {
+            let mut changed: JsonValue = serde_json::from_slice(&identity).unwrap();
+            changed[key] = JsonValue::Null;
+            assert!(
+                decode_self_test_corpus(&corpus, &archive, &serde_json::to_vec(&changed).unwrap())
+                    .is_err(),
+                "{key}"
+            );
+        }
+        for changed in [
+            PinnedSelfTestCorpus { cells: 2, ..corpus },
+            PinnedSelfTestCorpus {
+                observations: 2,
+                ..corpus
+            },
+            PinnedSelfTestCorpus {
+                invocations: 1,
+                ..corpus
+            },
+        ] {
+            assert!(decode_self_test_corpus(&changed, &archive, &identity_for(&changed)).is_err());
+        }
+        let mut invalid: JsonValue = serde_json::from_slice(&archive).unwrap();
+        invalid["cells"][0]["observations"][0]["detcore_tree"] = JsonValue::Null;
+        let invalid = serde_json::to_vec(&invalid).unwrap();
+        let invalid_digest = format!("{:x}", Sha256::digest(&invalid));
+        let invalid_corpus = PinnedSelfTestCorpus {
+            sha256: &invalid_digest,
+            bytes: invalid.len(),
+            ..corpus
+        };
+        assert!(
+            decode_self_test_corpus(&invalid_corpus, &invalid, &identity_for(&invalid_corpus))
+                .is_err(),
+            "coherent byte hashes do not replace namespace validation"
+        );
+
+        fs::write(ledger.join(&archive_path), &archive).unwrap();
+        fs::set_permissions(
+            ledger.join(&archive_path),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        commit(ledger);
+        let executable_commit = git_head(ledger).unwrap();
+        assert!(
+            load_self_test_corpus(
+                root,
+                &PinnedSelfTestCorpus {
+                    ledger_commit: &executable_commit,
+                    ..corpus
+                }
+            )
+            .is_err(),
+            "the pinned archive must be a regular nonexecutable blob"
+        );
+
+        // A partial clone can have the pinned tree but lack a promised blob.
+        // Prove the real loader refuses without Git fetching it implicitly.
+        // The remote is another tiny owned fixture, never a network service.
+        let provider = tempfile::tempdir().unwrap();
+        git(
+            ledger,
+            &[
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "gc.auto=0",
+                "clone",
+                "--quiet",
+                "--bare",
+                "--no-hardlinks",
+                ledger.to_str().unwrap(),
+                provider.path().to_str().unwrap(),
+            ],
+        );
+        git(
+            provider.path(),
+            &["config", "uploadpack.allowFilter", "true"],
+        );
+        git(
+            provider.path(),
+            &["config", "uploadpack.allowAnySHA1InWant", "true"],
+        );
+        let provider_url = format!("file://{}", provider.path().display());
+        git(
+            ledger,
+            &[
+                "config",
+                &format!("url.{provider_url}.insteadOf"),
+                TEST_LEDGER_REPOSITORY,
+            ],
+        );
+        git(ledger, &["config", "remote.origin.promisor", "true"]);
+        git(
+            ledger,
+            &["config", "remote.origin.partialclonefilter", "blob:none"],
+        );
+        let routed = Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(ledger)
+            .output()
+            .unwrap();
+        assert!(routed.status.success());
+        assert_eq!(
+            String::from_utf8(routed.stdout).unwrap().trim(),
+            provider_url
+        );
+        let loose = ledger
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]);
+        assert!(loose.is_file());
+        fs::remove_file(&loose).unwrap();
+        assert!(
+            load_self_test_corpus(root, &corpus).is_err(),
+            "missing promised objects must not fetch"
+        );
+        let still_missing = Command::new("git")
+            .args(["cat-file", "-e", &blob])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .current_dir(ledger)
+            .output()
+            .unwrap();
+        assert!(
+            !still_missing.status.success(),
+            "the loader must leave the blob absent"
+        );
+        // Positive opponent: the previous unguarded command really would fetch
+        // this exact blob from the local promisor and return the original data.
+        let fetched = Command::new("git")
+            .args([
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "gc.auto=0",
+                "--no-replace-objects",
+                "cat-file",
+                "blob",
+                &format!("{ledger_commit}:{archive_path}"),
+            ])
+            .env_remove("GIT_NO_LAZY_FETCH")
+            .current_dir(ledger)
+            .output()
+            .unwrap();
+        assert!(
+            fetched.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fetched.stderr)
+        );
+        assert_eq!(fetched.stdout, archive);
+        assert_eq!(load_self_test_corpus(root, &corpus).unwrap().cells.len(), 1);
+    }
+
+    #[test]
     fn manifest_build_target_is_separate_from_read_only_tool_source() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -21910,6 +22979,7 @@ mod catalogue_ledger_tests {
 
     #[test]
     fn exact_archive_and_parent_lock_are_required_before_history_changes() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
         let root = Path::new(file!())
             .parent()
             .unwrap()
@@ -22148,5 +23218,960 @@ mod catalogue_ledger_tests {
             cells: vec![],
         };
         assert!(validate_observation_identity_namespace(&cells).is_err());
+    }
+}
+
+#[cfg(test)]
+mod post_verdict_transaction_tests {
+    use std::os::fd::AsRawFd;
+
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().into()
+    }
+
+    fn commit(root: &Path, message: &str) -> String {
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                message,
+            ],
+        );
+        git(root, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn observation_worktree_state_matches_existing_git_guards() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "--quiet"]);
+        let unborn = observation_worktree_state(root).unwrap();
+        assert_eq!(unborn.head, "(initial)");
+        unborn.ensure_clean().unwrap();
+        fs::create_dir_all(root.join("ci/compat-envelope")).unwrap();
+        fs::create_dir(root.join("nested")).unwrap();
+        for path in [
+            SCORECARD,
+            CELLS,
+            "ordinary",
+            "nested/SCORECARD.md",
+            "newline\nfile",
+        ] {
+            fs::write(root.join(path), "base\n").unwrap();
+        }
+        git(root, &["add", "--all"]);
+        commit(root, "tracked files");
+        let sub = root.join("sub");
+        fs::create_dir(&sub).unwrap();
+        git(&sub, &["init", "--quiet"]);
+        fs::write(sub.join("tracked"), "base\n").unwrap();
+        git(&sub, &["add", "tracked"]);
+        let sub_head = commit(&sub, "submodule");
+        git(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &sub_head,
+                "sub",
+            ],
+        );
+        let base = commit(root, "record submodule");
+
+        for case in [
+            "clean",
+            "ordinary",
+            "scorecard",
+            "cells",
+            "nested",
+            "staged",
+            "staged-generated",
+            "staged-reverted",
+            "deleted",
+            "deleted-generated",
+            "rename",
+            "newline",
+            "untracked",
+            "intent-to-add",
+            "sub-untracked",
+            "sub-dirty",
+            "sub-commit",
+            "unmerged",
+            "sub-ignore",
+            "filemode",
+        ] {
+            git(root, &["reset", "--hard", &base]);
+            git(&sub, &["reset", "--hard", &sub_head]);
+            for path in [
+                root.join("untracked"),
+                root.join("new"),
+                root.join("renamed"),
+                sub.join("untracked"),
+            ] {
+                if path.exists() {
+                    fs::remove_file(path).unwrap();
+                }
+            }
+            let write = |path: &str| fs::write(root.join(path), "changed\n").unwrap();
+            match case {
+                "clean" => {}
+                "ordinary" => write("ordinary"),
+                "scorecard" => write(SCORECARD),
+                "cells" => write(CELLS),
+                "nested" => write("nested/SCORECARD.md"),
+                "staged" | "staged-reverted" => {
+                    write("ordinary");
+                    git(root, &["add", "ordinary"]);
+                    if case == "staged-reverted" {
+                        fs::write(root.join("ordinary"), "base\n").unwrap();
+                    }
+                }
+                "staged-generated" => {
+                    write(SCORECARD);
+                    git(root, &["add", SCORECARD]);
+                }
+                "deleted" => fs::remove_file(root.join("ordinary")).unwrap(),
+                "deleted-generated" => fs::remove_file(root.join(SCORECARD)).unwrap(),
+                "rename" => {
+                    git(root, &["mv", "ordinary", "renamed"]);
+                }
+                "newline" => write("newline\nfile"),
+                "untracked" => write("untracked"),
+                "intent-to-add" => {
+                    write("new");
+                    git(root, &["add", "-N", "new"]);
+                }
+                "sub-untracked" => fs::write(sub.join("untracked"), "new\n").unwrap(),
+                "sub-dirty" | "sub-ignore" | "sub-commit" => {
+                    fs::write(sub.join("tracked"), "changed\n").unwrap();
+                    if case == "sub-ignore" {
+                        git(root, &["config", "diff.ignoreSubmodules", "all"]);
+                    } else if case == "sub-commit" {
+                        git(&sub, &["add", "tracked"]);
+                        commit(&sub, "advance submodule");
+                    }
+                }
+                "unmerged" => {
+                    let blob = git(root, &["rev-parse", "HEAD:ordinary"]);
+                    git(root, &["update-index", "--force-remove", "ordinary"]);
+                    let mut child = Command::new("git")
+                        .args(["update-index", "--index-info"])
+                        .current_dir(root)
+                        .stdin(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    child.stdin.take().unwrap().write_all(format!(
+                        "100644 {blob} 1\tordinary\n100644 {blob} 2\tordinary\n100644 {blob} 3\tordinary\n"
+                    ).as_bytes()).unwrap();
+                    assert!(child.wait().unwrap().success());
+                }
+                "filemode" => {
+                    use std::os::unix::fs::PermissionsExt;
+                    git(root, &["config", "core.filemode", "true"]);
+                    fs::set_permissions(root.join("ordinary"), fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let old_clean = |args: &[&str]| {
+                let status = Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap();
+                assert!(matches!(status.code(), Some(0 | 1)));
+                status.success()
+            };
+            let staged_clean = old_clean(&["diff", "--cached", "--quiet", "--no-ext-diff"]);
+            let unrelated_clean = old_clean(&[
+                "diff",
+                "--quiet",
+                "--no-ext-diff",
+                "--",
+                ".",
+                ":(exclude)SCORECARD.md",
+                ":(exclude)ci/compat-envelope/cells.json",
+            ]);
+            let current = observation_worktree_state(root).unwrap();
+            assert_eq!(current.head, git(root, &["rev-parse", "HEAD"]), "{case}");
+            assert_eq!(current.staged_clean, staged_clean, "{case}");
+            assert_eq!(current.unrelated_clean, unrelated_clean, "{case}");
+            assert_eq!(
+                current.ensure_clean().err(),
+                observation_dirt_error(staged_clean, unrelated_clean).map(str::to_string),
+                "{case}",
+            );
+            if case == "sub-ignore" {
+                git(root, &["config", "--unset", "diff.ignoreSubmodules"]);
+            }
+        }
+    }
+
+    #[test]
+    fn observation_worktree_state_refuses_malformed_records() {
+        let head = format!("# branch.oid {}\0# branch.head main\0", "a".repeat(40));
+        for suffix in [
+            "? hidden\0",
+            "1 .M\0",
+            "u UU\0",
+            "unexpected\0",
+            "# branch.oid bad\0",
+            "truncated",
+        ] {
+            assert!(
+                parse_observation_worktree_state(format!("{head}{suffix}").as_bytes()).is_err()
+            );
+        }
+        assert!(parse_observation_worktree_state(b"# branch.head main\0").is_err());
+        let mut non_utf8 = format!(
+            "{head}1 .M N... 100644 100644 100644 {} {} ",
+            "b".repeat(40),
+            "b".repeat(40)
+        )
+        .into_bytes();
+        non_utf8.extend_from_slice(b"\xff\n# branch.oid spoof\0");
+        let state = parse_observation_worktree_state(&non_utf8).unwrap();
+        assert_eq!(state.head, "a".repeat(40));
+        assert!(state.staged_clean);
+        assert!(!state.unrelated_clean);
+        assert!(
+            state
+                .ensure_clean()
+                .unwrap_err()
+                .contains("outside the generated")
+        );
+    }
+
+    fn result_row(sha: &str) -> JsonValue {
+        let output = serde_json::json!({"exit_code":0,"signal":null,
+            "stdout_sha256":"e".repeat(64),"stdout_bytes":1,"stderr_sha256":"f".repeat(64),"stderr_bytes":0});
+        let report = serde_json::to_string(&serde_json::json!({
+            "verified":true,"bitwise_parity":true,"verdict":"matched","no_result_reason":null,
+            "infrastructure_error":null,"comparison":{
+                "strictness":"canonical","display_name":"BitwiseInfoV1","compare_logs":true,
+                "compare_io_buffers":true,"log_scope":"info","record_envelope":"all_records_v1",
+                "virtualize_time":false,"strip_lines":false,"canonicalize_addresses":true,"full_trace":true,
+                "exact_remainder":true,"stripped_prefixes":["real-wall-clock-prefix/v1"],
+                "canonicalizations":["host-address-to-first-appearance-ordinal/v1"],
+                "ignore_lines":false,"skip_commit":false,"skip_detlog":false
+            },"compared_log_messages":{"left":1,"right":1},"compared_outputs":{"left":output,"right":output},
+            "guest_exit_code":0,"guest_signal":null,
+            "first_divergent_scheduler_turn":null,"first_divergent_virtual_nanoseconds":null,
+            "first_divergent_record":null,"first_divergent_syscall":null,
+            "first_divergent_left_message":null,"first_divergent_right_message":null
+        })).unwrap();
+        let attempt = serde_json::json!({"index":"1","outcome":"PASS","error_kind":null,"status":0,"signal":null,
+                "timed_out":false,"argv":["hermit","record","start"],"guest_argv":["fixture"],"env":{"LC_ALL":"C"},
+                "cwd":"/repo","shell_command":"cd /repo && env LC_ALL=C hermit record start",
+                "verification_report_sha256":format!("{:x}",Sha256::digest(report.as_bytes())),"verification_report":report});
+        serde_json::json!({
+            "schema":4,"run_id":"partial-current-run","attempt":1,"hermit_sha":sha,"source_tree_dirty":false,
+            "binary_sha256":"b".repeat(64),"test_sha256":"c".repeat(64),"test":"system-utils/record-getpid",
+            "category":"system-utils","lane":"portable","mode":"replay","backend":"ptrace",
+            "classification":"required","outcome":"PASS","result":"pass","failure_class":null,
+            "timeout_seconds":15,"execution_cpu_timeout_seconds":10,"execution_wall_timeout_seconds":15,
+            "log_level":"info","effective_args":["record","start"],"argv":["hermit","record","start"],
+            "guest_argv":["fixture"],"env":{"LC_ALL":"C"},"cwd":"/repo",
+            "shell_command":"cd /repo && env LC_ALL=C hermit record start","relaxations":[],
+            "attempts":[attempt]
+        })
+    }
+
+    struct Fixture {
+        _environment: HistoryFixtureEnvironment,
+        _lock: File,
+        _directory: tempfile::TempDir,
+        root: PathBuf,
+        ledger: PathBuf,
+        options: ProjectAndObserveArgs,
+        baseline: GeneratedFiles,
+        row: JsonValue,
+        id: CellId,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let source = Path::new(file!())
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("repo");
+            git(
+                directory.path(),
+                &[
+                    "clone",
+                    "--quiet",
+                    "--shared",
+                    source.to_str().unwrap(),
+                    root.to_str().unwrap(),
+                ],
+            );
+            let local_au = format!(
+                "submodule.agent-utils.url={}",
+                source.join("agent-utils").display()
+            );
+            git(
+                &root,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "-c",
+                    &local_au,
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--recursive",
+                    "--",
+                    "agent-utils",
+                ],
+            );
+            let measured = git(&root, &["rev-parse", "HEAD"]);
+            fs::write(
+                root.join("detcore/scorecard-fixture-source"),
+                "distinct invocation source\n",
+            )
+            .unwrap();
+            git(&root, &["add", "detcore/scorecard-fixture-source"]);
+            let invoker = commit(&root, "independent invocation source");
+            let derived = derive(&root).unwrap();
+            let mut cells: TrackedCells = read_json(&root.join(CELLS)).unwrap();
+            for cell in &mut cells.cells {
+                cell.observations.clear();
+                cell.last_tested = None;
+            }
+            cells.projection = None;
+            refresh_measurement(&mut cells);
+            let baseline = generated_files(&derived, &cells).unwrap();
+            let ledger = directory.path().join("ledger");
+            fs::create_dir_all(ledger.join("scorecard")).unwrap();
+            git(&ledger, &["init", "--quiet"]);
+            git(
+                &ledger,
+                &["remote", "add", "origin", TEST_LEDGER_REPOSITORY],
+            );
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(ledger.join(".git/ci-hub-series-publication.lock"))
+                .unwrap();
+            FileExt::lock_exclusive(&lock).unwrap();
+            let environment = HistoryFixtureEnvironment::set(&ledger, lock.as_raw_fd());
+            let snapshot = directory.path().join("snapshot.json");
+            let value =
+                scorecard_snapshot_fixture_value(&"a".repeat(40), &"b".repeat(40), &[]).unwrap();
+            let snapshot_sha256 = write_scorecard_snapshot_fixture(&snapshot, &value).unwrap();
+            let results = directory.path().join("results");
+            fs::create_dir(&results).unwrap();
+            let options = ProjectAndObserveArgs {
+                snapshot,
+                snapshot_sha256,
+                results,
+                expected_head: invoker,
+                results_head: Some(measured.clone()),
+                refreshed_at: "fixture-start".into(),
+                finalized: None,
+            };
+            let id = CellId {
+                lane: "portable".into(),
+                category: "system-utils".into(),
+                test: "system-utils/record-getpid".into(),
+                mode: "replay".into(),
+                backend: "ptrace".into(),
+            };
+            let mut fixture = Self {
+                _environment: environment,
+                _lock: lock,
+                _directory: directory,
+                root,
+                ledger,
+                options,
+                baseline,
+                row: result_row(&measured),
+                id,
+            };
+            fixture.restore();
+            fixture.publish_inputs();
+            fixture
+        }
+
+        fn restore(&self) {
+            fs::write(self.ledger.join(LEDGER_SCORECARD), &self.baseline.scorecard).unwrap();
+            fs::write(self.ledger.join(LEDGER_CELLS), &self.baseline.cells).unwrap();
+        }
+
+        fn publish_inputs(&mut self) {
+            let row = self.row.clone();
+            self.publish_rows(std::slice::from_ref(&row));
+        }
+
+        fn publish_rows(&mut self, rows: &[JsonValue]) {
+            let mut bytes = Vec::new();
+            for row in rows {
+                bytes.extend(serde_json::to_vec(row).unwrap());
+                bytes.push(b'\n');
+            }
+            fs::write(self.options.results.join("results.jsonl"), &bytes).unwrap();
+            let measured = self.row["hermit_sha"].as_str().unwrap();
+            let run = self.row["run_id"].as_str().unwrap();
+            let census = hermit_manifest_plan::ledger::RawResultInputCensusV1::from_inputs(
+                run,
+                measured,
+                &BTreeMap::from([("results.jsonl".into(), bytes)]),
+            )
+            .unwrap();
+            // This deliberately FAILED partial run made one real observation
+            // in the modeled input and leaves other planned work unexecuted.
+            // Writeback must preserve it, not require or invent full coverage.
+            let row = serde_json::json!({"schema_version":5,"run_id":run,"commit":measured,
+                "tree_dirty":false,"commit_anchored":true,"started_at":"fixture-start","finished_at":"fixture-end",
+                "result":"fail","raw_result":"fail","executed_tests":null,"gates_expected":3,"gates_run":1,
+                "raw_result_input_census_v1":census});
+            let path = self._directory.path().join("finalized.json");
+            let bytes = serde_json::to_vec(&row).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            self.options.finalized = Some(FinalizedRunArgs {
+                row: path,
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+                state_root: self._directory.path().into(),
+            });
+        }
+
+        fn publish(&self) -> Result<(), String> {
+            project_and_observe_authorized_with(&self.root, &self.options, || Ok(()), |_| Ok(()))
+        }
+
+        fn cells(&self) -> TrackedCells {
+            read_json(&self.ledger.join(LEDGER_CELLS)).unwrap()
+        }
+    }
+
+    #[test]
+    fn invalid_snapshot_refuses_before_history_work_but_after_publication_authority() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let ledger = directory.path().join("ledger");
+        let results = directory.path().join("results");
+        for path in [&root, &ledger, &results] {
+            fs::create_dir(path).unwrap();
+        }
+        git(&root, &["init", "--quiet"]);
+        fs::write(root.join("source"), b"fixture").unwrap();
+        git(&root, &["add", "source"]);
+        let head = commit(&root, "snapshot refusal fixture");
+        git(&ledger, &["init", "--quiet"]);
+        git(
+            &ledger,
+            &["remote", "add", "origin", TEST_LEDGER_REPOSITORY],
+        );
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(ledger.join(".git/ci-hub-series-publication.lock"))
+            .unwrap();
+        let _environment = HistoryFixtureEnvironment::set(&ledger, lock.as_raw_fd());
+        let snapshot = directory.path().join("snapshot.fifo");
+        let fifo_name = std::ffi::CString::new(snapshot.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: fifo_name is a live NUL-terminated path with no interior NUL.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let mut options = ProjectAndObserveArgs {
+            snapshot,
+            snapshot_sha256: "0".repeat(64),
+            results,
+            expected_head: head,
+            results_head: None,
+            refreshed_at: "fixture-refresh".into(),
+            finalized: None,
+        };
+        let publish = |options: &ProjectAndObserveArgs| {
+            project_and_observe_authorized_with(&root, options, || Ok(()), |_| Ok(()))
+        };
+        let unauthorized = publish(&options).unwrap_err();
+        assert!(
+            unauthorized.contains("publication lock is not held"),
+            "{unauthorized}"
+        );
+        FileExt::lock_exclusive(&lock).unwrap();
+        let nonregular = publish(&options).unwrap_err();
+        assert!(nonregular.contains("not a regular file"), "{nonregular}");
+        options.snapshot = directory.path().join("snapshot.json");
+        let value =
+            scorecard_snapshot_fixture_value(&"a".repeat(40), &"b".repeat(40), &[]).unwrap();
+        let digest = write_scorecard_snapshot_fixture(&options.snapshot, &value).unwrap();
+        let mismatch = publish(&options).unwrap_err();
+        assert!(mismatch.contains("digest mismatch"), "{mismatch}");
+        options.snapshot_sha256 = digest;
+        // Valid operands still reach the original history prerequisite. This
+        // fixture intentionally has no history or catalogue to derive.
+        let history = publish(&options).unwrap_err();
+        assert!(history.contains("history unavailable"), "{history}");
+        assert!(!ledger.join(LEDGER_CELLS).exists());
+        assert!(!ledger.join(LEDGER_SCORECARD).exists());
+    }
+
+    #[test]
+    fn two_head_writeback_preserves_attribution_and_refuses_unbound_or_moving_inputs() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let invoker = fixture.options.expected_head.clone();
+        let source_before = read_generated_files(&fixture.root).unwrap();
+        let original_tree =
+            git_no_replace_rev_parse(&fixture.root, &format!("{measured}:detcore")).unwrap();
+        let current_tree = git_no_replace_rev_parse(&fixture.root, "HEAD:detcore").unwrap();
+        assert_ne!(original_tree, current_tree);
+        let expected_depth = source_depths(&fixture.root, &measured).unwrap();
+        let expected_pin = reverie_pin_at(&fixture.root, &measured);
+        // A real replacement ref substitutes a different source and history.
+        // The writer must still bind the measured object's original content.
+        let forged = git(
+            &fixture.root,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit-tree",
+                &git(&fixture.root, &["rev-parse", "HEAD^{tree}"]),
+                "-m",
+                "replacement root",
+            ],
+        );
+        git(&fixture.root, &["replace", &measured, &forged]);
+        assert_eq!(
+            git_rev_parse(&fixture.root, &format!("{measured}:detcore")).unwrap(),
+            current_tree
+        );
+        fixture.publish().unwrap();
+        let written = fixture.cells();
+        let cell = written
+            .cells
+            .iter()
+            .find(|cell| cell.id == fixture.id)
+            .unwrap();
+        let stamp = cell.last_tested.as_ref().unwrap();
+        assert_eq!(stamp.hermit_sha, measured);
+        assert_eq!(stamp.detcore_tree, original_tree);
+        assert_eq!(stamp.depth, expected_depth);
+        assert_eq!(
+            stamp.applicable_when_tested, None,
+            "invoker applicability is not measured-source authority"
+        );
+        assert_eq!(reverie_pin_at(&fixture.root, &measured), expected_pin);
+        let first = read_history_files(&fixture.root).unwrap();
+        fixture.publish().unwrap();
+        assert!(
+            read_history_files(&fixture.root).unwrap() == first,
+            "identical current input must remain idempotent"
+        );
+        git(&fixture.root, &["replace", "-d", &measured]);
+        fixture.restore();
+        let original_row = fixture.row.clone();
+        for case in [
+            "old-default-head",
+            "wrong-source",
+            "unknown-cell",
+            "truncated",
+            "extra-file",
+            "missing-proof",
+        ] {
+            fixture.row = original_row.clone();
+            fixture.publish_inputs();
+            fixture.restore();
+            match case {
+                "old-default-head" => fixture.options.results_head = None,
+                "wrong-source" => fixture.options.results_head = Some(forged.clone()),
+                "unknown-cell" => {
+                    fixture.row["test"] = "fixture/only-at-target".into();
+                    fixture.publish_inputs();
+                }
+                "truncated" => {
+                    fs::write(fixture.options.results.join("results.jsonl"), b"").unwrap();
+                }
+                "extra-file" => {
+                    fs::create_dir(fixture.options.results.join("extra")).unwrap();
+                    fs::write(fixture.options.results.join("extra/results.jsonl"), b"").unwrap();
+                }
+                "missing-proof" => {
+                    let proof = fixture.options.finalized.as_mut().unwrap();
+                    let mut row: JsonValue = read_json(&proof.row).unwrap();
+                    row.as_object_mut()
+                        .unwrap()
+                        .remove("raw_result_input_census_v1");
+                    let bytes = serde_json::to_vec(&row).unwrap();
+                    proof.sha256 = format!("{:x}", Sha256::digest(&bytes));
+                    fs::write(&proof.row, bytes).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(fixture.publish().is_err(), "admitted {case}");
+            assert!(
+                read_history_files(&fixture.root).unwrap() == fixture.baseline,
+                "mutated output for {case}"
+            );
+            fixture.options.results_head = Some(measured.clone());
+            if case == "extra-file" {
+                fs::remove_dir_all(fixture.options.results.join("extra")).unwrap();
+            }
+        }
+        fixture.row = original_row;
+        fixture.publish_inputs();
+        fixture.restore();
+        let mut prior_attempt = fixture.row.clone();
+        prior_attempt["attempt"] = 2.into();
+        fixture.publish_rows(&[fixture.row.clone(), prior_attempt.clone()]);
+        fixture.publish().unwrap();
+        fixture.restore();
+        // A surviving valid latest attempt cannot authenticate loss of the
+        // superseded attempt recorded by the producer before finalization.
+        let mut surviving = serde_json::to_vec(&prior_attempt).unwrap();
+        surviving.push(b'\n');
+        fs::write(fixture.options.results.join("results.jsonl"), surviving).unwrap();
+        assert!(
+            fixture
+                .publish()
+                .unwrap_err()
+                .contains("producer-finalized raw census")
+        );
+        assert!(read_history_files(&fixture.root).unwrap() == fixture.baseline);
+        fixture.publish_inputs();
+        let mut wrong = fixture.row.clone();
+        wrong["hermit_sha"] = invoker.clone().into();
+        wrong["attempt"] = 2.into();
+        let mut mixed = fs::read(fixture.options.results.join("results.jsonl")).unwrap();
+        mixed.extend(serde_json::to_vec(&wrong).unwrap());
+        mixed.push(b'\n');
+        fs::write(fixture.options.results.join("results.jsonl"), mixed).unwrap();
+        assert!(
+            fixture.publish().is_err(),
+            "mixed source population accepted"
+        );
+        assert!(read_history_files(&fixture.root).unwrap() == fixture.baseline);
+        fixture.publish_inputs();
+        let moved = project_and_observe_authorized_with(
+            &fixture.root,
+            &fixture.options,
+            || {
+                // Keep the index/worktree unchanged so this reaches the HEAD
+                // guard instead of the earlier unrelated-source dirt guard.
+                git(
+                    &fixture.root,
+                    &[
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "commit",
+                        "--allow-empty",
+                        "-qm",
+                        "move invocation during writeback",
+                    ],
+                );
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+        let moved_error = moved.unwrap_err();
+        assert!(moved_error.contains("HEAD moved"), "{moved_error}");
+        assert!(read_history_files(&fixture.root).unwrap() == fixture.baseline);
+        git(&fixture.root, &["update-ref", "HEAD", &invoker]);
+        for replacement in [0, 1, 2] {
+            let result_path = fixture.options.results.join("results.jsonl");
+            let mutate = || {
+                fs::write(&result_path, b"changed after admission")
+                    .map_err(|error| error.to_string())
+            };
+            let result = project_and_observe_authorized_with(
+                &fixture.root,
+                &fixture.options,
+                || if replacement == 0 { mutate() } else { Ok(()) },
+                |index| {
+                    if replacement == index {
+                        mutate()
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(
+                result.is_err(),
+                "moving current input accepted at replacement {replacement}"
+            );
+            assert!(
+                read_history_files(&fixture.root).unwrap() == fixture.baseline,
+                "atomic rollback failed at {replacement}"
+            );
+            fixture.publish_inputs();
+        }
+        // The snapshot itself introduces a newer stamp after the transaction
+        // entry snapshot. The old Current result must not overwrite that stamp.
+        let series: SeriesRow=serde_json::from_value(serde_json::json!({
+            "schema":"stress-series/v3","event_id":"newer-snapshot-event","event_type":"series.observation",
+            "emitted_at":"2026-09-20T00:00:00Z","team":"hermit","host":"fixture-host","producer":"validate",
+            "run_id":"newer-snapshot-run","series":{"cell":series_cell_key(&fixture.id),"tree":invoker,
+                "detcore_tree":current_tree,"outcome":"passed","result":"pass","failure_class":null,
+                "run_index":1,"attempt":1,"num_runs":1,"main_ancestry":true,"source_tree_dirty":false,
+                "depth":source_depths(&fixture.root,&invoker).unwrap(),
+                "machine_shortname":"fixture-host","kernel_version":"fixture-kernel",
+                "host_capabilities":{"cpuid-faulting":{"present":true,"evidence":"fixture cpuid probe"},
+                    "kvm":{"present":false,"evidence":"fixture kvm probe"}}}
+        })).unwrap();
+        series.validate_for_read().unwrap();
+        let value =
+            scorecard_snapshot_fixture_value(&"a".repeat(40), &"b".repeat(40), &[series]).unwrap();
+        fixture.options.snapshot_sha256 =
+            write_scorecard_snapshot_fixture(&fixture.options.snapshot, &value).unwrap();
+        fixture.publish().unwrap();
+        let after_snapshot = fixture.cells();
+        let stamped = after_snapshot
+            .cells
+            .iter()
+            .find(|cell| cell.id == fixture.id)
+            .unwrap();
+        assert_eq!(stamped.last_tested.as_ref().unwrap().hermit_sha, invoker);
+        assert!(
+            stamped
+                .observations
+                .iter()
+                .any(|observation| observation.hermit_shas.contains(&measured))
+        );
+        // An unrelated root commit may have arbitrary apparent depth. Without
+        // ancestry it cannot replace the current source stamp.
+        let incomparable = LastTested {
+            hermit_sha: forged,
+            detcore_tree: current_tree.clone(),
+            depth: BTreeMap::new(),
+            check: None,
+            applicable_when_tested: None,
+            comparison_verdict: None,
+        };
+        assert!(
+            !current_source_may_replace_stamp(
+                &fixture.root,
+                Some(&incomparable),
+                &measured,
+                &original_tree
+            )
+            .unwrap()
+        );
+        let empty =
+            scorecard_snapshot_fixture_value(&"a".repeat(40), &"b".repeat(40), &[]).unwrap();
+        fixture.options.snapshot_sha256 =
+            write_scorecard_snapshot_fixture(&fixture.options.snapshot, &empty).unwrap();
+        fixture.restore();
+        // Same source is still a NEW Current run: refresh the check identity,
+        // rather than borrowing retained-import's same-SHA suppression rule.
+        fixture.row["hermit_sha"] = invoker.clone().into();
+        fixture.options.results_head = Some(invoker.clone());
+        fixture.publish_inputs();
+        let mut prior = fixture.cells();
+        let cell = prior
+            .cells
+            .iter_mut()
+            .find(|cell| cell.id == fixture.id)
+            .unwrap();
+        cell.last_tested = Some(LastTested {
+            hermit_sha: invoker.clone(),
+            detcore_tree: current_tree.clone(),
+            depth: BTreeMap::new(),
+            check: None,
+            applicable_when_tested: Some(true),
+            comparison_verdict: None,
+        });
+        let baseline = generated_files(&derive(&fixture.root).unwrap(), &prior).unwrap();
+        fs::write(fixture.ledger.join(LEDGER_SCORECARD), &baseline.scorecard).unwrap();
+        fs::write(fixture.ledger.join(LEDGER_CELLS), &baseline.cells).unwrap();
+        fixture.publish().unwrap();
+        let refreshed = fixture.cells();
+        let stamp = refreshed
+            .cells
+            .iter()
+            .find(|cell| cell.id == fixture.id)
+            .unwrap()
+            .last_tested
+            .as_ref()
+            .unwrap();
+        assert!(stamp.check.is_some());
+        assert_eq!(
+            stamp.comparison_verdict,
+            Some(StampComparisonVerdict::Matched)
+        );
+        // A later invocation of an older measured tree preserves that newer
+        // stamp while retaining the older observation as additional evidence.
+        fixture.row["hermit_sha"] = measured.clone().into();
+        fixture.row["run_id"] = "later-old-source-run".into();
+        fixture.options.results_head = Some(measured.clone());
+        fixture.publish_inputs();
+        fixture.publish().unwrap();
+        let retained = fixture.cells();
+        let cell = retained
+            .cells
+            .iter()
+            .find(|cell| cell.id == fixture.id)
+            .unwrap();
+        assert_eq!(cell.last_tested.as_ref().unwrap().hermit_sha, invoker);
+        assert!(
+            cell.observations
+                .iter()
+                .any(|observation| observation.hermit_shas.contains(&measured))
+        );
+        assert!(
+            read_generated_files(&fixture.root).unwrap() == source_before,
+            "ledger publication must not mutate Hermit's catalogue or page"
+        );
+    }
+}
+
+#[cfg(test)]
+mod evidence_identity_tests {
+    use super::*;
+
+    const ORDINARY: &str = "9bf1be90807ed0c84ae4592759239ad264779bd962a220542cca372d2151f032";
+    const NULL_ERA: &str = "2d5035f82310e8774916d85ebf59afb89634c1e4ba789835166a33b396a8874e";
+
+    // Fixed synthetic failed/no-result input from the real parent transaction
+    // regression. The golden is the parent's immutable ordinary-row identity.
+    fn ordinary() -> ResultRow {
+        serde_json::from_str(r#"{"argv":["hermit","run","--verify","fixture"],"attempt":1,"attempts":[{"argv":["hermit","run","--verify","fixture"],"cwd":"/repo","env":{"LC_ALL":"C"},"error_kind":"incomplete-verification-evidence","guest_argv":["fixture"],"index":"1","outcome":"ERROR","shell_command":"cd /repo && env LC_ALL=C hermit run --verify fixture","signal":null,"status":75,"timed_out":false,"verification_report":"{\"bitwise_parity\":false,\"compared_log_messages\":null,\"comparison\":null,\"first_divergent_left_message\":null,\"first_divergent_record\":null,\"first_divergent_right_message\":null,\"first_divergent_scheduler_turn\":null,\"first_divergent_syscall\":null,\"first_divergent_virtual_nanoseconds\":null,\"guest_exit_code\":null,\"guest_signal\":null,\"infrastructure_error\":null,\"no_result_reason\":{\"kind\":\"not_run\"},\"runtime\":null,\"verdict\":\"no_result\",\"verified\":false}","verification_report_sha256":"0cf756d63a02c73f989586d9f6572c428ce52d55a510ffa4659baab4bdcef405"}],"backend":"ptrace","binary_sha256":"0f533a26257a88f0550ddbabdb318a47f029991cfcf743714ce7f6ee3243105b","category":"fixture","classification":"required","cwd":"/repo","effective_args":["run","--verify","fixture"],"env":{"LC_ALL":"C"},"execution_cpu_timeout_seconds":10,"execution_wall_timeout_seconds":15,"failure_class":"no_result","guest_argv":["fixture"],"hermit_sha":"e6a1657c5cbe966d24f70ae88151471ca3fbd362","lane":"portable","log_level":"info","mode":"verify","outcome":"ERROR","relaxations":[],"result":null,"run_id":"finalized-a","schema":4,"shell_command":"cd /repo && env LC_ALL=C hermit run --verify fixture","source_tree_dirty":false,"test":"fixture/no-result","test_sha256":"f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d","timeout_seconds":15}"#).unwrap()
+    }
+
+    fn parity() -> ResultRow {
+        let mut row: JsonValue = serde_json::from_str(r#"{"argv":["hermit","run","--backend","sabre"],"attempt":1,"attempts":[],"backend":"sabre","binary_sha256":"0f533a26257a88f0550ddbabdb318a47f029991cfcf743714ce7f6ee3243105b","category":"fixture","classification":"required","cwd":"/repo","effective_args":["run","--backend","sabre"],"env":{"LC_ALL":"C"},"execution_cpu_timeout_seconds":10,"execution_wall_timeout_seconds":15,"failure_class":null,"guest_argv":["fixture"],"hermit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","lane":"portable","log_level":"info","mode":"verify","outcome":"PASS","relaxations":[],"result":"pass","run_id":"typed-parity-identity-fixture","schema":4,"shell_command":"cd /repo && env LC_ALL=C hermit run --backend sabre","source_tree_dirty":false,"test":"fixture/no-result","test_sha256":"f16d05ec6b29248d2c61adb1e9263f78e4f7bace1b955014a2d17872cfe4064d","timeout_seconds":15}"#).unwrap();
+        let verification: JsonValue = serde_json::from_str(r#"{"bitwise_parity":true,"compared_log_messages":{"left":1,"right":1},"compared_outputs":{"left":{"exit_code":0,"signal":null,"stderr_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stdout_bytes":1,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"right":{"exit_code":0,"signal":null,"stderr_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stdout_bytes":1,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"comparison":{"canonicalizations":["host-address-to-first-appearance-ordinal/v1"],"canonicalize_addresses":true,"compare_io_buffers":true,"compare_logs":true,"display_name":"BitwiseInfoV1","exact_remainder":true,"full_trace":true,"ignore_lines":false,"log_scope":"info","record_envelope":"all_records_v1","skip_commit":false,"skip_detlog":false,"strictness":"canonical","strip_lines":false,"stripped_prefixes":["real-wall-clock-prefix/v1"],"virtualize_time":true},"first_divergent_left_message":null,"first_divergent_record":null,"first_divergent_right_message":null,"first_divergent_scheduler_turn":null,"first_divergent_syscall":null,"first_divergent_virtual_nanoseconds":null,"guest_exit_code":0,"guest_signal":null,"infrastructure_error":null,"no_result_reason":null,"verdict":"matched","verified":true}"#).unwrap();
+        let report = serde_json::to_string(&verification).unwrap();
+        let mut attempts = Vec::new();
+        for (backend, index) in [("sabre", "1"), ("ptrace", "parity-reference")] {
+            attempts.push(serde_json::json!({
+                "index":index,"outcome":"PASS","error_kind":null,"status":0,
+                "signal":null,"timed_out":false,
+                "argv":["hermit","run","--backend",backend],"guest_argv":["fixture"],
+                "env":{"LC_ALL":"C"},"cwd":"/repo",
+                "shell_command":format!("cd /repo && env LC_ALL=C hermit run --backend {backend}"),
+                "verification_report":report,
+                "verification_report_sha256":format!("{:x}",Sha256::digest(report.as_bytes()))
+            }));
+        }
+        row["attempts"] = serde_json::json!(attempts);
+        let operand = |backend: &str, digest: &str| {
+            serde_json::json!({
+                "backend":backend,"verification":verification,
+                "output":verification["compared_outputs"]["left"],
+                "retained_log":format!("{backend}.log"),"retained_log_sha256":digest.repeat(64)
+            })
+        };
+        row["backend_parity"] = serde_json::json!({
+            "schema":1,"verdict":"matched","reference":operand("ptrace","c"),
+            "candidate":operand("sabre","d"),"comparison":{"schema": 1, "verdict": "matched", "inputs": {"left": {"sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "bytes": 10}, "right": {"sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "bytes": 10}}, "selected_messages": {"left": 1, "right": 1}, "records": {"compared": 1, "available_left": 1, "available_right": 1, "withheld_incomplete_tail": false}, "comparison": {"stream": "info", "record_envelope": "cross_backend_detcore_v1", "unsafe_strip_lines": false, "canonicalize_host_addresses": true, "require_structured_events": true, "ignored_line_substrings": [], "skip_commit": false, "skip_detlog": false, "included_detlog_kinds": ["syscall", "syscall_result", "other"], "git_diff": false}, "first_divergent_scheduler_turn": null, "first_divergent_virtual_nanoseconds": null, "first_divergent_record": null, "first_divergent_syscall": null, "first_divergent_left_message": null, "first_divergent_right_message": null}
+        });
+        serde_json::from_value(row).unwrap()
+    }
+
+    #[test]
+    fn ordinary_identity_keeps_absent_and_null_parity_replay_bytes() {
+        let row = ordinary();
+        row.comparison_evidence().unwrap();
+        assert_eq!(row.evidence_identity().unwrap(), ORDINARY);
+        let explicit_null: ResultRow =
+            serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
+        assert_eq!(explicit_null.evidence_identity().unwrap(), ORDINARY);
+        assert_ne!(ORDINARY, NULL_ERA);
+        let mut changed = row;
+        changed.attempts[0]["status"] = serde_json::json!(74);
+        assert_ne!(changed.evidence_identity().unwrap(), ORDINARY);
+    }
+
+    #[test]
+    fn present_parity_preserves_its_full_typed_witness_identity() {
+        let row = parity();
+        row.comparison_evidence().unwrap();
+        // Independently computed by the unchanged parent's typed serializer.
+        assert_eq!(
+            row.evidence_identity().unwrap(),
+            "9193b921e05087f3768cab0a30625ab20f42b54731c0c5f2caffe2b157b67ee3"
+        );
+        let mut changed = row;
+        let witness = changed.backend_parity.as_mut().unwrap();
+        witness.candidate.retained_log_sha256 = "e".repeat(64);
+        assert!(changed.comparison_evidence().is_err());
+        changed
+            .backend_parity
+            .as_mut()
+            .unwrap()
+            .comparison
+            .inputs
+            .as_mut()
+            .unwrap()
+            .right
+            .sha256 = "e".repeat(64);
+        changed.comparison_evidence().unwrap();
+        assert_ne!(
+            changed.evidence_identity().unwrap(),
+            "9193b921e05087f3768cab0a30625ab20f42b54731c0c5f2caffe2b157b67ee3"
+        );
+    }
+
+    #[test]
+    fn unresolved_null_era_receipt_is_preserved_and_refused() {
+        let row = ordinary();
+        let source: SeriesRow = serde_json::from_str(r#"{"emitted_at":"2026-09-21T12:00:00Z","event_id":"series-b5769c0e4c118dcfde4edc338197faa6d73103fbccacd2f58186473168870bb5","event_type":"series.observation","host":"fixture","producer":"validate","run_id":"finalized-a","schema":"stress-series/v3","series":{"attempt":1,"cell":"fixture/no-result/verify/ptrace","depth":{"hermit":{"commits":2,"first_parent":2}},"detcore_tree":"6dcaa1b03f8a53bc21bf714b2a0465845994b680","failure_class":"no_result","host_capabilities":{"cpuid-faulting":{"evidence":"Synthetic fixture — no hardware probe","present":false},"kvm":{"evidence":"Synthetic fixture — no hardware probe","present":false}},"kernel_version":"fixture-no-execution","machine_shortname":"fixture","main_ancestry":true,"no_verdict_evidence":{"attempts":[{"attempt_outcome":"ERROR","disposition":"no_result","error_kind":"incomplete-verification-evidence","index":"1","kind":"not_run","signal":null,"status":75,"timed_out":false,"verification_report_sha256":"0cf756d63a02c73f989586d9f6572c428ce52d55a510ffa4659baab4bdcef405"}],"evidence_sha256":"9bf1be90807ed0c84ae4592759239ad264779bd962a220542cca372d2151f032"},"num_runs":1,"outcome":"no_result","result":null,"run_index":1,"runtime":{"wall_time_max_ms":null,"wall_time_min_ms":null},"source_tree_dirty":false,"tree":"e6a1657c5cbe966d24f70ae88151471ca3fbd362"},"team":"hermit"}"#).unwrap();
+        let mut tracked: TrackedCells = serde_json::from_value(serde_json::json!({
+            "schema":8,"cells":[{"lane":row.lane,"category":row.category,"test":row.test,
+            "mode":row.mode,"backend":row.backend,"status":"green",
+            "measurement":"measured-no-verdict","observations":[{
+                "detcore_tree":source.series.detcore_tree,"provenance":"validate",
+                "hermit_shas":[row.hermit_sha],"results":[],"invocations":[{
+                    "hermit_sha":row.hermit_sha,"run_id":row.run_id,"attempt":1,
+                    "evidence_sha256":ORDINARY,"argv":row.argv,"guest_argv":row.guest_argv,
+                    "env":row.env,"cwd":row.cwd,"shell_command":row.shell_command,
+                    "attempts":row.attempts
+                }]
+            }]}]
+        }))
+        .unwrap();
+        let rows = [source];
+        let exact = direct_representation(&tracked, &rows, &CurrentResultAttempts::new()).unwrap();
+        assert_eq!(
+            exact.represented_event_ids,
+            BTreeSet::from([rows[0].event_id.clone()])
+        );
+        assert!(!exact.has_unrepresented_direct_evidence);
+        let observations = &mut tracked.cells[0].observations;
+        let mut old = observations[0].invocations.pop_first().unwrap();
+        old.evidence_sha256 = Some(NULL_ERA.into());
+        observations[0].invocations.insert(old);
+        let before = serde_json::to_vec(&tracked).unwrap();
+        let error =
+            direct_representation(&tracked, &rows, &CurrentResultAttempts::new()).unwrap_err();
+        assert!(
+            error.contains("disagrees with its exact direct result or outer attempt"),
+            "{error}"
+        );
+        assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
     }
 }

@@ -55,71 +55,328 @@ fn hex_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn collect_results_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = fs::read_dir(path).map_err(|error| {
+/// An ordinary read and its optional custody evidence. Authority failures never
+/// replace the bytes used by the existing ordinary and schema-10 parsers.
+pub struct CapturedResults {
+    root: PathBuf,
+    inputs: Result<BTreeMap<PathBuf, Vec<u8>>, String>,
+    custody: Result<Vec<HeldInput>, String>,
+}
+
+/// Hold a named inode without accepting symlinks, foreign ownership or file
+/// hard links. Directories are held as well as files so renaming an ancestor
+/// cannot silently substitute a different result population.
+pub struct HeldInput {
+    path: PathBuf,
+    file: fs::File,
+    identity: (u64, u64, u32, u32),
+}
+
+impl HeldInput {
+    pub fn open(path: &Path, directory: bool, private: bool) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                libc::O_NOFOLLOW | libc::O_NONBLOCK | if directory { libc::O_DIRECTORY } else { 0 },
+            )
+            .open(path)
+            .map_err(|error| format!("cannot hold {}: {error}", path.display()))?;
+        Self::from_file(path, file, directory, private)
+    }
+
+    fn from_file(
+        path: &Path,
+        file: fs::File,
+        directory: bool,
+        private: bool,
+    ) -> Result<Self, String> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.is_dir() != directory
+            || (!directory && (!metadata.is_file() || metadata.nlink() != 1))
+            || (private && metadata.mode() & 0o077 != 0)
+        {
+            return Err(format!(
+                "{} is not an owned {} inode",
+                path.display(),
+                if directory {
+                    "directory"
+                } else {
+                    "single-link regular file"
+                }
+            ));
+        }
+        let held = Self {
+            path: path.into(),
+            file,
+            identity: (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mode(),
+                metadata.uid(),
+            ),
+        };
+        held.recheck()?;
+        Ok(held)
+    }
+
+    pub fn create_directory(path: &Path, private: bool) -> Result<Self, String> {
+        use std::os::unix::fs::DirBuilderExt;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let mut builder = fs::DirBuilder::new();
+        if private {
+            builder.mode(0o700);
+        }
+        builder.create(path).map_err(|error| {
+            format!(
+                "fresh result authority requires create-new {}: {error}",
+                path.display()
+            )
+        })?;
+        Self::open(path, true, private)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn recheck(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        for metadata in [
+            self.file.metadata().map_err(|error| error.to_string())?,
+            fs::symlink_metadata(&self.path)
+                .map_err(|error| format!("cannot recheck {}: {error}", self.path.display()))?,
+        ] {
+            if (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mode(),
+                metadata.uid(),
+            ) != self.identity
+                || (!metadata.is_dir() && metadata.nlink() != 1)
+            {
+                return Err(format!(
+                    "held/named identity changed: {}",
+                    self.path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn read(&self) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        use std::os::unix::fs::FileExt;
+        self.recheck()?;
+        let mut bytes = Vec::new();
+        let mut offset = 0;
+        let mut buffer = [0; 8192];
+        loop {
+            let count = self
+                .file
+                .read_at(&mut buffer, offset)
+                .map_err(|error| format!("cannot read held {}: {error}", self.path.display()))?;
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            offset += count as u64;
+        }
+        // Reopen the name independently. The bytes as well as the identity
+        // must agree; same-size in-place edits are not an identity change.
+        let named = Self::open(&self.path, false, false)?;
+        let mut named_bytes = Vec::new();
+        (&named.file)
+            .read_to_end(&mut named_bytes)
+            .map_err(|error| error.to_string())?;
+        if named.identity != self.identity || named_bytes != bytes {
+            return Err(format!("held/named bytes changed: {}", self.path.display()));
+        }
+        self.recheck()?;
+        Ok(bytes)
+    }
+}
+
+fn collect_snapshot_paths(
+    path: &Path,
+    files: &mut Vec<PathBuf>,
+    custody: &mut Result<Vec<HeldInput>, String>,
+) -> Result<(), String> {
+    keep_custody(custody, HeldInput::open(path, true, false));
+    for entry in fs::read_dir(path).map_err(|error| {
         format!(
             "cannot read per-cell result root {}: {error}",
             path.display()
         )
-    })?;
-    for entry in entries {
+    })? {
         let entry = entry.map_err(|error| format!("cannot read per-cell result entry: {error}"))?;
-        let file_type = entry
+        let kind = entry
             .file_type()
             .map_err(|error| format!("cannot classify {}: {error}", entry.path().display()))?;
-        if file_type.is_dir() {
-            collect_results_files(&entry.path(), output)?;
-        } else if file_type.is_file() && entry.file_name() == "results.jsonl" {
-            output.push(entry.path());
+        if kind.is_dir() {
+            collect_snapshot_paths(&entry.path(), files, custody)?;
+        } else if kind.is_file() && entry.file_name() == "results.jsonl" {
+            files.push(entry.path());
+        } else if kind.is_symlink() && custody.is_ok() {
+            // The legacy reader ignores links. That behavior remains ordinary
+            // evidence, but cannot attest complete rooted input membership.
+            *custody = Err(format!(
+                "raw result authority encountered a link: {}",
+                entry.path().display()
+            ));
         }
     }
     Ok(())
 }
 
-fn read_result_rows(path: &Path) -> Result<Vec<(PathBuf, usize, Value)>, String> {
-    read_result_rows_with(path, false)
-}
-
-fn read_result_rows_with(
-    path: &Path,
-    schema10: bool,
-) -> Result<Vec<(PathBuf, usize, Value)>, String> {
-    let mut files = Vec::new();
-    collect_results_files(path, &mut files)?;
-    files.sort();
-    let mut rows = Vec::new();
-    for file in files {
-        let text = fs::read_to_string(&file)
-            .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
-        for (line_number, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let parsed = if schema10 {
-                hermit_manifest_plan::ledger::read_schema10_source_result(line.as_bytes())
-            } else {
-                serde_json::from_str(line).map_err(|error| error.to_string())
-            };
-            let row = parsed.map_err(|error| {
-                format!(
-                    "{}:{} malformed result row: {error}",
-                    file.display(),
-                    line_number + 1
-                )
-            })?;
-            rows.push((file.clone(), line_number + 1, row));
+fn keep_custody(custody: &mut Result<Vec<HeldInput>, String>, input: Result<HeldInput, String>) {
+    if let Ok(held) = custody {
+        match input {
+            Ok(input) => held.push(input),
+            Err(error) => *custody = Err(error),
         }
     }
-    Ok(rows)
 }
 
-/// Read every retained cell attempt from the harness's appended result files.
-///
-/// This is the same population `retain` validates. Keeping one reader prevents
-/// the history writer from silently omitting retries that the terminal-verdict
-/// projection deliberately reduces to the latest attempt.
+impl CapturedResults {
+    pub fn capture(root: &Path) -> Self {
+        use std::io::Read;
+        let mut custody = Ok(Vec::new());
+        let inputs = (|| {
+            let mut files = Vec::new();
+            collect_snapshot_paths(root, &mut files, &mut custody)?;
+            files.sort();
+            let mut inputs = BTreeMap::new();
+            for path in files {
+                // Preserve ordinary open/read semantics. A separate held
+                // descriptor may refuse authority without suppressing this read.
+                let mut file = fs::File::open(&path)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+                let held = file
+                    .try_clone()
+                    .map_err(|error| error.to_string())
+                    .and_then(|file| HeldInput::from_file(&path, file, false, false));
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+                keep_custody(&mut custody, held);
+                inputs.insert(
+                    path.strip_prefix(root)
+                        .map_err(|error| error.to_string())?
+                        .into(),
+                    bytes,
+                );
+            }
+            Ok(inputs)
+        })();
+        Self {
+            root: root.into(),
+            inputs,
+            custody,
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn rows(&self, schema10: bool) -> Result<Vec<(PathBuf, usize, Value)>, String> {
+        let mut rows = Vec::new();
+        for (relative, bytes) in self.inputs.as_ref().map_err(Clone::clone)? {
+            let file = self.root.join(relative);
+            let text = std::str::from_utf8(bytes)
+                .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+            for (number, line) in text.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let parsed = if schema10 {
+                    hermit_manifest_plan::ledger::read_schema10_source_result(line.as_bytes())
+                } else {
+                    serde_json::from_str(line).map_err(|error| error.to_string())
+                };
+                rows.push((
+                    file.clone(),
+                    number + 1,
+                    parsed.map_err(|error| {
+                        format!(
+                            "{}:{} malformed result row: {error}",
+                            file.display(),
+                            number + 1
+                        )
+                    })?,
+                ));
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn all_rows(&self) -> Result<Vec<Value>, String> {
+        self.rows(false)
+            .map(|rows| rows.into_iter().map(|(_, _, row)| row).collect())
+    }
+
+    pub fn census(
+        &self,
+        run_id: &str,
+        commit: &str,
+        expected_files: &BTreeSet<PathBuf>,
+    ) -> Result<hermit_manifest_plan::ledger::RawResultInputCensusV1, String> {
+        let inputs = self.inputs.as_ref().map_err(Clone::clone)?;
+        if inputs.keys().cloned().collect::<BTreeSet<_>>() != *expected_files {
+            return Err("raw input membership differs from completed harness publishers".into());
+        }
+        let held = self.custody.as_ref().map_err(Clone::clone)?;
+        for input in held {
+            input.recheck()?;
+        }
+        let mut current_files = Vec::new();
+        let mut current_custody = Ok(Vec::new());
+        collect_snapshot_paths(&self.root, &mut current_files, &mut current_custody)?;
+        current_custody?;
+        let current_files = current_files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&self.root)
+                    .map(Path::to_path_buf)
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if current_files != *expected_files {
+            return Err("raw input membership changed before publication".into());
+        }
+        for input in held {
+            if let Ok(relative) = input.path.strip_prefix(&self.root) {
+                if let Some(bytes) = inputs.get(relative) {
+                    if input.read()? != *bytes {
+                        return Err(format!(
+                            "raw input bytes changed before publication: {}",
+                            relative.display()
+                        ));
+                    }
+                }
+            }
+            input.recheck()?;
+        }
+        let inputs = inputs
+            .iter()
+            .map(|(path, bytes)| {
+                path.to_str()
+                    .map(|path| (path.to_owned(), bytes.clone()))
+                    .ok_or_else(|| "raw result path is not UTF-8".to_owned())
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        hermit_manifest_plan::ledger::RawResultInputCensusV1::from_inputs(run_id, commit, &inputs)
+    }
+}
+
+#[cfg(test)]
 pub fn all_result_rows(path: &Path) -> Result<Vec<Value>, String> {
-    read_result_rows(path).map(|rows| rows.into_iter().map(|(_, _, row)| row).collect())
+    CapturedResults::capture(path).all_rows()
 }
 
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -653,9 +910,24 @@ pub fn retain_coverage_evidence(
 
 /// Transform all result rows for one validate invocation into the closed
 /// schema-7 cell-verdict artifact and summary used by ci-hub.
+#[cfg(test)]
 pub fn retain(
     parent: &Path,
     result_root: &Path,
+    commit: &str,
+    expected: &[Value],
+) -> Result<RetainedCellResults, String> {
+    retain_snapshot(
+        parent,
+        &CapturedResults::capture(result_root),
+        commit,
+        expected,
+    )
+}
+
+pub fn retain_snapshot(
+    parent: &Path,
+    snapshot: &CapturedResults,
     commit: &str,
     expected: &[Value],
 ) -> Result<RetainedCellResults, String> {
@@ -664,7 +936,7 @@ pub fn retain(
     let mut identities = BTreeSet::new();
     let mut observations = BTreeSet::new();
     let mut attempt_rows: BTreeMap<CellIdentity, Vec<(u64, Value)>> = BTreeMap::new();
-    for (file, line_number, row) in read_result_rows(result_root)? {
+    for (file, line_number, row) in snapshot.rows(false)? {
         if row.get("schema").and_then(Value::as_u64) != Some(4)
             || string(&row, "hermit_sha")? != commit
             || row.get("source_tree_dirty").and_then(Value::as_bool) != Some(false)
@@ -829,15 +1101,24 @@ pub fn retain(
 /// Retain full parity attempts in the immutable artifact and only derived,
 /// path-free summaries in schema 10. Ordinary and parity outcomes remain
 /// separate, and the selected population comes from the pre-execution plan.
+#[cfg(test)]
 pub fn retain_v10(
     parent: &Path,
     result_root: &Path,
     plan: &hermit_manifest_plan::ledger::ConstructedValidationPlanV10,
 ) -> Result<RetainedCellResults, String> {
+    retain_v10_snapshot(parent, &CapturedResults::capture(result_root), plan)
+}
+
+pub fn retain_v10_snapshot(
+    parent: &Path,
+    snapshot: &CapturedResults,
+    plan: &hermit_manifest_plan::ledger::ConstructedValidationPlanV10,
+) -> Result<RetainedCellResults, String> {
     // Deploy only after the published parent readers have been activated.
     retain_v10_with_contract(
         parent,
-        result_root,
+        snapshot,
         plan,
         CellBindingContract::SelectedAttemptV1,
     )
@@ -852,7 +1133,7 @@ pub fn retain_v10_legacy(
 ) -> Result<RetainedCellResults, String> {
     retain_v10_with_contract(
         parent,
-        result_root,
+        &CapturedResults::capture(result_root),
         plan,
         CellBindingContract::LegacyUnbound,
     )
@@ -860,7 +1141,7 @@ pub fn retain_v10_legacy(
 
 fn retain_v10_with_contract(
     parent: &Path,
-    result_root: &Path,
+    snapshot: &CapturedResults,
     plan: &hermit_manifest_plan::ledger::ConstructedValidationPlanV10,
     binding_contract: CellBindingContract,
 ) -> Result<RetainedCellResults, String> {
@@ -876,7 +1157,7 @@ fn retain_v10_with_contract(
         .collect::<BTreeSet<_>>();
     let mut rows = BTreeMap::<CellIdentity, Vec<(u64, Value)>>::new();
     let mut seen = BTreeSet::new();
-    for (file, line, row) in read_result_rows_with(result_root, true)? {
+    for (file, line, row) in snapshot.rows(true)? {
         if row.get("schema").and_then(Value::as_u64) != Some(4)
             || string(&row, "hermit_sha")? != plan.hermit_sha
             || string(&row, "run_id")? != plan.run_id
@@ -945,7 +1226,8 @@ fn retain_v10_with_contract(
         };
         let cpu_observation_history =
             hermit_manifest_plan::cpu_evidence::CellCpuHistoryV1::from_source_rows(&rows)?;
-        if binding_contract == CellBindingContract::LegacyUnbound && cpu_observation_history.is_some()
+        if binding_contract == CellBindingContract::LegacyUnbound
+            && cpu_observation_history.is_some()
         {
             return Err("legacy cell artifact cannot retain present CPU observations".into());
         }
@@ -2492,5 +2774,185 @@ mod tests {
                 "{pointer}"
             );
         }
+    }
+
+    #[test]
+    fn raw_snapshot_keeps_empty_files_original_bytes_and_superseded_attempts() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("raw");
+        fs::create_dir_all(root.join("empty")).unwrap();
+        fs::create_dir_all(root.join("bucket")).unwrap();
+        fs::write(root.join("empty/results.jsonl"), b"").unwrap();
+        let commit = "abababababababababababababababababababab";
+        let mut first = result_row("captured-run", commit);
+        first["attempt"] = 1.into();
+        first["outcome"] = "FAIL".into();
+        let mut second = result_row("captured-run", commit);
+        second["attempt"] = 2.into();
+        let bytes = format!("\n{first}\n \t\n{second}\n").into_bytes();
+        fs::write(root.join("bucket/results.jsonl"), &bytes).unwrap();
+        let snapshot = CapturedResults::capture(&root);
+        let members = ["bucket/results.jsonl", "empty/results.jsonl"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let census = snapshot.census("captured-run", commit, &members).unwrap();
+        assert_eq!(census.files.len(), 2);
+        assert_eq!(census.files[0].bytes, bytes.len() as u64);
+        assert_eq!(census.files[0].sha256, hex_digest(&bytes));
+        assert_eq!(
+            census.files[0]
+                .rows
+                .iter()
+                .map(|row| (row.line, row.attempt))
+                .collect::<Vec<_>>(),
+            vec![(2, 1), (4, 2)]
+        );
+        assert_eq!(census.files[1].bytes, 0);
+        assert!(census.files[1].rows.is_empty());
+        assert_eq!(snapshot.all_rows().unwrap(), vec![first, second.clone()]);
+        let projection =
+            retain_snapshot(parent.path(), &snapshot, commit, &expected(&second)).unwrap();
+        assert_eq!(projection.evidence["recorded_count"], 1);
+        assert_eq!(
+            projection.evidence["cells"][0]["cell_verdict"]["state"],
+            "compared-and-matched"
+        );
+        // A late authority refusal does not replace the snapshot's ordinary projection.
+        fs::write(
+            root.join("bucket/results.jsonl"),
+            b"malformed late replacement\n",
+        )
+        .unwrap();
+        assert!(snapshot.census("captured-run", commit, &members).is_err());
+        assert_eq!(snapshot.all_rows().unwrap().len(), 2);
+        assert_eq!(snapshot.all_rows().unwrap()[1], second);
+    }
+
+    #[test]
+    fn raw_snapshot_final_fence_rejects_membership_inode_and_same_size_changes() {
+        for opponent in [
+            "same-size",
+            "same-bytes-new-inode",
+            "append",
+            "add-empty",
+            "rename-empty",
+            "remove-empty",
+            "root-replacement",
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let root = parent.path().join("raw");
+            fs::create_dir_all(root.join("empty")).unwrap();
+            fs::write(root.join("empty/results.jsonl"), b"").unwrap();
+            let commit = "abababababababababababababababababababab";
+            let mut row = result_row("captured-run", commit);
+            row["attempt"] = 1.into();
+            let bytes = format!("{row}\n").into_bytes();
+            let path = root.join("results.jsonl");
+            fs::write(&path, &bytes).unwrap();
+            let snapshot = CapturedResults::capture(&root);
+            let members = ["empty/results.jsonl", "results.jsonl"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
+            snapshot.census("captured-run", commit, &members).unwrap();
+            match opponent {
+                "same-size" => {
+                    let changed = String::from_utf8(bytes.clone())
+                        .unwrap()
+                        .replace("\"PASS\"", "\"FAIL\"");
+                    assert_eq!(changed.len(), bytes.len());
+                    assert_ne!(changed.as_bytes(), bytes);
+                    fs::write(&path, changed).unwrap();
+                }
+                "same-bytes-new-inode" => {
+                    fs::rename(&path, root.join("old-input")).unwrap();
+                    fs::write(&path, &bytes).unwrap();
+                }
+                "append" => fs::write(&path, [bytes.as_slice(), b"\n"].concat()).unwrap(),
+                "add-empty" => {
+                    fs::create_dir(root.join("new")).unwrap();
+                    fs::write(root.join("new/results.jsonl"), b"").unwrap();
+                }
+                "rename-empty" => fs::rename(root.join("empty"), root.join("renamed")).unwrap(),
+                "remove-empty" => fs::remove_file(root.join("empty/results.jsonl")).unwrap(),
+                "root-replacement" => {
+                    fs::rename(&root, parent.path().join("old-root")).unwrap();
+                    fs::create_dir_all(root.join("empty")).unwrap();
+                    fs::write(&path, &bytes).unwrap();
+                    fs::write(root.join("empty/results.jsonl"), b"").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                snapshot.census("captured-run", commit, &members).is_err(),
+                "{opponent}"
+            );
+            assert_eq!(snapshot.all_rows().unwrap(), vec![row], "{opponent}");
+        }
+    }
+
+    #[test]
+    fn raw_snapshot_preserves_legacy_parser_and_caches_real_read_failures() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("missing");
+        let failed = CapturedResults::capture(&missing);
+        fs::create_dir(&missing).unwrap();
+        fs::write(
+            missing.join("results.jsonl"),
+            b"{\"value\":1,\"value\":2}\n",
+        )
+        .unwrap();
+        assert!(
+            failed.all_rows().is_err(),
+            "later input cannot repair a failed acquisition"
+        );
+        assert!(
+            failed
+                .census("run", &"a".repeat(40), &BTreeSet::new())
+                .is_err()
+        );
+        let captured = CapturedResults::capture(&missing);
+        assert_eq!(
+            captured.all_rows().unwrap(),
+            vec![serde_json::json!({"value":2})]
+        );
+        assert!(captured.rows(true).unwrap_err().contains("duplicate field"));
+    }
+
+    #[test]
+    fn raw_snapshot_custody_refusal_leaves_ordinary_symlink_root_readable() {
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("results.jsonl"), b"{\"ordinary\":true}\n").unwrap();
+        let alias = parent.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let snapshot = CapturedResults::capture(&alias);
+        assert_eq!(
+            snapshot.all_rows().unwrap(),
+            vec![serde_json::json!({"ordinary":true})]
+        );
+        assert!(
+            snapshot
+                .census(
+                    "run",
+                    &"a".repeat(40),
+                    &[PathBuf::from("results.jsonl")].into_iter().collect()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn raw_authority_requires_create_new_root_and_retains_its_identity() {
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("private");
+        let held = HeldInput::create_directory(&path, true).unwrap();
+        assert!(HeldInput::create_directory(&path, true).is_err());
+        held.recheck().unwrap();
+        fs::rename(&path, parent.path().join("old")).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(held.recheck().is_err());
     }
 }

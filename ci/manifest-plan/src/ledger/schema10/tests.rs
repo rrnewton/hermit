@@ -879,14 +879,79 @@ fn generated_plan_populations_preserve_command_policy() {
 
 #[test]
 fn focused_profile_round_trips_without_accepting_unknown_spellings() {
-    for name in ["quick", "full", "super", "cell-requalification"] {
+    for name in [
+        "quick",
+        "full",
+        "super",
+        "cell-requalification",
+        "only-quick",
+        "only-full",
+        "only-portable",
+        "only-hosted-portable",
+    ] {
         let encoded = serde_json::to_string(name).unwrap();
         let path: ValidatePath = serde_json::from_str(&encoded).unwrap();
         assert_eq!(path.as_str(), name);
         assert_eq!(serde_json::to_string(&path).unwrap(), encoded);
     }
-    for unknown in ["cellrequalification", "targeted", "unknown-profile"] {
+    for unknown in [
+        "cellrequalification",
+        "targeted",
+        "unknown-profile",
+        "only-custom",
+        "only-hosted",
+        "only-",
+    ] {
         assert!(serde_json::from_value::<ValidatePath>(unknown.into()).is_err());
+    }
+}
+
+#[test]
+fn selected_only_profiles_keep_schema_and_scope_at_the_verifier_boundary() {
+    for path in [
+        ValidatePath::OnlyQuick,
+        ValidatePath::OnlyFull,
+        ValidatePath::OnlyPortable,
+        ValidatePath::OnlyHostedPortable,
+    ] {
+        let (mut row, plan, cells, tests) = fixture_with_path(
+            parity(vec![completed(1, BackendParityVerdict::Matched)]),
+            path,
+        );
+        row.selection_mode = Some("only".into());
+        row.full_coverage = Some(false);
+        row.verify_schema10_artifact_bytes(&plan, &cells, &tests)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.profile.as_deref(), Some(path.as_str()));
+        assert_eq!(row.full_coverage, Some(false));
+        for mode in [None, Some("label"), Some("selected"), Some("full")] {
+            let mut changed = row.clone();
+            changed.selection_mode = mode.map(str::to_owned);
+            assert!(
+                changed
+                    .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+                    .is_err()
+            );
+        }
+        for claimed_profile in ["full", "quick"] {
+            let mut changed = row.clone();
+            changed.profile = Some(claimed_profile.into());
+            assert!(
+                changed
+                    .verify_schema10_artifact_bytes(&plan, &cells, &tests)
+                    .is_err()
+            );
+        }
+        for schema in [8, 9] {
+            let mut changed = row.clone();
+            changed.schema_version = Some(schema);
+            assert!(changed.cell_results_evidence().is_none());
+            assert!(changed.cell_results_validate_path().is_none());
+            if schema == 9 {
+                assert!(changed.test_results_evidence().is_err());
+            }
+        }
     }
 }
 
@@ -1646,4 +1711,365 @@ fn cpu_history_is_authenticated_without_changing_compact_verdicts() {
         legacy["cpu_observation_history"] = extension;
         assert!(serde_json::from_value::<LegacyCellArtifactResultV10Wire>(legacy.clone()).is_err());
     }
+}
+
+// Pure-data controls for the shared semantic verifier. These values never
+// establish canonical origin or grant a durable history-proof capability.
+fn finalized_raw_inputs(row: &mut HistoryRow, attempts: &[u64]) -> BTreeMap<String, Vec<u8>> {
+    let id = identity();
+    let mut raw = Vec::new();
+    for attempt in attempts {
+        raw.extend(
+            serde_json::to_vec(&serde_json::json!({
+                "schema":4, "run_id":row.run_id, "hermit_sha":row.commit,
+                "source_tree_dirty":false, "lane":id.lane, "category":id.category,
+                "test":id.test, "mode":id.mode, "backend":id.backend,
+                "attempt":attempt, "outcome":"FAIL"
+            }))
+            .unwrap(),
+        );
+        raw.push(b'\n');
+    }
+    let inputs = BTreeMap::from([
+        ("rows/results.jsonl".into(), raw),
+        ("empty/results.jsonl".into(), Vec::new()),
+    ]);
+    let census = RawResultInputCensusV1::from_inputs(
+        row.run_id.as_deref().unwrap(),
+        row.commit.as_deref().unwrap(),
+        &inputs,
+    )
+    .unwrap();
+    row.extra.insert(
+        "raw_result_input_census_v1".into(),
+        serde_json::to_value(census).unwrap(),
+    );
+    row.commit_anchored = Some(true);
+    row.started_at = Some("producer-start".into());
+    row.finished_at = Some("producer-finish".into());
+    row.result = Some("fail".into());
+    inputs
+}
+
+#[test]
+fn finalized_raw_verifier_preserves_partial_failure_and_checks_terminal_identity() {
+    let mut row: HistoryRow = serde_json::from_value(serde_json::json!({
+        "schema_version":5,"run_id":"partial-run","commit":"a".repeat(40),
+        "tree_dirty":false,"executed_tests":null,"gates_expected":3,"gates_run":1,
+        "unaccounted_nodes":["test.not-run"]
+    }))
+    .unwrap();
+    let inputs = finalized_raw_inputs(&mut row, &[1, 2]);
+    let encoded = serde_json::to_vec(&row).unwrap();
+    assert!(
+        !row.verify_finalized_raw_input_bytes(&"a".repeat(40), "producer-start", &inputs, None)
+            .unwrap()
+    );
+    assert_eq!(serde_json::to_vec(&row).unwrap(), encoded);
+    assert_eq!(row.result.as_deref(), Some("fail"));
+    assert_eq!(row.executed_tests, None);
+    assert_eq!(row.gates_expected, Some(3));
+    assert_eq!(row.gates_run, Some(1));
+    let mut no_result = row.clone();
+    no_result.result = Some("no_result".into());
+    assert!(
+        !no_result
+            .verify_finalized_raw_input_bytes(&"a".repeat(40), "producer-start", &inputs, None)
+            .unwrap()
+    );
+    for field in [
+        "commit",
+        "tree_dirty",
+        "commit_anchored",
+        "started_at",
+        "finished_at",
+        "result",
+    ] {
+        let mut bad = row.clone();
+        match field {
+            "commit" => bad.commit = Some("b".repeat(40)),
+            "tree_dirty" => bad.tree_dirty = Some(true),
+            "commit_anchored" => bad.commit_anchored = None,
+            "started_at" => bad.started_at = Some("different-start".into()),
+            "finished_at" => bad.finished_at = None,
+            "result" => bad.result = Some("running".into()),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            bad.verify_finalized_raw_input_bytes(&"a".repeat(40), "producer-start", &inputs, None)
+                .unwrap_err(),
+            "finalized row does not bind a terminal clean measured run and its stamp",
+            "{field}"
+        );
+    }
+    let mut missing_run = row.clone();
+    missing_run.run_id = None;
+    assert_eq!(
+        missing_run
+            .verify_finalized_raw_input_bytes(&"a".repeat(40), "producer-start", &inputs, None)
+            .unwrap_err(),
+        "finalized row omitted its run identity"
+    );
+    let mut wrong_run = row.clone();
+    wrong_run.run_id = Some("another-run".into());
+    assert_eq!(
+        wrong_run
+            .verify_finalized_raw_input_bytes(&"a".repeat(40), "producer-start", &inputs, None)
+            .unwrap_err(),
+        "raw result census has an unsupported version or row identity"
+    );
+}
+
+#[test]
+fn finalized_raw_verifier_keeps_complete_census_and_error_refusals() {
+    let mut row: HistoryRow = serde_json::from_value(serde_json::json!({
+        "schema_version":5,"run_id":"partial-run","commit":"a".repeat(40),"tree_dirty":false
+    }))
+    .unwrap();
+    let inputs = finalized_raw_inputs(&mut row, &[1, 2]);
+    assert!(
+        !row.verify_finalized_raw_input_bytes(&"a".repeat(40), "producer-start", &inputs, None)
+            .unwrap()
+    );
+    for change in [
+        "empty-file",
+        "superseded-attempt",
+        "renamed",
+        "extra",
+        "truncated",
+    ] {
+        let mut changed = inputs.clone();
+        match change {
+            "empty-file" => {
+                changed.remove("empty/results.jsonl");
+            }
+            "superseded-attempt" => {
+                let raw = changed.get_mut("rows/results.jsonl").unwrap();
+                let end = raw.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+                raw.drain(..end);
+            }
+            "renamed" => {
+                let bytes = changed.remove("rows/results.jsonl").unwrap();
+                changed.insert("renamed/results.jsonl".into(), bytes);
+            }
+            "extra" => {
+                changed.insert("extra/results.jsonl".into(), Vec::new());
+            }
+            "truncated" => {
+                changed.get_mut("rows/results.jsonl").unwrap().pop();
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            row.verify_finalized_raw_input_bytes(&"a".repeat(40), "producer-start", &changed, None)
+                .unwrap_err(),
+            "current result population or bytes differ from the producer-finalized raw census",
+            "{change}"
+        );
+    }
+    let mut bad = row.clone();
+    bad.extra.remove("raw_result_input_census_v1");
+    assert!(
+        bad.verify_finalized_raw_input_bytes(&"a".repeat(40), "producer-start", &inputs, None)
+            .unwrap_err()
+            .starts_with("finalized run has no producer-bound raw input census:")
+    );
+    let mut bad = row.clone();
+    bad.extra.insert(
+        "raw_result_input_census_error".into(),
+        Value::String("publication failed".into()),
+    );
+    assert_eq!(
+        bad.verify_finalized_raw_input_bytes(&"a".repeat(40), "producer-start", &inputs, None)
+            .unwrap_err(),
+        "raw result census cannot carry both proof and publication error"
+    );
+    let empty_inputs = finalized_raw_inputs(&mut row, &[]);
+    assert_eq!(
+        row.verify_finalized_raw_input_bytes(
+            &"a".repeat(40),
+            "producer-start",
+            &empty_inputs,
+            None
+        )
+        .unwrap_err(),
+        "zero-current proof requires schema 10"
+    );
+}
+
+#[test]
+fn finalized_raw_verifier_checks_recorded_population_selected_attempt_and_all_artifacts() {
+    let (mut row, plan, cells, tests) =
+        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let inputs = finalized_raw_inputs(&mut row, &[1, 2]);
+    assert!(
+        !row.verify_finalized_raw_input_bytes(
+            &"a".repeat(40),
+            "producer-start",
+            &inputs,
+            Some((&plan, &cells, &tests))
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        row.verify_finalized_raw_input_bytes(&"a".repeat(40), "producer-start", &inputs, None)
+            .unwrap_err(),
+        "finalized proof omitted required plan/cell/test artifact bytes"
+    );
+    for which in 0..3 {
+        let mut artifacts = [plan.clone(), cells.clone(), tests.clone()];
+        artifacts[which].push(b' ');
+        assert!(
+            row.verify_finalized_raw_input_bytes(
+                &"a".repeat(40),
+                "producer-start",
+                &inputs,
+                Some((&artifacts[0], &artifacts[1], &artifacts[2]))
+            )
+            .is_err(),
+            "artifact {which}"
+        );
+    }
+    let mut selected_missing = row.clone();
+    let only_later = finalized_raw_inputs(&mut selected_missing, &[2]);
+    assert_eq!(
+        selected_missing
+            .verify_finalized_raw_input_bytes(
+                &"a".repeat(40),
+                "producer-start",
+                &only_later,
+                Some((&plan, &cells, &tests))
+            )
+            .unwrap_err(),
+        "verified selected attempt is absent from the raw input census"
+    );
+    let mut empty = row.clone();
+    let empty_inputs = finalized_raw_inputs(&mut empty, &[]);
+    assert_eq!(
+        empty
+            .verify_finalized_raw_input_bytes(
+                &"a".repeat(40),
+                "producer-start",
+                &empty_inputs,
+                Some((&plan, &cells, &tests))
+            )
+            .unwrap_err(),
+        "current raw cells differ from the verified recorded artifact population"
+    );
+}
+
+#[test]
+fn finalized_raw_verifier_requires_full_zero_selection_not_merely_an_empty_census() {
+    let (row, plan, _, test_bytes) =
+        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let mut plan: ConstructedValidationPlanV10 = serde_json::from_slice(&plan).unwrap();
+    let cfg = dag_from_json(r#"{"steps":[{"group":"test","job":"fixture","cmd":"true","result_manifests":[{"kind":"structured-test-results","schema":2,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.fixture"}]}]}"#).unwrap();
+    plan.dag_json = dag_to_json(&cfg);
+    plan.expected_e2e_plan_json = r#"{"schema":1,"cells":[]}"#.into();
+    let plan = serde_json::to_vec(&plan).unwrap();
+    let mut raw = serde_json::to_value(row).unwrap();
+    raw["constructed_plan"]["sha256"] = hex_digest(&plan).into();
+    raw["constructed_plan"]["bytes"] = (plan.len() as u64).into();
+    let cells = &mut raw["cell_results"];
+    for field in ["selected", "selected_backend_parity", "cells"] {
+        cells[field] = serde_json::json!([]);
+    }
+    cells["selected_count"] = 0.into();
+    cells["recorded_count"] = 0.into();
+    cells["population_sha256"] = hex_digest(b"[]").into();
+    cells["artifact"]["row_count"] = 0.into();
+    cells["artifact"]["sha256"] = hex_digest(b"").into();
+    // Zero selected cells still requires complete, nonempty test-producer
+    // evidence under the existing schema-9 verifier. Do not invent an empty
+    // test-population exception for this control.
+    let selected = TestResultsSelectedPopulation {
+        nodes: vec!["test.fixture".into()],
+        compatibility: false,
+    };
+    let mut test_row: TestResultArtifactRow = serde_json::from_slice(&test_bytes).unwrap();
+    test_row.producer = TestResultProducer::Node {
+        node: "test.fixture".into(),
+        outer_attempt: 1,
+    };
+    let mut test_bytes = serde_json::to_vec(&test_row).unwrap();
+    test_bytes.push(b'\n');
+    let tests = &mut raw["test_results"];
+    tests["selected"] = serde_json::to_value(&selected).unwrap();
+    tests["population_sha256"] = hex_digest(&serde_json::to_vec(&selected).unwrap()).into();
+    tests["nodes"][0]["node"] = "test.fixture".into();
+    tests["artifact"]["sha256"] = hex_digest(&test_bytes).into();
+    let mut row: HistoryRow = serde_json::from_value(raw).unwrap();
+    let inputs = finalized_raw_inputs(&mut row, &[]);
+    assert!(
+        row.verify_finalized_raw_input_bytes(
+            &"a".repeat(40),
+            "producer-start",
+            &inputs,
+            Some((&plan, b"", &test_bytes))
+        )
+        .unwrap()
+    );
+    assert_eq!(inputs.len(), 2, "two empty files remain distinct inputs");
+    let mut missing = row.clone();
+    missing.test_results = None;
+    assert_eq!(
+        missing
+            .verify_finalized_raw_input_bytes(
+                &"a".repeat(40),
+                "producer-start",
+                &inputs,
+                Some((&plan, b"", &test_bytes))
+            )
+            .unwrap_err(),
+        "schema 10 row omitted test_results"
+    );
+    let (selected_row, selected_plan, _, selected_tests) =
+        fixture(parity(vec![completed(1, BackendParityVerdict::Matched)]));
+    let mut selected_row = serde_json::to_value(selected_row).unwrap();
+    // Keep the genuine nonzero plan/selection while recording no cell rows.
+    // Full test evidence is present, so this reaches the selected-zero guard.
+    selected_row["cell_results"]["cells"] = serde_json::json!([]);
+    selected_row["cell_results"]["recorded_count"] = 0.into();
+    selected_row["cell_results"]["artifact"]["row_count"] = 0.into();
+    selected_row["cell_results"]["artifact"]["sha256"] = hex_digest(b"").into();
+    let mut selected_row: HistoryRow = serde_json::from_value(selected_row).unwrap();
+    let empty_inputs = finalized_raw_inputs(&mut selected_row, &[]);
+    let partial = selected_row
+        .verify_schema10_artifact_bytes(&selected_plan, b"", &selected_tests)
+        .unwrap()
+        .unwrap();
+    assert_eq!(partial.cell_results.selected_count, 1);
+    assert_eq!(partial.missing_cells.len(), 1);
+    assert!(partial.full_test_results);
+    assert_eq!(
+        selected_row
+            .verify_finalized_raw_input_bytes(
+                &"a".repeat(40),
+                "producer-start",
+                &empty_inputs,
+                Some((&selected_plan, b"", &selected_tests))
+            )
+            .unwrap_err(),
+        "empty current results contradict the finalized selected population"
+    );
+    let mut plan_with_missing_work: ConstructedValidationPlanV10 =
+        serde_json::from_slice(&plan).unwrap();
+    let cfg = dag_from_json(r#"{"steps":[{"group":"test","job":"fixture","cmd":"true","result_manifests":[{"kind":"structured-test-results","schema":2,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.fixture"}]},{"group":"test","job":"omitted","cmd":"true","result_manifests":[{"kind":"structured-test-results","schema":2,"path_env":"DAGRUN_TEST_COUNTS_PATH","owner":"test.omitted"}]}]}"#).unwrap();
+    plan_with_missing_work.dag_json = dag_to_json(&cfg);
+    let bytes = serde_json::to_vec(&plan_with_missing_work).unwrap();
+    let mut missing_work = serde_json::to_value(&row).unwrap();
+    missing_work["constructed_plan"]["sha256"] = hex_digest(&bytes).into();
+    missing_work["constructed_plan"]["bytes"] = (bytes.len() as u64).into();
+    let missing_work: HistoryRow = serde_json::from_value(missing_work).unwrap();
+    assert!(
+        missing_work
+            .verify_finalized_raw_input_bytes(
+                &"a".repeat(40),
+                "producer-start",
+                &inputs,
+                Some((&bytes, b"", &test_bytes))
+            )
+            .is_err(),
+        "missing selected test work cannot become zero selection"
+    );
 }
