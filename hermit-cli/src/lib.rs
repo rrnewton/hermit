@@ -30,6 +30,8 @@ mod recorder;
 mod replay;
 mod replayer;
 mod sabre_ptrace;
+// OPT-IN DIAGNOSTIC, disposable clone only. Never lands.
+pub(crate) mod sabre_stack_capture;
 mod script;
 
 use std::ffi::OsStr;

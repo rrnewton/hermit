@@ -510,6 +510,7 @@ impl Supervisor {
         match syscall_info.op {
             libc::PTRACE_SYSCALL_INFO_ENTRY => {
                 let mut regs = ptrace::getregs(pid)?;
+                crate::sabre_stack_capture::on_syscall_entry(pid.as_raw(), &regs);
                 let site = regs
                     .rip
                     .checked_sub(SYSCALL_INSN.len() as u64)
@@ -562,6 +563,7 @@ impl Supervisor {
                 // per-page would be an optimisation, not a correctness
                 // requirement.
                 let exit_regs = ptrace::getregs(pid)?;
+                crate::sabre_stack_capture::on_syscall_exit(pid.as_raw(), &exit_regs);
                 if mutates_address_space(exit_regs.orig_rax) {
                     // Evict the whole ADDRESS SPACE, not just this thread's
                     // entries: CLONE_VM siblings share one mm, so a sibling
