@@ -18,6 +18,7 @@ use std::io::Read;
 use std::io::Write;
 use std::num::NonZeroU64;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -27,10 +28,14 @@ use std::time::Duration;
 
 use clap::Parser;
 use colored::Colorize;
+use detcore::network_replay::NetworkTracePublication;
 use detcore_model::backend_engagement::BackendEngagement;
 use detcore_model::backend_engagement::BackendEngagementReport;
+use detcore_model::config::Epoch;
+use detcore_model::config::capture_current_epoch;
 use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::Strength;
+use detcore_model::network_trace::NetworkTrace;
 use detcore_model::network_trace::NetworkTraceConfig;
 use detcore_model::summary::RunSummary;
 use hermit::Backend;
@@ -955,6 +960,45 @@ fn configure_command_network(command: &mut Command, mode: NetworkingMode) {
         }
         NetworkingMode::UnsafeHost => {}
     }
+}
+
+fn epoch_was_explicit_on_command_line() -> bool {
+    std::env::var_os("HERMIT_EPOCH").is_some()
+        || std::env::args_os().any(|argument| {
+            argument == OsStr::new("--epoch")
+                || argument
+                    .to_str()
+                    .is_some_and(|argument| argument.starts_with("--epoch="))
+        })
+}
+
+fn trace_epoch(trace: &NetworkTrace) -> Epoch {
+    match trace {
+        NetworkTrace::V1(trace) => trace.epoch,
+        NetworkTrace::V2(trace) => trace.epoch,
+    }
+}
+
+fn resolve_run_epoch(
+    config: &mut DetConfig,
+    explicit: bool,
+    replay_epoch: Option<Epoch>,
+    now: Epoch,
+) -> Result<(), Error> {
+    if let Some(replay_epoch) = replay_epoch {
+        if explicit && config.epoch != replay_epoch {
+            return Err(network_policy_refusal(format!(
+                "explicit epoch {} does not match network trace epoch {}",
+                config.epoch.to_rfc3339(),
+                replay_epoch.to_rfc3339()
+            )));
+        }
+        config.epoch = replay_epoch;
+    } else if !explicit {
+        config.epoch = now;
+    }
+    config.epoch_explicit = true;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Parser, Eq, PartialEq)]
@@ -3692,6 +3736,39 @@ impl RunOpts {
 
         let config = &mut self.det_opts.det_config;
         config.network_trace = network_trace;
+        let replay_epoch = if let Some(path) = &self.replay_networking {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+                .with_context(|| {
+                    format!(
+                        "failed to open network replay trace in the host namespace: {}",
+                        path.display()
+                    )
+                })?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            detcore::network_replay::replay_from_reader(std::io::Cursor::new(&bytes)).map_err(
+                |error| network_policy_refusal(format!("invalid network trace: {error}")),
+            )?;
+            let trace =
+                NetworkTrace::read_framed(std::io::Cursor::new(&bytes)).map_err(|error| {
+                    network_policy_refusal(format!("invalid network trace: {error}"))
+                })?;
+            let epoch = trace_epoch(&trace);
+            config.network_trace_input = Some(bytes);
+            Some(epoch)
+        } else {
+            config.network_trace_input = None;
+            None
+        };
+        resolve_run_epoch(
+            config,
+            epoch_was_explicit_on_command_line(),
+            replay_epoch,
+            capture_current_epoch(),
+        )?;
 
         // Only the ptrace-family backends launch the guest through Reverie's
         // `Container` (see `container::default_container`), which unshares
@@ -4487,6 +4564,27 @@ impl RunOpts {
         capture_output: bool,
         guest_capture: Option<&GuestRunCaptureSession>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
+        let mut network_publication = match self.det_opts.det_config.network_trace.policy {
+            detcore_model::network_trace::NetworkPolicy::Record => {
+                let path = self
+                    .det_opts
+                    .det_config
+                    .network_trace
+                    .path
+                    .as_ref()
+                    .ok_or_else(|| network_policy_refusal("network record path is missing"))?;
+                Some(NetworkTracePublication::reserve(path).with_context(|| {
+                    format!(
+                        "failed to reserve network trace in the host namespace: {}",
+                        path.display()
+                    )
+                })?)
+            }
+            _ => None,
+        };
+        let network_output_fd = network_publication
+            .as_ref()
+            .map(NetworkTracePublication::writer_fd);
         // main has reserved startup stdin before this can allocate a descriptor.
         // Keep the unlinked output open through the real container fork; its
         // controller-local proc-fd spelling is constructed only inside it.
@@ -4500,30 +4598,44 @@ impl RunOpts {
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
-            return with_container(&mut process, || {
+            let result = with_container(&mut process, || {
                 self.run_in_container(
                     global,
                     capture_output,
                     guest_capture,
                     summary_output.as_ref(),
                     None,
+                    network_output_fd,
                 )
             });
+            if result.is_ok()
+                && let Some(publication) = network_publication.take()
+            {
+                publication.commit().map_err(Error::msg)?;
+            }
+            return result;
         }
 
         let tmpfs = self.tmpfs()?;
 
         let (mut container, identity_sources) = self.container(tmpfs.path())?;
 
-        with_container(&mut container, || {
+        let result = with_container(&mut container, || {
             self.run_in_container(
                 global,
                 capture_output,
                 guest_capture,
                 summary_output.as_ref(),
                 Some(&identity_sources),
+                network_output_fd,
             )
-        })
+        });
+        if result.is_ok()
+            && let Some(publication) = network_publication.take()
+        {
+            publication.commit().map_err(Error::msg)?;
+        }
+        result
     }
 
     fn run_with_namespace_only(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
@@ -5298,6 +5410,7 @@ impl RunOpts {
         guest_capture: Option<&GuestRunCaptureSession>,
         summary_output: Option<&File>,
         identity_sources: Option<&IdentityGuard>,
+        network_output_fd: Option<i32>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
 
@@ -5333,6 +5446,7 @@ impl RunOpts {
         }
 
         let mut config = self.effective_det_config();
+        config.network_trace_output_fd = network_output_fd;
         config.mountinfo_root_rewrites = identity_sources
             .map(IdentityGuard::mountinfo_root_rewrites)
             .transpose()?
@@ -5465,6 +5579,51 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn omitted_epoch_is_captured_once_inside_call_range() {
+        let mut config = DetConfig::default();
+        let before = capture_current_epoch();
+        resolve_run_epoch(&mut config, false, None, capture_current_epoch()).unwrap();
+        let after = capture_current_epoch();
+        assert!(before <= config.epoch && config.epoch <= after);
+        assert!(config.epoch_explicit);
+        assert!(config.to_string().contains("--epoch="));
+    }
+
+    #[test]
+    fn explicit_epoch_is_preserved_and_rendered_exactly() {
+        let explicit = "2026-01-01T00:00:00Z".parse().unwrap();
+        let mut config = DetConfig::default();
+        config.epoch = explicit;
+        resolve_run_epoch(&mut config, true, None, capture_current_epoch()).unwrap();
+        assert_eq!(config.epoch, explicit);
+        assert!(config.epoch_explicit);
+        assert!(
+            config
+                .to_string()
+                .contains("--epoch=2026-01-01T00:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn explicit_epoch_mismatch_with_replay_refuses() {
+        let mut config = DetConfig::default();
+        config.epoch = "2026-01-01T00:00:00Z".parse().unwrap();
+        let replay_epoch = "2026-01-01T00:00:00.000001Z".parse().unwrap();
+        let error = resolve_run_epoch(
+            &mut config,
+            true,
+            Some(replay_epoch),
+            capture_current_epoch(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match network trace epoch")
+        );
+    }
 
     #[test]
     fn real_returned_guest_disposition_still_uses_first_run_rejected() {

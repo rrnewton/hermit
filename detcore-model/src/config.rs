@@ -28,6 +28,14 @@ use crate::schedule::SigWrapper;
 use crate::time::NANOS_PER_RCB;
 use crate::time::RcbTimeMultiplier;
 
+/// Resolved logical epoch shared by CLI metadata, Config, and network traces.
+pub type Epoch = DateTime<Utc>;
+
+/// Capture the wall clock exactly once at a CLI/run boundary.
+pub fn capture_current_epoch() -> Epoch {
+    Utc::now()
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -550,6 +558,26 @@ pub struct Config {
     #[clap(skip)]
     pub network_trace: NetworkTraceConfig,
 
+    /// Exact trace bytes opened and verified in the host namespace before the
+    /// container is entered. Record/replay policies must not reopen a path.
+    #[serde(default)]
+    #[clap(skip)]
+    pub network_trace_input: Option<Vec<u8>>,
+
+    /// Inherited descriptor for a host-reserved private publication file.
+    /// Detcore duplicates it before writing; the CLI retains publication
+    /// authority and performs the atomic no-replace commit afterward.
+    #[serde(default)]
+    #[clap(skip)]
+    pub network_trace_output_fd: Option<i32>,
+
+    /// Whether the logical epoch came from an explicit user/replay value.
+    /// False means the run boundary must resolve and store one wall-clock value
+    /// before the engine or container starts.
+    #[serde(default)]
+    #[clap(skip)]
+    pub epoch_explicit: bool,
+
     /// Configure the probability for the Sticky Random scheduler to stay in a thread.
     /// For value 0.0, we are behaving like Random.
     /// For value 1.0, we are behaving like a DFS, where the same thread is
@@ -895,8 +923,7 @@ impl fmt::Display for Config {
             RunsPostFork::Parent => write!(f, " --runs-post-fork=parent")?,
             RunsPostFork::Random => write!(f, " --runs-post-fork=random")?,
         }
-        let default_epoch: DateTime<Utc> = DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap();
-        if self.epoch != default_epoch {
+        if self.epoch_explicit {
             write!(f, " --epoch={}", self.epoch.to_rfc3339())?;
         }
         if self.seed != 0 {

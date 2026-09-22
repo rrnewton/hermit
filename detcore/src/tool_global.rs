@@ -19,6 +19,9 @@ use std::collections::btree_map::Entry;
 use std::fmt::Debug;
 use std::fs;
 use std::fs::File;
+use std::io::Cursor;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::os::fd::FromRawFd;
@@ -81,10 +84,9 @@ use crate::network_replay::DatagramReceiveOutcome;
 use crate::network_replay::NetworkReceiveOptions;
 use crate::network_replay::NetworkReplayEngine;
 use crate::network_replay::NetworkReplayError;
-use crate::network_replay::NetworkTracePublication;
 use crate::network_replay::StreamReceiveOutcome;
 use crate::network_replay::StreamTransmitOutcome;
-use crate::network_replay::replay_from_reader;
+use crate::network_replay::replay_from_reader_with_expected_epoch;
 use crate::preemptions::PreemptionReader;
 use crate::preemptions::ThreadHistory;
 use crate::record_or_replay::RecordOrReplay;
@@ -450,20 +452,24 @@ fn initialize_network_engine(
 ) -> Result<Option<Arc<Mutex<NetworkReplayEngine>>>, String> {
     let engine = match cfg.network_trace.policy {
         NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => return Ok(None),
-        NetworkPolicy::Record => NetworkReplayEngine::record(cfg.epoch),
+        NetworkPolicy::Record => {
+            if !cfg.epoch_explicit {
+                return Err(
+                    "network record epoch was not resolved before engine startup".to_owned(),
+                );
+            }
+            NetworkReplayEngine::record(cfg.epoch)
+        }
         NetworkPolicy::Replay => {
-            let path = cfg
-                .network_trace
-                .path
-                .as_ref()
-                .ok_or_else(|| "network replay policy omitted its trace path".to_owned())?;
-            let file = File::open(path).map_err(|error| {
-                format!(
-                    "cannot open network replay trace {}: {error}",
-                    path.display()
-                )
+            if !cfg.epoch_explicit {
+                return Err(
+                    "network replay epoch was not resolved before engine startup".to_owned(),
+                );
+            }
+            let bytes = cfg.network_trace_input.as_ref().ok_or_else(|| {
+                "network replay policy omitted verified host trace bytes".to_owned()
             })?;
-            replay_from_reader(file)
+            replay_from_reader_with_expected_epoch(Cursor::new(bytes), cfg.epoch)
                 .map_err(|error| format!("cannot initialize network replay: {error}"))?
         }
     };
@@ -915,17 +921,25 @@ impl GlobalState {
                 if trace.channels.is_empty() && !self.cfg.recordreplay_modes {
                     bail!("network recording captured no external channels");
                 }
-                let path = self.cfg.network_trace.path.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("network record policy omitted its trace path")
+                let inherited = self.cfg.network_trace_output_fd.ok_or_else(|| {
+                    anyhow::anyhow!("network record policy omitted its reserved host output")
                 })?;
-                NetworkTracePublication::reserve(path)
-                    .map_err(|error| {
-                        anyhow::anyhow!("cannot reserve network trace {}: {error}", path.display())
-                    })?
-                    .publish(&trace)
-                    .map_err(|error| {
-                        anyhow::anyhow!("cannot publish network trace {}: {error}", path.display())
-                    })
+                let duplicate = unsafe { libc::fcntl(inherited, libc::F_DUPFD_CLOEXEC, inherited) };
+                if duplicate < 0 {
+                    bail!(
+                        "cannot duplicate reserved network trace output: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                // SAFETY: fcntl returned a fresh owned descriptor.
+                let mut file = unsafe { File::from_raw_fd(duplicate) };
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+                trace.write_framed(&mut file).map_err(|error| {
+                    anyhow::anyhow!("cannot encode reserved network trace output: {error}")
+                })?;
+                file.sync_all()?;
+                Ok(())
             }
         }
     }
