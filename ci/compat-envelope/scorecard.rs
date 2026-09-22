@@ -83,6 +83,20 @@ const SCORECARD_SERIES_SNAPSHOT_SCHEMA: &str = "scorecard-series-snapshot/v1";
 const SCORECARD_SERIES_SNAPSHOT_SOURCE: &str = "series";
 const TEST_LEDGER_REPOSITORY: &str = "https://github.com/rrnewton/hermit_test_ledger.git";
 
+// This is a fixed self-test corpus, not the catalogue's live history reference.
+// The original source document remains byte-for-byte in the existing ledger.
+const SELF_TEST_CORPUS: PinnedSelfTestCorpus<'static> = PinnedSelfTestCorpus {
+    ledger_commit: "352c54f800e62426fe54bd58c9110e8d93d8daaf",
+    archive_blob: "c55b6e644a6f32aadfdea8fbbf76dfaddb20de3e",
+    identity_blob: "cc25483da6bf92e361a0a7596ba87ea33872eb15",
+    source_commit: "97c39b308efd854693038f24962484182d932f27",
+    sha256: "e07c158d1f697e6eea027414550c017fd9d88d80eebe4e35b73fb2eb8ac7eb0f",
+    bytes: 81_434_443,
+    cells: 5_760,
+    observations: 9_509,
+    invocations: 8_703,
+};
+
 const USAGE: &str = r#"Usage: ci/compat-envelope/scorecard.rs COMMAND [OPTIONS]
 
 Commands:
@@ -132,6 +146,9 @@ Commands:
       selected regression cell in the named lanes. The default is both lanes.
   self-test
       Exercise accepting and refusing result sets without running a guest.
+      Requires the pinned full-corpus archive in hermit_test_ledger; use
+      DEV_HERMIT_TEST_LEDGER_ROOT to select that existing checkout. Missing
+      archive objects are an error; the test does not fetch or use live history.
   self-test-and-check
       Run the self-test and exact tracked-file check in one forced compilation.
   --help
@@ -4376,6 +4393,132 @@ fn load_existing(root: &Path) -> Result<Option<TrackedCells>, String> {
     let cells = read_json(&path).map_err(|error| format!("history unavailable: {error}"))?;
     validate_observation_identity_namespace(&cells)?;
     Ok(Some(cells))
+}
+
+#[derive(Clone, Copy)]
+struct PinnedSelfTestCorpus<'a> {
+    ledger_commit: &'a str,
+    archive_blob: &'a str,
+    identity_blob: &'a str,
+    source_commit: &'a str,
+    sha256: &'a str,
+    bytes: usize,
+    cells: usize,
+    observations: usize,
+    invocations: usize,
+}
+
+fn decode_self_test_corpus(
+    corpus: &PinnedSelfTestCorpus<'_>,
+    archive: &[u8],
+    identity: &[u8],
+) -> Result<TrackedCells, String> {
+    if archive.len() != corpus.bytes || format!("{:x}", Sha256::digest(archive)) != corpus.sha256 {
+        return Err("self-test corpus archive has the wrong byte count or SHA-256".into());
+    }
+    let identity: JsonValue = serde_json::from_slice(identity)
+        .map_err(|error| format!("self-test corpus identity is invalid: {error}"))?;
+    if identity
+        != serde_json::json!({
+            "repository": "https://github.com/rrnewton/hermit.git",
+            "commit": corpus.source_commit, "path": CELLS, "blob": corpus.archive_blob,
+            "sha256": corpus.sha256, "bytes": corpus.bytes, "cells": corpus.cells,
+            "observations": corpus.observations,
+        })
+    {
+        return Err("self-test corpus identity differs from the pinned source document".into());
+    }
+    let cells: TrackedCells = serde_json::from_slice(archive)
+        .map_err(|error| format!("self-test corpus history is invalid: {error}"))?;
+    let observations = cells
+        .cells
+        .iter()
+        .map(|cell| cell.observations.len())
+        .sum::<usize>();
+    let invocations = cells
+        .cells
+        .iter()
+        .flat_map(|cell| &cell.observations)
+        .map(|observation| observation.invocations.len())
+        .sum::<usize>();
+    if cells.schema != SCHEMA
+        || cells.cells.len() != corpus.cells
+        || observations != corpus.observations
+        || invocations != corpus.invocations
+    {
+        return Err(
+            "self-test corpus has the wrong schema or cell/observation/invocation counts".into(),
+        );
+    }
+    validate_observation_identity_namespace(&cells)?;
+    Ok(cells)
+}
+
+fn load_self_test_corpus(
+    root: &Path,
+    corpus: &PinnedSelfTestCorpus<'_>,
+) -> Result<TrackedCells, String> {
+    let load = || -> Result<TrackedCells, String> {
+        let ledger = ledger_root(root, false)?;
+        let git = || {
+            let mut command = Command::new("git");
+            command
+                .arg("--no-replace-objects")
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .current_dir(&ledger);
+            command
+        };
+        let commit = git()
+            .args(["rev-parse", &format!("{}^{{commit}}", corpus.ledger_commit)])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !commit.status.success()
+            || commit.stdout != format!("{}\n", corpus.ledger_commit).as_bytes()
+        {
+            return Err("self-test corpus revision is not the pinned commit".into());
+        }
+        let archive_path = format!("scorecard/legacy/{}.json", corpus.archive_blob);
+        let identity_path = format!("scorecard/legacy/{}.identity.json", corpus.archive_blob);
+        let read = |path: &str, blob: &str| -> Result<Vec<u8>, String> {
+            let entry = git()
+                .args(["ls-tree", "-z", corpus.ledger_commit, "--", path])
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !entry.status.success()
+                || entry.stdout != format!("100644 blob {blob}\t{path}\0").as_bytes()
+            {
+                return Err(format!(
+                    "self-test corpus requires the exact committed regular blob {path}"
+                ));
+            }
+            let output = git()
+                .args([
+                    "cat-file",
+                    "blob",
+                    &format!("{}:{path}", corpus.ledger_commit),
+                ])
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !output.status.success() {
+                return Err(format!("self-test corpus object is unavailable: {path}"));
+            }
+            Ok(output.stdout)
+        };
+        decode_self_test_corpus(
+            corpus,
+            &read(&archive_path, corpus.archive_blob)?,
+            &read(&identity_path, corpus.identity_blob)?,
+        )
+    };
+    load().map_err(|error| {
+        format!(
+            "required scorecard self-test corpus is unavailable or invalid: {error}. \
+         Prepare the existing {TEST_LEDGER_REPOSITORY} checkout with commit {}; \
+         set DEV_HERMIT_TEST_LEDGER_ROOT when it is outside the parent workspace. \
+         The self-test never substitutes the current projection or empty history.",
+            corpus.ledger_commit,
+        )
+    })
 }
 
 /// Selection belongs to the current catalogue; observations belong to history.
@@ -14301,6 +14444,9 @@ fn self_test() -> Result<(), String> {
     }
 
     let command_root = repo_root()?;
+    // Resolve and authenticate the fixed complete corpus before installing the
+    // private fixture ledger environment. Catalogue-only source has no history.
+    let fixture_corpus = load_self_test_corpus(&command_root, &SELF_TEST_CORPUS)?;
     // Establish the normal helper through its real producer before any clone
     // invocation. The comparison below checks retained bytes, not the identity
     // of every concurrently executing process.
@@ -14367,7 +14513,7 @@ fn self_test() -> Result<(), String> {
     let fixture_cells =
         load_catalogue(&result_command_root)?.ok_or("result-command fixture has no catalogue")?;
     let fixture_derived = derive(&result_command_root)?;
-    let fixture_history = generated_files(&fixture_derived, &fixture_cells)?;
+    let fixture_history = generated_files(&fixture_derived, &fixture_corpus)?;
     fs::write(
         result_command_root.join(CELLS),
         encoded_catalogue(&fixture_cells)?,
@@ -22464,6 +22610,314 @@ mod catalogue_ledger_tests {
                 "fixture",
             ],
         );
+    }
+
+    #[test]
+    fn self_test_corpus_retains_the_complete_archived_input() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let root = Path::new(file!())
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let corpus = load_self_test_corpus(root, &SELF_TEST_CORPUS).unwrap();
+        // The pinned historical population is independent of future changes to
+        // the current catalogue. Its complete counts are checked by the loader.
+        assert!(
+            corpus
+                .cells
+                .iter()
+                .any(|cell| !cell.observations.is_empty())
+        );
+        println!(
+            "pinned corpus {}:{}: {} bytes, {} cells, {} observations, {} invocations",
+            SELF_TEST_CORPUS.ledger_commit,
+            SELF_TEST_CORPUS.archive_blob,
+            SELF_TEST_CORPUS.bytes,
+            SELF_TEST_CORPUS.cells,
+            SELF_TEST_CORPUS.observations,
+            SELF_TEST_CORPUS.invocations,
+        );
+    }
+
+    #[test]
+    fn self_test_corpus_requires_exact_committed_objects_and_identity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let root = Path::new(file!())
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let mut cell = load_catalogue(root).unwrap().unwrap().cells.remove(0);
+        cell.observations = vec![
+            serde_json::from_value(serde_json::json!({
+                "detcore_tree": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "provenance": "pressure-test",
+                "hermit_shas": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+                "results": ["pass"], "invocations": []
+            }))
+            .unwrap(),
+        ];
+        let small = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![cell],
+        };
+        let archive = encoded_cells(&small).unwrap().into_bytes();
+        let fixture = tempfile::tempdir().unwrap();
+        let ledger = fixture.path();
+        git(ledger, &["init", "--quiet"]);
+        git(ledger, &["remote", "add", "origin", TEST_LEDGER_REPOSITORY]);
+        fs::write(ledger.join("seed.json"), &archive).unwrap();
+        commit(ledger);
+        let blob = git_rev_parse(ledger, "HEAD:seed.json").unwrap();
+        let digest = format!("{:x}", Sha256::digest(&archive));
+        let source_commit = "b".repeat(40);
+        let identity_for = |corpus: &PinnedSelfTestCorpus<'_>| {
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "repository": "https://github.com/rrnewton/hermit.git",
+                "commit": corpus.source_commit, "path": CELLS, "blob": corpus.archive_blob,
+                "sha256": corpus.sha256, "bytes": corpus.bytes, "cells": corpus.cells,
+                "observations": corpus.observations,
+            }))
+            .unwrap()
+        };
+        let mut corpus = PinnedSelfTestCorpus {
+            ledger_commit: "",
+            archive_blob: &blob,
+            identity_blob: "",
+            source_commit: &source_commit,
+            sha256: &digest,
+            bytes: archive.len(),
+            cells: 1,
+            observations: 1,
+            invocations: 0,
+        };
+        let archive_path = format!("scorecard/legacy/{blob}.json");
+        let identity_path = format!("scorecard/legacy/{blob}.identity.json");
+        fs::create_dir_all(ledger.join("scorecard/legacy")).unwrap();
+        let identity = identity_for(&corpus);
+        fs::write(ledger.join(&archive_path), &archive).unwrap();
+        fs::write(ledger.join(&identity_path), &identity).unwrap();
+        commit(ledger);
+        let ledger_commit = git_head(ledger).unwrap();
+        let identity_blob = git_rev_parse(ledger, &format!("HEAD:{identity_path}")).unwrap();
+        corpus.ledger_commit = &ledger_commit;
+        corpus.identity_blob = &identity_blob;
+        let lock = File::open(ledger.join(".git/HEAD")).unwrap();
+        let _environment = HistoryFixtureEnvironment::set(ledger, lock.as_raw_fd());
+        assert_eq!(load_self_test_corpus(root, &corpus).unwrap().cells.len(), 1);
+
+        // The test reads the fixed committed objects, never the current files
+        // or a live projection whose history could be empty or still growing.
+        fs::write(ledger.join(&archive_path), b"wrong worktree bytes").unwrap();
+        fs::write(ledger.join(LEDGER_CELLS), b"{\"cells\":[]}").unwrap();
+        assert_eq!(load_self_test_corpus(root, &corpus).unwrap().cells.len(), 1);
+        let wrong = "c".repeat(40);
+        for changed in [
+            PinnedSelfTestCorpus {
+                ledger_commit: &wrong,
+                ..corpus
+            },
+            PinnedSelfTestCorpus {
+                archive_blob: &wrong,
+                ..corpus
+            },
+            PinnedSelfTestCorpus {
+                identity_blob: &wrong,
+                ..corpus
+            },
+        ] {
+            assert!(load_self_test_corpus(root, &changed).is_err());
+        }
+        git(
+            ledger,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://example.invalid/foreign.git",
+            ],
+        );
+        assert!(load_self_test_corpus(root, &corpus).is_err());
+        git(
+            ledger,
+            &["config", "remote.origin.url", TEST_LEDGER_REPOSITORY],
+        );
+
+        assert!(
+            decode_self_test_corpus(&corpus, &archive[..archive.len() - 1], &identity).is_err()
+        );
+        let mut changed = archive.clone();
+        changed[0] ^= 1;
+        assert!(decode_self_test_corpus(&corpus, &changed, &identity).is_err());
+        for key in [
+            "repository",
+            "commit",
+            "path",
+            "blob",
+            "sha256",
+            "bytes",
+            "cells",
+            "observations",
+            "extra",
+        ] {
+            let mut changed: JsonValue = serde_json::from_slice(&identity).unwrap();
+            changed[key] = JsonValue::Null;
+            assert!(
+                decode_self_test_corpus(&corpus, &archive, &serde_json::to_vec(&changed).unwrap())
+                    .is_err(),
+                "{key}"
+            );
+        }
+        for changed in [
+            PinnedSelfTestCorpus { cells: 2, ..corpus },
+            PinnedSelfTestCorpus {
+                observations: 2,
+                ..corpus
+            },
+            PinnedSelfTestCorpus {
+                invocations: 1,
+                ..corpus
+            },
+        ] {
+            assert!(decode_self_test_corpus(&changed, &archive, &identity_for(&changed)).is_err());
+        }
+        let mut invalid: JsonValue = serde_json::from_slice(&archive).unwrap();
+        invalid["cells"][0]["observations"][0]["detcore_tree"] = JsonValue::Null;
+        let invalid = serde_json::to_vec(&invalid).unwrap();
+        let invalid_digest = format!("{:x}", Sha256::digest(&invalid));
+        let invalid_corpus = PinnedSelfTestCorpus {
+            sha256: &invalid_digest,
+            bytes: invalid.len(),
+            ..corpus
+        };
+        assert!(
+            decode_self_test_corpus(&invalid_corpus, &invalid, &identity_for(&invalid_corpus))
+                .is_err(),
+            "coherent byte hashes do not replace namespace validation"
+        );
+
+        fs::write(ledger.join(&archive_path), &archive).unwrap();
+        fs::set_permissions(
+            ledger.join(&archive_path),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        commit(ledger);
+        let executable_commit = git_head(ledger).unwrap();
+        assert!(
+            load_self_test_corpus(
+                root,
+                &PinnedSelfTestCorpus {
+                    ledger_commit: &executable_commit,
+                    ..corpus
+                }
+            )
+            .is_err(),
+            "the pinned archive must be a regular nonexecutable blob"
+        );
+
+        // A partial clone can have the pinned tree but lack a promised blob.
+        // Prove the real loader refuses without Git fetching it implicitly.
+        // The remote is another tiny owned fixture, never a network service.
+        let provider = tempfile::tempdir().unwrap();
+        git(
+            ledger,
+            &[
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "gc.auto=0",
+                "clone",
+                "--quiet",
+                "--bare",
+                "--no-hardlinks",
+                ledger.to_str().unwrap(),
+                provider.path().to_str().unwrap(),
+            ],
+        );
+        git(
+            provider.path(),
+            &["config", "uploadpack.allowFilter", "true"],
+        );
+        git(
+            provider.path(),
+            &["config", "uploadpack.allowAnySHA1InWant", "true"],
+        );
+        let provider_url = format!("file://{}", provider.path().display());
+        git(
+            ledger,
+            &[
+                "config",
+                &format!("url.{provider_url}.insteadOf"),
+                TEST_LEDGER_REPOSITORY,
+            ],
+        );
+        git(ledger, &["config", "remote.origin.promisor", "true"]);
+        git(
+            ledger,
+            &["config", "remote.origin.partialclonefilter", "blob:none"],
+        );
+        let routed = Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(ledger)
+            .output()
+            .unwrap();
+        assert!(routed.status.success());
+        assert_eq!(
+            String::from_utf8(routed.stdout).unwrap().trim(),
+            provider_url
+        );
+        let loose = ledger
+            .join(".git/objects")
+            .join(&blob[..2])
+            .join(&blob[2..]);
+        assert!(loose.is_file());
+        fs::remove_file(&loose).unwrap();
+        assert!(
+            load_self_test_corpus(root, &corpus).is_err(),
+            "missing promised objects must not fetch"
+        );
+        let still_missing = Command::new("git")
+            .args(["cat-file", "-e", &blob])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .current_dir(ledger)
+            .output()
+            .unwrap();
+        assert!(
+            !still_missing.status.success(),
+            "the loader must leave the blob absent"
+        );
+        // Positive opponent: the previous unguarded command really would fetch
+        // this exact blob from the local promisor and return the original data.
+        let fetched = Command::new("git")
+            .args([
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "gc.auto=0",
+                "--no-replace-objects",
+                "cat-file",
+                "blob",
+                &format!("{ledger_commit}:{archive_path}"),
+            ])
+            .env_remove("GIT_NO_LAZY_FETCH")
+            .current_dir(ledger)
+            .output()
+            .unwrap();
+        assert!(
+            fetched.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fetched.stderr)
+        );
+        assert_eq!(fetched.stdout, archive);
+        assert_eq!(load_self_test_corpus(root, &corpus).unwrap().cells.len(), 1);
     }
 
     #[test]
