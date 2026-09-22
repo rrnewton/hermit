@@ -44,6 +44,10 @@ fn run() -> Result<i32, String> {
             println!("{}", hermit_manifest_plan::nextest_binaries::executable(&root, &package, &name)?.display());
             Ok(0)
         }
+        Some("budget-context") => {
+            println!("{}", hermit_manifest_plan::nextest_binaries::budget_context(&root, &args.collect::<Vec<_>>())?);
+            Ok(0)
+        }
         Some(operation @ ("cpu-wrapper" | "build-cpu-wrapper")) => {
             if args.next().is_some() { return Err("unexpected CPU wrapper query argument".into()); }
             let path = if operation == "cpu-wrapper" {
