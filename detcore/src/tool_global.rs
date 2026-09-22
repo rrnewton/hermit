@@ -885,10 +885,10 @@ impl GlobalState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take_network_engine();
-        if let Some(scheduler_engine) = &scheduler_engine {
-            if !Arc::ptr_eq(&engine, scheduler_engine) {
-                bail!("scheduler and RPC paths used different network engines");
-            }
+        if let Some(scheduler_engine) = &scheduler_engine
+            && !Arc::ptr_eq(&engine, scheduler_engine)
+        {
+            bail!("scheduler and RPC paths used different network engines");
         }
         drop(scheduler_engine);
         let engine = Arc::try_unwrap(engine)
