@@ -1590,6 +1590,8 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         "ci/manifest-plan/src/runner.rs",
         "ci/manifest-plan/src/service_result.rs",
         "ci/manifest-plan/src/timeouts.rs",
+        "ci/manifest-plan/src/validation_dag.rs",
+        "ci/manifest-plan/src/validation_dag_static.rs",
         "ci/manifest-plan/validation-service-result-schema.json",
         "ci/nextest-timeout-config.rs",
         "ci/run-nextest-counted.sh",
@@ -1625,6 +1627,8 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
                 "ci/manifest-plan/src/runner.rs",
                 "ci/manifest-plan/src/service_result.rs",
                 "ci/manifest-plan/src/timeouts.rs",
+                "ci/manifest-plan/src/validation_dag.rs",
+                "ci/manifest-plan/src/validation_dag_static.rs",
                 "ci/manifest-plan/validation-service-result-schema.json",
                 "ci/nextest-timeout-config.rs",
                 "ci/run-nextest-counted.sh",
@@ -8153,6 +8157,10 @@ const RUST_SCRIPT_PRODUCER_TAG: &str = "build.rust_scripts";
 const RUST_SCRIPT_COMMAND_PREFIX: &str = "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; \
     export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; \
     export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ";
+const DAGRUN_PREPARE_BODY: &str =
+    "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun";
+const RUST_SCRIPT_PRODUCER_BODY: &str =
+    "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun && ./ci/prepare-rust-scripts.sh";
 
 fn committed_rust_script_producer(root: &Path) -> Result<Step, String> {
     let cfg = validate_plan::validation_config(root)?;
@@ -8168,6 +8176,32 @@ fn committed_rust_script_producer(root: &Path) -> Result<Step, String> {
         ));
     }
     Ok(producers[0].clone())
+}
+
+fn committed_dagrun_prepare_boundary(root: &Path) -> Result<(String, i64), String> {
+    let producer = committed_rust_script_producer(root)?;
+    let body = producer
+        .cmd
+        .strip_prefix(RUST_SCRIPT_COMMAND_PREFIX)
+        .ok_or_else(|| {
+            format!(
+                "committed {RUST_SCRIPT_PRODUCER_TAG} lost its rust-script command prefix: {}",
+                producer.cmd
+            )
+        })?;
+    let suffix = " && ./ci/prepare-rust-scripts.sh";
+    let prepare = body.strip_suffix(suffix).ok_or_else(|| {
+        format!(
+            "committed {RUST_SCRIPT_PRODUCER_TAG} lost its dagrun-before-Cargo boundary: {}",
+            producer.cmd
+        )
+    })?;
+    if prepare != DAGRUN_PREPARE_BODY || producer.timeout != 900 {
+        return Err(format!(
+            "committed {RUST_SCRIPT_PRODUCER_TAG} changed its exact dagrun preparation or 900-second wall bound: {producer:?}"
+        ));
+    }
+    Ok((prepare.to_string(), producer.timeout))
 }
 
 fn serialized_step(step: &Step) -> String {
@@ -8194,7 +8228,7 @@ fn rust_script_producer_step() -> Step {
         "build",
         "rust_scripts",
         "Build every tracked rust-script before graph consumers run",
-        "./ci/prepare-rust-scripts.sh".into(),
+        RUST_SCRIPT_PRODUCER_BODY.into(),
         Vec::new(),
         900,  // wall-clock seconds
         7200, // CPU seconds: eight workers may consume this in 900 wall seconds
@@ -8373,7 +8407,7 @@ fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
         .iter()
         .find(|step| step.tag() == "fixture.child")
         .ok_or("rust-script producer bracket lost the child fixture")?;
-    if producer.cmd != format!("{RUST_SCRIPT_COMMAND_PREFIX}./ci/prepare-rust-scripts.sh")
+    if producer.cmd != format!("{RUST_SCRIPT_COMMAND_PREFIX}{RUST_SCRIPT_PRODUCER_BODY}")
         || root_step.deps != [RUST_SCRIPT_PRODUCER_TAG.to_string()]
         || child.deps != ["fixture.root".to_string()]
         || !root_step.cmd.starts_with(RUST_SCRIPT_COMMAND_PREFIX)
@@ -8392,6 +8426,23 @@ fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
     };
     if configure_prebuilt_rust_scripts(root, &mut duplicated, false).is_ok() {
         return Err("rust-script producer bracket accepted duplicate writers".into());
+    }
+    let mut late_prepare = committed_rust_script_producer(root)?;
+    late_prepare.cmd = format!(
+        "{RUST_SCRIPT_COMMAND_PREFIX}./ci/prepare-rust-scripts.sh && {DAGRUN_PREPARE_BODY}"
+    );
+    let mut late = Plan {
+        cfg: validate_plan::config_from(
+            vec![late_prepare],
+            "late dagrun preparation bracket",
+        ),
+        ..Default::default()
+    };
+    if configure_prebuilt_rust_scripts(root, &mut late, false).is_ok() {
+        return Err(
+            "rust-script producer bracket accepted dagrun preparation after Cargo compilation"
+                .into(),
+        );
     }
     let mut transported = Plan {
         cfg: validate_plan::config_from(
@@ -10667,6 +10718,41 @@ fn raw_run_dag_engine_bracket(root: &Path) -> Result<String, String> {
         .filter(|value| *value > 0)
         .unwrap_or(1)
         .to_string();
+    // In the production graph build.rust_scripts performs this preparation
+    // before opening its Cargo build directory. A standalone --self-test has
+    // no enclosing producer node, so exercise the exact committed prefix here
+    // before starting the independently bounded raw-launcher fixture.
+    let (prepare_command, prepare_timeout_s) = committed_dagrun_prepare_boundary(root)?;
+    let prepare_timeout = format!("{prepare_timeout_s}s");
+    let prepared = Command::new("timeout")
+        .args([
+            "--foreground",
+            "--kill-after=10s",
+            &prepare_timeout,
+            "bash",
+            "-c",
+            &prepare_command,
+        ])
+        .current_dir(root)
+        .env("CARGO_BUILD_JOBS", &scheduled_build_jobs)
+        .output()
+        .map_err(|error| format!("raw run-dag engine: cannot prepare committed dagrun: {error}"))?;
+    let prepared_stdout = String::from_utf8_lossy(&prepared.stdout);
+    let prepared_target = Path::new(prepared_stdout.trim());
+    let prepared_executable = prepared_target
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0);
+    if !prepared.status.success()
+        || prepared_stdout.lines().count() != 1
+        || !prepared_target.is_absolute()
+        || !prepared_executable
+    {
+        return Err(format!(
+            "raw run-dag engine: committed dagrun preparation failed or published no executable: status={} stdout={prepared_stdout:?} stderr={:?}",
+            prepared.status,
+            String::from_utf8_lossy(&prepared.stderr),
+        ));
+    }
     let launch = |engine: Option<&str>| -> Result<std::process::Output, String> {
         let mut command = Command::new("timeout");
         command
