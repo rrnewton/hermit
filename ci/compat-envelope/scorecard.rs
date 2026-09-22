@@ -4786,19 +4786,6 @@ fn check_tracked_with_lock(root: &Path) -> Result<Derived, String> {
     check_tracked(root)
 }
 
-fn git_diff_clean(root: &Path, args: &[&str]) -> Result<bool, String> {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .status()
-        .map_err(|e| format!("cannot inspect tracked changes: {e}"))?;
-    match status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err("git diff failed while checking tracked changes".into()),
-    }
-}
-
 fn observation_dirt_error(staged_clean: bool, unrelated_clean: bool) -> Option<&'static str> {
     if !staged_clean {
         Some("observe-results refuses staged changes")
@@ -4809,21 +4796,102 @@ fn observation_dirt_error(staged_clean: bool, unrelated_clean: bool) -> Option<&
     }
 }
 
+struct ObservationWorktreeState {
+    head: String,
+    staged_clean: bool,
+    unrelated_clean: bool,
+}
+
+impl ObservationWorktreeState {
+    fn ensure_clean(&self) -> Result<(), String> {
+        observation_dirt_error(self.staged_clean, self.unrelated_clean)
+            .map_or(Ok(()), |error| Err(error.into()))
+    }
+}
+
+fn parse_observation_worktree_state(bytes: &[u8]) -> Result<ObservationWorktreeState, String> {
+    let malformed = || "git returned malformed observation worktree state".to_string();
+    if bytes.last() != Some(&0) {
+        return Err(malformed());
+    }
+    let mut head = None;
+    let mut staged_clean = true;
+    let mut unrelated_clean = true;
+    for record in bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        if let Some(value) = record.strip_prefix(b"# branch.oid ") {
+            let value = std::str::from_utf8(value).map_err(|_| malformed())?;
+            if head.is_some() || !(is_object_id(value) || value == "(initial)") {
+                return Err(malformed());
+            }
+            head = Some(value.to_string());
+        } else if record.starts_with(b"# branch.head ")
+            || record.starts_with(b"# branch.upstream ")
+            || record.starts_with(b"# branch.ab ")
+        {
+            continue;
+        } else if record.starts_with(b"1 ") {
+            // --no-renames leaves one NUL-delimited ordinary record per path.
+            // Paths remain bytes: spaces, newlines and non-UTF8 names cannot
+            // become headers or broaden the two existing generated-file exceptions.
+            let fields = record.splitn(9, |byte| *byte == b' ').collect::<Vec<_>>();
+            if fields.len() != 9
+                || fields[1].len() != 2
+                || !fields[1].iter().all(|byte| b".MADRCUT".contains(byte))
+                || fields[2].len() != 4
+                || fields[8].is_empty()
+            {
+                return Err(malformed());
+            }
+            staged_clean &= fields[1][0] == b'.';
+            unrelated_clean &= fields[1][1] == b'.'
+                || fields[8] == SCORECARD.as_bytes()
+                || fields[8] == CELLS.as_bytes();
+        } else if record.starts_with(b"u ") {
+            let fields = record.splitn(11, |byte| *byte == b' ').collect::<Vec<_>>();
+            if fields.len() != 11 || fields[1].len() != 2 || fields[10].is_empty() {
+                return Err(malformed());
+            }
+            staged_clean = false;
+            unrelated_clean &= fields[10] == SCORECARD.as_bytes() || fields[10] == CELLS.as_bytes();
+        } else {
+            return Err(malformed());
+        }
+    }
+    Ok(ObservationWorktreeState {
+        head: head.ok_or_else(malformed)?,
+        staged_clean,
+        unrelated_clean,
+    })
+}
+
+fn observation_worktree_state(root: &Path) -> Result<ObservationWorktreeState, String> {
+    // Capture the same staged/unstaged policy and HEAD in one Git observation.
+    // Every original transaction boundary still obtains a fresh observation;
+    // there is no cross-boundary cache or change to publication authority.
+    let output = Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--no-ahead-behind",
+            "--no-renames",
+            "--untracked-files=no",
+            "-z",
+        ])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("cannot inspect tracked changes: {error}"))?;
+    if !output.status.success() {
+        return Err("git status failed while checking tracked changes".into());
+    }
+    parse_observation_worktree_state(&output.stdout)
+}
+
 fn check_observation_worktree(root: &Path) -> Result<(), String> {
-    let staged_clean = git_diff_clean(root, &["diff", "--cached", "--quiet", "--no-ext-diff"])?;
-    let unrelated_clean = git_diff_clean(
-        root,
-        &[
-            "diff",
-            "--quiet",
-            "--no-ext-diff",
-            "--",
-            ".",
-            ":(exclude)SCORECARD.md",
-            ":(exclude)ci/compat-envelope/cells.json",
-        ],
-    )?;
-    observation_dirt_error(staged_clean, unrelated_clean).map_or(Ok(()), |e| Err(e.into()))
+    observation_worktree_state(root)?.ensure_clean()
 }
 
 #[derive(Clone, PartialEq)]
@@ -6822,8 +6890,9 @@ fn verify_combined_write_state(
     expected_cells: &[u8],
     snapshot: &HeldScorecardSeriesSnapshot,
 ) -> Result<(), String> {
-    check_observation_worktree(root)?;
-    let current_head = git_head(root)?;
+    let worktree = observation_worktree_state(root)?;
+    worktree.ensure_clean()?;
+    let current_head = worktree.head;
     if current_head != expected_head {
         return Err(format!(
             "HEAD moved from {expected_head} to {current_head} during combined scorecard write-back"
@@ -7290,13 +7359,14 @@ where
     // A malformed or nonregular snapshot must not wait for history decoding or
     // manifest generation. The held file is still rechecked before publication.
     let snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
-    let head = git_head(root)?;
+    let worktree = observation_worktree_state(root)?;
+    let head = worktree.head.clone();
     if head != *expected_head {
         return Err(format!(
             "combined scorecard write-back expected HEAD {expected_head}, found {head}"
         ));
     }
-    check_observation_worktree(root)?;
+    worktree.ensure_clean()?;
     let original = read_history_files(root)?;
     let derived = check_tracked(root)?;
     if git_no_replace_rev_parse(root, &format!("{measured}^{{commit}}"))? != measured {
@@ -22732,6 +22802,210 @@ mod post_verdict_transaction_tests {
             ],
         );
         git(root, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn observation_worktree_state_matches_existing_git_guards() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "--quiet"]);
+        let unborn = observation_worktree_state(root).unwrap();
+        assert_eq!(unborn.head, "(initial)");
+        unborn.ensure_clean().unwrap();
+        fs::create_dir_all(root.join("ci/compat-envelope")).unwrap();
+        fs::create_dir(root.join("nested")).unwrap();
+        for path in [
+            SCORECARD,
+            CELLS,
+            "ordinary",
+            "nested/SCORECARD.md",
+            "newline\nfile",
+        ] {
+            fs::write(root.join(path), "base\n").unwrap();
+        }
+        git(root, &["add", "--all"]);
+        commit(root, "tracked files");
+        let sub = root.join("sub");
+        fs::create_dir(&sub).unwrap();
+        git(&sub, &["init", "--quiet"]);
+        fs::write(sub.join("tracked"), "base\n").unwrap();
+        git(&sub, &["add", "tracked"]);
+        let sub_head = commit(&sub, "submodule");
+        git(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &sub_head,
+                "sub",
+            ],
+        );
+        let base = commit(root, "record submodule");
+
+        for case in [
+            "clean",
+            "ordinary",
+            "scorecard",
+            "cells",
+            "nested",
+            "staged",
+            "staged-generated",
+            "staged-reverted",
+            "deleted",
+            "deleted-generated",
+            "rename",
+            "newline",
+            "untracked",
+            "intent-to-add",
+            "sub-untracked",
+            "sub-dirty",
+            "sub-commit",
+            "unmerged",
+            "sub-ignore",
+            "filemode",
+        ] {
+            git(root, &["reset", "--hard", &base]);
+            git(&sub, &["reset", "--hard", &sub_head]);
+            for path in [
+                root.join("untracked"),
+                root.join("new"),
+                root.join("renamed"),
+                sub.join("untracked"),
+            ] {
+                if path.exists() {
+                    fs::remove_file(path).unwrap();
+                }
+            }
+            let write = |path: &str| fs::write(root.join(path), "changed\n").unwrap();
+            match case {
+                "clean" => {}
+                "ordinary" => write("ordinary"),
+                "scorecard" => write(SCORECARD),
+                "cells" => write(CELLS),
+                "nested" => write("nested/SCORECARD.md"),
+                "staged" | "staged-reverted" => {
+                    write("ordinary");
+                    git(root, &["add", "ordinary"]);
+                    if case == "staged-reverted" {
+                        fs::write(root.join("ordinary"), "base\n").unwrap();
+                    }
+                }
+                "staged-generated" => {
+                    write(SCORECARD);
+                    git(root, &["add", SCORECARD]);
+                }
+                "deleted" => fs::remove_file(root.join("ordinary")).unwrap(),
+                "deleted-generated" => fs::remove_file(root.join(SCORECARD)).unwrap(),
+                "rename" => {
+                    git(root, &["mv", "ordinary", "renamed"]);
+                }
+                "newline" => write("newline\nfile"),
+                "untracked" => write("untracked"),
+                "intent-to-add" => {
+                    write("new");
+                    git(root, &["add", "-N", "new"]);
+                }
+                "sub-untracked" => fs::write(sub.join("untracked"), "new\n").unwrap(),
+                "sub-dirty" | "sub-ignore" | "sub-commit" => {
+                    fs::write(sub.join("tracked"), "changed\n").unwrap();
+                    if case == "sub-ignore" {
+                        git(root, &["config", "diff.ignoreSubmodules", "all"]);
+                    } else if case == "sub-commit" {
+                        git(&sub, &["add", "tracked"]);
+                        commit(&sub, "advance submodule");
+                    }
+                }
+                "unmerged" => {
+                    let blob = git(root, &["rev-parse", "HEAD:ordinary"]);
+                    git(root, &["update-index", "--force-remove", "ordinary"]);
+                    let mut child = Command::new("git")
+                        .args(["update-index", "--index-info"])
+                        .current_dir(root)
+                        .stdin(Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    child.stdin.take().unwrap().write_all(format!(
+                        "100644 {blob} 1\tordinary\n100644 {blob} 2\tordinary\n100644 {blob} 3\tordinary\n"
+                    ).as_bytes()).unwrap();
+                    assert!(child.wait().unwrap().success());
+                }
+                "filemode" => {
+                    use std::os::unix::fs::PermissionsExt;
+                    git(root, &["config", "core.filemode", "true"]);
+                    fs::set_permissions(root.join("ordinary"), fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let old_clean = |args: &[&str]| {
+                let status = Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .unwrap();
+                assert!(matches!(status.code(), Some(0 | 1)));
+                status.success()
+            };
+            let staged_clean = old_clean(&["diff", "--cached", "--quiet", "--no-ext-diff"]);
+            let unrelated_clean = old_clean(&[
+                "diff",
+                "--quiet",
+                "--no-ext-diff",
+                "--",
+                ".",
+                ":(exclude)SCORECARD.md",
+                ":(exclude)ci/compat-envelope/cells.json",
+            ]);
+            let current = observation_worktree_state(root).unwrap();
+            assert_eq!(current.head, git(root, &["rev-parse", "HEAD"]), "{case}");
+            assert_eq!(current.staged_clean, staged_clean, "{case}");
+            assert_eq!(current.unrelated_clean, unrelated_clean, "{case}");
+            assert_eq!(
+                current.ensure_clean().err(),
+                observation_dirt_error(staged_clean, unrelated_clean).map(str::to_string),
+                "{case}",
+            );
+            if case == "sub-ignore" {
+                git(root, &["config", "--unset", "diff.ignoreSubmodules"]);
+            }
+        }
+    }
+
+    #[test]
+    fn observation_worktree_state_refuses_malformed_records() {
+        let head = format!("# branch.oid {}\0# branch.head main\0", "a".repeat(40));
+        for suffix in [
+            "? hidden\0",
+            "1 .M\0",
+            "u UU\0",
+            "unexpected\0",
+            "# branch.oid bad\0",
+            "truncated",
+        ] {
+            assert!(
+                parse_observation_worktree_state(format!("{head}{suffix}").as_bytes()).is_err()
+            );
+        }
+        assert!(parse_observation_worktree_state(b"# branch.head main\0").is_err());
+        let mut non_utf8 = format!(
+            "{head}1 .M N... 100644 100644 100644 {} {} ",
+            "b".repeat(40),
+            "b".repeat(40)
+        )
+        .into_bytes();
+        non_utf8.extend_from_slice(b"\xff\n# branch.oid spoof\0");
+        let state = parse_observation_worktree_state(&non_utf8).unwrap();
+        assert_eq!(state.head, "a".repeat(40));
+        assert!(state.staged_clean);
+        assert!(!state.unrelated_clean);
+        assert!(
+            state
+                .ensure_clean()
+                .unwrap_err()
+                .contains("outside the generated")
+        );
     }
 
     fn result_row(sha: &str) -> JsonValue {
