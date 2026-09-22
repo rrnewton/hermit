@@ -38,13 +38,15 @@ use super::tracing::log_max_bytes;
 /// to the command run inside hermit, and the results will depend on the contents
 /// (but not timestamps or inode numbers) of those inputs.
 ///
-/// In run mode, networking is disallowed.  Run mode guarantees that if you
-/// run twice with the same input files, you will receive bitwise identical
-/// outputs from the computation.
+/// In run mode, external networking is denied by default. Isolated loopback is
+/// available explicitly, external traffic can be captured or replayed through
+/// a versioned trace, and live host networking requires the clearly unsafe
+/// `--unsafe-live-network` opt-in.
 ///
-/// In record mode, inputs (both files and network traffic) are captured
-/// in a content addressible store (CAS).  In this preview version of
-/// hermit, the CAS is stored locally in your home directory (~/.hermit).
+/// Full record/replay captures supported syscall effects in a content-addressable
+/// store (CAS), currently stored under ~/.hermit. Its network effects use the same
+/// trace engine as run-mode `--record-networking` and `--replay-networking` rather
+/// than a second network implementation.
 ///
 /// Below are options common to all subcommands.
 #[derive(Debug, Parser, Clone)]

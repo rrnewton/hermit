@@ -432,7 +432,7 @@ Hosts and container runtimes commonly block namespaces, ptrace, seccomp, or
 
 ```bash
 hermit run --namespace-only -- /bin/true
-hermit --log=info run --strace-only -- /bin/true
+hermit --log=info run --strace-only --unsafe-live-network -- /bin/true
 ```
 
 These are diagnostic modes and do not provide normal determinism. The

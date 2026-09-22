@@ -51,6 +51,8 @@ mod ivar;
 pub mod logdiff;
 mod memory;
 pub mod netlink_route;
+/// Schedule-independent external-network capture and replay state machine.
+pub mod network_replay;
 mod procfs;
 mod procmaps;
 pub mod random;
@@ -120,12 +122,32 @@ pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
 pub use tool_global::BackendFailureCleanup;
 pub use tool_global::GlobalState;
+#[doc(hidden)]
+pub use tool_global::NetworkCapturedStreamInput;
+#[doc(hidden)]
+pub use tool_global::NetworkCapturedStreamOutput;
+#[doc(hidden)]
+pub use tool_global::NetworkConnection;
+#[doc(hidden)]
+pub use tool_global::NetworkDatagramDelivery;
+#[doc(hidden)]
+pub use tool_global::NetworkDatagramReceive;
+#[doc(hidden)]
+pub use tool_global::NetworkReply;
+#[doc(hidden)]
+pub use tool_global::NetworkRequest;
+#[doc(hidden)]
+pub use tool_global::NetworkStreamReceive;
+#[doc(hidden)]
+pub use tool_global::NetworkStreamTransmit;
 use tool_global::ThreadDeregistration;
 use tool_global::acknowledge_robust_list_exit_time;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
 pub use tool_global::format_unsupported_syscall_warning;
+#[doc(hidden)]
+pub use tool_global::network_request;
 pub use tool_global::prepare_exec;
 use tool_global::report_unsupported_syscall;
 use tool_global::robust_list_wakes_after_exit;
@@ -2254,6 +2276,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // (scheduler yield + record/replay forwarding).
             SyscallClassification::Determinized if call.number() == Sysno::epoll_pwait2 => {
                 self.handle_epoll_pwait2(guest, call).await
+            }
+            SyscallClassification::Determinized if self.network_io_owns(guest, call) => {
+                self.handle_network_io(guest, call).await
             }
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,

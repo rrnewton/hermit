@@ -63,11 +63,15 @@ impl ReplayOpts {
                 .last_id()
                 .context("Failed to find last recording ID")?,
         };
+        let mut prepared_replay = Some(hermit.prepare_replay(id)?);
 
         if self.autopilot || self.serve_only {
             let (mut container, _identity_guard) = deterministic_container()?;
             with_container(&mut container, || {
-                self.container_main(global, self.autopilot, &hermit, id)
+                let prepared_replay = prepared_replay
+                    .take()
+                    .ok_or_else(|| Error::msg("replay trace reservation was consumed twice"))?;
+                self.container_main(global, self.autopilot, prepared_replay)
             })
         } else {
             // Find the path to the executable so that GDB can use it to resolve
@@ -113,7 +117,10 @@ impl ReplayOpts {
             let mut gdb_watch = GdbClientWatch::spawn(gdb_client, self.gdbserver_port);
             let (mut container, _identity_guard) = deterministic_container()?;
             let result = with_container(&mut container, || {
-                self.container_main(global, self.autopilot, &hermit, id)
+                let prepared_replay = prepared_replay
+                    .take()
+                    .ok_or_else(|| Error::msg("replay trace reservation was consumed twice"))?;
+                self.container_main(global, self.autopilot, prepared_replay)
             });
             let client_exited_early = gdb_watch.finish();
             match result {
@@ -130,15 +137,14 @@ impl ReplayOpts {
         &self,
         global: &GlobalOpts,
         autopilot: bool,
-        hermit: &HermitData,
-        id: Id,
+        prepared_replay: hermit::PreparedFullReplayTrace,
     ) -> Result<ExitStatus, Error> {
         let _guard = global.init_tracing();
 
         if autopilot {
-            hermit.replay(id)
+            hermit::replay_from(prepared_replay)
         } else {
-            hermit.replay_with_gdbserver(id, self.gdbserver_port)
+            hermit::replay_with_gdbserver(prepared_replay, self.gdbserver_port)
         }
     }
 }

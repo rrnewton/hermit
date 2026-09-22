@@ -390,7 +390,9 @@ use nix::sys::signal::SigHandler;
 use nix::sys::signal::SigSet;
 use nix::sys::signal::Signal;
 use nix::sys::signal::sigaction;
+pub use record::PreparedFullRecordTrace;
 use record::Record;
+pub use replay::PreparedFullReplayTrace;
 use replay::Replay;
 pub use reverie::ExitStatus;
 use reverie::GlobalTool;
@@ -3111,8 +3113,24 @@ impl HermitData {
         command: Command,
         mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     ) -> Result<Recording, Error> {
+        self.record_with_mountinfo_at_epoch(
+            command,
+            mountinfo_root_rewrites,
+            detcore_model::config::capture_current_epoch(),
+        )
+    }
+
+    /// Records with mount provenance at one already-resolved logical epoch.
+    pub fn record_with_mountinfo_at_epoch(
+        &self,
+        command: Command,
+        mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+        epoch: detcore_model::config::Epoch,
+    ) -> Result<Recording, Error> {
         let data = self.create_recording_dir()?;
-        let exit_status = record_to_with_mountinfo(command, data.path(), mountinfo_root_rewrites)?;
+        let prepared = PreparedFullRecordTrace::reserve(data.path())?;
+        let exit_status =
+            record_to_with_mountinfo(command, prepared, mountinfo_root_rewrites, epoch)?;
         self.commit_recording(data, exit_status)
     }
 
@@ -3149,14 +3167,17 @@ impl HermitData {
 
     /// Replays the given recording ID.
     pub fn replay(&self, id: Id) -> Result<ExitStatus, Error> {
-        let data = self.data_dir.join(id.to_string());
-        replay_from(&data)
+        replay_from(self.prepare_replay(id)?)
     }
 
     /// Replays the given recording ID with a gdbserver available to attach to.
     pub fn replay_with_gdbserver(&self, id: Id, port: u16) -> Result<ExitStatus, Error> {
-        let data = self.data_dir.join(id.to_string());
-        replay_with_gdbserver(&data, port)
+        replay_with_gdbserver(self.prepare_replay(id)?, port)
+    }
+
+    /// Open and validate one full replay in the current host namespace.
+    pub fn prepare_replay(&self, id: Id) -> Result<PreparedFullReplayTrace, Error> {
+        PreparedFullReplayTrace::open(&self.data_dir.join(id.to_string()))
     }
 
     /// Returns an iterator over the recordings.
@@ -3290,38 +3311,55 @@ impl<'a> From<Option<&'a PathBuf>> for HermitData {
 /// [`record_to_with_mountinfo`].
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
-    record_to_async(command, dir, Vec::new(), None).await
+    let prepared = PreparedFullRecordTrace::reserve(dir)?;
+    record_to_async(
+        command,
+        prepared,
+        Vec::new(),
+        None,
+        detcore_model::config::capture_current_epoch(),
+    )
+    .await
 }
 
 /// Records to the specified directory with exact mountinfo provenance.
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_to_with_mountinfo(
     command: Command,
-    dir: &Path,
+    prepared_trace: PreparedFullRecordTrace,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+    epoch: detcore_model::config::Epoch,
 ) -> Result<ExitStatus, Error> {
     let mountinfo_mount_ids = capture_mountinfo_identity_order()?;
     record_to_async(
         command,
-        dir,
+        prepared_trace,
         mountinfo_root_rewrites,
         Some(mountinfo_mount_ids),
+        epoch,
     )
     .await
 }
 
 async fn record_to_async(
     command: Command,
-    dir: &Path,
+    prepared_trace: PreparedFullRecordTrace,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     mountinfo_mount_ids: Option<Vec<u64>>,
+    epoch: detcore_model::config::Epoch,
 ) -> Result<ExitStatus, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
     let result = async {
-        Record::spawn_with_mountinfo(command, dir, mountinfo_root_rewrites, mountinfo_mount_ids)
-            .await?
-            .wait()
-            .await
+        Record::spawn_with_mountinfo(
+            command,
+            prepared_trace,
+            mountinfo_root_rewrites,
+            mountinfo_mount_ids,
+            epoch,
+        )
+        .await?
+        .wait()
+        .await
     }
     .await;
     skid_overshoot_report.finish(result)
@@ -3336,31 +3374,42 @@ async fn record_to_async(
 /// [`record_with_output_with_mountinfo`].
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error> {
-    record_with_output_async(command, dir, Vec::new(), None).await
+    let prepared = PreparedFullRecordTrace::reserve(dir)?;
+    record_with_output_async(
+        command,
+        prepared,
+        Vec::new(),
+        None,
+        detcore_model::config::capture_current_epoch(),
+    )
+    .await
 }
 
 /// Records with captured output and exact mountinfo provenance.
 #[tokio::main(flavor = "current_thread")]
 pub async fn record_with_output_with_mountinfo(
     command: Command,
-    dir: &Path,
+    prepared_trace: PreparedFullRecordTrace,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
+    epoch: detcore_model::config::Epoch,
 ) -> Result<Output, Error> {
     let mountinfo_mount_ids = capture_mountinfo_identity_order()?;
     record_with_output_async(
         command,
-        dir,
+        prepared_trace,
         mountinfo_root_rewrites,
         Some(mountinfo_mount_ids),
+        epoch,
     )
     .await
 }
 
 async fn record_with_output_async(
     mut command: Command,
-    dir: &Path,
+    prepared_trace: PreparedFullRecordTrace,
     mountinfo_root_rewrites: Vec<detcore_model::config::MountInfoRootRewrite>,
     mountinfo_mount_ids: Option<Vec<u64>>,
+    epoch: detcore_model::config::Epoch,
 ) -> Result<Output, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
     command.stdin(Stdio::null());
@@ -3368,10 +3417,16 @@ async fn record_with_output_async(
     command.stderr(Stdio::piped());
 
     let result = async {
-        Record::spawn_with_mountinfo(command, dir, mountinfo_root_rewrites, mountinfo_mount_ids)
-            .await?
-            .wait_with_output()
-            .await
+        Record::spawn_with_mountinfo(
+            command,
+            prepared_trace,
+            mountinfo_root_rewrites,
+            mountinfo_mount_ids,
+            epoch,
+        )
+        .await?
+        .wait_with_output()
+        .await
     }
     .await;
     skid_overshoot_report.finish(result)
@@ -3379,18 +3434,27 @@ async fn record_with_output_async(
 
 /// Replays from the specified directory.
 #[tokio::main(flavor = "current_thread")]
-pub async fn replay_from(dir: &Path) -> Result<ExitStatus, Error> {
+pub async fn replay_from(prepared: PreparedFullReplayTrace) -> Result<ExitStatus, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
-    let result = async { Ok(Replay::spawn(dir, false, None, &[]).await?.wait().await?) }.await;
+    let result = async {
+        Ok(Replay::spawn(prepared, false, None, &[])
+            .await?
+            .wait()
+            .await?)
+    }
+    .await;
     skid_overshoot_report.finish(result)
 }
 
 /// Replays with a gdb server.
 #[tokio::main(flavor = "current_thread")]
-pub async fn replay_with_gdbserver(dir: &Path, port: u16) -> Result<ExitStatus, Error> {
+pub async fn replay_with_gdbserver(
+    prepared: PreparedFullReplayTrace,
+    port: u16,
+) -> Result<ExitStatus, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
     let result = async {
-        Ok(Replay::spawn(dir, false, Some(port), &[])
+        Ok(Replay::spawn(prepared, false, Some(port), &[])
             .await?
             .wait()
             .await?)
@@ -3402,13 +3466,13 @@ pub async fn replay_with_gdbserver(dir: &Path, port: u16) -> Result<ExitStatus, 
 /// Replays with a gdb server and applies mounts inside the replay chroot.
 #[tokio::main(flavor = "current_thread")]
 pub async fn replay_with_gdbserver_and_mounts(
-    dir: &Path,
+    prepared: PreparedFullReplayTrace,
     port: u16,
     mounts: &[Mount],
 ) -> Result<ExitStatus, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
     let result = async {
-        Ok(Replay::spawn(dir, false, Some(port), mounts)
+        Ok(Replay::spawn(prepared, false, Some(port), mounts)
             .await?
             .wait()
             .await?)
@@ -3421,9 +3485,10 @@ pub async fn replay_with_gdbserver_and_mounts(
 /// stderr/stdout of the replay is captured in `Output`.
 #[tokio::main(flavor = "current_thread")]
 pub async fn replay_with_output(dir: &Path) -> Result<Output, Error> {
+    let prepared = PreparedFullReplayTrace::open(dir)?;
     let skid_overshoot_report = SkidOvershootReport::begin(true);
     let result = async {
-        Ok(Replay::spawn(dir, true, None, &[])
+        Ok(Replay::spawn(prepared, true, None, &[])
             .await?
             .wait_with_output()
             .await?)
@@ -3434,10 +3499,13 @@ pub async fn replay_with_output(dir: &Path) -> Result<Output, Error> {
 
 /// Replays with captured output and applies the requested mounts inside the replay chroot.
 #[tokio::main(flavor = "current_thread")]
-pub async fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Output, Error> {
+pub async fn replay_with_output_and_mounts(
+    prepared: PreparedFullReplayTrace,
+    mounts: &[Mount],
+) -> Result<Output, Error> {
     let skid_overshoot_report = SkidOvershootReport::begin(true);
     let result = async {
-        Ok(Replay::spawn(dir, true, None, mounts)
+        Ok(Replay::spawn(prepared, true, None, mounts)
             .await?
             .wait_with_output()
             .await?)

@@ -19,6 +19,9 @@ use std::collections::btree_map::Entry;
 use std::fmt::Debug;
 use std::fs;
 use std::fs::File;
+use std::io::Cursor;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::os::fd::FromRawFd;
@@ -34,6 +37,20 @@ use std::time::SystemTime;
 use anyhow::bail;
 use chrono::DateTime;
 use chrono::Utc;
+use detcore_model::network_trace::NetworkAddressV2;
+use detcore_model::network_trace::NetworkAncillaryDataV2;
+use detcore_model::network_trace::NetworkChannelId;
+use detcore_model::network_trace::NetworkChannelV2;
+use detcore_model::network_trace::NetworkConnectionResultV2;
+use detcore_model::network_trace::NetworkDatagramV2;
+use detcore_model::network_trace::NetworkInputEventV2;
+use detcore_model::network_trace::NetworkInputKindV2;
+use detcore_model::network_trace::NetworkOutputEventV2;
+use detcore_model::network_trace::NetworkOutputKindV2;
+use detcore_model::network_trace::NetworkPolicy;
+use detcore_model::network_trace::NetworkReadinessV2;
+use detcore_model::network_trace::NetworkReleaseV2;
+use detcore_model::network_trace::NetworkShutdownV2;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
@@ -62,6 +79,14 @@ use tracing::warn;
 use crate::config::Config;
 use crate::consts::ROOT_DETPID;
 use crate::ivar::Ivar;
+use crate::network_replay::ConnectionOutcome;
+use crate::network_replay::DatagramReceiveOutcome;
+use crate::network_replay::NetworkReceiveOptions;
+use crate::network_replay::NetworkReplayEngine;
+use crate::network_replay::NetworkReplayError;
+use crate::network_replay::StreamReceiveOutcome;
+use crate::network_replay::StreamTransmitOutcome;
+use crate::network_replay::replay_from_reader_with_expected_epoch;
 use crate::preemptions::PreemptionReader;
 use crate::preemptions::ThreadHistory;
 use crate::record_or_replay::RecordOrReplay;
@@ -422,6 +447,41 @@ impl DevicePool {
     }
 }
 
+fn initialize_network_engine(
+    cfg: &Config,
+) -> Result<Option<Arc<Mutex<NetworkReplayEngine>>>, String> {
+    let engine = match cfg.network_trace.policy {
+        NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => return Ok(None),
+        NetworkPolicy::Record => {
+            if !cfg.epoch_explicit {
+                return Err(
+                    "network record epoch was not resolved before engine startup".to_owned(),
+                );
+            }
+            NetworkReplayEngine::record(cfg.epoch)
+        }
+        NetworkPolicy::Replay => {
+            if !cfg.epoch_explicit {
+                return Err(
+                    "network replay epoch was not resolved before engine startup".to_owned(),
+                );
+            }
+            let bytes = cfg.network_trace_input.as_ref().ok_or_else(|| {
+                "network replay policy omitted verified host trace bytes".to_owned()
+            })?;
+            replay_from_reader_with_expected_epoch(Cursor::new(bytes), cfg.epoch)
+                .map_err(|error| format!("cannot initialize network replay: {error}"))?
+        }
+    };
+    Ok(Some(Arc::new(Mutex::new(engine))))
+}
+
+#[derive(Debug, Default)]
+struct NetworkRecordProgress {
+    inbound_stream: u64,
+    outbound_stream: u64,
+}
+
 /// Global state associated with the detcore tool.
 ///
 /// This is a singleton, and the one object of this type lives inside a central
@@ -429,6 +489,13 @@ impl DevicePool {
 #[derive(Debug)]
 pub struct GlobalState {
     sched: Arc<Mutex<Scheduler>>,
+
+    /// One run-global network engine shared by every guest task and scheduler wait.
+    network_engine: Option<Arc<Mutex<NetworkReplayEngine>>>,
+
+    /// Stream offsets are run-global so competing aliases cannot assign them
+    /// according to thread-local syscall order.
+    network_record_progress: Mutex<BTreeMap<OpenFileId, NetworkRecordProgress>>,
 
     inodes: Arc<Mutex<InodePool>>,
 
@@ -542,7 +609,15 @@ impl GlobalState {
     }
 
     fn initialize(cfg: &Config, spawn_scheduler: bool) -> Self {
-        let sched = Arc::new(Mutex::new(Scheduler::new(cfg)));
+        // Replay is decoded and fully validated before the first guest task can
+        // start.  There is no live-network fallback for a missing or malformed
+        // trace.
+        let network_engine = initialize_network_engine(cfg).unwrap_or_else(|error| {
+            panic!("network capture/replay initialization failed: {error}")
+        });
+        let mut scheduler = Scheduler::new(cfg);
+        scheduler.set_network_engine(network_engine.clone());
+        let sched = Arc::new(Mutex::new(scheduler));
         let global_time = Arc::new(Mutex::new(GlobalTime::new(cfg)));
         let handle = if cfg.sequentialize_threads && spawn_scheduler {
             // Announce before spawning, not from inside the spawned task. The
@@ -589,6 +664,8 @@ impl GlobalState {
 
         Self {
             sched,
+            network_engine,
+            network_record_progress: Mutex::new(BTreeMap::new()),
             next_port: AtomicU16::new(range[0]),
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
@@ -767,6 +844,8 @@ impl GlobalState {
             handle.await.expect("Global scheduler clean shutdown");
             debug!("Global state cleanup, continuing...");
         }
+        self.finalize_network_trace()
+            .expect("network capture/replay finalization failed");
         let banner =
             "  ------------------------------ hermit run report ------------------------------";
         let recording_destination = self.cfg.record_preemptions_to.clone();
@@ -802,6 +881,65 @@ impl GlobalState {
             );
             if let Some(x) = rt {
                 debug!("Nondeterministic realtime elapsed: {:?}", x);
+            }
+        }
+    }
+
+    /// Finish the shared engine and durably close its sidecar before a caller
+    /// publishes successful run metadata.  Replay refuses unconsumed input or
+    /// output; record validates the complete V2 trace before writing it.
+    pub fn finalize_network_trace(&mut self) -> anyhow::Result<()> {
+        let Some(engine) = self.network_engine.take() else {
+            return Ok(());
+        };
+        let scheduler_engine = self
+            .sched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_network_engine();
+        if let Some(scheduler_engine) = &scheduler_engine
+            && !Arc::ptr_eq(&engine, scheduler_engine)
+        {
+            bail!("scheduler and RPC paths used different network engines");
+        }
+        drop(scheduler_engine);
+        let engine = Arc::try_unwrap(engine)
+            .map_err(|_| anyhow::anyhow!("network engine still has live users at finalization"))?
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("network engine mutex was poisoned"))?;
+        match self.cfg.network_trace.policy {
+            NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => {
+                bail!("non-engine network policy unexpectedly owned an engine")
+            }
+            NetworkPolicy::Replay => engine
+                .finish()
+                .map_err(|error| anyhow::anyhow!("network replay mismatch: {error}")),
+            NetworkPolicy::Record => {
+                let trace = engine
+                    .into_recorded_trace()
+                    .map_err(|error| anyhow::anyhow!("invalid recorded network trace: {error}"))?;
+                if trace.channels.is_empty() && !self.cfg.recordreplay_modes {
+                    bail!("network recording captured no external channels");
+                }
+                let inherited = self.cfg.network_trace_output_fd.ok_or_else(|| {
+                    anyhow::anyhow!("network record policy omitted its reserved host output")
+                })?;
+                let duplicate = unsafe { libc::fcntl(inherited, libc::F_DUPFD_CLOEXEC, inherited) };
+                if duplicate < 0 {
+                    bail!(
+                        "cannot duplicate reserved network trace output: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                // SAFETY: fcntl returned a fresh owned descriptor.
+                let mut file = unsafe { File::from_raw_fd(duplicate) };
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+                trace.write_framed(&mut file).map_err(|error| {
+                    anyhow::anyhow!("cannot encode reserved network trace output: {error}")
+                })?;
+                file.sync_all()?;
+                Ok(())
             }
         }
     }
@@ -1433,6 +1571,7 @@ impl GlobalTool for GlobalState {
                 let ns = self.global_time.lock().unwrap().as_nanos();
                 R::GlobalTimeLowerBound(ns)
             }
+            GlobalRequest::Network(request) => R::Network(self.recv_network_request(request)),
             GlobalRequest::TraceSchedEvent(ev, detpid, command_bootstrap) => {
                 match self
                     .recv_trace_schedevent(ev, detpid, request_mm, command_bootstrap)
@@ -2657,6 +2796,215 @@ impl GlobalState {
         );
         SchedulerRpcResult::Continue(())
     }
+
+    fn recv_network_request(&self, request: NetworkRequest) -> Result<NetworkReply, String> {
+        let engine = self
+            .network_engine
+            .as_ref()
+            .ok_or_else(|| "network engine request under deny/unsafe-live policy".to_owned())?;
+        let mut engine = engine
+            .lock()
+            .map_err(|_| "network engine mutex was poisoned".to_owned())?;
+        let result = match request {
+            NetworkRequest::RecordChannel(channel) => {
+                engine.record_channel(channel).map(|()| NetworkReply::Unit)
+            }
+            NetworkRequest::RecordInput(input) => {
+                engine.record_input(input).map(|()| NetworkReply::Unit)
+            }
+            NetworkRequest::RecordOutput(output) => {
+                engine.record_output(output).map(|()| NetworkReply::Unit)
+            }
+            NetworkRequest::CaptureStreamInput {
+                open_file,
+                observed_at,
+                input,
+            } => (|| -> Result<NetworkReply, NetworkReplayError> {
+                let channel = engine
+                    .channel_for(open_file)
+                    .ok_or(NetworkReplayError::UnboundOpenFile(open_file))?;
+                let mut progress = self.network_record_progress.lock().unwrap();
+                let progress = progress.entry(open_file).or_default();
+                let event = match input {
+                    NetworkCapturedStreamInput::Bytes(bytes) => NetworkInputKindV2::StreamBytes {
+                        stream_offset: progress.inbound_stream,
+                        bytes,
+                    },
+                    NetworkCapturedStreamInput::EndOfFile => NetworkInputKindV2::PeerShutdown {
+                        stream_offset: progress.inbound_stream,
+                        direction: NetworkShutdownV2::Write,
+                    },
+                    NetworkCapturedStreamInput::Error(errno) => NetworkInputKindV2::SocketError {
+                        stream_offset: progress.inbound_stream,
+                        errno,
+                    },
+                    NetworkCapturedStreamInput::Connect(result) => {
+                        NetworkInputKindV2::Connect(result)
+                    }
+                };
+                let byte_count = match &event {
+                    NetworkInputKindV2::StreamBytes { bytes, .. } => bytes.len() as u64,
+                    _ => 0,
+                };
+                engine.record_input(NetworkInputEventV2 {
+                    ordinal: 0,
+                    channel,
+                    release: NetworkReleaseV2 {
+                        not_before_global_time: observed_at,
+                        after_transmitted_offset: progress.outbound_stream,
+                    },
+                    event,
+                })?;
+                progress.inbound_stream = progress
+                    .inbound_stream
+                    .checked_add(byte_count)
+                    .ok_or(NetworkReplayError::Overflow)?;
+                Ok(NetworkReply::Unit)
+            })(),
+            NetworkRequest::CaptureStreamOutput { open_file, output } => {
+                (|| -> Result<NetworkReply, NetworkReplayError> {
+                    let channel = engine
+                        .channel_for(open_file)
+                        .ok_or(NetworkReplayError::UnboundOpenFile(open_file))?;
+                    let mut progress = self.network_record_progress.lock().unwrap();
+                    let progress = progress.entry(open_file).or_default();
+                    let (event, byte_count) = match output {
+                        NetworkCapturedStreamOutput::Bytes(bytes) => {
+                            let byte_count = bytes.len() as u64;
+                            (
+                                NetworkOutputKindV2::StreamBytes {
+                                    stream_offset: progress.outbound_stream,
+                                    bytes,
+                                },
+                                byte_count,
+                            )
+                        }
+                        NetworkCapturedStreamOutput::Error(errno) => (
+                            NetworkOutputKindV2::SocketError {
+                                stream_offset: progress.outbound_stream,
+                                errno,
+                            },
+                            0,
+                        ),
+                        NetworkCapturedStreamOutput::Shutdown(direction) => (
+                            NetworkOutputKindV2::Shutdown {
+                                stream_offset: progress.outbound_stream,
+                                direction,
+                            },
+                            0,
+                        ),
+                    };
+                    engine.record_output(NetworkOutputEventV2 { channel, event })?;
+                    progress.outbound_stream = progress
+                        .outbound_stream
+                        .checked_add(byte_count)
+                        .ok_or(NetworkReplayError::Overflow)?;
+                    Ok(NetworkReply::Unit)
+                })()
+            }
+            NetworkRequest::Bind(open_file, channel) => {
+                engine.bind(open_file, channel).map(|()| NetworkReply::Unit)
+            }
+            NetworkRequest::Retire(open_file) => {
+                Ok(NetworkReply::Channel(engine.retire_open_file(open_file)))
+            }
+            NetworkRequest::ReleaseEligible(now) => engine
+                .release_eligible(now)
+                .map(|channels| NetworkReply::ReadyChannels(channels.into_iter().collect())),
+            NetworkRequest::ReceiveStream {
+                open_file,
+                maximum,
+                nonblocking,
+                flags,
+                receive_low_water,
+            } => engine
+                .receive_stream_with_options(
+                    open_file,
+                    NetworkReceiveOptions {
+                        maximum,
+                        nonblocking,
+                        flags,
+                        receive_low_water,
+                    },
+                )
+                .map(|outcome| {
+                    NetworkReply::StreamReceive(match outcome {
+                        StreamReceiveOutcome::Bytes(bytes) => NetworkStreamReceive::Bytes(bytes),
+                        StreamReceiveOutcome::EndOfFile => NetworkStreamReceive::EndOfFile,
+                        StreamReceiveOutcome::Error(errno) => NetworkStreamReceive::Error(errno),
+                        StreamReceiveOutcome::WouldBlock => NetworkStreamReceive::WouldBlock,
+                        StreamReceiveOutcome::Pending => NetworkStreamReceive::Pending,
+                    })
+                }),
+            NetworkRequest::ReceiveDatagram {
+                open_file,
+                maximum,
+                nonblocking,
+            } => engine
+                .receive_datagram(open_file, maximum, nonblocking)
+                .map(|outcome| {
+                    NetworkReply::DatagramReceive(match outcome {
+                        DatagramReceiveOutcome::Datagram(delivery) => {
+                            NetworkDatagramReceive::Datagram(NetworkDatagramDelivery {
+                                bytes: delivery.bytes,
+                                original_len: delivery.original_len,
+                                source: delivery.source,
+                                destination: delivery.destination,
+                                ancillary: delivery.ancillary,
+                                message_flags: delivery.message_flags,
+                            })
+                        }
+                        DatagramReceiveOutcome::Error(errno) => {
+                            NetworkDatagramReceive::Error(errno)
+                        }
+                        DatagramReceiveOutcome::WouldBlock => NetworkDatagramReceive::WouldBlock,
+                        DatagramReceiveOutcome::Pending => NetworkDatagramReceive::Pending,
+                    })
+                }),
+            NetworkRequest::TransmitStream { open_file, bytes } => {
+                engine.transmit_stream(open_file, &bytes).map(|outcome| {
+                    NetworkReply::StreamTransmit(match outcome {
+                        StreamTransmitOutcome::Accepted(count) => {
+                            NetworkStreamTransmit::Accepted(count)
+                        }
+                        StreamTransmitOutcome::Error(errno) => NetworkStreamTransmit::Error(errno),
+                    })
+                })
+            }
+            NetworkRequest::TransmitDatagram {
+                open_file,
+                datagram,
+            } => engine
+                .transmit_datagram(open_file, &datagram)
+                .map(|()| NetworkReply::Unit),
+            NetworkRequest::Shutdown(open_file, direction) => engine
+                .shutdown(open_file, direction)
+                .map(|()| NetworkReply::Unit),
+            NetworkRequest::TakeConnectionOutcome(open_file) => {
+                engine.take_connection_outcome(open_file).map(|outcome| {
+                    NetworkReply::Connection(outcome.map(|outcome| match outcome {
+                        ConnectionOutcome::Connect(result) => NetworkConnection::Connect(result),
+                        ConnectionOutcome::Accept {
+                            accepted,
+                            peer,
+                            ancillary,
+                        } => NetworkConnection::Accept {
+                            accepted,
+                            peer,
+                            ancillary,
+                        },
+                    }))
+                })
+            }
+            NetworkRequest::Readiness(open_file) => {
+                engine.readiness(open_file).map(NetworkReply::Readiness)
+            }
+            NetworkRequest::ChannelFor(open_file) => {
+                Ok(NetworkReply::Channel(engine.channel_for(open_file)))
+            }
+        };
+        result.map_err(|error| error.to_string())
+    }
 }
 
 /// Identity and final accounting for an asynchronous scheduler deregistration.
@@ -2671,6 +3019,199 @@ pub struct ThreadDeregistration {
     pub(crate) timeslice_stats: TimesliceStats,
     pub(crate) syscall_count: u64,
     pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
+}
+
+/// The one normalized request vocabulary used by all engine-owned socket and
+/// readiness syscalls.  It contains no thread identity or syscall ordinal.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkRequest {
+    /// Declare a trace-stable channel while capturing.
+    RecordChannel(NetworkChannelV2),
+    /// Append one live external observation while capturing.
+    RecordInput(NetworkInputEventV2),
+    /// Append one guest output observation while capturing.
+    RecordOutput(NetworkOutputEventV2),
+    /// Atomically assign offsets and append a live stream observation.
+    CaptureStreamInput {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Continuous logical time at host observation.
+        observed_at: LogicalTime,
+        /// Normalized input result.
+        input: NetworkCapturedStreamInput,
+    },
+    /// Atomically assign offsets and append guest stream output.
+    CaptureStreamOutput {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Normalized output result.
+        output: NetworkCapturedStreamOutput,
+    },
+    /// Bind a stable open-file description to a trace channel.
+    Bind(OpenFileId, NetworkChannelId),
+    /// Retire the binding after the final descriptor alias closes.
+    Retire(OpenFileId),
+    /// Release replay input eligible at this exact logical time.
+    ReleaseEligible(LogicalTime),
+    /// Consume available stream input without matching a caller identity.
+    ReceiveStream {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Guest buffer capacity.
+        maximum: usize,
+        /// Whether absence returns `WouldBlock` instead of `Pending`.
+        nonblocking: bool,
+        /// Linux receive flags relevant to data movement.
+        flags: i32,
+        /// Effective `SO_RCVLOWAT` value.
+        receive_low_water: usize,
+    },
+    /// Consume one complete datagram boundary.
+    ReceiveDatagram {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Guest payload capacity.
+        maximum: usize,
+        /// Whether absence returns `WouldBlock` instead of `Pending`.
+        nonblocking: bool,
+    },
+    /// Validate and advance outbound stream progress.
+    TransmitStream {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Guest-provided bytes in stream order.
+        bytes: Vec<u8>,
+    },
+    /// Validate one outbound datagram and its metadata.
+    TransmitDatagram {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Complete datagram boundary and addressing metadata.
+        datagram: NetworkDatagramV2,
+    },
+    /// Validate an outbound half/full-close transition.
+    Shutdown(OpenFileId, NetworkShutdownV2),
+    /// Consume one released connect or accept result.
+    TakeConnectionOutcome(OpenFileId),
+    /// Query modeled readiness without consuming availability.
+    Readiness(OpenFileId),
+    /// Resolve the trace channel currently bound to an open file.
+    ChannelFor(OpenFileId),
+}
+
+/// Live stream input normalized before entering the capture engine.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkCapturedStreamInput {
+    /// Newly observed bytes.
+    Bytes(Vec<u8>),
+    /// Peer write-side shutdown.
+    EndOfFile,
+    /// Positive Linux errno.
+    Error(i32),
+    /// Completion of an outbound connect attempt.
+    Connect(NetworkConnectionResultV2),
+}
+
+/// Guest stream output normalized before entering the capture engine.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkCapturedStreamOutput {
+    /// Successfully transmitted bytes.
+    Bytes(Vec<u8>),
+    /// Positive Linux errno.
+    Error(i32),
+    /// Local shutdown transition.
+    Shutdown(NetworkShutdownV2),
+}
+
+/// Serializable result of one replayed stream receive attempt.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkStreamReceive {
+    /// Bytes removed from currently available stream input.
+    Bytes(Vec<u8>),
+    /// Peer write shutdown after all preceding bytes were consumed.
+    EndOfFile,
+    /// Exact recorded Linux errno.
+    Error(i32),
+    /// A nonblocking attempt has no current availability.
+    WouldBlock,
+    /// A blocking attempt must register a scheduler wait.
+    Pending,
+}
+
+/// Serializable result of validating one stream transmit.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkStreamTransmit {
+    /// Byte count accepted before an error or trace boundary.
+    Accepted(usize),
+    /// Exact recorded Linux errno at current outbound progress.
+    Error(i32),
+}
+
+/// One replayed datagram after applying the guest payload bound.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub struct NetworkDatagramDelivery {
+    /// Bytes copied to guest memory, possibly truncated.
+    pub bytes: Vec<u8>,
+    /// Complete recorded datagram length.
+    pub original_len: usize,
+    /// Recorded sender address.
+    pub source: Option<NetworkAddressV2>,
+    /// Recorded destination address.
+    pub destination: Option<NetworkAddressV2>,
+    /// Control bytes plus object-relocation metadata.
+    pub ancillary: Option<NetworkAncillaryDataV2>,
+    /// Recorded message flags before adapter truncation flags.
+    pub message_flags: i32,
+}
+
+/// Serializable result of one replayed datagram receive attempt.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkDatagramReceive {
+    /// One complete recorded datagram boundary.
+    Datagram(NetworkDatagramDelivery),
+    /// Exact recorded Linux errno.
+    Error(i32),
+    /// A nonblocking attempt has no current datagram.
+    WouldBlock,
+    /// A blocking attempt must register a scheduler wait.
+    Pending,
+}
+
+/// Serializable released connection-control observation.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkConnection {
+    /// Completion of an outbound connect.
+    Connect(NetworkConnectionResultV2),
+    /// Completion of an accept with a new trace channel.
+    Accept {
+        /// Trace identity of the accepted socket.
+        accepted: NetworkChannelId,
+        /// Peer address returned to guest memory.
+        peer: Option<NetworkAddressV2>,
+        /// Creation-time ancillary relocation metadata.
+        ancillary: Option<NetworkAncillaryDataV2>,
+    },
+}
+
+/// Response vocabulary for the normalized network engine RPC.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkReply {
+    /// Mutation completed without a value.
+    Unit,
+    /// Optional channel from lookup or retirement.
+    Channel(Option<NetworkChannelId>),
+    /// Channels whose replay observations became eligible.
+    ReadyChannels(Vec<NetworkChannelId>),
+    /// Stream receive outcome.
+    StreamReceive(NetworkStreamReceive),
+    /// Stream transmit outcome.
+    StreamTransmit(NetworkStreamTransmit),
+    /// Datagram receive outcome.
+    DatagramReceive(NetworkDatagramReceive),
+    /// Optional connect or accept observation.
+    Connection(Option<NetworkConnection>),
+    /// Current modeled readiness bits.
+    Readiness(NetworkReadinessV2),
 }
 
 /// Messages to the global object.
@@ -2798,6 +3339,9 @@ pub enum GlobalRequest {
     /// Retrieve global time.
     GlobalTimeLowerBound,
 
+    /// Run one normalized operation against the shared network engine.
+    Network(NetworkRequest),
+
     /// Record scheduling event in a total order.
     // Logging provenance only; never serialized into a schedule artifact.
     TraceSchedEvent(SchedEvent, DetPid, bool),
@@ -2901,6 +3445,7 @@ pub enum GlobalResponse {
     UnlinkInode(()),
     TouchFile(()),
     GlobalTimeLowerBound(LogicalTime),
+    Network(Result<NetworkReply, String>),
     TraceSchedEvent(TraceSchedEventResponse),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
@@ -3060,6 +3605,28 @@ where
             .advance_to(time);
     }
     resp
+}
+
+/// Send one engine-owned network operation through the single global path.
+/// An unexpected response is an internal protocol failure, never permission to
+/// fall back to a live syscall.
+pub async fn network_request<G, T>(
+    guest: &mut G,
+    request: NetworkRequest,
+) -> Result<NetworkReply, String>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::Network(request))
+        .await
+        .1
+    {
+        GlobalResponse::Network(result) => result,
+        response => Err(format!(
+            "network engine RPC returned unexpected response {response:?}"
+        )),
+    }
 }
 
 /// When the thread resumes after a potentially-blocking scheduler request, is it a normal
