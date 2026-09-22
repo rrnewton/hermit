@@ -362,7 +362,7 @@ for name in "${pass_env[@]}"; do
 done
 
 
-# Only the integration node opts in. Native tests and independent containers
+# Only nodes selecting proc-locks fixtures opt in. Native tests and containers
 # must flock this same host inode: a per-container lock cannot serialize OFD
 # observations across PID namespaces. Never mount the rest of the host runtime.
 if "$proc_locks_runtime"; then

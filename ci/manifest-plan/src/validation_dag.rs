@@ -475,6 +475,13 @@ fn runs_in_pinned_root(step: &Step) -> bool {
 pub const PINNED_ROOT_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ "$#" -gt 0 ]; then printf -v hermit_extra ' %q' "$@"; hermit_payload+=$hermit_extra; fi && exec bash -c "$hermit_payload""#;
 pub(super) const LEGACY_PINNED_ROOT_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1""#;
 
+fn needs_proc_locks_runtime(tag: &str) -> bool {
+    matches!(
+        tag,
+        "test.hermit_integration" | "e2e.manifest_c_programs" | "quick.e2e_verify"
+    )
+}
+
 fn pinned_root_command(step: &Step) -> String {
     let mut env_names = PINNED_ROOT_FORWARDED_ENV
         .iter()
@@ -502,7 +509,7 @@ fn pinned_root_command(step: &Step) -> String {
     ];
     // Proc-locks snapshots include OFD locks from other PID namespaces. Share
     // the native host lease inode, not one file per container or validation.
-    if step.tag() == "test.hermit_integration" {
+    if needs_proc_locks_runtime(&step.tag()) {
         argv.push("--proc-locks-runtime".into());
     }
     if step.tag() == "test.regular_crates" {
@@ -540,7 +547,7 @@ pub(crate) fn refresh_pinned_root_environment(tag: &str, command: &str) -> Resul
         .iter()
         .filter(|word| **word == "--proc-locks-runtime")
         .count();
-    match (tag == "test.hermit_integration", lease_options) {
+    match (needs_proc_locks_runtime(tag), lease_options) {
         (true, 0) => refreshed.push_str(" --proc-locks-runtime"),
         (true, 1) | (false, 0) => {}
         _ => return Err(format!("{tag} has an unexpected proc-locks runtime option")),
@@ -2502,7 +2509,7 @@ sys.exit(37)
             );
             assert_eq!(
                 command.matches(" --proc-locks-runtime ").count(),
-                usize::from(step.tag() == "test.hermit_integration")
+                usize::from(needs_proc_locks_runtime(&step.tag()))
             );
         }
         let integration = steps
@@ -2525,6 +2532,19 @@ sys.exit(37)
             1
         );
         assert!(refresh_pinned_root_environment("test.hermit_unit", &command).is_err());
+        for tag in ["e2e.manifest_c_programs", "quick.e2e_verify"] {
+            let step = steps.iter().find(|step| step.tag() == tag).unwrap();
+            let command = pinned_root_command(step);
+            assert_eq!(
+                refresh_pinned_root_environment(tag, &command).unwrap(),
+                command
+            );
+            assert_eq!(
+                refresh_pinned_root_environment(tag, &command.replace(" --proc-locks-runtime", ""))
+                    .unwrap(),
+                command
+            );
+        }
         assert!(
             refresh_pinned_root_environment(
                 "test.hermit_integration",
