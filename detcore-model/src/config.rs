@@ -14,6 +14,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::SystemTime;
 
 use chrono::DateTime;
 use chrono::Utc;
@@ -203,11 +204,15 @@ pub struct Config {
     ///
     /// This is the datetime from which all time and date modtimes begin and
     /// monotonically increase. It is in RFC3339 format such as `2026-01-01T00:00:00Z`.
+    /// The stable default here is for library callers and wire-format fixtures;
+    /// the `hermit run` and `hermit oci run` commands replace an omitted CLI
+    /// default with one host wall-clock sample taken before backend dispatch.
     #[clap(
         long,
         env = "HERMIT_EPOCH",
         value_name = "YYYY-MM-DDThh:mm:ssZ",
-        default_value = DEFAULT_EPOCH_STR
+        default_value = DEFAULT_EPOCH_STR,
+        hide_default_value = true
     )]
     pub epoch: DateTime<Utc>,
 
@@ -737,6 +742,19 @@ fn try_parse_memory(from_str: &str) -> anyhow::Result<u64> {
 }
 
 impl Config {
+    /// Whether the epoch is the stable library default omitted by `Display`.
+    pub fn has_default_epoch(&self) -> bool {
+        self.epoch == DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap()
+    }
+
+    /// Replace the stable library/test default with the host wall clock captured
+    /// by the outer `hermit run` invocation. The caller owns the single
+    /// host-clock read boundary; all guest clock and metadata observations
+    /// consume the resulting concrete epoch.
+    pub fn capture_epoch_from_host_time(&mut self, now: SystemTime) {
+        self.epoch = epoch_from_host_time(now);
+    }
+
     /// Smallest PMU-backed maximum representable by one RCB at this clock multiplier.
     pub fn minimum_max_timeslice_nanos(&self) -> u64 {
         let slowdown = if self.chaos && self.chaos_per_thread_slowdown {
@@ -895,8 +913,7 @@ impl fmt::Display for Config {
             RunsPostFork::Parent => write!(f, " --runs-post-fork=parent")?,
             RunsPostFork::Random => write!(f, " --runs-post-fork=random")?,
         }
-        let default_epoch: DateTime<Utc> = DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap();
-        if self.epoch != default_epoch {
+        if !self.has_default_epoch() {
             write!(f, " --epoch={}", self.epoch.to_rfc3339())?;
         }
         if self.seed != 0 {
@@ -1272,6 +1289,13 @@ impl std::error::Error for ParseTimesliceError {
 /// original unix epoch (time zero).
 pub static DEFAULT_EPOCH_STR: &str = "2026-01-01T00:00:00Z";
 
+/// Convert one invocation's captured host instant without losing subsecond
+/// precision. CLI and comparison orchestration share this input conversion;
+/// guest clock progression never reads the host clock through it.
+pub fn epoch_from_host_time(now: SystemTime) -> DateTime<Utc> {
+    DateTime::<Utc>::from(now)
+}
+
 impl Config {
     /// Construct the config using environment variables only, not CLI args.
     pub fn from_env() -> Self {
@@ -1405,6 +1429,24 @@ mod tests {
         assert_eq!(DEFAULT_EPOCH_STR, "2026-01-01T00:00:00Z");
         let epoch = DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap();
         assert_eq!(epoch.timestamp(), 1_767_225_600);
+    }
+
+    #[test]
+    fn resolved_epoch_is_serialized_as_an_exact_config_input() {
+        let epoch = "2000-12-31T23:59:59.123456789Z"
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        let config = Config {
+            epoch,
+            ..Config::default()
+        };
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            encoded["epoch"],
+            serde_json::json!("2000-12-31T23:59:59.123456789Z")
+        );
+        let decoded: Config = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.epoch, epoch);
     }
 
     #[test]

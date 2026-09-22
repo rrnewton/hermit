@@ -1563,6 +1563,8 @@ pub struct RunContext {
     pub host_capabilities: HostCapabilities,
     pub attempt: u64,
     pub run_index: Option<u64>,
+    /// One concrete CLI input shared by comparison operands and outer retries.
+    pub epoch: String,
     pub source_sha: String,
     pub source_dirty: bool,
     /// Provenance the hermit binary reports about itself, probed once per run.
@@ -1577,6 +1579,20 @@ pub struct RunContext {
     pub timeout_multipliers: TimeoutMultipliers,
     pub scheduled_worker_capacity: ScheduledWorkerCapacity,
     pub isolated_workdir: Option<PathBuf>,
+}
+
+fn resolve_run_epoch(
+    explicit: Option<std::ffi::OsString>,
+    capture_now: impl FnOnce() -> SystemTime,
+) -> Result<String, String> {
+    match explicit {
+        // Preserve the supported input exactly, including invalid values that
+        // the CLI must reject. Never replace an override with a new sample.
+        Some(epoch) => epoch
+            .into_string()
+            .map_err(|_| "HERMIT_EPOCH must be valid Unicode".to_owned()),
+        None => Ok(detcore_model::config::epoch_from_host_time(capture_now()).to_rfc3339()),
+    }
 }
 
 impl RunContext {
@@ -1681,6 +1697,7 @@ impl RunContext {
             host_capabilities,
             attempt: 1,
             run_index,
+            epoch: resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"), SystemTime::now)?,
             source_sha,
             source_dirty,
             binary_build_sha,
@@ -2154,6 +2171,11 @@ pub fn build_spec(
     let backend = cell.id.backend.as_deref().unwrap_or("native");
     let mode_recipe = &cell.test.modes[&cell.id.mode];
     let mut env = execution_cell_env(context, &dir, cell.id.mode != "naked");
+    if cell.id.mode != "naked" {
+        // An environment input preserves explicit custom --epoch precedence.
+        // append_guest_env_args intentionally does not forward this CLI input.
+        env.insert("HERMIT_EPOCH".into(), context.epoch.clone());
+    }
     let sabre_path_evidence = (backend == "sabre").then(|| {
         dir.join("captures")
             .join(format!("{}-{attempt}.sabre-path.jsonl", cell.id.mode))
@@ -5863,6 +5885,7 @@ mod tests {
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             run_index: None,
+            epoch: "2026-01-01T00:00:00Z".into(),
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -5874,6 +5897,98 @@ mod tests {
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
         }
+    }
+
+    #[test]
+    fn comparison_epoch_is_captured_once_and_explicit_input_never_reads_clock() {
+        let calls = std::cell::Cell::new(0);
+        let epoch = resolve_run_epoch(None, || {
+            calls.set(calls.get() + 1);
+            UNIX_EPOCH + Duration::new(978_307_199, 123_456_789)
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(epoch, "2000-12-31T23:59:59.123456789+00:00");
+        let explicit = "2026-01-01T00:00:00.987654321Z";
+        assert_eq!(
+            resolve_run_epoch(Some(explicit.into()), || {
+                panic!("an explicit environment epoch must not sample the clock")
+            })
+            .unwrap(),
+            explicit
+        );
+    }
+
+    #[test]
+    fn comparison_epoch_is_retained_across_operands_repeats_and_outer_retries() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-comparison-epoch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let mut context = run_context(&root);
+        context.epoch = resolve_run_epoch(None, || {
+            UNIX_EPOCH + Duration::new(978_307_199, 123_456_789)
+        })
+        .unwrap();
+        for outer_attempt in [1, 2] {
+            let context = context.with_attempt(outer_attempt);
+            for backend in ["sabre", "ptrace"] {
+                let mut cell = ptrace_cell("verify");
+                cell.id.backend = Some(backend.into());
+                for attempt in ["1", "parity-reference"] {
+                    let spec = build_spec(
+                        &context,
+                        &cell,
+                        root.join(backend),
+                        vec!["/bin/date".into(), "+%s%N".into()],
+                        attempt,
+                        None,
+                        15,
+                    )
+                    .unwrap();
+                    assert_eq!(spec.env.get("HERMIT_EPOCH"), Some(&context.epoch));
+                    assert!(!spec.argv.iter().any(|arg| arg.contains("HERMIT_EPOCH")));
+                    assert!(!spec.argv.iter().any(|arg| arg.starts_with("--epoch")));
+                }
+            }
+        }
+        let mut custom = ptrace_cell("custom");
+        custom.test.modes.get_mut("custom").unwrap().args =
+            vec!["--epoch=2026-01-01T00:00:00.987654321Z".into()];
+        let spec = build_spec(
+            &context,
+            &custom,
+            root.join("custom"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+            15,
+        )
+        .unwrap();
+        assert_eq!(spec.env.get("HERMIT_EPOCH"), Some(&context.epoch));
+        assert_eq!(
+            spec.argv
+                .iter()
+                .filter(|arg| arg.starts_with("--epoch"))
+                .collect::<Vec<_>>(),
+            [&"--epoch=2026-01-01T00:00:00.987654321Z".to_owned()]
+        );
+        let naked = build_spec(
+            &context,
+            &ptrace_cell("naked"),
+            root.join("naked"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+            15,
+        )
+        .unwrap();
+        assert!(!naked.env.contains_key("HERMIT_EPOCH"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5965,6 +6080,7 @@ mod tests {
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             run_index: None,
+            epoch: "2026-01-01T00:00:00Z".into(),
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -7809,6 +7925,7 @@ int main(int argc, char **argv) {
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             run_index: None,
+            epoch: "2026-01-01T00:00:00Z".into(),
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -7882,6 +7999,7 @@ int main(int argc, char **argv) {
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             run_index: None,
+            epoch: "2026-01-01T00:00:00Z".into(),
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -8005,6 +8123,7 @@ int main(int argc, char **argv) {
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             run_index: None,
+            epoch: "2026-01-01T00:00:00Z".into(),
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -8274,6 +8393,7 @@ backends_disabled:
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             run_index: None,
+            epoch: "2026-01-01T00:00:00Z".into(),
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -8330,6 +8450,7 @@ backends_disabled:
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             run_index: None,
+            epoch: "2026-01-01T00:00:00Z".into(),
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -8627,6 +8748,7 @@ backends_disabled:
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             run_index: None,
+            epoch: "2026-01-01T00:00:00Z".into(),
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -8716,6 +8838,7 @@ backends_disabled:
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             run_index: None,
+            epoch: "2026-01-01T00:00:00Z".into(),
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -10826,6 +10949,7 @@ esac
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             run_index: None,
+            epoch: "2026-01-01T00:00:00Z".into(),
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -10883,6 +11007,7 @@ esac
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             run_index: None,
+            epoch: "2026-01-01T00:00:00Z".into(),
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
@@ -11050,6 +11175,7 @@ esac
             host_capabilities: fixture_host_capabilities(),
             attempt: 1,
             run_index: None,
+            epoch: "2026-01-01T00:00:00Z".into(),
             source_sha: "0".repeat(40),
             binary_build_sha: None,
             source_dirty: false,
