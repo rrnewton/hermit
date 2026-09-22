@@ -192,10 +192,32 @@ fn test_inputs(
 }
 
 impl PreparedEvidence {
+    // Compatibility for the existing typed-result fixture. This ordinary
+    // acquisition does not create RawCensusAuthority or a producer census.
+    #[cfg(test)]
     pub fn retain(
         self,
         parent: &Path,
         result_root: &Path,
+        ctx: &LedgerCtx,
+        outcomes: &[StepOutcome],
+        attempts: &[NodeAttempt],
+        compat_prefix: Option<&str>,
+    ) -> Result<RetainedEvidence, String> {
+        self.retain_snapshot(
+            parent,
+            &super::validate_cell_results::CapturedResults::capture(result_root),
+            ctx,
+            outcomes,
+            attempts,
+            compat_prefix,
+        )
+    }
+
+    pub fn retain_snapshot(
+        self,
+        parent: &Path,
+        snapshot: &super::validate_cell_results::CapturedResults,
         ctx: &LedgerCtx,
         outcomes: &[StepOutcome],
         attempts: &[NodeAttempt],
@@ -231,7 +253,8 @@ impl PreparedEvidence {
             compatibility,
             expected,
         )?;
-        let cells = super::validate_cell_results::retain_v10(parent, result_root, &self.plan)?;
+        let cells =
+            super::validate_cell_results::retain_v10_snapshot(parent, snapshot, &self.plan)?;
         let cell_path = cells
             .evidence
             .get("artifact")
