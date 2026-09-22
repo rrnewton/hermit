@@ -5104,7 +5104,8 @@ fn add_toolchain_homes(
     }
 }
 
-fn shell_command(cwd: &str, env: &BTreeMap<String, String>, argv: &[String]) -> String {
+/// Render recorded command fields without executing or expanding their contents.
+pub fn shell_command(cwd: &str, env: &BTreeMap<String, String>, argv: &[String]) -> String {
     let mut words = vec!["cd".into(), shell_quote(cwd), "&&".into(), "env".into()];
     words.extend(
         env.iter()

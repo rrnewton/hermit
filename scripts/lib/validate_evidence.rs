@@ -253,8 +253,12 @@ impl PreparedEvidence {
             compatibility,
             expected,
         )?;
-        let cells =
-            super::validate_cell_results::retain_v10_snapshot(parent, snapshot, &self.plan)?;
+        let cells = super::validate_cell_results::retain_v10_snapshot(
+            parent,
+            Path::new(&ctx.cwd),
+            snapshot,
+            &self.plan,
+        )?;
         let cell_path = cells
             .evidence
             .get("artifact")

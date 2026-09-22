@@ -1098,6 +1098,186 @@ pub fn retain_snapshot(
     })
 }
 
+/// Logical names for the two producer-owned roots in recorded commands.
+/// These strings are inert provenance, never paths opened by the proof reader.
+/// `/repo` is the scorecard's existing measured-root convention; the committed
+/// DAG already names the actual raw-results root as `$E2E_RESULT_ROOT`.
+struct CommandProvenanceRoots {
+    roots: Vec<(String, &'static str)>,
+}
+
+impl CommandProvenanceRoots {
+    fn new(measured: &Path, results: &Path) -> Result<Self, String> {
+        let text = |path: &Path| -> Result<String, String> {
+            let value = path
+                .to_str()
+                .ok_or("command provenance root is not UTF-8")?;
+            if !path.is_absolute() || path.parent().is_none() || value.contains('\0') {
+                return Err("command provenance root is not an absolute directory identity".into());
+            }
+            Ok(value.trim_end_matches('/').into())
+        };
+        let measured = text(measured)?;
+        let results = text(results)?;
+        let mut roots = vec![(measured.clone(), "/repo")];
+        if results != measured {
+            roots.push((results, "$E2E_RESULT_ROOT"));
+        }
+        roots.sort_by_key(|(root, _)| std::cmp::Reverse(root.len()));
+        Ok(Self { roots })
+    }
+
+    fn delimiter(character: char) -> bool {
+        matches!(character,
+            '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{0085}' | '\u{00a0}' |
+            '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' |
+            '\u{202f}' | '\u{205f}' | '\u{3000}' |
+            '=' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | '<' | '>' | '"' | '\'')
+    }
+
+    fn matches_at(value: &str, offset: usize, root: &str) -> bool {
+        value[offset..].starts_with(root)
+            && value[..offset]
+                .chars()
+                .next_back()
+                .is_none_or(Self::delimiter)
+            && value[offset + root.len()..]
+                .chars()
+                .next()
+                .is_none_or(|character| character == '/' || Self::delimiter(character))
+    }
+
+    fn render(&self, value: &str) -> Result<String, String> {
+        let mut rendered = String::with_capacity(value.len());
+        let mut offset = 0;
+        while offset < value.len() {
+            if let Some((physical, logical)) = self
+                .roots
+                .iter()
+                .find(|(root, _)| Self::matches_at(value, offset, root))
+            {
+                let suffix = &value[offset + physical.len()..];
+                let token_end = suffix.find(Self::delimiter).unwrap_or(suffix.len());
+                if suffix[..token_end]
+                    .split('/')
+                    .any(|part| matches!(part, "." | ".."))
+                {
+                    return Err("recorded command escapes or aliases a provenance root".into());
+                }
+                rendered.push_str(logical);
+                offset += physical.len();
+                continue;
+            }
+            // A literal logical path must not collapse with a different
+            // physical command after rendering. A real root with that spelling
+            // was handled above, including identical measured/results roots.
+            if ["/repo", "$E2E_RESULT_ROOT"]
+                .iter()
+                .any(|logical| Self::matches_at(value, offset, logical))
+            {
+                return Err("recorded command contains an ambiguous logical root".into());
+            }
+            let character = value[offset..].chars().next().expect("offset is in bounds");
+            rendered.push(character);
+            offset += character.len_utf8();
+        }
+        Ok(rendered)
+    }
+
+    fn render_command(
+        &self,
+        argv: &mut [String],
+        cwd: &mut String,
+        env: &mut BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        for argument in argv {
+            *argument = self.render(argument)?;
+        }
+        *cwd = self.render(cwd)?;
+        for value in env.values_mut() {
+            *value = self.render(value)?;
+        }
+        Ok(())
+    }
+
+    fn render_attempt(
+        &self,
+        attempt: &mut hermit_manifest_plan::ledger::ParityAttempt,
+    ) -> Result<(), String> {
+        let attempt = &mut attempt.0;
+        let original = (
+            attempt.argv.clone(),
+            attempt.cwd.clone(),
+            attempt.env.clone(),
+        );
+        self.render_command(&mut attempt.argv, &mut attempt.cwd, &mut attempt.env)?;
+        for argument in &mut attempt.guest_argv {
+            *argument = self.render(argument)?;
+        }
+        if original
+            != (
+                attempt.argv.clone(),
+                attempt.cwd.clone(),
+                attempt.env.clone(),
+            )
+        {
+            attempt.shell_command = hermit_manifest_plan::runner::shell_command(
+                &attempt.cwd,
+                &attempt.env,
+                &attempt.argv,
+            );
+        }
+        Ok(())
+    }
+
+    fn render_cell(
+        &self,
+        cell: &mut hermit_manifest_plan::ledger::CellArtifactResultV10,
+    ) -> Result<(), String> {
+        use hermit_manifest_plan::cpu_evidence::CpuAttemptHistory;
+        use hermit_manifest_plan::ledger::BackendParityCellAttempt;
+        if let Some(history) = &mut cell.cpu_observation_history {
+            for attempt in &mut history.attempts {
+                if let CpuAttemptHistory::Recorded { observations, .. } = attempt {
+                    for invocation in &mut observations.invocations {
+                        let command = &mut invocation.command;
+                        self.render_command(
+                            &mut command.argv,
+                            &mut command.cwd,
+                            &mut command.env_overrides,
+                        )?;
+                    }
+                }
+            }
+        }
+        if let RequiredNullable::Value(parity) = &mut cell.backend_parity {
+            for attempt in &mut parity.attempts {
+                match attempt {
+                    BackendParityCellAttempt::Completed {
+                        candidate_attempt,
+                        reference_attempt,
+                        ..
+                    } => {
+                        self.render_attempt(candidate_attempt)?;
+                        self.render_attempt(reference_attempt)?;
+                    }
+                    BackendParityCellAttempt::UnavailableWithReason {
+                        candidate_attempt,
+                        reference_attempt,
+                        ..
+                    } => {
+                        self.render_attempt(candidate_attempt)?;
+                        if let RequiredNullable::Value(reference) = reference_attempt {
+                            self.render_attempt(reference)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Retain full parity attempts in the immutable artifact and only derived,
 /// path-free summaries in schema 10. Ordinary and parity outcomes remain
 /// separate, and the selected population comes from the pre-execution plan.
@@ -1107,17 +1287,19 @@ pub fn retain_v10(
     result_root: &Path,
     plan: &hermit_manifest_plan::ledger::ConstructedValidationPlanV10,
 ) -> Result<RetainedCellResults, String> {
-    retain_v10_snapshot(parent, &CapturedResults::capture(result_root), plan)
+    retain_v10_snapshot(parent, parent, &CapturedResults::capture(result_root), plan)
 }
 
 pub fn retain_v10_snapshot(
     parent: &Path,
+    measured_root: &Path,
     snapshot: &CapturedResults,
     plan: &hermit_manifest_plan::ledger::ConstructedValidationPlanV10,
 ) -> Result<RetainedCellResults, String> {
     // Deploy only after the published parent readers have been activated.
     retain_v10_with_contract(
         parent,
+        measured_root,
         snapshot,
         plan,
         CellBindingContract::SelectedAttemptV1,
@@ -1133,6 +1315,7 @@ pub fn retain_v10_legacy(
 ) -> Result<RetainedCellResults, String> {
     retain_v10_with_contract(
         parent,
+        parent,
         &CapturedResults::capture(result_root),
         plan,
         CellBindingContract::LegacyUnbound,
@@ -1141,6 +1324,7 @@ pub fn retain_v10_legacy(
 
 fn retain_v10_with_contract(
     parent: &Path,
+    measured_root: &Path,
     snapshot: &CapturedResults,
     plan: &hermit_manifest_plan::ledger::ConstructedValidationPlanV10,
     binding_contract: CellBindingContract,
@@ -1180,6 +1364,7 @@ fn retain_v10_with_contract(
         rows.entry(id).or_default().push((attempt, row));
     }
     let mut full_cells = Vec::new();
+    let command_roots = CommandProvenanceRoots::new(measured_root, snapshot.root())?;
     for (id, mut rows) in rows {
         rows.sort_by_key(|(attempt, _)| *attempt);
         let (cell_verdict, backend_parity, selected_attempt) = if parity_candidates.contains(&id) {
@@ -1231,7 +1416,7 @@ fn retain_v10_with_contract(
         {
             return Err("legacy cell artifact cannot retain present CPU observations".into());
         }
-        full_cells.push(CellArtifactResultV10 {
+        let mut cell = CellArtifactResultV10 {
             lane: id.lane,
             category: id.category,
             test: id.test,
@@ -1242,7 +1427,14 @@ fn retain_v10_with_contract(
             cpu_observation_history,
             selected_attempt: (binding_contract == CellBindingContract::SelectedAttemptV1)
                 .then_some(selected_attempt),
-        });
+        };
+        // Both constructors above checked the original raw command equality.
+        // Render only typed command provenance before the first artifact hash;
+        // raw results, comparison reports and CPU observations stay untouched.
+        if binding_contract == CellBindingContract::SelectedAttemptV1 {
+            command_roots.render_cell(&mut cell)?;
+        }
+        full_cells.push(cell);
     }
     let mut bytes = Vec::new();
     let mut cells = Vec::new();
@@ -2539,6 +2731,205 @@ mod tests {
         assert!(error.contains("1 missing, 0 extra"));
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn command_provenance_roots_preserve_boundaries_and_refuse_aliases() {
+        let roots = CommandProvenanceRoots::new(
+            Path::new("/physical/source"),
+            Path::new("/physical/source/results"),
+        )
+        .unwrap();
+        for (input, expected) in [
+            ("/physical/source/target/hermit", "/repo/target/hermit"),
+            (
+                "--report=/physical/source/results/a.json",
+                "--report=$E2E_RESULT_ROOT/a.json",
+            ),
+            ("/physical/source/results", "$E2E_RESULT_ROOT"),
+            (
+                "/physical/source:/physical/source/results/x",
+                "/repo:$E2E_RESULT_ROOT/x",
+            ),
+            ("/physical/source-other/file", "/physical/source-other/file"),
+            ("prefix/physical/source/file", "prefix/physical/source/file"),
+            ("/unknown/owner/file", "/unknown/owner/file"),
+            ("credential=unchanged", "credential=unchanged"),
+        ] {
+            assert_eq!(roots.render(input).unwrap(), expected, "{input}");
+        }
+        for input in [
+            "/repo/target/hermit",
+            "$E2E_RESULT_ROOT/a.json",
+            "--report=/repo/a.json",
+            "/physical/source/../other",
+            "/physical/source/./file",
+        ] {
+            assert!(roots.render(input).is_err(), "{input}");
+        }
+        let equal =
+            CommandProvenanceRoots::new(Path::new("/physical"), Path::new("/physical")).unwrap();
+        assert_eq!(equal.render("/physical/file").unwrap(), "/repo/file");
+        let reversed =
+            CommandProvenanceRoots::new(Path::new("/physical/source"), Path::new("/physical"))
+                .unwrap();
+        assert_eq!(reversed.render("/physical/source/x").unwrap(), "/repo/x");
+        assert_eq!(
+            reversed.render("/physical/result").unwrap(),
+            "$E2E_RESULT_ROOT/result"
+        );
+        let already_physical =
+            CommandProvenanceRoots::new(Path::new("/repo"), Path::new("/repo/results")).unwrap();
+        assert_eq!(
+            already_physical.render("/repo/guest").unwrap(),
+            "/repo/guest"
+        );
+        assert_eq!(
+            already_physical.render("/repo/results/x").unwrap(),
+            "$E2E_RESULT_ROOT/x"
+        );
+        assert!(
+            CommandProvenanceRoots::new(Path::new("relative"), Path::new("/physical")).is_err()
+        );
+    }
+
+    #[test]
+    fn cpu_projection_renders_bound_commands_without_changing_typed_evidence() {
+        use hermit_manifest_plan::ledger::CellResultsEvidenceV10;
+        use hermit_manifest_plan::ledger::ConstructedValidationPlanV10;
+        let plan: ConstructedValidationPlanV10 =
+            serde_json::from_str(include_str!("fixtures/schema10-matched-plan.json")).unwrap();
+        let template: Value =
+            serde_json::from_str(include_str!("fixtures/schema10-matched-cell.json")).unwrap();
+        let completed = &template["backend_parity"]["attempts"][0];
+        let measured = tempfile::tempdir().unwrap();
+        // Supported result roots need not be inside the source or state root.
+        let results = tempfile::tempdir().unwrap();
+        let mut row = serde_json::json!({
+            "schema":4,"run_id":plan.run_id,"hermit_sha":plan.hermit_sha,
+            "source_tree_dirty":false,"attempt":1,"test":template["test"],
+            "category":template["category"],"lane":template["lane"],"mode":"verify","backend":"kvm",
+            "classification":"deterministic","outcome":"PASS","result":"pass",
+            "failure_class":null,"error_kind":null,"timeout_seconds":57,
+            "execution_cpu_timeout_seconds":22,"execution_wall_timeout_seconds":57,
+            "argv":[],"guest_argv":[],"env":{},"cwd":"/synthetic/fixture/work",
+            "shell_command":"synthetic retained writer input","artifact_dir":"synthetic",
+            "attempts":[completed["candidate_attempt"],completed["reference_attempt"]],
+            "backend_parity":completed["report"]
+        });
+        for attempt in row["attempts"].as_array_mut().unwrap() {
+            for key in ["argv", "guest_argv"] {
+                for argument in attempt[key].as_array_mut().unwrap() {
+                    *argument = argument
+                        .as_str()
+                        .unwrap()
+                        .replace("/synthetic/fixture", measured.path().to_str().unwrap())
+                        .into();
+                }
+            }
+            attempt["cwd"] = measured.path().join("work").to_str().unwrap().into();
+            attempt["env"] = serde_json::json!({"E2E_FIXTURE_DIR":results.path().join("fixtures")});
+        }
+        row["cpu_observations"] = cpu_fixture_envelope(&row);
+        append_result_row(results.path(), &row);
+        let snapshot = CapturedResults::capture(results.path());
+        let parent = tempfile::tempdir().unwrap();
+        let retained =
+            retain_v10_snapshot(parent.path(), measured.path(), &snapshot, &plan).unwrap();
+        let bytes = fs::read(
+            parent
+                .path()
+                .join(retained.evidence["artifact"]["path"].as_str().unwrap()),
+        )
+        .unwrap();
+        let evidence: CellResultsEvidenceV10 = serde_json::from_value(retained.evidence).unwrap();
+        evidence.verify_cell_artifact_bytes(&bytes).unwrap();
+        let artifact: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(artifact["selected_attempt"], 1);
+        let parity = &artifact["backend_parity"]["attempts"][0];
+        assert_eq!(parity["report"], row["backend_parity"]);
+        for (i, key) in ["candidate_attempt", "reference_attempt"]
+            .iter()
+            .enumerate()
+        {
+            let mapped = &parity[key];
+            assert_eq!(mapped["argv"][0], "/repo/hermit");
+            assert_eq!(mapped["cwd"], "/repo/work");
+            assert_eq!(mapped["guest_argv"][0], "/repo/guest");
+            assert_eq!(
+                mapped["env"]["E2E_FIXTURE_DIR"],
+                "$E2E_RESULT_ROOT/fixtures"
+            );
+            assert!(
+                mapped["shell_command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("/repo/hermit")
+            );
+            let mut restored = mapped.clone();
+            for field in ["argv", "cwd", "env", "guest_argv", "shell_command"] {
+                restored[field] = row["attempts"][i][field].clone();
+            }
+            assert_eq!(restored, row["attempts"][i]);
+        }
+        let mut observations =
+            artifact["cpu_observation_history"]["attempts"][0]["observations"].clone();
+        for (i, invocation) in observations["invocations"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            assert_eq!(invocation["command"]["argv"][0], "/repo/hermit");
+            assert_eq!(
+                invocation["command"]["env_overrides"]["E2E_FIXTURE_DIR"],
+                "$E2E_RESULT_ROOT/fixtures"
+            );
+            invocation["command"] = row["cpu_observations"]["invocations"][i]["command"].clone();
+        }
+        assert_eq!(observations, row["cpu_observations"]);
+
+        // Even if mapping could hide a raw mismatch, admission checks it first.
+        let mut bad = row.clone();
+        bad["cpu_observations"]["invocations"][0]["command"]["argv"][0] = "/repo/hermit".into();
+        let bad_results = tempfile::tempdir().unwrap();
+        append_result_row(bad_results.path(), &bad);
+        let bad_parent = tempfile::tempdir().unwrap();
+        assert!(
+            retain_v10_snapshot(
+                bad_parent.path(),
+                measured.path(),
+                &CapturedResults::capture(bad_results.path()),
+                &plan
+            )
+            .is_err()
+        );
+        assert!(
+            !bad_parent
+                .path()
+                .join("ignored/validate/artifacts")
+                .exists()
+        );
+
+        // A literal alias in BOTH operands cannot collapse with another command.
+        bad["attempts"][0]["argv"][0] = "/repo/hermit".into();
+        let alias_results = tempfile::tempdir().unwrap();
+        append_result_row(alias_results.path(), &bad);
+        let alias_parent = tempfile::tempdir().unwrap();
+        let error = retain_v10_snapshot(
+            alias_parent.path(),
+            measured.path(),
+            &CapturedResults::capture(alias_results.path()),
+            &plan,
+        )
+        .unwrap_err();
+        assert!(error.contains("ambiguous logical root"), "{error}");
+        assert!(
+            !alias_parent
+                .path()
+                .join("ignored/validate/artifacts")
+                .exists()
+        );
+    }
+
     // Synthetic reader controls: these values are not native CPU measurements.
     fn cpu_fixture_envelope(row: &Value) -> Value {
         let invocations: Vec<Value> = row["attempts"].as_array().unwrap().iter().enumerate().map(|(i, attempt)| serde_json::json!({
