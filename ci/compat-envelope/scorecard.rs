@@ -7286,6 +7286,10 @@ where
     }
 
     let _lock = acquire_history_write_lock(root)?;
+    // Validate and hold caller-owned operands before unrelated catalogue work.
+    // A malformed or nonregular snapshot must not wait for history decoding or
+    // manifest generation. The held file is still rechecked before publication.
+    let snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
     let head = git_head(root)?;
     if head != *expected_head {
         return Err(format!(
@@ -7295,7 +7299,6 @@ where
     check_observation_worktree(root)?;
     let original = read_history_files(root)?;
     let derived = check_tracked(root)?;
-    let snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
     if git_no_replace_rev_parse(root, &format!("{measured}^{{commit}}"))? != measured {
         return Err("measured source is not the specified actual commit".into());
     }
@@ -22937,6 +22940,71 @@ mod post_verdict_transaction_tests {
         fn cells(&self) -> TrackedCells {
             read_json(&self.ledger.join(LEDGER_CELLS)).unwrap()
         }
+    }
+
+    #[test]
+    fn invalid_snapshot_refuses_before_history_work_but_after_publication_authority() {
+        let _fixture_lock = HISTORY_FIXTURE_LOCK.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let ledger = directory.path().join("ledger");
+        let results = directory.path().join("results");
+        for path in [&root, &ledger, &results] {
+            fs::create_dir(path).unwrap();
+        }
+        git(&root, &["init", "--quiet"]);
+        fs::write(root.join("source"), b"fixture").unwrap();
+        git(&root, &["add", "source"]);
+        let head = commit(&root, "snapshot refusal fixture");
+        git(&ledger, &["init", "--quiet"]);
+        git(
+            &ledger,
+            &["remote", "add", "origin", TEST_LEDGER_REPOSITORY],
+        );
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(ledger.join(".git/ci-hub-series-publication.lock"))
+            .unwrap();
+        let _environment = HistoryFixtureEnvironment::set(&ledger, lock.as_raw_fd());
+        let snapshot = directory.path().join("snapshot.fifo");
+        let fifo_name = std::ffi::CString::new(snapshot.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: fifo_name is a live NUL-terminated path with no interior NUL.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let mut options = ProjectAndObserveArgs {
+            snapshot,
+            snapshot_sha256: "0".repeat(64),
+            results,
+            expected_head: head,
+            results_head: None,
+            refreshed_at: "fixture-refresh".into(),
+            finalized: None,
+        };
+        let publish = |options: &ProjectAndObserveArgs| {
+            project_and_observe_authorized_with(&root, options, || Ok(()), |_| Ok(()))
+        };
+        let unauthorized = publish(&options).unwrap_err();
+        assert!(
+            unauthorized.contains("publication lock is not held"),
+            "{unauthorized}"
+        );
+        FileExt::lock_exclusive(&lock).unwrap();
+        let nonregular = publish(&options).unwrap_err();
+        assert!(nonregular.contains("not a regular file"), "{nonregular}");
+        options.snapshot = directory.path().join("snapshot.json");
+        let value =
+            scorecard_snapshot_fixture_value(&"a".repeat(40), &"b".repeat(40), &[]).unwrap();
+        let digest = write_scorecard_snapshot_fixture(&options.snapshot, &value).unwrap();
+        let mismatch = publish(&options).unwrap_err();
+        assert!(mismatch.contains("digest mismatch"), "{mismatch}");
+        options.snapshot_sha256 = digest;
+        // Valid operands still reach the original history prerequisite. This
+        // fixture intentionally has no history or catalogue to derive.
+        let history = publish(&options).unwrap_err();
+        assert!(history.contains("history unavailable"), "{history}");
+        assert!(!ledger.join(LEDGER_CELLS).exists());
+        assert!(!ledger.join(LEDGER_SCORECARD).exists());
     }
 
     #[test]
