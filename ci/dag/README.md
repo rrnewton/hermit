@@ -193,6 +193,12 @@ The centralized manifests use an explicit build barrier before execution:
    exporting exact `HERMIT_BIN` and `HERMIT_INSTALL_DIR` paths. Parallel Cargo
    tests may then relink `target/debug/hermit` or restage `target/install_pkg`
    without invalidating a running bucket.
+   Ordinary validation binds the artifact pointer to its own checkout's
+   `target/ci/hermit-e2e-artifact.path`; an inherited
+   `HERMIT_E2E_ARTIFACT_POINTER` cannot select a different bundle or hide a
+   missing or invalid producer output. Direct standalone use of
+   `run-with-hermit-e2e-artifact.sh` still accepts that verified pointer
+   override, and the standalone test harness still supports `HERMIT_BIN`.
 4. `e2e.audit_compile_backend_parity_c` compiles every C guest that bucket
    declares, `ci=false` cells included. Nothing else in the DAG ever builds a
    disabled cell, so without this node a disabled fixture rots invisibly — it
