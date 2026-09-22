@@ -26,7 +26,7 @@ use sha2::Sha256;
 
 pub const SELECTION_ENV: &str = "NEXTEST_PREPARED_BUILD_SELECTION";
 pub const REQUIRED_ENV: &str = "HERMIT_PREPARED_NEXTEST_REQUIRED";
-const RECORD_SCHEMA: u32 = 2;
+const RECORD_SCHEMA: u32 = 3;
 pub const GUESTS_ENV: &str = "HERMIT_PREPARED_CARGO_GUESTS";
 pub const CPU_WRAPPER_ENV: &str = "HERMIT_NEXTEST_CPU_WRAPPER_BIN";
 const CPU_WRAPPER_PACKAGE: &str = "hermit-manifest-plan";
@@ -34,6 +34,9 @@ const CPU_WRAPPER_TARGET: &str = "nextest-cpu-wrapper";
 
 #[path = "../../cargo-guest-binaries.rs"]
 mod cargo_guests;
+
+#[path = "../../record-replay-workloads.rs"]
+pub mod record_workloads;
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Arguments {
@@ -340,7 +343,24 @@ struct PreparedRecord {
     cargo_metadata: FileIdentity,
     selections: BTreeMap<String, SelectionRecord>,
     guests: Vec<FileIdentity>,
+    record_workloads: Option<RecordWorkloads>,
     cpu_wrapper: CpuWrapperRecord,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct RecordWorkload {
+    name: String,
+    source: FileIdentity,
+    executable: FileIdentity,
+    cargo_origin: Option<FileIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct RecordWorkloads {
+    cargo_events: FileIdentity,
+    compiler: FileIdentity,
+    c_flags: Vec<String>,
+    workloads: Vec<RecordWorkload>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -962,6 +982,138 @@ fn guest_executables(
         .collect()
 }
 
+fn has_test_selection<'a>(selections: impl Iterator<Item = &'a Vec<String>>, name: &str) -> bool {
+    selections
+        .into_iter()
+        .any(|args| args.windows(2).any(|args| args == ["--test", name]))
+}
+
+fn prepare_record_workloads(
+    root: &Path,
+    generation: &Path,
+    cargo: &Value,
+    target: &Path,
+) -> Result<RecordWorkloads, PreparationError> {
+    let directory = generation.join("record-workloads");
+    fs::create_dir(&directory).map_err(|e| e.to_string())?;
+    let compiler = file_identity(&record_workloads::c_compiler()?, true)?;
+    let cargo_events = file_identity(&generation.join("guests.jsonl"), false)?;
+    let rust = record_workloads::cargo_executables(
+        &fs::read_to_string(&cargo_events.path).map_err(|e| e.to_string())?,
+        cargo,
+        root,
+        target,
+    )?;
+    let origins = rust
+        .iter()
+        .map(|(name, path)| Ok((name.clone(), file_identity(path, true)?)))
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    let mut paths = record_workloads::compile_c_workloads(root, &directory, &compiler.path)
+        .map_err(|error| PreparationError {
+            message: error.message,
+            status: error.status,
+        })?;
+    paths.extend(record_workloads::copy_cargo_workloads(rust, &directory)?);
+    let workloads = paths
+        .into_iter()
+        .map(|(name, path)| {
+            let source =
+                record_workloads::source(&name).ok_or("unexpected record workload alias")?;
+            Ok(RecordWorkload {
+                source: file_identity(&root.join(source), false)?,
+                executable: file_identity(&path, true)?,
+                cargo_origin: origins.get(&name).cloned(),
+                name,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(RecordWorkloads {
+        compiler,
+        cargo_events,
+        workloads,
+        c_flags: record_workloads::C_FLAGS.map(String::from).into(),
+    })
+}
+
+fn verify_record_workloads(
+    record: &PreparedRecord,
+    cargo: &Value,
+) -> Result<Option<String>, String> {
+    let selected = has_test_selection(
+        record.selections.values().map(|s| &s.build_args),
+        "record_replay",
+    );
+    let Some(workloads) = &record.record_workloads else {
+        return if selected {
+            Err("selected record_replay has no prepared workload population".into())
+        } else {
+            Ok(None)
+        };
+    };
+    if !selected {
+        return Err("unexpected record workloads for a selection without record_replay".into());
+    }
+    let generation = record
+        .cargo_metadata
+        .path
+        .parent()
+        .ok_or("missing prepared generation")?;
+    let directory = generation.join("record-workloads");
+    if workloads.cargo_events.path != generation.join("guests.jsonl") {
+        return Err("record workload Cargo events are outside the selected generation".into());
+    }
+    check_identity(&workloads.cargo_events, false)?;
+    let rust = record_workloads::cargo_executables(
+        &fs::read_to_string(&workloads.cargo_events.path).map_err(|e| e.to_string())?,
+        cargo,
+        &record.repository,
+        &record.target,
+    )?;
+    if workloads.compiler.path != record_workloads::c_compiler()?
+        || workloads.c_flags != record_workloads::C_FLAGS
+    {
+        return Err("record workload C compiler or recipe changed".into());
+    }
+    check_identity(&workloads.compiler, true)?;
+    let mut paths = BTreeMap::new();
+    for workload in &workloads.workloads {
+        let source =
+            record_workloads::source(&workload.name).ok_or("unknown record workload alias")?;
+        if workload.source.path != record.repository.join(source)
+            || workload.executable.path != directory.join(&workload.name)
+        {
+            return Err(
+                "record workload source or retained path differs from its declared alias".into(),
+            );
+        }
+        record_workloads::executable(&workload.executable.path, &directory)?;
+        check_identity(&workload.source, false)?;
+        check_identity(&workload.executable, true)?;
+        match (rust.get(&workload.name), &workload.cargo_origin) {
+            (Some(path), Some(origin)) if path == &origin.path => {
+                check_identity(origin, true)?;
+                if origin.sha256 != workload.executable.sha256
+                    || origin.size != workload.executable.size
+                    || origin.mode != workload.executable.mode
+                {
+                    return Err(
+                        "retained record workload differs from Cargo's actual artifact".into(),
+                    );
+                }
+            }
+            (None, None) => {}
+            _ => return Err("record workload Cargo origin differs from compiler metadata".into()),
+        }
+        if paths
+            .insert(workload.name.clone(), workload.executable.path.clone())
+            .is_some()
+        {
+            return Err("duplicate prepared record workload alias".into());
+        }
+    }
+    record_workloads::prepared_envelope(&paths).map(Some)
+}
+
 pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let selections = profile_selections(&root, profile)?;
@@ -1009,12 +1161,10 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         args.extend(selection.iter().cloned());
         cargo_output(&root, &args, &generation.join(format!("{key}.json")))?;
     }
-    let needs_guests = selections.values().any(|args| {
-        args.windows(2)
-            .any(|args| args == ["--test", "hermit_modes"])
-    });
+    let needs_guests = has_test_selection(selections.values(), "hermit_modes");
+    let needs_record_workloads = has_test_selection(selections.values(), "record_replay");
     let guest_path = generation.join("guests.jsonl");
-    if needs_guests {
+    if needs_guests || needs_record_workloads {
         cargo_output(
             &root,
             &[
@@ -1071,6 +1221,16 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     } else {
         vec![]
     };
+    let record_workloads = if needs_record_workloads {
+        Some(prepare_record_workloads(
+            &root,
+            &generation,
+            &cargo,
+            &target,
+        )?)
+    } else {
+        None
+    };
     let record = PreparedRecord {
         schema: RECORD_SCHEMA,
         repository: root.clone(),
@@ -1082,6 +1242,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         cargo_metadata: file_identity(&cargo_path, false)?,
         selections: recorded_selections,
         guests,
+        record_workloads,
         cpu_wrapper: CpuWrapperRecord {
             executable: cpu_wrapper_artifact(
                 &fs::read_to_string(&cpu_wrapper_path).map_err(|e| e.to_string())?,
@@ -1096,6 +1257,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         verify_selection(&record, &checked_cargo, &selection.build_args)?;
     }
     verify_guests(&record)?;
+    verify_record_workloads(&record, &checked_cargo)?;
     let staging = generation.join("record.json");
     fs::write(
         &staging,
@@ -1107,9 +1269,13 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     // inputs still match, since earlier Cargo commands may have changed them.
     fs::rename(staging, artifacts.root.join("current.json")).map_err(|e| e.to_string())?;
     eprintln!(
-        "prepared-nextest: published {} selections and {} Cargo guests for {profile}",
+        "prepared-nextest: published {} selections, {} hermit_modes Cargo guests and {} record workloads for {profile}",
         record.selections.len(),
-        record.guests.len()
+        record.guests.len(),
+        record
+            .record_workloads
+            .as_ref()
+            .map_or(0, |w| w.workloads.len()),
     );
     Ok(())
 }
@@ -1139,6 +1305,7 @@ pub fn run(
     let cargo = verify_record(&root, &record)?;
     let selection = verify_selection(&record, &cargo, &parsed.build)?;
     let guests = verify_guests(&record)?;
+    let record_workloads = verify_record_workloads(&record, &cargo)?;
     let mut command = Command::new("cargo");
     command.arg("nextest");
     if let Some(config) = config {
@@ -1156,6 +1323,11 @@ pub fn run(
             serde_json::to_string(&guests).map_err(|e| e.to_string())?,
         )
         .current_dir(&root);
+    // Never inherit an unverified population from the caller's environment.
+    command.env_remove(record_workloads::PREPARED_ENV);
+    if let Some(workloads) = record_workloads {
+        command.env(record_workloads::PREPARED_ENV, workloads);
+    }
     let status = command
         .status()
         .map_err(|e| format!("cannot run prepared Nextest: {e}"))?;
@@ -1174,6 +1346,7 @@ pub fn assert_profile(root: &Path, profile: &str) -> Result<(), String> {
         verify_selection(&record, &cargo, args)?;
     }
     verify_guests(&record)?;
+    verify_record_workloads(&record, &cargo)?;
     Ok(())
 }
 
@@ -1302,6 +1475,7 @@ mod tests {
                     cargo_metadata: file_identity(&cargo, false).unwrap(),
                     selections: BTreeMap::from([(selection_key(&args), selected)]),
                     guests: vec![],
+                    record_workloads: None,
                     cpu_wrapper,
                 },
                 args,
@@ -1348,6 +1522,211 @@ mod tests {
     }
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).into()).collect()
+    }
+
+    fn record_fixture(fixture: &Fixture) -> (PreparedRecord, Value) {
+        let (mut record, _) = fixture.selection();
+        record.selections.values_mut().next().unwrap().build_args =
+            argv(&["-p", "hermit", "--test", "record_replay"]);
+        let directory = fixture.root.join("record-workloads");
+        fs::create_dir(&directory).unwrap();
+        let mut targets = Vec::new();
+        let mut events = Vec::new();
+        let mut workloads = Vec::new();
+        for name in record_workloads::names() {
+            let source = fixture.root.join(record_workloads::source(name).unwrap());
+            fs::create_dir_all(source.parent().unwrap()).unwrap();
+            fs::write(&source, "source witness\n").unwrap();
+            let path = directory.join(name);
+            fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            let cargo_origin = if let Some((_, target, _)) = record_workloads::RUST_SOURCES
+                .into_iter()
+                .find(|(alias, _, _)| *alias == name)
+            {
+                let origin = fixture.target.join(target);
+                fs::copy(&path, &origin).unwrap();
+                let target =
+                    serde_json::json!({"name": target, "kind": ["bin"], "src_path": source});
+                targets.push(target.clone());
+                events.push(serde_json::json!({"reason":"compiler-artifact", "package_id":"record-package", "target":target, "profile":{"test":false}, "executable":origin}));
+                Some(file_identity(&origin, true).unwrap())
+            } else {
+                None
+            };
+            workloads.push(RecordWorkload {
+                name: name.into(),
+                source: file_identity(&source, false).unwrap(),
+                executable: file_identity(&path, true).unwrap(),
+                cargo_origin,
+            });
+        }
+        events.push(serde_json::json!({"reason":"build-finished", "success":true}));
+        let events_path = fixture.root.join("guests.jsonl");
+        fs::write(
+            &events_path,
+            events
+                .iter()
+                .map(|event| format!("{event}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let mut cargo = fixture.cargo.clone();
+        cargo["packages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "name":record_workloads::PACKAGE, "id":"record-package", "source":null,
+                "manifest_path":fixture.root.join("tests/Cargo.toml"), "targets":targets,
+            }));
+        record.record_workloads = Some(RecordWorkloads {
+            cargo_events: file_identity(&events_path, false).unwrap(),
+            compiler: file_identity(&record_workloads::c_compiler().unwrap(), true).unwrap(),
+            c_flags: record_workloads::C_FLAGS.map(String::from).into(),
+            workloads,
+        });
+        (record, cargo)
+    }
+
+    #[test]
+    fn record_workload_verified_producer_envelope_reaches_the_complete_consumer() {
+        let fixture = Fixture::new();
+        let (record, cargo) = record_fixture(&fixture);
+        let raw = verify_record_workloads(&record, &cargo).unwrap().unwrap();
+        let population = record_workloads::consume_prepared(true, Some(&raw))
+            .unwrap()
+            .unwrap();
+        assert_eq!(population.len(), 42);
+        assert_eq!(
+            population.iter().map(|w| w.name).collect::<BTreeSet<_>>(),
+            record_workloads::names().collect()
+        );
+        assert_eq!(
+            population
+                .iter()
+                .find(|w| w.name == "rs_clock_gettime")
+                .unwrap()
+                .path,
+            fixture.root.join("record-workloads/rs_clock_gettime")
+        );
+        assert!(record.guests.is_empty());
+        assert_eq!(cargo_guests::CARGO_GUEST_BINARIES.len(), 21);
+    }
+
+    #[test]
+    fn record_workload_selection_and_population_are_required_without_defaults() {
+        let fixture = Fixture::new();
+        let (record, cargo) = record_fixture(&fixture);
+        let mut missing = record.clone();
+        missing.record_workloads = None;
+        assert!(
+            verify_record_workloads(&missing, &cargo)
+                .unwrap_err()
+                .contains("no prepared")
+        );
+        let mut unselected = record.clone();
+        unselected.selections.clear();
+        assert!(
+            verify_record_workloads(&unselected, &cargo)
+                .unwrap_err()
+                .contains("without record_replay")
+        );
+        for duplicate in [false, true] {
+            let mut changed = record.clone();
+            let workloads = &mut changed.record_workloads.as_mut().unwrap().workloads;
+            if duplicate {
+                workloads.push(workloads[0].clone());
+            } else {
+                workloads.pop();
+            }
+            assert!(verify_record_workloads(&changed, &cargo).is_err());
+        }
+        let mut old_schema = record.clone();
+        old_schema.schema = 2;
+        assert!(
+            verify_record(&fixture.root, &old_schema)
+                .unwrap_err()
+                .contains("schema")
+        );
+    }
+
+    #[test]
+    fn record_workload_refuses_recipe_source_origin_and_retained_artifact_changes() {
+        let fixture = Fixture::new();
+        let (record, cargo) = record_fixture(&fixture);
+        let mut changed = record.clone();
+        changed.record_workloads.as_mut().unwrap().c_flags[0] = "-O2".into();
+        assert!(verify_record_workloads(&changed, &cargo).is_err());
+        let mut changed = record.clone();
+        changed.record_workloads.as_mut().unwrap().compiler.sha256 = "wrong".into();
+        assert!(verify_record_workloads(&changed, &cargo).is_err());
+        let mut changed = record.clone();
+        changed.record_workloads.as_mut().unwrap().workloads[0]
+            .source
+            .path = fixture.root.join("wrong.c");
+        assert!(verify_record_workloads(&changed, &cargo).is_err());
+        let mut changed = record.clone();
+        changed.record_workloads.as_mut().unwrap().workloads[0]
+            .executable
+            .path = fixture.target.join("outside-generation");
+        assert!(verify_record_workloads(&changed, &cargo).is_err());
+        let mut changed = record.clone();
+        changed
+            .record_workloads
+            .as_mut()
+            .unwrap()
+            .workloads
+            .iter_mut()
+            .find(|w| w.cargo_origin.is_some())
+            .unwrap()
+            .cargo_origin = None;
+        assert!(verify_record_workloads(&changed, &cargo).is_err());
+        let original = &record.record_workloads.as_ref().unwrap().workloads[0].executable;
+        fs::write(&original.path, "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(
+            verify_record_workloads(&record, &cargo)
+                .unwrap_err()
+                .contains("changed")
+        );
+    }
+
+    #[test]
+    fn record_workload_generation_lock_remains_held_until_consumer_returns() {
+        let fixture = Fixture::new();
+        let consumer = LockedArtifacts::open(&fixture.root, false).unwrap();
+        let competing = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(consumer.root.join("lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(competing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EWOULDBLOCK)
+        );
+        let root = fixture.root.clone();
+        let (starting_tx, starting_rx) = std::sync::mpsc::channel();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            starting_tx.send(()).unwrap();
+            let _lock = LockedArtifacts::open(&root, true).unwrap();
+            locked_tx.send(()).unwrap();
+        });
+        starting_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        assert!(matches!(
+            locked_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(consumer);
+        locked_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        producer.join().unwrap();
     }
 
     #[test]
