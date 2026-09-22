@@ -8484,7 +8484,10 @@ fn current_comparison_representation(
                 ));
             }
             if !covered.insert(((*base).clone(), *attempt)) {
-                return Err("current series events overlap the same bound outer attempt".into());
+                return Err(
+                    "current series cannot map one-to-one: events overlap the same bound outer attempt"
+                        .into(),
+                );
             }
             *represented_counts.entry(key.clone()).or_default() += 1;
         }
@@ -24619,6 +24622,22 @@ mod evidence_identity_tests {
             assert!(!represented.has_unrepresented_direct_evidence);
             assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
             for detcore_tree in [None, Some(tree.clone())] {
+                let mut duplicate_event = events[1].clone();
+                duplicate_event.event_id = "retry-overlapping-event".into();
+                duplicate_event.emitted_at = "2026-09-22T00:00:01Z".into();
+                duplicate_event.series.detcore_tree = detcore_tree.clone();
+                let error = direct_representation(
+                    &tracked,
+                    &[events[1].clone(), duplicate_event],
+                    &attempts,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error,
+                    "current series cannot map one-to-one: events overlap the same bound outer attempt"
+                );
+                assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
+
                 let mut wrong_attempt = events[1].clone();
                 wrong_attempt.series.detcore_tree = detcore_tree.clone();
                 wrong_attempt.series.attempt = Some(3);
