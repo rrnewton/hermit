@@ -14,6 +14,7 @@ const RTC_ROOT: &str = "/sys/class/rtc/rtc0";
 const RTC_DATE: &str = "/sys/class/rtc/rtc0/date";
 const RTC_TIME: &str = "/sys/class/rtc/rtc0/time";
 const RTC_EPOCH: &str = "/sys/class/rtc/rtc0/since_epoch";
+const FIXED_EPOCH: &str = "2026-01-01T00:00:00Z";
 
 struct ProgramCase {
     name: &'static str,
@@ -67,7 +68,7 @@ fn read_normalized_attribute(path: &str, epoch: Option<&str>) -> Vec<u8> {
 
 fn assert_normalized_attribute(path: &str, expected: &[u8]) {
     assert_eq!(
-        read_normalized_attribute(path, None),
+        read_normalized_attribute(path, Some(FIXED_EPOCH)),
         expected,
         "unexpected normalized {path}"
     );
@@ -123,13 +124,13 @@ fn sysfs_rtc_consumers_verify() {
     }
 
     assert_normalized_attribute(RTC_DATE, b"2026-01-01\n");
-    let rtc_time = String::from_utf8(read_normalized_attribute(RTC_TIME, None))
+    let rtc_time = String::from_utf8(read_normalized_attribute(RTC_TIME, Some(FIXED_EPOCH)))
         .expect("RTC time should be UTF-8");
     assert!(
         rtc_time.starts_with("00:00:"),
         "unexpected default RTC time: {rtc_time:?}"
     );
-    let rtc_epoch = String::from_utf8(read_normalized_attribute(RTC_EPOCH, None))
+    let rtc_epoch = String::from_utf8(read_normalized_attribute(RTC_EPOCH, Some(FIXED_EPOCH)))
         .expect("RTC epoch should be UTF-8")
         .trim()
         .parse::<i64>()

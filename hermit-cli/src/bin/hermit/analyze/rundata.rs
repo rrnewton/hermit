@@ -520,6 +520,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn analyzer_reproducer_retains_actual_default_and_fractional_epoch() {
+        use clap::CommandFactory;
+        for epoch in ["2026-01-01T00:00:00Z", "2000-12-31T23:59:59.123456789Z"] {
+            let mut options = AnalyzeOpts::try_parse_from([
+                "analyze",
+                "--",
+                "--epoch",
+                epoch,
+                "--seed=71",
+                "/bin/true",
+            ])
+            .unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            let run = RunData::new_baseline(&options, "epoch-repro".to_owned()).unwrap();
+            let repro = run.to_repro();
+            assert_eq!(repro.matches("--epoch=").count(), 1, "{repro}");
+            let matches = crate::Args::command()
+                .try_get_matches_from(shell_words::split(&repro).unwrap())
+                .unwrap();
+            let args = crate::args_from_matches_with_clock(&matches, || {
+                panic!("analyzer reproduction must retain its actual fixed input")
+            })
+            .unwrap();
+            let crate::Subcommand::Run(parsed) = args.command else {
+                panic!("expected run")
+            };
+            assert_eq!(
+                parsed.det_opts.det_config.epoch,
+                run.runopts.det_opts.det_config.epoch
+            );
+            assert_eq!(
+                parsed.det_opts.det_config.seed,
+                run.runopts.det_opts.det_config.seed
+            );
+        }
+    }
+
+    #[test]
     fn preemption_replay_preserves_selected_seeds_and_original_timer_policy() {
         for explicit_imprecise_timers in [false, true] {
             let mut args = vec![

@@ -104,6 +104,26 @@ fn require_store() -> Result<PodmanStore, Error> {
 }
 
 impl OciOpts {
+    /// Resolve the embedded run's omitted epoch at the same outer process
+    /// boundary as a top-level `hermit run` invocation.
+    pub(crate) fn capture_default_run_epoch(
+        &mut self,
+        capture_now: impl FnOnce() -> std::time::SystemTime,
+    ) {
+        if let OciSubcommand::Run(opts) = &mut self.command {
+            opts.run.capture_default_epoch(capture_now);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_epoch_capture_for_test(&self) -> (String, bool, bool) {
+        let OciSubcommand::Run(opts) = &self.command else {
+            panic!("expected oci run")
+        };
+        let (epoch, captured) = opts.run.epoch_capture_for_test();
+        (epoch, captured, opts.run.reports_virtual_epoch_for_test())
+    }
+
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         match &mut self.command {
             OciSubcommand::Ls(opts) => opts.main(),
