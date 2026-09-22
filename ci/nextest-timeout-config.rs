@@ -562,6 +562,12 @@ fn resolve_budgets(
 }
 
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
+    if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
+        println!(
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale calibration retains every selected default bound. Unknown context/profile/concurrency preserves legacy configuration without a map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+        );
+        return Ok(());
+    }
     if args.len() < 8 || args[7] != "--" {
         return Err("usage: --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...".into());
     }
