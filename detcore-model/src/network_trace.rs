@@ -1993,6 +1993,21 @@ mod tests {
     }
 
     #[test]
+    fn v2_codec_binds_the_exact_submicrosecond_epoch() {
+        let exact_epoch = Utc.timestamp_opt(1_790_000_000, 123_456_789).unwrap();
+        let trace = NetworkTraceV2 {
+            epoch: exact_epoch,
+            channels: vec![],
+            inputs: vec![],
+            outputs: vec![],
+        };
+        let mut frame = Vec::new();
+        trace.write_framed(&mut frame).unwrap();
+        let decoded = NetworkTraceV2::read_framed(Cursor::new(frame)).unwrap();
+        assert_eq!(decoded.epoch, exact_epoch);
+    }
+
+    #[test]
     fn versioned_reader_preserves_v1_decode_compatibility() {
         let v1 = valid_trace();
         assert_eq!(
