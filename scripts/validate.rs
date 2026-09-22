@@ -5740,13 +5740,40 @@ fn local_scorecard_writeback(
     if !should_write_scorecard(nested, off_the_record) {
         return None;
     }
-    let script = root.join("ci/compat-envelope/scorecard.rs");
+    let Some(parent) = find_parent(root) else {
+        return Some(Err("history publication unavailable: dev-hermit parent was not found; validation results remain retained".into()));
+    };
+    let tool = match configured_tool_root(Some(&parent)) {
+        Ok(Some(tool)) => tool,
+        Ok(None) => return Some(Err("history publication tool root is unavailable".into())),
+        Err(error) => return Some(Err(error)),
+    };
+    let script = tool.join("ci-hub/series/mirror.py");
+    let head = match Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        Ok(output) => {
+            return Some(Err(format!(
+                "cannot resolve history source HEAD: {}",
+                output.status
+            )));
+        }
+        Err(error) => return Some(Err(format!("cannot resolve history source HEAD: {error}"))),
+    };
     if !script.is_file() {
         return Some(Err(format!("{} does not exist", script.display())));
     }
     Some(
-        Command::new(&script)
-            .arg("observe-results")
+        Command::new("python3")
+            .arg(&script)
+            .arg("--parent").arg(&parent)
+            .arg("--source-checkout").arg(root)
+            .arg("--target").arg(head.trim())
             .arg("--results")
             .arg(result_root)
             .current_dir(root)
@@ -5763,7 +5790,7 @@ fn local_scorecard_writeback(
                     return Ok(());
                 }
                 Err(format!(
-                    "{} observe-results refused with {}: {}",
+                    "{} ledger publication refused with {}: {}",
                     script.display(),
                     output.status,
                     refusal_detail(&output.stderr, &output.stdout),
@@ -5831,15 +5858,12 @@ fn refusal_detail(stderr: &[u8], stdout: &[u8]) -> String {
     )
 }
 
-fn record_scorecard_writeback(
-    summary: &mut RunSummary,
-    writeback: Option<Result<(), String>>,
-) {
+fn record_scorecard_writeback(summary: &mut RunSummary, writeback: Option<Result<(), String>>) {
     let Some(writeback) = writeback else { return };
     let detail = match writeback {
         Ok(()) => {
             summary.scorecard_writeback = Some(ScorecardWriteback::Completed);
-            "scorecard write-back completed; review the generated SCORECARD.md and ci/compat-envelope/cells.json changes before committing".into()
+            "scorecard history published to hermit_test_ledger; Hermit catalogue unchanged".into()
         }
         Err(error) => {
             if summary.exit_code == 0 {
@@ -24344,22 +24368,50 @@ mod refusal_detail_tests {
     /// real refusing child.
     #[test]
     fn the_writeback_error_carries_the_child_message_and_not_only_its_status() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = tempfile::tempdir().expect("a temp root");
-        let script = root.path().join("ci/compat-envelope/scorecard.rs");
+        let fixture = tempfile::tempdir().expect("a temp root");
+        let root = fixture.path().join("hermit");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            fixture.path().join(".gitmodules"),
+            "[submodule \"hermit\"]\npath = hermit\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let script = fixture.path().join("ci-hub/series/mirror.py");
         std::fs::create_dir_all(script.parent().expect("a parent")).expect("the tool dir");
         // A stand-in for the real tool: refuses, and says why on stderr, which
         // is exactly the shape that stranded seven hours of validation.
         std::fs::write(
             &script,
-            "#!/bin/sh\necho 'parity history changes candidate identity for CELL-X' >&2\nexit 2\n",
+            "import sys\nassert '--source-checkout' in sys.argv and '--results' in sys.argv and '--target' in sys.argv\nprint('parity history changes candidate identity for CELL-X', file=sys.stderr)\nraise SystemExit(2)\n",
         )
         .expect("write the stand-in tool");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("make it executable");
 
-        let error = local_scorecard_writeback(root.path(), root.path(), false, false)
+        let error = local_scorecard_writeback(&root, &root, false, false)
             .expect("the writeback runs when not nested and on the record")
             .expect_err("a refusing tool must produce an error");
 
@@ -24374,17 +24426,15 @@ mod refusal_detail_tests {
         // Control in the other direction: a tool that succeeds produces no
         // error at all, so the assertions above are not passing because every
         // path errors.
-        std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("rewrite the tool");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("make it executable");
-        local_scorecard_writeback(root.path(), root.path(), false, false)
+        std::fs::write(&script, "import sys\nassert '--source-checkout' in sys.argv and '--results' in sys.argv and '--target' in sys.argv\n").expect("rewrite the tool");
+        local_scorecard_writeback(&root, &root, false, false)
             .expect("still runs")
             .expect("a succeeding tool must not error");
 
         // And the gate is still a gate: nested or off-the-record runs do not
         // invoke the tool at all.
-        assert!(local_scorecard_writeback(root.path(), root.path(), true, false).is_none());
-        assert!(local_scorecard_writeback(root.path(), root.path(), false, true).is_none());
+        assert!(local_scorecard_writeback(&root, &root, true, false).is_none());
+        assert!(local_scorecard_writeback(&root, &root, false, true).is_none());
     }
 
     #[test]

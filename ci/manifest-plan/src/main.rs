@@ -49,13 +49,15 @@ const CI_REASON_BASELINE: &str = "ci/ci-reason-baseline.json";
 const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
 
 const HELP: &str = "\
-Usage: hermit-manifest-plan [--format <FORMAT>]
+Usage: hermit-manifest-plan [--format <FORMAT>] [--root <HERMIT_CHECKOUT>]
 
 Validate the centralized end-to-end manifests and print their expanded plan.
 
 Options:
   --format <FORMAT>  Output format: text, json, matrix-json, harness-json, or
                      host-requirements (default: text)
+  --root <PATH>      Read manifests and inventory from this Hermit checkout
+                     (default: the checkout used to build this helper)
   -h, --help         Print this help";
 
 /// Every `(capability, test-id)` pair whose manifest token has a reviewed
@@ -143,15 +145,30 @@ fn die(msg: impl std::fmt::Display) -> ! {
     panic!("manifest-plan: {msg}");
 }
 
-fn parse_format() -> Option<Format> {
+fn parse_options(arguments: Vec<String>) -> Option<(Format, PathBuf)> {
     let mut format = Format::Text;
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     if matches!(arguments.as_slice(), [flag] if is_help_flag(flag)) {
         println!("{HELP}");
         return None;
     }
     let mut args = arguments.into_iter();
     while let Some(arg) = args.next() {
+        if arg == "--root" {
+            let path = args.next().unwrap_or_else(|| die("--root requires a path"));
+            if path.is_empty() {
+                die("--root requires a path");
+            }
+            root = PathBuf::from(path);
+            continue;
+        }
+        if let Some(path) = arg.strip_prefix("--root=") {
+            if path.is_empty() {
+                die("--root requires a path");
+            }
+            root = PathBuf::from(path);
+            continue;
+        }
         let value = if arg == "--format" {
             args.next()
                 .unwrap_or_else(|| die("--format requires a value"))
@@ -169,16 +186,11 @@ fn parse_format() -> Option<Format> {
             _ => die(format!("unknown format: {value}")),
         };
     }
-    Some(format)
+    Some((format, root))
 }
 
-fn main() {
-    let Some(format) = parse_format() else {
-        return;
-    };
-    let script_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/manifests");
-    let repo_root = script_dir.join("../../..");
-
+fn load_defaults(repo_root: &Path) -> (PathBuf, Value) {
+    let script_dir = repo_root.join("tests/e2e/manifests");
     let defaults_path = script_dir.join(DEFAULTS_FILE);
     let defaults_text = std::fs::read_to_string(&defaults_path)
         .unwrap_or_else(|error| die(format!("cannot read {}: {error}", defaults_path.display())));
@@ -188,6 +200,14 @@ fn main() {
             defaults_path.display()
         ))
     });
+    (script_dir, defaults)
+}
+
+fn main() {
+    let Some((format, repo_root)) = parse_options(std::env::args().skip(1).collect()) else {
+        return;
+    };
+    let (script_dir, defaults) = load_defaults(&repo_root);
     ensure_keys(
         &defaults,
         &[
@@ -2552,5 +2572,59 @@ liteinst = "unsupported"
             "min_distinct = 2\nmin_passes = 1\nmin_failures = 1\nmin_normalized_entropy = \"high\"\n",
         );
         validate_chaos(&spec, &mut Vec::new());
+    }
+}
+
+#[cfg(test)]
+mod runtime_root_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_data_roots_are_not_replaced_by_the_compile_time_checkout() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temporary = std::env::temp_dir().join(format!(
+            "manifest-plan-roots-{}-{unique}",
+            std::process::id()
+        ));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(temporary.clone());
+        for (name, timeout) in [("one", 91), ("two", 137)] {
+            let root = temporary.join(name);
+            std::fs::create_dir_all(root.join("tests/e2e/manifests")).unwrap();
+            std::fs::write(
+                root.join("tests/e2e/manifests").join(DEFAULTS_FILE),
+                format!("schema: 1\ntimeout_seconds: {timeout}\n"),
+            )
+            .unwrap();
+            let (format, selected) = parse_options(vec![
+                "--format".into(),
+                "matrix-json".into(),
+                "--root".into(),
+                root.to_str().unwrap().into(),
+            ])
+            .unwrap();
+            assert_eq!(format, Format::MatrixJson);
+            let (directory, defaults) = load_defaults(&selected);
+            assert_eq!(directory, root.join("tests/e2e/manifests"));
+            assert_eq!(defaults["timeout_seconds"].as_integer(), Some(timeout));
+        }
+        let (_, default) = parse_options(vec![]).unwrap();
+        assert_eq!(
+            default,
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+        );
+        let missing = temporary.join("missing");
+        assert!(
+            std::panic::catch_unwind(|| load_defaults(&missing)).is_err(),
+            "an unavailable selected root must not fall back to the compiled checkout"
+        );
     }
 }

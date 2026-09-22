@@ -210,11 +210,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Five CPU-evidence tests plus one schema-ingress test retain all 553 prior IDs.
     // Three policy controls retain all 559 prior identities.
     // Three real CPU-emission lifecycle controls retain all 562 prior identities.
-    ("test.regular_crates", 565),
+    // The runtime manifest-root regression retains all 565 prior identities.
+    ("test.regular_crates", 566),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     ("test.hermit_unit", 710),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
-    ("test.detcore_unit", 743),
+    // Five resource-limit controls retain all 743 prior identities.
+    ("test.detcore_unit", 748),
     ("test.detcore_misc", 27),
     ("test.detcore_parallel", 5),
     ("test.hermit_integration", 158),
@@ -240,13 +242,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.command_strict_verify_on_host", 9),
     ("test.detcore_misc_on_host", 27),
     ("test.detcore_parallel_on_host", 5),
-    ("test.detcore_unit_on_host", 743),
+    ("test.detcore_unit_on_host", 748),
     ("test.hermit_integration_on_host", 158),
     ("test.hermit_unit_on_host", 710),
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 565),
+    ("test.regular_crates_on_host", 566),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
