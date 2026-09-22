@@ -122,12 +122,28 @@ pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
 pub use tool_global::BackendFailureCleanup;
 pub use tool_global::GlobalState;
+#[doc(hidden)]
+pub use tool_global::NetworkConnection;
+#[doc(hidden)]
+pub use tool_global::NetworkDatagramDelivery;
+#[doc(hidden)]
+pub use tool_global::NetworkDatagramReceive;
+#[doc(hidden)]
+pub use tool_global::NetworkReply;
+#[doc(hidden)]
+pub use tool_global::NetworkRequest;
+#[doc(hidden)]
+pub use tool_global::NetworkStreamReceive;
+#[doc(hidden)]
+pub use tool_global::NetworkStreamTransmit;
 use tool_global::ThreadDeregistration;
 use tool_global::acknowledge_robust_list_exit_time;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
 use tool_global::deregister_thread;
 pub use tool_global::format_unsupported_syscall_warning;
+#[doc(hidden)]
+pub use tool_global::network_request;
 pub use tool_global::prepare_exec;
 use tool_global::report_unsupported_syscall;
 use tool_global::robust_list_wakes_after_exit;

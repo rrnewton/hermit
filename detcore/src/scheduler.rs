@@ -32,10 +32,12 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::vec::IntoIter;
 
+use detcore_model::fd::OpenFileId;
 use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::Position;
 use detcore_model::happens_before::Strength;
 use detcore_model::happens_before::ThreadRef;
+use detcore_model::network_trace::NetworkReadinessV2;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
 use futures::FutureExt;
@@ -74,9 +76,12 @@ use crate::config::Config;
 use crate::config::RunsPostFork;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
+use crate::network_replay::NetworkEngineMode;
+use crate::network_replay::NetworkReplayEngine;
 use crate::preemptions::PreemptionWriter;
 use crate::preemptions::read_trace;
 use crate::resources::ExternalOpId;
+use crate::resources::NetworkWaitKind;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -305,6 +310,11 @@ pub struct BlockedPool {
     /// re-admitted to the run queue. Their `InboundSignal` turn must now be
     /// granted rather than deferred again on the turn the scheduler selects them.
     pub sigchld_ready: BTreeSet<DetTid>,
+
+    /// Replay waiters keyed by stable open-file description.  Multiple dup/fork
+    /// aliases may wait on the same socket; readiness wakes all eligible
+    /// threads and the normal scheduler order decides which one consumes it.
+    pub network_waiters: BTreeMap<DetTid, (OpenFileId, NetworkWaitKind)>,
 }
 
 impl BlockedPool {
@@ -318,13 +328,15 @@ impl BlockedPool {
             && self.external_io_blockers.is_empty()
             && self.rt_sigsuspend_blockers.is_empty()
             && self.sigchld_deferred.is_empty()
+            && self.network_waiters.is_empty()
     }
 
     /// True if there are no runnable threads, and the only blocked ones are externally-blocked.
     fn only_external_blocked(&self) -> bool {
         let has_external_wait = !self.external_io_blockers.is_empty()
             || !self.child_waiters.is_empty()
-            || !self.physical_child_waiters.is_empty();
+            || !self.physical_child_waiters.is_empty()
+            || !self.network_waiters.is_empty();
         self.no_futex_waiters()
             && self.timed_waiters.is_empty()
             && self.physical_child_ready.is_empty()
@@ -552,6 +564,11 @@ pub struct Scheduler {
 
     /// INVARIANT: Thread IDs in `blocked` are absent from `run_queue`.
     pub blocked: BlockedPool,
+
+    /// The same run-global engine used by syscall RPCs.  The scheduler only
+    /// releases virtual-time-gated input and observes readiness; it never
+    /// consumes bytes on behalf of a thread.
+    network_engine: Option<Arc<Mutex<NetworkReplayEngine>>>,
 
     /// Kernel-blocked vfork parents and their children, once registered.
     vfork_barriers: BTreeMap<DetTid, Option<DetTid>>,
@@ -1674,6 +1691,7 @@ impl Scheduler {
             bg_action_pool: Default::default(),
             committed_time: Default::default(),
             blocked: Default::default(),
+            network_engine: None,
             vfork_barriers: Default::default(),
             pending_run_queue_admissions: Default::default(),
             pending_run_queue_removals: Default::default(),
@@ -1715,6 +1733,21 @@ impl Scheduler {
             post_fork_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed() ^ 0x706f_7374_666f_726b),
             happens_before: cfg.happens_before.clone().map(HbRuntime::new),
         }
+    }
+
+    /// Install the run-global capture/replay engine before the scheduler task
+    /// starts.  Every clone points at the same mutex-protected state machine.
+    pub(crate) fn set_network_engine(&mut self, engine: Option<Arc<Mutex<NetworkReplayEngine>>>) {
+        assert!(
+            self.network_engine.is_none(),
+            "network engine installed twice"
+        );
+        self.network_engine = engine;
+    }
+
+    /// Detach the scheduler's engine reference during terminal finalization.
+    pub(crate) fn take_network_engine(&mut self) -> Option<Arc<Mutex<NetworkReplayEngine>>> {
+        self.network_engine.take()
     }
 
     /// Record a newly created thread for happens-before `spawn_ordinal`
@@ -2421,6 +2454,7 @@ impl Scheduler {
         self.blocked.sigchld_ready.remove(dtid);
         self.blocked.child_waiters.remove(dtid);
         self.blocked.physical_child_ready.remove(dtid);
+        self.blocked.network_waiters.remove(dtid);
         self.blocked.physical_child_waiters.retain(|_, waiters| {
             waiters.remove(dtid);
             !waiters.is_empty()
@@ -2669,12 +2703,68 @@ impl Scheduler {
     ) -> Result<(), SkipTurn> {
         self.step2_drain_prefix()?;
         self.step2b_process_timed();
+        self.step2_network_replay_ready()?;
         if self.backend_failed() || self.control_barrier() {
             return Err(SkipTurn);
         }
         self.step2c_process_io_blockers()?;
         self.step2e_process_signal_deferred();
         self.step2d_handle_empty_queue(global_time)
+    }
+
+    fn network_wait_is_ready(readiness: NetworkReadinessV2, kind: NetworkWaitKind) -> bool {
+        match kind {
+            NetworkWaitKind::Readable => readiness.readable || readiness.error || readiness.hangup,
+            NetworkWaitKind::Writable => readiness.writable || readiness.error || readiness.hangup,
+            NetworkWaitKind::Any => !readiness.is_empty(),
+        }
+    }
+
+    /// Release trace events whose exact virtual-time and outbound-progress
+    /// gates are satisfied, then wake every eligible waiter.  No bytes are
+    /// consumed here: after ordinary scheduling, the winning syscall consumes
+    /// them and any losing reader re-parks if availability is exhausted.
+    fn step2_network_replay_ready(&mut self) -> Result<(), SkipTurn> {
+        if self.blocked.network_waiters.is_empty() {
+            return Ok(());
+        }
+        let Some(engine) = &self.network_engine else {
+            self.terminal_deadlock.get_or_insert_with(|| {
+                "network waiter registered without a capture/replay engine".to_owned()
+            });
+            return Err(SkipTurn);
+        };
+        let ready = {
+            let mut engine = engine.lock().unwrap();
+            if engine.mode() == NetworkEngineMode::Replay
+                && let Err(error) = engine.release_eligible(self.committed_time)
+            {
+                self.terminal_deadlock
+                    .get_or_insert_with(|| format!("network replay release failed: {error}"));
+                return Err(SkipTurn);
+            }
+            let mut ready = Vec::new();
+            for (&dettid, &(open_file, kind)) in &self.blocked.network_waiters {
+                match engine.readiness(open_file) {
+                    Ok(readiness) if Self::network_wait_is_ready(readiness, kind) => {
+                        ready.push(dettid);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.terminal_deadlock.get_or_insert_with(|| {
+                            format!("network replay readiness failed for {open_file:?}: {error}")
+                        });
+                        return Err(SkipTurn);
+                    }
+                }
+            }
+            ready
+        };
+        for dettid in ready {
+            assert!(self.blocked.network_waiters.remove(&dettid).is_some());
+            self.runqueue_push_back(dettid);
+        }
+        Ok(())
     }
 
     /// Re-admit parents whose host-async `SIGCHLD` was parked in
@@ -3712,7 +3802,8 @@ impl Scheduler {
         let timed_empty = self.blocked.timed_waiters.is_empty();
         let external_waits_empty = self.blocked.external_io_blockers.is_empty()
             && self.blocked.child_waiters.is_empty()
-            && self.blocked.physical_child_waiters.is_empty();
+            && self.blocked.physical_child_waiters.is_empty()
+            && self.blocked.network_waiters.is_empty();
         let rt_sigsuspend_empty = self.blocked.rt_sigsuspend_blockers.is_empty();
         let futex_empty = self.blocked.no_futex_waiters();
 
@@ -3727,6 +3818,57 @@ impl Scheduler {
                 );
                 std::thread::yield_now();
                 return Err(SkipTurn);
+            }
+            if !self.blocked.network_waiters.is_empty() {
+                let next_network = self
+                    .network_engine
+                    .as_ref()
+                    .and_then(|engine| {
+                        let engine = engine.lock().unwrap();
+                        (engine.mode() == NetworkEngineMode::Replay)
+                            .then(|| engine.next_release_time())
+                    })
+                    .transpose();
+                let next_network = match next_network {
+                    Ok(next) => next.flatten(),
+                    Err(error) => {
+                        self.terminal_deadlock.get_or_insert_with(|| {
+                            format!("network replay release-time lookup failed: {error}")
+                        });
+                        return Err(SkipTurn);
+                    }
+                };
+                let next_timer = self.blocked.timed_waiters.next_deadline();
+                if let Some(deadline) = next_network
+                    && !deadline.is_indefinite()
+                    && next_timer.is_none_or(|timer| deadline <= timer)
+                {
+                    let mut gt = global_time.lock().unwrap();
+                    let now = gt.as_nanos();
+                    if deadline > now {
+                        let delta = deadline.duration_since(now);
+                        info!(
+                            "[scheduler] advancing continuous virtual time exactly to network release {}",
+                            deadline
+                        );
+                        gt.add_extra_time(delta);
+                        return Err(SkipTurn);
+                    }
+                    drop(gt);
+                    self.terminal_deadlock.get_or_insert_with(|| {
+                        format!(
+                            "network replay waiter remained blocked at eligible release time {deadline}"
+                        )
+                    });
+                    return Err(SkipTurn);
+                }
+                if next_network.is_none() && timed_empty {
+                    self.terminal_deadlock.get_or_insert_with(|| {
+                        "network replay wait cannot be satisfied by time or outbound progress"
+                            .to_owned()
+                    });
+                    return Err(SkipTurn);
+                }
             }
             // When the run queue is empty, we sometimes need to give things a kick.
             if futex_empty && timed_empty && external_waits_empty && rt_sigsuspend_empty {
@@ -4171,6 +4313,39 @@ impl Scheduler {
                         self.wake_physical_child_waiters(*child);
                     }
                     skipped
+                }
+            }
+
+            ResourceID::NetworkWait { open_file, kind } => {
+                let Some(engine) = self.network_engine.as_ref() else {
+                    self.terminal_deadlock.get_or_insert_with(|| {
+                        "network wait requested without a capture/replay engine".to_owned()
+                    });
+                    return Err(SkipTurn);
+                };
+                let readiness = match engine.lock().unwrap().readiness(*open_file) {
+                    Ok(readiness) => readiness,
+                    Err(error) => {
+                        self.terminal_deadlock.get_or_insert_with(|| {
+                            format!("network replay readiness failed for {open_file:?}: {error}")
+                        });
+                        return Err(SkipTurn);
+                    }
+                };
+                if Self::network_wait_is_ready(readiness, *kind) {
+                    Ok(())
+                } else {
+                    info!(
+                        "[scheduler] NONCOMMIT turn {}, parking dettid {} for network OFD {:?} {:?}",
+                        self.turn, dettid, open_file, kind
+                    );
+                    assert!(
+                        self.blocked
+                            .network_waiters
+                            .insert(dettid, (*open_file, *kind))
+                            .is_none()
+                    );
+                    self.skip_turn_blocked(dettid)
                 }
             }
 

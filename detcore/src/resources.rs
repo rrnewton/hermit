@@ -24,6 +24,7 @@ use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::MmId;
+use crate::types::OpenFileId;
 use crate::types::RcbTimeMultiplier;
 use crate::types::SigWrapper;
 
@@ -69,6 +70,22 @@ pub struct ExternalOpId {
     pub tid: DetTid,
     /// Per-thread syscall sequence number.
     pub sequence: u64,
+}
+
+/// Modeled network condition which can make a parked socket operation runnable.
+///
+/// The condition is deliberately keyed by open-file description rather than a
+/// raw descriptor or calling thread. Every dup/fork alias therefore observes
+/// the same availability, and a numeric fd reused for another socket cannot
+/// inherit an old wait.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
+pub enum NetworkWaitKind {
+    /// Stream bytes, one datagram, EOF, an error, connect, or accept is ready.
+    Readable,
+    /// A transmit can make progress or return its recorded error.
+    Writable,
+    /// Any readiness transition is observable by poll/select/epoll.
+    Any,
 }
 
 impl ExternalOpId {
@@ -243,6 +260,14 @@ pub enum ResourceID {
     /// A guest-internal internal IO op which is guaranteed to be nonblocking,
     /// i.e. converted into a polling strategy.
     InternalIOPolling,
+
+    /// Wait for modeled network availability on one stable open-file description.
+    NetworkWait {
+        /// Socket open-file description shared by every descriptor alias.
+        open_file: OpenFileId,
+        /// Availability condition requested by the syscall adapter.
+        kind: NetworkWaitKind,
+    },
 
     /// An internal event that is only used when implementing context switches under tracereplay.
     /// It should not bump global time.
