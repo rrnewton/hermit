@@ -504,15 +504,38 @@ and reproducibility.
 
 Network modes are:
 
-- `--network=local` (default): isolated loopback networking.
-- `--network=host`: host networking. External responses and port state become
-  nondeterministic inputs.
+- `--network=none`: a fresh network namespace with no configured IP
+  networking. Linux still creates the mandatory `lo` device, but Hermit leaves
+  it down and exposes a fresh `/sys` containing only that device.
+- `--network=local` (current default): enable loopback inside the isolated network
+  namespace. This supports guest-internal client/server tests without admitting
+  external traffic.
+- `--unsafe-allow-networking`: use the host network. External responses and port
+  state become uncontrolled inputs, so the run does not carry Hermit's
+  deterministic-execution guarantee. The old `--network=host` spelling remains
+  accepted for compatibility and canonicalizes to this explicit unsafe option.
+
+`none` is intended to become the default after two compatibility prerequisites
+land: the DBT launcher must enter the same network namespace as the other
+backends, and loopback-dependent E2E/compatibility tests must declare `local`
+instead of receiving it implicitly. Until then, `--network=none` is an explicit
+fail-closed mode; DBT refuses it because that backend currently bypasses the
+container that owns namespace setup.
+
+`--record-networking=TRACE` and `--replay-networking=TRACE` reserve the CLI for
+schedule-independent external-input traces. This build refuses both options:
+the intended trace model is schedule-independent, but no network trace codec,
+socket/readiness capture, or scheduler integration is implemented, and Hermit
+will not silently substitute live networking. When enabled, both run-mode
+options and full replay must configure one shared network data-movement engine
+and trace codec; the subcommands are wrappers, not separate record/replay
+implementations.
 
 `hermit run --gdbserver` needs a host gdb client to reach the gdbserver port.
-Because `--network=local` binds that port inside the guest's isolated network
-namespace, run mode forces host networking (printing a warning) whenever
-`--gdbserver` is set so the debugger can attach. Attach from another terminal
-with `gdb -ex 'target remote :PORT'` (default port 1234, override with
+Both isolated modes hide that port from the host, so run mode requires an
+explicit `--unsafe-allow-networking` acknowledgment with `--gdbserver`; it never
+enables host networking as a side effect. Attach from another terminal with
+`gdb -ex 'target remote :PORT'` (default port 1234, override with
 `--gdbserver-port=PORT`). `--gdbserver` cannot be combined with
 `--analyze-networking`, which requires the isolated namespace.
 
