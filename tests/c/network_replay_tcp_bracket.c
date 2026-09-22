@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -29,9 +30,10 @@
 
 static const char REQUEST[] = "request\n";
 static const char PROGRESS[] = "next\n";
+static const char COMPLETION[] = "done\n";
 static const char FIRST_INPUT[] = "abc";
 static const char SECOND_INPUT[] = "def";
-static const char OUTBOUND_HEX[] = "726571756573740a6e6578740a";
+static const char OUTBOUND_HEX[] = "726571756573740a6e6578740a646f6e650a";
 
 static void fail(const char *operation) {
   perror(operation);
@@ -96,7 +98,8 @@ static uint64_t fnv1a64_update(uint64_t digest, const void *raw, size_t length) 
 static uint64_t expected_outbound_digest(void) {
   uint64_t digest = UINT64_C(14695981039346656037);
   digest = fnv1a64_update(digest, REQUEST, sizeof(REQUEST) - 1);
-  return fnv1a64_update(digest, PROGRESS, sizeof(PROGRESS) - 1);
+  digest = fnv1a64_update(digest, PROGRESS, sizeof(PROGRESS) - 1);
+  return fnv1a64_update(digest, COMPLETION, sizeof(COMPLETION) - 1);
 }
 
 static void publish_text(const char *path, const char *text) {
@@ -169,6 +172,11 @@ static int run_controller(const char *port_path, const char *report_path) {
   if (memcmp(progress, PROGRESS, sizeof(progress)) != 0)
     fail_message("outbound progress mismatch");
   send_all(client, SECOND_INPUT, sizeof(SECOND_INPUT) - 1);
+
+  char completion[sizeof(COMPLETION) - 1];
+  receive_exact(client, completion, sizeof(completion));
+  if (memcmp(completion, COMPLETION, sizeof(completion)) != 0)
+    fail_message("outbound completion mismatch");
   if (shutdown(client, SHUT_WR) != 0)
     fail("shutdown controller");
 
@@ -202,6 +210,7 @@ struct reader {
   pthread_barrier_t *start;
   char bytes[PAYLOAD_SIZE + 1];
   ssize_t received;
+  short readiness;
   int error;
 };
 
@@ -210,6 +219,25 @@ static void *run_reader(void *raw) {
   int barrier = pthread_barrier_wait(reader->start);
   if (barrier != 0 && barrier != PTHREAD_BARRIER_SERIAL_THREAD) {
     reader->error = barrier;
+    return NULL;
+  }
+
+  struct pollfd interest = {.fd = reader->fd, .events = POLLIN};
+  int ready;
+  do {
+    ready = poll(&interest, 1, 5000);
+  } while (ready < 0 && errno == EINTR);
+  if (ready < 0) {
+    reader->error = errno;
+    return NULL;
+  }
+  if (ready != 1) {
+    reader->error = ETIMEDOUT;
+    return NULL;
+  }
+  reader->readiness = interest.revents;
+  if (reader->readiness != POLLIN) {
+    reader->error = EIO;
     return NULL;
   }
 
@@ -301,6 +329,8 @@ static int run_client(const char *port_text, int mismatch) {
       memcmp(readers[second].bytes, SECOND_INPUT, PAYLOAD_SIZE) != 0)
     fail_message("competing readers did not consume the exact abc/def stream");
 
+  send_all(socket_fd, COMPLETION, sizeof(COMPLETION) - 1);
+
   char eof_byte;
   ssize_t eof;
   do {
@@ -309,7 +339,8 @@ static int run_client(const char *port_text, int mismatch) {
   if (eof != 0)
     fail_message("peer half-close did not produce EOF after abcdef");
 
-  printf("aggregate=abcdef eof=1 outbound_hex=%s outbound_fnv1a64=%016llx\n",
+  printf("aggregate=abcdef readiness=pollin,pollin eof=1 outbound_hex=%s "
+         "outbound_fnv1a64=%016llx\n",
          OUTBOUND_HEX, (unsigned long long)expected_outbound_digest());
   printf("reader-marker=%d:abc,%d:def\n", readers[first].index,
          readers[second].index);

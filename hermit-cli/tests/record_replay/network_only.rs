@@ -42,7 +42,8 @@ const REPLAY_CELLS: &[(u64, u64)] = &[
     (3, 4_000_000),
 ];
 
-const OUTBOUND_HEX: &str = "726571756573740a6e6578740a";
+const OUTBOUND_HEX: &str = "726571756573740a6e6578740a646f6e650a";
+const EVIDENCE_ENV: &str = "HERMIT_NETWORK_REPLAY_EVIDENCE";
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
     bytes
@@ -54,8 +55,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 
 fn expected_invariant() -> String {
     format!(
-        "aggregate=abcdef eof=1 outbound_hex={OUTBOUND_HEX} outbound_fnv1a64={:016x}",
-        fnv1a64(b"request\nnext\n")
+        "aggregate=abcdef readiness=pollin,pollin eof=1 outbound_hex={OUTBOUND_HEX} outbound_fnv1a64={:016x}",
+        fnv1a64(b"request\nnext\ndone\n")
     )
 }
 
@@ -199,7 +200,7 @@ impl Drop for Controller {
 fn assert_controller_report(report: &str) {
     let expected = format!(
         "controller=complete\noutbound_hex={OUTBOUND_HEX}\noutbound_fnv1a64={:016x}\n",
-        fnv1a64(b"request\nnext\n")
+        fnv1a64(b"request\nnext\ndone\n")
     );
     assert_eq!(
         report, expected,
@@ -242,9 +243,14 @@ fn safehermit_command(
         .arg(guest)
         .args(guest_arguments)
         .env("SAFEHERMIT_LOG_ROOT", log_root);
-    command.output().unwrap_or_else(|error| {
+    let output = command.output().unwrap_or_else(|error| {
         panic!("failed to start {label} through the required safehermit wrapper: {error}")
-    })
+    });
+    fs::write(evidence.join(format!("{label}.stdout")), &output.stdout)
+        .unwrap_or_else(|error| panic!("failed to retain {label} stdout: {error}"));
+    fs::write(evidence.join(format!("{label}.stderr")), &output.stderr)
+        .unwrap_or_else(|error| panic!("failed to retain {label} stderr: {error}"));
+    output
 }
 
 fn common_run_arguments(seed: u64, max_timeslice: u64) -> Vec<String> {
@@ -365,19 +371,34 @@ fn network_replay_tcp_fixture_has_the_exact_native_contract() {
     assert_controller_report(&controller.finish());
 }
 
+fn acceptance_evidence_directory() -> (Option<tempfile::TempDir>, PathBuf) {
+    if let Some(path) = std::env::var_os(EVIDENCE_ENV).map(PathBuf::from) {
+        fs::create_dir(&path).unwrap_or_else(|error| {
+            panic!(
+                "{EVIDENCE_ENV} must name a new evidence directory {}: {error}",
+                path.display()
+            )
+        });
+        return (None, path);
+    }
+    let temporary = tempfile::tempdir().expect("create network replay evidence directory");
+    let path = temporary.path().to_owned();
+    (Some(temporary), path)
+}
+
 #[test]
-#[ignore = "tests-first bracket: network run policies and shared runtime engine are not implemented"]
+#[ignore = "run explicitly after the shared network runtime reaches a green boundary"]
 fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
     let _guard = super::hermit_record_lock();
     let fixture = &super::workload("c_network_replay_tcp_bracket").path;
-    let evidence = tempfile::tempdir().expect("create network replay evidence directory");
-    let trace = evidence.path().join("network.trace");
+    let (_temporary_evidence, evidence) = acceptance_evidence_directory();
+    let trace = evidence.join("network.trace");
 
     // Policy 1: deterministic execution without a trace cannot touch even the
     // waiting loopback controller. This also proves that refusal is prompt.
-    let (closed_controller, closed_port) = Controller::start(fixture, evidence.path());
+    let (closed_controller, closed_port) = Controller::start(fixture, &evidence);
     let closed = safehermit_command(
-        evidence.path(),
+        &evidence,
         "default-policy-refusal",
         &common_run_arguments(0, 1_000_000),
         fixture,
@@ -392,13 +413,13 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
 
     // Policy 2 recording: the only live-network execution is explicit, bounded,
     // and backed by an external controller with an exact outbound oracle.
-    let record_directory = evidence.path().join("record-controller");
+    let record_directory = evidence.join("record-controller");
     fs::create_dir(&record_directory).expect("create record controller directory");
     let (controller, port) = Controller::start(fixture, &record_directory);
     let mut record_arguments = common_run_arguments(0, 1_000_000);
     record_arguments.push(format!("--record-networking={}", trace.display()));
     let recorded = safehermit_command(
-        evidence.path(),
+        &evidence,
         "record-networking",
         &record_arguments,
         fixture,
@@ -419,7 +440,7 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
     let mut reader_markers = BTreeSet::new();
     for (seed, max_timeslice) in REPLAY_CELLS {
         let label = format!("replay-seed-{seed}-timeslice-{max_timeslice}");
-        let report = evidence.path().join(format!("{label}.verify.json"));
+        let report = evidence.join(format!("{label}.verify.json"));
         let mut arguments = common_run_arguments(*seed, *max_timeslice);
         arguments.extend([
             "--verify".into(),
@@ -428,7 +449,7 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
             format!("--replay-networking={}", trace.display()),
         ]);
         let replayed = safehermit_command(
-            evidence.path(),
+            &evidence,
             &label,
             &arguments,
             fixture,
@@ -453,7 +474,7 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
     let mut mismatch_arguments = common_run_arguments(0, 1_000_000);
     mismatch_arguments.push(format!("--replay-networking={}", trace.display()));
     let mismatch = safehermit_command(
-        evidence.path(),
+        &evidence,
         "outbound-mismatch",
         &mismatch_arguments,
         fixture,
@@ -467,11 +488,11 @@ fn external_tcp_recording_replays_offline_across_schedules_and_refuses_mismatch(
 
     // Missing replay input is independently fail-closed and must fail before a
     // guest can attempt the fresh host connection.
-    let missing_trace = evidence.path().join("missing.trace");
+    let missing_trace = evidence.join("missing.trace");
     let mut missing_arguments = common_run_arguments(0, 1_000_000);
     missing_arguments.push(format!("--replay-networking={}", missing_trace.display()));
     let missing = safehermit_command(
-        evidence.path(),
+        &evidence,
         "missing-trace",
         &missing_arguments,
         fixture,
