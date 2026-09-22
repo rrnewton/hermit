@@ -621,8 +621,8 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
     // for their shared cache. Run no more than two at once: two is the largest
     // clean concurrent validation width established on this host, and a wider
     // unmeasured default would turn this speed change into a new concurrency
-    // assumption. Capture each child independently and replay it in the original
-    // order so diagnostics remain attributable.
+    // assumption. Publish each completed child immediately so a later timeout
+    // retains its diagnostics; the final status summary keeps the original order.
     let audit_jobs = validation_audit_worker_capacity(
         std::env::var(PREBUILT_RUST_SCRIPTS_REQUIRED).as_deref() == Ok("1"),
         std::env::var(SCHEDULED_BUILD_JOBS).ok().as_deref(),
@@ -963,50 +963,132 @@ fn run_audit(root: &Path, program: &Path, args: &[&str]) {
     }
 }
 
-fn run_audits_parallel(root: &Path, audits: &[(PathBuf, Vec<&str>)], jobs: usize) {
+struct AuditReport {
+    status: Result<std::process::ExitStatus, String>,
+    elapsed: std::time::Duration,
+}
+
+enum AuditEvent {
+    Started,
+    Finished(Result<Output, String>, std::time::Duration),
+}
+
+/// Publish each completed audit before waiting for the remaining workers.
+/// A later timeout must not erase an earlier audit's output or actual status.
+fn collect_audit_results(
+    root: &Path,
+    audits: &[(PathBuf, Vec<&str>)],
+    jobs: usize,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> Result<Vec<AuditReport>, String> {
     let mut results = std::iter::repeat_with(|| None)
         .take(audits.len())
-        .collect::<Vec<Option<Result<Output, String>>>>();
+        .collect::<Vec<Option<AuditReport>>>();
+    let mut output_error = None;
     for_each_parallel(
         audits.len(),
         ScheduledWorkerCapacity::new(jobs),
         |index, emit| {
+            if !emit(AuditEvent::Started, false) {
+                return;
+            }
             let (program, args) = &audits[index];
+            let started = std::time::Instant::now();
             let result = Command::new(program)
                 .args(args)
                 .current_dir(root)
                 .output()
                 .map_err(|error| format!("cannot execute {}: {error}", program.display()));
-            let _ = emit(result, false);
+            let _ = emit(AuditEvent::Finished(result, started.elapsed()), false);
         },
-        |index, result, _| {
-            results[index] = Some(result);
+        |index, event, _| {
+            if output_error.is_some() {
+                return false;
+            }
+            let (program, args) = &audits[index];
+            let replay = (|| -> std::io::Result<()> {
+                match event {
+                    AuditEvent::Started => writeln!(
+                        stderr,
+                        "test-harness: audit {}/{} START {} {}",
+                        index + 1,
+                        audits.len(),
+                        program.display(),
+                        args.join(" ")
+                    )?,
+                    AuditEvent::Finished(result, elapsed) => {
+                        if let Ok(output) = &result {
+                            stdout.write_all(&output.stdout)?;
+                            stderr.write_all(&output.stderr)?;
+                        }
+                        let status = result.map(|output| output.status);
+                        let detail = match &status {
+                            Ok(status) => status.to_string(),
+                            Err(error) => error.clone(),
+                        };
+                        writeln!(
+                            stderr,
+                            "test-harness: audit {}/{} END {} {}: {detail}; elapsed={:.3}s",
+                            index + 1,
+                            audits.len(),
+                            program.display(),
+                            args.join(" "),
+                            elapsed.as_secs_f64()
+                        )?;
+                        results[index] = Some(AuditReport { status, elapsed });
+                    }
+                }
+                stdout.flush()?;
+                stderr.flush()
+            })();
+            if let Err(error) = replay {
+                output_error = Some(format!(
+                    "cannot publish audit {} diagnostics: {error}",
+                    program.display()
+                ));
+                return false;
+            }
             true
         },
     );
+    if let Some(error) = output_error {
+        return Err(error);
+    }
+    Ok(results
+        .into_iter()
+        .map(|result| result.expect("every validation audit worker returns one result"))
+        .collect())
+}
 
+fn run_audits_parallel(root: &Path, audits: &[(PathBuf, Vec<&str>)], jobs: usize) {
+    let results = collect_audit_results(
+        root,
+        audits,
+        jobs,
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )
+    .unwrap_or_else(|error| fail(error));
+
+    // Output bodies were published exactly once at completion. Keep this small
+    // terminal summary in the declared order, independent of completion order.
+    for ((program, args), result) in audits.iter().zip(&results) {
+        let status = match &result.status {
+            Ok(status) => status.to_string(),
+            Err(error) => error.clone(),
+        };
+        println!(
+            "test-harness: audit result {} {}: {status}; elapsed={:.3}s",
+            program.display(),
+            args.join(" "),
+            result.elapsed.as_secs_f64()
+        );
+    }
     for ((program, args), result) in audits.iter().zip(results) {
-        let output = result
-            .expect("every validation audit worker returns one result")
-            .unwrap_or_else(|error| fail(error));
-        std::io::stdout()
-            .write_all(&output.stdout)
-            .unwrap_or_else(|error| {
-                fail(format!(
-                    "cannot replay {} stdout: {error}",
-                    program.display()
-                ))
-            });
-        std::io::stderr()
-            .write_all(&output.stderr)
-            .unwrap_or_else(|error| {
-                fail(format!(
-                    "cannot replay {} stderr: {error}",
-                    program.display()
-                ))
-            });
-        if !output.status.success() {
-            if output.status.code() == Some(127) {
+        let status = result.status.unwrap_or_else(|error| fail(error));
+        if !status.success() {
+            if status.code() == Some(127) {
                 fail(format!(
                     "cannot run {}: exited 127, which means its interpreter was not found, \
                      not that the audit failed. This program runs under \
@@ -3272,6 +3354,91 @@ report.write_bytes((root/'verification.json').read_bytes())
         );
     }
 
+    fn completed_audit_output_survives_an_unfinished_peer() {
+        use std::io::Write;
+        use std::path::PathBuf;
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        struct ReleaseOnFlush {
+            bytes: Vec<u8>,
+            release: PathBuf,
+        }
+        impl Write for ReleaseOnFlush {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self
+                    .bytes
+                    .windows(b"second stdout\n".len())
+                    .any(|part| part == b"second stdout\n")
+                {
+                    fs::write(&self.release, b"completed peer diagnostics observed")?;
+                }
+                Ok(())
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "hermit-audit-output-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir(&path).unwrap();
+        let fixture = Scratch(path);
+        let release = fixture.0.join("release");
+        let mut stdout = ReleaseOnFlush {
+            bytes: Vec::new(),
+            release: release.clone(),
+        };
+        let mut stderr = Vec::new();
+        // The first audit cannot succeed until its parent's output writer has
+        // flushed the second audit. The old all-join buffering hits exit 97.
+        // A fixed polling limit bounds this opponent even when publication fails.
+        let blocked = "i=0; while [ ! -f \"$1\" ]; do i=$((i+1)); [ \"$i\" -lt 200 ] || exit 97; sleep 0.01; done; printf 'first stdout\\n'";
+        let audits = [
+            (
+                PathBuf::from("/bin/sh"),
+                vec!["-c", blocked, "audit", release.to_str().unwrap()],
+            ),
+            (
+                PathBuf::from("/bin/sh"),
+                vec![
+                    "-c",
+                    "printf 'second stdout\\n'; printf 'second stderr\\n' >&2; exit 23",
+                ],
+            ),
+        ];
+        let results =
+            super::collect_audit_results(&fixture.0, &audits, 2, &mut stdout, &mut stderr).unwrap();
+        assert_eq!(stdout.bytes, b"second stdout\nfirst stdout\n");
+        let diagnostics = String::from_utf8(stderr).unwrap();
+        assert_eq!(
+            diagnostics
+                .lines()
+                .filter(|line| *line == "second stderr")
+                .count(),
+            1
+        );
+        assert!(diagnostics.contains("audit 1/2 START /bin/sh"));
+        assert!(diagnostics.contains("audit 2/2 START /bin/sh"));
+        assert!(diagnostics.contains("exit status: 23; elapsed="));
+        assert!(
+            diagnostics.find("audit 2/2 END").unwrap() < diagnostics.find("audit 1/2 END").unwrap()
+        );
+        // Retained terminal records stay in declared order; early publication
+        // must neither reorder the final summary nor relabel the failing child.
+        assert_eq!(results.len(), 2);
+        assert!(results[0].status.as_ref().unwrap().success());
+        assert_eq!(results[1].status.as_ref().unwrap().code(), Some(23));
+    }
+
     #[test]
     fn parallel_runner_delivers_every_completion_before_returning() {
         let active = AtomicUsize::new(0);
@@ -3296,6 +3463,7 @@ report.write_bytes((root/'verification.json').read_bytes())
         rows.sort_unstable();
         assert_eq!(rows, (0..8).map(|index| (index, index)).collect::<Vec<_>>());
         assert!(maximum.load(Ordering::SeqCst) > 1);
+        completed_audit_output_survives_an_unfinished_peer();
     }
     #[test]
     fn retry_policy_retries_only_classified_product_failures() {

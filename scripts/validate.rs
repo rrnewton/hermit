@@ -1565,9 +1565,15 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
     let ledger = tempfile::NamedTempFile::new_in(fixture.path())
         .map_err(|error| format!("submodule service result: cannot create private ledger: {error}"))?;
     let checkout = fixture.path().join("hermit");
+    // The bracket needs the current tree and recorded AU API, not unrelated
+    // branch history. Keep transport copying (--no-local), so the disposable
+    // repositories remain independent of the source's object store.
     checked_command(
         Command::new("git")
-            .args(["clone", "--quiet", "--no-local", "--no-recurse-submodules"])
+            .args([
+                "clone", "--quiet", "--no-local", "--no-recurse-submodules",
+                "--depth", "1", "--single-branch", "--no-tags",
+            ])
             .arg(root)
             .arg(&checkout),
         "clone the independent Hermit fixture",
@@ -1688,7 +1694,10 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
 
     checked_command(
         Command::new("git")
-            .args(["clone", "--quiet", "--no-local"])
+            .args([
+                "clone", "--quiet", "--no-local",
+                "--depth", "1", "--single-branch", "--no-tags",
+            ])
             .arg(root.join("agent-utils"))
             .arg(checkout.join("agent-utils")),
         "populate only agent-utils",
