@@ -44,6 +44,15 @@ fn run() -> Result<i32, String> {
             println!("{}", hermit_manifest_plan::nextest_binaries::executable(&root, &package, &name)?.display());
             Ok(0)
         }
+        Some("budget-context") => {
+            let remaining = args.collect::<Vec<_>>();
+            if remaining == ["--help"] || remaining == ["-h"] {
+                println!("usage: ci/nextest-binaries.rs budget-context NEXTEST_ARGS...\n\nRead the existing verified preparation record and print the regular selection's calibration context as JSON. Use the same Cargo selectors as the counted run. Other selections print null and keep legacy bounds. Missing or stale preparation refuses; this command does not build artifacts.");
+                return Ok(0);
+            }
+            println!("{}", hermit_manifest_plan::nextest_binaries::budget_context(&root, &remaining)?);
+            Ok(0)
+        }
         Some(operation @ ("cpu-wrapper" | "build-cpu-wrapper")) => {
             if args.next().is_some() { return Err("unexpected CPU wrapper query argument".into()); }
             let path = if operation == "cpu-wrapper" {
@@ -70,7 +79,7 @@ fn run() -> Result<i32, String> {
             } else { None };
             hermit_manifest_plan::nextest_binaries::run(&root, operation, config.as_deref(), &remaining)
         }
-        _ => Err("usage: ci/nextest-binaries.rs prepare PROFILE | run|list [--config-file PATH] NEXTEST_ARGS...".into()),
+        _ => Err("usage: ci/nextest-binaries.rs prepare PROFILE | run|list [--config-file PATH] NEXTEST_ARGS... | budget-context NEXTEST_ARGS...".into()),
     }
 }
 

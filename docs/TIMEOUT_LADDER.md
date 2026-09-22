@@ -93,6 +93,62 @@ effective bounds as
 accept older rows with neither field but refuse current publication unless both
 are present and consistent.
 
+## Regular Nextest calibration and enclosing budgets
+
+The prepared regular-crates runner can use `.config/nextest-budgets.json`, a
+derived configuration under the same CPU/wall formulas above. Raw observations
+remain in the existing run evidence; this file is not a second history store.
+It keys each row by the exact package, binary ID and test name from Nextest's
+typed selected inventory. The resolver produces one CPU/wall pair and retains
+the complete resolved map beside the CPU report as `.budgets.json`. Both the
+generated wall configuration and every CPU-wrapper invocation bind those same
+bytes; the wrapper refuses a changed digest or an absent executing identity.
+
+Applicability requires the recorded source, verified build context, CPU model,
+available CPU allocation and emitted Nextest concurrency to match. The source
+fingerprint includes every tracked tree entry and gitlink except this one
+derived calibration file; dirty source cannot activate it. This avoids a
+calibration invalidating its own measurements when its table is written.
+Prepared-artifact checks still verify the actual source views, compiler,
+configuration and executable bytes. Comparison context replaces only a
+verified target directory and configuration placement with logical locations;
+it does not equate executable hashes from different checkouts.
+
+Current-cohort p90 values are not pooled across resource allocations. An
+applicable historical positive maximum supplies a conservative floor before
+the owner formula is evaluated. With three current samples, p90 is the maximum
+of those three, not a statistically established tail. Bounds are positive whole
+seconds, with base wall at least CPU+3. If either formula exceeds the existing
+22/57 defaults, that row remains explicitly unresolved at the unchanged
+defaults; a high observation is neither discarded nor called calibrated after
+truncation. Each machine multiplier is applied once, followed by the strict
+CPU+2 < wall check. A collision refuses rather than extending wall silently.
+
+Missing or stale calibration keeps every selected case at its existing default
+bounds, allowing a changed source tree to be measured without a circular gate.
+Unsupported profiles, overrides and standalone consumers retain their existing
+configuration. A measured calibration does not authorize case exclusions,
+assertion changes, retries being ignored, or a serialized group being treated
+as independent work.
+
+The regular population calculation sums every attempt's CPU allowance. For
+independent work-conserving slots of actual width J, its nominal wall allowance
+is `ceil((sum(wall_i+2) + (J-1)*max(wall_i+2))/J)`, with sequential retries
+included in each case. Nextest times the whole wrapper and sends process-group
+SIGKILL after its two-second wall grace; the wrapper's own gentle shutdown and
+five-second reap deadline run inside that outer lifetime. This model assumes a
+responsive runner and scheduler. Setup, reporting, accounting delay and failed
+cleanup remain separate infrastructure work under the unchanged containment.
+
+The report distinguishes nominal work from available headroom under the regular
+node's 900 wall/7200 CPU limits. Conservative defaults can exceed those totals;
+that is uncertified aggregate headroom, not a promise that all cases can consume
+their maximum simultaneously. Emergency expiry remains incomplete and
+non-green. The ordinary selected eleven-node run retains its 4200-second
+whole-work cap even though its nominal dependency critical path can total
+6300 seconds. Neither this calibration nor healthy observed margins qualify
+the separate unmeasured Detcore and full-profile populations.
+
 ## Gentle first, hard as fallback
 
 Owner ruling: a run is stopped by a **proper teardown with a gentle kill of

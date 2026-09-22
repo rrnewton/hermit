@@ -144,6 +144,7 @@ function emit_libtest_count {
 function run_nextest {
     local events_log=$1 wall_multiplier=$2 cpu_wrapper=$3 attempts=$4 binary_map=$5
     local inventory=$6 cpu_report=$7
+    local budget_map="$4/../resolved-budgets.json" budget_context="$4/../budget-context.json"
     local status count_status=0
     local -a inventory_arguments=()
     shift 7
@@ -172,6 +173,33 @@ function run_nextest {
         printf 'run-nextest-counted: cannot validate typed nextest binary inventory\n' >&2
         cleanup_nextest_config
         return 2
+    fi
+
+    # Prepared consumers can bind calibration to the exact checked build and
+    # selected inventory. Standalone/unsupported populations keep the existing
+    # path. Never infer a calibration context from unchecked executable names.
+    if [[ ${HERMIT_PREPARED_NEXTEST_REQUIRED:-0} == 1 && $cpu_report != - ]]; then
+        if ! run_rust_script "$SCRIPT_DIR/nextest-binaries.rs" budget-context \
+            "${inventory_arguments[@]}" >"$budget_context"; then
+            cleanup_nextest_config
+            return 2
+        fi
+        if ! HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" run_rust_script "$TIMEOUT_CONFIG_WRITER" \
+            --resolve "$SCRIPT_DIR/../.config/nextest.toml" "$wall_multiplier" "$nextest_config" \
+            "$inventory" "$budget_context" "$budget_map" "$SCRIPT_DIR/../.config/nextest-budgets.json" \
+            -- "$@"; then
+            cleanup_nextest_config
+            return 2
+        fi
+        if [[ -f $budget_map ]]; then
+            # Keep the exact digest-bound CPU/wall input on both success and
+            # failure, beside the existing attempt report. Never replace an
+            # earlier invocation's retained calibration evidence.
+            if ! (set -o noclobber; cat -- "$budget_map" >"$cpu_report.budgets.json"); then
+                cleanup_nextest_config
+                return 2
+            fi
+        fi
     fi
 
     set +e

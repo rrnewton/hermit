@@ -55,6 +55,222 @@ struct NextestInventorySuite {
     kind: String,
     #[serde(rename = "binary-path")]
     executable: String,
+    #[serde(default)]
+    testcases: BTreeMap<String, NextestInventoryCase>,
+}
+
+#[derive(Deserialize)]
+struct NextestInventoryCase {
+    ignored: bool,
+    #[serde(rename = "filter-match")]
+    filter_match: NextestFilterMatch,
+}
+
+#[derive(Deserialize)]
+struct NextestFilterMatch {
+    status: String,
+}
+
+/// The same selected identities used by Nextest, without display-name joins.
+pub fn selected_inventory(bytes: &[u8]) -> Result<Vec<AttemptIdentity>, String> {
+    BinaryMap::from_nextest_inventory(bytes)?;
+    let inventory: NextestInventory =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let mut identities = Vec::new();
+    for suite in inventory.rust_suites.into_values() {
+        for (test, case) in suite.testcases {
+            match case.filter_match.status.as_str() {
+                "matches" if !case.ignored => identities.push(AttemptIdentity {
+                    package: suite.package.clone(),
+                    binary: suite.binary.clone(),
+                    test,
+                    attempt: 1,
+                }),
+                "matches" | "mismatch" => {}
+                status => return Err(format!("unknown Nextest filter status {status:?}")),
+            }
+        }
+    }
+    identities.sort();
+    for identity in &identities {
+        identity.validate()?;
+    }
+    if identities.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("duplicate selected Nextest identity".into());
+    }
+    Ok(identities)
+}
+
+pub const BUDGET_SCHEMA: u64 = 1;
+pub const CALIBRATION_PATH: &str = ".config/nextest-budgets.json";
+
+/// Applicability, not an assertion that binaries from different paths match.
+/// The prepared-artifact reader independently verifies each actual binary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetContext {
+    pub source_sha256: String,
+    pub source_clean: bool,
+    pub build_sha256: String,
+    pub machine: String,
+    pub available_cpus: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CalibrationRow {
+    pub identity: AttemptIdentity,
+    pub samples: u64,
+    pub p90_cpu_usec: u64,
+    pub p90_wall_millis: u64,
+    pub historical_cpu_usec: u64,
+    pub historical_wall_millis: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetCalibration {
+    pub schema: u64,
+    pub context: BudgetContext,
+    pub test_threads: u64,
+    pub evidence_sha256: Vec<String>,
+    pub rows: Vec<CalibrationRow>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedBudget {
+    pub identity: AttemptIdentity,
+    pub cpu_seconds: u64,
+    pub wall_seconds: u64,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PopulationBudget {
+    pub selected: u64,
+    pub attempts: u64,
+    pub test_threads: u64,
+    pub cpu_seconds: u64,
+    pub nominal_wall_seconds: u64,
+}
+
+/// Nominal work only: setup, reporting and a stuck supervisor are separately
+/// contained by the unchanged node limits. This is not a cleanup guarantee.
+pub fn population_budget(
+    entries: &[ResolvedBudget],
+    test_threads: u64,
+    retries: u64,
+) -> Result<PopulationBudget, String> {
+    if test_threads == 0 {
+        return Err("test concurrency must be positive".into());
+    }
+    let overflow = || "Nextest population allowance overflows".to_string();
+    let attempts_per_case = retries.checked_add(1).ok_or_else(overflow)?;
+    let mut cpu = 0_u64;
+    let mut wall = 0_u64;
+    let mut max_wall = 0_u64;
+    for entry in entries {
+        let with_grace = entry.wall_seconds.checked_add(2).ok_or_else(overflow)?;
+        cpu = cpu
+            .checked_add(
+                entry
+                    .cpu_seconds
+                    .checked_mul(attempts_per_case)
+                    .ok_or_else(overflow)?,
+            )
+            .ok_or_else(overflow)?;
+        wall = wall
+            .checked_add(
+                with_grace
+                    .checked_mul(attempts_per_case)
+                    .ok_or_else(overflow)?,
+            )
+            .ok_or_else(overflow)?;
+        max_wall = max_wall.max(
+            with_grace
+                .checked_mul(attempts_per_case)
+                .ok_or_else(overflow)?,
+        );
+    }
+    let numerator = wall
+        .checked_add(
+            (test_threads - 1)
+                .checked_mul(max_wall)
+                .ok_or_else(overflow)?,
+        )
+        .ok_or_else(overflow)?;
+    let nominal_wall_seconds = numerator / test_threads + u64::from(numerator % test_threads != 0);
+    let selected = u64::try_from(entries.len()).map_err(|_| overflow())?;
+    Ok(PopulationBudget {
+        selected,
+        attempts: selected
+            .checked_mul(attempts_per_case)
+            .ok_or_else(overflow)?,
+        test_threads,
+        cpu_seconds: cpu,
+        nominal_wall_seconds,
+    })
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedBudgets {
+    pub schema: u64,
+    pub context: BudgetContext,
+    pub calibration_sha256: Option<String>,
+    pub applicability: String,
+    pub population: Option<PopulationBudget>,
+    pub entries: Vec<ResolvedBudget>,
+}
+
+impl ResolvedBudgets {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != BUDGET_SCHEMA {
+            return Err("unsupported resolved Nextest budget schema".into());
+        }
+        let mut identities = std::collections::BTreeSet::new();
+        for entry in &self.entries {
+            entry.identity.validate()?;
+            if entry.identity.attempt != 1 || !identities.insert(&entry.identity) {
+                return Err("duplicate or attempt-specific Nextest budget identity".into());
+            }
+            if entry.cpu_seconds == 0
+                || entry
+                    .cpu_seconds
+                    .checked_add(2)
+                    .is_none_or(|limit| limit >= entry.wall_seconds)
+                || entry.cpu_seconds.checked_mul(1_000_000).is_none()
+            {
+                return Err("resolved CPU budget plus cleanup must be below wall budget".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn cpu_budget_usec(&self, identity: &AttemptIdentity) -> Result<u64, String> {
+        self.validate()?;
+        self.entries
+            .iter()
+            .find(|entry| {
+                entry.identity.package == identity.package
+                    && entry.identity.binary == identity.binary
+                    && entry.identity.test == identity.test
+            })
+            .map(|entry| entry.cpu_seconds * 1_000_000)
+            .ok_or_else(|| format!("executing identity absent from resolved budgets: {identity:?}"))
+    }
+
+    pub fn read_bound(path: &Path, expected_sha256: &str) -> Result<Self, String> {
+        let bytes = fs::read(path).map_err(|error| error.to_string())?;
+        if format!("{:x}", Sha256::digest(&bytes)) != expected_sha256 {
+            return Err("resolved Nextest budget digest mismatch".into());
+        }
+        let resolved: Self = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        resolved.validate()?;
+        Ok(resolved)
+    }
 }
 
 impl BinaryMap {

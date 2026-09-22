@@ -482,6 +482,109 @@ pub fn cpu_wrapper(root: &Path) -> Result<PathBuf, String> {
     Ok(record.cpu_wrapper.executable.path)
 }
 
+/// A comparison context for the regular calibration, after the ordinary
+/// preparation checks. Other selectors retain their existing timeout path.
+pub fn budget_context(root: &Path, args: &[String]) -> Result<String, String> {
+    let parsed = split_arguments(args)?;
+    let regular = [
+        "--workspace",
+        "--exclude",
+        "hermit-detcore",
+        "--exclude",
+        "hermit",
+        "--exclude",
+        "hermetic_infra_hermit_flaky-tests",
+    ];
+    if parsed.build != regular {
+        return Ok("null".into());
+    }
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let artifacts = LockedArtifacts::open(&root, false)?;
+    let record = artifacts.current()?;
+    let cargo = verify_record(&root, &record)?;
+    verify_selection(&record, &cargo, &parsed.build)?;
+    let excluded = format!(":(exclude){}", crate::nextest_cpu::CALIBRATION_PATH);
+    let tree = git_bytes(&root, &["ls-tree", "-r", "-z", "HEAD"])?;
+    let mut source_hash = Sha256::new();
+    for entry in tree
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let path = entry
+            .splitn(2, |byte| *byte == b'\t')
+            .nth(1)
+            .ok_or("invalid Git tree entry")?;
+        if path != crate::nextest_cpu::CALIBRATION_PATH.as_bytes() {
+            source_hash.update(entry);
+            source_hash.update([0]);
+        }
+    }
+    let dirty = git_bytes(
+        &root,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=normal",
+            "--",
+            ".",
+            &excluded,
+        ],
+    )?;
+    // Only the derived calibration table is excluded. Its own digest is bound
+    // separately in the resolved map. Dirty source never activates a table.
+    let source_sha256 = format!("{:x}", source_hash.finalize());
+    let mut environment = record.build_environment.clone();
+    if environment.get("CARGO_TARGET_DIR").map(Path::new) == Some(record.target.as_path()) {
+        environment.insert("CARGO_TARGET_DIR".into(), "${VERIFIED_TARGET}".into());
+    }
+    // Cargo configuration contents remain exact. Logical placement preserves
+    // precedence without equating physical executable paths across checkouts.
+    let config = record
+        .cargo_config
+        .iter()
+        .filter_map(|(path, identity)| {
+            identity.as_ref().map(|identity| {
+                let location = if let Ok(relative) = path.strip_prefix(&root) {
+                    format!("source/{}", relative.display())
+                } else if let Some(parent) = path.parent().and_then(Path::parent) {
+                    match root.ancestors().position(|ancestor| ancestor == parent) {
+                        Some(depth) => format!(
+                            "ancestor-{depth}/{}",
+                            path.file_name().unwrap().to_string_lossy()
+                        ),
+                        None => path.display().to_string(),
+                    }
+                } else {
+                    path.display().to_string()
+                };
+                (location, identity.mode, identity.sha256.clone())
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    let build = serde_json::to_vec(&(&record.rustc, &parsed.build, environment, config))
+        .map_err(|e| e.to_string())?;
+    let machine = fs::read_to_string("/proc/cpuinfo")
+        .map_err(|e| e.to_string())?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("model name")
+                .and_then(|value| value.split_once(':'))
+                .map(|(_, value)| value.trim().to_string())
+        })
+        .ok_or("cannot identify calibration CPU model")?;
+    let context = crate::nextest_cpu::BudgetContext {
+        source_sha256,
+        source_clean: dirty.is_empty(),
+        build_sha256: format!("{:x}", Sha256::digest(&build)),
+        machine: format!("{}:{machine}", std::env::consts::ARCH),
+        available_cpus: std::thread::available_parallelism()
+            .map_err(|e| e.to_string())?
+            .get() as u64,
+    };
+    serde_json::to_string(&context).map_err(|e| e.to_string())
+}
+
 fn build_environment() -> BTreeMap<String, String> {
     std::env::vars()
         .filter(|(name, _)| {

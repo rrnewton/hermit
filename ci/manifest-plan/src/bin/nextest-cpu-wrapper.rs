@@ -39,6 +39,7 @@ use hermit_manifest_plan::nextest_cpu::CPU_REPORT_PATH_ENV;
 use hermit_manifest_plan::nextest_cpu::CPU_SOURCE_CGROUP_V2;
 use hermit_manifest_plan::nextest_cpu::CPU_SOURCE_PROCFS_AND_REAPED;
 use hermit_manifest_plan::nextest_cpu::CPU_SOURCE_REAPED;
+use hermit_manifest_plan::nextest_cpu::ResolvedBudgets;
 use hermit_manifest_plan::nextest_cpu::Wait4Record;
 use hermit_manifest_plan::nextest_cpu::read_attempt_records;
 use hermit_manifest_plan::nextest_cpu::read_binary_map;
@@ -339,6 +340,7 @@ fn parse_positive_u64(value: &OsStr, label: &str) -> Result<u64, String> {
 
 struct WrapperInvocation {
     cpu_budget_usec: Option<u64>,
+    budget_map: Option<(PathBuf, String)>,
     termination_grace: Duration,
     command: Vec<OsString>,
 }
@@ -350,14 +352,12 @@ fn parse_wrapper_invocation(args: Vec<OsString>) -> Result<WrapperInvocation, St
         }
         return Ok(WrapperInvocation {
             cpu_budget_usec: None,
+            budget_map: None,
             termination_grace: Duration::from_secs(2),
             command: args,
         });
     }
-    if args.len() < 6
-        || args[2] != OsStr::new("--termination-grace-ms")
-        || args[4] != OsStr::new("--")
-    {
+    if args.len() < 6 || args[2] != OsStr::new("--termination-grace-ms") {
         return Err(
             "nextest CPU wrapper budget form requires --cpu-timeout-usec USEC --termination-grace-ms MS -- TEST_COMMAND"
                 .into(),
@@ -365,12 +365,35 @@ fn parse_wrapper_invocation(args: Vec<OsString>) -> Result<WrapperInvocation, St
     }
     let cpu_budget_usec = parse_positive_u64(&args[1], "--cpu-timeout-usec")?;
     let grace_ms = parse_positive_u64(&args[3], "--termination-grace-ms")?;
-    let command = args[5..].to_vec();
+    let (budget_map, separator) = if args[4] == OsStr::new("--budget-map") {
+        if args.len() < 10 || args[6] != OsStr::new("--budget-sha256") {
+            return Err("budget map requires PATH --budget-sha256 SHA256 -- TEST_COMMAND".into());
+        }
+        let path = PathBuf::from(&args[5]);
+        let digest = args[7]
+            .to_str()
+            .ok_or("budget digest is not UTF-8")?
+            .to_string();
+        if !path.is_absolute()
+            || digest.len() != 64
+            || !digest.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err("budget map requires an absolute path and SHA256 digest".into());
+        }
+        (Some((path, digest)), 8)
+    } else {
+        (None, 4)
+    };
+    if args[separator] != OsStr::new("--") {
+        return Err("nextest CPU wrapper requires -- before the test command".into());
+    }
+    let command = args[separator + 1..].to_vec();
     if command.is_empty() {
         return Err("nextest CPU wrapper requires a test command after --".into());
     }
     Ok(WrapperInvocation {
         cpu_budget_usec: Some(cpu_budget_usec),
+        budget_map,
         termination_grace: Duration::from_millis(grace_ms),
         command,
     })
@@ -1359,7 +1382,7 @@ fn wait_for_direct_child(
 }
 
 fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
-    let invocation = parse_wrapper_invocation(args)?;
+    let mut invocation = parse_wrapper_invocation(args)?;
     let entry_control = ReapEntryControl::from_env()?;
     if entry_control.is_some() && invocation.cpu_budget_usec.is_none() {
         return Err("entry control requires the budgeted self-test wrapper".into());
@@ -1378,6 +1401,10 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     let record_dir = PathBuf::from(required_env(CPU_RECORD_DIR_ENV)?);
     let run_id = required_env(RUN_ID_ENV)?;
     let identity = identity_from_command(program, child_args)?;
+    if let Some((path, digest)) = &invocation.budget_map {
+        invocation.cpu_budget_usec =
+            Some(ResolvedBudgets::read_bound(path, digest)?.cpu_budget_usec(&identity)?);
+    }
     let started = Instant::now();
     RECEIVED_SIGNAL.store(0, Ordering::SeqCst);
     install_signal_handlers()?;
@@ -2505,6 +2532,131 @@ fn exit_before_first_reap_control(
     }
 }
 
+fn budget_map_self_test(
+    executable: &Path,
+    test_binary: &Path,
+    scratch: &Path,
+) -> Result<(), String> {
+    use hermit_manifest_plan::nextest_cpu::BudgetContext;
+    use hermit_manifest_plan::nextest_cpu::ResolvedBudget;
+    use sha2::Digest;
+    use sha2::Sha256;
+    let root = scratch.join("budget-map-controls");
+    fs::create_dir_all(root.join("attempts")).map_err(|e| e.to_string())?;
+    fs::copy(
+        scratch.join("binary-map.json"),
+        root.join("binary-map.json"),
+    )
+    .map_err(|e| e.to_string())?;
+    let rows = ["success", "exit-after-escaped-burner"].map(|test| ResolvedBudget {
+        identity: AttemptIdentity {
+            package: "fixture".into(),
+            binary: "fixture::bin/fixture_name".into(),
+            test: test.into(),
+            attempt: 1,
+        },
+        cpu_seconds: 1,
+        wall_seconds: 4,
+        reason: "native exact-identity control".into(),
+    });
+    let budgets = ResolvedBudgets {
+        schema: 1,
+        context: BudgetContext {
+            source_sha256: "a".repeat(64),
+            source_clean: true,
+            build_sha256: "b".repeat(64),
+            machine: "control".into(),
+            available_cpus: 1,
+        },
+        calibration_sha256: None,
+        applicability: "native control".into(),
+        population: None,
+        entries: rows.into(),
+    };
+    let bytes = serde_json::to_vec(&budgets).map_err(|e| e.to_string())?;
+    let path = root.join("budgets.json");
+    fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let run = |mode: &str, digest: &str| {
+        let original = control_command(executable, test_binary, &root, mode, 1);
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "--cpu-timeout-usec",
+                "10000000",
+                "--termination-grace-ms",
+                "2000",
+                "--budget-map",
+            ])
+            .arg(&path)
+            .args(["--budget-sha256", digest, "--"])
+            .args(original.get_args().skip(5))
+            .current_dir(&root)
+            .process_group(0);
+        command.env(CONTROL_PID_FILE_ENV, root.join("descendant.pid"));
+        for (name, value) in original.get_envs() {
+            match value {
+                Some(value) => {
+                    command.env(name, value);
+                }
+                None => {
+                    command.env_remove(name);
+                }
+            }
+        }
+        command.output().map_err(|e| e.to_string())
+    };
+    let success = run("success", &digest)?;
+    if !success.status.success()
+        || success.stdout != b"stdout-exact\n"
+        || success.stderr != b"stderr-exact\n"
+    {
+        return Err(format!(
+            "mapped positive control changed behavior: {success:?}"
+        ));
+    }
+    let stopped = run("exit-after-escaped-burner", &digest)?;
+    if stopped.status.code() != Some(CPU_TIMEOUT_EXIT.into()) {
+        return Err(format!("mapped CPU opponent did not stop: {stopped:?}"));
+    }
+    if process_exists(read_pid(&root.join("descendant.pid"))?) {
+        return Err("mapped CPU opponent left its escaped descendant alive".into());
+    }
+    let records = read_attempt_records(&root.join("attempts"))?;
+    if !records.iter().any(|record| {
+        matches!(
+            record.completion,
+            AttemptCompletion::CpuTimeout {
+                cpu_budget_usec: 1_000_000,
+                ..
+            }
+        )
+    }) {
+        return Err(
+            "mapped CPU opponent used the scalar fallback instead of its exact budget".into(),
+        );
+    }
+    for (mode, hash, diagnostic) in [
+        ("failure", digest.as_str(), "absent from resolved budgets"),
+        ("success", "0", "SHA256 digest"),
+    ] {
+        let refusal = run(mode, hash)?;
+        if refusal.status.code() != Some(INFRASTRUCTURE_EXIT.into())
+            || !String::from_utf8_lossy(&refusal.stderr).contains(diagnostic)
+        {
+            return Err(format!("mapped refusal control failed: {refusal:?}"));
+        }
+    }
+    fs::write(&path, b"{}").map_err(|e| e.to_string())?;
+    let tampered = run("success", &digest)?;
+    if tampered.status.code() != Some(INFRASTRUCTURE_EXIT.into())
+        || !String::from_utf8_lossy(&tampered.stderr).contains("digest mismatch")
+    {
+        return Err(format!("modified map was accepted: {tampered:?}"));
+    }
+    Ok(())
+}
+
 fn self_test() -> Result<(), String> {
     let scratch = Scratch::new()?;
     let executable = env::current_exe().map_err(|error| error.to_string())?;
@@ -2525,6 +2677,7 @@ fn self_test() -> Result<(), String> {
         }],
     };
     write_binary_map_atomic(&scratch.0.join("binary-map.json"), &map)?;
+    budget_map_self_test(&executable, &test_binary, &scratch.0)?;
 
     let ownership_identity = AttemptIdentity {
         package: "fixture".into(),
