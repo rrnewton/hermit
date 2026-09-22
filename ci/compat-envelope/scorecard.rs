@@ -8364,18 +8364,146 @@ fn source_direct_evidence_key(
     )))
 }
 
+/// The validate producer uses run_index for the outer attempt and may omit
+/// detcore_tree. Resolve that form only through comparison digests already
+/// checked against the held current-result census, never through a run label.
+fn current_comparison_representation(
+    tracked: &TrackedCells,
+    rows: &[SeriesRow],
+    current: &CurrentResultAttempts,
+    direct_counts: &BTreeMap<DirectEvidenceKey, usize>,
+) -> Result<(BTreeSet<String>, BTreeSet<DirectEvidenceKey>), String> {
+    let mut bound = BTreeMap::<DirectEvidenceBase, BTreeMap<u64, DirectEvidenceKey>>::new();
+    for cell in &tracked.cells {
+        for observation in &cell.observations {
+            if !observation.event_ids.is_empty() {
+                continue;
+            }
+            let identity = SeriesObservationIdentity::from_observation(observation)?;
+            for (hermit_sha, run_id, digest, result) in direct_comparison_receipts(observation) {
+                let base = DirectEvidenceBase {
+                    cell: series_cell_key(&cell.id),
+                    identity: identity.clone(),
+                    provenance: observation.provenance,
+                    hermit_sha: hermit_sha.into(),
+                    run_id: run_id.into(),
+                };
+                let Some(attempt) = current.get(&(base.clone(), digest.into())) else {
+                    continue;
+                };
+                let key = DirectEvidenceKey {
+                    base: base.clone(),
+                    kind: DirectEvidenceKind::Result(result),
+                };
+                if bound
+                    .entry(base)
+                    .or_default()
+                    .insert(*attempt, key.clone())
+                    .is_some()
+                {
+                    return Err(format!(
+                        "series evidence claims direct run {} at {}, but the retained scorecard has {} records for that exact identity",
+                        key.base.run_id, key.base.hermit_sha, direct_counts[&key]
+                    ));
+                }
+            }
+        }
+    }
+    let mut events = BTreeSet::new();
+    let mut covered = BTreeSet::new();
+    let mut represented_counts = BTreeMap::<DirectEvidenceKey, usize>::new();
+    for row in rows {
+        if row.producer != SeriesProducer::Validate
+            || row.schema != SeriesSchema::V3
+            || row.series.no_verdict_evidence.is_some()
+        {
+            continue;
+        }
+        let matches = bound
+            .iter()
+            .filter(|(base, _)| {
+                base.provenance == ObservationProvenance::Validate
+                    && base.cell == row.cell()
+                    && base.hermit_sha == row.series.tree
+                    && base.run_id == row.run_id
+            })
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            continue;
+        }
+        let [(base, attempts)] = matches.as_slice() else {
+            return Err("current series event has ambiguous bound source identity".into());
+        };
+        row.validate_for_projection()?;
+        if row.series.detcore_tree.as_ref().is_some_and(|tree| {
+            base.identity != SeriesObservationIdentity::DetcoreTree(tree.clone())
+        }) {
+            return Err(
+                "current series detcore identity disagrees with its bound comparison".into(),
+            );
+        }
+        let first = row.series.run_index;
+        let last = series_last_run_index(row).ok_or("current series attempt span overflows")?;
+        if last.checked_sub(first).and_then(|span| span.checked_add(1)) != Some(row.series.num_runs)
+            || row
+                .series
+                .attempt
+                .is_some_and(|attempt| row.series.num_runs != 1 || attempt != first)
+        {
+            return Err("current series has inconsistent outer-attempt coverage".into());
+        }
+        // Range over existing evidence, not an event-declared allocation.
+        let matching = attempts.range(first..=last).collect::<Vec<_>>();
+        if matching.len() as u64 != row.series.num_runs {
+            return Err("current series lacks complete bound outer-attempt coverage".into());
+        }
+        for (attempt, key) in matching {
+            if row.series.result.map(DirectEvidenceKind::Result).as_ref() != Some(&key.kind) {
+                return Err("current series result disagrees with its bound comparison".into());
+            }
+            let bound_count = attempts
+                .values()
+                .filter(|candidate| *candidate == key)
+                .count();
+            if direct_counts.get(key) != Some(&bound_count) {
+                return Err(format!(
+                    "series evidence claims direct run {} at {}, but the retained scorecard has {} records for that exact identity",
+                    key.base.run_id, key.base.hermit_sha, direct_counts[key]
+                ));
+            }
+            if !covered.insert(((*base).clone(), *attempt)) {
+                return Err("current series events overlap the same bound outer attempt".into());
+            }
+            *represented_counts.entry(key.clone()).or_default() += 1;
+        }
+        if !events.insert(row.event_id.clone()) {
+            return Err("current series repeats an authenticated event identity".into());
+        }
+    }
+    let represented = represented_counts
+        .into_iter()
+        .filter_map(|(key, count)| (direct_counts.get(&key) == Some(&count)).then_some(key))
+        .collect();
+    Ok((events, represented))
+}
+
 fn direct_representation(
     tracked: &TrackedCells,
     rows: &[SeriesRow],
     current_attempts: &CurrentResultAttempts,
 ) -> Result<DirectRepresentation, String> {
     let (direct, opaque) = direct_evidence_keys(tracked)?;
+    let (mut represented_event_ids, mut represented_direct) =
+        current_comparison_representation(tracked, rows, current_attempts, &direct)?;
     let bound_attempts = bound_direct_attempts(tracked, current_attempts)?;
     let mut source = BTreeMap::<
         DirectEvidenceBase,
         Vec<(Option<DirectEvidenceKey>, String, Option<u64>, u64)>,
     >::new();
     for row in rows {
+        if represented_event_ids.contains(&row.event_id) {
+            continue;
+        }
         let Some((base, key)) = source_direct_evidence_key(row, tracked)? else {
             continue;
         };
@@ -8417,9 +8545,10 @@ fn direct_representation(
         }
     }
 
-    let mut represented_event_ids = BTreeSet::new();
-    let mut represented_direct = BTreeSet::new();
     for (direct_key, direct_count) in &direct {
+        if represented_direct.contains(direct_key) {
+            continue;
+        }
         let candidates = source
             .get(&direct_key.base)
             .map(Vec::as_slice)
@@ -23933,7 +24062,9 @@ mod post_verdict_transaction_tests {
         different[0].series.failure_class = Some(FailureClass::ProductFailure);
         different[0].series.outcome = SeriesOutcome::Errored;
         for bad in [Vec::new(), duplicate, different] {
-            assert!(retain_selected_custom_results(&tracked, &selected, &candidates, &bad).is_err());
+            assert!(
+                retain_selected_custom_results(&tracked, &selected, &candidates, &bad).is_err()
+            );
         }
         let mut sparse = events.clone();
         sparse[0].series.last_run_index = Some(3);
@@ -23946,12 +24077,14 @@ mod post_verdict_transaction_tests {
         middle.row.attempt = 2;
         middle.evidence_identity = middle.row.evidence_identity().unwrap();
         assert!(
-            retain_selected_custom_results(&tracked, &selected, &sparse_candidates, &sparse).is_err()
+            retain_selected_custom_results(&tracked, &selected, &sparse_candidates, &sparse)
+                .is_err()
         );
         let mut wrong_attempt = events.clone();
         wrong_attempt[0].series.attempt = Some(2);
         assert!(
-            retain_selected_custom_results(&tracked, &selected, &candidates, &wrong_attempt).is_err()
+            retain_selected_custom_results(&tracked, &selected, &candidates, &wrong_attempt)
+                .is_err()
         );
         let id = selected.first().unwrap();
         let mut bad = candidates.clone();
@@ -24018,11 +24151,13 @@ mod post_verdict_transaction_tests {
         let mut folded = events.clone();
         folded[0].series.last_run_index = Some(2);
         folded[0].series.num_runs = 2;
-        let receipts = retain_selected_custom_results(&tracked, &selected, &retried, &folded).unwrap();
+        let receipts =
+            retain_selected_custom_results(&tracked, &selected, &retried, &folded).unwrap();
         assert_eq!(receipts.receipts.len(), 4);
         assert_eq!(receipts.event_ids.len(), 3);
         folded[0].series.last_run_index = None;
-        let implicit = retain_selected_custom_results(&tracked, &selected, &retried, &folded).unwrap();
+        let implicit =
+            retain_selected_custom_results(&tracked, &selected, &retried, &folded).unwrap();
         assert_eq!(implicit.receipts, receipts.receipts);
         assert_eq!(implicit.event_ids, receipts.event_ids);
         assert!(retain_selected_custom_results(&tracked, &selected, &candidates, &folded).is_err());
@@ -24413,6 +24548,114 @@ mod post_verdict_transaction_tests {
 #[cfg(test)]
 mod evidence_identity_tests {
     use super::*;
+
+    #[test]
+    fn current_comparisons_bind_validate_retry_indices_and_source_identity() {
+        let head = "a".repeat(40);
+        let tree = "b".repeat(40);
+        let digests = ["c".repeat(64), "d".repeat(64)];
+        for second in [ObservedResult::DeterminismFailure, ObservedResult::Pass] {
+            let results = [ObservedResult::DeterminismFailure, second];
+            let receipts = results
+                .iter()
+                .zip(&digests)
+                .map(|(result, digest)| {
+                    serde_json::json!({"hermit_sha":head,"hermit_commits":2,"hermit_first_parent":2,
+                    "run_id":"current-retries","evidence_sha256":digest,"result":result,
+                    "left_info_messages":[196],"right_info_messages":[196]})
+                })
+                .collect::<Vec<_>>();
+            let tracked: TrackedCells = serde_json::from_value(serde_json::json!({
+                "schema":8,"cells":[{"lane":"portable","category":"fixture","test":"fixture/retry",
+                    "mode":"verify","backend":"ptrace","status":"red","observations":[{
+                        "detcore_tree":tree,"provenance":"validate","hermit_shas":[head],
+                        "results":results.into_iter().collect::<BTreeSet<_>>(),
+                        "canonical_comparisons":receipts,"invocations":[]
+                    }]}]
+            }))
+            .unwrap();
+            let base = DirectEvidenceBase {
+                cell: "fixture/retry/verify/ptrace".into(),
+                identity: SeriesObservationIdentity::DetcoreTree(tree.clone()),
+                provenance: ObservationProvenance::Validate,
+                hermit_sha: head.clone(),
+                run_id: "current-retries".into(),
+            };
+            let attempts = CurrentResultAttempts::from([
+                ((base.clone(), digests[0].clone()), 1),
+                ((base.clone(), digests[1].clone()), 2),
+            ]);
+            let events = results.iter().enumerate().map(|(index, result)| {
+                serde_json::from_value::<SeriesRow>(serde_json::json!({
+                    "schema":"stress-series/v3","event_id":format!("retry-{index}"),
+                    "event_type":"series.observation","emitted_at":"2026-09-22T00:00:00Z",
+                    "team":"hermit","host":"fixture","producer":"validate","run_id":"current-retries",
+                    "series":{"cell":base.cell,"tree":head,"run_index":index+1,"num_runs":1,
+                        "result":result,"outcome":if *result==ObservedResult::Pass {"passed"} else {"diverged"},
+                        "failure_class":if *result==ObservedResult::Pass {None} else {Some("product_failure")},
+                        "source_tree_dirty":false,"machine_shortname":"fixture","kernel_version":"fixture",
+                        "host_capabilities":{"cpuid-faulting":{"present":false,"evidence":"synthetic fixture"},
+                            "kvm":{"present":false,"evidence":"synthetic fixture"}}}
+                })).unwrap()
+            }).collect::<Vec<_>>();
+            let before = serde_json::to_vec(&tracked).unwrap();
+            let represented = direct_representation(&tracked, &events, &attempts).unwrap();
+            assert_eq!(
+                represented.represented_event_ids,
+                events.iter().map(|r| r.event_id.clone()).collect()
+            );
+            assert!(!represented.has_unrepresented_direct_evidence);
+            assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
+            let mut duplicate = tracked.clone();
+            duplicate.cells[0]
+                .observations
+                .push(tracked.cells[0].observations[0].clone());
+            let error = direct_representation(&duplicate, &events, &attempts).unwrap_err();
+            assert!(error.contains("records for that exact identity"), "{error}");
+            // No current digest binding means no new authority to suppress a
+            // historical event merely because its run and result look alike.
+            assert!(
+                direct_representation(&tracked, &events, &CurrentResultAttempts::new())
+                    .unwrap()
+                    .represented_event_ids
+                    .is_empty()
+            );
+            for mutate in 0..5 {
+                let mut bad = events.clone();
+                match mutate {
+                    0 => bad.push(events[0].clone()),
+                    1 => bad[1].series.attempt = Some(1),
+                    2 => bad[1].series.detcore_tree = Some("e".repeat(40)),
+                    3 => bad[1].series.run_index = 3,
+                    _ => {
+                        bad[0].series.result = Some(ObservedResult::Pass);
+                        bad[0].series.outcome = SeriesOutcome::Passed;
+                        bad[0].series.failure_class = None;
+                    }
+                }
+                assert!(
+                    direct_representation(&tracked, &bad, &attempts).is_err(),
+                    "opponent {mutate}"
+                );
+            }
+            if second == ObservedResult::DeterminismFailure {
+                let mut compressed = vec![events[0].clone()];
+                compressed[0].series.num_runs = 2;
+                for explicit_last in [None, Some(2)] {
+                    compressed[0].series.last_run_index = explicit_last;
+                    let represented =
+                        direct_representation(&tracked, &compressed, &attempts).unwrap();
+                    assert_eq!(represented.represented_event_ids.len(), 1);
+                    assert!(!represented.has_unrepresented_direct_evidence);
+                }
+                compressed[0].series.last_run_index = Some(3);
+                assert!(direct_representation(&tracked, &compressed, &attempts).is_err());
+                compressed[0].series.last_run_index = None;
+                compressed[0].series.run_index = u64::MAX;
+                assert!(direct_representation(&tracked, &compressed, &attempts).is_err());
+            }
+        }
+    }
 
     const ORDINARY: &str = "9bf1be90807ed0c84ae4592759239ad264779bd962a220542cca372d2151f032";
     const NULL_ERA: &str = "2d5035f82310e8774916d85ebf59afb89634c1e4ba789835166a33b396a8874e";
