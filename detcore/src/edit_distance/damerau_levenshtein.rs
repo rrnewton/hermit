@@ -7,7 +7,7 @@
  */
 
 use core::hash::Hash;
-use std::collections::HashMap;
+use detcore_model::collections::DetHashMap as HashMap;
 
 fn index(row_length: usize, row: usize, col: usize) -> usize {
     row_length * row + col
@@ -82,7 +82,7 @@ where
         matrix[index(width, 0, j + 1)] = inf;
     }
 
-    let mut last_row = HashMap::<&T, usize>::new();
+    let mut last_row = HashMap::<&T, usize>::default();
 
     for row in 1..=m {
         let ch_s = &source[row - 1];

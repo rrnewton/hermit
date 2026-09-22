@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::collections::HashMap;
+use detcore_model::collections::DetHashMap as HashMap;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -36,7 +36,7 @@ pub struct MiniSchedEvent {
 /// Counts the number of events for each thread.
 #[allow(dead_code)]
 fn count_thread_events(schedule: &Schedule) -> HashMap<u32, usize> {
-    let mut result = HashMap::new();
+    let mut result = HashMap::default();
 
     for event in schedule {
         *result.entry(event.tid).or_insert(0) += event.count;
@@ -48,7 +48,7 @@ fn count_thread_events(schedule: &Schedule) -> HashMap<u32, usize> {
 /// Counts the number of events for each thread.
 #[allow(dead_code)]
 fn partition_thread_events(schedule: Schedule) -> HashMap<u32, Schedule> {
-    let mut result = HashMap::<u32, Vec<_>>::new();
+    let mut result = HashMap::<u32, Vec<_>>::default();
 
     for event in schedule {
         result.entry(event.tid).or_default().push(event);
@@ -80,7 +80,7 @@ pub fn prune_schedule(passing: Schedule, failing: &Schedule) -> Schedule {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use detcore_model::collections::DetHashSet as HashSet;
 
     use super::*;
     use crate::edit_distance::damerau_lev;

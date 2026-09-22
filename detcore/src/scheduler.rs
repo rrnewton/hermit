@@ -14,8 +14,8 @@ pub mod timed_waiters;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use detcore_model::collections::DetHashMap as HashMap;
+use detcore_model::collections::DetHashSet as HashSet;
 use std::fmt::Write;
 use std::iter::Peekable;
 use std::path::PathBuf;

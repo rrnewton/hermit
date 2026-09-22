@@ -8,7 +8,7 @@
 
 //! Modeling resource types on which guest programs have side effects.
 
-use std::collections::HashMap;
+use detcore_model::collections::DetHashMap as HashMap;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 
@@ -342,7 +342,7 @@ impl Resources {
     pub fn new(tid: DetTid) -> Resources {
         Resources {
             tid,
-            resources: HashMap::new(),
+            resources: HashMap::default(),
             poll_attempt: 0,
             fyi: String::new(),
         }

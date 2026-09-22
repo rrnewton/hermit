@@ -38,3 +38,13 @@ resolver = "2"
 [workspace.package]
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
+
+# MEASUREMENT ONLY -- disposable clone. Redirects the pinned reverie rev to a
+# local checkout of that SAME rev with C5/C6 determinized, to test whether the
+# plugin's getrandom(16) survives. NOT a proposal to move the pin.
+[patch."https://github.com/rrnewton/reverie.git"]
+reverie-core = { path = "/home/newton/work/dev-hermit/ignored/reverie-hashseed-c261050c/reverie/reverie" }
+reverie-memory = { path = "/home/newton/work/dev-hermit/ignored/reverie-hashseed-c261050c/reverie/reverie-memory" }
+reverie-rpc-transport = { path = "/home/newton/work/dev-hermit/ignored/reverie-hashseed-c261050c/reverie/reverie-rpc-transport" }
+reverie-sabre = { path = "/home/newton/work/dev-hermit/ignored/reverie-hashseed-c261050c/reverie/experimental/reverie-sabre" }
+reverie-syscalls = { path = "/home/newton/work/dev-hermit/ignored/reverie-hashseed-c261050c/reverie/reverie-syscalls" }

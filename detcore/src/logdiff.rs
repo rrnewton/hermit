@@ -12,7 +12,7 @@ use core::fmt::Display;
 use core::fmt::Formatter;
 use core::fmt::Result;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use detcore_model::collections::DetHashMap as HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
@@ -321,7 +321,7 @@ fn messages_for_comparison(messages: &[(usize, &str)], opts: &LogDiffOpts) -> Ve
             .map(|(_, message)| strip_log_entry(message))
             .collect()
     } else if opts.canonicalize_addresses {
-        let mut addresses = HashMap::new();
+        let mut addresses = HashMap::default();
         let mut next_address = 1usize;
         messages
             .iter()
@@ -1805,8 +1805,8 @@ Jun 09 06:49:17.742 TRACE detcore::scheduler: [scheduler] Guest unblocked (<ivar
 
     #[test]
     fn test_canonicalize_addresses_in_line() {
-        use std::collections::HashMap;
-        let mut map = HashMap::new();
+        use detcore_model::collections::DetHashMap as HashMap;
+        let mut map = HashMap::default();
         let mut next = 1usize;
         // First appearance numbers marked addresses by order; a repeated address
         // reuses its ordinal (identity + aliasing). A BARE `0x...` literal and

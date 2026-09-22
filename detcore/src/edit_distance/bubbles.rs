@@ -7,7 +7,7 @@
  */
 
 use core::hash::Hash;
-use std::collections::HashMap;
+use detcore_model::collections::DetHashMap as HashMap;
 use std::fmt::Debug;
 use std::ops::Range;
 

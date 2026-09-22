@@ -12,8 +12,8 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use detcore_model::collections::DetHashMap as HashMap;
+use detcore_model::collections::DetHashSet as HashSet;
 use std::collections::btree_map::Entry;
 use std::fmt::Debug;
 use std::fs;
@@ -155,8 +155,8 @@ impl Default for InodePool {
 impl InodePool {
     fn new() -> Self {
         InodePool {
-            inodes: HashMap::new(),
-            detinodes_info: HashMap::new(),
+            inodes: HashMap::default(),
+            detinodes_info: HashMap::default(),
             next_inode: 1,
         }
     }
@@ -241,7 +241,7 @@ impl DevicePool {
         // Start at 1 so no file reports st_dev == 0, which some tools treat as
         // "no device".
         DevicePool {
-            devices: HashMap::new(),
+            devices: HashMap::default(),
             next_device: 1,
         }
     }
@@ -390,12 +390,12 @@ impl GlobalState {
         Self {
             sched,
             next_port: AtomicU16::new(range[0]),
-            used_ports: Mutex::new(HashSet::new()),
+            used_ports: Mutex::new(HashSet::default()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
             unsupported_syscall_report_fd,
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
-            open_file_to_port: Mutex::new(HashMap::new()),
+            open_file_to_port: Mutex::new(HashMap::default()),
             past_first_execve: AtomicBool::new(false),
             pending_exec_states: Mutex::new(BTreeMap::new()),
             post_exec_fd_blocking: Mutex::new(BTreeMap::new()),
@@ -1365,7 +1365,7 @@ impl GlobalState {
             }
             // The resources that must be held for the fresh thread to run:
             let rsrcs = {
-                let mut s = HashMap::new();
+                let mut s = HashMap::default();
                 s.insert(ResourceID::MemAddrSpace(detpid), Permission::RW); // TODO(T78055411): track mem aliasing.
                 Resources {
                     tid: dettid,

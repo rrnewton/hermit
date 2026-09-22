@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashMap;
+use detcore_model::collections::DetHashMap as HashMap;
 use std::os::fd::BorrowedFd;
 use std::path::Path;
 use std::sync::Arc;
@@ -314,7 +314,7 @@ impl FileMetadata {
             files_id: FilesId::initial(owner),
             next_open_file_sequence: 0,
             next_socket_open_file_sequence: 0,
-            file_handles: HashMap::new(),
+            file_handles: HashMap::default(),
         }
     }
 
@@ -411,7 +411,7 @@ impl FileMetadata {
             return Vec::new();
         }
 
-        let mut open_files = HashMap::new();
+        let mut open_files = HashMap::default();
         for detfd in self.file_handles.values() {
             let id = detfd.open_file_id();
             let total_aliases = detfd.open_file_alias_count();
@@ -1734,7 +1734,7 @@ impl<T> ThreadState<T> {
 
     /// Build a singleton resource request from the current thread.
     pub fn mk_request(&self, rid: ResourceID, perm: Permission) -> Resources {
-        let mut resources = HashMap::new();
+        let mut resources = HashMap::default();
         resources.insert(rid, perm);
         Resources {
             tid: self.dettid,

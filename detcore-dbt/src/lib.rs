@@ -13,7 +13,7 @@
 
 #![deny(missing_docs)]
 
-use std::collections::HashMap;
+use detcore_model::collections::DetHashMap as HashMap;
 use std::ffi::c_void;
 use std::fs;
 use std::future::Future;
@@ -408,7 +408,7 @@ struct NativeThreadScratch {
 
 static RUNTIME: LazyLock<RwLock<Option<Arc<Runtime>>>> = LazyLock::new(|| RwLock::new(None));
 static PENDING_THREAD_PARENTS: LazyLock<Mutex<HashMap<i32, PendingThreadParent>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+    LazyLock::new(|| Mutex::new(HashMap::default()));
 static IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static READY_IMAGE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_SHUTDOWN: AtomicBool = AtomicBool::new(false);

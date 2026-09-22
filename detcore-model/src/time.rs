@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::collections::HashMap;
+use crate::collections::DetHashMap as HashMap;
 use std::fmt;
 use std::ops::Add;
 use std::ops::Sub;
@@ -761,7 +761,7 @@ impl GlobalTime {
         let base = DetTime::new(cfg);
         GlobalTime {
             starting_nanos: LogicalTime::from_micros(micros_from_utc(&cfg.epoch)),
-            time_vector: HashMap::new(),
+            time_vector: HashMap::default(),
             extra_time: LogicalTime::from_nanos(0),
             total: base.as_nanos(),
             multiplier: cfg.clock_multiplier.unwrap_or(1.0),
