@@ -275,6 +275,7 @@ impl PreparedEvidence {
         };
         let mut row = serde_json::json!({ "schema_version":10, "run_id":self.plan.run_id,
             "commit":ctx.commit, "profile":ctx.profile, "tree_dirty":ctx.tree_dirty,
+            "selection_mode":ctx.selection_mode,
             "executed_tests":ctx.executed_tests, "passed_tests":ctx.passed_tests,
             "filtered_tests":ctx.filtered_tests });
         retained.add_to_record(&mut row)?;

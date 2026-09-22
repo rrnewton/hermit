@@ -25294,7 +25294,14 @@ with (root/'calls.jsonl').open('a') as out:
             ("quick", false),
             ("super", false),
             ("full", true),
+            ("only-hosted-portable", false),
+            ("only-hosted-portable", true),
         ] {
+            let selection_mode = if profile == "only-hosted-portable" {
+                "only"
+            } else {
+                "selected"
+            };
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path();
             std::fs::create_dir_all(root.join("ci/dag")).unwrap();
@@ -25367,7 +25374,7 @@ raise SystemExit(0 if result.wasSuccessful() else 1)
                 Plan {
                     cfg,
                     profile: profile.into(),
-                    selection_mode: "selected",
+                    selection_mode,
                     ..Plan::default()
                 },
                 dag_path,
@@ -25432,6 +25439,7 @@ raise SystemExit(0 if result.wasSuccessful() else 1)
                 .map(|outcome| reported_attempt(outcome, 1))
                 .collect();
             let mut ctx = context(root, profile, &run_id, commit, tree);
+            ctx.selection_mode = selection_mode.into();
             ctx.passed_tests = Some(i64::from(!fails));
             let snapshot = validate_cell_results::CapturedResults::capture(&results);
             let evidence = prepared
@@ -25466,7 +25474,7 @@ raise SystemExit(0 if result.wasSuccessful() else 1)
                 };
             let row = publish(&ledger, u8::from(fails), &snapshot, &mut authority).unwrap();
             assert_eq!(row["profile"], profile);
-            assert_eq!(row["selection_mode"], "selected");
+            assert_eq!(row["selection_mode"], selection_mode);
             assert_eq!(row["schema_version"], 10);
             assert_eq!(row["executed_tests"], 1);
             assert_eq!(row["result"], if fails { "fail" } else { "pass" });
@@ -25482,6 +25490,16 @@ raise SystemExit(0 if result.wasSuccessful() else 1)
             assert_eq!(std::fs::read_dir(&results).unwrap().count(), 0);
             let typed: HistoryRow = serde_json::from_value(row.clone()).unwrap();
             evidence.verify_record(&typed).unwrap();
+            if selection_mode == "only" {
+                for wrong_mode in [serde_json::Value::Null, serde_json::json!("selected")] {
+                    let mut changed = row.clone();
+                    changed["selection_mode"] = wrong_mode;
+                    let changed: HistoryRow = serde_json::from_value(changed).unwrap();
+                    assert!(evidence.verify_record(&changed).unwrap_err().contains(
+                        "selected-only evidence requires schema 10 and selection_mode=only"
+                    ));
+                }
+            }
             typed
                 .raw_result_input_census_v1()
                 .unwrap()
