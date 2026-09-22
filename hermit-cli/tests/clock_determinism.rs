@@ -21,6 +21,7 @@ use common::hermit_binary;
 use common::nondeterminism::NondeterminismCase;
 
 const DETERMINISM_RUNS: usize = 5;
+const REPEATABLE_EPOCH: &str = "2000-12-31T23:59:59.123456789Z";
 
 static HERMIT_CLOCK_LOCK: Mutex<()> = Mutex::new(());
 static CLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -85,8 +86,8 @@ fn run_clock_matrix(iteration: usize) -> Vec<u8> {
         "--base-env=minimal",
         "--no-virtualize-cpuid",
         "--max-timeslice=disabled",
-        "--",
     ]);
+    command.arg(format!("--epoch={REPEATABLE_EPOCH}")).arg("--");
     command.arg(clock_guest());
     let output = command_output(
         command,
@@ -110,6 +111,74 @@ fn run_clock_matrix(iteration: usize) -> Vec<u8> {
         );
     }
     output.stdout
+}
+
+fn run_date_at_epoch(epoch: Option<&str>) -> Output {
+    let mut command = Command::new(hermit_binary::hermit_binary());
+    // Keep the omitted-input case independent of the caller's valid override.
+    // Environment precedence is covered separately in isolated parser children.
+    command.env_remove("HERMIT_EPOCH");
+    command.args([
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+    ]);
+    if let Some(epoch) = epoch {
+        command.arg(format!("--epoch={epoch}"));
+    }
+    command.args(["--", "/bin/date", "+%s.%N"]);
+    command_output(command, "virtual epoch date probe")
+}
+
+#[test]
+fn default_virtual_epoch_tracks_invocation_start_and_is_reported() {
+    let _guard = hermit_clock_lock();
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let output = run_date_at_epoch(None);
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let observed = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f64>()
+        .unwrap();
+    assert!(
+        observed >= before && observed <= after + 1.0,
+        "default virtual epoch {observed} was not captured near host now [{before}, {after}]"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("virtual-time epoch="), "{stderr}");
+    assert!(stderr.contains("source=host-now"), "{stderr}");
+    assert!(stderr.contains("reproduce with --epoch="), "{stderr}");
+}
+
+#[test]
+fn explicit_virtual_epoch_reproduces_identical_observed_time() {
+    let _guard = hermit_clock_lock();
+    let first = run_date_at_epoch(Some(REPEATABLE_EPOCH));
+    let second = run_date_at_epoch(Some(REPEATABLE_EPOCH));
+    assert_eq!(first.stdout, second.stdout);
+    let rendered = String::from_utf8_lossy(&first.stdout);
+    let (seconds, nanos) = rendered.trim().split_once('.').unwrap();
+    let observed = seconds.parse::<u64>().unwrap() * 1_000_000_000 + nanos.parse::<u64>().unwrap();
+    let epoch = 978_307_199_123_456_789;
+    assert!(
+        (epoch..epoch + 1_000_000_000).contains(&observed),
+        "explicit epoch did not seed the expected virtual-time trajectory: {observed}"
+    );
+    for output in [first, second] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("source=explicit"), "{stderr}");
+        assert!(
+            stderr.contains("2000-12-31T23:59:59.123456789+00:00"),
+            "{stderr}"
+        );
+    }
 }
 
 #[test]

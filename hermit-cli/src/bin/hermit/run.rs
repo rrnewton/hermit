@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::Duration;
+use std::time::SystemTime;
 
 use clap::Parser;
 use colored::Colorize;
@@ -379,6 +380,15 @@ pub struct RunOpts {
     /// defaults it to `None` when `RunOpts` is parsed or round-tripped.
     #[clap(skip)]
     resolved_happens_before: Option<HappensBeforeProgram>,
+
+    /// Whether this invocation's epoch was captured from the host clock because
+    /// neither `--epoch` nor `HERMIT_EPOCH` supplied an explicit input.
+    ///
+    /// This is CLI provenance only: the resolved timestamp itself is copied into
+    /// `DetConfig` before any backend starts and is the sole value serialized or
+    /// observed by the guest.
+    #[clap(skip)]
+    epoch_captured_from_host: bool,
 
     #[clap(flatten)]
     pub(crate) det_opts: DetOptions,
@@ -1121,8 +1131,13 @@ impl fmt::Display for RunOpts {
             }
         }
 
-        // Write the rest of the flags from the Config itself:
+        // A reproducer must retain the actual epoch, including the stable
+        // library default: an omitted CLI epoch now captures a new host time.
+        // Config already emits nondefault epochs, so add only its omitted case.
         write!(f, "{}", dop)?;
+        if dop.has_default_epoch() {
+            write!(f, " --epoch={}", dop.epoch.to_rfc3339())?;
+        }
 
         write!(
             f,
@@ -1312,7 +1327,10 @@ fn display_runopts1() {
     let vec: Vec<&str> = vec!["fakehermit", "fakeprog", "arg1", "arg2"];
     let mut ro = RunOpts::parse_from(vec.iter());
     ro.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
+    assert_eq!(
+        format!("{}", ro),
+        " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog arg1 arg2"
+    );
 }
 
 #[test]
@@ -1321,7 +1339,10 @@ fn backend_defaults_to_ptrace() {
     ro.validate_args_with_perf_support(true).unwrap();
     assert_eq!(ro.backend, None);
     assert_eq!(ro.selected_backend(), Backend::Ptrace);
-    assert_eq!(format!("{}", ro), " -- fakeprog");
+    assert_eq!(
+        format!("{}", ro),
+        " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+    );
 }
 
 #[test]
@@ -1338,7 +1359,8 @@ fn backend_values_parse_and_round_trip() {
         ro.validate_args_with_perf_support(true).unwrap();
         assert_eq!(ro.backend, Some(expected));
         assert_eq!(ro.selected_backend(), expected);
-        let normalized = format!(" --backend={value} -- fakeprog");
+        let normalized =
+            format!(" --backend={value} --epoch=2026-01-01T00:00:00+00:00 -- fakeprog");
         assert_eq!(format!("{}", ro), normalized);
     }
 }
@@ -1839,7 +1861,10 @@ fn display_runopts2() {
     ];
     let mut ro = RunOpts::parse_from(vec.iter());
     ro.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(format!("{}", ro), " -- fakeprog arg1 arg2");
+    assert_eq!(
+        format!("{}", ro),
+        " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog arg1 arg2"
+    );
 }
 
 #[test]
@@ -1866,7 +1891,10 @@ fn display_runopts4() {
     let vec: Vec<&str> = vec!["fakehermit", "--sequentialize-threads", "fakeprog", "arg1"];
     let mut ro = RunOpts::parse_from(vec.iter());
     ro.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(format!("{}", ro), " -- fakeprog arg1");
+    assert_eq!(
+        format!("{}", ro),
+        " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog arg1"
+    );
 }
 
 #[test]
@@ -1875,7 +1903,10 @@ fn unsupported_syscalls_fail_closed_by_default_with_explicit_opt_out() {
     normal.validate_args_with_perf_support(true).unwrap();
     assert!(normal.det_opts.det_config.panic_on_unsupported_syscalls);
     assert!(!normal.det_opts.det_config.passthru_opt);
-    assert_eq!(format!("{}", normal), " -- fakeprog");
+    assert_eq!(
+        format!("{}", normal),
+        " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+    );
 
     let mut strict = RunOpts::parse_from(["fakehermit", "--strict", "fakeprog"]);
     strict.validate_args_with_perf_support(true).unwrap();
@@ -1884,7 +1915,10 @@ fn unsupported_syscalls_fail_closed_by_default_with_explicit_opt_out() {
     assert!(strict.det_opts.det_config.deterministic_io);
     assert!(!strict.det_opts.det_config.passthru_opt);
     assert!(strict.det_opts.det_config.panic_on_unsupported_syscalls);
-    assert_eq!(format!("{}", strict), " -- fakeprog");
+    assert_eq!(
+        format!("{}", strict),
+        " --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+    );
 
     let mut compatibility =
         RunOpts::parse_from(["fakehermit", "--allow-unsupported-syscalls", "fakeprog"]);
@@ -1897,7 +1931,7 @@ fn unsupported_syscalls_fail_closed_by_default_with_explicit_opt_out() {
     );
     assert_eq!(
         format!("{}", compatibility),
-        " --allow-unsupported-syscalls -- fakeprog"
+        " --allow-unsupported-syscalls --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
     );
 }
 
@@ -1909,7 +1943,10 @@ fn panic_on_rbc_overshoot_flag_wires_to_detcore_config() {
     let mut opts = RunOpts::parse_from(["fakehermit", "--panic-on-rbc-overshoot", "fakeprog"]);
     opts.validate_args_with_perf_support(true).unwrap();
     assert!(opts.det_opts.det_config.panic_on_rcb_overshoot);
-    assert_eq!(format!("{}", opts), " --panic-on-rbc-overshoot -- fakeprog");
+    assert_eq!(
+        format!("{}", opts),
+        " --panic-on-rbc-overshoot --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+    );
 }
 
 #[test]
@@ -1925,7 +1962,7 @@ fn passthru_optimization_requires_explicit_compatibility_opt_out() {
     assert!(ro.det_opts.det_config.passthru_opt);
     assert_eq!(
         format!("{}", ro),
-        " --allow-unsupported-syscalls --passthru-opt -- fakeprog"
+        " --allow-unsupported-syscalls --passthru-opt --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
     );
 }
 
@@ -1982,7 +2019,7 @@ fn timeslice_flags_parse_and_round_trip() {
     let rendered = format!("{}", ro);
     assert_eq!(
         rendered,
-        " --max-timeslice=100000 --target-timeslice=20000 -- fakeprog"
+        " --max-timeslice=100000 --target-timeslice=20000 --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
     );
 
     let mut reparsed_args = vec!["fakehermit".to_owned()];
@@ -2005,7 +2042,10 @@ fn skid_margin_override_parses_and_round_trips() {
     opts.validate_args_with_perf_support(true).unwrap();
 
     assert_eq!(opts.skid_margin, Some(500));
-    assert_eq!(format!("{opts}"), " --skid-margin=500 -- fakeprog");
+    assert_eq!(
+        format!("{opts}"),
+        " --skid-margin=500 --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+    );
 }
 
 #[test]
@@ -2039,7 +2079,7 @@ fn skid_margin_override_is_available_to_liteinst_host_hybrid() {
     assert_eq!(opts.skid_margin, Some(500));
     assert_eq!(
         format!("{opts}"),
-        " --backend=liteinst --skid-margin=500 -- fakeprog"
+        " --backend=liteinst --skid-margin=500 --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
     );
 }
 
@@ -2052,7 +2092,10 @@ fn deprecated_preemption_timeout_alias_round_trips_canonically() {
         ro.det_opts.det_config.max_timeslice,
         std::num::NonZeroU64::new(100_000)
     );
-    assert_eq!(format!("{}", ro), " --max-timeslice=100000 -- fakeprog");
+    assert_eq!(
+        format!("{}", ro),
+        " --max-timeslice=100000 --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+    );
 }
 
 #[test]
@@ -2063,7 +2106,10 @@ fn deprecated_preemption_timeout_disabled_values_round_trip_canonically() {
         ro.validate_args_with_perf_support(true).unwrap();
 
         assert_eq!(ro.det_opts.det_config.max_timeslice, None);
-        assert_eq!(format!("{}", ro), " --max-timeslice=disabled -- fakeprog");
+        assert_eq!(
+            format!("{}", ro),
+            " --max-timeslice=disabled --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
+        );
     }
 }
 
@@ -2227,7 +2273,7 @@ fn no_namespace_uses_host_resources_and_disables_uts_assumption() {
     assert!(opts.pin_threads);
     assert_eq!(
         format!("{}", opts),
-        " --network=host --no-namespace --tmp=/tmp -- fakeprog"
+        " --network=host --no-namespace --tmp=/tmp --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
     );
 }
 
@@ -2460,7 +2506,7 @@ fn display_runopts_without_perf_support() {
     ro.validate_args_with_perf_support(false).unwrap();
     assert_eq!(
         format!("{}", ro),
-        " --max-timeslice=disabled -- fakeprog arg1"
+        " --max-timeslice=disabled --epoch=2026-01-01T00:00:00+00:00 -- fakeprog arg1"
     );
 }
 
@@ -2828,6 +2874,47 @@ fn restore_standard_fd_status_flags(before: [Option<libc::c_int>; VERIFY_RESTORE
 /// Create two logging destinations and two global configs. Returns non-zero exit
 /// status if there was a difference in any component of the output.
 impl RunOpts {
+    /// Resolve the one intentionally nondeterministic input of an ordinary run.
+    ///
+    /// The top-level parser calls this exactly once, before evidence setup or
+    /// guest launch. Both halves of `--verify` and every backend then receive the
+    /// same concrete `DateTime`; Detcore never reads the host clock itself.
+    pub(crate) fn capture_default_epoch(&mut self, capture_now: impl FnOnce() -> SystemTime) {
+        if self.uses_virtual_time_determinization() {
+            self.det_opts
+                .det_config
+                .capture_epoch_from_host_time(capture_now());
+            self.epoch_captured_from_host = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn epoch_capture_for_test(&self) -> (String, bool) {
+        (
+            self.det_opts.det_config.epoch.to_rfc3339(),
+            self.epoch_captured_from_host,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reports_virtual_epoch_for_test(&self) -> bool {
+        self.uses_virtual_time_determinization()
+    }
+
+    /// Whether this execution path actually feeds virtual time to a guest.
+    /// Namespace-only bypasses Detcore, while strace-only deliberately turns
+    /// all determinization off during validation; neither owns an epoch input.
+    fn uses_virtual_time_determinization(&self) -> bool {
+        self.det_opts.det_config.virtualize_time
+            && !self.namespace_only
+            && !self.strace_only
+            && !self.hb_list_events
+    }
+
+    fn epoch_rfc3339(&self) -> String {
+        self.det_opts.det_config.epoch.to_rfc3339()
+    }
+
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the
@@ -3056,6 +3143,17 @@ impl RunOpts {
         // subsequent tracing_subscriber::fmt::init() call.
         // tracing::subscriber::with_default(super::tracing::stderr_subscriber(global.log), || {
         self.validate_args()?;
+        if self.uses_virtual_time_determinization() {
+            let epoch = self.epoch_rfc3339();
+            let source = if self.epoch_captured_from_host {
+                "host-now"
+            } else {
+                "explicit"
+            };
+            eprintln!(
+                "hermit: virtual-time epoch={epoch} source={source}; reproduce with --epoch={epoch}"
+            );
+        }
         if self.allow_unsupported_syscalls {
             eprintln!(
                 "WARNING: --allow-unsupported-syscalls permits unmodeled syscalls to reach the \

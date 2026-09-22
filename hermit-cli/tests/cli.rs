@@ -2938,6 +2938,7 @@ fn run_kvm_setpriv_capability_wrapper_is_deterministic() {
         "--strict",
         "--verify",
         "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
         "--",
         "/usr/bin/setpriv",
         "--bounding-set=-sys_time",
