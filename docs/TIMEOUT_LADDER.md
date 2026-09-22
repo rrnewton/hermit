@@ -105,7 +105,10 @@ generated wall configuration and every CPU-wrapper invocation bind those same
 bytes; the wrapper refuses a changed digest or an absent executing identity.
 
 Applicability requires the recorded source, verified build context, CPU model,
-available CPU allocation and emitted Nextest concurrency to match. The source
+available CPU allocation and emitted Nextest concurrency to match. It also
+requires the same verified execution domain (native host or exact pinned image
+and config ID), ancestor CPU quota/period limits, affinity/cpuset and effective
+memory/swap limits. The source
 fingerprint includes every tracked tree entry and gitlink except this one
 derived calibration file; dirty source cannot activate it. This avoids a
 calibration invalidating its own measurements when its table is written.
@@ -113,6 +116,16 @@ Prepared-artifact checks still verify the actual source views, compiler,
 configuration and executable bytes. Comparison context replaces only a
 verified target directory and configuration placement with logical locations;
 it does not equate executable hashes from different checkouts.
+
+The maintained launcher observes host ancestors before entering a pinned root;
+the inner verifier checks the actual image and visible cgroup anchor/controls
+against the dedicated read-only proof mount. Hidden ancestors remain explicitly
+launch-observed. Each invocation retains its proof bytes beside the CPU report
+as `.launch.json`; its hash binds the context and final run but is not part of
+the reusable cohort key. Missing or legacy cohort evidence keeps defaults,
+while malformed supplied evidence refuses. Bootstrap wrapper calls do not
+capture or compile an observer. Existing calibration tables are not activated
+by adding this transport; new matching measurements are still required.
 
 Current-cohort p90 values are not pooled across resource allocations. An
 applicable historical positive maximum supplies a conservative floor before

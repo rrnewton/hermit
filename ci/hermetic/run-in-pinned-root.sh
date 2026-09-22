@@ -16,6 +16,7 @@
 #
 #   usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA]
 #                                [--src-rw] [--cargo-home DIR] [--proc-locks-runtime] [--env NAME]... -- CMD...
+#                                [--nextest-calibration]
 #          run-in-pinned-root.sh --check-image [--digest NAME@SHA]
 #
 # --check-image only reads the exact local image reference. It shares the late
@@ -48,9 +49,15 @@ DIGEST_FILE="$HERE/image.digest"
 src=""; out=""; digest=""; src_mode="ro=true"; cargo_home=""
 proc_locks_runtime=false
 check_image=false
+nextest_calibration=false
 pass_env=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --help|-h)
+            printf '%s\n' 'usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA] [--src-rw] [--cargo-home DIR] [--proc-locks-runtime] [--nextest-calibration] [--env NAME]... -- CMD...' \
+                '       run-in-pinned-root.sh --check-image [--digest NAME@SHA]' \
+                '--nextest-calibration captures the actual host envelope for the regular Nextest consumer using an existing prepared helper. Missing capture capability stays unqualified; bootstrap calls do not capture or compile.'
+            exit 0 ;;
         --src) src=$2; shift 2 ;;
         --out) out=$2; shift 2 ;;
         --digest) digest=$2; shift 2 ;;
@@ -58,6 +65,7 @@ while [[ $# -gt 0 ]]; do
         --src-rw) src_mode="ro=false"; shift ;;
         --cargo-home) cargo_home=$2; shift 2 ;;
         --proc-locks-runtime) proc_locks_runtime=true; shift ;;
+        --nextest-calibration) nextest_calibration=true; shift ;;
         --env) pass_env+=("$2"); shift 2 ;;
         --) shift; break ;;
         *) echo "run-in-pinned-root: unexpected argument '$1'" >&2; exit 2 ;;
@@ -102,7 +110,7 @@ check_pinned_image() {
 }
 
 if "$check_image"; then
-    [[ -z "$src" && -z "$out" && -z "$cargo_home" && "$src_mode" == ro=true && "$proc_locks_runtime" == false && ${#pass_env[@]} == 0 && $# == 0 ]] || {
+    [[ -z "$src" && -z "$out" && -z "$cargo_home" && "$src_mode" == ro=true && "$proc_locks_runtime" == false && "$nextest_calibration" == false && ${#pass_env[@]} == 0 && $# == 0 ]] || {
         echo "run-in-pinned-root: --check-image accepts only optional --digest." >&2
         exit 2
     }
@@ -147,6 +155,40 @@ mkdir -p \
     "$agent_utils_state/target" \
     "$agent_utils_state/locks" \
     "$agent_utils_state/snapshots"
+
+# Only actual regular calibration consumers opt in. In particular, the script
+# producer and other bootstrap calls must not depend on their own output.
+calibration_mount=()
+if "$nextest_calibration"; then
+    host_scripts="$src/target/ci/rust-scripts"
+    if [[ -e "$host_scripts/manifest.tsv" || -L "$host_scripts/manifest.tsv" ]]; then
+        resolve_status=0
+        capture_binary=$(cd -- "$src" && HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$host_scripts" \
+            "$src/ci/rust-script-bin/rust-script" --resolve-optional --force "$src/ci/nextest-binaries.rs") || resolve_status=$?
+        if ((resolve_status != 0 && resolve_status != 3)); then exit "$resolve_status"; fi
+        capture_status=2
+        if ((resolve_status == 0)); then
+            capture_status=0
+            capture_version=$("$capture_binary" capture-launch --probe) || capture_status=$?
+        fi
+        case $capture_status in
+            0)
+                [[ $capture_version == nextest-launch-observation-v1 ]] || { printf 'nextest budgets: malformed prepared capture capability; refresh build.rust_scripts\n' >&2; exit 2; }
+                launch_dir=$(mktemp -d "$out/nextest-launch.XXXXXX")
+                launch_file="$launch_dir/context.json"
+                image_id=$(timeout --verbose --signal=TERM --kill-after=2s 10s \
+                    podman image inspect --format '{{.Id}}' "$digest")
+                image_id=${image_id#sha256:}
+                "$capture_binary" capture-launch --pinned-image "$digest" --image-id "$image_id" --output "$launch_file"
+                calibration_mount+=(--mount "type=bind,source=$launch_file,destination=/run/hermit-nextest-launch.json,ro=true")
+                ;;
+            2) printf 'nextest budgets: prepared host capture capability unavailable; pinned cohort remains unqualified\n' >&2 ;;
+            *) exit "$capture_status" ;;
+        esac
+    else
+        printf 'nextest budgets: prepared host capture unavailable; pinned cohort remains unqualified\n' >&2
+    fi
+fi
 
 cargo_mount=(); cargo_home_in=/build/.cargo
 git_mounts=()
@@ -397,6 +439,7 @@ exec podman run --rm \
     "${cargo_mount[@]}" \
     "${git_mounts[@]}" \
     "${extra_mounts[@]}" \
+    "${calibration_mount[@]}" \
     "${env_args[@]}" \
     -e HOME=/build \
     -e CARGO_HOME="$cargo_home_in" \

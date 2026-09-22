@@ -505,6 +505,9 @@ fn pinned_root_command(step: &Step) -> String {
     if step.tag() == "test.hermit_integration" {
         argv.push("--proc-locks-runtime".into());
     }
+    if step.tag() == "test.regular_crates" {
+        argv.push("--nextest-calibration".into());
+    }
     for name in env_names {
         argv.extend(["--env".into(), name.into()]);
     }
@@ -514,7 +517,9 @@ fn pinned_root_command(step: &Step) -> String {
         "-c".into(),
         PINNED_ROOT_COMMAND_GUARD.into(),
         "bash".into(),
-        step.cmd.clone(),
+        if step.tag() == "test.regular_crates" {
+            step.cmd.replace("./ci/run-nextest-counted.sh", "./ci/run-nextest-counted.sh --calibration-launch-proof /run/hermit-nextest-launch.json")
+        } else { step.cmd.clone() },
     ]);
     argv.iter()
         .map(|argument| shell_quote(argument))
@@ -984,6 +989,47 @@ fn materialize_runtime_policy(cfg: &mut DagConfig) {
         // caller-selected level from reaching child helpers.
         step.env.remove("VALIDATE_VERBOSITY");
     }
+}
+
+fn materialize_regular_calibration_launch(cfg: &mut DagConfig) -> Result<(), String> {
+    let producer = cfg
+        .steps
+        .iter()
+        .any(|step| step.tag() == "build.rust_scripts");
+    for step in &mut cfg.steps {
+        match step.tag().as_str() {
+            "test.regular_crates" => {
+                if !producer
+                    || !step.cmd.contains("--nextest-calibration")
+                    || !step
+                        .cmd
+                        .contains("--calibration-launch-proof /run/hermit-nextest-launch.json")
+                {
+                    return Err(
+                        "regular pinned calibration lost its explicit launch observation boundary"
+                            .into(),
+                    );
+                }
+                step.deps.push("build.rust_scripts".into());
+                step.deps.sort();
+                step.deps.dedup();
+            }
+            "test.regular_crates_on_host" => {
+                const RUNNER: &str = "./ci/run-nextest-counted.sh";
+                if step.cmd.matches(RUNNER).count() != 1 || step.cmd.contains("--calibration-") {
+                    return Err(
+                        "regular host calibration requires its explicit native command boundary"
+                            .into(),
+                    );
+                }
+                step.cmd = step
+                    .cmd
+                    .replace(RUNNER, &format!("{RUNNER} --calibration-host"));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -2045,6 +2091,7 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     materialize_focused_preflight(&mut refreshed)?;
     materialize_quick_super_budgets(&mut refreshed);
     materialize_runtime_policy(&mut refreshed);
+    materialize_regular_calibration_launch(&mut refreshed)?;
     attach_result_ownership(&mut refreshed, &cells);
     assert_invariants(&refreshed, &cells)?;
     Ok(refreshed)
@@ -2443,6 +2490,16 @@ sys.exit(37)
         let steps = crate::validation_dag_static::config().steps;
         for step in &steps {
             let command = pinned_root_command(step);
+            assert_eq!(
+                command.matches(" --nextest-calibration ").count(),
+                usize::from(step.tag() == "test.regular_crates")
+            );
+            assert_eq!(
+                command
+                    .matches("--calibration-launch-proof /run/hermit-nextest-launch.json")
+                    .count(),
+                usize::from(step.tag() == "test.regular_crates")
+            );
             assert_eq!(
                 command.matches(" --proc-locks-runtime ").count(),
                 usize::from(step.tag() == "test.hermit_integration")
@@ -2880,9 +2937,18 @@ sys.exit(37)
             } else {
                 local.cmd.clone()
             };
+            let expected_host_payload = if local_tag == "test.regular_crates" {
+                const PINNED: &str = "--calibration-launch-proof /run/hermit-nextest-launch.json";
+                assert_eq!(local_payload.matches(PINNED).count(), 1);
+                assert_eq!(hosted.cmd.matches("--calibration-host").count(), 1);
+                assert!(local.deps.iter().any(|dep| dep == "build.rust_scripts"));
+                local_payload.replace(PINNED, "--calibration-host")
+            } else {
+                local_payload
+            };
             assert_eq!(
                 hosted.cmd,
-                local_payload,
+                expected_host_payload,
                 "{} changed its test selection",
                 hosted.tag()
             );
