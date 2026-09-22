@@ -738,6 +738,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         open_file_id: OpenFileId,
     ) -> Option<u16> {
+        if open_file_id.is_socket() && guest.config().network_trace.uses_trace() {
+            match network_request(guest, NetworkRequest::Retire(open_file_id)).await {
+                Ok(NetworkReply::Channel(_)) => {}
+                Ok(other) => panic!("unexpected network-retirement response: {other:?}"),
+                Err(error) => panic!("network open-file retirement failed: {error}"),
+            }
+        }
         let response = send_and_update_time(guest, GlobalRequest::ReleasePort(open_file_id)).await;
         match response.1 {
             GlobalResponse::ReleasePort(port) => port,

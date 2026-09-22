@@ -41,11 +41,13 @@ use detcore_model::network_trace::NetworkChannelV2;
 use detcore_model::network_trace::NetworkConnectionResultV2;
 use detcore_model::network_trace::NetworkDatagramV2;
 use detcore_model::network_trace::NetworkInputEventV2;
+use detcore_model::network_trace::NetworkInputKindV2;
 use detcore_model::network_trace::NetworkOutputEventV2;
+use detcore_model::network_trace::NetworkOutputKindV2;
 use detcore_model::network_trace::NetworkPolicy;
 use detcore_model::network_trace::NetworkReadinessV2;
+use detcore_model::network_trace::NetworkReleaseV2;
 use detcore_model::network_trace::NetworkShutdownV2;
-use detcore_model::network_trace::NetworkTrace;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
@@ -76,9 +78,13 @@ use crate::consts::ROOT_DETPID;
 use crate::ivar::Ivar;
 use crate::network_replay::ConnectionOutcome;
 use crate::network_replay::DatagramReceiveOutcome;
+use crate::network_replay::NetworkReceiveOptions;
 use crate::network_replay::NetworkReplayEngine;
+use crate::network_replay::NetworkReplayError;
+use crate::network_replay::NetworkTracePublication;
 use crate::network_replay::StreamReceiveOutcome;
 use crate::network_replay::StreamTransmitOutcome;
+use crate::network_replay::replay_from_reader;
 use crate::preemptions::PreemptionReader;
 use crate::preemptions::ThreadHistory;
 use crate::record_or_replay::RecordOrReplay;
@@ -457,22 +463,17 @@ fn initialize_network_engine(
                     path.display()
                 )
             })?;
-            let trace = NetworkTrace::read_framed(file).map_err(|error| {
-                format!(
-                    "cannot decode network replay trace {}: {error}",
-                    path.display()
-                )
-            })?;
-            let NetworkTrace::V2(trace) = trace else {
-                return Err(
-                    "network replay requires the schedule-robust V2 trace format".to_owned(),
-                );
-            };
-            NetworkReplayEngine::replay(trace)
+            replay_from_reader(file)
                 .map_err(|error| format!("cannot initialize network replay: {error}"))?
         }
     };
     Ok(Some(Arc::new(Mutex::new(engine))))
+}
+
+#[derive(Debug, Default)]
+struct NetworkRecordProgress {
+    inbound_stream: u64,
+    outbound_stream: u64,
 }
 
 /// Global state associated with the detcore tool.
@@ -485,6 +486,10 @@ pub struct GlobalState {
 
     /// One run-global network engine shared by every guest task and scheduler wait.
     network_engine: Option<Arc<Mutex<NetworkReplayEngine>>>,
+
+    /// Stream offsets are run-global so competing aliases cannot assign them
+    /// according to thread-local syscall order.
+    network_record_progress: Mutex<BTreeMap<OpenFileId, NetworkRecordProgress>>,
 
     inodes: Arc<Mutex<InodePool>>,
 
@@ -654,6 +659,7 @@ impl GlobalState {
         Self {
             sched,
             network_engine,
+            network_record_progress: Mutex::new(BTreeMap::new()),
             next_port: AtomicU16::new(range[0]),
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
@@ -906,20 +912,20 @@ impl GlobalState {
                 let trace = engine
                     .into_recorded_trace()
                     .map_err(|error| anyhow::anyhow!("invalid recorded network trace: {error}"))?;
+                if trace.channels.is_empty() && !self.cfg.recordreplay_modes {
+                    bail!("network recording captured no external channels");
+                }
                 let path = self.cfg.network_trace.path.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("network record policy omitted its trace path")
                 })?;
-                let mut file = File::create(path).map_err(|error| {
-                    anyhow::anyhow!("cannot create network trace {}: {error}", path.display())
-                })?;
-                trace.write_framed(&mut file).map_err(|error| {
-                    anyhow::anyhow!("cannot encode network trace {}: {error}", path.display())
-                })?;
-                file.sync_all().map_err(|error| {
-                    anyhow::anyhow!("cannot flush network trace {}: {error}", path.display())
-                })?;
-                drop(file);
-                Ok(())
+                NetworkTracePublication::reserve(path)
+                    .map_err(|error| {
+                        anyhow::anyhow!("cannot reserve network trace {}: {error}", path.display())
+                    })?
+                    .publish(&trace)
+                    .map_err(|error| {
+                        anyhow::anyhow!("cannot publish network trace {}: {error}", path.display())
+                    })
             }
         }
     }
@@ -2795,6 +2801,93 @@ impl GlobalState {
             NetworkRequest::RecordOutput(output) => {
                 engine.record_output(output).map(|()| NetworkReply::Unit)
             }
+            NetworkRequest::CaptureStreamInput {
+                open_file,
+                observed_at,
+                input,
+            } => (|| -> Result<NetworkReply, NetworkReplayError> {
+                let channel = engine
+                    .channel_for(open_file)
+                    .ok_or(NetworkReplayError::UnboundOpenFile(open_file))?;
+                let mut progress = self.network_record_progress.lock().unwrap();
+                let progress = progress.entry(open_file).or_default();
+                let event = match input {
+                    NetworkCapturedStreamInput::Bytes(bytes) => NetworkInputKindV2::StreamBytes {
+                        stream_offset: progress.inbound_stream,
+                        bytes,
+                    },
+                    NetworkCapturedStreamInput::EndOfFile => NetworkInputKindV2::PeerShutdown {
+                        stream_offset: progress.inbound_stream,
+                        direction: NetworkShutdownV2::Write,
+                    },
+                    NetworkCapturedStreamInput::Error(errno) => NetworkInputKindV2::SocketError {
+                        stream_offset: progress.inbound_stream,
+                        errno,
+                    },
+                    NetworkCapturedStreamInput::Connect(result) => {
+                        NetworkInputKindV2::Connect(result)
+                    }
+                };
+                let byte_count = match &event {
+                    NetworkInputKindV2::StreamBytes { bytes, .. } => bytes.len() as u64,
+                    _ => 0,
+                };
+                engine.record_input(NetworkInputEventV2 {
+                    ordinal: 0,
+                    channel,
+                    release: NetworkReleaseV2 {
+                        not_before_global_time: observed_at,
+                        after_transmitted_offset: progress.outbound_stream,
+                    },
+                    event,
+                })?;
+                progress.inbound_stream = progress
+                    .inbound_stream
+                    .checked_add(byte_count)
+                    .ok_or(NetworkReplayError::Overflow)?;
+                Ok(NetworkReply::Unit)
+            })(),
+            NetworkRequest::CaptureStreamOutput { open_file, output } => {
+                (|| -> Result<NetworkReply, NetworkReplayError> {
+                    let channel = engine
+                        .channel_for(open_file)
+                        .ok_or(NetworkReplayError::UnboundOpenFile(open_file))?;
+                    let mut progress = self.network_record_progress.lock().unwrap();
+                    let progress = progress.entry(open_file).or_default();
+                    let (event, byte_count) = match output {
+                        NetworkCapturedStreamOutput::Bytes(bytes) => {
+                            let byte_count = bytes.len() as u64;
+                            (
+                                NetworkOutputKindV2::StreamBytes {
+                                    stream_offset: progress.outbound_stream,
+                                    bytes,
+                                },
+                                byte_count,
+                            )
+                        }
+                        NetworkCapturedStreamOutput::Error(errno) => (
+                            NetworkOutputKindV2::SocketError {
+                                stream_offset: progress.outbound_stream,
+                                errno,
+                            },
+                            0,
+                        ),
+                        NetworkCapturedStreamOutput::Shutdown(direction) => (
+                            NetworkOutputKindV2::Shutdown {
+                                stream_offset: progress.outbound_stream,
+                                direction,
+                            },
+                            0,
+                        ),
+                    };
+                    engine.record_output(NetworkOutputEventV2 { channel, event })?;
+                    progress.outbound_stream = progress
+                        .outbound_stream
+                        .checked_add(byte_count)
+                        .ok_or(NetworkReplayError::Overflow)?;
+                    Ok(NetworkReply::Unit)
+                })()
+            }
             NetworkRequest::Bind(open_file, channel) => {
                 engine.bind(open_file, channel).map(|()| NetworkReply::Unit)
             }
@@ -2808,8 +2901,18 @@ impl GlobalState {
                 open_file,
                 maximum,
                 nonblocking,
+                flags,
+                receive_low_water,
             } => engine
-                .receive_stream(open_file, maximum, nonblocking)
+                .receive_stream_with_options(
+                    open_file,
+                    NetworkReceiveOptions {
+                        maximum,
+                        nonblocking,
+                        flags,
+                        receive_low_water,
+                    },
+                )
                 .map(|outcome| {
                     NetworkReply::StreamReceive(match outcome {
                         StreamReceiveOutcome::Bytes(bytes) => NetworkStreamReceive::Bytes(bytes),
@@ -2914,6 +3017,22 @@ pub enum NetworkRequest {
     RecordInput(NetworkInputEventV2),
     /// Append one guest output observation while capturing.
     RecordOutput(NetworkOutputEventV2),
+    /// Atomically assign offsets and append a live stream observation.
+    CaptureStreamInput {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Continuous logical time at host observation.
+        observed_at: LogicalTime,
+        /// Normalized input result.
+        input: NetworkCapturedStreamInput,
+    },
+    /// Atomically assign offsets and append guest stream output.
+    CaptureStreamOutput {
+        /// Stable socket open-file description.
+        open_file: OpenFileId,
+        /// Normalized output result.
+        output: NetworkCapturedStreamOutput,
+    },
     /// Bind a stable open-file description to a trace channel.
     Bind(OpenFileId, NetworkChannelId),
     /// Retire the binding after the final descriptor alias closes.
@@ -2928,6 +3047,10 @@ pub enum NetworkRequest {
         maximum: usize,
         /// Whether absence returns `WouldBlock` instead of `Pending`.
         nonblocking: bool,
+        /// Linux receive flags relevant to data movement.
+        flags: i32,
+        /// Effective `SO_RCVLOWAT` value.
+        receive_low_water: usize,
     },
     /// Consume one complete datagram boundary.
     ReceiveDatagram {
@@ -2960,6 +3083,30 @@ pub enum NetworkRequest {
     Readiness(OpenFileId),
     /// Resolve the trace channel currently bound to an open file.
     ChannelFor(OpenFileId),
+}
+
+/// Live stream input normalized before entering the capture engine.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkCapturedStreamInput {
+    /// Newly observed bytes.
+    Bytes(Vec<u8>),
+    /// Peer write-side shutdown.
+    EndOfFile,
+    /// Positive Linux errno.
+    Error(i32),
+    /// Completion of an outbound connect attempt.
+    Connect(NetworkConnectionResultV2),
+}
+
+/// Guest stream output normalized before entering the capture engine.
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
+pub enum NetworkCapturedStreamOutput {
+    /// Successfully transmitted bytes.
+    Bytes(Vec<u8>),
+    /// Positive Linux errno.
+    Error(i32),
+    /// Local shutdown transition.
+    Shutdown(NetworkShutdownV2),
 }
 
 /// Serializable result of one replayed stream receive attempt.

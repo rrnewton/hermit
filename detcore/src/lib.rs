@@ -123,6 +123,10 @@ pub use scheduler::runqueue::LAST_PRIORITY;
 pub use tool_global::BackendFailureCleanup;
 pub use tool_global::GlobalState;
 #[doc(hidden)]
+pub use tool_global::NetworkCapturedStreamInput;
+#[doc(hidden)]
+pub use tool_global::NetworkCapturedStreamOutput;
+#[doc(hidden)]
 pub use tool_global::NetworkConnection;
 #[doc(hidden)]
 pub use tool_global::NetworkDatagramDelivery;
@@ -2272,6 +2276,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // (scheduler yield + record/replay forwarding).
             SyscallClassification::Determinized if call.number() == Sysno::epoll_pwait2 => {
                 self.handle_epoll_pwait2(guest, call).await
+            }
+            SyscallClassification::Determinized if self.network_io_owns(guest, call) => {
+                self.handle_network_io(guest, call).await
             }
             SyscallClassification::Determinized => match call {
                 Syscall::Write(w) => self.handle_write(guest, w).await,
