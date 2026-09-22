@@ -8,21 +8,20 @@
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
+#[path = "common/proc_locks_lease.rs"]
+mod proc_locks_lease;
 
 use std::env;
 use std::ffi::CString;
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
-use std::fs::OpenOptions;
-use std::io;
 use std::io::ErrorKind;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs as unix_fs;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -34,123 +33,10 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use proc_locks_lease::*;
+
 struct ProcLocksSnapshotLease {
     _file: File,
-}
-
-const PROC_LOCKS_LEASE_NAME: &str = "hermit-proc-locks-determinism.lock";
-
-fn effective_uid() -> u32 {
-    // SAFETY: `geteuid` takes no arguments and has no memory-safety preconditions.
-    unsafe { libc::geteuid() }
-}
-
-fn validated_runtime_directory(
-    configured: Option<&OsStr>,
-    fallback: &Path,
-    expected_uid: u32,
-) -> io::Result<PathBuf> {
-    let configured = configured.map(Path::new);
-    let directory = match configured {
-        Some(path) if !path.as_os_str().is_empty() && path.is_absolute() => path,
-        _ => fallback,
-    };
-    if !directory.is_absolute() {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "proc-locks runtime directory is not absolute",
-        ));
-    }
-    let metadata = fs::symlink_metadata(directory)?;
-    if !metadata.file_type().is_dir() {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "proc-locks runtime path is not a directory",
-        ));
-    }
-    if metadata.uid() != expected_uid {
-        return Err(io::Error::new(
-            ErrorKind::PermissionDenied,
-            "proc-locks runtime directory is not owned by the current user",
-        ));
-    }
-    if metadata.mode() & 0o077 != 0 {
-        return Err(io::Error::new(
-            ErrorKind::PermissionDenied,
-            "proc-locks runtime directory is accessible by another user",
-        ));
-    }
-    Ok(directory.to_path_buf())
-}
-
-fn open_proc_locks_snapshot_lease_file(
-    runtime_directory: &Path,
-    expected_uid: u32,
-) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(runtime_directory.join(PROC_LOCKS_LEASE_NAME))?;
-    let metadata = file.metadata()?;
-    if !metadata.file_type().is_file() {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "proc-locks snapshot lease is not a regular file",
-        ));
-    }
-    if metadata.uid() != expected_uid {
-        return Err(io::Error::new(
-            ErrorKind::PermissionDenied,
-            "proc-locks snapshot lease is not owned by the current user",
-        ));
-    }
-    if metadata.mode() & 0o077 != 0 {
-        return Err(io::Error::new(
-            ErrorKind::PermissionDenied,
-            "proc-locks snapshot lease is accessible by another user",
-        ));
-    }
-    Ok(file)
-}
-
-// The pinned launcher records the host file it safely opened. A mount-source
-// replacement or a different inode must fail before any snapshot guest runs.
-fn validate_proc_locks_host_identity(file: &File, expected: Option<&OsStr>) -> io::Result<()> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
-    let expected = expected.to_str().ok_or_else(|| {
-        io::Error::new(ErrorKind::InvalidInput, "non-UTF8 proc-locks host identity")
-    })?;
-    let (device, inode) = expected.split_once(':').ok_or_else(|| {
-        io::Error::new(
-            ErrorKind::InvalidInput,
-            "malformed proc-locks host identity",
-        )
-    })?;
-    let parse = |value: &str| -> io::Result<u64> {
-        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                "malformed proc-locks host identity",
-            ));
-        }
-        value
-            .parse()
-            .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))
-    };
-    let expected = (parse(device)?, parse(inode)?);
-    let metadata = file.metadata()?;
-    if (metadata.dev(), metadata.ino()) != expected {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "mounted proc-locks lease differs from the host inode",
-        ));
-    }
-    Ok(())
 }
 
 fn acquire_proc_locks_snapshot_lease() -> ProcLocksSnapshotLease {
@@ -291,6 +177,25 @@ fn proc_locks_snapshot_lease_rejects_unsafe_paths() {
         open_proc_locks_snapshot_lease_file(&safe, expected_uid).is_err(),
         "symlink lease path must be refused"
     );
+
+    // The manifest consumer uses this same inode with an absolute deadline;
+    // neither contention nor retry may start a fresh wait budget.
+    fs::remove_file(&lease_path).unwrap();
+    let open = || open_proc_locks_snapshot_lease_file(&safe, expected_uid).unwrap();
+    let first = lock_until(open(), Instant::now() + Duration::from_secs(1)).unwrap();
+    let deadline = Instant::now() + Duration::from_millis(20);
+    assert_eq!(
+        lock_until(open(), deadline).unwrap_err().kind(),
+        ErrorKind::TimedOut
+    );
+    assert!(Instant::now() >= deadline);
+    drop(first);
+    assert_eq!(
+        lock_until(open(), deadline).unwrap_err().kind(),
+        ErrorKind::TimedOut
+    );
+    let released = lock_until(open(), Instant::now() + Duration::from_secs(1)).unwrap();
+    drop(released);
 }
 
 fn build_guest(repository: &Path, build_root: &Path, name: &str, api: &str) -> std::path::PathBuf {

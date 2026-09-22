@@ -3976,6 +3976,32 @@ pub fn run_cell_with_parity(
     })
 }
 
+// All modes/backends using this fixture share the existing host inode with
+// integration-test OFD producers. Other cells do not acquire a lease.
+fn acquire_proc_locks_lease(
+    cell: &SelectedCell,
+    deadline: Instant,
+    runtime_directory: Option<&OsStr>,
+    host_identity: Option<&OsStr>,
+) -> Result<Option<File>, String> {
+    if cell.test.program.as_deref() != Some("tests/c/proc_locks.c") {
+        return Ok(None);
+    }
+    use crate::proc_locks_lease;
+    let uid = proc_locks_lease::effective_uid();
+    let fallback = PathBuf::from(format!("/run/user/{uid}"));
+    let acquire = || -> std::io::Result<File> {
+        let directory =
+            proc_locks_lease::validated_runtime_directory(runtime_directory, &fallback, uid)?;
+        let file = proc_locks_lease::open_proc_locks_snapshot_lease_file(&directory, uid)?;
+        proc_locks_lease::validate_proc_locks_host_identity(&file, host_identity)?;
+        proc_locks_lease::lock_until(file, deadline)
+    };
+    acquire()
+        .map(Some)
+        .map_err(|error| format!("proc-locks snapshot lease: {error}"))
+}
+
 fn run_cell_inner(
     context: &RunContext,
     cell: &SelectedCell,
@@ -4009,6 +4035,15 @@ fn run_cell_inner(
     // for a wedged process that consumes no CPU and therefore cannot reach the
     // primary bound.
     let deadline = execution_deadline_after_preparation(Instant::now(), timeouts.wall_seconds)?;
+    // Keep the guard through every repeat and parity operand. Waiting consumes
+    // this same deadline; acquisition failure returns through record_cell before
+    // any guest attempt can be created, preserving an infrastructure no-result.
+    let _proc_locks_lease = acquire_proc_locks_lease(
+        cell,
+        deadline,
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        std::env::var_os("HERMIT_PROC_LOCKS_LEASE_ID").as_deref(),
+    )?;
     let execution_cpu_budget_usec = timeouts.cpu_seconds.saturating_mul(1_000_000);
     let mut execution_cpu_usage_usec = 0u64;
     let mode = cell.test.modes.get(&cell.id.mode).unwrap();
@@ -6348,6 +6383,48 @@ mod tests {
                 attempt.error_kind.as_deref(),
             ),
             Some(FailureClass::NoResult)
+        );
+        let runtime = root.join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut cell = ptrace_cell("verify");
+        let context = run_context(&root);
+        // An unrelated recipe must never inspect the invalid lease transport.
+        assert!(
+            acquire_proc_locks_lease(
+                &cell,
+                Instant::now(),
+                Some(OsStr::new("/missing/lease")),
+                Some(OsStr::new("invalid")),
+            )
+            .unwrap()
+            .is_none()
+        );
+        cell.test.program = Some("tests/c/proc_locks.c".into());
+        let mut reached_guest = false;
+        let failure = record_cell(&context, &cell, |_| {
+            let _lease =
+                acquire_proc_locks_lease(&cell, Instant::now(), Some(runtime.as_os_str()), None)?;
+            reached_guest = true;
+            unreachable!("expired lease deadline cannot reach guest launch")
+        })
+        .unwrap_err();
+        assert!(!reached_guest);
+        assert!(failure.attempts.is_empty());
+        assert!(failure.observations.invocations.is_empty());
+        let result = failure.into_result(&context, &cell);
+        assert_eq!(result.outcome, "ERROR");
+        assert_eq!(
+            result.failure_class,
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+        assert!(result.result.is_none());
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("execution deadline before guest launch")
         );
         fs::remove_dir_all(root).unwrap();
     }

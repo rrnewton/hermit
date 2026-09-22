@@ -16,6 +16,8 @@ pub mod nextest_binaries;
 mod nextest_build_selections;
 pub mod nextest_cohort;
 pub mod nextest_cpu;
+#[path = "../../../hermit-cli/tests/common/proc_locks_lease.rs"]
+mod proc_locks_lease;
 pub mod runner;
 pub mod service_result;
 pub mod stress_series;
