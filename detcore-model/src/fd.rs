@@ -147,6 +147,11 @@ impl OpenFileId {
         }
     }
 
+    /// Whether this identity came from the socket-specific allocation domain.
+    pub const fn is_socket(self) -> bool {
+        self.sequence & SOCKET_SEQUENCE_DOMAIN != 0
+    }
+
     // TODO-HUMAN-REVIEW(PR-886): Review stable socket-cookie identity encoding.
     /// Encode the per-task socket-open sequence as a deterministic socket cookie.
     ///
@@ -174,6 +179,8 @@ mod tests {
         let other_task = OpenFileId::new_socket(DetTid::from_raw(4), 7);
 
         assert_ne!(first.deterministic_socket_cookie(), 0);
+        assert!(first.is_socket());
+        assert!(!OpenFileId::new(DetTid::from_raw(3), 7).is_socket());
         assert_eq!(
             first.deterministic_socket_cookie(),
             alias.deterministic_socket_cookie()

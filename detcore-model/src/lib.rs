@@ -165,6 +165,7 @@ pub mod config;
 pub mod fd;
 pub mod futex;
 pub mod happens_before;
+pub mod network_trace;
 pub mod pedigree;
 pub mod pid;
 pub mod procfs;

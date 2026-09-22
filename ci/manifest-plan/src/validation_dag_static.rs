@@ -213,7 +213,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The runtime manifest-root regression retains all 565 prior identities.
     // Eleven record-workload preparation controls retain all 566 prior IDs.
     // Seven census/finalized-run/scope controls retain all 577 current-main IDs.
-    ("test.regular_crates", 584),
+    ("test.regular_crates", 601),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     ("test.hermit_unit", 710),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
@@ -250,7 +250,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.ignored_syscall_regressions_on_host", 4),
     ("test.liteinst_strict_on_host", 24),
     // The host node carries the identical selection.
-    ("test.regular_crates_on_host", 584),
+    ("test.regular_crates_on_host", 601),
     ("test.rr_suite_contract_on_host", 1),
     ("test.sabre_examples_on_host", 6),
 ];
