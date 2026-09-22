@@ -3465,6 +3465,25 @@ cleared-caps refusal names {} starved step(s)",
                 manifest_audit.deps
             ));
         }
+        let pinned_manifest_producer = full
+            .cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "setup.manifest_plan_in_pinned_root")
+            .ok_or("full-plan bracket: pinned-root manifest producer disappeared")?;
+        let pinned_manifest_command = guarded_command_source(
+            &pinned_manifest_producer.tag(),
+            &pinned_manifest_producer.cmd,
+        )?;
+        if pinned_manifest_command
+            != format!(
+                "{RUST_SCRIPT_COMMAND_PREFIX}cargo build -p hermit-manifest-plan --bins"
+            )
+        {
+            return Err(format!(
+                "full-plan bracket: pinned-root manifest producer can reacquire the shared dagrun cache lock or lost its manifest build: {pinned_manifest_command}"
+            ));
+        }
         println!("  {}", manifest_producer_edge_bracket(&full.cfg)?);
         let pin_nodes: Vec<String> = full
             .cfg

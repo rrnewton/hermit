@@ -35,6 +35,7 @@ const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SUPER_REPETITIONS: &str = "20";
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
+const DAGRUN_PREPARE_COMMAND: &str = "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun && ";
 pub(super) const PIN_GATE_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; hermit_run_pin_check() { if command -v with-proxy >/dev/null 2>&1; then with-proxy "$@"; else "$@"; fi; }; hermit_run_pin_check ./ci/run-reverie-pin-check.sh --repo "$PWD""#;
 const LINT_CHECKS_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/lint-checks-node.sh"#;
 
@@ -802,6 +803,19 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
         }
         if producer.job == "manifest_guests" && producer_tags.contains("setup.manifest_plan") {
             twin.deps.push("setup.manifest_plan_in_pinned_root".into());
+        }
+        // The host manifest producer already prepares the tracked Rust dagrun
+        // before gate.manifest. The pinned-root twin builds only the manifest
+        // binaries it publishes. Re-running the host launcher here can hold the
+        // shared agent-utils cache lock longer than the gate's bounded raw
+        // launcher fixture while contributing no pinned-root output.
+        if producer.tag() == "setup.manifest_plan" {
+            if twin.cmd.matches(DAGRUN_PREPARE_COMMAND).count() != 1 {
+                return Err(
+                    "manifest-plan producer lost its exact dagrun preparation boundary".into(),
+                );
+            }
+            twin.cmd = twin.cmd.replacen(DAGRUN_PREPARE_COMMAND, "", 1);
         }
         if producer.tag() == "compatprep.hermit_release" {
             twin.deps.push("gate.manifest".into());
@@ -1658,6 +1672,16 @@ fn assert_invariants(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), Strin
         || focused_image.jobs_env != focused_release.jobs_env
     {
         return Err("portable focused release producer changed the dedicated command or resources, or lost its gate/image prerequisites".into());
+    }
+    let pinned_manifest_setup = step("setup.manifest_plan_in_pinned_root")?;
+    let pinned_manifest_command =
+        crate::nextest_build_selections::execution_command(pinned_manifest_setup)?;
+    if pinned_manifest_command
+        != "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build -p hermit-manifest-plan --bins"
+    {
+        return Err(format!(
+            "pinned-root manifest setup can reacquire the shared dagrun cache lock or lost its manifest build: {pinned_manifest_command}"
+        ));
     }
     for group in [
         "portablecompatprep",
