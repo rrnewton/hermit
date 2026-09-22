@@ -46,6 +46,7 @@ use serde_yaml::Value as YamlValue;
 const EXPECTED_PLAN_SCHEMA: u64 = 1;
 const VALIDATE_AUDIT_JOBS: usize = 2;
 const PREBUILT_RUST_SCRIPTS_REQUIRED: &str = "HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED";
+const SCHEDULED_BUILD_JOBS: &str = "CARGO_BUILD_JOBS";
 const DEFAULT_BUILD_JOBS: usize = 16;
 
 const HELP: &str = "\
@@ -432,6 +433,32 @@ fn build_worker_capacity(args: &Args) -> ScheduledWorkerCapacity {
     ScheduledWorkerCapacity::new(args.jobs.unwrap_or(DEFAULT_BUILD_JOBS))
 }
 
+/// Bound metadata-audit concurrency by the CPU width the outer scheduler gave
+/// this gate.
+///
+/// `gate.manifest` is normally a one-core step. Running two audit children in
+/// that cgroup lets one child's Cargo/cache work consume the quota while the
+/// other child's source-current dagrun launcher waits on the shared cache lock.
+/// The launcher's deliberately short wall-time self-test can then expire after
+/// almost no CPU time. `dagrun` exports the admitted width as
+/// `CARGO_BUILD_JOBS` at the final command boundary, so use that same authority
+/// rather than host-wide parallelism. Missing or malformed scheduler evidence
+/// stays serial; a gate explicitly granted two or more cores retains the
+/// measured two-worker path.
+fn validation_audit_worker_capacity(
+    prebuilt_rust_scripts: bool,
+    scheduled_build_jobs: Option<&str>,
+) -> ScheduledWorkerCapacity {
+    if !prebuilt_rust_scripts {
+        return ScheduledWorkerCapacity::new(1);
+    }
+    let granted = scheduled_build_jobs
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+    ScheduledWorkerCapacity::new(VALIDATE_AUDIT_JOBS.min(granted))
+}
+
 fn required_value(values: &mut impl Iterator<Item = String>, option: &str) -> String {
     let value = values
         .next()
@@ -596,11 +623,11 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
     // unmeasured default would turn this speed change into a new concurrency
     // assumption. Capture each child independently and replay it in the original
     // order so diagnostics remain attributable.
-    let audit_jobs = if std::env::var(PREBUILT_RUST_SCRIPTS_REQUIRED).as_deref() == Ok("1") {
-        VALIDATE_AUDIT_JOBS
-    } else {
-        1
-    };
+    let audit_jobs = validation_audit_worker_capacity(
+        std::env::var(PREBUILT_RUST_SCRIPTS_REQUIRED).as_deref() == Ok("1"),
+        std::env::var(SCHEDULED_BUILD_JOBS).ok().as_deref(),
+    )
+    .configured();
     run_audits_parallel(
         root,
         &[
@@ -2331,6 +2358,7 @@ mod tests {
     use super::PINNED_COMMAND_PREFIX;
     use super::PINNED_COMMAND_SEPARATOR;
     use super::PREBUILT_COMMAND_PREFIX;
+    use super::VALIDATE_AUDIT_JOBS;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
     use super::audit_run_dag_workflow_runner;
@@ -2350,6 +2378,7 @@ mod tests {
     use super::structured_test_results_from_rows;
     use super::unique_plan_rows;
     use super::validate_args;
+    use super::validation_audit_worker_capacity;
 
     #[test]
     fn ptrace_parity_policy_is_explicit_and_independent_of_selection() {
@@ -3212,6 +3241,35 @@ report.write_bytes((root/'verification.json').read_bytes())
             build_worker_capacity(&parse(["--jobs", "3"].into_iter().map(str::to_string)));
         assert_eq!(explicit.configured(), 3);
         assert_eq!(explicit.workers_for(2), 2);
+    }
+
+    #[test]
+    fn validation_audits_do_not_oversubscribe_the_scheduler_grant() {
+        assert_eq!(
+            validation_audit_worker_capacity(true, Some("1")).configured(),
+            1,
+            "the one-core gate must not start the two cache-contending audit workers"
+        );
+        assert_eq!(
+            validation_audit_worker_capacity(true, Some("2")).configured(),
+            VALIDATE_AUDIT_JOBS
+        );
+        assert_eq!(
+            validation_audit_worker_capacity(true, Some("32")).configured(),
+            VALIDATE_AUDIT_JOBS
+        );
+        for unavailable in [None, Some("0"), Some("not-a-width")] {
+            assert_eq!(
+                validation_audit_worker_capacity(true, unavailable).configured(),
+                1,
+                "missing or invalid scheduler capacity must fail closed to serial audits"
+            );
+        }
+        assert_eq!(
+            validation_audit_worker_capacity(false, Some("32")).configured(),
+            1,
+            "audits without immutable prebuilt scripts retain the existing serial policy"
+        );
     }
 
     #[test]
