@@ -22,6 +22,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::happens_before::HappensBeforeProgram;
+use crate::network_trace::NetworkTraceConfig;
 use crate::pid::DetTid;
 use crate::schedule::SigWrapper;
 use crate::time::NANOS_PER_RCB;
@@ -539,6 +540,15 @@ pub struct Config {
     /// Use this number to seed the PRNG that supplies randomness to the scheduler.
     #[clap(long, env = "HERMIT_SCHED_SEED", value_name = "uint64")]
     pub sched_seed: Option<u64>,
+
+    /// Reserved configuration for a schedule-independent external-network trace.
+    ///
+    /// This is inert until a recorder/replayer integration explicitly consumes
+    /// it. In particular, its perturbation seed has no fallback to `seed` or
+    /// `sched_seed`.
+    #[serde(default)]
+    #[clap(skip)]
+    pub network_trace: NetworkTraceConfig,
 
     /// Configure the probability for the Sticky Random scheduler to stay in a thread.
     /// For value 0.0, we are behaving like Random.
@@ -1303,6 +1313,7 @@ pub const CONFIG_FINGERPRINT_ENV: &str = "REVERIE_SABRE_HERMIT_CONFIG_FINGERPRIN
 const CONFIG_DEFINITION_SOURCES: &[&[u8]] = &[
     include_bytes!("config.rs"),
     include_bytes!("happens_before.rs"),
+    include_bytes!("network_trace.rs"),
     include_bytes!("pid.rs"),
     include_bytes!("schedule.rs"),
     include_bytes!("time.rs"),
@@ -1408,6 +1419,25 @@ mod tests {
         assert!(config.backend_supports_parked_write_signal_interruption);
         assert!(!config.backend_virtualizes_capability_prctls);
         assert!(!config.backend_defers_vfork_child_registration);
+    }
+
+    #[test]
+    fn network_perturbation_seed_never_falls_back_to_scheduler_seeds() {
+        let mut config = Config {
+            seed: 41,
+            sched_seed: Some(42),
+            ..Config::default()
+        };
+        assert_eq!(config.network_trace.network_perturb_seed, None);
+
+        config.network_trace = NetworkTraceConfig {
+            mode: crate::network_trace::NetworkTraceMode::Replay,
+            path: Some("network.trace".into()),
+            network_perturb_seed: Some(43),
+        };
+        assert_eq!(config.seed, 41);
+        assert_eq!(config.sched_seed(), 42);
+        assert_eq!(config.network_trace.network_perturb_seed, Some(43));
     }
 
     #[test]
