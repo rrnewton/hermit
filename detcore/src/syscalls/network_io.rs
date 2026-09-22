@@ -21,6 +21,8 @@ use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
+use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
@@ -137,14 +139,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(self.network_shutdown(guest, call, policy).await)
             }
             Syscall::Readv(call) if self.network_open_file(guest, call.fd()).is_some() => {
-                Some(Err(engine_error(
-                    "vectored socket I/O is not yet represented by the guest-memory adapter",
-                )))
+                Some(self.network_readv(guest, call, policy).await)
             }
             Syscall::Writev(call) if self.network_open_file(guest, call.fd()).is_some() => {
-                Some(Err(engine_error(
-                    "vectored socket I/O is not yet represented by the guest-memory adapter",
-                )))
+                Some(self.network_writev(guest, call, policy).await)
             }
             Syscall::Recvmsg(call) if self.network_open_file(guest, call.sockfd()).is_some() => {
                 Some(Err(engine_error(
@@ -357,6 +355,68 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
     }
 
+    async fn network_readv<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Readv,
+        policy: NetworkPolicy,
+    ) -> Result<i64, Error> {
+        let open_file = guest.thread_state().socket_open_file_id(call.fd())?;
+        let segments = read_network_iovecs(guest, call.iov(), call.len())?;
+        let maximum = iovec_capacity(&segments)?;
+        let nonblocking = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.is_nonblocking())?;
+        match policy {
+            NetworkPolicy::Record => {
+                let result = self.live_network_syscall(guest, call.into()).await;
+                let input = match &result {
+                    Ok(0) => NetworkCapturedStreamInput::EndOfFile,
+                    Ok(count) => {
+                        let count = usize::try_from(*count).map_err(|_| Errno::EIO)?;
+                        NetworkCapturedStreamInput::Bytes(gather_iovec_prefix(
+                            guest, &segments, count,
+                        )?)
+                    }
+                    Err(error) => NetworkCapturedStreamInput::Error(
+                        error_errno(error).ok_or_else(|| engine_error(error))?,
+                    ),
+                };
+                self.capture_input(guest, open_file, input).await?;
+                result
+            }
+            NetworkPolicy::Replay => {
+                let outcome = self
+                    .replay_stream_receive(guest, open_file, maximum, nonblocking)
+                    .await?;
+                match outcome {
+                    NetworkStreamReceive::Bytes(bytes) => {
+                        scatter_iovec_prefix(guest, &segments, &bytes)?;
+                        Ok(bytes.len() as i64)
+                    }
+                    NetworkStreamReceive::EndOfFile => Ok(0),
+                    NetworkStreamReceive::Error(errno) => errno_result(errno),
+                    NetworkStreamReceive::WouldBlock => Err(Errno::EAGAIN.into()),
+                    NetworkStreamReceive::Pending => unreachable!(),
+                }
+            }
+            NetworkPolicy::Deny | NetworkPolicy::UnsafeLive => unreachable!(),
+        }
+    }
+
+    async fn network_writev<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Writev,
+        policy: NetworkPolicy,
+    ) -> Result<i64, Error> {
+        let open_file = guest.thread_state().socket_open_file_id(call.fd())?;
+        let segments = read_network_iovecs(guest, call.iov(), call.len())?;
+        let bytes = gather_iovec_prefix(guest, &segments, iovec_capacity(&segments)?)?;
+        self.stream_transmit(guest, call.into(), open_file, bytes, policy)
+            .await
+    }
+
     async fn network_recvfrom<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -565,6 +625,111 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
+fn read_network_iovecs<G, T>(
+    guest: &mut G,
+    address: Option<Addr<'_, libc::iovec>>,
+    count: usize,
+) -> Result<Vec<(usize, usize)>, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if count > libc::UIO_MAXIOV as usize {
+        return Err(Errno::EINVAL.into());
+    }
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let address = address.ok_or(Errno::EFAULT)?;
+    let mut iovecs = vec![
+        libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        };
+        count
+    ];
+    guest.memory().read_values(address, &mut iovecs)?;
+    let segments: Vec<_> = iovecs
+        .into_iter()
+        .map(|iov| (iov.iov_base as usize, iov.iov_len))
+        .collect();
+    iovec_capacity(&segments)?;
+    Ok(segments)
+}
+
+fn iovec_capacity(segments: &[(usize, usize)]) -> Result<usize, Error> {
+    let total = segments.iter().try_fold(0usize, |total, (_, length)| {
+        total.checked_add(*length).ok_or(Errno::EINVAL)
+    })?;
+    if total > isize::MAX as usize {
+        return Err(Errno::EINVAL.into());
+    }
+    Ok(total)
+}
+
+fn gather_iovec_prefix<G, T>(
+    guest: &mut G,
+    segments: &[(usize, usize)],
+    count: usize,
+) -> Result<Vec<u8>, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if count > iovec_capacity(segments)? {
+        return Err(Errno::EIO.into());
+    }
+    let mut bytes = Vec::with_capacity(count);
+    let mut remaining = count;
+    for &(base, length) in segments {
+        if remaining == 0 {
+            break;
+        }
+        let length = length.min(remaining);
+        if length == 0 {
+            continue;
+        }
+        let address = Addr::<u8>::from_raw(base).ok_or(Errno::EFAULT)?;
+        let start = bytes.len();
+        bytes.resize(start + length, 0);
+        guest
+            .memory()
+            .read_exact(address, &mut bytes[start..start + length])?;
+        remaining -= length;
+    }
+    Ok(bytes)
+}
+
+fn scatter_iovec_prefix<G, T>(
+    guest: &mut G,
+    segments: &[(usize, usize)],
+    bytes: &[u8],
+) -> Result<(), Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if bytes.len() > iovec_capacity(segments)? {
+        return Err(Errno::EIO.into());
+    }
+    let mut offset = 0;
+    for &(base, length) in segments {
+        if offset == bytes.len() {
+            break;
+        }
+        let length = length.min(bytes.len() - offset);
+        if length == 0 {
+            continue;
+        }
+        let address = AddrMut::<u8>::from_raw(base).ok_or(Errno::EFAULT)?;
+        guest
+            .memory()
+            .write_exact(address, &bytes[offset..offset + length])?;
+        offset += length;
+    }
+    Ok(())
+}
+
 fn read_network_address<G, T>(
     guest: &mut G,
     address: Option<reverie::syscalls::AddrMut<'_, libc::sockaddr>>,
@@ -605,5 +770,20 @@ where
         family => Err(engine_error(format!(
             "unsupported connect address family {family}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iovec_capacity_preserves_empty_segments_and_rejects_overflow() {
+        assert_eq!(iovec_capacity(&[]).unwrap(), 0);
+        assert_eq!(iovec_capacity(&[(0, 0), (1, 3), (4, 5)]).unwrap(), 8);
+        assert!(matches!(
+            iovec_capacity(&[(1, isize::MAX as usize), (2, 1)]),
+            Err(Error::Errno(errno)) if errno == Errno::EINVAL
+        ));
     }
 }
